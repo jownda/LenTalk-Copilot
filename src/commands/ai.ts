@@ -1,0 +1,521 @@
+import { invoke, isTauri } from '@tauri-apps/api/core';
+import { useSettingsStore } from '@/stores/settingsStore';
+
+export interface GenerateRequest {
+  prompt: string;
+  /** 负向提示词(上游 AI 服务支持的模型可生效) */
+  negative_prompt?: string;
+  model: string;
+  size: string;
+  aspect_ratio: string;
+  reference_images?: string[];
+  extra_params?: Record<string, unknown>;
+}
+
+export type GenerationJobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'not_found';
+
+export interface GenerationJobStatus {
+  job_id: string;
+  status: GenerationJobState;
+  result?: string | null;
+  error?: string | null;
+}
+
+const BASE64_PREVIEW_HEAD = 96;
+const BASE64_PREVIEW_TAIL = 24;
+
+function truncateText(value: string, max = 200): string {
+  if (value.length <= max) {
+    return value;
+  }
+  return `${value.slice(0, max)}...(${value.length} chars)`;
+}
+
+function truncateBase64Like(value: string): string {
+  if (!value) {
+    return value;
+  }
+
+  if (value.startsWith('data:')) {
+    const [meta, payload = ''] = value.split(',', 2);
+    if (payload.length <= BASE64_PREVIEW_HEAD + BASE64_PREVIEW_TAIL) {
+      return value;
+    }
+    return `${meta},${payload.slice(0, BASE64_PREVIEW_HEAD)}...${payload.slice(-BASE64_PREVIEW_TAIL)}(${payload.length} chars)`;
+  }
+
+  const base64Like = /^[A-Za-z0-9+/=]+$/.test(value) && value.length > 256;
+  if (!base64Like) {
+    return truncateText(value, 280);
+  }
+
+  return `${value.slice(0, BASE64_PREVIEW_HEAD)}...${value.slice(-BASE64_PREVIEW_TAIL)}(${value.length} chars)`;
+}
+
+function sanitizeGenerateRequestForLog(request: GenerateRequest): Record<string, unknown> {
+  return {
+    prompt: truncateText(request.prompt, 240),
+    negative_prompt: truncateText(request.negative_prompt ?? '', 240),
+    model: request.model,
+    size: request.size,
+    aspect_ratio: request.aspect_ratio,
+    reference_images_count: request.reference_images?.length ?? 0,
+    reference_images_preview: (request.reference_images ?? []).map((item) =>
+      truncateBase64Like(item)
+    ),
+    extra_params: request.extra_params ?? {},
+  };
+}
+
+interface ErrorWithDetails extends Error {
+  details?: string;
+}
+
+function normalizeInvokeError(error: unknown): { message: string; details?: string } {
+  if (error instanceof Error) {
+    const detailsText =
+      'details' in error
+        ? typeof (error as { details?: unknown }).details === 'string'
+          ? (error as { details?: string }).details
+          : undefined
+        : undefined;
+    return { message: error.message || 'Generation failed', details: detailsText };
+  }
+
+  if (typeof error === 'string') {
+    return { message: error || 'Generation failed', details: error || undefined };
+  }
+
+  if (error && typeof error === 'object') {
+    const record = error as Record<string, unknown>;
+    const message =
+      (typeof record.message === 'string' && record.message) ||
+      (typeof record.error === 'string' && record.error) ||
+      (typeof record.msg === 'string' && record.msg) ||
+      'Generation failed';
+    let details: string | undefined;
+    try {
+      details = truncateText(JSON.stringify(record, null, 2), 2000);
+    } catch {
+      details = truncateText(String(record), 2000);
+    }
+    return { message, details };
+  }
+
+  return { message: 'Generation failed' };
+}
+
+function createErrorWithDetails(message: string, details?: string): ErrorWithDetails {
+  const error: ErrorWithDetails = new Error(message);
+  if (details) {
+    error.details = details;
+  }
+  return error;
+}
+
+export async function setApiKey(provider: string, apiKey: string): Promise<void> {
+  console.info('[AI] set_api_key', {
+    provider,
+    apiKeyMasked: apiKey ? `${apiKey.slice(0, 4)}***${apiKey.slice(-2)}` : '',
+    tauri: isTauri(),
+  });
+  if (!isTauri()) {
+    // 浏览器降级:key 已存于 settingsStore,无需传给 Rust
+    return;
+  }
+  return await invoke('set_api_key', { provider, apiKey });
+}
+
+const CUSTOM_PROVIDER_PREFIX = 'custom:';
+
+/** 浏览器降级任务存储:jobId → 状态(与 Rust 异步任务语义一致) */
+const browserGenerationJobs = new Map<string, GenerationJobStatus>();
+
+/**
+ * 浏览器降级生成:直接调 OpenAI 兼容文生图接口 POST {base}/v1/images/generations。
+ * 与 Rust openai_compat provider 行为一致:key 从 settingsStore.apiKeys[providerId] 读,
+ * base_url 从 extra_params.provider_base_url 读,固定 1024x1024 / n=1 / b64_json。
+ */
+async function browserGenerateImage(request: GenerateRequest): Promise<string> {
+  const model = request.model;
+  const providerId = model.split('/')[0] ?? '';
+  if (!providerId.startsWith(CUSTOM_PROVIDER_PREFIX)) {
+    throw new Error('浏览器模式仅支持自定义平台(custom:*)模型,其他平台请使用桌面版 LenTalk 生成');
+  }
+  // 发送给平台的 model 需去掉 custom:<id>/ 前缀(与 Rust 端拆分逻辑一致)
+  const apiModel = model.split('/').slice(1).join('/') || model;
+
+  const rawBaseUrl = request.extra_params?.provider_base_url;
+  const baseUrl =
+    typeof rawBaseUrl === 'string' ? rawBaseUrl.trim().replace(/\/+$/, '') : '';
+  if (!baseUrl) {
+    throw new Error('缺少 provider_base_url,请检查自定义平台配置');
+  }
+
+  const apiKey = useSettingsStore.getState().apiKeys[providerId] ?? '';
+  if (!apiKey) {
+    throw new Error('未配置 API Key,请在「设置-密钥」中填写该平台的密钥');
+  }
+
+  const endpoint = `${baseUrl}/v1/images/generations`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 180000);
+  try {
+    // 参考图:取第一张转 image 字段(data URL 原样,http 原样,blob: 转 data URL)
+    let referenceImage: string | undefined;
+    const referenceSources = request.reference_images ?? [];
+    if (referenceSources.length > 0) {
+      const source = referenceSources[0].trim();
+      if (source.startsWith('data:') || source.startsWith('http://') || source.startsWith('https://')) {
+        referenceImage = source;
+      } else if (source.startsWith('blob:')) {
+        try {
+          const blob = await (await fetch(source)).blob();
+          referenceImage = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result ?? ''));
+            reader.onerror = () => reject(new Error('参考图读取失败'));
+            reader.readAsDataURL(blob);
+          });
+        } catch (error) {
+          console.warn('[AI] browser fallback: failed to read blob reference image', { error });
+        }
+      }
+    }
+
+    const body: Record<string, unknown> = {
+      model: apiModel,
+      prompt: request.prompt,
+      size: '1024x1024',
+      n: 1,
+      response_format: 'b64_json',
+    };
+    if (referenceImage) {
+      body.image = referenceImage;
+    }
+
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    let payload: unknown = null;
+    try {
+      payload = (await response.json()) as unknown;
+    } catch {
+      payload = null;
+    }
+
+    if (!response.ok) {
+      const errorMessage =
+        payload && typeof payload === 'object'
+          ? ((payload as { error?: { message?: unknown } }).error?.message as string | undefined) ??
+            ((payload as { message?: unknown }).message as string | undefined)
+          : undefined;
+      throw new Error(
+        `自定义平台请求失败 (HTTP ${response.status}): ${errorMessage ?? response.statusText}`
+      );
+    }
+
+    const data =
+      payload && typeof payload === 'object' && Array.isArray((payload as { data?: unknown }).data)
+        ? (payload as { data: unknown[] }).data
+        : [];
+    const first = data[0];
+    if (first && typeof first === 'object') {
+      const b64 = (first as { b64_json?: unknown }).b64_json;
+      if (typeof b64 === 'string' && b64) {
+        return `data:image/png;base64,${b64}`;
+      }
+      const url = (first as { url?: unknown }).url;
+      if (typeof url === 'string' && url) {
+        return url;
+      }
+    }
+    const errorMessage =
+      payload && typeof payload === 'object'
+        ? ((payload as { error?: { message?: unknown } }).error?.message as string | undefined)
+        : undefined;
+    throw new Error(errorMessage ?? '响应中未找到图片数据');
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('生成超时(180s),请检查平台服务状态或网络');
+    }
+    // 浏览器跨域(CORS)或网络错误:fetch 会抛 TypeError
+    if (error instanceof TypeError) {
+      throw new Error(
+        `浏览器跨域(CORS)或网络错误:${error.message}。若平台未开放跨域访问,请使用桌面版 LenTalk 生成`
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function generateImage(request: GenerateRequest): Promise<string> {
+  const startedAt = performance.now();
+  console.info('[AI] generate_image request', {
+    ...sanitizeGenerateRequestForLog(request),
+    tauri: isTauri(),
+  });
+
+  if (!isTauri()) {
+    // 浏览器降级:直接请求 OpenAI 兼容文生图接口
+    return await browserGenerateImage(request);
+  }
+
+  try {
+    const rawResult = await invoke<unknown>('generate_image', { request });
+    if (typeof rawResult !== 'string') {
+      throw createErrorWithDetails(
+        'Generation returned non-string payload',
+        truncateText(
+          (() => {
+            try {
+              return JSON.stringify(rawResult, null, 2);
+            } catch {
+              return String(rawResult);
+            }
+          })(),
+          2000
+        )
+      );
+    }
+    const result = rawResult.trim();
+    if (!result) {
+      throw createErrorWithDetails('Generation returned empty image source');
+    }
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    console.info('[AI] generate_image success', {
+      elapsedMs,
+      resultPreview: truncateText(result, 220),
+    });
+    return result;
+  } catch (error) {
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    const normalizedError = normalizeInvokeError(error);
+    console.error('[AI] generate_image failed', {
+      elapsedMs,
+      request: sanitizeGenerateRequestForLog(request),
+      error,
+      normalizedError,
+    });
+    const commandError: ErrorWithDetails = new Error(normalizedError.message);
+    commandError.details = normalizedError.details;
+    throw commandError;
+  }
+}
+
+export async function submitGenerateImageJob(request: GenerateRequest): Promise<string> {
+  console.info('[AI] submit_generate_image_job request', {
+    ...sanitizeGenerateRequestForLog(request),
+    tauri: isTauri(),
+  });
+
+  if (!isTauri()) {
+    // 浏览器降级:同步发起生成,结果存内存 job map(与 Rust 异步任务语义一致)
+    const jobId = crypto.randomUUID();
+    browserGenerationJobs.set(jobId, {
+      job_id: jobId,
+      status: 'running',
+      result: null,
+      error: null,
+    });
+    void browserGenerateImage(request).then(
+      (result) => {
+        browserGenerationJobs.set(jobId, { job_id: jobId, status: 'succeeded', result, error: null });
+      },
+      (error) => {
+        browserGenerationJobs.set(jobId, {
+          job_id: jobId,
+          status: 'failed',
+          result: null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    );
+    return jobId;
+  }
+
+  const jobId = await invoke<string>('submit_generate_image_job', { request });
+  if (typeof jobId !== 'string' || !jobId.trim()) {
+    throw new Error('submit_generate_image_job returned invalid job id');
+  }
+  return jobId.trim();
+}
+
+export async function getGenerateImageJob(jobId: string): Promise<GenerationJobStatus> {
+  if (!isTauri()) {
+    // 浏览器降级:从内存 job map 读取
+    const record = browserGenerationJobs.get(jobId);
+    if (!record) {
+      return { job_id: jobId, status: 'not_found', result: null, error: 'job not found' };
+    }
+    return record;
+  }
+
+  const result = await invoke<GenerationJobStatus>('get_generate_image_job', { jobId });
+  if (!result || typeof result !== 'object' || typeof result.status !== 'string') {
+    throw new Error('get_generate_image_job returned invalid payload');
+  }
+  return result;
+}
+
+export async function listModels(): Promise<string[]> {
+  return await invoke('list_models');
+}
+
+export interface ProviderConnectionResult {
+  ok: boolean;
+  protocol?: string;
+  models?: string[];
+  count?: number;
+  status?: number;
+}
+
+function normalizeBaseUrl(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/+$/, '');
+}
+
+/** 浏览器降级 fetch:带超时与跨域友好错误 */
+async function httpFetchWithTimeout(url: string, init: RequestInit, timeoutMs = 10000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('请求超时(10s),请检查网络或平台服务状态');
+    }
+    // 浏览器跨域(CORS)被拦截或网络错误时 fetch 会抛 TypeError
+    throw new Error(
+      error instanceof Error ? error.message : String(error)
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 从 OpenAI 兼容 /v1/models 响应中提取模型 id 列表 */
+function extractModelsFromPayload(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object') {
+    return [];
+  }
+  const data = (payload as { data?: unknown }).data;
+  if (!Array.isArray(data)) {
+    return [];
+  }
+  return data
+    .map((item) => {
+      if (item && typeof item === 'object' && typeof (item as { id?: unknown }).id === 'string') {
+        return (item as { id: string }).id;
+      }
+      return '';
+    })
+    .filter((id) => id.length > 0);
+}
+
+/** 仅验证自定义平台 Base URL 是否可达(不需要 Key) */
+export async function verifyProviderUrl(
+  baseUrl: string
+): Promise<{ ok: boolean; status: number }> {
+  if (!isTauri()) {
+    // 浏览器降级:先尝试普通请求拿真实状态码;被 CORS 拦截时退化为 no-cors 探测可达性
+    const url = normalizeBaseUrl(baseUrl);
+    try {
+      const response = await httpFetchWithTimeout(url, { method: 'GET', cache: 'no-store' });
+      return { ok: response.status < 500, status: response.status };
+    } catch {
+      try {
+        await httpFetchWithTimeout(url, { method: 'GET', mode: 'no-cors', cache: 'no-store' });
+        // no-cors 响应为 opaque,无法读取状态码,可达即视为成功
+        return { ok: true, status: 0 };
+      } catch {
+        return { ok: false, status: 0 };
+      }
+    }
+  }
+  return await invoke<{ ok: boolean; status: number }>('verify_provider_url', { baseUrl });
+}
+
+/** 验证自定义平台协议(带 Key 调 /v1/models,检测 OpenAI 兼容) */
+export async function testProviderConnection(
+  baseUrl: string,
+  apiKey: string
+): Promise<ProviderConnectionResult> {
+  if (!isTauri()) {
+    // 浏览器降级:直接请求 /v1/models(受 CORS 限制,失败时给出友好提示)
+    const url = `${normalizeBaseUrl(baseUrl)}/v1/models`;
+    const headers: Record<string, string> = {};
+    if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+    let response: Response;
+    try {
+      response = await httpFetchWithTimeout(url, { method: 'GET', headers });
+    } catch (error) {
+      const hint = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `浏览器跨域(CORS)或网络错误:${hint}。若平台未开放跨域访问,请使用桌面版 LenTalk 验证`
+      );
+    }
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+    let models: string[] = [];
+    try {
+      const payload = (await response.json()) as unknown;
+      models = extractModelsFromPayload(payload);
+    } catch {
+      models = [];
+    }
+    return {
+      ok: true,
+      protocol: 'openai',
+      models,
+      count: models.length,
+      status: response.status,
+    };
+  }
+  return await invoke<ProviderConnectionResult>('test_provider_connection', { baseUrl, apiKey });
+}
+
+/** 从自定义平台拉取模型列表(OpenAI 兼容 /v1/models) */
+export async function fetchProviderModels(
+  baseUrl: string,
+  apiKey: string
+): Promise<{ models: string[]; count: number }> {
+  if (!isTauri()) {
+    // 浏览器降级:直接请求 /v1/models(受 CORS 限制,失败时给出友好提示)
+    const url = `${normalizeBaseUrl(baseUrl)}/v1/models`;
+    const headers: Record<string, string> = {};
+    if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+    let response: Response;
+    try {
+      response = await httpFetchWithTimeout(url, { method: 'GET', headers });
+    } catch (error) {
+      const hint = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `浏览器跨域(CORS)或网络错误:${hint}。若平台未开放跨域访问,请使用桌面版 LenTalk 验证`
+      );
+    }
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+    const payload = (await response.json()) as unknown;
+    const models = extractModelsFromPayload(payload);
+    return { models, count: models.length };
+  }
+  return await invoke<{ models: string[]; count: number }>('fetch_provider_models', {
+    baseUrl,
+    apiKey,
+  });
+}
