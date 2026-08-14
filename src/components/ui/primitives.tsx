@@ -46,7 +46,7 @@ interface UiCheckboxProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, 
   onCheckedChange?: (checked: boolean) => void;
 }
 
-interface UiSelectProps extends SelectHTMLAttributes<HTMLSelectElement> {}
+type UiSelectProps = SelectHTMLAttributes<HTMLSelectElement>;
 
 interface UiSelectOption {
   value: string;
@@ -98,6 +98,17 @@ export function UiIconButton({ className = '', active = false, ...props }: UiIco
   return (
     <button
       className={`inline-flex h-10 w-10 items-center justify-center border ui-field transition-colors ${active ? 'border-accent/45 bg-accent/18 text-text-dark' : 'text-text-muted hover:bg-[rgba(15,23,42,0.08)] dark:hover:bg-bg-dark'} ${className}`}
+      {...props}
+    />
+  );
+}
+
+/** 轻量图标按钮:无边框/背景,仅 hover 时出现浅底色(与画布工具栏图标按钮一致) */
+export function UiGhostIconButton({ className = '', ...props }: ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button
+      type="button"
+      className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-bg-dark hover:text-text-dark disabled:cursor-not-allowed disabled:opacity-50 ${className}`}
       {...props}
     />
   );
@@ -268,7 +279,8 @@ export function UiSelect({ className = '', children, ...props }: UiSelectProps) 
       setMenuStyle({
         left: rect.left,
         top: openAbove ? Math.max(8, rect.top - estimatedMenuHeight - 8) : rect.bottom + 8,
-        width: rect.width,
+        // 菜单至少 200px 宽,保证较长选项(如带后缀的词库名)完整显示
+        width: Math.max(rect.width, 200),
       });
     };
 
@@ -484,9 +496,9 @@ export function UiModal({
       >
         <div className="flex items-center justify-between border-b border-[rgba(255,255,255,0.1)] px-4 py-3">
           <h2 className="text-sm font-medium text-text-dark">{title}</h2>
-          <UiIconButton className="h-8 w-8" onClick={onClose}>
+          <UiGhostIconButton className="h-8 w-8" onClick={onClose}>
             <X className="h-4 w-4" />
-          </UiIconButton>
+          </UiGhostIconButton>
         </div>
 
         <div className="px-4 py-4">{children}</div>

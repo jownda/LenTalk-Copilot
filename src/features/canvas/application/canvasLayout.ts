@@ -257,7 +257,7 @@ export function computeAlignment(
 
 const ALIGN_OVERLAP_GAP = 24;
 
-/** 沿 y 方向防重叠: 保持原始上下相对顺序, 仅在有重叠时下移错开 */
+/** 沿 y 方向防重叠: 保持原始上下相对顺序, 仅在与已放置节点 x/y 均重叠时下移错开 */
 function resolveNonOverlapAlongY(
   items: AlignableItem[],
   positions: Map<string, { x: number; y: number }>
@@ -265,21 +265,22 @@ function resolveNonOverlapAlongY(
   const sorted = [...items].sort(
     (a, b) => (positions.get(a.id)?.y ?? a.y) - (positions.get(b.id)?.y ?? b.y)
   );
-  const placed: Array<{ top: number; bottom: number }> = [];
+  const placed: Array<{ left: number; right: number; top: number; bottom: number }> = [];
   for (const item of sorted) {
     const pos = positions.get(item.id) as { x: number; y: number };
     let top = pos.y;
     for (const region of placed) {
-      if (top < region.bottom && top + item.height > region.top) {
+      const overlapsX = pos.x < region.right && pos.x + item.width > region.left;
+      if (overlapsX && top < region.bottom && top + item.height > region.top) {
         top = region.bottom + ALIGN_OVERLAP_GAP;
       }
     }
     positions.set(item.id, { x: pos.x, y: Math.round(top) });
-    placed.push({ top, bottom: top + item.height });
+    placed.push({ left: pos.x, right: pos.x + item.width, top, bottom: top + item.height });
   }
 }
 
-/** 沿 x 方向防重叠: 保持原始左右相对顺序, 仅在有重叠时右移错开 */
+/** 沿 x 方向防重叠: 保持原始左右相对顺序, 仅在与已放置节点 x/y 均重叠时右移错开 */
 function resolveNonOverlapAlongX(
   items: AlignableItem[],
   positions: Map<string, { x: number; y: number }>
@@ -287,16 +288,55 @@ function resolveNonOverlapAlongX(
   const sorted = [...items].sort(
     (a, b) => (positions.get(a.id)?.x ?? a.x) - (positions.get(b.id)?.x ?? b.x)
   );
-  const placed: Array<{ left: number; right: number }> = [];
+  const placed: Array<{ left: number; right: number; top: number; bottom: number }> = [];
   for (const item of sorted) {
     const pos = positions.get(item.id) as { x: number; y: number };
     let left = pos.x;
     for (const region of placed) {
-      if (left < region.right && left + item.width > region.left) {
+      const overlapsY = pos.y < region.bottom && pos.y + item.height > region.top;
+      if (overlapsY && left < region.right && left + item.width > region.left) {
         left = region.right + ALIGN_OVERLAP_GAP;
       }
     }
     positions.set(item.id, { x: Math.round(left), y: pos.y });
-    placed.push({ left, right: left + item.width });
+    placed.push({ left, right: left + item.width, top: pos.y, bottom: pos.y + item.height });
   }
+}
+
+/**
+ * 全画布网格对齐 + 防重叠:
+ * - 只布局顶层节点(组内子节点随组节点整体移动);
+ * - 每个节点吸附到最近的网格交点;
+ * - 保持节点原有上下相对顺序, 对齐后若有纵向重叠则自动下移错开, 保证不叠在一起。
+ * 返回 nodeId -> 绝对坐标(与 computeAlignment 的返回值形式一致)。
+ */
+export function computeGridSnapLayout(
+  nodes: CanvasNode[],
+  gridSize: number
+): Map<string, { x: number; y: number }> {
+  const result = new Map<string, { x: number; y: number }>();
+  const grid = gridSize > 0 ? gridSize : 20;
+  const topLevelNodes = nodes.filter((node) => !node.parentId);
+  if (topLevelNodes.length === 0) {
+    return result;
+  }
+
+  const items: AlignableItem[] = topLevelNodes.map((node) => {
+    const size = getNodeSize(node);
+    return {
+      id: node.id,
+      x: Math.round(node.position.x / grid) * grid,
+      y: Math.round(node.position.y / grid) * grid,
+      width: size.width,
+      height: size.height,
+    };
+  });
+
+  for (const item of items) {
+    result.set(item.id, { x: item.x, y: item.y });
+  }
+
+  // 防重叠: 保持上下相对顺序, 重叠时下移错开
+  resolveNonOverlapAlongY(items, result);
+  return result;
 }

@@ -308,9 +308,12 @@ export const usePromptLibraryStore = create<PromptLibraryStore>((set, get) => ({
     if (!oldTrimmed || !newTrimmed || oldTrimmed === newTrimmed) {
       return;
     }
-    const categories = get().categories.map((category) =>
-      category === oldTrimmed ? newTrimmed : category
-    );
+    // categories 中 old→new;若 old 不在 categories(如仅出现在条目分类中),
+    // 仍把 new 加入 categories,保证新分组名可继续管理
+    const hasOld = get().categories.includes(oldTrimmed);
+    const categories = hasOld
+      ? get().categories.map((category) => (category === oldTrimmed ? newTrimmed : category))
+      : [...get().categories, newTrimmed];
     set({ categories });
     persistCategories(categories);
     // 同步更新所有非只读词库中该分类条目的分类

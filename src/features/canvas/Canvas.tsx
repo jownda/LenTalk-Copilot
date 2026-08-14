@@ -23,12 +23,13 @@ import {
   type Viewport,
 } from '@xyflow/react';
 import { useTranslation } from 'react-i18next';
-import { AlignJustify, Film, Layers, Library, Magnet } from 'lucide-react';
+import { AlignJustify, Film, Keyboard, Layers, Library, Magnet } from 'lucide-react';
 import '@xyflow/react/dist/style.css';
 
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useProjectStore } from '@/stores/projectStore';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { matchesBinding, useKeyboardShortcutStore } from '@/stores/keyboardShortcutStore';
 import { canvasAiGateway, canvasEventBus } from '@/features/canvas/application/canvasServices';
 import { nodeCatalog } from '@/features/canvas/application/nodeCatalog';
 import {
@@ -58,6 +59,7 @@ import { SelectedNodeOverlay } from './ui/SelectedNodeOverlay';
 import { NodeToolDialog } from './ui/NodeToolDialog';
 import { ImageViewerModal } from './ui/ImageViewerModal';
 import { VideoFrameExtractDialog } from './ui/VideoFrameExtractDialog';
+import { ShortcutSettingsDialog } from './ui/ShortcutSettingsDialog';
 import { AssetLibraryPanel } from '@/features/library/AssetLibraryPanel';
 import { useAssetLibraryStore } from '@/features/library/assetStore';
 import { ASSET_DRAG_DATA_TYPE, parseAssetDragPayload, PROMPT_DRAG_DATA_TYPE, parsePromptDragPayload } from '@/features/library/importAssets';
@@ -328,8 +330,12 @@ interface PreviewConnectionLine {
 export function Canvas() {
   const { t } = useTranslation();
   const reactFlowInstance = useReactFlow();
+
   const wrapperRef = useRef<HTMLDivElement>(null);
   const suppressNextPaneClickRef = useRef(false);
+  // 框选成功后的 click/dblclick 抑制时间窗(ms 时间戳)。
+  // 必须用 ref 而非 effect 闭包变量: setNodes 会触发 store 更新导致 effect 重建, 闭包变量值会丢失。
+  const suppressClickUntilRef = useRef(0);
   const suppressNextEdgeClickRef = useRef(false);
 
   const [showNodeMenu, setShowNodeMenu] = useState(false);
@@ -345,6 +351,9 @@ export function Canvas() {
     useState<PreviewConnectionVisual | null>(null);
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [isVideoExtractOpen, setIsVideoExtractOpen] = useState(false);
+  const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
+  /** 双击框选: 选择矩形(相对画布容器坐标) */
+  const [dragSelectRect, setDragSelectRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   const [isAlignMenuOpen, setIsAlignMenuOpen] = useState(false);
   const alignMenuRef = useRef<HTMLDivElement>(null);
   const flashTimerRef = useRef<number | null>(null);
@@ -397,6 +406,7 @@ export function Canvas() {
   const setFlashGroupId = useCanvasStore((state) => state.setFlashGroupId);
   const setChargingGroupId = useCanvasStore((state) => state.setChargingGroupId);
   const alignNodes = useCanvasStore((state) => state.alignNodes);
+  const snapAllNodesToGrid = useCanvasStore((state) => state.snapAllNodesToGrid);
   const undo = useCanvasStore((state) => state.undo);
   const redo = useCanvasStore((state) => state.redo);
   const openToolDialog = useCanvasStore((state) => state.openToolDialog);
@@ -940,6 +950,152 @@ export function Canvas() {
     [alignNodes, scheduleCanvasPersist, selectedNodeIds]
   );
 
+  // 双击第二下按住左键拖拽 = 框选节点(左键拖拽留给平移, 所以框选改为双击手势)
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) {
+      return;
+    }
+    let lastDownAt = 0;
+    let lastDownPos = { x: 0, y: 0 };
+    let selecting = false;
+    let startScreen = { x: 0, y: 0 };
+
+    const isBlankPaneTarget = (target: EventTarget | null) => {
+      const el = target as HTMLElement | null;
+      if (!el || !(el instanceof HTMLElement) || !el.closest('.react-flow__pane')) {
+        return false;
+      }
+      // 节点/边/控件/交互元素上不触发框选
+      if (el.closest('.react-flow__node, .react-flow__edge, .react-flow__minimap, .react-flow__controls, .react-flow__panel, .nokey, button, input, select, textarea, a')) {
+        return false;
+      }
+      return true;
+    };
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.button !== 0 || !isBlankPaneTarget(event.target)) {
+        return;
+      }
+      const now = performance.now();
+      const pos = { x: event.clientX, y: event.clientY };
+      const isDoubleClick = now - lastDownAt < 320 && Math.hypot(pos.x - lastDownPos.x, pos.y - lastDownPos.y) < 10;
+      lastDownAt = now;
+      lastDownPos = pos;
+      if (!isDoubleClick) {
+        return;
+      }
+      // 双击第二下按住: 进入框选, 捕获阶段拦截阻止 React Flow 的 pan(pointerdown) 与 d3-drag 平移(mousedown)
+      selecting = true;
+      startScreen = pos;
+      const wrapperRect = wrapper.getBoundingClientRect();
+      setDragSelectRect({
+        left: pos.x - wrapperRect.left,
+        top: pos.y - wrapperRect.top,
+        width: 0,
+        height: 0,
+      });
+      event.stopPropagation();
+      event.preventDefault();
+    };
+
+    // React Flow 的 pan 由 d3-drag 绑定在 pane 的 mousedown 驱动, 必须额外拦截 mousedown
+    const handleMouseDown = (event: MouseEvent) => {
+      if (selecting && event.button === 0) {
+        event.stopPropagation();
+        event.preventDefault();
+      }
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      if (!selecting) {
+        return;
+      }
+      const wrapperRect = wrapper.getBoundingClientRect();
+      setDragSelectRect({
+        left: Math.min(startScreen.x, event.clientX) - wrapperRect.left,
+        top: Math.min(startScreen.y, event.clientY) - wrapperRect.top,
+        width: Math.abs(event.clientX - startScreen.x),
+        height: Math.abs(event.clientY - startScreen.y),
+      });
+      event.stopPropagation();
+      event.preventDefault();
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      if (!selecting) {
+        return;
+      }
+      selecting = false;
+      const endScreen = { x: event.clientX, y: event.clientY };
+      const width = Math.abs(endScreen.x - startScreen.x);
+      const height = Math.abs(endScreen.y - startScreen.y);
+      setDragSelectRect(null);
+      // 几乎没拖动 → 视为普通双击(不框选), 放行后续 click 打开节点菜单
+      if (width < 5 && height < 5) {
+        return;
+      }
+      const rect = {
+        x: Math.min(startScreen.x, endScreen.x),
+        y: Math.min(startScreen.y, endScreen.y),
+        right: Math.max(startScreen.x, endScreen.x),
+        bottom: Math.max(startScreen.y, endScreen.y),
+      };
+      const topLeft = reactFlowInstance.screenToFlowPosition({ x: rect.x, y: rect.y });
+      const bottomRight = reactFlowInstance.screenToFlowPosition({ x: rect.right, y: rect.bottom });
+      const selectedByNode = new Map(
+        nodes.map((node) => {
+          const nodeWidth = node.measured?.width ?? node.width ?? 220;
+          const nodeHeight = node.measured?.height ?? node.height ?? 200;
+          const nx = node.position.x;
+          const ny = node.position.y;
+          const selected =
+            nx < bottomRight.x
+            && nx + nodeWidth > topLeft.x
+            && ny < bottomRight.y
+            && ny + nodeHeight > topLeft.y;
+          return [node.id, selected] as const;
+        })
+      );
+      // setNodes 是 React Flow 受控模式下设置 selected 的官方方式;
+      // 注意必须始终返回新对象(React Flow 以引用比较检测差异)
+      reactFlowInstance.setNodes((nds) =>
+        nds.map((node) => ({ ...node, selected: selectedByNode.get(node.id) ?? false }))
+      );
+      // 框选成功: 在时间窗口内拦截松开后的 click/dblclick,
+      // 阻止 React Flow 的 Pane.onClick 调用 resetSelectedElements 取消框选结果
+      suppressClickUntilRef.current = performance.now() + 600;
+      event.stopPropagation();
+      event.preventDefault();
+    };
+
+    // React Flow Pane 的 onClick 会调用 resetSelectedElements() 取消所有选中。
+    // 框选(双击第二下拖拽)成功后, 在时间窗口内拦截 click/dblclick, 阻止 React 事件委托触发该逻辑。
+    const handleClickCapture = (event: MouseEvent) => {
+      if (performance.now() < suppressClickUntilRef.current) {
+        suppressClickUntilRef.current = 0;
+        event.stopPropagation();
+        event.preventDefault();
+      }
+    };
+
+    // document 捕获阶段拦截: 早于 React(root 委托) 与 d3-drag(pane bubble), 才能阻止平移
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    document.addEventListener('mousedown', handleMouseDown, true);
+    window.addEventListener('pointermove', handlePointerMove, true);
+    window.addEventListener('pointerup', handlePointerUp, true);
+    document.addEventListener('click', handleClickCapture, true);
+    document.addEventListener('dblclick', handleClickCapture, true);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+      document.removeEventListener('mousedown', handleMouseDown, true);
+      window.removeEventListener('pointermove', handlePointerMove, true);
+      window.removeEventListener('pointerup', handlePointerUp, true);
+      document.removeEventListener('click', handleClickCapture, true);
+      document.removeEventListener('dblclick', handleClickCapture, true);
+    };
+  }, [nodes, reactFlowInstance]);
+
   useEffect(() => {
     if (!isAlignMenuOpen) {
       return;
@@ -1000,13 +1156,13 @@ export function Canvas() {
         return;
       }
 
-      const commandPressed = event.ctrlKey || event.metaKey;
-      const key = event.key.toLowerCase();
-      const isUndo = commandPressed && key === 'z' && !event.shiftKey;
-      const isRedo = commandPressed && (key === 'y' || (key === 'z' && event.shiftKey));
-      const isGroup = commandPressed && key === 'g';
-      const isCopy = commandPressed && key === 'c' && !event.shiftKey;
-      const isPaste = commandPressed && key === 'v' && !event.shiftKey;
+      const shortcuts = useKeyboardShortcutStore.getState().bindings;
+      const isUndo = matchesBinding(event, shortcuts.undo);
+      const isRedo = matchesBinding(event, shortcuts.redo);
+      const isGroup = matchesBinding(event, shortcuts.group);
+      const isCopy = matchesBinding(event, shortcuts.copy);
+      const isPaste = matchesBinding(event, shortcuts.paste);
+      const isDelete = matchesBinding(event, shortcuts.delete);
 
       if (isCopy) {
         if (selectedNodeIds.length === 0) {
@@ -1070,7 +1226,7 @@ export function Canvas() {
         return;
       }
 
-      if (event.key !== 'Delete' && event.key !== 'Backspace') {
+      if (!isDelete) {
         return;
       }
 
@@ -2141,7 +2297,11 @@ export function Canvas() {
         maxZoom={5}
         snapToGrid={snapToGrid}
         snapGrid={[20, 20]}
-        selectionOnDrag
+        // 左/中/右键拖拽均可平移画布; 框选改用「双击第二下按住拖拽」(自定义实现)
+        panOnDrag={[0, 1, 2]}
+        // 禁用空格临时平移(默认 Space 会让光标随按键重复闪烁)
+        panActivationKeyCode={null}
+        onPaneContextMenu={(event) => event.preventDefault()}
         selectionMode={SelectionMode.Partial}
         multiSelectionKeyCode={['Control', 'Meta']}
         selectionKeyCode={['Control', 'Meta']}
@@ -2164,19 +2324,44 @@ export function Canvas() {
         <SelectedNodeOverlay />
       </ReactFlow>
 
+      {dragSelectRect && (
+        <div
+          className="pointer-events-none absolute z-30 border border-accent/70 bg-accent/15"
+          style={{
+            left: dragSelectRect.left,
+            top: dragSelectRect.top,
+            width: dragSelectRect.width,
+            height: dragSelectRect.height,
+          }}
+        />
+      )}
+
       <div className="absolute right-4 top-4 z-10 flex items-center gap-2">
+        <button
+          onClick={() => setIsShortcutsOpen(true)}
+          className="flex h-9 w-9 items-center justify-center rounded-lg border border-border-dark bg-surface-dark shadow-lg transition-colors text-text-dark hover:bg-bg-dark"
+          title={t('canvas.toolbar.shortcuts', '快捷键设置')}
+        >
+          <Keyboard className="h-4 w-4 text-text-muted" />
+        </button>
+
         <div ref={alignMenuRef} className="relative">
           <button
-            onClick={() => setIsAlignMenuOpen((open) => !open)}
-            disabled={selectedNodeIds.length < 2}
-            className={`flex h-9 w-9 items-center justify-center rounded-lg border border-border-dark bg-surface-dark shadow-lg transition-colors ${
-              selectedNodeIds.length < 2
-                ? 'cursor-not-allowed opacity-50'
-                : 'text-text-dark hover:bg-bg-dark'
-            }`}
+            onClick={() => {
+              if (selectedNodeIds.length < 2) {
+                // 未选中多个节点:一键让全画布节点吸附最近网格并防重叠
+                const changed = snapAllNodesToGrid(20);
+                if (changed) {
+                  scheduleCanvasPersist(0);
+                }
+                return;
+              }
+              setIsAlignMenuOpen((open) => !open);
+            }}
+            className="flex h-9 w-9 items-center justify-center rounded-lg border border-border-dark bg-surface-dark shadow-lg transition-colors text-text-dark hover:bg-bg-dark"
             title={
               selectedNodeIds.length < 2
-                ? t('canvas.toolbar.alignHint', '框选或按住 ⌘ 多选 2 个以上节点后对齐')
+                ? t('canvas.toolbar.alignAll', '一键整理:全部节点吸附最近网格并对齐,自动防重叠')
                 : t('canvas.toolbar.align', '对齐选中节点')
             }
           >
@@ -2310,6 +2495,11 @@ export function Canvas() {
       <VideoFrameExtractDialog
         open={isVideoExtractOpen}
         onClose={() => setIsVideoExtractOpen(false)}
+      />
+
+      <ShortcutSettingsDialog
+        open={isShortcutsOpen}
+        onClose={() => setIsShortcutsOpen(false)}
       />
     </div>
   );

@@ -6,6 +6,7 @@ import path from "path";
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
+/// <reference types="vitest/config" />
 export default defineConfig(async () => ({
   plugins: [react()],
 
@@ -13,6 +14,12 @@ export default defineConfig(async () => ({
     alias: {
       "@": path.resolve(__dirname, "./src"),
     },
+  },
+
+  test: {
+    globals: true,
+    environment: "node",
+    include: ["src/**/*.test.ts"],
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

@@ -1,8 +1,17 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import {
   AudioLines,
+  ChevronDown,
   ChevronRight,
   Download,
   Folder,
@@ -23,13 +32,13 @@ import {
 
 import { useAssetLibraryStore } from './assetStore';
 import { ASSET_DRAG_DATA_TYPE, assetDragPayload, importFilesToAssets } from './importAssets';
-import type { AssetMediaType, LibraryAsset } from './types';
 import { CategoryManagerDialog } from './CategoryManagerDialog';
+import type { AssetMediaType, LibraryAsset } from './types';
 import {
   buildBackupFileName,
   createLibraryBackupZip,
-  downloadBlob,
   importLibraryBackupZip,
+  saveBlobWithDialog,
 } from './libraryBackup';
 import { PromptLibraryPanel } from '@/features/prompts/PromptLibraryPanel';
 import { RenameDialog } from '@/features/project/RenameDialog';
@@ -38,12 +47,14 @@ import { useCanvasStore } from '@/stores/canvasStore';
 import { CANVAS_NODE_TYPES } from '@/features/canvas/domain/canvasNodes';
 import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import { nodeCatalog } from '@/features/canvas/application/nodeCatalog';
-import { UiButton, UiIconButton } from '@/components/ui/primitives';
+import { UiButton, UiGhostIconButton, UiInput, UiSelect } from '@/components/ui/primitives';
 
 export interface AssetLibraryPanelProps {
   open: boolean;
   onClose: () => void;
   fullscreen?: boolean;
+  /** 触发按钮底部的视口 Y 坐标(fullscreen 模式下面板从此处下方平滑呼出,不顶到最顶部) */
+  anchorTop?: number;
   /** 画布入口传入,提示词「应用」回调(素材库内嵌提示词 tab 时用) */
   onApplyPrompt?: (template: PromptTemplate, mode: 'positive' | 'full') => void;
 }
@@ -61,9 +72,9 @@ function resolveViewportCenterPosition(): { x: number; y: number } {
 }
 
 function mediaIcon(mediaType: AssetMediaType) {
-  if (mediaType === 'video') return <Video className="h-5 w-5" />;
-  if (mediaType === 'audio') return <Music2 className="h-5 w-5" />;
-  return <ImagePlus className="h-5 w-5" />;
+  if (mediaType === 'video') return <Video className="h-3.5 w-3.5 text-text-muted" />;
+  if (mediaType === 'audio') return <Music2 className="h-3.5 w-3.5 text-text-muted" />;
+  return <ImagePlus className="h-3.5 w-3.5 text-text-muted" />;
 }
 
 function MediaPreview({ asset }: { asset: LibraryAsset }) {
@@ -109,7 +120,7 @@ function MediaPreview({ asset }: { asset: LibraryAsset }) {
   );
 }
 
-export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onApplyPrompt }: AssetLibraryPanelProps) => {
+export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anchorTop, onApplyPrompt }: AssetLibraryPanelProps) => {
   const { t } = useTranslation();
   const hydrate = useAssetLibraryStore((state) => state.hydrate);
   const isHydrated = useAssetLibraryStore((state) => state.isHydrated);
@@ -155,6 +166,19 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
     title: string;
     defaultValue: string;
   } | null>(null);
+  /** 面板呼出动画:打开后下一帧置为可见,实现从锚点平滑浮现 */
+  const [panelVisible, setPanelVisible] = useState(false);
+  /** 侧边面板中「分组」列表折叠/展开 */
+  const [categoriesCollapsed, setCategoriesCollapsed] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const raf = window.requestAnimationFrame(() => setPanelVisible(true));
+    return () => {
+      window.cancelAnimationFrame(raf);
+      setPanelVisible(false);
+    };
+  }, [open]);
 
   useEffect(() => {
     void hydrate();
@@ -232,8 +256,13 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
     setBackupNotice(null);
     try {
       const blob = await createLibraryBackupZip();
-      downloadBlob(blob, buildBackupFileName());
-      setBackupNotice(t('assetLibrary.backupDone', '备份已导出'));
+      const savedPath = await saveBlobWithDialog(blob, buildBackupFileName());
+      if (savedPath === null) {
+        // 用户在保存对话框点了取消(仅桌面环境会返回 null 表示取消)
+        setBackupNotice(t('assetLibrary.backupCanceled', '已取消导出'));
+      } else {
+        setBackupNotice(t('assetLibrary.backupDone', '备份已导出'));
+      }
       window.setTimeout(() => setBackupNotice(null), 3000);
     } catch (error) {
       console.error('[assetLibrary] backup failed', error);
@@ -489,7 +518,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
                   event.dataTransfer.setData(ASSET_DRAG_DATA_TYPE, assetDragPayload(asset.id));
                   event.dataTransfer.effectAllowed = 'copy';
                 }}
-                className={`group relative overflow-hidden rounded-md border bg-bg-dark ${selected ? 'border-accent ring-2 ring-accent/35' : 'border-border-dark hover:border-accent/60'}`}
+                className={`group relative overflow-hidden rounded-lg border bg-surface-dark ${selected ? 'border-accent ring-2 ring-accent/35' : 'border-border-dark hover:border-accent/60'}`}
               >
                 <button
                   type="button"
@@ -518,7 +547,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
                     });
                   }}
                 >
-                  <MoreVertical className="h-4 w-4" strokeWidth={2.6} />
+                  <MoreVertical className="h-4 w-4" />
                 </button>
               </article>
             );
@@ -539,103 +568,151 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
   /** 右上角:备份 / 导入(图标按钮) */
   const backupControls = (
     <>
-      <UiIconButton
+      <UiGhostIconButton
         title={t('assetLibrary.backupHint', '导出素材库和提示词库为 zip 备份文件')}
         onClick={() => void handleExportBackup()}
         disabled={backupBusy}
       >
-        <Download className="h-4 w-4" />
-      </UiIconButton>
-      <UiIconButton
+        <Upload className="h-4 w-4" />
+      </UiGhostIconButton>
+      <UiGhostIconButton
         title={t('assetLibrary.importBackupHint', '从 zip 备份文件恢复素材库和提示词库')}
         onClick={() => backupInputRef.current?.click()}
         disabled={backupBusy}
       >
-        <Upload className="h-4 w-4" />
-      </UiIconButton>
+        <Download className="h-4 w-4" />
+      </UiGhostIconButton>
     </>
   );
 
-  const toolbar = (
-    <div className="flex flex-wrap items-center gap-2">
-      <UiButton variant="primary" size="sm" onClick={() => fileInputRef.current?.click()} disabled={isImporting}>
-        <ImagePlus className="h-4 w-4" />
-        {isImporting ? t('assetLibrary.importing', '导入中…') : t('assetLibrary.import', '导入素材')}
-      </UiButton>
-      <UiButton variant="muted" size="sm" onClick={() => setShowCategoryManager(true)}>
-        <FolderCog className="h-4 w-4" />
-        {t('assetLibrary.manageCategories', '管理分组')}
-      </UiButton>
-      <div className="min-w-[126px] flex-1" />
-      {selectedAssetIds.size > 0 && (
-        <>
-          <UiIconButton title={t('assetLibrary.smartClassify', '智能分类')} onClick={() => {
-            const changed = classifyAssets([...selectedAssetIds]);
-            if (changed === 0) window.alert(t('assetLibrary.classifyNoMatch', '没有找到匹配的分类。请先建立角色、场景或道具分组，并使用有意义的素材名称或标签。'));
-          }}>
-            <Sparkles className="h-4 w-4 text-amber-300" />
-          </UiIconButton>
-          <select
-            className="h-8 max-w-[132px] rounded-md border border-border-dark bg-bg-dark px-2 text-xs text-text-dark"
-            defaultValue=""
-            aria-label={t('assetLibrary.moveTo', '移动到分组')}
-            onChange={(event) => {
-              const value = event.target.value;
-              if (!value) return;
-              moveAssetsToCategory([...selectedAssetIds], value === '__none__' ? null : value);
-              event.target.value = '';
-            }}
-          >
-            <option value="" disabled>{t('assetLibrary.moveTo', '移动到分组')}</option>
-            {libraryCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
-            <option value="__none__">{t('assetLibrary.uncategorized', '未分组')}</option>
-          </select>
-          <UiIconButton title={t('assetLibrary.deleteSelected', '删除已选')} onClick={() => {
-            if (window.confirm(t('assetLibrary.deleteSelectedConfirm', '确定删除选中的 {{count}} 个素材吗?', { count: selectedAssetIds.size }))) {
-              deleteAssets([...selectedAssetIds]);
-              setSelectedAssetIds(new Set());
-            }
-          }}>
-            <Trash2 className="h-4 w-4 text-red-400" />
-          </UiIconButton>
-        </>
-      )}
+  /** 搜索框:占满父容器剩余宽度(由调用方决定放在哪一行) */
+  const searchBox = (
+    <div className="relative min-w-[120px] flex-1">
+      <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-text-muted" />
+      <UiInput
+        value={searchQuery}
+        onChange={(event) => setSearchQuery(event.target.value)}
+        placeholder={t('assetLibrary.search', '搜索素材或标签…')}
+        className="h-9 rounded-lg pl-8 pr-2 text-xs"
+      />
     </div>
   );
 
-  const filterBar = (
-    <div className="space-y-2">
-      <div className="relative">
-        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-text-muted" />
-        <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder={t('assetLibrary.search', '搜索素材或标签…')} className="h-8 w-full rounded-md border border-border-dark bg-bg-dark pl-8 pr-2 text-xs text-text-dark outline-none focus:border-accent" />
-      </div>
-      <div className="flex gap-1">
-        {(['all', 'image', 'video', 'audio'] as MediaFilter[]).map((type) => (
-          <button key={type} type="button" onClick={() => setMediaFilter(type)} className={`h-7 rounded-md border px-2 text-[11px] ${mediaFilter === type ? 'border-accent/60 bg-accent/15 text-text-dark' : 'border-border-dark text-text-muted hover:bg-bg-dark'}`}>
-            {type === 'all' ? t('assetLibrary.all', '全部') : type === 'image' ? t('assetLibrary.images', '图片') : type === 'video' ? t('assetLibrary.videos', '视频') : t('assetLibrary.audio', '音频')}
-          </button>
-        ))}
-      </div>
-      <div className="flex items-center gap-2 pt-0.5">
-        <ImagePlus className="h-3.5 w-3.5 shrink-0 text-text-muted/60" />
-        <input
-          type="range"
-          min={84}
-          max={220}
-          step={2}
-          value={thumbSize}
-          onChange={(event) => setThumbSize(Number(event.target.value))}
-          aria-label={t('assetLibrary.thumbSize', '缩略图大小')}
-          className="h-1.5 min-w-0 flex-1 cursor-pointer appearance-none rounded-full bg-border-dark accent-accent"
-        />
-        <span className="w-8 shrink-0 text-right text-[10px] text-text-muted">{thumbSize}</span>
-      </div>
+  const importButton = (
+    <UiButton variant="primary" size="sm" onClick={() => fileInputRef.current?.click()} disabled={isImporting}>
+      <ImagePlus className="h-4 w-4" />
+      {isImporting ? t('assetLibrary.importing', '导入中…') : t('assetLibrary.import', '导入素材')}
+    </UiButton>
+  );
+
+  const manageButton = (
+    <UiButton variant="muted" size="sm" onClick={() => setShowCategoryManager(true)}>
+      <FolderCog className="h-4 w-4" />
+      {t('assetLibrary.manageCategories', '管理分组')}
+    </UiButton>
+  );
+
+  const selectedOps = selectedAssetIds.size > 0 && (
+    <>
+      <UiGhostIconButton title={t('assetLibrary.smartClassify', '智能分类')} onClick={() => {
+        const changed = classifyAssets([...selectedAssetIds]);
+        if (changed === 0) window.alert(t('assetLibrary.classifyNoMatch', '没有找到匹配的分类。请先建立角色、场景或道具分组，并使用有意义的素材名称或标签。'));
+      }}>
+        <Sparkles className="h-4 w-4 text-amber-300" />
+      </UiGhostIconButton>
+      <UiSelect
+        className="h-8 max-w-[132px] rounded-lg text-xs"
+        aria-label={t('assetLibrary.moveTo', '移动到分组')}
+        defaultValue=""
+        onChange={(event) => {
+          const value = event.target.value;
+          if (!value) return;
+          moveAssetsToCategory([...selectedAssetIds], value === '__none__' ? null : value);
+          event.target.value = '';
+        }}
+      >
+        <option value="" disabled>{t('assetLibrary.moveTo', '移动到分组')}</option>
+        {libraryCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
+        <option value="__none__">{t('assetLibrary.uncategorized', '未分组')}</option>
+      </UiSelect>
+      <UiGhostIconButton title={t('assetLibrary.deleteSelected', '删除已选')} onClick={() => {
+        if (window.confirm(t('assetLibrary.deleteSelectedConfirm', '确定删除选中的 {{count}} 个素材吗?', { count: selectedAssetIds.size }))) {
+          deleteAssets([...selectedAssetIds]);
+          setSelectedAssetIds(new Set());
+        }
+      }}>
+        <Trash2 className="h-4 w-4 text-red-400" />
+      </UiGhostIconButton>
+    </>
+  );
+
+  const mediaFilterRow = (extra?: ReactNode) => (
+    <div className="flex flex-wrap items-center gap-1">
+      {(['all', 'image', 'video', 'audio'] as MediaFilter[]).map((type) => (
+        <button
+          key={type}
+          type="button"
+          onClick={() => setMediaFilter(type)}
+          className={`h-9 rounded-lg border px-3 text-xs transition-colors ${mediaFilter === type ? 'border-accent/60 bg-accent/15 text-text-dark' : 'border-border-dark text-text-muted hover:bg-bg-dark'}`}
+        >
+          {type === 'all' ? t('assetLibrary.all', '全部') : type === 'image' ? t('assetLibrary.images', '图片') : type === 'video' ? t('assetLibrary.videos', '视频') : t('assetLibrary.audio', '音频')}
+        </button>
+      ))}
+      {extra}
     </div>
   );
+
+  const thumbSlider = (
+    <div className="flex items-center gap-2 pt-0.5">
+      <ImagePlus className="h-3.5 w-3.5 shrink-0 text-text-muted" />
+      <input
+        type="range"
+        min={84}
+        max={220}
+        step={2}
+        value={thumbSize}
+        onChange={(event) => setThumbSize(Number(event.target.value))}
+        aria-label={t('assetLibrary.thumbSize', '缩略图大小')}
+        className="h-1.5 min-w-0 flex-1 cursor-pointer appearance-none rounded-full bg-border-dark accent-accent"
+      />
+      <span className="w-8 shrink-0 text-right text-[10px] text-text-muted">{thumbSize}</span>
+    </div>
+  );
+
+  /** fullscreen 工具行:导入 + 管理分组 + spacer + 选中操作(搜索框在筛选栏顶部) */
+  const toolbar = () => (
+    <div className="flex flex-wrap items-center gap-2">
+      {importButton}
+      {manageButton}
+      <div className="min-w-0 flex-1" />
+      {selectedOps}
+    </div>
+  );
+
+  /** fullscreen 筛选栏:搜索 + 媒体 + 滑杆 */
+  const filterBar = () => (
+    <div className="space-y-2">
+      {searchBox}
+      {mediaFilterRow()}
+      {thumbSlider}
+    </div>
+  );
+
+  /** 侧栏工具行:导入 + 搜索(占满剩余宽度) + 选中操作 */
+  const sidebarMainRow = (
+    <div className="flex flex-wrap items-center gap-2">
+      {importButton}
+      {searchBox}
+      {selectedOps}
+    </div>
+  );
+
+  /** 侧栏媒体过滤行:媒体按钮 + 管理分组(放音频按钮右边) */
+  const sidebarFilterRow = mediaFilterRow(manageButton);
 
   const categoryList = (
     <div className="space-y-1">
-      <button type="button" onClick={() => setActiveCategoryId(null)} className={`flex h-8 w-full items-center justify-between rounded-md px-2 text-left text-xs ${activeCategoryId === null ? 'bg-accent/15 text-text-dark' : 'text-text-muted hover:bg-bg-dark'}`}>
+      <button type="button" onClick={() => setActiveCategoryId(null)} className={`flex h-9 w-full items-center justify-between rounded-lg px-2.5 text-left text-xs ${activeCategoryId === null ? 'bg-accent/15 text-text-dark' : 'text-text-muted hover:bg-bg-dark'}`}>
         <span>{t('assetLibrary.all', '全部')}</span><span>{libraryAssets.length}</span>
       </button>
       {libraryCategories
@@ -645,7 +722,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
             <button
               type="button"
               onClick={() => setActiveCategoryId(category.id)}
-              className={`flex h-8 w-full items-center justify-between rounded-md px-2 text-left text-xs ${activeCategoryId === category.id ? 'bg-accent/15 text-text-dark' : 'text-text-muted hover:bg-bg-dark'}`}
+              className={`flex h-9 w-full items-center justify-between rounded-lg px-2.5 text-left text-xs ${activeCategoryId === category.id ? 'bg-accent/15 text-text-dark' : 'text-text-muted hover:bg-bg-dark'}`}
             >
               <span className="flex min-w-0 items-center gap-1.5">
                 <Folder className="h-3.5 w-3.5 shrink-0 text-text-muted/60" />
@@ -660,7 +737,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
                   key={child.id}
                   type="button"
                   onClick={() => setActiveCategoryId(child.id)}
-                  className={`flex h-8 w-full items-center justify-between rounded-md pl-6 pr-2 text-left text-xs ${activeCategoryId === child.id ? 'bg-accent/15 text-text-dark' : 'text-text-muted hover:bg-bg-dark'}`}
+                  className={`flex h-9 w-full items-center justify-between rounded-lg pl-6 pr-2.5 text-left text-xs ${activeCategoryId === child.id ? 'bg-accent/15 text-text-dark' : 'text-text-muted hover:bg-bg-dark'}`}
                 >
                   <span className="flex min-w-0 items-center gap-1.5">
                     <Folder className="h-3 w-3 shrink-0 text-text-muted/40" />
@@ -676,21 +753,26 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
 
   const libraryControls = currentLibrary && (
     <div className="flex items-center gap-1">
-      <select value={currentLibrary.id} onChange={(event) => setActiveLibrary(event.target.value)} className="h-8 min-w-0 flex-1 rounded-md border border-border-dark bg-bg-dark px-2 text-xs text-text-dark">
+      <UiSelect
+        value={currentLibrary.id}
+        onChange={(event) => setActiveLibrary(event.target.value)}
+        aria-label={t('assetLibrary.title', '素材库')}
+        className="h-9 min-w-0 flex-1 rounded-lg text-xs"
+      >
         {libraries.map((library) => <option key={library.id} value={library.id}>{library.name}</option>)}
-      </select>
-      <UiIconButton title={t('assetLibrary.newLibrary', '新建素材库')} onClick={requestNewLibrary}><Plus className="h-4 w-4" /></UiIconButton>
-      <UiIconButton title={t('assetLibrary.renameLibrary', '重命名素材库')} onClick={() => {
+      </UiSelect>
+      <UiGhostIconButton title={t('assetLibrary.newLibrary', '新建素材库')} onClick={requestNewLibrary}><Plus className="h-4 w-4" /></UiGhostIconButton>
+      <UiGhostIconButton title={t('assetLibrary.renameLibrary', '重命名素材库')} onClick={() => {
         setRenameDialog({
           mode: 'library',
           targetId: currentLibrary.id,
           title: t('assetLibrary.renameLibrary', '重命名素材库'),
           defaultValue: currentLibrary.name,
         });
-      }}><Pencil className="h-3.5 w-3.5" /></UiIconButton>
-      {libraries.length > 1 && <UiIconButton title={t('assetLibrary.deleteLibrary', '删除素材库')} onClick={() => {
+      }}><Pencil className="h-3.5 w-3.5" /></UiGhostIconButton>
+      {libraries.length > 1 && <UiGhostIconButton title={t('assetLibrary.deleteLibrary', '删除素材库')} onClick={() => {
         if (window.confirm(t('assetLibrary.deleteLibraryConfirm', '删除素材库及其全部素材？'))) deleteLibrary(currentLibrary.id);
-      }}><Trash2 className="h-3.5 w-3.5 text-red-400" /></UiIconButton>}
+      }}><Trash2 className="h-3.5 w-3.5 text-red-400" /></UiGhostIconButton>}
     </div>
   );
 
@@ -721,10 +803,22 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
   );
 
   if (fullscreen) {
+    // 面板顶部:从触发按钮下方呼出(未传入锚点时回退到 TitleBar 下方),不顶到最顶部
+    const panelTop = (anchorTop ?? 40) + 8;
     return (
-      <div className="fixed inset-0 z-[98] flex flex-col bg-surface-dark" data-asset-library>
+      <>
+        {/* 透明遮罩:点击面板外部区域关闭 */}
+        <div
+          className={`fixed inset-0 z-[97] bg-black/20 transition-opacity duration-200 ${panelVisible ? 'opacity-100' : 'opacity-0'}`}
+          onClick={onClose}
+        />
+        <div
+          className={`fixed inset-x-3 z-[98] flex flex-col overflow-hidden rounded-xl border border-border-dark bg-surface-dark shadow-2xl transition-all duration-200 ease-out ${panelVisible ? 'translate-y-0 opacity-100' : 'pointer-events-none translate-y-3 opacity-0'}`}
+          style={{ top: panelTop, bottom: 12 }}
+          data-asset-library
+        >
         <header className="flex items-center justify-between border-b border-border-dark px-5 py-3">
-          <div className="flex items-center gap-2"><Library className="h-5 w-5 text-accent" /><h2 className="text-sm font-medium text-text-dark">{t('assetLibrary.title', '素材库')}</h2><span className="text-xs text-text-muted">{visibleAssets.length}</span></div>
+          <div className="flex items-center gap-2"><Library className="h-5 w-5 text-accent" /><h2 className="text-base font-semibold text-text-dark">{t('assetLibrary.title', '素材库')}</h2><span className="text-xs text-text-muted">{visibleAssets.length}</span></div>
           {/* 图片素材 / 提示词库 tab */}
           <div className="flex items-center gap-1 rounded-lg border border-border-dark bg-bg-dark/50 p-0.5">
             <button
@@ -744,7 +838,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
           </div>
           <div className="flex items-center gap-1">
             {backupControls}
-            <UiIconButton onClick={onClose} title={t('common.close', '关闭')}><X className="h-4 w-4" /></UiIconButton>
+            <UiGhostIconButton onClick={onClose} title={t('common.close', '关闭')}><X className="h-4 w-4" /></UiGhostIconButton>
           </div>
         </header>
         {activeSection === 'prompts' ? (
@@ -765,11 +859,11 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
           <div className="flex min-h-0 flex-1">
             <aside className="flex w-64 shrink-0 flex-col gap-3 border-r border-border-dark p-3">
               {libraryControls}
-              <div className="border-t border-border-dark pt-3">{toolbar}</div>
+              <div className="border-t border-border-dark pt-3">{toolbar()}</div>
               <div className="min-h-0 flex-1 overflow-y-auto">{categoryList}</div>
               {categoryControls}
             </aside>
-            <section className="flex min-w-0 flex-1 flex-col"><div className="border-b border-border-dark p-3">{filterBar}</div>{assetGrid}</section>
+            <section className="flex min-w-0 flex-1 flex-col"><div className="border-b border-border-dark p-3">{filterBar()}</div>{assetGrid}</section>
           </div>
         )}
         {activeSection === 'assets' && fileInput}
@@ -782,37 +876,42 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
           onClose={() => setShowCategoryManager(false)}
           libraryId={currentLibrary?.id ?? null}
         />
-      </div>
+        </div>
+      </>
     );
   }
 
   return (
     <>
-      <aside className="fixed right-0 top-0 z-[96] flex h-full flex-col border-l border-border-dark bg-surface-dark shadow-2xl" style={{ width: PANEL_WIDTH }} data-asset-library>
+      <aside
+        className={`fixed right-0 top-10 z-[96] flex h-[calc(100%-2.5rem)] flex-col border-l border-border-dark bg-surface-dark shadow-2xl transition-transform duration-200 ease-out ${panelVisible ? 'translate-x-0' : 'translate-x-full'}`}
+        style={{ width: PANEL_WIDTH }}
+        data-asset-library
+      >
         <header className="flex items-center justify-between border-b border-border-dark px-4 py-3">
           <div className="flex items-center gap-2">
-            <Library className="h-4 w-4 text-accent" />
+            <Library className="h-4 w-4 text-text-muted" />
             <h2 className="text-sm font-medium text-text-dark">{t('assetLibrary.title', '素材库')}</h2>
           </div>
           <div className="flex items-center gap-2">
-            <div className="flex items-center gap-0.5 rounded-md border border-border-dark bg-bg-dark/50 p-0.5">
+            <div className="flex items-center gap-0.5 rounded-lg border border-border-dark bg-bg-dark/50 p-0.5">
               <button
                 type="button"
-                className={`rounded px-2 py-0.5 text-[11px] transition-colors ${activeSection === 'assets' ? 'bg-accent/20 text-text-dark' : 'text-text-muted hover:text-text-dark'}`}
+                className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === 'assets' ? 'bg-accent/20 text-text-dark' : 'text-text-muted hover:text-text-dark'}`}
                 onClick={() => setActiveSection('assets')}
               >
                 {t('assetLibrary.assetsTab', '图片素材')}
               </button>
               <button
                 type="button"
-                className={`rounded px-2 py-0.5 text-[11px] transition-colors ${activeSection === 'prompts' ? 'bg-accent/20 text-text-dark' : 'text-text-muted hover:text-text-dark'}`}
+                className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === 'prompts' ? 'bg-accent/20 text-text-dark' : 'text-text-muted hover:text-text-dark'}`}
                 onClick={() => setActiveSection('prompts')}
               >
                 {t('assetLibrary.promptsTab', '提示词库')}
               </button>
             </div>
             {backupControls}
-            <UiIconButton onClick={onClose} title={t('common.close', '关闭')}><X className="h-4 w-4" /></UiIconButton>
+            <UiGhostIconButton onClick={onClose} title={t('common.close', '关闭')}><X className="h-4 w-4" /></UiGhostIconButton>
           </div>
         </header>
         {activeSection === 'prompts' ? (
@@ -831,8 +930,24 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
           </div>
         ) : (
           <>
-            <div className="space-y-2 border-b border-border-dark p-3">{libraryControls}{toolbar}{filterBar}</div>
-            <div className="max-h-40 overflow-y-auto border-b border-border-dark p-2">{categoryList}</div>
+            <div className="space-y-2 border-b border-border-dark p-3">{libraryControls}{sidebarMainRow}{sidebarFilterRow}{thumbSlider}</div>
+            <div className="border-b border-border-dark">
+              <button
+                type="button"
+                onClick={() => setCategoriesCollapsed((value) => !value)}
+                className="flex h-9 w-full items-center justify-between px-3 text-xs font-medium text-text-dark transition-colors hover:bg-bg-dark"
+                title={categoriesCollapsed ? t('assetLibrary.expandGroups', '展开分组') : t('assetLibrary.collapseGroups', '折叠分组')}
+              >
+                <span className="flex items-center gap-1.5">
+                  <FolderCog className="h-3.5 w-3.5 text-text-muted" />
+                  {t('assetLibrary.groups', '分组')}
+                </span>
+                <ChevronDown className={`h-3.5 w-3.5 text-text-muted transition-transform ${categoriesCollapsed ? '-rotate-90' : ''}`} />
+              </button>
+              {!categoriesCollapsed && (
+                <div className="ui-scrollbar max-h-40 overflow-y-auto border-t border-border-dark/60 p-2">{categoryList}</div>
+              )}
+            </div>
             {categoryControls && <div className="border-b border-border-dark p-2">{categoryControls}</div>}
             {assetGrid}
             {fileInput}
@@ -840,14 +955,14 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
             {backupStatusNotice}
             {assetMenuNode}
             {renameDialogNode}
+            <CategoryManagerDialog
+              open={showCategoryManager && activeSection === 'assets'}
+              onClose={() => setShowCategoryManager(false)}
+              libraryId={currentLibrary?.id ?? null}
+            />
           </>
         )}
       </aside>
-      <CategoryManagerDialog
-        open={showCategoryManager && activeSection === 'assets'}
-        onClose={() => setShowCategoryManager(false)}
-        libraryId={currentLibrary?.id ?? null}
-      />
     </>
   );
 });
@@ -855,5 +970,5 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, onAp
 AssetLibraryPanel.displayName = 'AssetLibraryPanel';
 
 function EmptyState({ label }: { label: string }) {
-  return <div className="flex h-full min-h-56 flex-col items-center justify-center gap-2 text-center"><Library className="h-9 w-9 text-text-muted/40" /><p className="whitespace-pre-line text-xs leading-5 text-text-muted">{label}</p></div>;
+  return <div className="flex h-full min-h-56 flex-col items-center justify-center gap-3 text-center"><Library className="h-12 w-12 text-text-muted/40" /><p className="whitespace-pre-line text-xs leading-5 text-text-muted">{label}</p></div>;
 }

@@ -13,6 +13,12 @@ import {
 
 const LEGACY_STORAGE_KEY = 'storyboard-asset-library-v1-v1';
 
+const BUILTIN_CATEGORY_DEFINITIONS = [
+  { key: 'characters', name: '角色' },
+  { key: 'scenes', name: '场景' },
+  { key: 'props', name: '道具' },
+] as const;
+
 interface AssetLibraryStore extends AssetLibraryState {
   isHydrated: boolean;
   hydrate: () => Promise<void>;
@@ -41,14 +47,40 @@ function defaultState(): AssetLibraryState {
   const libraryId = 'library-default';
   return {
     libraries: [{ id: libraryId, name: '我的素材库', createdAt: 0 }],
-    categories: [
-      { id: 'category-characters', libraryId, name: '角色', createdAt: 0 },
-      { id: 'category-scenes', libraryId, name: '场景', createdAt: 0 },
-      { id: 'category-props', libraryId, name: '道具', createdAt: 0 },
-    ],
+    categories: createBuiltinCategories(libraryId),
     assets: [],
     activeLibraryId: libraryId,
   };
+}
+
+function createBuiltinCategories(libraryId: string): AssetCategory[] {
+  return BUILTIN_CATEGORY_DEFINITIONS.map(({ key, name }) => ({
+    id: libraryId === 'library-default' ? `category-${key}` : `category-${libraryId}-${key}`,
+    libraryId,
+    name,
+    builtin: true,
+    createdAt: 0,
+  }));
+}
+
+function ensureBuiltinCategories(libraries: AssetLibrary[], categories: AssetCategory[]): AssetCategory[] {
+  const next = [...categories];
+  for (const library of libraries) {
+    for (const definition of BUILTIN_CATEGORY_DEFINITIONS) {
+      const existing = next.find(
+        (category) => category.libraryId === library.id && category.name === definition.name && !category.parentId
+      );
+      if (existing) {
+        if (!existing.builtin) {
+          const index = next.indexOf(existing);
+          next[index] = { ...existing, builtin: true };
+        }
+        continue;
+      }
+      next.push(...createBuiltinCategories(library.id).filter((category) => category.name === definition.name));
+    }
+  }
+  return next;
 }
 
 function readBrowserState(): AssetLibraryState {
@@ -65,9 +97,10 @@ function normalizeState(state: AssetLibraryState): AssetLibraryState {
   const libraries = state.libraries.filter((library) => Boolean(library?.id));
   if (libraries.length === 0) return defaultState();
   const libraryIds = new Set(libraries.map((library) => library.id));
-  const categories = (Array.isArray(state.categories) ? state.categories : []).filter(
+  const rawCategories = (Array.isArray(state.categories) ? state.categories : []).filter(
     (category) => category?.id && libraryIds.has(category.libraryId)
   );
+  const categories = ensureBuiltinCategories(libraries, rawCategories);
   const categoryIds = new Set(categories.map((category) => category.id));
   const assets = (Array.isArray(state.assets) ? state.assets : [])
     .filter((asset) => asset?.id && asset.sourcePath && libraryIds.has(asset.libraryId))
@@ -208,16 +241,10 @@ export const useAssetLibraryStore = create<AssetLibraryStore>((set, get) => ({
       name: name.trim() || '新素材库',
       createdAt: now,
     };
-    const category: AssetCategory = {
-      id: createId('category'),
-      libraryId: library.id,
-      name: '默认分组',
-      createdAt: now,
-    };
     updateStore(set, {
       ...state,
       libraries: [...state.libraries, library],
-      categories: [...state.categories, category],
+      categories: [...state.categories, ...createBuiltinCategories(library.id)],
       activeLibraryId: library.id,
     });
     return library.id;
@@ -297,11 +324,17 @@ export const useAssetLibraryStore = create<AssetLibraryStore>((set, get) => ({
 
   addCategory: (libraryId, name, parentId) => {
     const state = get();
+    const value = name.trim();
+    if (!value || !state.libraries.some((library) => library.id === libraryId)) return '';
+    const normalizedParentId = parentId || null;
+    if (state.categories.some((category) =>
+      category.libraryId === libraryId && category.parentId === normalizedParentId && category.name === value
+    )) return '';
     const category: AssetCategory = {
       id: createId('category'),
       libraryId,
-      name: name.trim() || '新分组',
-      parentId: parentId || null,
+      name: value,
+      parentId: normalizedParentId,
       createdAt: Date.now(),
     };
     updateStore(set, { ...state, categories: [...state.categories, category] });
@@ -312,6 +345,13 @@ export const useAssetLibraryStore = create<AssetLibraryStore>((set, get) => ({
     const value = name.trim();
     if (!value) return;
     const state = get();
+    const current = state.categories.find((category) => category.id === categoryId);
+    if (!current || current.builtin || state.categories.some((category) =>
+      category.id !== categoryId
+      && category.libraryId === current.libraryId
+      && category.parentId === current.parentId
+      && category.name === value
+    )) return;
     updateStore(set, {
       ...state,
       categories: state.categories.map((category) =>
@@ -322,6 +362,8 @@ export const useAssetLibraryStore = create<AssetLibraryStore>((set, get) => ({
 
   deleteCategory: (categoryId) => {
     const state = get();
+    const category = state.categories.find((item) => item.id === categoryId);
+    if (!category || category.builtin) return;
     // 收集该分组及所有子分组的 id
     const idsToDelete = new Set<string>([categoryId]);
     let changed = true;

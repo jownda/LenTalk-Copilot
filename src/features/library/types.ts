@@ -10,6 +10,8 @@ export interface AssetCategory {
   id: string;
   libraryId: string;
   name: string;
+  /** 系统内置分组，始终保留且不可重命名或删除 */
+  builtin?: boolean;
   /** 父分组 id,无则为顶级分组 */
   parentId?: string | null;
   createdAt: number;

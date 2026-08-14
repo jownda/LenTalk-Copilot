@@ -22,6 +22,8 @@ export function ProjectManager() {
   /** 项目卡片宽度(px, 由顶部滑杆调节, 网格固定宽度线性跟随) */
   const [thumbSize, setThumbSize] = useState(240);
   const [showLibrary, setShowLibrary] = useState(false);
+  /** 素材库按钮底部视口 Y,素材库面板从此处下方平滑呼出(不顶到最顶部) */
+  const [libraryAnchorTop, setLibraryAnchorTop] = useState(0);
   const [show3DDirector, setShow3DDirector] = useState(false);
 
   const { projects, isOpeningProject, createProject, deleteProject, renameProject, openProject } =
@@ -138,7 +140,15 @@ export function ProjectManager() {
               <Boxes className="w-5 h-5" />
               3D导演台
             </UiButton>
-            <UiButton type="button" variant="muted" onClick={() => setShowLibrary(true)} className="gap-2">
+            <UiButton
+              type="button"
+              variant="muted"
+              onClick={(event) => {
+                setLibraryAnchorTop(event.currentTarget.getBoundingClientRect().bottom);
+                setShowLibrary(true);
+              }}
+              className="gap-2"
+            >
               <Library className="w-5 h-5" />
               {t('project.assetLibrary')}
             </UiButton>
@@ -252,7 +262,7 @@ export function ProjectManager() {
         onConfirm={handleConfirm}
       />
 
-      <AssetLibraryPanel open={showLibrary} onClose={() => setShowLibrary(false)} fullscreen />
+      <AssetLibraryPanel open={showLibrary} onClose={() => setShowLibrary(false)} fullscreen anchorTop={libraryAnchorTop} />
 
       {show3DDirector && <ThreeDDirectorDesk onClose={() => setShow3DDirector(false)} />}
     </div>

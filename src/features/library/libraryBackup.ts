@@ -4,7 +4,9 @@
 // 素材图片以 data URL 内嵌在素材记录中,zip 自包含,可在任意浏览器/设备恢复。
 // ---------------------------------------------------------------------------
 import JSZip from 'jszip';
-import { ASSET_LIBRARY_STORAGE_KEY } from './types';
+import { isTauri } from '@tauri-apps/api/core';
+import { ASSET_LIBRARY_STORAGE_KEY, type AssetLibraryState } from './types';
+import { loadAssetLibraryState, saveAssetLibraryState } from '@/commands/assetLibrary';
 
 export const PROMPT_LIBRARY_STORAGE_KEY = 'storyboard-prompt-library-v2';
 
@@ -67,7 +69,14 @@ export async function createLibraryBackupZip(): Promise<Blob> {
   };
   zip.file('manifest.json', JSON.stringify(manifest, null, 2));
 
-  const assetRaw = localStorage.getItem(ASSET_LIBRARY_STORAGE_KEY);
+  // 素材库:桌面版存 Rust 后端,浏览器存 localStorage,分别读取真实数据
+  let assetRaw: string | null = null;
+  if (isTauri()) {
+    const state = await loadAssetLibraryState();
+    assetRaw = JSON.stringify(state);
+  } else {
+    assetRaw = localStorage.getItem(ASSET_LIBRARY_STORAGE_KEY);
+  }
   zip.file(
     'asset-library.json',
     assetRaw ?? JSON.stringify({ libraries: [], categories: [], assets: [], activeLibraryId: null })
@@ -115,7 +124,11 @@ export async function importLibraryBackupZip(
       throw new Error('备份文件中的素材库数据无效');
     }
     assetCount = state.assets.length;
-    localStorage.setItem(ASSET_LIBRARY_STORAGE_KEY, assetRaw);
+    if (isTauri()) {
+      await saveAssetLibraryState(state as AssetLibraryState);
+    } else {
+      localStorage.setItem(ASSET_LIBRARY_STORAGE_KEY, assetRaw);
+    }
   }
 
   // 3) 提示词库
@@ -147,4 +160,35 @@ export function downloadBlob(blob: Blob, fileName: string): void {
   anchor.click();
   anchor.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+/** 判断是否运行在 Tauri 桌面环境 */
+export function isTauriRuntime(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+/**
+ * 保存 Blob 到文件:
+ * - Tauri 环境:弹出系统保存对话框,用户选择路径后写入
+ * - 浏览器环境:fallback 为浏览器下载
+ * 返回保存路径(浏览器环境返回 null)。
+ */
+export async function saveBlobWithDialog(blob: Blob, fileName: string): Promise<string | null> {
+  if (!isTauriRuntime()) {
+    downloadBlob(blob, fileName);
+    return null;
+  }
+
+  const { save } = await import('@tauri-apps/plugin-dialog');
+  const { writeFile } = await import('@tauri-apps/plugin-fs');
+
+  const filePath = await save({
+    defaultPath: fileName,
+    filters: [{ name: 'ZIP 备份', extensions: ['zip'] }],
+  });
+  if (!filePath) return null; // 用户取消
+
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  await writeFile(filePath, bytes);
+  return filePath;
 }
