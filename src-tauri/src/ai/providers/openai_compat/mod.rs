@@ -109,6 +109,16 @@ impl OpenAICompatibleProvider {
         Ok(last_status)
     }
 
+    /// gpt-image 系列仅支持 1024x1024 / 1536x1024 / 1024x1536。
+    /// 按目标画幅映射到最接近的官方尺寸(忽略档位, gpt-image 物理上限即 1536)。
+    fn map_gpt_image_size(aspect_ratio: &str) -> &'static str {
+        match aspect_ratio {
+            "9:16" | "3:4" | "2:3" | "4:5" | "1:2" | "1:3" => "1024x1536",
+            "16:9" | "3:2" | "4:3" | "5:4" | "2:1" | "3:1" | "21:9" => "1536x1024",
+            _ => "1024x1024",
+        }
+    }
+
     /// 参考图 → 可发送给平台的 image 值:
     /// data URL / http(s) URL 原样返回;本地路径/文件 URL 读取并转 base64 data URL。
     fn reference_image_to_image_field(source: &str) -> Result<Option<String>, AIError> {
@@ -262,15 +272,24 @@ impl AIProvider for OpenAICompatibleProvider {
         let client = Self::build_client();
         let endpoint = format!("{}/v1/images/generations", base_url);
 
+        // gpt-image 系列(OpenAI 原生协议): input_image + output_format,
+        // 无 response_format; 其他兼容平台(dall-e 风格)保持 image + response_format。
+        let is_gpt_image = api_model.to_ascii_lowercase().contains("gpt-image");
+
         let mut body = json!({
             "model": api_model,
             "prompt": request.prompt,
-            "size": "1024x1024",
             "n": 1,
-            "response_format": "b64_json"
         });
+        if is_gpt_image {
+            body["size"] = json!(Self::map_gpt_image_size(&request.aspect_ratio));
+            body["output_format"] = json!("png");
+        } else {
+            body["size"] = json!("1024x1024");
+            body["response_format"] = json!("b64_json");
+        }
 
-        // 参考图:取第一张,以 OpenAI Images 兼容的 image 字段(base64 data URL)发送
+        // 参考图:取第一张,以平台对应字段发送(base64 data URL / http URL)
         if let Some(reference_image) = request
             .reference_images
             .as_ref()
@@ -284,7 +303,11 @@ impl AIProvider for OpenAICompatibleProvider {
                     ))
                 })?;
             if let Some(image) = image_field {
-                body["image"] = json!(image);
+                if is_gpt_image {
+                    body["input_image"] = json!(image);
+                } else {
+                    body["image"] = json!(image);
+                }
             }
         }
 
@@ -296,17 +319,31 @@ impl AIProvider for OpenAICompatibleProvider {
             .await?;
 
         let status = response.status();
-        let payload: Value = response.json().await?;
+        // 先读文本, 再尝试 JSON: 4xx/5xx 平台可能返回 HTML/空 body, 避免笼统的 "decoding response body"
+        let body_text = response.text().await?;
+        let payload: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         if !status.is_success() {
-            let payload_text = payload.to_string();
             let message = payload
                 .get("error")
                 .and_then(|value| value.get("message"))
                 .and_then(|value| value.as_str())
-                .unwrap_or(&payload_text);
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| {
+                    if body_text.trim().is_empty() {
+                        format!("HTTP {} 空响应体", status)
+                    } else {
+                        body_text.chars().take(300).collect()
+                    }
+                });
             return Err(AIError::TaskFailed(format!(
                 "自定义平台请求失败 (HTTP {}): {}",
                 status, message
+            )));
+        }
+        if payload.is_null() {
+            return Err(AIError::TaskFailed(format!(
+                "自定义平台响应不是有效 JSON: {}",
+                body_text.chars().take(300).collect::<String>()
             )));
         }
 
