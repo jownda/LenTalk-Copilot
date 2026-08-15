@@ -21,7 +21,11 @@ export interface CustomApiProvider {
   apiKey: string;
   models: string[];
   createdAt: number;
+  /** 请求模式: sync=同步等待平台返回图片; async=提交后轮询任务状态 */
+  requestMode: 'sync' | 'async';
 }
+
+export type CustomApiRequestMode = CustomApiProvider['requestMode'];
 
 /** 自定义平台在模型/密钥体系里的 provider id 前缀 */
 export const CUSTOM_API_PROVIDER_PREFIX = 'custom:';
@@ -186,6 +190,7 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         ? item.models.map((model) => String(model).trim()).filter(Boolean)
         : [],
       createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
+      requestMode: item.requestMode === 'async' ? ('async' as const) : ('sync' as const),
     }))
     .filter((item) => item.id && item.name && item.baseUrl);
 }

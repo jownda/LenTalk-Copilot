@@ -5,6 +5,7 @@ import {
   submitGenerateImageJob,
 } from '@/commands/ai';
 import { imageUrlToDataUrl, persistImageLocally } from '@/features/canvas/application/imageData';
+import { useSettingsStore } from '@/stores/settingsStore';
 
 import type { AiGateway, GenerateImagePayload } from '../application/ports';
 
@@ -18,6 +19,31 @@ function mergeNegativePrompt(
     extras.negative_prompt = payload.negativePrompt.trim();
   }
   return Object.keys(extras).length > 0 ? extras : payload.extraParams;
+}
+
+/**
+ * 自定义平台按设置里的请求模式注入 request_mode:
+ * sync → 后端同步等待; async → 后端提交任务后轮询。
+ */
+function injectCustomApiRequestMode(payload: GenerateImagePayload): GenerateImagePayload {
+  if (!payload.model.startsWith('custom:')) {
+    return payload;
+  }
+  const providerId = payload.model.split('/')[0].replace('custom:', '');
+  const customApi = useSettingsStore
+    .getState()
+    .customApis.find((api) => api.id === providerId);
+  const requestMode = customApi?.requestMode ?? 'sync';
+  if (requestMode === 'sync') {
+    return payload;
+  }
+  return {
+    ...payload,
+    extraParams: {
+      ...(payload.extraParams ?? {}),
+      request_mode: 'async',
+    },
+  };
 }
 
 /**
@@ -56,8 +82,9 @@ async function normalizeReferenceImages(payload: GenerateImagePayload): Promise<
 export const tauriAiGateway: AiGateway = {
   setApiKey,
   generateImage: async (payload: GenerateImagePayload) => {
-    const normalizedReferenceImages = await normalizeReferenceImages(payload);
-    const mergedExtraParams = mergeNegativePrompt(payload);
+    const injected = injectCustomApiRequestMode(payload);
+    const normalizedReferenceImages = await normalizeReferenceImages(injected);
+    const mergedExtraParams = mergeNegativePrompt(injected);
 
     return await generateImage({
       prompt: localizeReferenceTokens(payload.prompt, payload.model),
@@ -70,8 +97,9 @@ export const tauriAiGateway: AiGateway = {
     });
   },
   submitGenerateImageJob: async (payload: GenerateImagePayload) => {
-    const normalizedReferenceImages = await normalizeReferenceImages(payload);
-    const mergedExtraParams = mergeNegativePrompt(payload);
+    const injected = injectCustomApiRequestMode(payload);
+    const normalizedReferenceImages = await normalizeReferenceImages(injected);
+    const mergedExtraParams = mergeNegativePrompt(injected);
     return await submitGenerateImageJob({
       prompt: localizeReferenceTokens(payload.prompt, payload.model),
       negative_prompt: payload.negativePrompt,

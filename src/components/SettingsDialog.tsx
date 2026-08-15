@@ -206,6 +206,7 @@ export function SettingsDialog({
     baseUrl: '',
     apiKey: '',
     modelsText: '',
+    requestMode: 'sync' as 'sync' | 'async',
   });
   const [customApiBusy, setCustomApiBusy] = useState<'idle' | 'testing' | 'fetching'>('idle');
   const [customApiStatus, setCustomApiStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
@@ -219,6 +220,7 @@ export function SettingsDialog({
       baseUrl: api.baseUrl,
       apiKey: '',
       modelsText: api.models.join('\n'),
+      requestMode: 'sync',
     });
     setShowAddCustomApi(true);
     setCustomApiStatus(null);
@@ -321,6 +323,7 @@ export function SettingsDialog({
       baseUrl: api.baseUrl,
       apiKey: api.apiKey,
       modelsText: api.models.join('\n'),
+      requestMode: api.requestMode,
     });
     setShowAddCustomApi(true);
   }, []);
@@ -328,7 +331,7 @@ export function SettingsDialog({
   const resetCustomApiForm = useCallback(() => {
     setShowAddCustomApi(false);
     setEditingCustomApiId(null);
-    setCustomApiDraft({ name: '', baseUrl: '', apiKey: '', modelsText: '' });
+    setCustomApiDraft({ name: '', baseUrl: '', apiKey: '', modelsText: '', requestMode: 'sync' });
   }, []);
 
   const submitCustomApi = useCallback(() => {
@@ -347,9 +350,16 @@ export function SettingsDialog({
         baseUrl,
         apiKey: customApiDraft.apiKey.trim(),
         models,
+        requestMode: customApiDraft.requestMode,
       });
     } else {
-      addCustomApi({ name, baseUrl, apiKey: customApiDraft.apiKey.trim(), models });
+      addCustomApi({
+        name,
+        baseUrl,
+        apiKey: customApiDraft.apiKey.trim(),
+        models,
+        requestMode: customApiDraft.requestMode,
+      });
     }
     resetCustomApiForm();
   }, [addCustomApi, customApiDraft, editingCustomApiId, resetCustomApiForm, updateCustomApi]);
@@ -927,6 +937,39 @@ export function SettingsDialog({
                             className="ui-scrollbar w-full resize-none rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
                           />
                         </label>
+                        <div>
+                          <span className="mb-1 block text-[11px] text-text-muted">
+                            {t('settings.customApiRequestMode', '请求模式')}
+                          </span>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setCustomApiDraft({ ...customApiDraft, requestMode: 'sync' })
+                              }
+                              className={`flex-1 rounded border px-2.5 py-1.5 text-[11px] transition-colors ${
+                                customApiDraft.requestMode === 'sync'
+                                  ? 'border-accent/60 bg-accent/15 text-text-dark'
+                                  : 'border-border-dark text-text-muted hover:text-text-dark'
+                              }`}
+                            >
+                              {t('settings.customApiRequestModeSync', '同步(等待平台直接返回)')}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setCustomApiDraft({ ...customApiDraft, requestMode: 'async' })
+                              }
+                              className={`flex-1 rounded border px-2.5 py-1.5 text-[11px] transition-colors ${
+                                customApiDraft.requestMode === 'async'
+                                  ? 'border-accent/60 bg-accent/15 text-text-dark'
+                                  : 'border-border-dark text-text-muted hover:text-text-dark'
+                              }`}
+                            >
+                              {t('settings.customApiRequestModeAsync', '异步(提交后轮询结果)')}
+                            </button>
+                          </div>
+                        </div>
 
                         {/* 验证链接 / 验证协议 / 拉取模型 */}
                         <div className="flex flex-wrap items-center gap-2 pt-0.5">
@@ -1002,9 +1045,22 @@ export function SettingsDialog({
                               {api.baseUrl}
                             </span>
                           </div>
-                          <div className="mt-0.5 text-[11px] text-text-muted">
-                            {api.models.length} {t('settings.customApiModelCount')} ·{' '}
-                            {api.apiKey ? t('settings.customApiKeySet') : t('settings.customApiKeyMissing')}
+                          <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-text-muted">
+                            <span>
+                              {api.models.length} {t('settings.customApiModelCount')} ·{' '}
+                              {api.apiKey ? t('settings.customApiKeySet') : t('settings.customApiKeyMissing')}
+                            </span>
+                            <span
+                              className={`rounded px-1 py-px text-[10px] ${
+                                api.requestMode === 'async'
+                                  ? 'bg-accent/15 text-accent'
+                                  : 'bg-bg-dark text-text-muted/80'
+                              }`}
+                            >
+                              {api.requestMode === 'async'
+                                ? t('settings.customApiRequestModeAsyncShort', '异步')
+                                : t('settings.customApiRequestModeSyncShort', '同步')}
+                            </span>
                           </div>
                         </div>
                         <div className="flex shrink-0 items-center gap-1">
