@@ -87,7 +87,8 @@
       "flipV": "Flip Vertical",
       "loading": "Loading…",
       "previewAlt": "Rotate Preview"
-    }
+    },
+    "adjust": "Adjust"
   },
   "toolDialog": {
     "suffix": " Tool",
@@ -97,7 +98,8 @@
     "apply": "Apply",
     "cropResultTitle": "Crop Result",
     "annotateResultTitle": "Annotation Result",
-    "rotateResultTitle": "Rotated Result"
+    "rotateResultTitle": "Rotated Result",
+    "adjustResultTitle": "Adjusted Result"
   },
   "nodeToolbar": {
     "reupload": "Reupload",

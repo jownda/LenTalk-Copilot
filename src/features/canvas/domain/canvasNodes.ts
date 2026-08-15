@@ -214,6 +214,7 @@ export const NODE_TOOL_TYPES = {
   annotate: 'annotate',
   splitStoryboard: 'split-storyboard',
   rotate: 'rotate',
+  adjust: 'adjust',
 } as const;
 
 export type NodeToolType = (typeof NODE_TOOL_TYPES)[keyof typeof NODE_TOOL_TYPES];

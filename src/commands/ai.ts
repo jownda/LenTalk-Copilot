@@ -128,6 +128,16 @@ export async function setApiKey(provider: string, apiKey: string): Promise<void>
 
 const CUSTOM_PROVIDER_PREFIX = 'custom:';
 
+function mapGptImageSize(aspectRatio: string): string {
+  if (['9:16', '3:4', '2:3', '4:5', '1:2', '1:3'].includes(aspectRatio)) {
+    return '1024x1536';
+  }
+  if (['16:9', '3:2', '4:3', '5:4', '2:1', '3:1', '21:9'].includes(aspectRatio)) {
+    return '1536x1024';
+  }
+  return '1024x1024';
+}
+
 /** 浏览器降级任务存储:jobId → 状态(与 Rust 异步任务语义一致) */
 const browserGenerationJobs = new Map<string, GenerationJobStatus>();
 
@@ -191,11 +201,14 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
     const body: Record<string, unknown> = {
       model: apiModel,
       prompt: request.prompt,
-      size: '1024x1024',
+      size: isGptImage ? mapGptImageSize(request.aspect_ratio) : '1024x1024',
       n: 1,
     };
     if (isGptImage) {
       body.output_format = 'png';
+      if (apiModel.toLowerCase().includes('gpt-image-2')) {
+        body.aspect_ratio = request.aspect_ratio;
+      }
     } else {
       body.response_format = 'b64_json';
     }

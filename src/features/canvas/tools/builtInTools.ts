@@ -88,9 +88,29 @@ export const rotateToolPlugin: CanvasToolPlugin = {
     await context.processTool(NODE_TOOL_TYPES.rotate, sourceImageUrl, options),
 };
 
+export const adjustToolPlugin: CanvasToolPlugin = {
+  type: NODE_TOOL_TYPES.adjust,
+  label: '调节',
+  icon: 'adjust',
+  editor: 'adjust',
+  supportsNode: (node) => supportsImageSourceNode(node) && Boolean(node.data.imageUrl),
+  createInitialOptions: () => ({
+    brightness: 0,
+    contrast: 0,
+    saturation: 0,
+    temperature: 0,
+    shadows: 0,
+    highlights: 0,
+  }),
+  fields: [],
+  execute: async (sourceImageUrl, options, context) =>
+    await context.processTool(NODE_TOOL_TYPES.adjust, sourceImageUrl, options),
+};
+
 export const builtInToolPlugins: CanvasToolPlugin[] = [
   cropToolPlugin,
   annotateToolPlugin,
   splitStoryboardToolPlugin,
   rotateToolPlugin,
+  adjustToolPlugin,
 ];

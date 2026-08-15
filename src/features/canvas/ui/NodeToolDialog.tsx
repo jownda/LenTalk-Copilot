@@ -24,6 +24,7 @@ import { CropToolEditor } from './tool-editors/CropToolEditor';
 import { AnnotateToolEditor } from './tool-editors/AnnotateToolEditor';
 import { SplitStoryboardToolEditor } from './tool-editors/SplitStoryboardToolEditor';
 import { RotateToolEditor } from './tool-editors/RotateToolEditor';
+import { AdjustToolEditor } from './tool-editors/AdjustToolEditor';
 
 export function NodeToolDialog() {
   const { t } = useTranslation();
@@ -187,6 +188,9 @@ export function NodeToolDialog() {
     if (toolType === NODE_TOOL_TYPES.rotate) {
       return t('tool.rotate.title');
     }
+    if (toolType === NODE_TOOL_TYPES.adjust) {
+      return t('tool.adjust');
+    }
     return '';
   }, [t]);
   const resolveResultNodeTitle = useCallback((toolType: NodeToolType | undefined) => {
@@ -198,6 +202,9 @@ export function NodeToolDialog() {
     }
     if (toolType === NODE_TOOL_TYPES.rotate) {
       return t('toolDialog.rotateResultTitle');
+    }
+    if (toolType === NODE_TOOL_TYPES.adjust) {
+      return t('toolDialog.adjustResultTitle');
     }
     return EXPORT_RESULT_DISPLAY_NAME.generic;
   }, [t]);
@@ -327,6 +334,17 @@ export function NodeToolDialog() {
     if (activePlugin.editor === 'rotate' && sourceImageUrl) {
       return (
         <RotateToolEditor
+          plugin={activePlugin}
+          sourceImageUrl={sourceImageUrl}
+          options={options}
+          onOptionsChange={setOptions}
+        />
+      );
+    }
+
+    if (activePlugin.editor === 'adjust' && sourceImageUrl) {
+      return (
+        <AdjustToolEditor
           plugin={activePlugin}
           sourceImageUrl={sourceImageUrl}
           options={options}

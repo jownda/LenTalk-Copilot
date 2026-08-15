@@ -87,7 +87,8 @@
       "flipV": "上下镜像",
       "loading": "加载中…",
       "previewAlt": "旋转预览"
-    }
+    },
+    "adjust": "调节"
   },
   "toolDialog": {
     "suffix": "工具",
@@ -97,7 +98,8 @@
     "apply": "应用",
     "cropResultTitle": "裁剪结果",
     "annotateResultTitle": "标注结果",
-    "rotateResultTitle": "旋转结果"
+    "rotateResultTitle": "旋转结果",
+    "adjustResultTitle": "调节结果"
   },
   "nodeToolbar": {
     "reupload": "重新上传",

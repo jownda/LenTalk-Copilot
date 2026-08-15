@@ -253,7 +253,7 @@ function renderPromptWithHighlights(
     }
 
     if (imageUrl) {
-      // 缩略图填满 token 的文本宽度，既保持光标位置一致，也不留下额外空隙。
+      // 保留 token 占位以保持光标位置一致，缩略图使用紧凑正方形显示。
       segments.push(
         <span
           key={`ref-${matchStart}`}
@@ -261,7 +261,7 @@ function renderPromptWithHighlights(
         >
           {matchText}
           <span
-            className="nodrag pointer-events-auto absolute inset-x-0 top-1/2 inline-flex h-5 -translate-y-1/2 cursor-zoom-in items-center justify-center overflow-hidden rounded-[6px] bg-accent/70"
+            className="nodrag pointer-events-auto absolute left-1/2 top-1/2 inline-flex h-4 w-4 -translate-x-1/2 -translate-y-1/2 cursor-zoom-in items-center justify-center overflow-hidden rounded-[3px] bg-accent/70"
             onClick={(event) => {
               event.stopPropagation();
               onThumbnailClick?.(imageUrl, event);

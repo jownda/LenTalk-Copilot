@@ -12,6 +12,11 @@ import {
 } from './imageData';
 import { cropImageSource, readStoryboardImageMetadata } from '@/commands/image';
 import { drawAnnotations, parseAnnotationItems } from '../tools/annotation';
+import {
+  adjustImageSource,
+  DEFAULT_IMAGE_ADJUSTMENTS,
+  type ImageAdjustments,
+} from './imageAdjust';
 import type {
   IdGenerator,
   ImageSplitGateway,
@@ -59,6 +64,10 @@ export class CanvasToolProcessor implements ToolProcessor {
       case NODE_TOOL_TYPES.rotate:
         return {
           outputImageUrl: await this.rotateImage(sourceImageUrl, options),
+        };
+      case NODE_TOOL_TYPES.adjust:
+        return {
+          outputImageUrl: await this.adjustImage(sourceImageUrl, options),
         };
       default:
         throw new Error('不支持的工具类型');
@@ -253,6 +262,26 @@ export class CanvasToolProcessor implements ToolProcessor {
     context.drawImage(image, -nw / 2, -nh / 2, nw, nh);
     context.restore();
     return canvasToDataUrl(canvas);
+  }
+
+  private async adjustImage(
+    sourceImage: string,
+    options: Record<string, unknown>
+  ): Promise<string> {
+    const readNumber = (key: string): number => {
+      const value = options[key];
+      const numeric = typeof value === 'number' ? value : Number(value);
+      return Number.isFinite(numeric) ? numeric : 0;
+    };
+    const adjustments: ImageAdjustments = {
+      brightness: readNumber('brightness') ?? DEFAULT_IMAGE_ADJUSTMENTS.brightness,
+      contrast: readNumber('contrast') ?? DEFAULT_IMAGE_ADJUSTMENTS.contrast,
+      saturation: readNumber('saturation') ?? DEFAULT_IMAGE_ADJUSTMENTS.saturation,
+      temperature: readNumber('temperature') ?? DEFAULT_IMAGE_ADJUSTMENTS.temperature,
+      shadows: readNumber('shadows') ?? DEFAULT_IMAGE_ADJUSTMENTS.shadows,
+      highlights: readNumber('highlights') ?? DEFAULT_IMAGE_ADJUSTMENTS.highlights,
+    };
+    return await adjustImageSource(sourceImage, adjustments);
   }
 
   private resolveAnnotateY(position: string, canvasHeight: number, boxHeight: number): number {

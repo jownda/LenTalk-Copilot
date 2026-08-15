@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NodeToolbar as ReactFlowNodeToolbar } from '@xyflow/react';
-import { Copy, Crop, Download, FolderOpen, PenLine, RefreshCw, RotateCw, Scissors, Trash2, Unlink2 } from 'lucide-react';
+import { Copy, Crop, Download, FolderOpen, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Trash2, Unlink2 } from 'lucide-react';
 import { save } from '@tauri-apps/plugin-dialog';
 import { useTranslation } from 'react-i18next';
 
@@ -20,7 +20,6 @@ import { getNodeToolPlugins } from '@/features/canvas/tools';
 import type { ToolIconKey } from '@/features/canvas/tools';
 import { UiChipButton, UiPanel } from '@/components/ui';
 import {
-  copyImageSourceToClipboard,
   saveImageSourceToDirectory,
   saveImageSourceToPath,
 } from '@/commands/image';
@@ -45,6 +44,7 @@ const toolIconMap: Record<ToolIconKey, typeof Crop> = {
   annotate: PenLine,
   split: Scissors,
   rotate: RotateCw,
+  adjust: SlidersHorizontal,
 };
 
 const TOOLBAR_BUTTON_RADIUS_CLASS = 'rounded-full';
@@ -67,11 +67,9 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   );
   const [downloadMenu, setDownloadMenu] = useState<{ x: number; y: number } | null>(null);
   const [isDownloadMenuVisible, setIsDownloadMenuVisible] = useState(false);
-  const [isCopySuccess, setIsCopySuccess] = useState(false);
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
   const downloadMenuRef = useRef<HTMLDivElement | null>(null);
-  const copyFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyTextFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyErrorFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const downloadMenuCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -127,6 +125,9 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     if (toolType === NODE_TOOL_TYPES.rotate) {
       return t('tool.rotate.title');
     }
+    if (toolType === NODE_TOOL_TYPES.adjust) {
+      return t('tool.adjust');
+    }
     return '';
   }, [t]);
 
@@ -167,9 +168,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
 
   useEffect(() => {
     return () => {
-      if (copyFeedbackTimerRef.current) {
-        clearTimeout(copyFeedbackTimerRef.current);
-      }
       if (copyTextFeedbackTimerRef.current) {
         clearTimeout(copyTextFeedbackTimerRef.current);
       }
@@ -181,27 +179,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       }
     };
   }, []);
-
-  const handleCopyImage = useCallback(async () => {
-    if (!imageSource) {
-      return;
-    }
-
-    setIsCopySuccess(true);
-    if (copyFeedbackTimerRef.current) {
-      clearTimeout(copyFeedbackTimerRef.current);
-    }
-    copyFeedbackTimerRef.current = setTimeout(() => {
-      setIsCopySuccess(false);
-      copyFeedbackTimerRef.current = null;
-    }, 1100);
-
-    try {
-      await copyImageSourceToClipboard(imageSource);
-    } catch (error) {
-      console.error('Failed to copy image to clipboard', error);
-    }
-  }, [imageSource]);
 
   const storyboardText = useMemo(() => {
     if (isStoryboardGen) {
@@ -344,22 +321,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           >
             <RefreshCw className="h-3.5 w-3.5" />
             {t('nodeToolbar.reupload')}
-          </UiChipButton>
-        )}
-        {!isImageEdit && canHandleImage && (
-          <UiChipButton
-            key="image-copy"
-            className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS} ${
-              isCopySuccess
-                ? '!border-emerald-400/70 !bg-emerald-500/20 !text-emerald-200 hover:!bg-emerald-500/30'
-                : ''
-            }`}
-            onClick={() => {
-              void handleCopyImage();
-            }}
-          >
-            <Copy className="h-3.5 w-3.5" />
-            {t('nodeToolbar.copy')}
           </UiChipButton>
         )}
         {!isImageEdit && canCopyStoryboardText && (

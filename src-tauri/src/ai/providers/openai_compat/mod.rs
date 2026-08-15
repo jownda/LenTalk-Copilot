@@ -163,6 +163,10 @@ impl OpenAICompatibleProvider {
         if is_gpt_image {
             body["size"] = json!(Self::map_gpt_image_size(aspect_ratio));
             body["output_format"] = json!("png");
+            // gpt-image-2-* 中转模型会读取该字段；仅传 OpenAI 的 size 时会回退为服务端默认横幅。
+            if api_model.to_ascii_lowercase().contains("gpt-image-2") {
+                body["aspect_ratio"] = json!(aspect_ratio);
+            }
         } else {
             body["size"] = json!("1024x1024");
             body["response_format"] = json!("b64_json");
@@ -217,6 +221,26 @@ impl OpenAICompatibleProvider {
             _ if api_model.to_ascii_lowercase().contains("gpt-image") => "input_image",
             _ => "image",
         }
+    }
+
+    fn alternate_reference_image_field(reference_image_field: &str) -> &'static str {
+        if reference_image_field == "input_image" {
+            "image"
+        } else {
+            "input_image"
+        }
+    }
+
+    fn should_retry_with_alternate_reference_field(
+        status: reqwest::StatusCode,
+        body_text: &str,
+        reference_image_count: usize,
+    ) -> bool {
+        reference_image_count > 0
+            && status.as_u16() == 400
+            && body_text
+                .to_ascii_lowercase()
+                .contains("failed to parse request body")
     }
 
     /// 是否走 Responses API 协议(extra_params.protocol == "responses")。
@@ -518,14 +542,40 @@ impl AIProvider for OpenAICompatibleProvider {
 
         let response = client
             .post(&endpoint)
-            .bearer_auth(api_key)
+            .bearer_auth(&api_key)
             .json(&body)
             .send()
             .await?;
 
-        let status = response.status();
+        let mut status = response.status();
         // 先读文本, 再尝试 JSON: 4xx/5xx 平台可能返回 HTML/空 body, 避免笼统的 "decoding response body"
-        let body_text = response.text().await?;
+        let mut body_text = response.text().await?;
+        if !is_responses && Self::should_retry_with_alternate_reference_field(
+            status,
+            &body_text,
+            reference_image_count,
+        ) {
+            let alternate_field = Self::alternate_reference_image_field(reference_image_field);
+            let alternate_body = Self::build_request_body(
+                api_model,
+                &request.prompt,
+                &request.aspect_ratio,
+                request.reference_images.as_ref(),
+                alternate_field,
+            )?;
+            info!(
+                "[OpenAI Compatible Request] retrying with reference_image_field: {}",
+                alternate_field
+            );
+            let retry_response = client
+                .post(&endpoint)
+                .bearer_auth(&api_key)
+                .json(&alternate_body)
+                .send()
+                .await?;
+            status = retry_response.status();
+            body_text = retry_response.text().await?;
+        }
         let payload: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         if !status.is_success() {
             let message = payload
@@ -607,12 +657,39 @@ impl AIProvider for OpenAICompatibleProvider {
 
         let response = client
             .post(&endpoint)
-            .bearer_auth(api_key.clone())
+            .bearer_auth(&api_key)
             .json(&body)
             .send()
             .await?;
-        let status = response.status();
-        let body_text = response.text().await?;
+        let mut status = response.status();
+        let mut body_text = response.text().await?;
+        let reference_image_count = request.reference_images.as_ref().map(|images| images.len()).unwrap_or(0);
+        if Self::should_retry_with_alternate_reference_field(
+            status,
+            &body_text,
+            reference_image_count,
+        ) {
+            let alternate_field = Self::alternate_reference_image_field(reference_image_field);
+            let alternate_body = Self::build_request_body(
+                api_model,
+                &request.prompt,
+                &request.aspect_ratio,
+                request.reference_images.as_ref(),
+                alternate_field,
+            )?;
+            info!(
+                "[OpenAI Compatible Request] async retrying with reference_image_field: {}",
+                alternate_field
+            );
+            let retry_response = client
+                .post(&endpoint)
+                .bearer_auth(&api_key)
+                .json(&alternate_body)
+                .send()
+                .await?;
+            status = retry_response.status();
+            body_text = retry_response.text().await?;
+        }
         let payload: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
 
         if status.is_success() {
@@ -744,6 +821,25 @@ mod tests {
     use super::OpenAICompatibleProvider;
 
     #[test]
+    fn retries_alternate_reference_field_only_for_request_body_parse_errors() {
+        assert!(OpenAICompatibleProvider::should_retry_with_alternate_reference_field(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"code":400,"message":"failed to parse request body"}"#,
+            1,
+        ));
+        assert!(!OpenAICompatibleProvider::should_retry_with_alternate_reference_field(
+            reqwest::StatusCode::BAD_REQUEST,
+            "invalid model",
+            1,
+        ));
+        assert!(!OpenAICompatibleProvider::should_retry_with_alternate_reference_field(
+            reqwest::StatusCode::BAD_REQUEST,
+            "failed to parse request body",
+            0,
+        ));
+    }
+
+    #[test]
     fn builds_generic_image_field_when_configured() {
         let references = vec!["data:image/png;base64,QUJD".to_string()];
         let body = OpenAICompatibleProvider::build_request_body(
@@ -773,6 +869,21 @@ mod tests {
 
         assert_eq!(body["input_image"], "QUJD");
         assert!(body.get("image").is_none());
+    }
+
+    #[test]
+    fn keeps_gpt_image_two_aspect_ratio_for_compatible_platforms() {
+        let body = OpenAICompatibleProvider::build_request_body(
+            "gpt-image-2-auto",
+            "generate a square image",
+            "1:1",
+            None,
+            "image",
+        )
+        .expect("request body should be built");
+
+        assert_eq!(body["size"], "1024x1024");
+        assert_eq!(body["aspect_ratio"], "1:1");
     }
 
     #[test]
