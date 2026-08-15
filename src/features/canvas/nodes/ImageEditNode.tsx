@@ -230,8 +230,7 @@ function resolvePreviewTop(clientY: number, height: number): number {
 function renderPromptWithHighlights(
   prompt: string,
   maxImageCount: number,
-  imageUrls: string[],
-  onThumbnailClick?: (displayUrl: string, event: { clientX: number; clientY: number }) => void
+  imageUrls: string[]
 ): ReactNode {
   if (!prompt) {
     return ' ';
@@ -253,21 +252,16 @@ function renderPromptWithHighlights(
     }
 
     if (imageUrl) {
-      // 保留 token 占位以保持光标位置一致，缩略图使用紧凑正方形显示。
+      // 保留 token 占位以保持光标位置一致，缩略图贴左展示。
+      // 缩略图必须 pointer-events-none: 它在高亮层(z-20)覆盖在 textarea 上方,
+      // 若可点击会拦截鼠标, 导致光标不跟手、文字无法选中/删除。
       segments.push(
         <span
           key={`ref-${matchStart}`}
           className="relative z-0 inline-block whitespace-nowrap align-text-bottom text-transparent"
         >
           {matchText}
-          <span
-            className="nodrag pointer-events-auto absolute left-1/2 top-1/2 inline-flex h-4 w-4 -translate-x-1/2 -translate-y-1/2 cursor-zoom-in items-center justify-center overflow-hidden rounded-[3px] bg-accent/70"
-            onClick={(event) => {
-              event.stopPropagation();
-              onThumbnailClick?.(imageUrl, event);
-            }}
-            onMouseDown={(event) => event.stopPropagation()}
-          >
+          <span className="pointer-events-none absolute left-0 top-1/2 inline-flex h-5 w-5 -translate-y-1/2 items-center justify-center overflow-hidden rounded-[4px] bg-accent/70">
             <img
               src={imageUrl}
               alt={matchText}
@@ -900,11 +894,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
               {renderPromptWithHighlights(
                 promptDraft,
                 incomingImages.length,
-                incomingImageItems.map((item) => item.displayUrl),
-                (displayUrl, event) => {
-                  setPreviewState({ url: displayUrl, x: event.clientX, y: event.clientY });
-                  setPreviewSize(null);
-                }
+                incomingImageItems.map((item) => item.displayUrl)
               )}
             </div>
           </div>
