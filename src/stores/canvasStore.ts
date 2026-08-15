@@ -893,7 +893,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       const dx = x - anchorX;
       const dy = y - anchorY;
       const distanceScore = Math.hypot(dx, dy);
-      const upwardPenalty = dy < 0 ? Math.abs(dy) * 0.25 : 0;
+      // 下游节点期望在右侧/下方对齐, 禁止跑到源节点上方(否则右侧被占时会跳到上面)
+      const upwardPenalty = dy < 0 ? Math.abs(dy) * 50 + 50000 : 0;
       const overflow = overflowAmount(x, y);
       const score = distanceScore + upwardPenalty + overflow * 1000;
       const candidate = { x, y, score };
@@ -915,14 +916,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       const offsets = [
         { x: ring, y: 0 },
         { x: ring, y: 1 },
-        { x: ring, y: -1 },
-        { x: 0, y: ring },
-        { x: 0, y: -ring },
-        { x: -ring, y: 0 },
         { x: ring, y: 2 },
-        { x: ring, y: -2 },
+        { x: 0, y: ring },
+        { x: -ring, y: 0 },
         { x: -ring, y: 1 },
-        { x: -ring, y: -1 },
+        { x: -ring, y: 2 },
+        { x: ring, y: 3 },
+        { x: -ring, y: 3 },
+        { x: 0, y: ring + 1 },
       ];
       for (const offset of offsets) {
         evaluateCandidate(anchorX + offset.x * stepX, anchorY + offset.y * stepY);
