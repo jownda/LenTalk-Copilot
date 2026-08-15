@@ -1,158 +1,94 @@
 <div align="center">
-  <img src="./src-tauri/icons/128x128@2x.png" width="100" height="100" alt="Storyboard Copilot" style="margin-bottom: -50px;">
-  <h1 style="color: ##111227;">分镜助手</h1>
-  <h3>基于节点画布的 AI 分镜工作台，一站式完成图片生成、编辑与分镜流程</h3>
+  <img src="./src-tauri/icons/128x128@2x.png" width="100" height="100" alt="LenTalk" />
+  <h1>LenTalk · 分镜助手</h1>
+  <p>基于无限画布的 AI 分镜工作台 —— 一站式完成图片生成、分镜规划、3D 预演与素材管理</p>
 
-<div align="center">
-  <img src="./docs/imgs/readme/storyboard-copilot-homepage.webp" alt="Storyboard Copilot 首页截图" width="820" />
+  <p>
+    <a href="https://github.com/jownda/LenTalk-Copilot/releases/latest">
+      <img src="https://img.shields.io/github/v/release/jownda/LenTalk-Copilot?style=for-the-badge&color=4f46e5" alt="Latest Release" />
+    </a>
+    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-22c55e?style=for-the-badge" alt="Platform" />
+    <img src="https://img.shields.io/badge/version-1.0.0-f97316?style=for-the-badge" alt="Version" />
+  </p>
 </div>
 
-## 下载
+---
+
+## ✨ 核心特性
+
+| | 功能 | 说明 |
+|---|------|------|
+| 🎨 | **AI 图像生成** | 节点式画布，多模型提供商接入，生成后可继续编辑 |
+| 🖼️ | **无限画布** | 自由布局分镜节点、连线组织叙事流，支持缩放平移与框选 |
+| 🎬 | **3D 导演台** | 内置人体素体、姿势系统、摄像机与几何体，在 3D 空间预演分镜 |
+| 📚 | **素材库** | 图片 / 视频 / 音频分类管理，支持拖拽入画布、智能分类与 zip 备份恢复 |
+| 💡 | **提示词库** | 沉淀常用提示词，一键应用到生成节点 |
+| 🗂️ | **项目管理** | 多项目隔离，独立保存与切换 |
+| 🌗 | **主题与多语言** | 暗色 / 亮色主题，中英双语切换 |
+| ⌨️ | **快捷键系统** | 高频操作全键盘可达，可自定义 |
+
+## 📥 下载安装
 
 <div align="center">
-Windows 用户请下载 <strong>.exe</strong> 文件，macOS 用户请下载 <strong>.dmg</strong> 文件
 
-Windows 用户如果在启动时遇到了报错，请尝试安装 [WebView2 运行时](https://developer.microsoft.com/zh-cn/Microsoft-edge/webview2#download)
+| 平台 | 安装包 | 说明 |
+|------|--------|------|
+| **Windows** | `.exe`（NSIS 安装包） | 双击安装，建议安装 [WebView2 运行时](https://developer.microsoft.com/zh-cn/microsoft-edge/webview2) |
+| **Windows** | `.msi` | 企业批量分发用 |
+| **macOS** | `.dmg` | 双击挂载，拖入「应用程序」安装 |
 
-### Github 下载
-[![Download Latest Release](https://img.shields.io/github/v/release/henjicc/Storyboard-Copilot?style=for-the-badge&color=blue)](https://github.com/henjicc/Storyboard-Copilot/releases/latest)
+👉 **[前往 Releases 下载最新版本](https://github.com/jownda/LenTalk-Copilot/releases/latest)**
 
-### 网盘下载
-**夸克网盘**：[https://pan.quark.cn/s/5b6733a8fc8e](https://pan.quark.cn/s/5b6733a8fc8e)
+</div>
 
-## 技术栈
+> macOS 首次打开若提示"无法验证开发者"，请在应用上右键 → 打开 → 仍要打开。
 
-- 前端：React 18 + TypeScript + Zustand + `@xyflow/react` + TailwindCSS
-- 桌面容器：Tauri 2
-- 后端：Rust 命令接口
-- 数据存储：SQLite（`rusqlite`，WAL）
-- i18n：`react-i18next` + `i18next`
+## 🛠️ 本地开发
 
-## 环境要求
-
-- Node.js 20+
-- npm 10+
-- Rust stable（含 Cargo）
-- Tauri 平台依赖（Windows/macOS）
-
-安装与平台准备可参考：
-- [基础工具安装配置（Windows / macOS）](./docs/development-guides/base-tools-installation.md)
-
-## 快速开始
+需要环境：**Node.js 20+**、**Rust（stable）**、Tauri 系统依赖（macOS: Xcode CLT / Windows: VS Build Tools + WebView2）
 
 ```bash
+# 安装依赖
 npm install
-```
 
-仅前端开发：
-
-```bash
+# 启动开发模式（热更新）
 npm run dev
-```
 
-Tauri 联调（推荐）：
-
-```bash
+# 桌面端开发运行（Tauri）
 npm run tauri dev
 ```
 
-## 常用命令
+## 📦 打包构建
 
 ```bash
-# TypeScript 类型检查
-npx tsc --noEmit
-
-# Rust 快速检查
-cd src-tauri && cargo check
-
-# 前端构建检查
+# 类型检查 + 前端构建
 npm run build
 
-# Tauri 构建桌面应用
+# 打桌面安装包（当前平台）
 npm run tauri build
 ```
 
-## 一键发布（自动构建 + Release）
+产物位置：
+- macOS：`src-tauri/target/release/bundle/dmg/`
+- Windows：`src-tauri/target/release/bundle/nsis/` 与 `bundle/wix/`
 
-本项目支持一条命令完成版本联动、触发 GitHub Actions 构建并发布 Release。
+> 仓库已配置 [GitHub Actions](./.github/workflows/build-releases.yml)：推送 `v*` 标签或手动触发，自动在 Windows / macOS 云构建并发布安装包到 Releases。
 
-```bash
-# patch 递增（例如 0.1.0 -> 0.1.1），并写入本次更新说明
-npm run release -- patch "修复导出节点在大图下崩溃；优化启动速度"
+## 🧰 技术栈
 
-# 或指定版本号
-npm run release -- 0.2.0 "新增分镜批量裁剪工具"
-```
+<div align="center">
 
-命令会自动执行：
-- 同步版本号到 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`
-- 提交版本变更并创建带说明的 tag（如 `v0.2.0`）
-- 推送分支和 tag，触发 `.github/workflows/build.yml`
-- 由 Action 构建 Windows/macOS 安装包并发布到 GitHub Releases（说明显示为 tag 注释）
+[![Tauri](https://img.shields.io/badge/Tauri_2-FFC131?logo=tauri&logoColor=black)](https://tauri.app) [![React](https://img.shields.io/badge/React_18-61DAFB?logo=react&logoColor=black)](https://react.dev) [![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org) [![Vite](https://img.shields.io/badge/Vite-646CFF?logo=vite&logoColor=white)](https://vitejs.dev) [![Three.js](https://img.shields.io/badge/Three.js-000000?logo=three.js&logoColor=white)](https://threejs.org) [![Zustand](https://img.shields.io/badge/Zustand-7C3AED?)](https://github.com/pmndrs/zustand)
 
-## 项目结构（核心）
+</div>
 
-```text
-src/
-  features/canvas/          # 画布主流程（节点、工具、模型、UI）
-  stores/                   # 全局状态与自动持久化策略
-  commands/                 # 前端到 Tauri 命令桥接
-  i18n/                     # 国际化入口与语言包
-src-tauri/src/
-  commands/                 # Rust 侧命令实现（含 project_state）
-  lib.rs                    # Tauri 命令注册入口
-docs/development-guides/    # 开发与扩展文档
-```
+- **桌面框架**：Tauri 2（Rust 后端 + WebView 前端）
+- **前端**：React 18 + TypeScript + Vite
+- **画布**：React Flow / Konva
+- **3D**：Three.js + @react-three/fiber
+- **状态**：Zustand + TanStack Query
+- **国际化**：i18next（中 / 英）
 
-## 架构要点
+## 📄 关于
 
-- 分层数据流：`UI -> Store -> Application Service -> Command/API -> Persistence`
-- 节点注册单一真相源：`src/features/canvas/domain/nodeRegistry.ts`
-- 工具体系分层：`tools/types.ts`、`tools/builtInTools.ts`、`ui/tool-editors/*`、`application/toolProcessor.ts`
-- 持久化双通道：
-  - 项目快照：`upsert_project_record`
-  - 视口快照：`update_project_viewport_record`
-
-## 扩展开发
-
-### 新增模型
-
-1. 在 `src/features/canvas/models/image/<provider>/` 新增模型文件
-2. 声明 `displayName`、`providerId`、分辨率/比例、默认参数
-3. 实现请求映射函数 `resolveRequest`
-
-### 新增工具
-
-1. 在 `src/features/canvas/tools/types.ts` 声明能力
-2. 在 `src/features/canvas/tools/builtInTools.ts` 注册
-3. 在 `src/features/canvas/ui/tool-editors/` 新增编辑器
-4. 在 `src/features/canvas/application/toolProcessor.ts` 接入执行
-
-### 新增节点
-
-1. 在 `src/features/canvas/domain/canvasNodes.ts` 增加类型与数据结构
-2. 在 `src/features/canvas/domain/nodeRegistry.ts` 注册默认数据与连线能力
-3. 在 `src/features/canvas/nodes/index.ts` 注册渲染组件
-
-详细指南：
-- [项目开发环境与注意事项](./docs/development-guides/project-development-setup.md)
-- [供应商与模型扩展指南](./docs/development-guides/provider-and-model-extension.md)
-
-## 持久化与数据说明
-
-- 自动持久化由 `projectStore` 驱动，不需要手动保存
-- SQLite 文件位于 Tauri `app_data_dir/projects.db`
-- `projects` 表核心字段：`nodes_json`、`edges_json`、`viewport_json`、`history_json`、`node_count`
-- 图片字段通过 `imagePool + __img_ref__` 去重编码
-
-## i18n 约定
-
-- 入口：`src/i18n/index.ts`
-- 语言包：`src/i18n/locales/zh.json`、`src/i18n/locales/en.json`
-- 代码中使用 `useTranslation()` + `t('key.path')`，避免硬编码文案
-
-## 开发文档导航
-
-- [项目开发环境与注意事项](./docs/development-guides/project-development-setup.md)
-- [供应商与模型扩展指南](./docs/development-guides/provider-and-model-extension.md)
-- [基础工具安装配置（Windows / macOS）](./docs/development-guides/base-tools-installation.md)
+LenTalk 是个人项目，从开源分镜工具 **Storyboard-Copilot** 演进而来，按需持续迭代中。欢迎提 Issue 反馈问题或建议。
