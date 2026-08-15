@@ -171,7 +171,16 @@ impl OpenAICompatibleProvider {
                 })?;
             if let Some(image) = image_field {
                 if is_gpt_image {
-                    body["input_image"] = json!(image);
+                    // gpt-image 的 input_image 只接受 URL 或纯 base64(不含 data: 前缀);
+                    // 本地参考图会被转成 data URL, 这里剥掉前缀避免平台解析失败
+                    let normalized = if let Some(rest) = image.strip_prefix("data:") {
+                        rest.split_once(',')
+                            .map(|(_, base64_part)| base64_part.to_string())
+                            .unwrap_or(image)
+                    } else {
+                        image
+                    };
+                    body["input_image"] = json!(normalized);
                 } else {
                     body["image"] = json!(image);
                 }
