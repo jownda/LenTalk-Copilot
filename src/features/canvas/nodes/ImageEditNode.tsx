@@ -255,10 +255,12 @@ function renderPromptWithHighlights(
       // 保留 token 占位以保持光标位置一致，缩略图贴左展示。
       // 缩略图必须 pointer-events-none: 它在高亮层(z-20)覆盖在 textarea 上方,
       // 若可点击会拦截鼠标, 导致光标不跟手、文字无法选中/删除。
+      // token 用普通 inline span(勿用 inline-block): 保证高亮层排版与 textarea
+      // 完全一致(基线/换行), 否则光标位置与显示文字错位。
       segments.push(
         <span
           key={`ref-${matchStart}`}
-          className="relative z-0 inline-block whitespace-nowrap align-text-bottom text-transparent"
+          className="relative z-0 text-transparent"
         >
           {matchText}
           <span className="pointer-events-none absolute left-0 top-1/2 inline-flex h-5 w-5 -translate-y-1/2 items-center justify-center overflow-hidden rounded-[4px] bg-accent/70">
@@ -911,7 +913,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
             onScroll={syncPromptHighlightScroll}
             onMouseDown={(event) => event.stopPropagation()}
             placeholder={t('node.imageEdit.promptPlaceholder')}
-            className="ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words"
+            className="ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit]"
             style={{ scrollbarGutter: 'stable' }}
           />
         </div>
