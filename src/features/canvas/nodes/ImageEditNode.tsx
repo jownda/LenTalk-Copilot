@@ -160,20 +160,6 @@ function resolvePickerAnchor(
   };
 }
 
-/**
- * 估算 `@图N` token 的文字宽度(text-sm=14px: 半角 7px, CJK 14px)。
- * 高亮层缩略图徽章使用相同宽度, 保证与 textarea 换行一致、不错位。
- */
-function estimateReferenceTokenWidth(token: string): number {
-  let width = 0;
-  for (const ch of token) {
-    const code = ch.codePointAt(0) ?? 0;
-    const isWide = code >= 0x2e80 || ch === '\u3000';
-    width += isWide ? 14 : 7;
-  }
-  return Math.max(18, width);
-}
-
 /** 缩略图轻量预览浮层状态: 图片地址 + 鼠标点击位置(用于定位) */
 interface ReferencePreviewState {
   url: string;
@@ -267,29 +253,31 @@ function renderPromptWithHighlights(
     }
 
     if (imageUrl) {
-      // 引用缩略图徽章: 宽度=原 token 文字宽度(保持换行一致), 点击放大查看
+      // 引用缩略图: 绝对定位覆盖在 token 文字上(不占文档流),
+      // 保证高亮层排版与 textarea 完全一致、光标不错位; 点击放大查看
       segments.push(
         <span
           key={`ref-${matchStart}`}
-          className="nodrag pointer-events-auto inline-flex cursor-zoom-in items-center justify-center overflow-hidden rounded-[6px] bg-accent/55 align-middle"
-          style={{
-            width: estimateReferenceTokenWidth(matchText),
-            height: 18,
-            boxSizing: 'border-box',
-          }}
-          onClick={(event) => {
-            event.stopPropagation();
-            onThumbnailClick?.(imageUrl, event);
-          }}
-          onMouseDown={(event) => event.stopPropagation()}
-          title={matchText}
+          className="relative z-0 text-white [text-shadow:0.24px_0_currentColor,-0.24px_0_currentColor] before:absolute before:-inset-x-[4px] before:-inset-y-[1px] before:-z-10 before:rounded-[7px] before:bg-accent/55 before:content-['']"
         >
-          <img
-            src={imageUrl}
-            alt={matchText}
-            draggable={false}
-            className="h-[13px] w-[13px] shrink-0 rounded-[3px] object-cover"
-          />
+          {matchText}
+          <span
+            className="nodrag pointer-events-auto absolute left-1/2 top-1/2 inline-flex -translate-x-1/2 -translate-y-1/2 cursor-zoom-in items-center justify-center overflow-hidden rounded-[6px] bg-accent/70"
+            style={{ width: 18, height: 18, boxSizing: 'border-box' }}
+            onClick={(event) => {
+              event.stopPropagation();
+              onThumbnailClick?.(imageUrl, event);
+            }}
+            onMouseDown={(event) => event.stopPropagation()}
+            title={matchText}
+          >
+            <img
+              src={imageUrl}
+              alt={matchText}
+              draggable={false}
+              className="h-[13px] w-[13px] shrink-0 rounded-[3px] object-cover"
+            />
+          </span>
         </span>
       );
     } else {
