@@ -59,7 +59,9 @@ export interface ImageSplitGateway {
     imageSource: string,
     rows: number,
     cols: number,
-    lineThickness: number
+    lineThickness: number,
+    colFractions?: number[],
+    rowFractions?: number[]
   ) => Promise<string[]>;
 }
 

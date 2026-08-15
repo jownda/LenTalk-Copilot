@@ -35,6 +35,8 @@ pub async fn split_image(
     rows: u32,
     cols: u32,
     line_thickness: Option<u32>,
+    col_fractions: Option<Vec<f32>>,
+    row_fractions: Option<Vec<f32>>,
 ) -> Result<Vec<String>, String> {
     let safe_rows = rows.max(1);
     let safe_cols = cols.max(1);
@@ -61,8 +63,18 @@ pub async fn split_image(
         return Err("分割线过粗，无法完成切割".to_string());
     }
 
-    let column_widths = split_sizes(usable_width, safe_cols);
-    let row_heights = split_sizes(usable_height, safe_rows);
+    let column_widths = match &col_fractions {
+        Some(fractions) if fractions.len() == safe_cols as usize => {
+            split_sizes_with_fractions(usable_width, fractions)
+        }
+        _ => split_sizes(usable_width, safe_cols),
+    };
+    let row_heights = match &row_fractions {
+        Some(fractions) if fractions.len() == safe_rows as usize => {
+            split_sizes_with_fractions(usable_height, fractions)
+        }
+        _ => split_sizes(usable_height, safe_rows),
+    };
 
     let mut x_offsets = Vec::with_capacity(safe_cols as usize);
     let mut cursor_x = 0_u32;
@@ -116,6 +128,8 @@ pub async fn split_image_source(
     rows: u32,
     cols: u32,
     line_thickness: Option<u32>,
+    col_fractions: Option<Vec<f32>>,
+    row_fractions: Option<Vec<f32>>,
 ) -> Result<Vec<String>, String> {
     let started = Instant::now();
     let trimmed_source = source.trim();
@@ -146,8 +160,18 @@ pub async fn split_image_source(
         return Err("分割线过粗，无法完成切割".to_string());
     }
 
-    let column_widths = split_sizes(usable_width, safe_cols);
-    let row_heights = split_sizes(usable_height, safe_rows);
+    let column_widths = match &col_fractions {
+        Some(fractions) if fractions.len() == safe_cols as usize => {
+            split_sizes_with_fractions(usable_width, fractions)
+        }
+        _ => split_sizes(usable_width, safe_cols),
+    };
+    let row_heights = match &row_fractions {
+        Some(fractions) if fractions.len() == safe_rows as usize => {
+            split_sizes_with_fractions(usable_height, fractions)
+        }
+        _ => split_sizes(usable_height, safe_rows),
+    };
 
     let mut x_offsets = Vec::with_capacity(safe_cols as usize);
     let mut cursor_x = 0_u32;
@@ -263,6 +287,24 @@ fn split_sizes(total: u32, segments: u32) -> Vec<u32> {
         .map(|index| base + if index < remainder { 1 } else { 0 })
         .collect()
 }
+
+fn split_sizes_with_fractions(total: u32, fractions: &[f32]) -> Vec<u32> {
+    if fractions.is_empty() {
+        return split_sizes(total, 1);
+    }
+    let mut sizes: Vec<u32> = fractions
+        .iter()
+        .map(|fraction| (total as f32 * fraction.max(0.0)).floor() as u32)
+        .collect();
+    let sum: u32 = sizes.iter().sum();
+    if sum < total {
+        if let Some(last) = sizes.last_mut() {
+            *last += total - sum;
+        }
+    }
+    sizes
+}
+
 
 fn gcd_u32(a: u32, b: u32) -> u32 {
     let mut x = a.max(1);

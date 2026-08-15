@@ -2,7 +2,9 @@ import type { CanvasNode, NodeToolType } from '../domain/canvasNodes';
 import type { ToolProcessorResult } from '../application/ports';
 
 export type ToolOptionPrimitive = string | number | boolean;
-export type ToolOptions = Record<string, ToolOptionPrimitive>;
+/** 扩展: 允许数组值(如切割自定义行列位置 fractions) */
+export type ToolOptionValue = ToolOptionPrimitive | number[];
+export type ToolOptions = Record<string, ToolOptionValue>;
 
 interface ToolFieldBase {
   key: string;

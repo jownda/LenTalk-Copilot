@@ -43,7 +43,9 @@ export class CanvasToolProcessor implements ToolProcessor {
         Number(options.cols ?? metadata?.gridCols ?? 3),
         Number(options.lineThicknessPercent),
         Number(options.lineThickness ?? 0),
-        metadata?.frameNotes
+        metadata?.frameNotes,
+        this.readNumberArray(options.colFractions),
+        this.readNumberArray(options.rowFractions)
       );
     }
 
@@ -302,7 +304,9 @@ export class CanvasToolProcessor implements ToolProcessor {
     cols: number,
     lineThicknessPercent: number,
     lineThicknessPxFallback: number,
-    frameNotes?: string[]
+    frameNotes?: string[],
+    colFractions?: number[],
+    rowFractions?: number[]
   ): Promise<ToolProcessorResult> {
     const normalizedRows = Number.isFinite(rows) ? rows : 3;
     const normalizedCols = Number.isFinite(cols) ? cols : 3;
@@ -333,11 +337,20 @@ export class CanvasToolProcessor implements ToolProcessor {
         sourceImage,
         safeRows,
         safeCols,
-        safeLineThickness
+        safeLineThickness,
+        colFractions,
+        rowFractions
       );
     } catch {
       // Fallback when Tauri command is unavailable or fails.
-      outputs = await this.localSplit(sourceImage, safeRows, safeCols, safeLineThickness);
+      outputs = await this.localSplit(
+        sourceImage,
+        safeRows,
+        safeCols,
+        safeLineThickness,
+        colFractions,
+        rowFractions
+      );
     }
 
     const persistedFrameImages = await Promise.all(
@@ -437,11 +450,37 @@ export class CanvasToolProcessor implements ToolProcessor {
     );
   }
 
+  private splitSizesWithFractions(totalSize: number, fractions: number[]): number[] {
+    if (fractions.length === 0) {
+      return [totalSize];
+    }
+    const sizes = fractions.map((fraction) =>
+      Math.max(0, Math.floor(totalSize * Math.max(0, fraction)))
+    );
+    const sum = sizes.reduce((acc, value) => acc + value, 0);
+    if (sum < totalSize && sizes.length > 0) {
+      sizes[sizes.length - 1] += totalSize - sum;
+    }
+    return sizes;
+  }
+
+  private readNumberArray(value: unknown): number[] | undefined {
+    if (!Array.isArray(value)) {
+      return undefined;
+    }
+    const numbers = value
+      .map((item) => (typeof item === 'number' ? item : Number(item)))
+      .filter((item) => Number.isFinite(item));
+    return numbers.length > 0 ? numbers : undefined;
+  }
+
   private async localSplit(
     sourceImage: string,
     rows: number,
     cols: number,
-    lineThickness: number
+    lineThickness: number,
+    colFractions?: number[],
+    rowFractions?: number[]
   ): Promise<string[]> {
     const image = await loadImageElement(sourceImage);
 
@@ -460,8 +499,14 @@ export class CanvasToolProcessor implements ToolProcessor {
       throw new Error('分割线过粗，无法完成切割');
     }
 
-    const columnWidths = this.splitIntoSegments(usableWidth, cols);
-    const rowHeights = this.splitIntoSegments(usableHeight, rows);
+    const columnWidths =
+      colFractions && colFractions.length === cols
+        ? this.splitSizesWithFractions(usableWidth, colFractions)
+        : this.splitIntoSegments(usableWidth, cols);
+    const rowHeights =
+      rowFractions && rowFractions.length === rows
+        ? this.splitSizesWithFractions(usableHeight, rowFractions)
+        : this.splitIntoSegments(usableHeight, rows);
 
     const results: string[] = [];
 
