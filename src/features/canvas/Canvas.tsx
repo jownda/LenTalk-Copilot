@@ -39,7 +39,7 @@ import {
   type CanvasNodeType,
   DEFAULT_NODE_WIDTH,
 } from '@/features/canvas/domain/canvasNodes';
-import { prepareNodeImage } from '@/features/canvas/application/imageData';
+import { prepareNodeImage, prepareNodeImageFromFile } from '@/features/canvas/application/imageData';
 import {
   buildGenerationErrorReport,
   CURRENT_RUNTIME_SESSION_ID,
@@ -1437,7 +1437,10 @@ export function Canvas() {
 
   const handleAssetLibraryDragOver = useCallback((event: ReactDragEvent) => {
     const types = event.dataTransfer.types;
-    if (types.includes(ASSET_DRAG_DATA_TYPE) || types.includes(PROMPT_DRAG_DATA_TYPE)) {
+    const hasAssetDrag = types.includes(ASSET_DRAG_DATA_TYPE) || types.includes(PROMPT_DRAG_DATA_TYPE);
+    // 系统文件拖入: dragOver 阶段 files 不可读(浏览器安全限制), 只能靠 types 里的 'Files'
+    const hasFiles = types.includes('Files');
+    if (hasAssetDrag || hasFiles) {
       event.preventDefault();
       event.dataTransfer.dropEffect = 'copy';
     }
@@ -1509,6 +1512,50 @@ export function Canvas() {
       displayName: asset.name,
     });
     setSelectedNode(nodeId);
+    scheduleCanvasPersist(0);
+  }, [addNode, reactFlowInstance, scheduleCanvasPersist, setSelectedNode]);
+
+  // 从系统文件管理器拖入图片文件 → 每张生成一个图片节点(支持多张一起拖入)
+  const handleFileDrop = useCallback(async (event: ReactDragEvent) => {
+    const files = Array.from(event.dataTransfer?.files ?? []).filter((file) =>
+      file.type.startsWith('image/')
+    );
+    if (files.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+
+    const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.upload);
+    const basePosition = reactFlowInstance.screenToFlowPosition({
+      x: event.clientX,
+      y: event.clientY,
+    });
+    // 多张时右下阶梯排布, 避免完全重叠
+    const offsetStep = 40;
+    let lastNodeId: string | null = null;
+
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      const prepared = await prepareNodeImageFromFile(file);
+      const position = {
+        x: basePosition.x + index * offsetStep,
+        y: basePosition.y + index * offsetStep,
+      };
+      const nodeId = addNode(CANVAS_NODE_TYPES.upload, position, {
+        ...definition.createDefaultData(),
+        imageUrl: prepared.imageUrl,
+        previewImageUrl: prepared.previewImageUrl ?? prepared.imageUrl,
+        aspectRatio: prepared.aspectRatio ?? '1:1',
+        sourceFileName: file.name,
+        displayName: file.name.replace(/\.[^.]+$/, ''),
+      });
+      lastNodeId = nodeId;
+    }
+
+    if (lastNodeId) {
+      setSelectedNode(lastNodeId);
+    }
     scheduleCanvasPersist(0);
   }, [addNode, reactFlowInstance, scheduleCanvasPersist, setSelectedNode]);
 
@@ -2415,7 +2462,10 @@ export function Canvas() {
         onPaneClick={handlePaneClick}
         onNodeContextMenu={(event, node) => handleNodeContextMenu(event, node as CanvasNode)}
         onDragOver={handleAssetLibraryDragOver}
-        onDrop={handleAssetLibraryDrop}
+        onDrop={(event) => {
+          handleAssetLibraryDrop(event);
+          void handleFileDrop(event);
+        }}
         onMove={handleMove}
         onMoveStart={handleMoveStart}
         onMoveEnd={handleMoveEnd}
