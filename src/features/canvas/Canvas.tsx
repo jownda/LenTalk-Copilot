@@ -1043,12 +1043,19 @@ export function Canvas() {
       };
       const topLeft = reactFlowInstance.screenToFlowPosition({ x: rect.x, y: rect.y });
       const bottomRight = reactFlowInstance.screenToFlowPosition({ x: rect.right, y: rect.bottom });
+      // 子节点 position 是相对父节点的局部坐标, 需换算为全局绝对坐标再做相交检测;
+      // group 节点不参与框选(其包围盒覆盖全部子节点, 碰到即连带整组选中造成误选)
+      const nodeMap = new Map(nodes.map((node) => [node.id, node]));
       const selectedByNode = new Map(
         nodes.map((node) => {
+          if (node.type === CANVAS_NODE_TYPES.group) {
+            return [node.id, false] as const;
+          }
           const nodeWidth = node.measured?.width ?? node.width ?? 220;
           const nodeHeight = node.measured?.height ?? node.height ?? 200;
-          const nx = node.position.x;
-          const ny = node.position.y;
+          const absolute = resolveCanvasNodeAbsolutePosition(node.id, nodeMap);
+          const nx = absolute.x;
+          const ny = absolute.y;
           const selected =
             nx < bottomRight.x
             && nx + nodeWidth > topLeft.x
