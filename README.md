@@ -3,9 +3,6 @@
   <h1 style="color: ##111227;">分镜助手</h1>
   <h3>基于节点画布的 AI 分镜工作台，一站式完成图片生成、编辑与分镜流程</h3>
 
-  [![Bilibili](https://img.shields.io/badge/bilibili-痕继痕迹-00AEEC?logo=bilibili)](https://space.bilibili.com/39337803)
-</div>
-
 <div align="center">
   <img src="./docs/imgs/readme/storyboard-copilot-homepage.webp" alt="Storyboard Copilot 首页截图" width="820" />
 </div>
@@ -22,22 +19,6 @@ Windows 用户如果在启动时遇到了报错，请尝试安装 [WebView2 运�
 
 ### 网盘下载
 **夸克网盘**：[https://pan.quark.cn/s/5b6733a8fc8e](https://pan.quark.cn/s/5b6733a8fc8e)
-
-</div>
-
-## 赞助
-
-<div align="center">
-  <div style="text-align: center; font-weight: 700; margin-bottom: 10px; font-size: 20px;">
-    <a href="https://platform.minimaxi.com/subscribe/token-plan?code=8XOI15IbO4&source=link" target="_blank" style="color: #f0440bff; text-decoration: none;">
-      MiniMax M2.7 Token Plan 专属 88 折优惠
-    </a>
-  </div>
-  <a href="https://platform.minimaxi.com/subscribe/token-plan?code=8XOI15IbO4&source=link" target="_blank">
-    <img src="./docs/imgs/readme/token_plan.webp" alt="MiniMax Coding Plan" width="720">
-  </a>
-</div>
-
 
 ## 技术栈
 
