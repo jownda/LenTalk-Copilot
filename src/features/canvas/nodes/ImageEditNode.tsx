@@ -263,12 +263,12 @@ function renderPromptWithHighlights(
           className="relative z-0 text-transparent"
         >
           {matchText}
-          <span className="pointer-events-none absolute inset-0 overflow-hidden rounded-[4px] bg-accent/70">
+          <span className="pointer-events-none absolute left-0 top-1/2 inline-flex h-5 w-5 -translate-y-1/2 items-center justify-center overflow-hidden rounded-[4px] bg-accent/70">
             <img
               src={imageUrl}
               alt={matchText}
               draggable={false}
-              className="h-full w-full object-cover"
+              className="h-full w-full shrink-0 object-cover"
             />
           </span>
         </span>
