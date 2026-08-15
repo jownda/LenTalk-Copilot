@@ -230,7 +230,8 @@ function resolvePreviewTop(clientY: number, height: number): number {
 function renderPromptWithHighlights(
   prompt: string,
   maxImageCount: number,
-  imageUrls: string[]
+  imageUrls: string[],
+  onThumbnailClick?: (displayUrl: string, event: { clientX: number; clientY: number }) => void
 ): ReactNode {
   if (!prompt) {
     return ' ';
@@ -263,7 +264,14 @@ function renderPromptWithHighlights(
           className="relative z-0 text-transparent"
         >
           {matchText}
-          <span className="pointer-events-none absolute left-1/2 top-1/2 inline-flex h-[20px] w-[20px] -translate-x-1/2 -translate-y-1/2 items-center justify-center overflow-hidden rounded-[5px] bg-accent/70">
+          <span
+            className="pointer-events-auto absolute left-1/2 top-1/2 inline-flex h-[20px] w-[20px] -translate-x-1/2 -translate-y-1/2 cursor-zoom-in items-center justify-center overflow-hidden rounded-[5px] bg-accent/70"
+            onClick={(event) => {
+              event.stopPropagation();
+              onThumbnailClick?.(imageUrl, event);
+            }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
             <img
               src={imageUrl}
               alt={matchText}
@@ -896,7 +904,11 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
               {renderPromptWithHighlights(
                 promptDraft,
                 incomingImages.length,
-                incomingImageItems.map((item) => item.displayUrl)
+                incomingImageItems.map((item) => item.displayUrl),
+                (displayUrl, event) => {
+                  setPreviewState({ url: displayUrl, x: event.clientX, y: event.clientY });
+                  setPreviewSize(null);
+                }
               )}
             </div>
           </div>
