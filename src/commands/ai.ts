@@ -161,37 +161,57 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 180000);
   try {
-    // 参考图:取第一张转 image 字段(data URL 原样,http 原样,blob: 转 data URL)
-    let referenceImage: string | undefined;
+    // 参考图:全部保留(data URL / http(s) 原样,blob 转 data URL)。
+    const referenceImages: string[] = [];
     const referenceSources = request.reference_images ?? [];
-    if (referenceSources.length > 0) {
-      const source = referenceSources[0].trim();
+    for (const rawSource of referenceSources) {
+      const source = rawSource.trim();
       if (source.startsWith('data:') || source.startsWith('http://') || source.startsWith('https://')) {
-        referenceImage = source;
+        referenceImages.push(source);
       } else if (source.startsWith('blob:')) {
         try {
           const blob = await (await fetch(source)).blob();
-          referenceImage = await new Promise<string>((resolve, reject) => {
+          const dataUrl = await new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = () => resolve(String(reader.result ?? ''));
             reader.onerror = () => reject(new Error('参考图读取失败'));
             reader.readAsDataURL(blob);
           });
+          referenceImages.push(dataUrl);
         } catch (error) {
           console.warn('[AI] browser fallback: failed to read blob reference image', { error });
         }
       }
     }
 
+    const isGptImage = apiModel.toLowerCase().includes('gpt-image');
+    const referenceImageField = request.extra_params?.reference_image_field === 'input_image'
+      ? 'input_image'
+      : 'image';
     const body: Record<string, unknown> = {
       model: apiModel,
       prompt: request.prompt,
       size: '1024x1024',
       n: 1,
-      response_format: 'b64_json',
     };
-    if (referenceImage) {
-      body.image = referenceImage;
+    if (isGptImage) {
+      body.output_format = 'png';
+    } else {
+      body.response_format = 'b64_json';
+    }
+    if (referenceImages.length > 0) {
+      if (referenceImageField === 'input_image') {
+        // input_image accepts URL or plain base64 rather than a data URL.
+        const normalized = referenceImages.map((image) =>
+          image.startsWith('data:') ? (image.split(',', 2)[1] ?? image) : image
+        );
+        body.input_image = normalized.length === 1 ? normalized[0] : normalized;
+      } else {
+        body.image = referenceImages[0];
+        if (referenceImages.length > 1) {
+          body.images = referenceImages;
+        }
+      }
     }
 
     const response = await fetch(endpoint, {

@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
+use tracing::info;
 
 use crate::ai::error::AIError;
 use crate::ai::{
@@ -144,12 +145,14 @@ impl OpenAICompatibleProvider {
         Ok((base_url, api_key))
     }
 
-    /// 构造 /v1/images/generations 请求体(gpt-image 系列用 input_image + output_format)。
+    /// 构造 /v1/images/generations 请求体。
+    /// 自定义中转平台通常使用 image，原生 GPT Image API 使用 input_image。
     fn build_request_body(
         api_model: &str,
         prompt: &str,
         aspect_ratio: &str,
         reference_images: Option<&Vec<String>>,
+        reference_image_field: &str,
     ) -> Result<Value, AIError> {
         let is_gpt_image = api_model.to_ascii_lowercase().contains("gpt-image");
         let mut body = json!({
@@ -164,29 +167,56 @@ impl OpenAICompatibleProvider {
             body["size"] = json!("1024x1024");
             body["response_format"] = json!("b64_json");
         }
-        if let Some(reference_image) = reference_images.and_then(|images| images.first()) {
-            let image_field =
-                Self::reference_image_to_image_field(reference_image).map_err(|error| {
-                    AIError::InvalidRequest(format!("自定义平台参考图处理失败: {}", error))
-                })?;
-            if let Some(image) = image_field {
-                if is_gpt_image {
-                    // gpt-image 的 input_image 只接受 URL 或纯 base64(不含 data: 前缀);
-                    // 本地参考图会被转成 data URL, 这里剥掉前缀避免平台解析失败
-                    let normalized = if let Some(rest) = image.strip_prefix("data:") {
-                        rest.split_once(',')
-                            .map(|(_, base64_part)| base64_part.to_string())
-                            .unwrap_or(image)
-                    } else {
+        let images = reference_images
+            .map(|references| {
+                references
+                    .iter()
+                    .filter_map(|reference| Self::reference_image_to_image_field(reference).transpose())
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        if !images.is_empty() {
+            if reference_image_field == "input_image" {
+                // input_image 只接受 URL 或纯 base64(不含 data: 前缀)。
+                let normalized = images
+                    .into_iter()
+                    .map(|image| {
                         image
-                    };
-                    body["input_image"] = json!(normalized);
+                            .strip_prefix("data:")
+                            .and_then(|rest| rest.split_once(',').map(|(_, base64_part)| base64_part.to_string()))
+                            .unwrap_or(image)
+                    })
+                    .collect::<Vec<_>>();
+                body["input_image"] = if normalized.len() == 1 {
+                    json!(normalized[0])
                 } else {
-                    body["image"] = json!(image);
+                    json!(normalized)
+                };
+            } else {
+                // image 保持单图兼容；多图使用 images 数组，确保所有上游图片都送达平台。
+                body["image"] = json!(images[0]);
+                if images.len() > 1 {
+                    body["images"] = json!(images);
                 }
             }
         }
         Ok(body)
+    }
+
+    fn resolve_reference_image_field(extra_params: &Option<HashMap<String, Value>>, api_model: &str) -> &'static str {
+        match extra_params
+            .as_ref()
+            .and_then(|params| params.get("reference_image_field"))
+            .and_then(|value| value.as_str())
+        {
+            Some("input_image") => "input_image",
+            Some("image") => "image",
+            // 兼容旧调用: 未传配置时沿用 GPT Image 的原有 input_image 行为。
+            _ if api_model.to_ascii_lowercase().contains("gpt-image") => "input_image",
+            _ => "image",
+        }
     }
 
     /// 是否走 Responses API 协议(extra_params.protocol == "responses")。
@@ -453,6 +483,8 @@ impl AIProvider for OpenAICompatibleProvider {
             .await?;
         let client = Self::build_client();
         let is_responses = Self::is_responses_protocol(&request.extra_params);
+        let reference_image_field = Self::resolve_reference_image_field(&request.extra_params, api_model);
+        let reference_image_count = request.reference_images.as_ref().map(|images| images.len()).unwrap_or(0);
         let (endpoint, body) = if is_responses {
             (
                 format!("{}/v1/responses", base_url),
@@ -471,9 +503,18 @@ impl AIProvider for OpenAICompatibleProvider {
                     &request.prompt,
                     &request.aspect_ratio,
                     request.reference_images.as_ref(),
+                    reference_image_field,
                 )?,
             )
         };
+
+        info!(
+            "[OpenAI Compatible Request] model: {}, protocol: {}, reference_images: {}, reference_image_field: {}",
+            api_model,
+            if is_responses { "responses" } else { "images" },
+            reference_image_count,
+            if is_responses { "input_image" } else { reference_image_field },
+        );
 
         let response = client
             .post(&endpoint)
@@ -555,11 +596,13 @@ impl AIProvider for OpenAICompatibleProvider {
             .await?;
         let client = Self::build_client();
         let endpoint = format!("{}/v1/images/generations", base_url);
+        let reference_image_field = Self::resolve_reference_image_field(&request.extra_params, api_model);
         let body = Self::build_request_body(
             api_model,
             &request.prompt,
             &request.aspect_ratio,
             request.reference_images.as_ref(),
+            reference_image_field,
         )?;
 
         let response = client
@@ -693,5 +736,79 @@ impl AIProvider for OpenAICompatibleProvider {
         Ok(ProviderTaskPollResult::Failed(
             "平台未提供可识别的任务状态端点(尝试了 /images/generations/<id> 与 /status)".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenAICompatibleProvider;
+
+    #[test]
+    fn builds_generic_image_field_when_configured() {
+        let references = vec!["data:image/png;base64,QUJD".to_string()];
+        let body = OpenAICompatibleProvider::build_request_body(
+            "gpt-image-2",
+            "edit the image",
+            "1:1",
+            Some(&references),
+            "image",
+        )
+        .expect("request body should be built");
+
+        assert_eq!(body["image"], "data:image/png;base64,QUJD");
+        assert!(body.get("input_image").is_none());
+    }
+
+    #[test]
+    fn builds_native_input_image_field_when_configured() {
+        let references = vec!["data:image/png;base64,QUJD".to_string()];
+        let body = OpenAICompatibleProvider::build_request_body(
+            "gpt-image-2",
+            "edit the image",
+            "1:1",
+            Some(&references),
+            "input_image",
+        )
+        .expect("request body should be built");
+
+        assert_eq!(body["input_image"], "QUJD");
+        assert!(body.get("image").is_none());
+    }
+
+    #[test]
+    fn keeps_all_generic_reference_images() {
+        let references = vec![
+            "data:image/png;base64,QUJD".to_string(),
+            "data:image/png;base64,REVG".to_string(),
+        ];
+        let body = OpenAICompatibleProvider::build_request_body(
+            "gpt-image-2",
+            "combine both images",
+            "1:1",
+            Some(&references),
+            "image",
+        )
+        .expect("request body should be built");
+
+        assert_eq!(body["image"], "data:image/png;base64,QUJD");
+        assert_eq!(body["images"], serde_json::json!(references));
+    }
+
+    #[test]
+    fn keeps_all_native_reference_images() {
+        let references = vec![
+            "data:image/png;base64,QUJD".to_string(),
+            "data:image/png;base64,REVG".to_string(),
+        ];
+        let body = OpenAICompatibleProvider::build_request_body(
+            "gpt-image-1",
+            "combine both images",
+            "1:1",
+            Some(&references),
+            "input_image",
+        )
+        .expect("request body should be built");
+
+        assert_eq!(body["input_image"], serde_json::json!(["QUJD", "REVG"]));
     }
 }

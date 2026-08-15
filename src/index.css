@@ -170,6 +170,15 @@ html[data-platform='macos'] #root {
   height: 8px;
 }
 
+/* 所有类型节点使用同一套选中描边，不改变节点自身亮度。 */
+.react-flow__node.selected > * {
+  border-color: rgb(var(--accent-rgb) / 0.98) !important;
+  box-shadow:
+    0 0 0 2px rgb(var(--accent-rgb) / 0.95),
+    0 0 0 4px rgb(var(--accent-rgb) / 0.28),
+    0 8px 22px rgb(var(--accent-rgb) / 0.24) !important;
+}
+
 .ui-panel {
   background: var(--ui-surface-panel);
   border-color: var(--ui-border-soft);

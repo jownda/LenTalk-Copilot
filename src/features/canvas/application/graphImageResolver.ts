@@ -1,8 +1,11 @@
 import {
+  isDirectorDeskNode,
   isExportImageNode,
   isGroupNode,
   isImageEditNode,
   isPanoramaNode,
+  isStoryboardGenNode,
+  isStoryboardSplitNode,
   isUploadNode,
   type CanvasEdge,
   type CanvasNode,
@@ -43,6 +46,21 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
         return [node.data.outputImageUrl];
       }
       return node.data.inputImageUrl ? [node.data.inputImageUrl] : [];
+    }
+
+    if (isStoryboardSplitNode(node)) {
+      return [...node.data.frames]
+        .sort((left, right) => left.order - right.order)
+        .map((frame) => frame.imageUrl ?? frame.previewImageUrl ?? null)
+        .filter((imageUrl): imageUrl is string => Boolean(imageUrl));
+    }
+
+    if (isStoryboardGenNode(node)) {
+      return node.data.imageUrl ? [node.data.imageUrl] : [];
+    }
+
+    if (isDirectorDeskNode(node)) {
+      return node.data.lastCaptureUrl ? [node.data.lastCaptureUrl] : [];
     }
 
     if (isUploadNode(node) || isImageEditNode(node) || isExportImageNode(node)) {

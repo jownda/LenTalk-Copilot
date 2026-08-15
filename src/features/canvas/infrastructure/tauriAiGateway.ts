@@ -33,8 +33,9 @@ function injectCustomApiRequestMode(payload: GenerateImagePayload): GenerateImag
   const customApi = useSettingsStore
     .getState()
     .customApis.find((api) => api.id === providerId);
-  const requestMode = customApi?.requestMode ?? 'sync';
+  const requestMode = customApi?.requestMode ?? 'async';
   const protocol = customApi?.protocol ?? 'images';
+  const referenceImageField = customApi?.referenceImageField ?? 'image';
   const extraParams: Record<string, unknown> = {
     ...(payload.extraParams ?? {}),
   };
@@ -44,6 +45,7 @@ function injectCustomApiRequestMode(payload: GenerateImagePayload): GenerateImag
   if (protocol === 'responses') {
     extraParams.protocol = 'responses';
   }
+  extraParams.reference_image_field = referenceImageField;
   return {
     ...payload,
     extraParams,

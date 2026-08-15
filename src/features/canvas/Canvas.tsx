@@ -55,6 +55,7 @@ import type { NodeAlignMode } from '@/features/canvas/application/canvasLayout';
 import { nodeTypes } from './nodes';
 import { edgeTypes } from './edges';
 import { NodeSelectionMenu } from './NodeSelectionMenu';
+import { CanvasContextMenu } from './CanvasContextMenu';
 import { SelectedNodeOverlay } from './ui/SelectedNodeOverlay';
 import { NodeToolDialog } from './ui/NodeToolDialog';
 import { ImageViewerModal } from './ui/ImageViewerModal';
@@ -62,7 +63,13 @@ import { VideoFrameExtractDialog } from './ui/VideoFrameExtractDialog';
 import { ShortcutSettingsDialog } from './ui/ShortcutSettingsDialog';
 import { AssetLibraryPanel } from '@/features/library/AssetLibraryPanel';
 import { useAssetLibraryStore } from '@/features/library/assetStore';
-import { ASSET_DRAG_DATA_TYPE, parseAssetDragPayload, PROMPT_DRAG_DATA_TYPE, parsePromptDragPayload } from '@/features/library/importAssets';
+import {
+  ASSET_DRAG_DATA_TYPE,
+  importImageUrlToAsset,
+  parseAssetDragPayload,
+  PROMPT_DRAG_DATA_TYPE,
+  parsePromptDragPayload,
+} from '@/features/library/importAssets';
 import { usePromptLibraryStore, type PromptTemplate } from '@/features/prompts/promptLibraryStore';
 
 const DEFAULT_VIEWPORT: Viewport = { x: 0, y: 0, zoom: 1 };
@@ -77,6 +84,35 @@ const ALIGN_OPTIONS: Array<{ mode: NodeAlignMode; label: string }> = [
   { mode: 'distributeH', label: '水平等距' },
   { mode: 'distributeV', label: '垂直等距' },
 ];
+
+function isFailedGenerationResultNode(node: CanvasNode): boolean {
+  if (node.type !== CANVAS_NODE_TYPES.exportImage) {
+    return false;
+  }
+
+  const data = node.data as {
+    imageUrl?: unknown;
+    isGenerating?: unknown;
+    generationError?: unknown;
+  };
+  const hasGeneratedImage = typeof data.imageUrl === 'string' && data.imageUrl.trim().length > 0;
+  return data.isGenerating !== true
+    && !hasGeneratedImage
+    && typeof data.generationError === 'string'
+    && data.generationError.trim().length > 0;
+}
+
+function resolveContextMenuImageUrl(node: CanvasNode): string | null {
+  const data = node.data as {
+    imageUrl?: unknown;
+    inputImageUrl?: unknown;
+    outputImageUrl?: unknown;
+  };
+  const candidates = [data.imageUrl, data.outputImageUrl, data.inputImageUrl];
+  return candidates.find(
+    (imageUrl): imageUrl is string => typeof imageUrl === 'string' && imageUrl.trim().length > 0
+  ) ?? null;
+}
 
 function resolveCanvasNodeAbsolutePosition(
   nodeId: string,
@@ -339,6 +375,10 @@ export function Canvas() {
   const suppressNextEdgeClickRef = useRef(false);
 
   const [showNodeMenu, setShowNodeMenu] = useState(false);
+  const [canvasContextMenu, setCanvasContextMenu] = useState<{
+    position: { x: number; y: number };
+    imageUrl: string | null;
+  } | null>(null);
   const [menuPosition, setMenuPosition] = useState({ x: 0, y: 0 });
   const [flowPosition, setFlowPosition] = useState({ x: 0, y: 0 });
   const [menuAllowedTypes, setMenuAllowedTypes] = useState<CanvasNodeType[] | undefined>(
@@ -419,6 +459,20 @@ export function Canvas() {
   const apiKeys = useSettingsStore((state) => state.apiKeys);
   const snapToGrid = useSettingsStore((state) => state.snapToGrid);
   const setSnapToGrid = useSettingsStore((state) => state.setSnapToGrid);
+  const assetLibraries = useAssetLibraryStore((state) => state.libraries);
+  const activeAssetLibraryId = useAssetLibraryStore((state) => state.activeLibraryId);
+  const assetCategories = useAssetLibraryStore((state) => state.categories);
+
+  const failedGenerationNodeIds = useMemo(
+    () => nodes.filter(isFailedGenerationResultNode).map((node) => node.id),
+    [nodes]
+  );
+  const activeAssetLibraryCategories = useMemo(() => {
+    const libraryId = activeAssetLibraryId || assetLibraries[0]?.id;
+    return libraryId
+      ? assetCategories.filter((category) => category.libraryId === libraryId)
+      : [];
+  }, [activeAssetLibraryId, assetCategories, assetLibraries]);
 
   const getCurrentProject = useProjectStore((state) => state.getCurrentProject);
   const saveCurrentProject = useProjectStore((state) => state.saveCurrentProject);
@@ -1311,7 +1365,75 @@ export function Canvas() {
     setMenuAllowedTypes(undefined);
     setPendingConnectStart(null);
     setPreviewConnectionVisual(null);
+    setCanvasContextMenu(null);
   }, [openNodeMenuAtClientPosition, setSelectedNode]);
+
+  const openCanvasContextMenu = useCallback((
+    event: MouseEvent | ReactMouseEvent,
+    imageUrl: string | null
+  ) => {
+    event.preventDefault();
+    const containerRect = wrapperRef.current?.getBoundingClientRect();
+    if (!containerRect) {
+      return;
+    }
+
+    setShowNodeMenu(false);
+    setMenuAllowedTypes(undefined);
+    setPendingConnectStart(null);
+    setPreviewConnectionVisual(null);
+    setCanvasContextMenu({
+      position: {
+        x: event.clientX - containerRect.left,
+        y: event.clientY - containerRect.top,
+      },
+      imageUrl,
+    });
+  }, []);
+
+  const handleCanvasContextMenu = useCallback(
+    (event: MouseEvent | ReactMouseEvent) => openCanvasContextMenu(event, null),
+    [openCanvasContextMenu]
+  );
+
+  const handleNodeContextMenu = useCallback(
+    (event: ReactMouseEvent, node: CanvasNode) => {
+      const imageUrl = resolveContextMenuImageUrl(node);
+      if (!imageUrl) {
+        event.preventDefault();
+        setCanvasContextMenu(null);
+        return;
+      }
+      openCanvasContextMenu(event, imageUrl);
+    },
+    [openCanvasContextMenu]
+  );
+
+  const handleClearFailedNodes = useCallback(() => {
+    if (failedGenerationNodeIds.length === 0) {
+      return;
+    }
+    deleteNodes(failedGenerationNodeIds);
+    setCanvasContextMenu(null);
+    scheduleCanvasPersist(0);
+  }, [deleteNodes, failedGenerationNodeIds, scheduleCanvasPersist]);
+
+  const handleAddImageToLibrary = useCallback(async (imageUrl: string, categoryId: string) => {
+    setCanvasContextMenu(null);
+    const assetLibraryState = useAssetLibraryStore.getState();
+    const libraryId = assetLibraryState.activeLibraryId || assetLibraryState.libraries[0]?.id;
+    if (!libraryId) {
+      return;
+    }
+
+    const asset = await importImageUrlToAsset(imageUrl, libraryId, categoryId);
+    if (asset) {
+      useAssetLibraryStore.getState().addAssets([asset]);
+      return;
+    }
+
+    void showErrorDialog('无法将该图片添加到素材库', '添加失败');
+  }, []);
 
   const handleAssetLibraryDragOver = useCallback((event: ReactDragEvent) => {
     const types = event.dataTransfer.types;
@@ -2291,6 +2413,7 @@ export function Canvas() {
         onNodeDrag={handleNodeDrag}
         onNodeDragStop={handleNodeDragStop}
         onPaneClick={handlePaneClick}
+        onNodeContextMenu={(event, node) => handleNodeContextMenu(event, node as CanvasNode)}
         onDragOver={handleAssetLibraryDragOver}
         onDrop={handleAssetLibraryDrop}
         onMove={handleMove}
@@ -2308,7 +2431,7 @@ export function Canvas() {
         panOnDrag={[0, 1, 2]}
         // 禁用空格临时平移(默认 Space 会让光标随按键重复闪烁)
         panActivationKeyCode={null}
-        onPaneContextMenu={(event) => event.preventDefault()}
+        onPaneContextMenu={handleCanvasContextMenu}
         selectionMode={SelectionMode.Partial}
         multiSelectionKeyCode={['Control', 'Meta']}
         selectionKeyCode={['Control', 'Meta']}
@@ -2479,6 +2602,18 @@ export function Canvas() {
             setPendingConnectStart(null);
             setPreviewConnectionVisual(null);
           }}
+        />
+      )}
+
+      {canvasContextMenu && (
+        <CanvasContextMenu
+          position={canvasContextMenu.position}
+          imageUrl={canvasContextMenu.imageUrl}
+          categories={activeAssetLibraryCategories}
+          failedNodeCount={failedGenerationNodeIds.length}
+          onClearFailedNodes={handleClearFailedNodes}
+          onAddImageToLibrary={handleAddImageToLibrary}
+          onClose={() => setCanvasContextMenu(null)}
         />
       )}
 

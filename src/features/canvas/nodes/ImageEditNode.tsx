@@ -253,29 +253,26 @@ function renderPromptWithHighlights(
     }
 
     if (imageUrl) {
-      // 引用缩略图: 绝对定位覆盖在 token 文字上(不占文档流),
-      // 保证高亮层排版与 textarea 完全一致、光标不错位; 点击放大查看
+      // 缩略图填满 token 的文本宽度，既保持光标位置一致，也不留下额外空隙。
       segments.push(
         <span
           key={`ref-${matchStart}`}
-          className="relative z-0 text-white [text-shadow:0.24px_0_currentColor,-0.24px_0_currentColor] before:absolute before:-inset-x-[4px] before:-inset-y-[1px] before:-z-10 before:rounded-[7px] before:bg-accent/55 before:content-['']"
+          className="relative z-0 inline-block whitespace-nowrap align-text-bottom text-transparent"
         >
           {matchText}
           <span
-            className="nodrag pointer-events-auto absolute left-1/2 top-1/2 inline-flex -translate-x-1/2 -translate-y-1/2 cursor-zoom-in items-center justify-center overflow-hidden rounded-[6px] bg-accent/70"
-            style={{ width: 18, height: 18, boxSizing: 'border-box' }}
+            className="nodrag pointer-events-auto absolute inset-x-0 top-1/2 inline-flex h-5 -translate-y-1/2 cursor-zoom-in items-center justify-center overflow-hidden rounded-[6px] bg-accent/70"
             onClick={(event) => {
               event.stopPropagation();
               onThumbnailClick?.(imageUrl, event);
             }}
             onMouseDown={(event) => event.stopPropagation()}
-            title={matchText}
           >
             <img
               src={imageUrl}
               alt={matchText}
               draggable={false}
-              className="h-[13px] w-[13px] shrink-0 rounded-[3px] object-cover"
+              className="h-full w-full shrink-0 object-cover"
             />
           </span>
         </span>
@@ -284,7 +281,7 @@ function renderPromptWithHighlights(
       segments.push(
         <span
           key={`ref-${matchStart}`}
-          className="relative z-0 text-white [text-shadow:0.24px_0_currentColor,-0.24px_0_currentColor] before:absolute before:-inset-x-[4px] before:-inset-y-[1px] before:-z-10 before:rounded-[7px] before:bg-accent/55 before:content-['']"
+          className="relative z-0 text-transparent"
         >
           {matchText}
         </span>

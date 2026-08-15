@@ -3,7 +3,7 @@ import { X, Eye, EyeOff, FolderOpen, Pencil, Plus, Trash2, ChevronDown, ChevronR
 import { Trans, useTranslation } from 'react-i18next';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useSettingsStore } from '@/stores/settingsStore';
-import { fetchProviderModels, testProviderConnection, verifyProviderUrl } from '@/commands/ai';
+import { testProviderConnection, verifyProviderUrl } from '@/commands/ai';
 import { recommendedApis } from '@/features/settings/recommendedApis';
 import { UiCheckbox, UiSelect } from '@/components/ui';
 import { UI_CONTENT_OVERLAY_INSET_CLASS, UI_DIALOG_TRANSITION_MS } from '@/components/ui/motion';
@@ -206,8 +206,9 @@ export function SettingsDialog({
     baseUrl: '',
     apiKey: '',
     modelsText: '',
-    requestMode: 'sync' as 'sync' | 'async',
+    requestMode: 'async' as 'sync' | 'async',
     protocol: 'images' as 'images' | 'responses',
+    referenceImageField: 'image' as 'image' | 'input_image',
   });
   const [customApiBusy, setCustomApiBusy] = useState<'idle' | 'testing' | 'fetching'>('idle');
   const [customApiStatus, setCustomApiStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
@@ -221,8 +222,9 @@ export function SettingsDialog({
       baseUrl: api.baseUrl,
       apiKey: '',
       modelsText: api.models.join('\n'),
-      requestMode: 'sync',
+      requestMode: 'async',
       protocol: 'images',
+      referenceImageField: 'image',
     });
     setShowAddCustomApi(true);
     setCustomApiStatus(null);
@@ -270,6 +272,16 @@ export function SettingsDialog({
     setCustomApiStatus(null);
     try {
       const result = await testProviderConnection(baseUrl, apiKey);
+      const models = result.models ?? [];
+      const hasNativeGptImage = models.some((model) => /^gpt-image-1(?:$|[-_])/i.test(model));
+      setCustomApiDraft((previous) => ({
+        ...previous,
+        modelsText: models.length > 0 ? models.join('\n') : previous.modelsText,
+        // 异步提交同时兼容平台直接返回图片和返回任务 ID 两种行为。
+        requestMode: 'async',
+        protocol: 'images',
+        referenceImageField: hasNativeGptImage ? 'input_image' : 'image',
+      }));
       setCustomApiStatus({
         type: 'ok',
         text: t('settings.customApiTestOk', { count: result.count ?? 0 }),
@@ -278,36 +290,6 @@ export function SettingsDialog({
       setCustomApiStatus({
         type: 'err',
         text: `${t('settings.customApiTestFailed')} ${error instanceof Error ? error.message : String(error)}`,
-      });
-    } finally {
-      setCustomApiBusy('idle');
-    }
-  }, [customApiDraft.apiKey, customApiDraft.baseUrl, t]);
-
-  /** 从自定义平台拉取模型列表(填入表单) */
-  const handleFetchCustomModels = useCallback(async () => {
-    const baseUrl = customApiDraft.baseUrl.trim().replace(/\/+$/, '');
-    const apiKey = customApiDraft.apiKey.trim();
-    if (!baseUrl) {
-      setCustomApiStatus({ type: 'err', text: t('settings.customApiTestNeedUrl') });
-      return;
-    }
-    setCustomApiBusy('fetching');
-    setCustomApiStatus(null);
-    try {
-      const result = await fetchProviderModels(baseUrl, apiKey);
-      setCustomApiDraft((previous) => ({
-        ...previous,
-        modelsText: result.models.join('\n'),
-      }));
-      setCustomApiStatus({
-        type: 'ok',
-        text: t('settings.customApiFetched', { count: result.count }),
-      });
-    } catch (error) {
-      setCustomApiStatus({
-        type: 'err',
-        text: `${t('settings.customApiFetchFailed')} ${error instanceof Error ? error.message : String(error)}`,
       });
     } finally {
       setCustomApiBusy('idle');
@@ -327,6 +309,7 @@ export function SettingsDialog({
       modelsText: api.models.join('\n'),
       requestMode: api.requestMode,
       protocol: api.protocol,
+      referenceImageField: api.referenceImageField ?? 'image',
     });
     setShowAddCustomApi(true);
   }, []);
@@ -334,7 +317,15 @@ export function SettingsDialog({
   const resetCustomApiForm = useCallback(() => {
     setShowAddCustomApi(false);
     setEditingCustomApiId(null);
-    setCustomApiDraft({ name: '', baseUrl: '', apiKey: '', modelsText: '', requestMode: 'sync', protocol: 'images' });
+    setCustomApiDraft({
+      name: '',
+      baseUrl: '',
+      apiKey: '',
+      modelsText: '',
+      requestMode: 'async',
+      protocol: 'images',
+      referenceImageField: 'image',
+    });
   }, []);
 
   const submitCustomApi = useCallback(() => {
@@ -355,6 +346,7 @@ export function SettingsDialog({
         models,
         requestMode: customApiDraft.requestMode,
         protocol: customApiDraft.protocol,
+        referenceImageField: customApiDraft.referenceImageField,
       });
     } else {
       addCustomApi({
@@ -364,6 +356,7 @@ export function SettingsDialog({
         models,
         requestMode: customApiDraft.requestMode,
         protocol: customApiDraft.protocol,
+        referenceImageField: customApiDraft.referenceImageField,
       });
     }
     resetCustomApiForm();
@@ -942,74 +935,7 @@ export function SettingsDialog({
                             className="ui-scrollbar w-full resize-none rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
                           />
                         </label>
-                        <div>
-                          <span className="mb-1 block text-[11px] text-text-muted">
-                            {t('settings.customApiRequestMode', '请求模式')}
-                          </span>
-                          <div className="flex gap-2">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setCustomApiDraft({ ...customApiDraft, requestMode: 'sync' })
-                              }
-                              className={`flex-1 rounded border px-2.5 py-1.5 text-[11px] transition-colors ${
-                                customApiDraft.requestMode === 'sync'
-                                  ? 'border-accent/60 bg-accent/15 text-text-dark'
-                                  : 'border-border-dark text-text-muted hover:text-text-dark'
-                              }`}
-                            >
-                              {t('settings.customApiRequestModeSync', '同步(等待平台直接返回)')}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setCustomApiDraft({ ...customApiDraft, requestMode: 'async' })
-                              }
-                              className={`flex-1 rounded border px-2.5 py-1.5 text-[11px] transition-colors ${
-                                customApiDraft.requestMode === 'async'
-                                  ? 'border-accent/60 bg-accent/15 text-text-dark'
-                                  : 'border-border-dark text-text-muted hover:text-text-dark'
-                              }`}
-                            >
-                              {t('settings.customApiRequestModeAsync', '异步(提交后轮询结果)')}
-                            </button>
-                          </div>
-                        </div>
-                        <div>
-                          <span className="mb-1 block text-[11px] text-text-muted">
-                            {t('settings.customApiProtocol', '接口协议')}
-                          </span>
-                          <div className="flex gap-2">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setCustomApiDraft({ ...customApiDraft, protocol: 'images' })
-                              }
-                              className={`flex-1 rounded border px-2.5 py-1.5 text-[11px] transition-colors ${
-                                customApiDraft.protocol === 'images'
-                                  ? 'border-accent/60 bg-accent/15 text-text-dark'
-                                  : 'border-border-dark text-text-muted hover:text-text-dark'
-                              }`}
-                            >
-                              {t('settings.customApiProtocolImages', 'Images(/v1/images/generations)')}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setCustomApiDraft({ ...customApiDraft, protocol: 'responses' })
-                              }
-                              className={`flex-1 rounded border px-2.5 py-1.5 text-[11px] transition-colors ${
-                                customApiDraft.protocol === 'responses'
-                                  ? 'border-accent/60 bg-accent/15 text-text-dark'
-                                  : 'border-border-dark text-text-muted hover:text-text-dark'
-                              }`}
-                            >
-                              {t('settings.customApiProtocolResponses', 'Responses(/v1/responses)')}
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* 验证链接 / 验证协议 / 拉取模型 */}
+                        {/* 验证连接会自动匹配请求模式、接口协议和参考图字段。 */}
                         <div className="flex flex-wrap items-center gap-2 pt-0.5">
                           <button
                             type="button"
@@ -1030,16 +956,6 @@ export function SettingsDialog({
                             {customApiBusy === 'testing'
                               ? t('settings.customApiTesting')
                               : t('settings.customApiVerifyProtocol')}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => void handleFetchCustomModels()}
-                            disabled={customApiBusy !== 'idle'}
-                            className="rounded-md border border-border-dark px-2.5 py-1 text-[11px] text-text-muted transition-colors hover:border-accent/50 hover:text-text-dark disabled:opacity-50"
-                          >
-                            {customApiBusy === 'fetching'
-                              ? t('settings.customApiFetching')
-                              : t('settings.customApiFetch')}
                           </button>
                           {customApiStatus && (
                             <span
@@ -1087,26 +1003,6 @@ export function SettingsDialog({
                             <span>
                               {api.models.length} {t('settings.customApiModelCount')} ·{' '}
                               {api.apiKey ? t('settings.customApiKeySet') : t('settings.customApiKeyMissing')}
-                            </span>
-                            <span
-                              className={`rounded px-1 py-px text-[10px] ${
-                                api.requestMode === 'async'
-                                  ? 'bg-accent/15 text-accent'
-                                  : 'bg-bg-dark text-text-muted/80'
-                              }`}
-                            >
-                              {api.requestMode === 'async'
-                                ? t('settings.customApiRequestModeAsyncShort', '异步')
-                                : t('settings.customApiRequestModeSyncShort', '同步')}
-                            </span>
-                            <span
-                              className={`rounded px-1 py-px text-[10px] ${
-                                api.protocol === 'responses'
-                                  ? 'bg-sky-500/15 text-sky-400'
-                                  : 'bg-bg-dark text-text-muted/80'
-                              }`}
-                            >
-                              {api.protocol === 'responses' ? 'Responses' : 'Images'}
                             </span>
                           </div>
                         </div>

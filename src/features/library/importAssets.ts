@@ -2,7 +2,7 @@ import { v4 as uuid } from 'uuid';
 import { isTauri } from '@tauri-apps/api/core';
 
 import { persistLibraryAssetBinary, extractVideoThumbnail } from '@/commands/assetLibrary';
-import { prepareNodeImageFromFile } from '@/features/canvas/application/imageData';
+import { imageUrlToDataUrl, prepareNodeImageFromFile } from '@/features/canvas/application/imageData';
 import { ASSET_LIBRARY_MIME_PREFIX, type AssetMediaType, type LibraryAsset } from './types';
 
 export function createAssetId(): string {
@@ -19,7 +19,9 @@ export async function importImageUrlToAsset(
   categoryId: string | null
 ): Promise<LibraryAsset | null> {
   try {
-    const response = await fetch(imageUrl);
+    // 画布结果在桌面端通常是本地路径，先转换为 data URL 才能稳定读取。
+    const normalizedImageUrl = await imageUrlToDataUrl(imageUrl);
+    const response = await fetch(normalizedImageUrl);
     if (!response.ok) {
       return null;
     }

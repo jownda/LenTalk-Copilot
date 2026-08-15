@@ -846,7 +846,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     const sourceWidth = sourceNode.measured?.width ?? DEFAULT_NODE_WIDTH;
     const sourceHeight = sourceNode.measured?.height ?? 200;
-    const anchorX = sourceNode.position.x + sourceWidth + 28;
+    const anchorX = sourceNode.position.x + sourceWidth + 20;
     const anchorY = sourceNode.position.y;
 
     const zoom = Math.max(0.01, state.currentViewport.zoom || 1);
@@ -873,17 +873,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return overLeft + overTop + overRight + overBottom;
     };
 
-    const stepX = Math.max(newNodeWidth + 12, 110);
-    const stepY = Math.max(Math.round(newNodeHeight * 0.35), 54);
-    const baseCandidates = [
-      { x: anchorX, y: anchorY },
-      { x: sourceNode.position.x, y: sourceNode.position.y + sourceHeight + 20 },
-      { x: sourceNode.position.x - newNodeWidth - 20, y: sourceNode.position.y },
-      { x: sourceNode.position.x, y: sourceNode.position.y - newNodeHeight - 20 },
-    ];
-
-    let bestInView: { x: number; y: number; score: number } | null = null;
-    let bestOutOfView: { x: number; y: number; score: number } | null = null;
+    const stepX = Math.max(newNodeWidth + 16, 110);
+    const stepY = Math.max(newNodeHeight + 16, 112);
+    const rightSideOffsets = [0, 1, 2, -1, 3, -2, 4, -3];
+    let bestCandidate: { x: number; y: number; score: number } | null = null;
 
     const evaluateCandidate = (x: number, y: number) => {
       if (collides(x, y, newNodeWidth, newNodeHeight)) {
@@ -893,46 +886,38 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       const dx = x - anchorX;
       const dy = y - anchorY;
       const distanceScore = Math.hypot(dx, dy);
-      // 下游节点期望在右侧/下方对齐, 禁止跑到源节点上方(否则右侧被占时会跳到上面)
-      const upwardPenalty = dy < 0 ? Math.abs(dy) * 50 + 50000 : 0;
+      // 右侧位置优先；同一列的下方位置优先于上方位置。
+      const nonRightPenalty = x < anchorX ? Math.max(80, Math.round(newNodeWidth * 0.75)) : 0;
+      const upwardPenalty = dy < 0 ? Math.round(newNodeHeight * 0.35) : 0;
       const overflow = overflowAmount(x, y);
-      const score = distanceScore + upwardPenalty + overflow * 1000;
+      // 保持与来源节点接近，比留在当前可视区域更重要。
+      const score = distanceScore + nonRightPenalty + upwardPenalty + overflow * 0.4;
       const candidate = { x, y, score };
 
-      if (overflow === 0) {
-        if (!bestInView || score < bestInView.score) {
-          bestInView = candidate;
-        }
-      } else if (!bestOutOfView || score < bestOutOfView.score) {
-        bestOutOfView = candidate;
+      if (!bestCandidate || score < bestCandidate.score) {
+        bestCandidate = candidate;
       }
     };
 
-    for (const base of baseCandidates) {
-      evaluateCandidate(base.x, base.y);
+    // 输出节点优先沿来源节点右边排列，右侧被占用时仅做就近的上下错位。
+    for (const offsetY of rightSideOffsets) {
+      evaluateCandidate(anchorX, anchorY + offsetY * stepY);
     }
 
-    for (let ring = 1; ring <= 8; ring += 1) {
-      const offsets = [
-        { x: ring, y: 0 },
-        { x: ring, y: 1 },
-        { x: ring, y: 2 },
-        { x: 0, y: ring },
-        { x: -ring, y: 0 },
-        { x: -ring, y: 1 },
-        { x: -ring, y: 2 },
-        { x: ring, y: 3 },
-        { x: -ring, y: 3 },
-        { x: 0, y: ring + 1 },
-      ];
-      for (const offset of offsets) {
-        evaluateCandidate(anchorX + offset.x * stepX, anchorY + offset.y * stepY);
+    for (let column = 1; column <= 4; column += 1) {
+      for (const offsetY of rightSideOffsets) {
+        evaluateCandidate(anchorX + column * stepX, anchorY + offsetY * stepY);
       }
     }
 
+    // 只有右侧附近均无空位时，才考虑来源节点的其他方向。
+    evaluateCandidate(sourceNode.position.x, sourceNode.position.y + sourceHeight + 20);
+    evaluateCandidate(sourceNode.position.x - newNodeWidth - 20, sourceNode.position.y);
+    evaluateCandidate(sourceNode.position.x, sourceNode.position.y - newNodeHeight - 20);
+
     // If ring sampling misses an available slot in current viewport,
     // run a denser viewport sweep before falling back outside view.
-    if (!bestInView && visibleBounds) {
+    if (!bestCandidate && visibleBounds) {
       const padding = 8;
       const minX = visibleBounds.minX + padding;
       const maxX = visibleBounds.maxX - newNodeWidth - padding;
@@ -957,9 +942,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       }
     }
 
-    const resolvedCandidate = (bestInView || bestOutOfView) as
-      | { x: number; y: number; score: number }
-      | null;
+    const resolvedCandidate = bestCandidate as { x: number; y: number; score: number } | null;
     if (resolvedCandidate) {
       return { x: resolvedCandidate.x, y: resolvedCandidate.y };
     }

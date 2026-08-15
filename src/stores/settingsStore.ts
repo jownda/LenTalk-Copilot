@@ -25,10 +25,13 @@ export interface CustomApiProvider {
   requestMode: 'sync' | 'async';
   /** 接口协议: images=/v1/images/generations; responses=/v1/responses(gpt-image 中转平台常用) */
   protocol: 'images' | 'responses';
+  /** Images 协议的参考图字段: 大多数中转平台用 image, 原生 GPT Image 用 input_image。 */
+  referenceImageField: 'image' | 'input_image';
 }
 
 export type CustomApiRequestMode = CustomApiProvider['requestMode'];
 export type CustomApiProtocol = CustomApiProvider['protocol'];
+export type CustomApiReferenceImageField = CustomApiProvider['referenceImageField'];
 
 /** 自定义平台在模型/密钥体系里的 provider id 前缀 */
 export const CUSTOM_API_PROVIDER_PREFIX = 'custom:';
@@ -193,8 +196,10 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         ? item.models.map((model) => String(model).trim()).filter(Boolean)
         : [],
       createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
-      requestMode: item.requestMode === 'async' ? ('async' as const) : ('sync' as const),
+      requestMode: item.requestMode === 'sync' ? ('sync' as const) : ('async' as const),
       protocol: item.protocol === 'responses' ? ('responses' as const) : ('images' as const),
+      referenceImageField:
+        item.referenceImageField === 'input_image' ? ('input_image' as const) : ('image' as const),
     }))
     .filter((item) => item.id && item.name && item.baseUrl);
 }
@@ -355,7 +360,7 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'settings-storage',
-      version: 12,
+      version: 14,
       onRehydrateStorage: () => {
         return (_state, error) => {
           if (error) {
