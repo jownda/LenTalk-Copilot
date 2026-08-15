@@ -20,6 +20,25 @@ function mergeNegativePrompt(
   return Object.keys(extras).length > 0 ? extras : payload.extraParams;
 }
 
+/**
+ * 参考图引用标记本地化:
+ * 画布提示词里用 `@图N` 引用参考图(提交前被去掉 @ 变为 `图N`),
+ * 参考图按数组顺序传给后端(image_urls / urls / image_base64s)。
+ * 英文模型(fal / ppio gemini)的引用协议是 `Image N`, 中文 `图N` 会被当作普通文字,
+ * 导致模型无法把引用与参考图对应 —— 这里按模型把标记转换成协议语言。
+ * 仅当 token 前是行首/空白/标点时视为引用, 避免误伤正文里的"如图1所示"等普通文字。
+ */
+export function localizeReferenceTokens(prompt: string, model: string): string {
+  if (!prompt) return prompt;
+  const usesEnglishProtocol = model.startsWith('fal/') || model.startsWith('ppio/');
+  if (!usesEnglishProtocol) return prompt;
+
+  return prompt.replace(
+    /(^|[\s，。；：、,.;:！？!?（）()【】\[\]"'“”‘’])(@?\s*图)(\d+)/g,
+    (_match, prefix: string, _marker: string, index: string) => `${prefix}Image ${index}`
+  );
+}
+
 async function normalizeReferenceImages(payload: GenerateImagePayload): Promise<string[] | undefined> {
   const isKieModel = payload.model.startsWith('kie/');
   const isFalModel = payload.model.startsWith('fal/');
@@ -41,7 +60,7 @@ export const tauriAiGateway: AiGateway = {
     const mergedExtraParams = mergeNegativePrompt(payload);
 
     return await generateImage({
-      prompt: payload.prompt,
+      prompt: localizeReferenceTokens(payload.prompt, payload.model),
       negative_prompt: payload.negativePrompt,
       model: payload.model,
       size: payload.size,
@@ -54,7 +73,7 @@ export const tauriAiGateway: AiGateway = {
     const normalizedReferenceImages = await normalizeReferenceImages(payload);
     const mergedExtraParams = mergeNegativePrompt(payload);
     return await submitGenerateImageJob({
-      prompt: payload.prompt,
+      prompt: localizeReferenceTokens(payload.prompt, payload.model),
       negative_prompt: payload.negativePrompt,
       model: payload.model,
       size: payload.size,
