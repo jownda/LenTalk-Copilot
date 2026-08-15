@@ -34,15 +34,19 @@ function injectCustomApiRequestMode(payload: GenerateImagePayload): GenerateImag
     .getState()
     .customApis.find((api) => api.id === providerId);
   const requestMode = customApi?.requestMode ?? 'sync';
-  if (requestMode === 'sync') {
-    return payload;
+  const protocol = customApi?.protocol ?? 'images';
+  const extraParams: Record<string, unknown> = {
+    ...(payload.extraParams ?? {}),
+  };
+  if (requestMode === 'async') {
+    extraParams.request_mode = 'async';
+  }
+  if (protocol === 'responses') {
+    extraParams.protocol = 'responses';
   }
   return {
     ...payload,
-    extraParams: {
-      ...(payload.extraParams ?? {}),
-      request_mode: 'async',
-    },
+    extraParams,
   };
 }
 

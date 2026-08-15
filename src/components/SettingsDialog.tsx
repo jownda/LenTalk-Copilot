@@ -207,6 +207,7 @@ export function SettingsDialog({
     apiKey: '',
     modelsText: '',
     requestMode: 'sync' as 'sync' | 'async',
+    protocol: 'images' as 'images' | 'responses',
   });
   const [customApiBusy, setCustomApiBusy] = useState<'idle' | 'testing' | 'fetching'>('idle');
   const [customApiStatus, setCustomApiStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
@@ -221,6 +222,7 @@ export function SettingsDialog({
       apiKey: '',
       modelsText: api.models.join('\n'),
       requestMode: 'sync',
+      protocol: 'images',
     });
     setShowAddCustomApi(true);
     setCustomApiStatus(null);
@@ -324,6 +326,7 @@ export function SettingsDialog({
       apiKey: api.apiKey,
       modelsText: api.models.join('\n'),
       requestMode: api.requestMode,
+      protocol: api.protocol,
     });
     setShowAddCustomApi(true);
   }, []);
@@ -331,7 +334,7 @@ export function SettingsDialog({
   const resetCustomApiForm = useCallback(() => {
     setShowAddCustomApi(false);
     setEditingCustomApiId(null);
-    setCustomApiDraft({ name: '', baseUrl: '', apiKey: '', modelsText: '', requestMode: 'sync' });
+    setCustomApiDraft({ name: '', baseUrl: '', apiKey: '', modelsText: '', requestMode: 'sync', protocol: 'images' });
   }, []);
 
   const submitCustomApi = useCallback(() => {
@@ -351,6 +354,7 @@ export function SettingsDialog({
         apiKey: customApiDraft.apiKey.trim(),
         models,
         requestMode: customApiDraft.requestMode,
+        protocol: customApiDraft.protocol,
       });
     } else {
       addCustomApi({
@@ -359,6 +363,7 @@ export function SettingsDialog({
         apiKey: customApiDraft.apiKey.trim(),
         models,
         requestMode: customApiDraft.requestMode,
+        protocol: customApiDraft.protocol,
       });
     }
     resetCustomApiForm();
@@ -970,6 +975,39 @@ export function SettingsDialog({
                             </button>
                           </div>
                         </div>
+                        <div>
+                          <span className="mb-1 block text-[11px] text-text-muted">
+                            {t('settings.customApiProtocol', '接口协议')}
+                          </span>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setCustomApiDraft({ ...customApiDraft, protocol: 'images' })
+                              }
+                              className={`flex-1 rounded border px-2.5 py-1.5 text-[11px] transition-colors ${
+                                customApiDraft.protocol === 'images'
+                                  ? 'border-accent/60 bg-accent/15 text-text-dark'
+                                  : 'border-border-dark text-text-muted hover:text-text-dark'
+                              }`}
+                            >
+                              {t('settings.customApiProtocolImages', 'Images(/v1/images/generations)')}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setCustomApiDraft({ ...customApiDraft, protocol: 'responses' })
+                              }
+                              className={`flex-1 rounded border px-2.5 py-1.5 text-[11px] transition-colors ${
+                                customApiDraft.protocol === 'responses'
+                                  ? 'border-accent/60 bg-accent/15 text-text-dark'
+                                  : 'border-border-dark text-text-muted hover:text-text-dark'
+                              }`}
+                            >
+                              {t('settings.customApiProtocolResponses', 'Responses(/v1/responses)')}
+                            </button>
+                          </div>
+                        </div>
 
                         {/* 验证链接 / 验证协议 / 拉取模型 */}
                         <div className="flex flex-wrap items-center gap-2 pt-0.5">
@@ -1060,6 +1098,15 @@ export function SettingsDialog({
                               {api.requestMode === 'async'
                                 ? t('settings.customApiRequestModeAsyncShort', '异步')
                                 : t('settings.customApiRequestModeSyncShort', '同步')}
+                            </span>
+                            <span
+                              className={`rounded px-1 py-px text-[10px] ${
+                                api.protocol === 'responses'
+                                  ? 'bg-sky-500/15 text-sky-400'
+                                  : 'bg-bg-dark text-text-muted/80'
+                              }`}
+                            >
+                              {api.protocol === 'responses' ? 'Responses' : 'Images'}
                             </span>
                           </div>
                         </div>

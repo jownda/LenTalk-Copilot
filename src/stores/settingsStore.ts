@@ -23,9 +23,12 @@ export interface CustomApiProvider {
   createdAt: number;
   /** 请求模式: sync=同步等待平台返回图片; async=提交后轮询任务状态 */
   requestMode: 'sync' | 'async';
+  /** 接口协议: images=/v1/images/generations; responses=/v1/responses(gpt-image 中转平台常用) */
+  protocol: 'images' | 'responses';
 }
 
 export type CustomApiRequestMode = CustomApiProvider['requestMode'];
+export type CustomApiProtocol = CustomApiProvider['protocol'];
 
 /** 自定义平台在模型/密钥体系里的 provider id 前缀 */
 export const CUSTOM_API_PROVIDER_PREFIX = 'custom:';
@@ -191,6 +194,7 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         : [],
       createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
       requestMode: item.requestMode === 'async' ? ('async' as const) : ('sync' as const),
+      protocol: item.protocol === 'responses' ? ('responses' as const) : ('images' as const),
     }))
     .filter((item) => item.id && item.name && item.baseUrl);
 }

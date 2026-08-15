@@ -189,6 +189,79 @@ impl OpenAICompatibleProvider {
         Ok(body)
     }
 
+    /// 是否走 Responses API 协议(extra_params.protocol == "responses")。
+    /// 部分 gpt-image 中转平台(如 comfly)用 /v1/responses + image_generation tool,
+    /// 而非 /v1/images/generations。
+    fn is_responses_protocol(extra_params: &Option<HashMap<String, Value>>) -> bool {
+        extra_params
+            .as_ref()
+            .and_then(|params| params.get("protocol"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.eq_ignore_ascii_case("responses"))
+            .unwrap_or(false)
+    }
+
+    /// 构造 Responses API 请求体: input_text + input_image + image_generation tool。
+    fn build_responses_body(
+        api_model: &str,
+        prompt: &str,
+        aspect_ratio: &str,
+        reference_images: Option<&Vec<String>>,
+    ) -> Result<Value, AIError> {
+        let mut content: Vec<Value> = vec![json!({ "type": "input_text", "text": prompt })];
+        if let Some(images) = reference_images {
+            for reference in images.iter() {
+                if let Some(field) = Self::reference_image_to_image_field(reference)? {
+                    content.push(json!({ "type": "input_image", "image_url": field }));
+                }
+            }
+        }
+        let action = if reference_images.map_or(false, |images| !images.is_empty()) {
+            "edit"
+        } else {
+            "generate"
+        };
+        let mut tool = json!({ "type": "image_generation", "action": action });
+        tool["size"] = json!(Self::map_gpt_image_size(aspect_ratio));
+        Ok(json!({
+            "model": api_model,
+            "input": [{ "role": "user", "content": content }],
+            "tools": [tool],
+            "tool_choice": { "type": "image_generation" },
+        }))
+    }
+
+    /// 解析 Responses 输出: output[] 里 image_generation_call.result(b64/url) 或 image.image_url。
+    fn extract_responses_image(payload: &Value) -> Option<String> {
+        let output = payload.get("output").and_then(|value| value.as_array())?;
+        for item in output {
+            if let Some(result) = item.get("result").and_then(|value| value.as_str()) {
+                if result.is_empty() {
+                    continue;
+                }
+                if result.starts_with("http://") || result.starts_with("https://") || result.starts_with("data:") {
+                    return Some(result.to_string());
+                }
+                return Some(format!("data:image/png;base64,{}", result));
+            }
+            if let Some(image_url) = item.get("image_url").and_then(|value| value.as_str()) {
+                if !image_url.is_empty() {
+                    return Some(image_url.to_string());
+                }
+            }
+            if let Some(content) = item.get("content").and_then(|value| value.as_array()) {
+                for part in content {
+                    if let Some(image_url) = part.get("image_url").and_then(|value| value.as_str()) {
+                        if !image_url.is_empty() {
+                            return Some(image_url.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// 从响应中提取图片(不报错版): 支持 data[]b64/url、顶层 b64_json/url/image/output。
     fn extract_image_data_if_present(payload: &Value) -> Option<String> {
         if let Some(data) = payload.get("data").and_then(|value| value.as_array()) {
@@ -379,13 +452,28 @@ impl AIProvider for OpenAICompatibleProvider {
             .resolve_base_url_and_key(provider_id, &request.extra_params)
             .await?;
         let client = Self::build_client();
-        let endpoint = format!("{}/v1/images/generations", base_url);
-        let body = Self::build_request_body(
-            api_model,
-            &request.prompt,
-            &request.aspect_ratio,
-            request.reference_images.as_ref(),
-        )?;
+        let is_responses = Self::is_responses_protocol(&request.extra_params);
+        let (endpoint, body) = if is_responses {
+            (
+                format!("{}/v1/responses", base_url),
+                Self::build_responses_body(
+                    api_model,
+                    &request.prompt,
+                    &request.aspect_ratio,
+                    request.reference_images.as_ref(),
+                )?,
+            )
+        } else {
+            (
+                format!("{}/v1/images/generations", base_url),
+                Self::build_request_body(
+                    api_model,
+                    &request.prompt,
+                    &request.aspect_ratio,
+                    request.reference_images.as_ref(),
+                )?,
+            )
+        };
 
         let response = client
             .post(&endpoint)
@@ -421,6 +509,15 @@ impl AIProvider for OpenAICompatibleProvider {
                 "自定义平台响应不是有效 JSON: {}",
                 body_text.chars().take(300).collect::<String>()
             )));
+        }
+
+        if is_responses {
+            if let Some(image) = Self::extract_responses_image(&payload) {
+                return Ok(image);
+            }
+            return Err(AIError::TaskFailed(
+                "Responses 响应中未找到图片(请确认该平台模型为 image-to-image 变体)".to_string(),
+            ));
         }
 
         Self::extract_image_data(&payload)
