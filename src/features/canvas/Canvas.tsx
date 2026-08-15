@@ -38,7 +38,10 @@ import {
   type CanvasNode,
   type CanvasNodeType,
   DEFAULT_NODE_WIDTH,
+  EXPORT_RESULT_NODE_MIN_HEIGHT,
+  EXPORT_RESULT_NODE_MIN_WIDTH,
 } from '@/features/canvas/domain/canvasNodes';
+import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
 import { prepareNodeImage, prepareNodeImageFromFile } from '@/features/canvas/application/imageData';
 import {
   buildGenerationErrorReport,
@@ -1531,26 +1534,47 @@ export function Canvas() {
       x: event.clientX,
       y: event.clientY,
     });
-    // 多张时右下阶梯排布, 避免完全重叠
-    const offsetStep = 40;
+
+    // 先处理所有文件拿到宽高比, 再按网格对齐排列(每行 3 张, 行列对齐)
+    const prepared = [];
+    for (const file of files) {
+      prepared.push(await prepareNodeImageFromFile(file));
+    }
+
+    const GAP = 24;
+    const COLS = 3;
+    const sizeFor = (aspectRatio: string) =>
+      resolveMinEdgeFittedSize(aspectRatio, {
+        minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
+        minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
+      });
+
+    let cursorX = basePosition.x;
+    let cursorY = basePosition.y;
+    let rowMaxHeight = 0;
     let lastNodeId: string | null = null;
 
-    for (let index = 0; index < files.length; index += 1) {
+    for (let index = 0; index < prepared.length; index += 1) {
+      const item = prepared[index];
       const file = files[index];
-      const prepared = await prepareNodeImageFromFile(file);
-      const position = {
-        x: basePosition.x + index * offsetStep,
-        y: basePosition.y + index * offsetStep,
-      };
-      const nodeId = addNode(CANVAS_NODE_TYPES.upload, position, {
+      const size = sizeFor(item.aspectRatio ?? '1:1');
+      if (index > 0 && index % COLS === 0) {
+        // 换行: x 回到起点, y 下移上一行最大高度 + 间距
+        cursorX = basePosition.x;
+        cursorY += rowMaxHeight + GAP;
+        rowMaxHeight = 0;
+      }
+      const nodeId = addNode(CANVAS_NODE_TYPES.upload, { x: cursorX, y: cursorY }, {
         ...definition.createDefaultData(),
-        imageUrl: prepared.imageUrl,
-        previewImageUrl: prepared.previewImageUrl ?? prepared.imageUrl,
-        aspectRatio: prepared.aspectRatio ?? '1:1',
+        imageUrl: item.imageUrl,
+        previewImageUrl: item.previewImageUrl ?? item.imageUrl,
+        aspectRatio: item.aspectRatio ?? '1:1',
         sourceFileName: file.name,
         displayName: file.name.replace(/\.[^.]+$/, ''),
       });
       lastNodeId = nodeId;
+      cursorX += size.width + GAP;
+      rowMaxHeight = Math.max(rowMaxHeight, size.height);
     }
 
     if (lastNodeId) {
