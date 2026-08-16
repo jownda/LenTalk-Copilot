@@ -50,16 +50,21 @@ impl OpenAICompatibleProvider {
             .unwrap_or_else(|_| reqwest::Client::new())
     }
 
+    /// 短超时 client(20s): 用于「验证连接/验证协议/拉取模型」等交互操作,
+    /// 避免平台不可达时 UI 长时间卡在"验证中/拉取中"。
+    fn build_short_timeout_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
     /// 从 OpenAI 兼容服务的 /v1/models 拉取模型列表(供「测试链接 / 拉取模型」使用)
     pub async fn fetch_openai_models(
         base_url: &str,
         api_key: &str,
     ) -> Result<Vec<String>, AIError> {
-        // 拉取模型是交互操作, 用短超时(20s), 避免平台不可达时 UI 长时间卡在"拉取中"
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = Self::build_short_timeout_client();
         let endpoint = format!("{}/v1/models", base_url.trim_end_matches('/'));
 
         let response = client
@@ -96,7 +101,7 @@ impl OpenAICompatibleProvider {
 
     /// 仅检查 Base URL 是否可达(不依赖 API Key,供「验证链接」使用)
     pub async fn check_url_reachable(base_url: &str) -> Result<u16, AIError> {
-        let client = Self::build_client();
+        let client = Self::build_short_timeout_client();
         let normalized = base_url.trim_end_matches('/');
         if normalized.is_empty() {
             return Err(AIError::InvalidRequest("Base URL 为空".into()));
