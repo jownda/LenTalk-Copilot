@@ -3,7 +3,7 @@ import { X, Eye, EyeOff, FolderOpen, Pencil, Plus, Trash2, ChevronDown, ChevronR
 import { Trans, useTranslation } from 'react-i18next';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useSettingsStore } from '@/stores/settingsStore';
-import { testProviderConnection, verifyProviderUrl } from '@/commands/ai';
+import { fetchProviderModels, testProviderConnection, verifyProviderUrl } from '@/commands/ai';
 import { recommendedApis } from '@/features/settings/recommendedApis';
 import { UiCheckbox, UiModal, UiSelect } from '@/components/ui';
 import { UI_CONTENT_OVERLAY_INSET_CLASS, UI_DIALOG_TRANSITION_MS } from '@/components/ui/motion';
@@ -212,6 +212,10 @@ export function SettingsDialog({
   });
   const [customApiBusy, setCustomApiBusy] = useState<'idle' | 'testing' | 'fetching'>('idle');
   const [customApiStatus, setCustomApiStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const [pickedModels, setPickedModels] = useState<string[]>([]);
+  const [modelPickerSearch, setModelPickerSearch] = useState('');
   const { shouldRender, isVisible } = useDialogTransition(isOpen, UI_DIALOG_TRANSITION_MS);
 
   /** 一键添加推荐平台(预填到新增表单) */
@@ -261,6 +265,71 @@ export function SettingsDialog({
   }, [customApiDraft.baseUrl, t]);
 
   /** 验证协议:带 Key 调 /v1/models,检测 OpenAI 兼容 */
+  /** 拉取平台模型列表并打开模型选择弹窗(默认只勾选当前已填模型) */
+  const handleFetchModels = useCallback(async () => {
+    const baseUrl = customApiDraft.baseUrl.trim().replace(/\/+$/, '');
+    if (!baseUrl) {
+      setCustomApiStatus({ type: 'err', text: t('settings.customApiTestNeedUrl') });
+      return;
+    }
+    setCustomApiBusy('fetching');
+    setCustomApiStatus(null);
+    try {
+      const { models } = await fetchProviderModels(baseUrl, customApiDraft.apiKey.trim());
+      if (models.length === 0) {
+        setCustomApiStatus({ type: 'err', text: t('settings.customApiNoModels', '未从平台拉取到模型') });
+        return;
+      }
+      setFetchedModels(models);
+      const existing = new Set(
+        customApiDraft.modelsText
+          .split(/[\n,]/)
+          .map((model) => model.trim())
+          .filter(Boolean)
+      );
+      setPickedModels(models.filter((model) => existing.has(model)));
+      setModelPickerSearch('');
+      setIsModelPickerOpen(true);
+    } catch (error) {
+      setCustomApiStatus({
+        type: 'err',
+        text: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setCustomApiBusy('idle');
+    }
+  }, [customApiDraft.apiKey, customApiDraft.baseUrl, customApiDraft.modelsText, t]);
+
+  const togglePickedModel = useCallback((model: string) => {
+    setPickedModels((previous) =>
+      previous.includes(model)
+        ? previous.filter((item) => item !== model)
+        : [...previous, model]
+    );
+  }, []);
+
+  const confirmPickedModels = useCallback(() => {
+    setCustomApiDraft({ ...customApiDraft, modelsText: pickedModels.join('\n') });
+    setIsModelPickerOpen(false);
+    setCustomApiStatus({ type: 'ok', text: t('settings.customApiModelsApplied', '已应用所选模型') });
+  }, [customApiDraft, pickedModels, t]);
+
+  const filteredFetchedModels = useMemo(() => {
+    const keyword = modelPickerSearch.trim().toLowerCase();
+    if (!keyword) {
+      return fetchedModels;
+    }
+    return fetchedModels.filter((model) => model.toLowerCase().includes(keyword));
+  }, [fetchedModels, modelPickerSearch]);
+
+  const handleSelectAllPickedModels = useCallback(() => {
+    setPickedModels(filteredFetchedModels);
+  }, [filteredFetchedModels]);
+
+  const handleClearPickedModels = useCallback(() => {
+    setPickedModels([]);
+  }, []);
+
   const handleTestCustomApi = useCallback(async () => {
     const baseUrl = customApiDraft.baseUrl.trim().replace(/\/+$/, '');
     const apiKey = customApiDraft.apiKey.trim();
@@ -932,8 +1001,18 @@ export function SettingsDialog({
                           />
                         </label>
                         <label className="block">
-                          <span className="mb-1 block text-[11px] text-text-muted">
-                            {t('settings.customApiModels')}
+                          <span className="mb-1 flex items-center justify-between text-[11px] text-text-muted">
+                            <span>{t('settings.customApiModels')}</span>
+                            <button
+                              type="button"
+                              onClick={() => void handleFetchModels()}
+                              disabled={customApiBusy !== 'idle'}
+                              className="rounded-md border border-border-dark px-2 py-0.5 text-[11px] text-text-muted transition-colors hover:border-accent/50 hover:text-text-dark disabled:opacity-50"
+                            >
+                              {customApiBusy === 'fetching'
+                                ? t('settings.customApiFetching', '拉取中…')
+                                : t('settings.customApiFetchModels', '拉取模型')}
+                            </button>
                           </span>
                           <textarea
                             value={customApiDraft.modelsText}
@@ -995,6 +1074,83 @@ export function SettingsDialog({
                       </div>
                       </UiModal>
                     )}
+
+                    <UiModal
+                      isOpen={isModelPickerOpen}
+                      title={t('settings.customApiPickModels', '选择模型')}
+                      onClose={() => setIsModelPickerOpen(false)}
+                      widthClassName="w-[480px]"
+                      footer={
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => setIsModelPickerOpen(false)}
+                            className="rounded-md border border-border-dark px-3 py-1.5 text-xs text-text-muted transition-colors hover:text-text-dark"
+                          >
+                            {t('common.cancel')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={confirmPickedModels}
+                            disabled={pickedModels.length === 0}
+                            className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/85 disabled:opacity-40"
+                          >
+                            {t('settings.customApiApplyModels', '应用所选')} ({pickedModels.length})
+                          </button>
+                        </>
+                      }
+                    >
+                      <div className="space-y-3">
+                        <input
+                          value={modelPickerSearch}
+                          onChange={(event) => setModelPickerSearch(event.target.value)}
+                          placeholder={t('settings.customApiSearchModels', '搜索模型…')}
+                          className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
+                        />
+                        <div className="flex items-center justify-between text-[11px] text-text-muted">
+                          <span>
+                            {t('settings.customApiModelCount', { count: fetchedModels.length })}
+                          </span>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={handleSelectAllPickedModels}
+                              className="text-accent transition-colors hover:opacity-80"
+                            >
+                              {t('settings.customApiSelectAll', '全选')}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleClearPickedModels}
+                              className="text-text-muted transition-colors hover:text-text-dark"
+                            >
+                              {t('settings.customApiSelectNone', '清空')}
+                            </button>
+                          </div>
+                        </div>
+                        <div className="ui-scrollbar max-h-[320px] space-y-1 overflow-y-auto rounded-lg border border-[rgba(255,255,255,0.08)] bg-bg-dark/60 p-2">
+                          {filteredFetchedModels.map((model) => (
+                            <label
+                              key={model}
+                              className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs text-text-dark transition-colors hover:bg-bg-dark"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={pickedModels.includes(model)}
+                                onChange={() => togglePickedModel(model)}
+                                className="accent-accent"
+                              />
+                              <span className="truncate">{model}</span>
+                            </label>
+                          ))}
+                          {filteredFetchedModels.length === 0 && (
+                            <p className="py-4 text-center text-xs text-text-muted/60">
+                              {t('settings.customApiNoModelsMatch', '没有匹配的模型')}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </UiModal>
 
                     {customApis.map((api) => (
                       <div
