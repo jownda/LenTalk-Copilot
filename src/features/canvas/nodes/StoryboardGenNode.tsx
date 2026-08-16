@@ -550,6 +550,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
   const addEdge = useCanvasStore((state) => state.addEdge);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
   const apiKeys = useSettingsStore((state) => state.apiKeys);
+  const customApis = useSettingsStore((state) => state.customApis);
   const grsaiNanoBananaProModel = useSettingsStore((state) => state.grsaiNanoBananaProModel);
   const storyboardGenKeepStyleConsistent = useSettingsStore(
     (state) => state.storyboardGenKeepStyleConsistent
@@ -615,21 +616,25 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     [incomingImageItems]
   );
 
-  const imageModels = useMemo(() => listImageModels(), []);
-
-  const selectedModel = useMemo(() => {
-    const modelId = nodeData.model ?? DEFAULT_IMAGE_MODEL_ID;
-    return getImageModel(modelId);
-  }, [nodeData.model]);
+  const imageModels = listImageModels();
+  const selectedModel = getImageModel(nodeData.model ?? DEFAULT_IMAGE_MODEL_ID);
   const providerApiKey = apiKeys[selectedModel.providerId] ?? '';
+  const customApiBaseUrl = useMemo(() => {
+    if (!selectedModel.providerId.startsWith('custom:')) {
+      return undefined;
+    }
+    const customId = selectedModel.providerId.slice('custom:'.length);
+    return customApis.find((api) => api.id === customId)?.baseUrl;
+  }, [customApis, selectedModel.providerId]);
   const effectiveExtraParams = useMemo(
     () => ({
       ...(nodeData.extraParams ?? {}),
+      ...(customApiBaseUrl ? { provider_base_url: customApiBaseUrl } : {}),
       ...(selectedModel.id === GRSAI_NANO_BANANA_PRO_MODEL_ID
         ? { grsai_pro_model: grsaiNanoBananaProModel }
         : {}),
     }),
-    [grsaiNanoBananaProModel, nodeData.extraParams, selectedModel.id]
+    [customApiBaseUrl, grsaiNanoBananaProModel, nodeData.extraParams, selectedModel.id]
   );
   const resolutionOptions = useMemo(
     () => resolveImageModelResolutions(selectedModel, { extraParams: effectiveExtraParams }),

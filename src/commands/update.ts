@@ -1,9 +1,15 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 
-export async function checkLatestReleaseTag(): Promise<string | null> {
+export interface LatestReleaseInfo {
+  version: string;
+  release_url: string;
+  download_url: string | null;
+  release_notes: string | null;
+}
+
+export async function getLatestReleaseInfo(): Promise<LatestReleaseInfo | null> {
   if (!isTauri()) {
     return null;
   }
-  const tag = await invoke<string | null>('check_latest_release_tag');
-  return tag ? tag.trim() : null;
+  return invoke<LatestReleaseInfo>('get_latest_release_info');
 }

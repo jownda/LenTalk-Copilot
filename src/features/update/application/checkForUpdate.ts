@@ -1,19 +1,24 @@
 import { getVersion } from '@tauri-apps/api/app';
 import { isTauri } from '@tauri-apps/api/core';
-import { checkLatestReleaseTag } from '../../../commands/update';
+import { getLatestReleaseInfo } from '../../../commands/update';
 
-const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/henjicc/Storyboard-Copilot/releases/latest';
+const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/jownda/LenTalk-Copilot/releases/latest';
 const VERSION_SUPPRESSION_STORAGE_KEY = 'storyboard:update-check:version-suppressions';
 
 export interface UpdateCheckResult {
   hasUpdate: boolean;
   latestVersion?: string;
   currentVersion?: string;
+  downloadUrl?: string;
+  releaseUrl?: string;
+  releaseNotes?: string;
   error?: 'network' | 'unknown';
 }
 
 interface GithubLatestReleaseResponse {
   tag_name?: string;
+  html_url?: string;
+  body?: string;
 }
 type VersionSuppressionMode = 'today' | 'forever';
 
@@ -46,24 +51,21 @@ function readVersionSuppressions(): VersionSuppressionMap {
       return {};
     }
 
-    return Object.entries(parsed as Record<string, unknown>).reduce<VersionSuppressionMap>(
-      (acc, [version, value]) => {
-        if (!version || typeof value !== 'object' || value === null) {
-          return acc;
-        }
-        const mode = (value as { mode?: unknown }).mode;
-        if (mode !== 'today' && mode !== 'forever') {
-          return acc;
-        }
-        const dayKey = (value as { dayKey?: unknown }).dayKey;
-        acc[version] = {
-          mode,
-          dayKey: typeof dayKey === 'string' ? dayKey : undefined,
-        };
+    return Object.entries(parsed as Record<string, unknown>).reduce<VersionSuppressionMap>((acc, [version, value]) => {
+      if (!version || typeof value !== 'object' || value === null) {
         return acc;
-      },
-      {}
-    );
+      }
+      const mode = (value as { mode?: unknown }).mode;
+      if (mode !== 'today' && mode !== 'forever') {
+        return acc;
+      }
+      const dayKey = (value as { dayKey?: unknown }).dayKey;
+      acc[version] = {
+        mode,
+        dayKey: typeof dayKey === 'string' ? dayKey : undefined
+      };
+      return acc;
+    }, {});
   } catch {
     return {};
   }
@@ -88,7 +90,7 @@ export function suppressUpdateVersion(version: string, mode: VersionSuppressionM
     mode === 'today'
       ? {
           mode: 'today',
-          dayKey: getLocalDateKey(new Date()),
+          dayKey: getLocalDateKey(new Date())
         }
       : { mode: 'forever' };
 
@@ -153,10 +155,17 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
     const timeoutId = window.setTimeout(() => controller.abort(), 8000);
 
     let latestTag = '';
+    let downloadUrl: string | undefined;
+    let releaseUrl: string | undefined;
+    let releaseNotes: string | undefined;
 
     if (isTauri()) {
       try {
-        latestTag = normalizeVersion((await checkLatestReleaseTag()) ?? '');
+        const release = await getLatestReleaseInfo();
+        latestTag = normalizeVersion(release?.version ?? '');
+        downloadUrl = release?.download_url ?? undefined;
+        releaseUrl = release?.release_url;
+        releaseNotes = release?.release_notes ?? undefined;
       } catch {
         return { hasUpdate: false, error: 'network' };
       } finally {
@@ -167,9 +176,9 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
         const response = await fetch(GITHUB_LATEST_RELEASE_API, {
           method: 'GET',
           headers: {
-            Accept: 'application/vnd.github+json',
+            Accept: 'application/vnd.github+json'
           },
-          signal: controller.signal,
+          signal: controller.signal
         });
 
         if (!response.ok) {
@@ -178,6 +187,8 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 
         const data = (await response.json()) as GithubLatestReleaseResponse;
         latestTag = normalizeVersion(data.tag_name ?? '');
+        releaseUrl = data.html_url;
+        releaseNotes = data.body?.trim() || undefined;
       } finally {
         window.clearTimeout(timeoutId);
       }
@@ -192,6 +203,9 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
         hasUpdate: true,
         latestVersion: latestTag,
         currentVersion,
+        downloadUrl,
+        releaseUrl,
+        releaseNotes
       };
     }
 

@@ -17,7 +17,7 @@ import {
   type UploadImageNodeData,
 } from './canvasNodes';
 import { DEFAULT_NODE_DISPLAY_NAME } from './nodeDisplay';
-import { DEFAULT_IMAGE_MODEL_ID, getImageModel } from '../models';
+import { getDefaultImageModelId, getImageModel } from '../models';
 import { useSettingsStore } from '@/stores/settingsStore';
 
 export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music';
@@ -94,7 +94,7 @@ const imageEditNodeDefinition: CanvasNodeDefinition<ImageEditNodeData> = {
   },
   createDefaultData: () => {
     // 默认选中「上一次使用的模型」;模型失效或未配置密钥时回退到默认模型
-    let defaultModelId = DEFAULT_IMAGE_MODEL_ID;
+    let defaultModelId = getDefaultImageModelId();
     const lastModelId = useSettingsStore.getState().lastImageModelId;
     if (lastModelId) {
       const resolved = getImageModel(lastModelId);
@@ -283,7 +283,7 @@ const storyboardGenNodeDefinition: CanvasNodeDefinition<StoryboardGenNodeData> =
     gridCols: 2,
     frames: [],
     ratioControlMode: 'cell',
-    model: DEFAULT_IMAGE_MODEL_ID,
+    model: getDefaultImageModelId(),
     size: '2K' as ImageSize,
     requestAspectRatio: AUTO_REQUEST_ASPECT_RATIO,
     extraParams: {},

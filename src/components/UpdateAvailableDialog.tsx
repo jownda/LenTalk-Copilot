@@ -3,8 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { UiButton, UiModal, UiSelect } from '@/components/ui';
 
-const QUARK_DOWNLOAD_URL = 'https://pan.quark.cn/s/5b6733a8fc8e';
-const GITHUB_RELEASES_URL = 'https://github.com/henjicc/Storyboard-Copilot/releases';
+const GITHUB_RELEASES_URL = 'https://github.com/jownda/LenTalk-Copilot/releases';
 export type UpdateIgnoreMode = 'today-version' | 'forever-version' | 'forever-all';
 
 interface UpdateAvailableDialogProps {
@@ -12,6 +11,9 @@ interface UpdateAvailableDialogProps {
   onClose: () => void;
   latestVersion?: string;
   currentVersion?: string;
+  downloadUrl?: string;
+  releaseUrl?: string;
+  releaseNotes?: string;
   onApplyIgnore?: (mode: UpdateIgnoreMode) => void;
 }
 
@@ -20,7 +22,10 @@ export function UpdateAvailableDialog({
   onClose,
   latestVersion,
   currentVersion,
-  onApplyIgnore,
+  downloadUrl,
+  releaseUrl,
+  releaseNotes,
+  onApplyIgnore
 }: UpdateAvailableDialogProps) {
   const { t } = useTranslation();
   const [ignoreMode, setIgnoreMode] = useState<UpdateIgnoreMode>('today-version');
@@ -29,18 +34,14 @@ export function UpdateAvailableDialog({
     () => [
       { value: 'today-version' as const, label: t('update.ignoreTodayVersion') },
       { value: 'forever-version' as const, label: t('update.ignoreThisVersionForever') },
-      { value: 'forever-all' as const, label: t('update.ignoreAllForever') },
+      { value: 'forever-all' as const, label: t('update.ignoreAllForever') }
     ],
     [t]
   );
 
-  const handleOpenQuark = useCallback(() => {
-    void openUrl(QUARK_DOWNLOAD_URL);
-  }, []);
-
   const handleOpenGithub = useCallback(() => {
-    void openUrl(GITHUB_RELEASES_URL);
-  }, []);
+    void openUrl(downloadUrl ?? releaseUrl ?? GITHUB_RELEASES_URL);
+  }, [downloadUrl, releaseUrl]);
 
   const handleApplyIgnore = useCallback(() => {
     onApplyIgnore?.(ignoreMode);
@@ -52,22 +53,19 @@ export function UpdateAvailableDialog({
       isOpen={isOpen}
       onClose={onClose}
       title={t('update.dialogTitle')}
-      footer={(
+      footer={
         <>
           <UiButton variant="muted" onClick={onClose}>
             {t('common.cancel')}
           </UiButton>
-          <UiButton variant="muted" onClick={handleOpenQuark}>
-            {t('update.goToQuarkDownload')}
-          </UiButton>
           <UiButton variant="primary" onClick={handleOpenGithub}>
-            {t('update.goToGithubDownload')}
+            {t(downloadUrl ? 'update.downloadGithubInstaller' : 'update.goToGithubDownload')}
           </UiButton>
           <UiButton variant="ghost" onClick={handleApplyIgnore}>
             {t('update.applyIgnore')}
           </UiButton>
         </>
-      )}
+      }
     >
       <div className="text-sm text-text-muted leading-6">
         <p>{t('update.dialogDescription')}</p>
@@ -75,9 +73,14 @@ export function UpdateAvailableDialog({
           <p className="mt-2 text-xs">
             {t('update.versionLine', {
               currentVersion: currentVersion ?? '-',
-              latestVersion: latestVersion ?? '-',
+              latestVersion: latestVersion ?? '-'
             })}
           </p>
+        )}
+        {releaseNotes && (
+          <div className="mt-3 max-h-32 overflow-y-auto whitespace-pre-wrap rounded-md bg-bg-dark/60 px-3 py-2 text-xs leading-5 text-text-muted">
+            {releaseNotes}
+          </div>
         )}
         <div className="mt-3">
           <p className="mb-1 text-xs text-text-muted">{t('update.ignoreRule')}</p>

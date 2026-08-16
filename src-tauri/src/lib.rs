@@ -197,7 +197,7 @@ pub fn run() {
             project_state::rename_project_record,
             project_state::delete_project_record,
             system::get_runtime_system_info,
-            update::check_latest_release_tag,
+            update::get_latest_release_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -6,6 +6,7 @@ import {
 } from '@/commands/ai';
 import { imageUrlToDataUrl, persistImageLocally } from '@/features/canvas/application/imageData';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { isWindowsDesktopRuntime } from '@/platform/runtime';
 
 import type { AiGateway, GenerateImagePayload } from '../application/ports';
 
@@ -45,6 +46,9 @@ function injectCustomApiRequestMode(payload: GenerateImagePayload): GenerateImag
   if (protocol === 'responses') {
     extraParams.protocol = 'responses';
   }
+  if (customApi?.baseUrl) {
+    extraParams.provider_base_url = customApi.baseUrl;
+  }
   extraParams.reference_image_field = referenceImageField;
   return {
     ...payload,
@@ -66,7 +70,7 @@ export function localizeReferenceTokens(prompt: string, model: string): string {
   if (!usesEnglishProtocol) return prompt;
 
   return prompt.replace(
-    /(^|[\s，。；：、,.;:！？!?（）()【】\[\]"'“”‘’])(@?\s*图)(\d+)/g,
+    /(^|[\s，。；：、,.;:！？!?（）()【】[\]"'“”‘’])(@?\s*图)(\d+)/g,
     (_match, prefix: string, _marker: string, index: string) => `${prefix}Image ${index}`
   );
 }
@@ -74,10 +78,12 @@ export function localizeReferenceTokens(prompt: string, model: string): string {
 async function normalizeReferenceImages(payload: GenerateImagePayload): Promise<string[] | undefined> {
   const isKieModel = payload.model.startsWith('kie/');
   const isFalModel = payload.model.startsWith('fal/');
+  const usesWindowsWebviewTransport =
+    isWindowsDesktopRuntime() && payload.model.startsWith('custom:');
   return payload.referenceImages
     ? await Promise.all(
       payload.referenceImages.map(async (imageUrl) =>
-        isKieModel || isFalModel
+        isKieModel || isFalModel || usesWindowsWebviewTransport
           ? await imageUrlToDataUrl(imageUrl)
           : await persistImageLocally(imageUrl)
       )

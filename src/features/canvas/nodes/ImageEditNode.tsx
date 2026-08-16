@@ -358,6 +358,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
   const addEdge = useCanvasStore((state) => state.addEdge);
   const apiKeys = useSettingsStore((state) => state.apiKeys);
+  const customApis = useSettingsStore((state) => state.customApis);
   const grsaiNanoBananaProModel = useSettingsStore((state) => state.grsaiNanoBananaProModel);
   const showNodePrice = useSettingsStore((state) => state.showNodePrice);
   const priceDisplayCurrencyMode = useSettingsStore((state) => state.priceDisplayCurrencyMode);
@@ -384,20 +385,16 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     [incomingImageItems]
   );
 
-  const imageModels = useMemo(() => listImageModels(), []);
-
-  const selectedModel = useMemo(() => {
-    const modelId = data.model ?? DEFAULT_IMAGE_MODEL_ID;
-    return getImageModel(modelId);
-  }, [data.model]);
+  const imageModels = listImageModels();
+  const selectedModel = getImageModel(data.model ?? DEFAULT_IMAGE_MODEL_ID);
   const providerApiKey = apiKeys[selectedModel.providerId] ?? '';
   const customApiBaseUrl = useMemo(() => {
     if (!selectedModel.providerId.startsWith('custom:')) {
       return undefined;
     }
     const customId = selectedModel.providerId.slice('custom:'.length);
-    return useSettingsStore.getState().customApis.find((api) => api.id === customId)?.baseUrl;
-  }, [selectedModel.providerId]);
+    return customApis.find((api) => api.id === customId)?.baseUrl;
+  }, [customApis, selectedModel.providerId]);
   const effectiveExtraParams = useMemo(
     () => ({
       ...(data.extraParams ?? {}),

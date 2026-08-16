@@ -9,6 +9,7 @@ import {
   buildCustomProviderId,
   useSettingsStore,
 } from '@/stores/settingsStore';
+import { isWindowsDesktopRuntime } from '@/platform/runtime';
 
 const providerModules = import.meta.glob<{ provider: ModelProviderDefinition }>(
   './providers/*.ts',
@@ -37,6 +38,24 @@ const imageModelMap = new Map<string, ImageModelDefinition>(
 );
 
 export const DEFAULT_IMAGE_MODEL_ID = 'kie/nano-banana-2';
+const WINDOWS_UNCONFIGURED_IMAGE_MODEL_ID = 'custom:unconfigured/configure-api';
+const WINDOWS_UNCONFIGURED_IMAGE_MODEL: ImageModelDefinition = {
+  id: WINDOWS_UNCONFIGURED_IMAGE_MODEL_ID,
+  mediaType: 'image',
+  displayName: '请先配置自定义 API',
+  providerId: 'custom:unconfigured',
+  description: 'Windows 桌面端仅支持自定义 OpenAI 兼容 API',
+  eta: '1min',
+  expectedDurationMs: 60000,
+  defaultAspectRatio: '1:1',
+  defaultResolution: '1K',
+  aspectRatios: [{ value: '1:1', label: '1:1' }],
+  resolutions: [{ value: '1K', label: '1K' }],
+  resolveRequest: () => ({
+    requestModel: WINDOWS_UNCONFIGURED_IMAGE_MODEL_ID,
+    modeLabel: '需要配置',
+  }),
+};
 
 const imageModelAliasMap = new Map<string, string>([
   ['gemini-3.1-flash', 'ppio/gemini-3.1-flash'],
@@ -44,21 +63,36 @@ const imageModelAliasMap = new Map<string, string>([
 ]);
 
 export function listImageModels(): ImageModelDefinition[] {
+  if (isWindowsDesktopRuntime()) {
+    const customModels = buildCustomImageModels();
+    return customModels.length > 0 ? customModels : [WINDOWS_UNCONFIGURED_IMAGE_MODEL];
+  }
   return [...imageModels, ...buildCustomImageModels()];
 }
 
 export function listModelProviders(): ModelProviderDefinition[] {
+  if (isWindowsDesktopRuntime()) {
+    return buildCustomProviders();
+  }
   return [...providers, ...buildCustomProviders()];
 }
 
 export function getImageModel(modelId: string): ImageModelDefinition {
   const resolvedModelId = imageModelAliasMap.get(modelId) ?? modelId;
-  const builtin = imageModelMap.get(resolvedModelId);
-  if (builtin) {
-    return builtin;
-  }
   const custom = buildCustomImageModels().find((model) => model.id === resolvedModelId);
-  return custom ?? imageModelMap.get(DEFAULT_IMAGE_MODEL_ID)!;
+  if (custom) {
+    return custom;
+  }
+
+  if (isWindowsDesktopRuntime()) {
+    return buildCustomImageModels()[0] ?? WINDOWS_UNCONFIGURED_IMAGE_MODEL;
+  }
+
+  return imageModelMap.get(resolvedModelId) ?? imageModelMap.get(DEFAULT_IMAGE_MODEL_ID)!;
+}
+
+export function getDefaultImageModelId(): string {
+  return listImageModels()[0]?.id ?? DEFAULT_IMAGE_MODEL_ID;
 }
 
 export function resolveImageModelResolutions(

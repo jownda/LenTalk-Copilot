@@ -407,9 +407,9 @@
   },
   "update": {
     "dialogTitle": "Update Available",
-    "dialogDescription": "A new version is available. Do you want to download it now?",
-    "goToQuarkDownload": "Quark Download",
-    "goToGithubDownload": "GitHub Releases",
+    "dialogDescription": "A new version is available. Download the installer for this system from GitHub.",
+    "goToGithubDownload": "View GitHub Release",
+    "downloadGithubInstaller": "Download Installer",
     "versionLine": "Current: {{currentVersion}}, Latest: {{latestVersion}}",
     "ignoreRule": "Ignore reminder rule",
     "ignoreTodayVersion": "Do not remind this version today",

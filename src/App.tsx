@@ -13,16 +13,10 @@ import { useSettingsStore } from './stores/settingsStore';
 import {
   checkForUpdate,
   isUpdateVersionSuppressed,
-  suppressUpdateVersion,
+  suppressUpdateVersion
 } from './features/update/application/checkForUpdate';
-import {
-  subscribeOpenGlobalErrorDialog,
-  type GlobalErrorDialogDetail,
-} from './features/app/errorDialogEvents';
-import {
-  subscribeOpenSettingsDialog,
-  type SettingsCategory,
-} from './features/settings/settingsEvents';
+import { subscribeOpenGlobalErrorDialog, type GlobalErrorDialogDetail } from './features/app/errorDialogEvents';
+import { subscribeOpenSettingsDialog, type SettingsCategory } from './features/settings/settingsEvents';
 
 function toRgbCssValue(hexColor: string): string {
   const hex = hexColor.replace('#', '');
@@ -48,6 +42,9 @@ function App() {
   const [showUpdateDialog, setShowUpdateDialog] = useState(false);
   const [latestVersion, setLatestVersion] = useState<string>('');
   const [currentVersion, setCurrentVersion] = useState<string>('');
+  const [updateDownloadUrl, setUpdateDownloadUrl] = useState<string | undefined>();
+  const [updateReleaseUrl, setUpdateReleaseUrl] = useState<string | undefined>();
+  const [updateReleaseNotes, setUpdateReleaseNotes] = useState<string | undefined>();
   const [globalError, setGlobalError] = useState<GlobalErrorDialogDetail | null>(null);
 
   const isHydrated = useProjectStore((state) => state.isHydrated);
@@ -72,8 +69,8 @@ function App() {
   useEffect(() => {
     const root = document.documentElement;
     const isMac =
-      typeof navigator !== 'undefined'
-      && /(Mac|iPhone|iPad|iPod)/i.test(`${navigator.platform} ${navigator.userAgent}`);
+      typeof navigator !== 'undefined' &&
+      /(Mac|iPhone|iPad|iPod)/i.test(`${navigator.platform} ${navigator.userAgent}`);
     root.dataset.platform = isMac ? 'macos' : 'default';
   }, []);
 
@@ -159,6 +156,9 @@ function App() {
         }
         setLatestVersion(result.latestVersion ?? '');
         setCurrentVersion(result.currentVersion ?? '');
+        setUpdateDownloadUrl(result.downloadUrl);
+        setUpdateReleaseUrl(result.releaseUrl);
+        setUpdateReleaseNotes(result.releaseNotes);
         setShowUpdateDialog(true);
       }
     };
@@ -177,6 +177,9 @@ function App() {
 
     setLatestVersion(result.latestVersion ?? '');
     setCurrentVersion(result.currentVersion ?? '');
+    setUpdateDownloadUrl(result.downloadUrl);
+    setUpdateReleaseUrl(result.releaseUrl);
+    setUpdateReleaseNotes(result.releaseNotes);
 
     if (enableUpdateDialog) {
       setShowUpdateDialog(true);
@@ -218,9 +221,7 @@ function App() {
           onBackClick={closeProject}
         />
 
-        <main className="flex-1 relative">
-          {currentProjectId ? <Canvas /> : <ProjectManager />}
-        </main>
+        <main className="flex-1 relative">{currentProjectId ? <Canvas /> : <ProjectManager />}</main>
 
         <SettingsDialog
           isOpen={showSettings}
@@ -233,6 +234,9 @@ function App() {
           onClose={() => setShowUpdateDialog(false)}
           latestVersion={latestVersion}
           currentVersion={currentVersion}
+          downloadUrl={updateDownloadUrl}
+          releaseUrl={updateReleaseUrl}
+          releaseNotes={updateReleaseNotes}
           onApplyIgnore={handleApplyIgnore}
         />
         <GlobalErrorDialog

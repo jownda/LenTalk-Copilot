@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import { useSettingsStore } from '@/stores/settingsStore';
+import { CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from '@/stores/settingsStore';
+import { isWindowsDesktopRuntime } from '@/platform/runtime';
 
 export interface GenerateRequest {
   prompt: string;
@@ -119,14 +120,12 @@ export async function setApiKey(provider: string, apiKey: string): Promise<void>
     apiKeyMasked: apiKey ? `${apiKey.slice(0, 4)}***${apiKey.slice(-2)}` : '',
     tauri: isTauri(),
   });
-  if (!isTauri()) {
+  if (!isTauri() || isWindowsDesktopRuntime()) {
     // 浏览器降级:key 已存于 settingsStore,无需传给 Rust
     return;
   }
   return await invoke('set_api_key', { provider, apiKey });
 }
-
-const CUSTOM_PROVIDER_PREFIX = 'custom:';
 
 function mapGptImageSize(aspectRatio: string): string {
   if (['9:16', '3:4', '2:3', '4:5', '1:2', '1:3'].includes(aspectRatio)) {
@@ -141,15 +140,33 @@ function mapGptImageSize(aspectRatio: string): string {
 /** 浏览器降级任务存储:jobId → 状态(与 Rust 异步任务语义一致) */
 const browserGenerationJobs = new Map<string, GenerationJobStatus>();
 
+function isCustomModel(model: string): boolean {
+  return model.startsWith(CUSTOM_API_PROVIDER_PREFIX);
+}
+
+function shouldUseWebviewGeneration(request: GenerateRequest): boolean {
+  return !isTauri() || (isWindowsDesktopRuntime() && isCustomModel(request.model));
+}
+
+function shouldUseWebviewProviderRequests(): boolean {
+  return !isTauri() || isWindowsDesktopRuntime();
+}
+
+function assertWindowsModelSupported(request: GenerateRequest): void {
+  if (isWindowsDesktopRuntime() && !isCustomModel(request.model)) {
+    throw new Error('Windows 桌面端仅支持通过自定义平台(custom:*)生成图片，请在设置中配置 OpenAI 兼容 API。');
+  }
+}
+
 /**
  * 浏览器降级生成:直接调 OpenAI 兼容文生图接口 POST {base}/v1/images/generations。
  * 与 Rust openai_compat provider 行为一致:key 从 settingsStore.apiKeys[providerId] 读,
- * base_url 从 extra_params.provider_base_url 读,固定 1024x1024 / n=1 / b64_json。
+ * base_url 从 extra_params.provider_base_url 读,支持 Images 与 Responses 协议。
  */
 async function browserGenerateImage(request: GenerateRequest): Promise<string> {
   const model = request.model;
   const providerId = model.split('/')[0] ?? '';
-  if (!providerId.startsWith(CUSTOM_PROVIDER_PREFIX)) {
+  if (!providerId.startsWith(CUSTOM_API_PROVIDER_PREFIX)) {
     throw new Error('浏览器模式仅支持自定义平台(custom:*)模型,其他平台请使用桌面版 LenTalk 生成');
   }
   // 发送给平台的 model 需去掉 custom:<id>/ 前缀(与 Rust 端拆分逻辑一致)
@@ -167,7 +184,10 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
     throw new Error('未配置 API Key,请在「设置-密钥」中填写该平台的密钥');
   }
 
-  const endpoint = `${baseUrl}/v1/images/generations`;
+  const usesResponsesProtocol =
+    typeof request.extra_params?.protocol === 'string' &&
+    request.extra_params.protocol.toLowerCase() === 'responses';
+  const endpoint = `${baseUrl}/v1/${usesResponsesProtocol ? 'responses' : 'images/generations'}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 180000);
   try {
@@ -194,38 +214,24 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
       }
     }
 
-    const isGptImage = apiModel.toLowerCase().includes('gpt-image');
-    const referenceImageField = request.extra_params?.reference_image_field === 'input_image'
-      ? 'input_image'
-      : 'image';
-    const body: Record<string, unknown> = {
-      model: apiModel,
-      prompt: request.prompt,
-      size: isGptImage ? mapGptImageSize(request.aspect_ratio) : '1024x1024',
-      n: 1,
-    };
-    if (isGptImage) {
-      body.output_format = 'png';
-      if (apiModel.toLowerCase().includes('gpt-image-2')) {
-        body.aspect_ratio = request.aspect_ratio;
-      }
-    } else {
-      body.response_format = 'b64_json';
-    }
-    if (referenceImages.length > 0) {
-      if (referenceImageField === 'input_image') {
-        // input_image accepts URL or plain base64 rather than a data URL.
-        const normalized = referenceImages.map((image) =>
-          image.startsWith('data:') ? (image.split(',', 2)[1] ?? image) : image
-        );
-        body.input_image = normalized.length === 1 ? normalized[0] : normalized;
-      } else {
-        body.image = referenceImages[0];
-        if (referenceImages.length > 1) {
-          body.images = referenceImages;
+    const body: Record<string, unknown> = usesResponsesProtocol
+      ? {
+          model: apiModel,
+          input: [{
+            role: 'user',
+            content: [
+              { type: 'input_text', text: request.prompt },
+              ...referenceImages.map((image) => ({ type: 'input_image', image_url: image })),
+            ],
+          }],
+          tools: [{
+            type: 'image_generation',
+            action: referenceImages.length > 0 ? 'edit' : 'generate',
+            size: mapGptImageSize(request.aspect_ratio),
+          }],
+          tool_choice: { type: 'image_generation' },
         }
-      }
-    }
+      : buildBrowserImagesRequestBody(request, apiModel, referenceImages);
 
     const response = await fetch(endpoint, {
       method: 'POST',
@@ -253,6 +259,14 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
       throw new Error(
         `自定义平台请求失败 (HTTP ${response.status}): ${errorMessage ?? response.statusText}`
       );
+    }
+
+    if (usesResponsesProtocol) {
+      const image = extractBrowserResponsesImage(payload);
+      if (image) {
+        return image;
+      }
+      throw new Error('Responses 响应中未找到图片，请确认该平台模型支持图像生成');
     }
 
     const data =
@@ -291,6 +305,80 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
   }
 }
 
+function buildBrowserImagesRequestBody(
+  request: GenerateRequest,
+  apiModel: string,
+  referenceImages: string[]
+): Record<string, unknown> {
+  const isGptImage = apiModel.toLowerCase().includes('gpt-image');
+  const referenceImageField = request.extra_params?.reference_image_field === 'input_image'
+    ? 'input_image'
+    : 'image';
+  const body: Record<string, unknown> = {
+    model: apiModel,
+    prompt: request.prompt,
+    size: isGptImage ? mapGptImageSize(request.aspect_ratio) : '1024x1024',
+    n: 1,
+  };
+  if (isGptImage) {
+    body.output_format = 'png';
+    if (apiModel.toLowerCase().includes('gpt-image-2')) {
+      body.aspect_ratio = request.aspect_ratio;
+    }
+  } else {
+    body.response_format = 'b64_json';
+  }
+  if (referenceImages.length > 0) {
+    if (referenceImageField === 'input_image') {
+      const normalized = referenceImages.map((image) =>
+        image.startsWith('data:') ? (image.split(',', 2)[1] ?? image) : image
+      );
+      body.input_image = normalized.length === 1 ? normalized[0] : normalized;
+    } else {
+      body.image = referenceImages[0];
+      if (referenceImages.length > 1) {
+        body.images = referenceImages;
+      }
+    }
+  }
+  return body;
+}
+
+function extractBrowserResponsesImage(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+  const output = (payload as { output?: unknown }).output;
+  if (!Array.isArray(output)) {
+    return null;
+  }
+  for (const item of output) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const result = (item as { result?: unknown }).result;
+    if (typeof result === 'string' && result) {
+      return /^(https?:|data:)/.test(result) ? result : `data:image/png;base64,${result}`;
+    }
+    const imageUrl = (item as { image_url?: unknown }).image_url;
+    if (typeof imageUrl === 'string' && imageUrl) {
+      return imageUrl;
+    }
+    const content = (item as { content?: unknown }).content;
+    if (!Array.isArray(content)) {
+      continue;
+    }
+    for (const part of content) {
+      const partImageUrl =
+        part && typeof part === 'object' ? (part as { image_url?: unknown }).image_url : undefined;
+      if (typeof partImageUrl === 'string' && partImageUrl) {
+        return partImageUrl;
+      }
+    }
+  }
+  return null;
+}
+
 export async function generateImage(request: GenerateRequest): Promise<string> {
   const startedAt = performance.now();
   console.info('[AI] generate_image request', {
@@ -298,7 +386,8 @@ export async function generateImage(request: GenerateRequest): Promise<string> {
     tauri: isTauri(),
   });
 
-  if (!isTauri()) {
+  assertWindowsModelSupported(request);
+  if (shouldUseWebviewGeneration(request)) {
     // 浏览器降级:直接请求 OpenAI 兼容文生图接口
     return await browserGenerateImage(request);
   }
@@ -351,7 +440,8 @@ export async function submitGenerateImageJob(request: GenerateRequest): Promise<
     tauri: isTauri(),
   });
 
-  if (!isTauri()) {
+  assertWindowsModelSupported(request);
+  if (shouldUseWebviewGeneration(request)) {
     // 浏览器降级:同步发起生成,结果存内存 job map(与 Rust 异步任务语义一致)
     const jobId = crypto.randomUUID();
     browserGenerationJobs.set(jobId, {
@@ -384,7 +474,7 @@ export async function submitGenerateImageJob(request: GenerateRequest): Promise<
 }
 
 export async function getGenerateImageJob(jobId: string): Promise<GenerationJobStatus> {
-  if (!isTauri()) {
+  if (!isTauri() || browserGenerationJobs.has(jobId)) {
     // 浏览器降级:从内存 job map 读取
     const record = browserGenerationJobs.get(jobId);
     if (!record) {
@@ -458,7 +548,7 @@ function extractModelsFromPayload(payload: unknown): string[] {
 export async function verifyProviderUrl(
   baseUrl: string
 ): Promise<{ ok: boolean; status: number }> {
-  if (!isTauri()) {
+  if (shouldUseWebviewProviderRequests()) {
     // 浏览器降级:先尝试普通请求拿真实状态码;被 CORS 拦截时退化为 no-cors 探测可达性
     const url = normalizeBaseUrl(baseUrl);
     try {
@@ -482,7 +572,7 @@ export async function testProviderConnection(
   baseUrl: string,
   apiKey: string
 ): Promise<ProviderConnectionResult> {
-  if (!isTauri()) {
+  if (shouldUseWebviewProviderRequests()) {
     // 浏览器降级:直接请求 /v1/models(受 CORS 限制,失败时给出友好提示)
     const url = `${normalizeBaseUrl(baseUrl)}/v1/models`;
     const headers: Record<string, string> = {};
@@ -524,7 +614,7 @@ export async function fetchProviderModels(
   baseUrl: string,
   apiKey: string
 ): Promise<{ models: string[]; count: number }> {
-  if (!isTauri()) {
+  if (shouldUseWebviewProviderRequests()) {
     // 浏览器降级:直接请求 /v1/models(受 CORS 限制,失败时给出友好提示)
     const url = `${normalizeBaseUrl(baseUrl)}/v1/models`;
     const headers: Record<string, string> = {};
