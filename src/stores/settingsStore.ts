@@ -366,7 +366,11 @@ export const useSettingsStore = create<SettingsState>()(
           if (error) {
             console.error('failed to hydrate settings storage', error);
           }
-          useSettingsStore.setState({ isHydrated: true });
+          // 延迟到下一个 tick: persist 的同步 rehydrate 发生在 create() 返回前,
+          // 此时直接访问 useSettingsStore 会触发 TDZ(Cannot access before initialization)
+          setTimeout(() => {
+            useSettingsStore.setState({ isHydrated: true });
+          }, 0);
         };
       },
       migrate: (persistedState: unknown) => {
