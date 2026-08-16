@@ -5,7 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { testProviderConnection, verifyProviderUrl } from '@/commands/ai';
 import { recommendedApis } from '@/features/settings/recommendedApis';
-import { UiCheckbox, UiSelect } from '@/components/ui';
+import { UiCheckbox, UiModal, UiSelect } from '@/components/ui';
 import { UI_CONTENT_OVERLAY_INSET_CLASS, UI_DIALOG_TRANSITION_MS } from '@/components/ui/motion';
 import { useDialogTransition } from '@/components/ui/useDialogTransition';
 import { listModelProviders } from '@/features/canvas/models';
@@ -863,7 +863,7 @@ export function SettingsDialog({
                       </div>
                       <button
                         type="button"
-                        onClick={() => (showAddCustomApi ? resetCustomApiForm() : setShowAddCustomApi(true))}
+                        onClick={() => setShowAddCustomApi(true)}
                         className="flex items-center gap-1 rounded-md border border-border-dark px-2.5 py-1.5 text-xs text-text-muted transition-colors hover:border-accent/50 hover:text-text-dark"
                       >
                         <Plus className="h-3.5 w-3.5" />
@@ -878,7 +878,17 @@ export function SettingsDialog({
                     )}
 
                     {showAddCustomApi && (
-                      <div className="mb-3 space-y-2 rounded-md border border-border-dark bg-bg-dark p-3">
+                      <UiModal
+                        isOpen={showAddCustomApi}
+                        title={
+                          editingCustomApiId
+                            ? t('settings.customApiEditTitle', '编辑平台')
+                            : t('settings.customApiAdd')
+                        }
+                        onClose={resetCustomApiForm}
+                        widthClassName="w-[560px]"
+                      >
+                      <div className="space-y-2">
                         <div className="grid grid-cols-2 gap-2">
                           <label className="block">
                             <span className="mb-1 block text-[11px] text-text-muted">
@@ -983,6 +993,7 @@ export function SettingsDialog({
                           </button>
                         </div>
                       </div>
+                      </UiModal>
                     )}
 
                     {customApis.map((api) => (
