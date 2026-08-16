@@ -1,7 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { X, Eye, EyeOff, FolderOpen, Pencil, Plus, Trash2, ChevronDown, ChevronRight } from 'lucide-react';
+import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight } from 'lucide-react';
 import { Trans, useTranslation } from 'react-i18next';
-import { open } from '@tauri-apps/plugin-dialog';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { fetchProviderModels, testProviderConnection, verifyProviderUrl } from '@/commands/ai';
 import { recommendedApis } from '@/features/settings/recommendedApis';
@@ -95,7 +94,6 @@ export function SettingsDialog({
     apiKeys,
     customApis,
     grsaiNanoBananaProModel,
-    downloadPresetPaths,
     useUploadFilenameAsNodeTitle,
     storyboardGenKeepStyleConsistent,
     storyboardGenDisableTextInImage,
@@ -119,7 +117,6 @@ export function SettingsDialog({
     updateCustomApi,
     removeCustomApi,
     setGrsaiNanoBananaProModel,
-    setDownloadPresetPaths,
     setUseUploadFilenameAsNodeTitle,
     setStoryboardGenKeepStyleConsistent,
     setStoryboardGenDisableTextInImage,
@@ -158,8 +155,6 @@ export function SettingsDialog({
   const [localGrsaiNanoBananaProModel, setLocalGrsaiNanoBananaProModel] = useState(
     grsaiNanoBananaProModel
   );
-  const [localDownloadPathInput, setLocalDownloadPathInput] = useState('');
-  const [localDownloadPresetPaths, setLocalDownloadPresetPaths] = useState(downloadPresetPaths);
   const [localUseUploadFilenameAsNodeTitle, setLocalUseUploadFilenameAsNodeTitle] = useState(
     useUploadFilenameAsNodeTitle
   );
@@ -436,7 +431,6 @@ export function SettingsDialog({
       return;
     }
     setLocalApiKeys(apiKeys);
-    setLocalDownloadPresetPaths(downloadPresetPaths);
     setLocalGrsaiNanoBananaProModel(grsaiNanoBananaProModel);
     setLocalUseUploadFilenameAsNodeTitle(useUploadFilenameAsNodeTitle);
     setLocalStoryboardGenKeepStyleConsistent(storyboardGenKeepStyleConsistent);
@@ -458,7 +452,6 @@ export function SettingsDialog({
     setLocalEnableUpdateDialog(enableUpdateDialog);
     setCheckUpdateStatus('');
     setRevealedApiKeys({});
-    setLocalDownloadPathInput('');
   }, [
     isOpen,
   ]);
@@ -476,7 +469,6 @@ export function SettingsDialog({
       setProviderApiKey(provider.id, localApiKeys[provider.id] ?? '');
     });
     setGrsaiNanoBananaProModel(localGrsaiNanoBananaProModel);
-    setDownloadPresetPaths(localDownloadPresetPaths);
     setUseUploadFilenameAsNodeTitle(localUseUploadFilenameAsNodeTitle);
     setStoryboardGenKeepStyleConsistent(localStoryboardGenKeepStyleConsistent);
     setStoryboardGenDisableTextInImage(localStoryboardGenDisableTextInImage);
@@ -498,7 +490,6 @@ export function SettingsDialog({
     onClose();
   }, [
     localApiKeys,
-    localDownloadPresetPaths,
     localGrsaiNanoBananaProModel,
     localUseUploadFilenameAsNodeTitle,
     localStoryboardGenKeepStyleConsistent,
@@ -521,7 +512,6 @@ export function SettingsDialog({
     providers,
     setProviderApiKey,
     setGrsaiNanoBananaProModel,
-    setDownloadPresetPaths,
     setUseUploadFilenameAsNodeTitle,
     setStoryboardGenKeepStyleConsistent,
     setStoryboardGenDisableTextInImage,
@@ -552,44 +542,6 @@ export function SettingsDialog({
     const status = await onCheckUpdate();
     setCheckUpdateStatus(status);
   }, [onCheckUpdate]);
-
-  const handlePickDownloadPath = useCallback(async () => {
-    try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-      });
-      if (!selected || Array.isArray(selected)) {
-        return;
-      }
-      setLocalDownloadPresetPaths((previous) => {
-        if (previous.includes(selected)) {
-          return previous;
-        }
-        return [...previous, selected].slice(0, 8);
-      });
-    } catch (error) {
-      console.error('Failed to pick download path', error);
-    }
-  }, []);
-
-  const handleAddDownloadPathFromInput = useCallback(() => {
-    const next = localDownloadPathInput.trim();
-    if (!next) {
-      return;
-    }
-    setLocalDownloadPresetPaths((previous) => {
-      if (previous.includes(next)) {
-        return previous;
-      }
-      return [...previous, next].slice(0, 8);
-    });
-    setLocalDownloadPathInput('');
-  }, [localDownloadPathInput]);
-
-  const handleRemoveDownloadPath = useCallback((path: string) => {
-    setLocalDownloadPresetPaths((previous) => previous.filter((value) => value !== path));
-  }, []);
 
   if (!shouldRender) return null;
 
@@ -1477,67 +1429,6 @@ export function SettingsDialog({
                     title={t('settings.useUploadFilenameAsNodeTitle')}
                     description={t('settings.useUploadFilenameAsNodeTitleDesc')}
                   />
-
-                  <div className="rounded-lg border border-border-dark bg-bg-dark p-4">
-                    <div className="mb-3">
-                      <h3 className="text-sm font-medium text-text-dark">
-                        {t('settings.downloadPresetPaths')}
-                      </h3>
-                      <p className="mt-1 text-xs text-text-muted">
-                        {t('settings.downloadPresetPathsDesc')}
-                      </p>
-                    </div>
-
-                    <div className="mb-2 flex items-center gap-2">
-                      <input
-                        value={localDownloadPathInput}
-                        onChange={(event) => setLocalDownloadPathInput(event.target.value)}
-                        placeholder={t('settings.downloadPathPlaceholder')}
-                        className="h-9 flex-1 rounded border border-border-dark bg-surface-dark px-3 text-sm text-text-dark outline-none placeholder:text-text-muted"
-                      />
-                      <button
-                        type="button"
-                        className="inline-flex h-9 items-center justify-center rounded border border-border-dark bg-surface-dark px-3 text-xs text-text-dark transition-colors hover:bg-bg-dark"
-                        onClick={handleAddDownloadPathFromInput}
-                      >
-                        <Plus className="mr-1 h-3.5 w-3.5" />
-                        {t('settings.addPath')}
-                      </button>
-                      <button
-                        type="button"
-                        className="inline-flex h-9 items-center justify-center rounded border border-border-dark bg-surface-dark px-3 text-xs text-text-dark transition-colors hover:bg-bg-dark"
-                        onClick={() => {
-                          void handlePickDownloadPath();
-                        }}
-                      >
-                        <FolderOpen className="mr-1 h-3.5 w-3.5" />
-                        {t('settings.chooseFolder')}
-                      </button>
-                    </div>
-
-                    <div className="space-y-1">
-                      {localDownloadPresetPaths.length > 0 ? (
-                        localDownloadPresetPaths.map((path) => (
-                          <div
-                            key={path}
-                            className="flex items-center gap-2 rounded border border-border-dark bg-surface-dark px-2 py-1.5"
-                          >
-                            <span className="truncate text-xs text-text-dark">{path}</span>
-                            <button
-                              type="button"
-                              className="ml-auto inline-flex h-6 w-6 items-center justify-center rounded text-text-muted transition-colors hover:bg-bg-dark hover:text-text-dark"
-                              onClick={() => handleRemoveDownloadPath(path)}
-                              title={t('common.delete')}
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-                        ))
-                      ) : (
-                        <div className="text-xs text-text-muted">{t('settings.noDownloadPresetPaths')}</div>
-                      )}
-                    </div>
-                  </div>
 
                   {/* 更新(原「关于」页移入) */}
                   <div className="rounded-lg border border-border-dark bg-bg-dark p-4 space-y-3">
