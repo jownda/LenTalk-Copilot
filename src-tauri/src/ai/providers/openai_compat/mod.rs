@@ -55,7 +55,11 @@ impl OpenAICompatibleProvider {
         base_url: &str,
         api_key: &str,
     ) -> Result<Vec<String>, AIError> {
-        let client = Self::build_client();
+        // 拉取模型是交互操作, 用短超时(20s), 避免平台不可达时 UI 长时间卡在"拉取中"
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let endpoint = format!("{}/v1/models", base_url.trim_end_matches('/'));
 
         let response = client
