@@ -8,6 +8,7 @@ import {
 import {
 } from '@tauri-apps/api/core';
 import {
+  imageUrlToDataUrl,
 } from '@/features/canvas/application/imageData';
 import { useSettingsStore } from '@/stores/settingsStore';
 
@@ -86,14 +87,25 @@ export function localizeReferenceTokens(prompt: string, model: string): string {
   );
 }
 
+/** 参考图片直传: http(s) URL 直接透传(平台可下载); 本地路径/dataURL 转 base64 内嵌。 */
+async function normalizeReferenceUrls(
+  urls: string[] | undefined
+): Promise<string[] | undefined> {
+  if (!urls?.length) return undefined;
+  return await Promise.all(
+    urls
+      .map((url) => url.trim())
+      .filter(Boolean)
+      .map(async (url) => (/^https?:\/\//i.test(url) ? url : await imageUrlToDataUrl(url)))
+  );
+}
+
 export const tauriAiGateway: AiGateway = {
   setApiKey,
   generateImage: async (payload: GenerateImagePayload) => {
     const injected = injectCustomApiRequestMode(payload);
-    // 图片直传: 上游图片 URL 数组直接透传(不做 dataURL/persist/上传)
-    const normalizedReferenceImages = injected.referenceImages
-      ?.map((imageUrl) => imageUrl.trim())
-      .filter(Boolean);
+    // 图片直传: http URL 透传, 本地路径转 base64(平台需能下载)
+    const normalizedReferenceImages = await normalizeReferenceUrls(injected.referenceImages);
     const mergedExtraParams = mergeNegativePrompt(injected);
 
     return await generateImage({
@@ -111,10 +123,8 @@ export const tauriAiGateway: AiGateway = {
   },
   submitGenerateImageJob: async (payload: GenerateImagePayload) => {
     const injected = injectCustomApiRequestMode(payload);
-    // 图片直传: 上游图片 URL 数组直接透传
-    const normalizedReferenceImages = injected.referenceImages
-      ?.map((imageUrl) => imageUrl.trim())
-      .filter(Boolean);
+    // 图片直传: http URL 透传, 本地路径转 base64
+    const normalizedReferenceImages = await normalizeReferenceUrls(injected.referenceImages);
     const mergedExtraParams = mergeNegativePrompt(injected);
     return await submitGenerateImageJob({
       prompt: localizeReferenceTokens(
@@ -132,10 +142,8 @@ export const tauriAiGateway: AiGateway = {
   getGenerateImageJob,
   generateVideo: async (payload: GenerateVideoPayload) => {
     const injected = injectCustomApiRequestMode(payload as unknown as GenerateImagePayload);
-    // 图片直传: 上游图片 URL 数组直接透传(不做 dataURL/上传)
-    const referenceImages = payload.referenceImages
-      ?.map((imageUrl) => imageUrl.trim())
-      .filter(Boolean);
+    // 图片直传: http URL 透传, 本地路径转 base64(平台需能下载)
+    const referenceImages = await normalizeReferenceUrls(payload.referenceImages);
     // 音频直传: 直接把上游音频 URL 数组透传给后端(不做 /v1/files 上传),
     // 由后端按 audio_url / audio_urls 字段提交给平台。
     const referenceAudio = payload.referenceAudio
