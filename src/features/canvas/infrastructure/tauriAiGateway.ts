@@ -10,7 +10,6 @@ import {
 import {
 } from '@/features/canvas/application/imageData';
 import { useSettingsStore } from '@/stores/settingsStore';
-import { isWindowsDesktopRuntime } from '@/platform/runtime';
 
 import type { AiGateway, GenerateImagePayload, GenerateVideoPayload } from '../application/ports';
 
