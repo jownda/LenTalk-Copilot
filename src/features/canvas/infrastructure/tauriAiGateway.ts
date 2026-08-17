@@ -86,18 +86,6 @@ export function localizeReferenceTokens(prompt: string, model: string): string {
   );
 }
 
-function normalizeProviderBaseUrl(baseUrl: string): string {
-  return baseUrl.trim().replace(/\/+$/, '').replace(/\/v1$/i, '');
-}
-
-function usesWgspaiVideoStudio(baseUrl: string): boolean {
-  try {
-    return new URL(normalizeProviderBaseUrl(baseUrl)).hostname.toLowerCase() === 'api.wgspai.cn';
-  } catch {
-    return false;
-  }
-}
-
 export const tauriAiGateway: AiGateway = {
   setApiKey,
   generateImage: async (payload: GenerateImagePayload) => {
@@ -144,18 +132,10 @@ export const tauriAiGateway: AiGateway = {
   getGenerateImageJob,
   generateVideo: async (payload: GenerateVideoPayload) => {
     const injected = injectCustomApiRequestMode(payload as unknown as GenerateImagePayload);
-    const providerBaseUrl = typeof injected.extraParams?.provider_base_url === 'string'
-      ? injected.extraParams.provider_base_url
-      : '';
-    const useWgspaiStudio = usesWgspaiVideoStudio(providerBaseUrl);
     // 图片直传: 上游图片 URL 数组直接透传(不做 dataURL/上传)
     const referenceImages = payload.referenceImages
       ?.map((imageUrl) => imageUrl.trim())
       .filter(Boolean);
-    const videoExtraParams = {
-      ...(injected.extraParams ?? {}),
-      ...(useWgspaiStudio ? { video_transport: 'wgspai-studio' } : {}),
-    };
     // 音频直传: 直接把上游音频 URL 数组透传给后端(不做 /v1/files 上传),
     // 由后端按 audio_url / audio_urls 字段提交给平台。
     const referenceAudio = payload.referenceAudio
@@ -169,7 +149,7 @@ export const tauriAiGateway: AiGateway = {
       image_mode: payload.imageMode,
       reference_images: referenceImages,
       reference_audio: referenceAudio,
-      extra_params: videoExtraParams,
+      extra_params: injected.extraParams,
     });
   },
 };
