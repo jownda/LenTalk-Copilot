@@ -8,6 +8,7 @@ export interface TextRange {
 export interface ReferenceTokenMatch extends TextRange {
   token: string;
   value: number;
+  kind: 'image' | 'audio';
 }
 
 interface TokenRange extends TextRange {
@@ -31,19 +32,35 @@ function isAsciiDigit(char: string): boolean {
   return char >= '0' && char <= '9';
 }
 
-export function findReferenceTokens(text: string, maxImageCount?: number): ReferenceTokenMatch[] {
+export function findReferenceTokens(
+  text: string,
+  maxImageCount?: number,
+  maxAudioCount?: number
+): ReferenceTokenMatch[] {
   const tokens: ReferenceTokenMatch[] = [];
-  const maxReferenceNumber = resolveMaxReferenceNumber(maxImageCount);
 
   for (let index = 0; index < text.length; index += 1) {
-    if (text[index] !== '@' || text[index + 1] !== '图') {
+    if (text[index] !== '@') {
       continue;
     }
 
-    const digitsStart = index + 2;
+    const kind = text.startsWith('@图', index)
+      ? 'image'
+      : text.startsWith('@音频', index)
+        ? 'audio'
+        : null;
+    if (!kind) {
+      continue;
+    }
+
+    const digitsStart = index + (kind === 'image' ? 2 : 3);
     if (!isAsciiDigit(text[digitsStart] ?? '')) {
       continue;
     }
+
+    const maxReferenceNumber = resolveMaxReferenceNumber(
+      kind === 'image' ? maxImageCount : maxAudioCount
+    );
 
     let digitsEnd = digitsStart;
     while (isAsciiDigit(text[digitsEnd] ?? '')) {
@@ -58,6 +75,7 @@ export function findReferenceTokens(text: string, maxImageCount?: number): Refer
           end: digitsEnd,
           token: text.slice(index, digitsEnd),
           value: fullValue,
+          kind,
         });
         index = digitsEnd - 1;
       }
@@ -86,6 +104,7 @@ export function findReferenceTokens(text: string, maxImageCount?: number): Refer
         end: bestEnd,
         token: text.slice(index, bestEnd),
         value: bestValue,
+        kind,
       });
       index = bestEnd - 1;
     }
@@ -94,9 +113,13 @@ export function findReferenceTokens(text: string, maxImageCount?: number): Refer
   return tokens;
 }
 
-function findTokenRanges(text: string, maxImageCount?: number): TokenRange[] {
+function findTokenRanges(
+  text: string,
+  maxImageCount?: number,
+  maxAudioCount?: number
+): TokenRange[] {
   const ranges: TokenRange[] = [];
-  const referenceTokens = findReferenceTokens(text, maxImageCount);
+  const referenceTokens = findReferenceTokens(text, maxImageCount, maxAudioCount);
   for (const token of referenceTokens) {
     const start = token.start;
     const end = token.end;
@@ -139,13 +162,14 @@ export function resolveReferenceAwareDeleteRange(
   selectionStart: number,
   selectionEnd: number,
   direction: DeleteDirection,
-  maxImageCount?: number
+  maxImageCount?: number,
+  maxAudioCount?: number
 ): TextRange | null {
   const safeStart = clamp(selectionStart, 0, text.length);
   const safeEnd = clamp(selectionEnd, 0, text.length);
   const selectionMin = Math.min(safeStart, safeEnd);
   const selectionMax = Math.max(safeStart, safeEnd);
-  const tokenRanges = findTokenRanges(text, maxImageCount);
+  const tokenRanges = findTokenRanges(text, maxImageCount, maxAudioCount);
 
   if (selectionMin !== selectionMax) {
     let expandedStart = selectionMin;
@@ -211,15 +235,19 @@ export function removeTextRange(
 }
 
 /**
- * 移除提示词中超出 maxImageCount 的 `@图N` 引用(上游图片断连后调用)。
+ * 移除提示词中超出当前图片或音频数量的引用标记(上游断连后调用)。
  * 从后往前删除, 连同 token 前紧邻的空格一并移除, 避免残留多余空格。
  */
 export function removeOutOfRangeReferenceTokens(
   text: string,
-  maxImageCount: number
+  maxImageCount: number,
+  maxAudioCount?: number
 ): string {
   const tokens = findReferenceTokens(text);
-  const outOfRange = tokens.filter((token) => token.value > maxImageCount);
+  const maxAudioReferenceNumber = resolveMaxReferenceNumber(maxAudioCount);
+  const outOfRange = tokens.filter((token) => token.value > (
+    token.kind === 'image' ? maxImageCount : maxAudioReferenceNumber
+  ));
   if (outOfRange.length === 0) {
     return text;
   }

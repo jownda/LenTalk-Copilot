@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight } from 'lucide-react';
 import { Trans, useTranslation } from 'react-i18next';
-import { useSettingsStore } from '@/stores/settingsStore';
+import { isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
 import { fetchProviderModels, testProviderConnection, verifyProviderUrl } from '@/commands/ai';
 import { recommendedApis } from '@/features/settings/recommendedApis';
 import { UiCheckbox, UiModal, UiSelect } from '@/components/ui';
@@ -204,6 +204,7 @@ export function SettingsDialog({
     baseUrl: '',
     apiKey: '',
     modelsText: '',
+    videoModelsText: '',
     requestMode: 'async' as 'sync' | 'async',
     protocol: 'images' as 'images' | 'responses',
     referenceImageField: 'image' as 'image' | 'input_image',
@@ -211,6 +212,7 @@ export function SettingsDialog({
   const [customApiBusy, setCustomApiBusy] = useState<'idle' | 'testing' | 'fetching'>('idle');
   const [customApiStatus, setCustomApiStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
+  const [modelPickerMediaType, setModelPickerMediaType] = useState<'image' | 'video'>('image');
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [pickedModels, setPickedModels] = useState<string[]>([]);
   const [modelPickerSearch, setModelPickerSearch] = useState('');
@@ -224,6 +226,7 @@ export function SettingsDialog({
       baseUrl: api.baseUrl,
       apiKey: '',
       modelsText: api.models.join('\n'),
+      videoModelsText: (api.videoModels ?? []).join('\n'),
       requestMode: 'async',
       protocol: 'images',
       referenceImageField: 'image',
@@ -263,8 +266,8 @@ export function SettingsDialog({
   }, [customApiDraft.baseUrl, t]);
 
   /** 验证协议:带 Key 调 /v1/models,检测 OpenAI 兼容 */
-  /** 拉取平台模型列表并打开模型选择弹窗(默认只勾选当前已填模型) */
-  const handleFetchModels = useCallback(async () => {
+  /** 拉取平台模型列表并打开对应媒体类型的模型选择弹窗。 */
+  const handleFetchModels = useCallback(async (mediaType: 'image' | 'video') => {
     const baseUrl = customApiDraft.baseUrl.trim().replace(/\/+$/, '');
     if (!baseUrl) {
       setCustomApiStatus({ type: 'err', text: t('settings.customApiTestNeedUrl') });
@@ -278,15 +281,27 @@ export function SettingsDialog({
         setCustomApiStatus({ type: 'err', text: t('settings.customApiNoModels', '未从平台拉取到模型') });
         return;
       }
-      setFetchedModels(models);
+      const videoModelIds = new Set(
+        customApiDraft.videoModelsText
+          .split(/[\n,]/)
+          .map((model) => model.trim().toLowerCase())
+          .filter(Boolean)
+      );
+      const targetModels = models.filter(
+        (model) => mediaType === 'video'
+          ? isVideoGenerationModelName(model)
+          : !videoModelIds.has(model.trim().toLowerCase()) && !isVideoGenerationModelName(model)
+      );
+      setFetchedModels(targetModels);
       const existing = new Set(
-        customApiDraft.modelsText
+        (mediaType === 'video' ? customApiDraft.videoModelsText : customApiDraft.modelsText)
           .split(/[\n,]/)
           .map((model) => model.trim())
           .filter(Boolean)
       );
-      setPickedModels(models.filter((model) => existing.has(model)));
+      setPickedModels(targetModels.filter((model) => existing.has(model)));
       setModelPickerSearch('');
+      setModelPickerMediaType(mediaType);
       setIsModelPickerOpen(true);
     } catch (error) {
       setCustomApiStatus({
@@ -296,7 +311,13 @@ export function SettingsDialog({
     } finally {
       setCustomApiBusy('idle');
     }
-  }, [customApiDraft.apiKey, customApiDraft.baseUrl, customApiDraft.modelsText, t]);
+  }, [
+    customApiDraft.apiKey,
+    customApiDraft.baseUrl,
+    customApiDraft.modelsText,
+    customApiDraft.videoModelsText,
+    t,
+  ]);
 
   const togglePickedModel = useCallback((model: string) => {
     setPickedModels((previous) =>
@@ -307,10 +328,15 @@ export function SettingsDialog({
   }, []);
 
   const confirmPickedModels = useCallback(() => {
-    setCustomApiDraft({ ...customApiDraft, modelsText: pickedModels.join('\n') });
+    setCustomApiDraft({
+      ...customApiDraft,
+      ...(modelPickerMediaType === 'video'
+        ? { videoModelsText: pickedModels.join('\n') }
+        : { modelsText: pickedModels.join('\n') }),
+    });
     setIsModelPickerOpen(false);
     setCustomApiStatus({ type: 'ok', text: t('settings.customApiModelsApplied', '已应用所选模型') });
-  }, [customApiDraft, pickedModels, t]);
+  }, [customApiDraft, modelPickerMediaType, pickedModels, t]);
 
   const filteredFetchedModels = useMemo(() => {
     const keyword = modelPickerSearch.trim().toLowerCase();
@@ -340,10 +366,17 @@ export function SettingsDialog({
     try {
       const result = await testProviderConnection(baseUrl, apiKey);
       const models = result.models ?? [];
+      const videoModelIds = new Set(
+        customApiDraft.videoModelsText
+          .split(/[\n,]/)
+          .map((model) => model.trim().toLowerCase())
+          .filter(Boolean)
+      );
+      const imageModels = models.filter((model) => !videoModelIds.has(model.trim().toLowerCase()));
       const hasNativeGptImage = models.some((model) => /^gpt-image-1(?:$|[-_])/i.test(model));
       setCustomApiDraft((previous) => ({
         ...previous,
-        modelsText: models.length > 0 ? models.join('\n') : previous.modelsText,
+        modelsText: imageModels.length > 0 ? imageModels.join('\n') : previous.modelsText,
         // 异步提交同时兼容平台直接返回图片和返回任务 ID 两种行为。
         requestMode: 'async',
         protocol: 'images',
@@ -361,7 +394,7 @@ export function SettingsDialog({
     } finally {
       setCustomApiBusy('idle');
     }
-  }, [customApiDraft.apiKey, customApiDraft.baseUrl, t]);
+  }, [customApiDraft.apiKey, customApiDraft.baseUrl, customApiDraft.videoModelsText, t]);
 
   const startEditCustomApi = useCallback((id: string) => {
     const api = useSettingsStore.getState().customApis.find((item) => item.id === id);
@@ -374,6 +407,7 @@ export function SettingsDialog({
       baseUrl: api.baseUrl,
       apiKey: api.apiKey,
       modelsText: api.models.join('\n'),
+      videoModelsText: api.videoModels.join('\n'),
       requestMode: api.requestMode,
       protocol: api.protocol,
       referenceImageField: api.referenceImageField ?? 'image',
@@ -389,6 +423,7 @@ export function SettingsDialog({
       baseUrl: '',
       apiKey: '',
       modelsText: '',
+      videoModelsText: '',
       requestMode: 'async',
       protocol: 'images',
       referenceImageField: 'image',
@@ -402,7 +437,15 @@ export function SettingsDialog({
       .split(/[\n,]/)
       .map((model) => model.trim())
       .filter(Boolean);
-    if (!name || !baseUrl || models.length === 0) {
+    const videoModels = customApiDraft.videoModelsText
+      .split(/[\n,]/)
+      .map((model) => model.trim())
+      .filter(Boolean);
+    const videoModelIds = new Set(videoModels.map((model) => model.toLowerCase()));
+    const imageModels = models.filter(
+      (model) => !videoModelIds.has(model.toLowerCase()) && !isVideoGenerationModelName(model)
+    );
+    if (!name || !baseUrl || (models.length === 0 && videoModels.length === 0)) {
       return;
     }
     if (editingCustomApiId) {
@@ -410,7 +453,8 @@ export function SettingsDialog({
         name,
         baseUrl,
         apiKey: customApiDraft.apiKey.trim(),
-        models,
+        models: imageModels,
+        videoModels,
         requestMode: customApiDraft.requestMode,
         protocol: customApiDraft.protocol,
         referenceImageField: customApiDraft.referenceImageField,
@@ -420,7 +464,8 @@ export function SettingsDialog({
         name,
         baseUrl,
         apiKey: customApiDraft.apiKey.trim(),
-        models,
+        models: imageModels,
+        videoModels,
         requestMode: customApiDraft.requestMode,
         protocol: customApiDraft.protocol,
         referenceImageField: customApiDraft.referenceImageField,
@@ -854,6 +899,18 @@ export function SettingsDialog({
                             </button>
                           </div>
                           <p className="mt-1 text-[11px] text-text-muted">{api.summary}</p>
+                          {api.advantages.length > 0 && (
+                            <div className="mt-2 flex flex-wrap gap-1">
+                              {api.advantages.map((advantage) => (
+                                <span
+                                  key={advantage}
+                                  className="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent"
+                                >
+                                  {advantage}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                           {api.models.length > 0 && (
                             <p className="mt-1 truncate text-[10px] text-text-muted/60">
                               {api.models.slice(0, 3).join(' · ')}
@@ -861,12 +918,14 @@ export function SettingsDialog({
                             </p>
                           )}
                           <a
-                            href={api.registerUrl}
+                            href={api.pricingUrl ?? api.registerUrl}
                             target="_blank"
                             rel="noreferrer"
                             className="mt-1.5 text-[11px] text-accent hover:underline"
                           >
-                            {t('settings.recommendedApisRegister')}
+                            {api.pricingUrl
+                              ? t('settings.recommendedApisPricing')
+                              : t('settings.recommendedApisRegister')}
                           </a>
                         </div>
                       ))}
@@ -957,10 +1016,34 @@ export function SettingsDialog({
                         </label>
                         <label className="block">
                           <span className="mb-1 flex items-center justify-between text-[11px] text-text-muted">
+                            <span>{t('settings.customApiVideoModels')}</span>
+                            <button
+                              type="button"
+                              onClick={() => void handleFetchModels('video')}
+                              disabled={customApiBusy !== 'idle'}
+                              className="rounded-md border border-border-dark px-2 py-0.5 text-[11px] text-text-muted transition-colors hover:border-accent/50 hover:text-text-dark disabled:opacity-50"
+                            >
+                              {customApiBusy === 'fetching'
+                                ? t('settings.customApiFetching', '拉取中…')
+                                : t('settings.customApiFetchModels', '拉取模型')}
+                            </button>
+                          </span>
+                          <textarea
+                            value={customApiDraft.videoModelsText}
+                            onChange={(event) =>
+                              setCustomApiDraft({ ...customApiDraft, videoModelsText: event.target.value })
+                            }
+                            rows={2}
+                            placeholder={t('settings.customApiVideoModelsPlaceholder')}
+                            className="ui-scrollbar w-full resize-none rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
+                          />
+                        </label>
+                        <label className="block">
+                          <span className="mb-1 flex items-center justify-between text-[11px] text-text-muted">
                             <span>{t('settings.customApiModels')}</span>
                             <button
                               type="button"
-                              onClick={() => void handleFetchModels()}
+                              onClick={() => void handleFetchModels('image')}
                               disabled={customApiBusy !== 'idle'}
                               className="rounded-md border border-border-dark px-2 py-0.5 text-[11px] text-text-muted transition-colors hover:border-accent/50 hover:text-text-dark disabled:opacity-50"
                             >
@@ -1032,7 +1115,10 @@ export function SettingsDialog({
 
                     <UiModal
                       isOpen={isModelPickerOpen}
-                      title={t('settings.customApiPickModels', '选择模型')}
+                      title={t(
+                        'settings.customApiPickModels',
+                        modelPickerMediaType === 'video' ? '选择视频模型' : '选择图片模型'
+                      )}
                       onClose={() => setIsModelPickerOpen(false)}
                       widthClassName="w-[480px]"
                       footer={

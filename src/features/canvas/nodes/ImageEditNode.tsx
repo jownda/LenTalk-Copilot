@@ -370,6 +370,11 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     () => graphImageResolver.collectInputImages(id, nodes, edges),
     [id, nodes, edges]
   );
+  const incomingText = useMemo(
+    () => graphImageResolver.collectInputText(id, nodes, edges),
+    [edges, id, nodes]
+  );
+  const incomingTextDisplay = incomingText.join('\n\n');
 
   const incomingImageItems = useMemo(
     () =>
@@ -597,7 +602,10 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   }, []);
 
   const handleGenerate = useCallback(async () => {
-    const prompt = promptDraft.replace(/@(?=图\d+)/g, '').trim();
+    const prompt = [
+      promptDraft.replace(/@(?=图\d+)/g, '').trim(),
+      ...incomingText,
+    ].filter(Boolean).join('\n\n').trim();
     if (!prompt) {
       const errorMessage = t('node.imageEdit.promptRequired');
       setError(errorMessage);
@@ -737,6 +745,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     addEdge,
     providerApiKey,
     findNodePosition,
+    incomingText,
     promptDraft,
     effectiveExtraParams,
     id,
@@ -922,9 +931,17 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
             onScroll={syncPromptHighlightScroll}
             onMouseDown={(event) => event.stopPropagation()}
             placeholder={t('node.imageEdit.promptPlaceholder')}
-            className="ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit]"
+            className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${incomingTextDisplay ? 'pb-16' : ''}`}
             style={{ scrollbarGutter: 'stable' }}
           />
+          {incomingTextDisplay && (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 line-clamp-3 whitespace-pre-wrap break-words bg-bg-dark/90 px-1 py-0.5 text-sm leading-6 text-text-muted"
+            >
+              {incomingTextDisplay}
+            </div>
+          )}
         </div>
 
         {showImagePicker && incomingImageItems.length > 0 && (

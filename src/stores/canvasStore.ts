@@ -129,6 +129,7 @@ interface CanvasState {
 
   updateNodeData: (nodeId: string, data: Partial<CanvasNodeData>) => void;
   updateNodePosition: (nodeId: string, position: { x: number; y: number }) => void;
+  updateNodeSize: (nodeId: string, width: number, height: number) => void;
   updateStoryboardFrame: (
     nodeId: string,
     frameId: string,
@@ -1149,6 +1150,43 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         return {
           ...node,
           position,
+        };
+      });
+
+      if (!changed) {
+        return {};
+      }
+
+      return { nodes: nextNodes };
+    });
+  },
+
+  updateNodeSize: (nodeId, width, height) => {
+    const safeWidth = Math.max(1, Math.round(width));
+    const safeHeight = Math.max(1, Math.round(height));
+    set((state) => {
+      let changed = false;
+      const nextNodes = state.nodes.map((node) => {
+        if (node.id !== nodeId) {
+          return node;
+        }
+
+        const nextWidth = Math.round(safeWidth);
+        const nextHeight = Math.round(safeHeight);
+        if (node.width === nextWidth && node.height === nextHeight) {
+          return node;
+        }
+
+        changed = true;
+        return {
+          ...node,
+          width: nextWidth,
+          height: nextHeight,
+          style: {
+            ...(node.style ?? {}),
+            width: nextWidth,
+            height: nextHeight,
+          },
         };
       });
 

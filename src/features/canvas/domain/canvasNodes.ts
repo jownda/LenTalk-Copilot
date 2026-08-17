@@ -3,6 +3,7 @@ import type { Edge, Node, XYPosition } from '@xyflow/react';
 export const CANVAS_NODE_TYPES = {
   upload: 'uploadNode',
   imageEdit: 'imageNode',
+  videoGen: 'videoGenNode',
   exportImage: 'exportImageNode',
   textAnnotation: 'textAnnotationNode',
   group: 'groupNode',
@@ -84,6 +85,18 @@ export interface ImageEditNodeData extends NodeImageData {
   isGenerating?: boolean;
   generationStartedAt?: number | null;
   generationDurationMs?: number;
+}
+
+export interface VideoGenNodeData extends NodeDisplayData {
+  prompt: string;
+  model: string;
+  duration: number;
+  aspectRatio: string;
+  imageMode?: 'reference' | 'first-last';
+  firstFrameImageUrl?: string | null;
+  firstFramePreviewImageUrl?: string | null;
+  lastFrameImageUrl?: string | null;
+  lastFramePreviewImageUrl?: string | null;
 }
 
 export interface StoryboardFrameItem {
@@ -178,6 +191,16 @@ export interface AudioNodeData extends NodeDisplayData {
   aspectRatio?: string;
   /** 媒体类型: audio | video */
   mediaType?: 'audio' | 'video';
+  /** 下游生成中状态(AI 视频节点生成时写入) */
+  isGenerating?: boolean;
+  generationStartedAt?: number | null;
+  generationDurationMs?: number;
+  /** 生成失败信息(显示在节点上) */
+  generationError?: string | null;
+  generationErrorDetails?: string | null;
+  generationProviderId?: string | null;
+  generationModel?: string | null;
+  providerBaseUrl?: string | null;
   [key: string]: unknown;
 }
 
@@ -187,6 +210,7 @@ export type CanvasNodeData =
   | TextAnnotationNodeData
   | GroupNodeData
   | ImageEditNodeData
+  | VideoGenNodeData
   | StoryboardSplitNodeData
   | StoryboardGenNodeData
   | PanoramaNodeData

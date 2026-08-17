@@ -13,6 +13,13 @@ export type CanvasEdgeRoutingMode = 'spline' | 'orthogonal' | 'smartOrthogonal';
 export type ProviderApiKeys = Record<string, string>;
 export const DEFAULT_GRSAI_NANO_BANANA_PRO_MODEL = 'nano-banana-pro';
 
+/** 视频模型必须与图片模型分开注册，避免通用模型拉取结果污染图片节点。 */
+export function isVideoGenerationModelName(model: string): boolean {
+  return /seedance|minimax-h3|grok-imagine-video|(?:^|[-_])video(?:[-_]|$)|hailuo|kling|runway|(?:^|[-_])veo(?:[-_]|$)|(?:^|[-_])sora(?:[-_]|$)|pixverse|vidu|luma/i.test(
+    model.trim()
+  );
+}
+
 /** 自定义 AI 平台(OpenAI 兼容),参考 Infinite Canvas 的 API 设置写法 */
 export interface CustomApiProvider {
   id: string;
@@ -20,6 +27,8 @@ export interface CustomApiProvider {
   baseUrl: string;
   apiKey: string;
   models: string[];
+  /** 视频生成模型：与图像模型分开，避免在图片节点中误选。 */
+  videoModels: string[];
   createdAt: number;
   /** 请求模式: sync=同步等待平台返回图片; async=提交后轮询任务状态 */
   requestMode: 'sync' | 'async';
@@ -187,20 +196,36 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
 
   return input
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
-    .map((item) => ({
-      id: String(item.id ?? '').trim(),
-      name: String(item.name ?? '').trim(),
-      baseUrl: String(item.baseUrl ?? '').trim().replace(/\/+$/, ''),
-      apiKey: normalizeApiKey(String(item.apiKey ?? '')),
-      models: Array.isArray(item.models)
+    .map((item) => {
+      const explicitVideoModels = Array.isArray(item.videoModels)
+        ? item.videoModels.map((model) => String(model).trim()).filter(Boolean)
+        : [];
+      const configuredModels = Array.isArray(item.models)
         ? item.models.map((model) => String(model).trim()).filter(Boolean)
-        : [],
-      createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
-      requestMode: item.requestMode === 'sync' ? ('sync' as const) : ('async' as const),
-      protocol: item.protocol === 'responses' ? ('responses' as const) : ('images' as const),
-      referenceImageField:
-        item.referenceImageField === 'input_image' ? ('input_image' as const) : ('image' as const),
-    }))
+        : [];
+      const videoModels = Array.from(new Set([
+        ...explicitVideoModels,
+        ...configuredModels.filter(isVideoGenerationModelName),
+      ]));
+      const videoModelIds = new Set(videoModels.map((model) => model.toLowerCase()));
+      const models = configuredModels.filter(
+        (model) => !videoModelIds.has(model.toLowerCase()) && !isVideoGenerationModelName(model)
+      );
+
+      return {
+        id: String(item.id ?? '').trim(),
+        name: String(item.name ?? '').trim(),
+        baseUrl: String(item.baseUrl ?? '').trim().replace(/\/+$/, ''),
+        apiKey: normalizeApiKey(String(item.apiKey ?? '')),
+        models,
+        videoModels,
+        createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
+        requestMode: item.requestMode === 'sync' ? ('sync' as const) : ('async' as const),
+        protocol: item.protocol === 'responses' ? ('responses' as const) : ('images' as const),
+        referenceImageField:
+          item.referenceImageField === 'input_image' ? ('input_image' as const) : ('image' as const),
+      };
+    })
     .filter((item) => item.id && item.name && item.baseUrl);
 }
 

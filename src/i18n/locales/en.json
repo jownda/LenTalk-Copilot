@@ -135,9 +135,10 @@
     "menu": {
       "uploadImage": "Upload Image",
       "aiImageGeneration": "AI Image",
+      "aiVideoGeneration": "AI Video",
       "storyboard": "Storyboard Node",
       "storyboardGen": "Storyboard Generation",
-      "textAnnotation": "Text Annotation",
+      "textAnnotation": "Text",
       "panorama": "360 Panorama",
       "directorDesk": "3D Director Desk",
       "audio": "Media"
@@ -166,6 +167,17 @@
       "negativePromptLabel": "Negative Prompt",
       "negativePromptPlaceholder": "Negative prompt (exclude content)…"
     },
+    "videoGen": {
+      "imageMode": "Image mode",
+      "referenceMode": "Reference",
+      "firstLastMode": "First / Last Frame",
+      "firstLastHint": "Upload the first and last frames separately",
+      "firstFrame": "First frame",
+      "lastFrame": "Last frame",
+      "uploadFirstFrame": "Upload first frame",
+      "uploadLastFrame": "Upload last frame",
+      "firstLastNeedImages": "First / last frame mode requires both the first and last frames"
+    },
     "upload": {
       "uploadedAlt": "Uploaded image",
       "hint": "Click or drag to upload image"
@@ -191,7 +203,7 @@
     },
     "textAnnotation": {
       "placeholder": "Write Markdown text. It will render when unselected.",
-      "empty": "Empty note"
+      "empty": "Empty text"
     },
     "panorama": {
       "dropHint": "Drop a panorama image or connect from upstream",
@@ -377,7 +389,9 @@
     "customApiKey": "API Key",
     "customApiKeyPlaceholder": "sk-...",
     "customApiModels": "Models (one per line)",
+    "customApiVideoModels": "Video models (one per line)",
     "customApiModelsPlaceholder": "gpt-image-2\nnano-banana",
+    "customApiVideoModelsPlaceholder": "seedance-v2-720p-fast",
     "customApiModelCount": "models",
     "customApiKeySet": "✓ Key set",
     "customApiKeyMissing": "✗ No key",
@@ -385,6 +399,7 @@
     "recommendedApisDesc": "Built-in providers: click a card to configure its key. Recommended providers: click Add to connect (OpenAI-compatible), then fill in your API Key",
     "recommendedApisAdd": "Add",
     "recommendedApisRegister": "Get a key →",
+    "recommendedApisPricing": "View pricing →",
     "customApiTesting": "Testing…",
     "customApiFetch": "Fetch Models",
     "customApiFetching": "Fetching…",

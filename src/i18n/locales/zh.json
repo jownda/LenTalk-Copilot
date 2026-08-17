@@ -135,9 +135,10 @@
     "menu": {
       "uploadImage": "上传图片",
       "aiImageGeneration": "AI 图片",
+      "aiVideoGeneration": "AI 视频",
       "storyboard": "分镜节点",
       "storyboardGen": "分镜生成",
-      "textAnnotation": "文本注释",
+      "textAnnotation": "文本",
       "panorama": "360 全景",
       "directorDesk": "3D 导演台",
       "audio": "媒体"
@@ -166,6 +167,17 @@
       "negativePromptLabel": "负面提示词",
       "negativePromptPlaceholder": "负面提示词(排除内容)…"
     },
+    "videoGen": {
+      "imageMode": "图片模式",
+      "referenceMode": "参考图",
+      "firstLastMode": "首尾帧",
+      "firstLastHint": "分别上传首帧和尾帧",
+      "firstFrame": "首帧",
+      "lastFrame": "尾帧",
+      "uploadFirstFrame": "上传首帧",
+      "uploadLastFrame": "上传尾帧",
+      "firstLastNeedImages": "首尾帧模式需要上传首帧和尾帧"
+    },
     "upload": {
       "uploadedAlt": "已上传图片",
       "hint": "点击或拖拽上传图片"
@@ -191,7 +203,7 @@
     },
     "textAnnotation": {
       "placeholder": "输入 Markdown 文本，取消选中后会渲染预览",
-      "empty": "空注释"
+      "empty": "空文本"
     },
     "panorama": {
       "dropHint": "拖入全景图或从上游连线",
@@ -377,7 +389,9 @@
     "customApiKey": "API Key",
     "customApiKeyPlaceholder": "sk-...",
     "customApiModels": "模型列表(每行一个)",
+    "customApiVideoModels": "视频模型(每行一个)",
     "customApiModelsPlaceholder": "gpt-image-2\nnano-banana",
+    "customApiVideoModelsPlaceholder": "seedance-v2-720p-fast",
     "customApiModelCount": "个模型",
     "customApiKeySet": "✓ 已填 Key",
     "customApiKeyMissing": "✗ 未填 Key",
@@ -385,6 +399,7 @@
     "recommendedApisDesc": "内置平台点击卡片展开配置密钥;推荐平台点击「添加」快速接入(OpenAI 兼容),再填入 API Key 即可使用",
     "recommendedApisAdd": "添加",
     "recommendedApisRegister": "注册获取 Key →",
+    "recommendedApisPricing": "查看公开价格 →",
     "customApiTesting": "验证中…",
     "customApiFetch": "拉取模型",
     "customApiFetching": "拉取中…",

@@ -59,3 +59,17 @@ export interface ImageModelDefinition {
     modeLabel: string;
   };
 }
+
+export interface VideoModelDefinition {
+  id: string;
+  mediaType: 'video';
+  displayName: string;
+  providerId: string;
+  description: string;
+  expectedDurationMs?: number;
+  aspectRatios: AspectRatioOption[];
+  defaultAspectRatio: string;
+  durationOptions: number[];
+  defaultDuration: number;
+  pricing?: ModelPricingDefinition;
+}

@@ -8,12 +8,46 @@ export interface RecommendedApi {
   name: string;
   baseUrl: string;
   registerUrl: string;
+  pricingUrl?: string;
   summary: string;
   advantages: string[];
   models: string[];
+  videoModels?: string[];
 }
 
 export const recommendedApis: RecommendedApi[] = [
+  {
+    id: 'wgspai',
+    name: 'WGSPAI',
+    baseUrl: 'https://api.wgspai.cn',
+    registerUrl: 'https://api.wgspai.cn/pricing',
+    pricingUrl: 'https://api.wgspai.cn/pricing',
+    summary: 'OpenAI 兼容平台，图像与视频模型价格有竞争力',
+    advantages: [
+      'GPT Image 2K ¥0.10/次',
+      'Seedance V2 720p Fast ¥0.17/秒起',
+      'Minimax H3 ¥1.50/次',
+      '视频生成价格优势',
+    ],
+    models: ['gpt-image-2-2k'],
+    videoModels: ['seedance-v2-720p-fast', 'seedance-v2-720p', 'grok-imagine-video-6s', 'Minimax-h3'],
+  },
+  {
+    id: 'comfly',
+    name: 'COMFly',
+    baseUrl: 'https://ai.comfly.org',
+    registerUrl: 'https://ai.comfly.org/register',
+    pricingUrl: 'https://ai.comfly.org/pricing',
+    summary: 'OpenAI 兼容中转平台，50+ 模型覆盖图像/视频/LLM',
+    advantages: [
+      '50+ 领先模型，图像/视频/LLM 全覆盖',
+      '100% OpenAI 兼容，接入即用',
+      '7×24 稳定在线',
+      '按量付费，价格透明',
+    ],
+    models: ['gpt-image-2-2k', 'nano-banana'],
+    videoModels: ['seedance-v2-720p-fast', 'seedance-v2-720p', 'grok-imagine-video-6s', 'Minimax-h3'],
+  },
   {
     id: 'tudou',
     name: '土豆API',

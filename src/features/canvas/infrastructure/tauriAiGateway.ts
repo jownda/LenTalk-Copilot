@@ -8,8 +8,6 @@ import {
 import {
 } from '@tauri-apps/api/core';
 import {
-  imageUrlToDataUrl,
-  persistImageLocally,
 } from '@/features/canvas/application/imageData';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
@@ -89,33 +87,26 @@ export function localizeReferenceTokens(prompt: string, model: string): string {
   );
 }
 
-async function normalizeReferenceImages(payload: GenerateImagePayload): Promise<string[] | undefined> {
-  const isKieModel = payload.model.startsWith('kie/');
-  const isFalModel = payload.model.startsWith('fal/');
-  const usesWindowsWebviewTransport =
-    isWindowsDesktopRuntime() && payload.model.startsWith('custom:');
-  return payload.referenceImages
-    ? await Promise.all(
-      payload.referenceImages.map(async (imageUrl) =>
-        isKieModel || isFalModel || usesWindowsWebviewTransport
-          ? await imageUrlToDataUrl(imageUrl)
-          : await persistImageLocally(imageUrl)
-      )
-    )
-    : undefined;
+function normalizeProviderBaseUrl(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/+$/, '').replace(/\/v1$/i, '');
 }
 
-/**
- * 从本地路径读取音频文件, 返回 Blob(文件名用于平台识别格式)。
- * 用 asset protocol(convertFileSrc) 读取, 与画布播放本地视频/音频同机制,
- * 避免依赖 fs 插件的 read_file 权限。
- */
-/** 从上传响应里递归提取可访问 URL(参考 Infinite Canvas 的多 key 提取策略)。 */
+function usesWgspaiVideoStudio(baseUrl: string): boolean {
+  try {
+    return new URL(normalizeProviderBaseUrl(baseUrl)).hostname.toLowerCase() === 'api.wgspai.cn';
+  } catch {
+    return false;
+  }
+}
+
 export const tauriAiGateway: AiGateway = {
   setApiKey,
   generateImage: async (payload: GenerateImagePayload) => {
     const injected = injectCustomApiRequestMode(payload);
-    const normalizedReferenceImages = await normalizeReferenceImages(injected);
+    // 图片直传: 上游图片 URL 数组直接透传(不做 dataURL/persist/上传)
+    const normalizedReferenceImages = injected.referenceImages
+      ?.map((imageUrl) => imageUrl.trim())
+      .filter(Boolean);
     const mergedExtraParams = mergeNegativePrompt(injected);
 
     return await generateImage({
@@ -133,7 +124,10 @@ export const tauriAiGateway: AiGateway = {
   },
   submitGenerateImageJob: async (payload: GenerateImagePayload) => {
     const injected = injectCustomApiRequestMode(payload);
-    const normalizedReferenceImages = await normalizeReferenceImages(injected);
+    // 图片直传: 上游图片 URL 数组直接透传
+    const normalizedReferenceImages = injected.referenceImages
+      ?.map((imageUrl) => imageUrl.trim())
+      .filter(Boolean);
     const mergedExtraParams = mergeNegativePrompt(injected);
     return await submitGenerateImageJob({
       prompt: localizeReferenceTokens(
@@ -151,9 +145,18 @@ export const tauriAiGateway: AiGateway = {
   getGenerateImageJob,
   generateVideo: async (payload: GenerateVideoPayload) => {
     const injected = injectCustomApiRequestMode(payload as unknown as GenerateImagePayload);
+    const providerBaseUrl = typeof injected.extraParams?.provider_base_url === 'string'
+      ? injected.extraParams.provider_base_url
+      : '';
+    const useWgspaiStudio = usesWgspaiVideoStudio(providerBaseUrl);
+    // 图片直传: 上游图片 URL 数组直接透传(不做 dataURL/上传)
     const referenceImages = payload.referenceImages
-      ? await Promise.all(payload.referenceImages.map((imageUrl) => imageUrlToDataUrl(imageUrl)))
-      : undefined;
+      ?.map((imageUrl) => imageUrl.trim())
+      .filter(Boolean);
+    const videoExtraParams = {
+      ...(injected.extraParams ?? {}),
+      ...(useWgspaiStudio ? { video_transport: 'wgspai-studio' } : {}),
+    };
     // 音频直传: 直接把上游音频 URL 数组透传给后端(不做 /v1/files 上传),
     // 由后端按 audio_url / audio_urls 字段提交给平台。
     const referenceAudio = payload.referenceAudio
@@ -167,7 +170,7 @@ export const tauriAiGateway: AiGateway = {
       image_mode: payload.imageMode,
       reference_images: referenceImages,
       reference_audio: referenceAudio,
-      extra_params: injected.extraParams,
+      extra_params: videoExtraParams,
     });
   },
 };

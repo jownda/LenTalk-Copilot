@@ -3,13 +3,16 @@ import type {
   ImageModelRuntimeContext,
   ModelProviderDefinition,
   ResolutionOption,
+  VideoModelDefinition,
 } from './types';
 import {
   buildCustomModelId,
   buildCustomProviderId,
+  isVideoGenerationModelName,
   useSettingsStore,
 } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
+import { createFixedResolutionPricing } from '@/features/canvas/pricing';
 
 const providerModules = import.meta.glob<{ provider: ModelProviderDefinition }>(
   './providers/*.ts',
@@ -95,6 +98,35 @@ export function getDefaultImageModelId(): string {
   return listImageModels()[0]?.id ?? DEFAULT_IMAGE_MODEL_ID;
 }
 
+export function listVideoModels(): VideoModelDefinition[] {
+  return useSettingsStore.getState().customApis.flatMap((api) =>
+    Array.from(new Set([
+      ...api.videoModels,
+      ...api.models.filter(isVideoGenerationModelName),
+    ])).map((model) => ({
+      id: buildCustomModelId(api.id, model),
+      mediaType: 'video',
+      displayName: `${api.name} · ${model}`,
+      providerId: buildCustomProviderId(api.id),
+      description: `${api.name} · ${model}`,
+      expectedDurationMs: 180000,
+      aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
+      defaultAspectRatio: '16:9',
+      durationOptions: Array.from({ length: 30 }, (_, index) => index + 1),
+      defaultDuration: 5,
+      pricing: resolveCustomVideoPricing(api.name, model),
+    }))
+  );
+}
+
+export function getVideoModel(modelId: string): VideoModelDefinition | undefined {
+  return listVideoModels().find((model) => model.id === modelId);
+}
+
+export function getDefaultVideoModelId(): string {
+  return listVideoModels()[0]?.id ?? '';
+}
+
 export function resolveImageModelResolutions(
   model: ImageModelDefinition,
   context: ImageModelRuntimeContext = {}
@@ -155,6 +187,46 @@ const CUSTOM_RESOLUTIONS: ResolutionOption[] = [
   { value: '4K', label: '4K' },
 ];
 
+const WGSPAI_GPT_IMAGE_2_2K_PRICING = createFixedResolutionPricing({
+  currency: 'CNY',
+  standardRates: {
+    '1K': 0.1,
+    '2K': 0.1,
+    '4K': 0.1,
+  },
+});
+
+function resolveCustomImagePricing(apiName: string, model: string) {
+  if (apiName.trim().toLowerCase() === 'wgspai' && model.trim().toLowerCase() === 'gpt-image-2-2k') {
+    return WGSPAI_GPT_IMAGE_2_2K_PRICING;
+  }
+  return undefined;
+}
+
+function resolveCustomVideoPricing(apiName: string, model: string) {
+  if (apiName.trim().toLowerCase() !== 'wgspai') return undefined;
+  const normalized = model.trim().toLowerCase();
+  const perSecondRates: Record<string, number> = {
+    'seedance-v2-720p-fast': 0.17,
+    'seedance-v2-720p': 0.3,
+  };
+  if (perSecondRates[normalized] != null) {
+    return {
+      quote: ({ extraParams }: { extraParams?: Record<string, unknown> }) => ({
+        amount: perSecondRates[normalized] * Math.max(1, Number(extraParams?.duration) || 5),
+        currency: 'CNY' as const,
+      }),
+    };
+  }
+  if (normalized === 'grok-imagine-video-6s') {
+    return createFixedResolutionPricing({ currency: 'CNY', standardRates: { video: 0.1 } });
+  }
+  if (normalized === 'minimax-h3') {
+    return createFixedResolutionPricing({ currency: 'CNY', standardRates: { video: 1.5 } });
+  }
+  return undefined;
+}
+
 function buildCustomProviders(): ModelProviderDefinition[] {
   return useSettingsStore.getState().customApis.map((api) => ({
     id: buildCustomProviderId(api.id),
@@ -167,7 +239,14 @@ function buildCustomImageModels(): ImageModelDefinition[] {
   return useSettingsStore
     .getState()
     .customApis.flatMap((api) =>
-      api.models.map((model) => {
+      api.models
+        .filter((model) => {
+          const normalizedModel = model.trim().toLowerCase();
+          return !isVideoGenerationModelName(model) && !api.videoModels.some(
+            (videoModel) => videoModel.trim().toLowerCase() === normalizedModel
+          );
+        })
+        .map((model) => {
         const modelId = buildCustomModelId(api.id, model);
         return {
           id: modelId,
@@ -181,6 +260,7 @@ function buildCustomImageModels(): ImageModelDefinition[] {
           defaultResolution: '1K',
           aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
           resolutions: CUSTOM_RESOLUTIONS,
+          pricing: resolveCustomImagePricing(api.name, model),
           resolveRequest: ({ referenceImageCount }) => ({
             requestModel: modelId,
             modeLabel: referenceImageCount > 0 ? '编辑模式' : '生成模式',

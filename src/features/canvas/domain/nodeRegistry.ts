@@ -10,6 +10,7 @@ import {
   type ExportImageNodeData,
   type GroupNodeData,
   type ImageEditNodeData,
+  type VideoGenNodeData,
   type PanoramaNodeData,
   type StoryboardSplitNodeData,
   type StoryboardGenNodeData,
@@ -20,7 +21,7 @@ import { DEFAULT_NODE_DISPLAY_NAME } from './nodeDisplay';
 import { getDefaultImageModelId, getImageModel } from '../models';
 import { useSettingsStore } from '@/stores/settingsStore';
 
-export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music';
+export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music' | 'video';
 
 export interface CanvasNodeCapabilities {
   toolbar: boolean;
@@ -121,6 +122,20 @@ const imageEditNodeDefinition: CanvasNodeDefinition<ImageEditNodeData> = {
   },
 };
 
+const videoGenNodeDefinition: CanvasNodeDefinition<VideoGenNodeData> = {
+  type: CANVAS_NODE_TYPES.videoGen,
+  menuLabelKey: 'node.menu.aiVideoGeneration',
+  menuIcon: 'video',
+  visibleInMenu: true,
+  capabilities: { toolbar: true, promptInput: false },
+  connectivity: { sourceHandle: true, targetHandle: true, connectMenu: { fromSource: true, fromTarget: false } },
+  createDefaultData: () => ({
+    displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.videoGen],
+    prompt: '', model: '', duration: 5, aspectRatio: '16:9', imageMode: 'reference',
+  }),
+  defaultSize: { width: 420, height: 360 },
+};
+
 const exportImageNodeDefinition: CanvasNodeDefinition<ExportImageNodeData> = {
   type: CANVAS_NODE_TYPES.exportImage,
   menuLabelKey: 'node.menu.uploadImage',
@@ -208,10 +223,10 @@ const textAnnotationNodeDefinition: CanvasNodeDefinition<TextAnnotationNodeData>
     promptInput: false,
   },
   connectivity: {
-    sourceHandle: false,
+    sourceHandle: true,
     targetHandle: false,
     connectMenu: {
-      fromSource: false,
+      fromSource: true,
       fromTarget: false,
     },
   },
@@ -358,6 +373,7 @@ const directorDeskNodeDefinition: CanvasNodeDefinition<DirectorDeskNodeData> = {
 export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition> = {
   [CANVAS_NODE_TYPES.upload]: uploadNodeDefinition,
   [CANVAS_NODE_TYPES.imageEdit]: imageEditNodeDefinition,
+  [CANVAS_NODE_TYPES.videoGen]: videoGenNodeDefinition,
   [CANVAS_NODE_TYPES.exportImage]: exportImageNodeDefinition,
   [CANVAS_NODE_TYPES.textAnnotation]: textAnnotationNodeDefinition,
   [CANVAS_NODE_TYPES.group]: groupNodeDefinition,

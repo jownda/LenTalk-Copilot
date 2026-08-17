@@ -9,6 +9,7 @@ import {
   isExportImageNode,
   isGroupNode,
   isImageEditNode,
+  isAudioNode,
   isStoryboardGenNode,
   isStoryboardSplitNode,
   isUploadNode,
@@ -54,6 +55,7 @@ const TOOLBAR_NEUTRAL_BUTTON_CLASS =
 export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const { t, i18n } = useTranslation();
   const isImageEdit = isImageEditNode(node);
+  const isGeneratedVideoNode = isAudioNode(node) && node.data.mediaType === 'video';
   const isStoryboardGen = isStoryboardGenNode(node);
   const isStoryboardSplit = isStoryboardSplitNode(node);
   const canCopyStoryboardText = isStoryboardGen || isStoryboardSplit;
@@ -81,16 +83,17 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   }, [node]);
   const canHandleImage = Boolean(imageSource);
   const generationError =
-    isExportImageNode(node)
+    (isExportImageNode(node) || isGeneratedVideoNode)
     && typeof (node.data as { generationError?: unknown }).generationError === 'string'
       ? ((node.data as { generationError?: string }).generationError ?? '').trim()
       : '';
   const generationErrorDetails =
-    isExportImageNode(node)
+    (isExportImageNode(node) || isGeneratedVideoNode)
     && typeof (node.data as { generationErrorDetails?: unknown }).generationErrorDetails === 'string'
       ? ((node.data as { generationErrorDetails?: string }).generationErrorDetails ?? '').trim()
       : '';
-  const canCopyGenerationError = isExportImageNode(node) && generationError.length > 0;
+  const canCopyGenerationError =
+    (isExportImageNode(node) || isGeneratedVideoNode) && generationError.length > 0;
   const generationErrorReport = useMemo(
     () =>
       buildGenerationErrorReport({

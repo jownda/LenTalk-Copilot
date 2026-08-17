@@ -178,6 +178,9 @@ impl OpenAICompatibleProvider {
             }
         } else {
             body["size"] = json!("1024x1024");
+            // Generic OpenAI-compatible image relays commonly expose arbitrary
+            // canvas framing through aspect_ratio rather than size alone.
+            body["aspect_ratio"] = json!(aspect_ratio);
             body["response_format"] = json!("b64_json");
         }
         let images = reference_images

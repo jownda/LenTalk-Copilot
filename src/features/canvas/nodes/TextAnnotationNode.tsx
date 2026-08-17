@@ -1,5 +1,5 @@
 import { memo, useCallback } from 'react';
-import { type NodeProps } from '@xyflow/react';
+import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { FileText } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -71,6 +71,12 @@ export const TextAnnotationNode = memo(({
         minHeight={MIN_HEIGHT}
         maxWidth={MAX_WIDTH}
         maxHeight={MAX_HEIGHT}
+      />
+      <Handle
+        id="source"
+        type="source"
+        position={Position.Right}
+        className="!h-2 !w-2 !border-surface-dark !bg-accent"
       />
 
       {selected ? (

@@ -1665,6 +1665,20 @@ pub async fn load_image(file_path: String) -> Result<String, String> {
         "image/gif"
     } else if file_path.ends_with(".webp") {
         "image/webp"
+    } else if file_path.ends_with(".mp3") {
+        "audio/mpeg"
+    } else if file_path.ends_with(".wav") {
+        "audio/wav"
+    } else if file_path.ends_with(".m4a") {
+        "audio/mp4"
+    } else if file_path.ends_with(".aac") {
+        "audio/aac"
+    } else if file_path.ends_with(".ogg") {
+        "audio/ogg"
+    } else if file_path.ends_with(".flac") {
+        "audio/flac"
+    } else if file_path.ends_with(".webm") {
+        "audio/webm"
     } else {
         "image/png"
     };

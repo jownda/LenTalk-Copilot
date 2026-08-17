@@ -602,6 +602,10 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     () => graphImageResolver.collectInputImages(id, nodes, edges),
     [id, nodes, edges]
   );
+  const incomingText = useMemo(
+    () => graphImageResolver.collectInputText(id, nodes, edges),
+    [edges, id, nodes]
+  );
   const incomingImageItems = useMemo(
     () =>
       incomingImages.map((imageUrl, index) => ({
@@ -1055,7 +1059,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
       return;
     }
 
-    const prompt = buildPrompt();
+    const prompt = [buildPrompt(), ...incomingText].filter(Boolean).join('\n\n').trim();
     if (!prompt) {
       const errorMessage = '请填写至少一个分镜内容描述';
       setError(errorMessage);
@@ -1202,6 +1206,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     providerApiKey,
     nodeData,
     incomingImages,
+    incomingText,
     requestResolution.requestModel,
     effectiveExtraParams,
     selectedModel.expectedDurationMs,

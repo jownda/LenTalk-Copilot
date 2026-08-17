@@ -29,6 +29,8 @@ export interface NodeFactory {
 
 export interface GraphImageResolver {
   collectInputImages: (nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]) => string[];
+  collectInputAudio: (nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]) => string[];
+  collectInputText: (nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]) => string[];
 }
 
 export interface GenerateImagePayload {
@@ -42,6 +44,16 @@ export interface GenerateImagePayload {
   extraParams?: Record<string, unknown>;
 }
 
+export interface GenerateVideoPayload {
+  prompt: string;
+  model: string;
+  duration: number;
+  aspectRatio: string;
+  imageMode?: 'reference' | 'first-last';
+  referenceImages?: string[];
+  referenceAudio?: string[];
+}
+
 export interface AiGateway {
   setApiKey: (provider: string, apiKey: string) => Promise<void>;
   generateImage: (payload: GenerateImagePayload) => Promise<string>;
@@ -52,6 +64,7 @@ export interface AiGateway {
     result?: string | null;
     error?: string | null;
   }>;
+  generateVideo: (payload: GenerateVideoPayload) => Promise<string>;
 }
 
 export interface ImageSplitGateway {

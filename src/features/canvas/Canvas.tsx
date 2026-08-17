@@ -58,6 +58,11 @@ import type { NodeAlignMode } from '@/features/canvas/application/canvasLayout';
 import { nodeTypes } from './nodes';
 import { edgeTypes } from './edges';
 import { NodeSelectionMenu } from './NodeSelectionMenu';
+import {
+  CANVAS_NODE_DRAG_DATA_TYPE,
+  NodePaletteSidebar,
+  NodePaletteToggle,
+} from './NodePaletteSidebar';
 import { CanvasContextMenu } from './CanvasContextMenu';
 import { SelectedNodeOverlay } from './ui/SelectedNodeOverlay';
 import { NodeToolDialog } from './ui/NodeToolDialog';
@@ -89,18 +94,22 @@ const ALIGN_OPTIONS: Array<{ mode: NodeAlignMode; label: string }> = [
 ];
 
 function isFailedGenerationResultNode(node: CanvasNode): boolean {
-  if (node.type !== CANVAS_NODE_TYPES.exportImage) {
+  if (node.type !== CANVAS_NODE_TYPES.exportImage && node.type !== CANVAS_NODE_TYPES.audio) {
     return false;
   }
 
   const data = node.data as {
     imageUrl?: unknown;
+    sourcePath?: unknown;
     isGenerating?: unknown;
     generationError?: unknown;
   };
-  const hasGeneratedImage = typeof data.imageUrl === 'string' && data.imageUrl.trim().length > 0;
+  // 图片结果节点以 imageUrl 为准, 音频/视频结果节点以 sourcePath 为准。
+  const hasGeneratedResult = node.type === CANVAS_NODE_TYPES.audio
+    ? typeof data.sourcePath === 'string' && data.sourcePath.trim().length > 0
+    : typeof data.imageUrl === 'string' && data.imageUrl.trim().length > 0;
   return data.isGenerating !== true
-    && !hasGeneratedImage
+    && !hasGeneratedResult
     && typeof data.generationError === 'string'
     && data.generationError.trim().length > 0;
 }
@@ -378,6 +387,7 @@ export function Canvas() {
   const suppressNextEdgeClickRef = useRef(false);
 
   const [showNodeMenu, setShowNodeMenu] = useState(false);
+  const [isNodePaletteOpen, setIsNodePaletteOpen] = useState(true);
   const [canvasContextMenu, setCanvasContextMenu] = useState<{
     position: { x: number; y: number };
     imageUrl: string | null;
@@ -1441,13 +1451,20 @@ export function Canvas() {
   const handleAssetLibraryDragOver = useCallback((event: ReactDragEvent) => {
     const types = event.dataTransfer.types;
     const hasAssetDrag = types.includes(ASSET_DRAG_DATA_TYPE) || types.includes(PROMPT_DRAG_DATA_TYPE);
+    const hasNodeDrag = types.includes(CANVAS_NODE_DRAG_DATA_TYPE);
     // 系统文件拖入: dragOver 阶段 files 不可读(浏览器安全限制), 只能靠 types 里的 'Files'
     const hasFiles = types.includes('Files');
-    if (hasAssetDrag || hasFiles) {
+    if (hasAssetDrag || hasNodeDrag || hasFiles) {
       event.preventDefault();
       event.dataTransfer.dropEffect = 'copy';
     }
   }, []);
+
+  const handlePaletteNodeSelect = useCallback((type: CanvasNodeType) => {
+    const nodeId = addNode(type, resolveViewportCenterPosition());
+    setSelectedNode(nodeId);
+    scheduleCanvasPersist(0);
+  }, [addNode, scheduleCanvasPersist, setSelectedNode]);
 
   const handleAssetLibraryDrop = useCallback((event: ReactDragEvent) => {
     const types = event.dataTransfer.types;
@@ -1582,6 +1599,22 @@ export function Canvas() {
     }
     scheduleCanvasPersist(0);
   }, [addNode, reactFlowInstance, scheduleCanvasPersist, setSelectedNode]);
+
+  const handleCanvasDrop = useCallback((event: ReactDragEvent) => {
+    const droppedType = event.dataTransfer.getData(CANVAS_NODE_DRAG_DATA_TYPE) as CanvasNodeType;
+    const isMenuNode = nodeCatalog.getMenuDefinitions().some((definition) => definition.type === droppedType);
+    if (isMenuNode) {
+      event.preventDefault();
+      const position = reactFlowInstance.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+      const nodeId = addNode(droppedType, position);
+      setSelectedNode(nodeId);
+      scheduleCanvasPersist(0);
+      return;
+    }
+
+    handleAssetLibraryDrop(event);
+    void handleFileDrop(event);
+  }, [addNode, handleAssetLibraryDrop, handleFileDrop, reactFlowInstance, scheduleCanvasPersist, setSelectedNode]);
 
   const handleApplyPromptTemplate = useCallback((template: PromptTemplate, mode: 'positive' | 'full' = 'full') => {
     // 对齐 Infinite Canvas:完整应用时把正向 + 负向合并成一段文本输出
@@ -2486,10 +2519,7 @@ export function Canvas() {
         onPaneClick={handlePaneClick}
         onNodeContextMenu={(event, node) => handleNodeContextMenu(event, node as CanvasNode)}
         onDragOver={handleAssetLibraryDragOver}
-        onDrop={(event) => {
-          handleAssetLibraryDrop(event);
-          void handleFileDrop(event);
-        }}
+        onDrop={handleCanvasDrop}
         onMove={handleMove}
         onMoveStart={handleMoveStart}
         onMoveEnd={handleMoveEnd}
@@ -2527,6 +2557,16 @@ export function Canvas() {
 
         <SelectedNodeOverlay />
       </ReactFlow>
+
+      {isNodePaletteOpen ? (
+        <NodePaletteSidebar
+          open={isNodePaletteOpen}
+          onToggle={() => setIsNodePaletteOpen(false)}
+          onSelect={handlePaletteNodeSelect}
+        />
+      ) : (
+        <NodePaletteToggle onClick={() => setIsNodePaletteOpen(true)} />
+      )}
 
       {dragSelectRect && (
         <div

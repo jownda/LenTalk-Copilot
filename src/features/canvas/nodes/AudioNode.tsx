@@ -1,6 +1,6 @@
-import { memo, useCallback, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Handle, Position } from '@xyflow/react';
-import { AudioLines, Camera, Music2, Upload, Video } from 'lucide-react';
+import { AlertTriangle, AudioLines, Camera, LoaderCircle, Music2, Upload, Video } from 'lucide-react';
 
 import { CANVAS_NODE_TYPES, type AudioNodeData } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
@@ -26,6 +26,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const [isCapturing, setIsCapturing] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
 
   const resolvedTitle = useMemo(
     () => resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, data),
@@ -33,6 +34,51 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   );
   const isVideo = data.mediaType === 'video';
   const mediaSrc = data.sourcePath ? resolveImageDisplayUrl(data.sourcePath) : null;
+  const isGenerating = typeof data.isGenerating === 'boolean' ? data.isGenerating : false;
+  const generationError =
+    typeof data.generationError === 'string' ? data.generationError.trim() : '';
+  const hasGenerationError = isGenerating === false && !mediaSrc && generationError.length > 0;
+  const generationStartedAt =
+    typeof data.generationStartedAt === 'number' ? data.generationStartedAt : null;
+  const generationDurationMs =
+    typeof data.generationDurationMs === 'number' ? data.generationDurationMs : 180000;
+
+  // 生成中: 定时刷新以驱动模拟进度条(与 AI 图片结果节点一致)
+  useEffect(() => {
+    if (!isGenerating) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+    }, 120);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isGenerating]);
+
+  const simulatedProgress = useMemo(() => {
+    if (!isGenerating) {
+      return 0;
+    }
+    const startedAt = generationStartedAt ?? Date.now();
+    const duration = Math.max(1000, generationDurationMs);
+    const elapsed = Math.max(0, now - startedAt);
+    return Math.min(elapsed / duration, 0.96);
+  }, [generationDurationMs, generationStartedAt, isGenerating, now]);
+
+  const waitedMinutes = useMemo(() => {
+    if (!isGenerating || generationStartedAt === null) {
+      return 0;
+    }
+    return Math.floor(Math.max(0, now - generationStartedAt) / 60000);
+  }, [generationStartedAt, isGenerating, now]);
+
+  const waitingResultText = useMemo(() => {
+    if (!isGenerating || waitedMinutes < 2) {
+      return '生成中…';
+    }
+    return `生成中…（已等待 ${waitedMinutes} 分钟）`;
+  }, [isGenerating, waitedMinutes]);
 
   /** 上传媒体文件(点击选择或拖拽), 持久化后写入节点 */
   const handleMediaFiles = useCallback(async (files: FileList | File[]) => {
@@ -58,6 +104,8 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
         mediaType,
         previewImageUrl: null,
         aspectRatio: undefined,
+        // 导入媒体时用文件原名作为节点标题, 避免显示默认的"媒体"导致分不清
+        displayName: file.name.replace(/\.[^.]+$/, '').trim() || file.name,
       });
     } catch (error) {
       console.warn('[mediaNode] upload failed', error);
@@ -124,7 +172,11 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   return (
     <div
       className={`flex h-full w-full flex-col rounded-[var(--node-radius)] border bg-surface-dark/90 p-2 transition-colors duration-150 ${
-        selected
+        hasGenerationError
+          ? (selected
+            ? 'border-red-400 shadow-[0_0_0_1px_rgba(248,113,113,0.42)]'
+            : 'border-red-500/70 bg-[rgba(127,29,29,0.12)] hover:border-red-400/80 dark:border-red-500/70 dark:hover:border-red-400/80')
+          : selected
           ? 'border-accent shadow-[0_0_0_1px_rgba(59,130,246,0.32)]'
           : 'border-[rgba(15,23,42,0.22)] dark:border-[rgba(255,255,255,0.22)]'
       }`}
@@ -176,6 +228,26 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
             />
           </div>
         )
+      ) : hasGenerationError ? (
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-lg border border-red-500/40 bg-[rgba(127,29,29,0.2)] px-4 text-red-300">
+          <AlertTriangle className="h-7 w-7 opacity-90" />
+          <span className="text-center text-[12px] font-medium leading-5 text-red-200">生成失败</span>
+          <span className="max-h-[88px] overflow-y-auto break-words text-center text-[11px] leading-5 text-red-200/90">
+            {generationError}
+          </span>
+        </div>
+      ) : isGenerating ? (
+        <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-2 overflow-hidden rounded-lg border border-[rgba(255,255,255,0.1)] bg-bg-dark/45 p-2 text-text-muted/85">
+          <LoaderCircle className="h-7 w-7 animate-spin text-accent/70" />
+          <span className="px-4 text-center text-[12px] leading-6">{waitingResultText}</span>
+          <div className="pointer-events-none absolute inset-0 overflow-hidden">
+            <div className="absolute inset-0 bg-bg-dark/30" />
+            <div
+              className="absolute left-0 top-0 h-full bg-gradient-to-r from-[rgba(255,255,255,0.28)] to-[rgba(255,255,255,0.05)] transition-[width] duration-100 ease-linear"
+              style={{ width: `${simulatedProgress * 100}%` }}
+            />
+          </div>
+        </div>
       ) : (
         /* 空状态: 点击或拖拽上传媒体 */
         <button

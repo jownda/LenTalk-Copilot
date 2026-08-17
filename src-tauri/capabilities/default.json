@@ -8,6 +8,10 @@
     "opener:default",
     "dialog:default",
     {
+      "identifier": "fs:allow-read-file",
+      "allow": [{ "path": "$HOME/**" }, { "path": "$TEMP/**" }]
+    },
+    {
       "identifier": "fs:allow-write-file",
       "allow": [{ "path": "$HOME/**" }, { "path": "$TEMP/**" }]
     },

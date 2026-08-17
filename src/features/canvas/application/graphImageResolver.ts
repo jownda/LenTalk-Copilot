@@ -1,11 +1,13 @@
 import {
   isDirectorDeskNode,
+  isAudioNode,
   isExportImageNode,
   isGroupNode,
   isImageEditNode,
   isPanoramaNode,
   isStoryboardGenNode,
   isStoryboardSplitNode,
+  isTextAnnotationNode,
   isUploadNode,
   type CanvasEdge,
   type CanvasNode,
@@ -24,6 +26,32 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
       .flatMap((node) => this.extractImages(node, nodeById));
 
     return [...new Set(images)];
+  }
+
+  collectInputAudio(nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]): string[] {
+    const nodeById = new Map(nodes.map((node) => [node.id, node]));
+    const sourceNodeIds = edges
+      .filter((edge) => edge.target === nodeId)
+      .map((edge) => edge.source);
+
+    const audioSources = sourceNodeIds
+      .map((sourceId) => nodeById.get(sourceId))
+      .flatMap((node) => this.extractAudio(node, nodeById));
+
+    return [...new Set(audioSources)];
+  }
+
+  collectInputText(nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]): string[] {
+    const nodeById = new Map(nodes.map((node) => [node.id, node]));
+    const sourceNodeIds = edges
+      .filter((edge) => edge.target === nodeId)
+      .map((edge) => edge.source);
+
+    const textSources = sourceNodeIds
+      .map((sourceId) => nodeById.get(sourceId))
+      .flatMap((node) => this.extractText(node, nodeById));
+
+    return [...new Set(textSources)];
   }
 
   private extractImages(
@@ -65,6 +93,47 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
 
     if (isUploadNode(node) || isImageEditNode(node) || isExportImageNode(node)) {
       return node.data.imageUrl ? [node.data.imageUrl] : [];
+    }
+
+    return [];
+  }
+
+  private extractAudio(
+    node: CanvasNode | undefined,
+    nodeById: Map<string, CanvasNode>
+  ): string[] {
+    if (!node) {
+      return [];
+    }
+
+    if (isGroupNode(node)) {
+      const children = Array.from(nodeById.values()).filter((item) => item.parentId === node.id);
+      return children.flatMap((child) => this.extractAudio(child, nodeById));
+    }
+
+    if (isAudioNode(node) && node.data.mediaType !== 'video' && node.data.sourcePath) {
+      return [node.data.sourcePath];
+    }
+
+    return [];
+  }
+
+  private extractText(
+    node: CanvasNode | undefined,
+    nodeById: Map<string, CanvasNode>
+  ): string[] {
+    if (!node) {
+      return [];
+    }
+
+    if (isGroupNode(node)) {
+      const children = Array.from(nodeById.values()).filter((item) => item.parentId === node.id);
+      return children.flatMap((child) => this.extractText(child, nodeById));
+    }
+
+    if (isTextAnnotationNode(node)) {
+      const content = node.data.content.trim();
+      return content ? [content] : [];
     }
 
     return [];

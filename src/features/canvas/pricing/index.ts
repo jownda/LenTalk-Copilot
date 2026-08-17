@@ -175,7 +175,7 @@ export function createGrsaiPointsPricing(
 }
 
 export function resolveModelPriceDisplay(
-  model: ImageModelDefinition,
+  model: Pick<ImageModelDefinition, 'pricing'>,
   options: {
     resolution: string;
     extraParams?: Record<string, unknown>;
@@ -241,7 +241,6 @@ export function resolveModelPriceDisplay(
 export function isHighThinkingEnabled(extraParams: Record<string, unknown> | undefined): boolean {
   return normalizeStringParam(extraParams?.thinking_level) === 'high';
 }
-
 
 
 

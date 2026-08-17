@@ -1,6 +1,6 @@
 import { useMemo, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Image, Upload, Sparkles, LayoutGrid, Type, Orbit, Box, Music2 } from 'lucide-react';
+import { Image, Upload, Sparkles, LayoutGrid, Type, Orbit, Box, Music2, Video } from 'lucide-react';
 import { UI_POPOVER_TRANSITION_MS } from '@/components/ui/motion';
 
 import type { CanvasNodeType } from '@/features/canvas/domain/canvasNodes';
@@ -14,7 +14,7 @@ interface NodeSelectionMenuProps {
   onClose: () => void;
 }
 
-const iconMap: Record<MenuIconKey, typeof Upload> = {
+export const nodeMenuIconMap: Record<MenuIconKey, typeof Upload> = {
   upload: Upload,
   sparkles: Sparkles,
   layout: LayoutGrid,
@@ -22,6 +22,7 @@ const iconMap: Record<MenuIconKey, typeof Upload> = {
   orbit: Orbit,
   box: Box,
   music: Music2,
+  video: Video,
 };
 
 export function NodeSelectionMenu({
@@ -98,7 +99,7 @@ export function NodeSelectionMenu({
       style={{ left: position.x, top: position.y }}
     >
       {menuItems.map((item, index) => {
-        const Icon = iconMap[item.menuIcon] ?? Image;
+        const Icon = nodeMenuIconMap[item.menuIcon] ?? Image;
         return (
           <button
             key={item.type}
