@@ -370,7 +370,17 @@ async function generateWgspaiStudioVideo(
       : {}),
   };
   const payload = await postWgspaiVideoStudioRequest(baseUrl, apiKey, 'create', body, headers);
-  ensureWgspaiStudioSuccess(payload);
+  try {
+    ensureWgspaiStudioSuccess(payload);
+  } catch (error) {
+    // 附加 token 摘要, 便于定位 401 是 token 未保存还是填错
+    const maskedToken = apiKey.length > 4
+      ? `${apiKey.slice(0, 4)}***${apiKey.slice(-2)}`
+      : apiKey
+        ? '(short)'
+        : '(empty)';
+    throw new Error(`${error instanceof Error ? error.message : String(error)} [access token: ${maskedToken}]`);
+  }
 
   const immediateResult = getVideoResultUrl(payload);
   if (immediateResult) return immediateResult;
