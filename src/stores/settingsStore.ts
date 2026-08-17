@@ -36,6 +36,8 @@ export interface CustomApiProvider {
   protocol: 'images' | 'responses';
   /** Images 协议的参考图字段: 大多数中转平台用 image, 原生 GPT Image 用 input_image。 */
   referenceImageField: 'image' | 'input_image';
+  /** WGSPAI 视频工作台 access token(与 API Key 分开, 视频工作台用它认证) */
+  videoAccessToken?: string;
 }
 
 export type CustomApiRequestMode = CustomApiProvider['requestMode'];

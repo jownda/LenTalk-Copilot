@@ -186,6 +186,7 @@ pub fn run() {
             ai_commands::verify_provider_url,
             ai_commands::test_provider_connection,
             ai_commands::fetch_provider_models,
+            ai_commands::post_wgspai_video_studio_request,
             ai_commands::submit_generate_image_job,
             ai_commands::get_generate_image_job,
             ai_commands::generate_image,

@@ -1,5 +1,5 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import { CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from '@/stores/settingsStore';
+import { buildCustomProviderId, CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
 
 export interface GenerateRequest {
@@ -309,9 +309,43 @@ function ensureWgspaiStudioSuccess(payload: unknown): void {
   }
 }
 
+async function postWgspaiVideoStudioRequest(
+  baseUrl: string,
+  apiKey: string,
+  action: 'create' | 'query',
+  body: Record<string, unknown>,
+  headers: Record<string, string>
+): Promise<unknown> {
+  if (isTauri()) {
+    return await invoke('post_wgspai_video_studio_request', {
+      baseUrl,
+      apiKey,
+      action,
+      body,
+    });
+  }
+
+  const url = `${baseUrl}/api/video-studio/${action}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
+  if (!response.ok) {
+    throw new Error(buildHttpErrorSummary(response.status, rawResponse, url));
+  }
+  try {
+    return JSON.parse(rawResponse);
+  } catch {
+    throw new Error(`平台返回了非 JSON 响应 (${url})`);
+  }
+}
+
 async function generateWgspaiStudioVideo(
   request: GenerateVideoRequest,
   baseUrl: string,
+  apiKey: string,
   apiModel: string,
   headers: Record<string, string>
 ): Promise<string> {
@@ -335,22 +369,7 @@ async function generateWgspaiStudioVideo(
       }
       : {}),
   };
-  const createUrl = `${baseUrl}/api/video-studio/create`;
-  const createResponse = await fetch(createUrl, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
-  const rawCreateResponse = await createResponse.text();
-  let payload: unknown = null;
-  try {
-    payload = JSON.parse(rawCreateResponse);
-  } catch {
-    payload = null;
-  }
-  if (!createResponse.ok) {
-    throw new Error(`WGSPAI 视频工作台请求失败: ${buildHttpErrorSummary(createResponse.status, rawCreateResponse, createUrl)}`);
-  }
+  const payload = await postWgspaiVideoStudioRequest(baseUrl, apiKey, 'create', body, headers);
   ensureWgspaiStudioSuccess(payload);
 
   const immediateResult = getVideoResultUrl(payload);
@@ -360,24 +379,15 @@ async function generateWgspaiStudioVideo(
     throw new Error(`WGSPAI 视频工作台响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
   }
 
-  const queryUrl = `${baseUrl}/api/video-studio/query`;
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 3000));
-    const queryResponse = await fetch(queryUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ task_id: taskId }),
-    });
-    const rawQueryResponse = await queryResponse.text();
-    let queryPayload: unknown = null;
-    try {
-      queryPayload = JSON.parse(rawQueryResponse);
-    } catch {
-      queryPayload = null;
-    }
-    if (!queryResponse.ok) {
-      throw new Error(`WGSPAI 视频任务查询失败: ${buildHttpErrorSummary(queryResponse.status, rawQueryResponse, queryUrl)}`);
-    }
+    const queryPayload = await postWgspaiVideoStudioRequest(
+      baseUrl,
+      apiKey,
+      'query',
+      { task_id: taskId },
+      headers
+    );
     ensureWgspaiStudioSuccess(queryPayload);
     const videoUrl = getVideoResultUrl(queryPayload);
     if (videoUrl) return videoUrl;
@@ -398,13 +408,19 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
     ? request.extra_params.provider_base_url
     : '';
   const baseUrl = normalizeVideoProviderBaseUrl(configuredBaseUrl);
-  const apiKey = useSettingsStore.getState().apiKeys[providerId] ?? '';
+  // WGSPAI 视频工作台用独立的 access token(优先), 其他平台用 API Key。
+  const settingsState = useSettingsStore.getState();
+  const customApi = settingsState.customApis.find(
+    (item) => buildCustomProviderId(item.id) === providerId
+  );
+  const wgspaiAccessToken = customApi?.videoAccessToken?.trim() ?? '';
+  const apiKey = wgspaiAccessToken || (settingsState.apiKeys[providerId] ?? '');
   if (!baseUrl || !apiKey || !apiModel) {
     throw new Error('请在设置中配置视频模型对应的 Base URL、API Key 和模型名称');
   }
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
   if (request.extra_params?.video_transport === 'wgspai-studio') {
-    return await generateWgspaiStudioVideo(request, baseUrl, apiModel, headers);
+    return await generateWgspaiStudioVideo(request, baseUrl, apiKey, apiModel, headers);
   }
   const videoImages = request.image_mode === 'first-last'
     ? request.reference_images?.slice(0, 2)

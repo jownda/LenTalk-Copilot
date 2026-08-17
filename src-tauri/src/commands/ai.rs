@@ -332,6 +332,55 @@ pub async fn fetch_provider_models(
     }))
 }
 
+/// WGSPAI 视频工作台未开放 CORS 给桌面 WebView。
+/// 仅允许其 create/query 两个固定端点，通过原生 HTTP 代理避免浏览器层的 Load failed。
+#[tauri::command]
+pub async fn post_wgspai_video_studio_request(
+    base_url: String,
+    api_key: String,
+    action: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if action != "create" && action != "query" {
+        return Err("Unsupported WGSPAI video studio action".to_string());
+    }
+
+    let normalized_base_url = base_url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/')
+        .to_string();
+    let parsed_base_url = reqwest::Url::parse(&normalized_base_url)
+        .map_err(|error| format!("Invalid WGSPAI Base URL: {}", error))?;
+    if parsed_base_url.host_str() != Some("api.wgspai.cn") {
+        return Err("WGSPAI video studio requires https://api.wgspai.cn".to_string());
+    }
+
+    let endpoint = format!("{}/api/video-studio/{}", normalized_base_url, action);
+    let response = reqwest::Client::new()
+        .post(&endpoint)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("WGSPAI video studio request failed: {}", error))?;
+    let status = response.status();
+    let response_text = response
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read WGSPAI response: {}", error))?;
+    if !status.is_success() {
+        let summary: String = response_text.chars().take(600).collect();
+        return Err(format!("HTTP {}: {}", status.as_u16(), summary));
+    }
+
+    serde_json::from_str(&response_text).map_err(|error| {
+        let summary: String = response_text.chars().take(600).collect();
+        format!("WGSPAI video studio returned non-JSON response: {} ({})", error, summary)
+    })
+}
+
 #[tauri::command]
 pub async fn submit_generate_image_job(
     app: AppHandle,
