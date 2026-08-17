@@ -219,6 +219,7 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         name: String(item.name ?? '').trim(),
         baseUrl: String(item.baseUrl ?? '').trim().replace(/\/+$/, ''),
         apiKey: normalizeApiKey(String(item.apiKey ?? '')),
+        videoAccessToken: normalizeApiKey(String(item.videoAccessToken ?? '')),
         models,
         videoModels,
         createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
