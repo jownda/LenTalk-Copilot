@@ -1,14 +1,20 @@
 import {
   generateImage,
+  generateVideo,
   getGenerateImageJob,
   setApiKey,
   submitGenerateImageJob,
 } from '@/commands/ai';
-import { imageUrlToDataUrl, persistImageLocally } from '@/features/canvas/application/imageData';
+import {
+} from '@tauri-apps/api/core';
+import {
+  imageUrlToDataUrl,
+  persistImageLocally,
+} from '@/features/canvas/application/imageData';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
 
-import type { AiGateway, GenerateImagePayload } from '../application/ports';
+import type { AiGateway, GenerateImagePayload, GenerateVideoPayload } from '../application/ports';
 
 function mergeNegativePrompt(
   payload: GenerateImagePayload
@@ -20,6 +26,14 @@ function mergeNegativePrompt(
     extras.negative_prompt = payload.negativePrompt.trim();
   }
   return Object.keys(extras).length > 0 ? extras : payload.extraParams;
+}
+
+function withAspectRatioRequirement(prompt: string, aspectRatio: string): string {
+  const match = aspectRatio.trim().match(/^(\d+)\s*:\s*(\d+)$/);
+  if (!match || Number(match[1]) <= 0 || Number(match[2]) <= 0) {
+    return prompt;
+  }
+  return `${prompt.trim()}\n\n[Required image aspect ratio: ${match[1]}:${match[2]}. Compose for this exact frame without borders or empty padding.]`;
 }
 
 /**
@@ -91,6 +105,12 @@ async function normalizeReferenceImages(payload: GenerateImagePayload): Promise<
     : undefined;
 }
 
+/**
+ * 从本地路径读取音频文件, 返回 Blob(文件名用于平台识别格式)。
+ * 用 asset protocol(convertFileSrc) 读取, 与画布播放本地视频/音频同机制,
+ * 避免依赖 fs 插件的 read_file 权限。
+ */
+/** 从上传响应里递归提取可访问 URL(参考 Infinite Canvas 的多 key 提取策略)。 */
 export const tauriAiGateway: AiGateway = {
   setApiKey,
   generateImage: async (payload: GenerateImagePayload) => {
@@ -99,7 +119,10 @@ export const tauriAiGateway: AiGateway = {
     const mergedExtraParams = mergeNegativePrompt(injected);
 
     return await generateImage({
-      prompt: localizeReferenceTokens(payload.prompt, payload.model),
+      prompt: localizeReferenceTokens(
+        withAspectRatioRequirement(payload.prompt, payload.aspectRatio),
+        payload.model
+      ),
       negative_prompt: payload.negativePrompt,
       model: payload.model,
       size: payload.size,
@@ -113,7 +136,10 @@ export const tauriAiGateway: AiGateway = {
     const normalizedReferenceImages = await normalizeReferenceImages(injected);
     const mergedExtraParams = mergeNegativePrompt(injected);
     return await submitGenerateImageJob({
-      prompt: localizeReferenceTokens(payload.prompt, payload.model),
+      prompt: localizeReferenceTokens(
+        withAspectRatioRequirement(payload.prompt, payload.aspectRatio),
+        payload.model
+      ),
       negative_prompt: payload.negativePrompt,
       model: payload.model,
       size: payload.size,
@@ -123,4 +149,25 @@ export const tauriAiGateway: AiGateway = {
     });
   },
   getGenerateImageJob,
+  generateVideo: async (payload: GenerateVideoPayload) => {
+    const injected = injectCustomApiRequestMode(payload as unknown as GenerateImagePayload);
+    const referenceImages = payload.referenceImages
+      ? await Promise.all(payload.referenceImages.map((imageUrl) => imageUrlToDataUrl(imageUrl)))
+      : undefined;
+    // 音频直传: 直接把上游音频 URL 数组透传给后端(不做 /v1/files 上传),
+    // 由后端按 audio_url / audio_urls 字段提交给平台。
+    const referenceAudio = payload.referenceAudio
+      ?.map((audioUrl) => audioUrl.trim())
+      .filter(Boolean);
+    return await generateVideo({
+      prompt: payload.prompt,
+      model: payload.model,
+      duration: payload.duration,
+      aspect_ratio: payload.aspectRatio,
+      image_mode: payload.imageMode,
+      reference_images: referenceImages,
+      reference_audio: referenceAudio,
+      extra_params: injected.extraParams,
+    });
+  },
 };
