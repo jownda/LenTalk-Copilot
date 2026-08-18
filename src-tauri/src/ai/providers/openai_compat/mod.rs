@@ -73,16 +73,31 @@ impl OpenAICompatibleProvider {
             .send()
             .await?;
         let status = response.status();
-        let payload: Value = response.json().await?;
+        // 先读文本再尝试 JSON: 部分平台 /v1/models 返回非标准 JSON/HTML,
+        // 直接 .json() 会抛 "error decoding response body"
+        let body_text = response.text().await.unwrap_or_default();
+        let payload: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
 
         if !status.is_success() {
-            let payload_text = payload.to_string();
             let message = payload
                 .get("error")
                 .and_then(|value| value.get("message"))
                 .and_then(|value| value.as_str())
-                .unwrap_or(&payload_text);
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| {
+                    if body_text.trim().is_empty() {
+                        format!("HTTP {} 空响应体", status)
+                    } else {
+                        body_text.chars().take(300).collect()
+                    }
+                });
             return Err(AIError::TaskFailed(format!("HTTP {}: {}", status, message)));
+        }
+        if payload.is_null() {
+            return Err(AIError::TaskFailed(format!(
+                "/v1/models 返回非 JSON 响应: {}",
+                body_text.chars().take(200).collect::<String>()
+            )));
         }
 
         let models = payload
