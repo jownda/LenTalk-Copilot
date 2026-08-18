@@ -65,7 +65,12 @@ impl OpenAICompatibleProvider {
         api_key: &str,
     ) -> Result<Vec<String>, AIError> {
         let client = Self::build_short_timeout_client();
-        let endpoint = format!("{}/v1/models", base_url.trim_end_matches('/'));
+        // base_url 可能已含 /v1(如 ModelScope 推荐地址 https://.../v1), 避免拼出 /v1/v1/models
+        let normalized_base = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches('/');
+        let endpoint = format!("{}/v1/models", normalized_base);
 
         let response = client
             .get(&endpoint)
@@ -117,7 +122,10 @@ impl OpenAICompatibleProvider {
     /// 仅检查 Base URL 是否可达(不依赖 API Key,供「验证链接」使用)
     pub async fn check_url_reachable(base_url: &str) -> Result<u16, AIError> {
         let client = Self::build_short_timeout_client();
-        let normalized = base_url.trim_end_matches('/');
+        let normalized = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches('/');
         if normalized.is_empty() {
             return Err(AIError::InvalidRequest("Base URL 为空".into()));
         }
@@ -628,6 +636,12 @@ impl AIProvider for OpenAICompatibleProvider {
         let (base_url, api_key) = self
             .resolve_base_url_and_key(provider_id, &request.extra_params)
             .await?;
+        // base_url 可能已含 /v1(如 ModelScope 推荐地址), 归一化避免拼出 /v1/v1/...
+        let base_url = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches('/')
+            .to_string();
         let client = Self::build_client();
         let is_wgspai_chat = Self::uses_wgspai_chat_completions(provider_id);
         let is_responses = Self::is_responses_protocol(&request.extra_params);
