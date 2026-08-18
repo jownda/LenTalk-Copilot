@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Handle, Position } from '@xyflow/react';
-import { AlertTriangle, AudioLines, Camera, LoaderCircle, Music2, Upload, Video } from 'lucide-react';
+import { AlertTriangle, AudioLines, Camera, LoaderCircle, Music2, Upload, Video, X } from 'lucide-react';
 
 import { CANVAS_NODE_TYPES, type AudioNodeData } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
@@ -16,6 +17,38 @@ type AudioNodeProps = {
   selected?: boolean;
 };
 
+function waitForDecodedVideoFrame(video: HTMLVideoElement, timeoutMs = 5000): Promise<void> {
+  if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const events = ['loadeddata', 'canplay', 'playing', 'seeked'];
+    const cleanup = () => {
+      window.clearTimeout(timeoutId);
+      events.forEach((event) => video.removeEventListener(event, onFrameReady));
+      video.removeEventListener('error', onError);
+    };
+    const onFrameReady = () => {
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        cleanup();
+        resolve();
+      }
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error('视频帧无法解码'));
+    };
+    const timeoutId = window.setTimeout(() => {
+      cleanup();
+      reject(new Error('视频帧尚未准备好'));
+    }, timeoutMs);
+    events.forEach((event) => video.addEventListener(event, onFrameReady));
+    video.addEventListener('error', onError);
+    onFrameReady();
+  });
+}
+
 export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const addDerivedExportNode = useCanvasStore((state) => state.addDerivedExportNode);
@@ -26,6 +59,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const [isCapturing, setIsCapturing] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [isVideoViewerOpen, setIsVideoViewerOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
 
   const resolvedTitle = useMemo(
@@ -55,6 +89,19 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       window.clearInterval(timer);
     };
   }, [isGenerating]);
+
+  useEffect(() => {
+    if (!isVideoViewerOpen) {
+      return;
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsVideoViewerOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isVideoViewerOpen]);
 
   const simulatedProgress = useMemo(() => {
     if (!isGenerating) {
@@ -123,8 +170,9 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     setIsCapturing(true);
     setCaptureError(null);
     try {
-      const width = videoEl.videoWidth > 0 ? videoEl.videoWidth : videoEl.clientWidth || 640;
-      const height = videoEl.videoHeight > 0 ? videoEl.videoHeight : videoEl.clientHeight || 360;
+      await waitForDecodedVideoFrame(videoEl);
+      const width = videoEl.videoWidth;
+      const height = videoEl.videoHeight;
       const canvas = document.createElement('canvas');
       canvas.width = width;
       canvas.height = height;
@@ -151,7 +199,13 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       }
     } catch (error) {
       console.warn('[mediaNode] capture frame failed', error);
-      setCaptureError('截图失败');
+      setCaptureError(
+        error instanceof DOMException && error.name === 'SecurityError'
+          ? '视频源未授权跨域截图'
+          : error instanceof Error
+            ? error.message
+            : '截图失败'
+      );
     } finally {
       setIsCapturing(false);
     }
@@ -198,9 +252,14 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
               <video
                 ref={videoRef}
                 controls
+                crossOrigin={/^https?:\/\//i.test(mediaSrc) ? 'anonymous' : undefined}
                 src={mediaSrc}
                 preload="metadata"
                 className="nodrag h-full w-full object-contain"
+                onDoubleClick={(event) => {
+                  event.stopPropagation();
+                  setIsVideoViewerOpen(true);
+                }}
               />
             </div>
             {/* 底部操作行 */}
@@ -293,6 +352,32 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
         className="!h-2 !w-2 !border-surface-dark !bg-accent"
       />
       <NodeResizeHandle minWidth={180} minHeight={150} maxWidth={520} maxHeight={400} />
+      {isVideoViewerOpen && mediaSrc && createPortal(
+        <div
+          className="fixed inset-0 z-[180] flex items-center justify-center bg-black/90 p-6 backdrop-blur-sm"
+          onClick={() => setIsVideoViewerOpen(false)}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="absolute right-5 top-5 z-10 flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-black/60 text-white transition-colors hover:bg-white/15"
+            onClick={() => setIsVideoViewerOpen(false)}
+            title="关闭视频预览"
+            aria-label="关闭视频预览"
+          >
+            <X className="h-5 w-5" />
+          </button>
+          <video
+            controls
+            autoPlay
+            src={mediaSrc}
+            preload="auto"
+            className="max-h-full max-w-full rounded-lg object-contain shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          />
+        </div>,
+        document.body
+      )}
     </div>
   );
 });

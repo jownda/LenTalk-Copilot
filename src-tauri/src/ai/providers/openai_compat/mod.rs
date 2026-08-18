@@ -248,11 +248,16 @@ impl OpenAICompatibleProvider {
         body_text: &str,
         reference_image_count: usize,
     ) -> bool {
-        reference_image_count > 0
-            && status.as_u16() == 400
-            && body_text
-                .to_ascii_lowercase()
-                .contains("failed to parse request body")
+        if reference_image_count == 0 {
+            return false;
+        }
+
+        let normalized_body = body_text.to_ascii_lowercase();
+        // 部分 OpenAI 兼容中转会把不支持的 image / input_image 字段错误
+        // 错误地返回为 404 Not Found。请求未被受理时切换字段重试一次，
+        // 使 GPT Image 的多参考图编辑可以兼容这类实现。
+        (status.as_u16() == 400 && normalized_body.contains("failed to parse request body"))
+            || (status == reqwest::StatusCode::NOT_FOUND && normalized_body.contains("not found"))
     }
 
     /// 是否走 Responses API 协议(extra_params.protocol == "responses")。
@@ -265,6 +270,43 @@ impl OpenAICompatibleProvider {
             .and_then(|value| value.as_str())
             .map(|value| value.eq_ignore_ascii_case("responses"))
             .unwrap_or(false)
+    }
+
+    /// WGSPAI 将 gpt-image 模型映射到 Chat Completions，而不是 Images API。
+    /// 这是一条平台专用兼容分支，其他自定义平台继续使用其原有协议。
+    fn uses_wgspai_chat_completions(provider_id: &str) -> bool {
+        provider_id == "custom:wgspai"
+    }
+
+    fn build_wgspai_chat_completions_body(
+        api_model: &str,
+        prompt: &str,
+        reference_images: Option<&Vec<String>>,
+    ) -> Result<Value, AIError> {
+        let images = reference_images
+            .map(|references| {
+                references
+                    .iter()
+                    .filter_map(|reference| Self::reference_image_to_image_field(reference).transpose())
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let content = if images.is_empty() {
+            Value::String(prompt.to_string())
+        } else {
+            let mut parts = vec![json!({ "type": "text", "text": prompt })];
+            parts.extend(images.into_iter().map(|image_url| {
+                json!({ "type": "image_url", "image_url": { "url": image_url } })
+            }));
+            Value::Array(parts)
+        };
+
+        Ok(json!({
+            "model": api_model,
+            "messages": [{ "role": "user", "content": content }],
+            "temperature": 0.7,
+        }))
     }
 
     /// 构造 Responses API 请求体: input_text + input_image + image_generation tool。
@@ -328,6 +370,57 @@ impl OpenAICompatibleProvider {
         None
     }
 
+    fn extract_url_from_chat_content(content: &str) -> Option<String> {
+        let start = content.find("https://").or_else(|| content.find("http://"))?;
+        let candidate = &content[start..];
+        let end = candidate
+            .find(|character: char| character.is_whitespace() || matches!(character, ')' | ']' | '}' | '"' | '\'' | ','))
+            .unwrap_or(candidate.len());
+        let url = candidate[..end].trim();
+        (!url.is_empty()).then(|| url.to_string())
+    }
+
+    /// WGSPAI Chat Completions 的生成结果通常位于 assistant content 的 Markdown/纯 URL 中。
+    fn extract_wgspai_chat_image(payload: &Value) -> Option<String> {
+        let choices = payload.get("choices")?.as_array()?;
+        for choice in choices {
+            let message = choice.get("message")?;
+            if let Some(image_url) = message.get("image_url").and_then(|value| value.as_str()) {
+                if !image_url.is_empty() {
+                    return Some(image_url.to_string());
+                }
+            }
+            let Some(content) = message.get("content") else {
+                continue;
+            };
+            if let Some(text) = content.as_str() {
+                if let Some(url) = Self::extract_url_from_chat_content(text) {
+                    return Some(url);
+                }
+                continue;
+            }
+            if let Some(parts) = content.as_array() {
+                for part in parts {
+                    if let Some(image_url) = part
+                        .get("image_url")
+                        .and_then(|value| value.get("url").or(Some(value)))
+                        .and_then(|value| value.as_str())
+                    {
+                        if !image_url.is_empty() {
+                            return Some(image_url.to_string());
+                        }
+                    }
+                    if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                        if let Some(url) = Self::extract_url_from_chat_content(text) {
+                            return Some(url);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// 从响应中提取图片(不报错版): 支持 data[]b64/url、顶层 b64_json/url/image/output。
     fn extract_image_data_if_present(payload: &Value) -> Option<String> {
         if let Some(data) = payload.get("data").and_then(|value| value.as_array()) {
@@ -364,7 +457,7 @@ impl OpenAICompatibleProvider {
                 }
             }
         }
-        None
+        Self::extract_wgspai_chat_image(payload)
     }
 
     /// 从提交响应中提取任务 id(各平台非标字段名)。
@@ -465,6 +558,9 @@ impl OpenAICompatibleProvider {
                 }
             }
         }
+        if let Some(image) = Self::extract_wgspai_chat_image(payload) {
+            return Ok(image);
+        }
         let error_message = payload
             .get("error")
             .and_then(|value| value.get("message"))
@@ -518,10 +614,20 @@ impl AIProvider for OpenAICompatibleProvider {
             .resolve_base_url_and_key(provider_id, &request.extra_params)
             .await?;
         let client = Self::build_client();
+        let is_wgspai_chat = Self::uses_wgspai_chat_completions(provider_id);
         let is_responses = Self::is_responses_protocol(&request.extra_params);
         let reference_image_field = Self::resolve_reference_image_field(&request.extra_params, api_model);
         let reference_image_count = request.reference_images.as_ref().map(|images| images.len()).unwrap_or(0);
-        let (endpoint, body) = if is_responses {
+        let (endpoint, body) = if is_wgspai_chat {
+            (
+                format!("{}/v1/chat/completions", base_url),
+                Self::build_wgspai_chat_completions_body(
+                    api_model,
+                    &request.prompt,
+                    request.reference_images.as_ref(),
+                )?,
+            )
+        } else if is_responses {
             (
                 format!("{}/v1/responses", base_url),
                 Self::build_responses_body(
@@ -547,9 +653,9 @@ impl AIProvider for OpenAICompatibleProvider {
         info!(
             "[OpenAI Compatible Request] model: {}, protocol: {}, reference_images: {}, reference_image_field: {}",
             api_model,
-            if is_responses { "responses" } else { "images" },
+            if is_wgspai_chat { "wgspai-chat" } else if is_responses { "responses" } else { "images" },
             reference_image_count,
-            if is_responses { "input_image" } else { reference_image_field },
+            if is_wgspai_chat || is_responses { "image_url" } else { reference_image_field },
         );
 
         let response = client
@@ -562,7 +668,7 @@ impl AIProvider for OpenAICompatibleProvider {
         let mut status = response.status();
         // 先读文本, 再尝试 JSON: 4xx/5xx 平台可能返回 HTML/空 body, 避免笼统的 "decoding response body"
         let mut body_text = response.text().await?;
-        if !is_responses && Self::should_retry_with_alternate_reference_field(
+        if !is_wgspai_chat && !is_responses && Self::should_retry_with_alternate_reference_field(
             status,
             &body_text,
             reference_image_count,
@@ -657,15 +763,29 @@ impl AIProvider for OpenAICompatibleProvider {
             .resolve_base_url_and_key(provider_id, &request.extra_params)
             .await?;
         let client = Self::build_client();
-        let endpoint = format!("{}/v1/images/generations", base_url);
+        let is_wgspai_chat = Self::uses_wgspai_chat_completions(provider_id);
         let reference_image_field = Self::resolve_reference_image_field(&request.extra_params, api_model);
-        let body = Self::build_request_body(
-            api_model,
-            &request.prompt,
-            &request.aspect_ratio,
-            request.reference_images.as_ref(),
-            reference_image_field,
-        )?;
+        let (endpoint, body) = if is_wgspai_chat {
+            (
+                format!("{}/v1/chat/completions", base_url),
+                Self::build_wgspai_chat_completions_body(
+                    api_model,
+                    &request.prompt,
+                    request.reference_images.as_ref(),
+                )?,
+            )
+        } else {
+            (
+                format!("{}/v1/images/generations", base_url),
+                Self::build_request_body(
+                    api_model,
+                    &request.prompt,
+                    &request.aspect_ratio,
+                    request.reference_images.as_ref(),
+                    reference_image_field,
+                )?,
+            )
+        };
 
         let response = client
             .post(&endpoint)
@@ -676,7 +796,7 @@ impl AIProvider for OpenAICompatibleProvider {
         let mut status = response.status();
         let mut body_text = response.text().await?;
         let reference_image_count = request.reference_images.as_ref().map(|images| images.len()).unwrap_or(0);
-        if Self::should_retry_with_alternate_reference_field(
+        if !is_wgspai_chat && Self::should_retry_with_alternate_reference_field(
             status,
             &body_text,
             reference_image_count,
@@ -833,7 +953,7 @@ mod tests {
     use super::OpenAICompatibleProvider;
 
     #[test]
-    fn retries_alternate_reference_field_only_for_request_body_parse_errors() {
+    fn retries_alternate_reference_field_for_supported_reference_errors() {
         assert!(OpenAICompatibleProvider::should_retry_with_alternate_reference_field(
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"code":400,"message":"failed to parse request body"}"#,
@@ -844,11 +964,56 @@ mod tests {
             "invalid model",
             1,
         ));
+        assert!(OpenAICompatibleProvider::should_retry_with_alternate_reference_field(
+            reqwest::StatusCode::NOT_FOUND,
+            "Not Found",
+            2,
+        ));
+        assert!(!OpenAICompatibleProvider::should_retry_with_alternate_reference_field(
+            reqwest::StatusCode::NOT_FOUND,
+            "Not Found",
+            0,
+        ));
         assert!(!OpenAICompatibleProvider::should_retry_with_alternate_reference_field(
             reqwest::StatusCode::BAD_REQUEST,
             "failed to parse request body",
             0,
         ));
+    }
+
+    #[test]
+    fn builds_wgspai_chat_request_with_reference_images() {
+        let references = vec![
+            "data:image/png;base64,QUJD".to_string(),
+            "https://example.com/reference.png".to_string(),
+        ];
+        let body = OpenAICompatibleProvider::build_wgspai_chat_completions_body(
+            "gpt-image-2-2k",
+            "edit the product image",
+            Some(&references),
+        )
+        .expect("WGSPAI chat body should be built");
+
+        assert_eq!(body["model"], "gpt-image-2-2k");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][0]["content"][1]["image_url"]["url"], references[0]);
+        assert_eq!(body["messages"][0]["content"][2]["image_url"]["url"], references[1]);
+    }
+
+    #[test]
+    fn extracts_wgspai_chat_image_url_from_markdown_content() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "![generated image](https://cdn.example.com/generated.png)"
+                }
+            }]
+        });
+
+        assert_eq!(
+            OpenAICompatibleProvider::extract_wgspai_chat_image(&payload),
+            Some("https://cdn.example.com/generated.png".to_string())
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ import { v4 as uuid } from 'uuid';
 import { isTauri } from '@tauri-apps/api/core';
 
 import { persistLibraryAssetBinary, extractVideoThumbnail } from '@/commands/assetLibrary';
-import { imageUrlToDataUrl, prepareNodeImageFromFile } from '@/features/canvas/application/imageData';
+import { imageUrlToDataUrl, prepareNodeImageFromFile, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import { ASSET_LIBRARY_MIME_PREFIX, type AssetMediaType, type LibraryAsset } from './types';
 
 export function createAssetId(): string {
@@ -45,6 +45,47 @@ export async function importImageUrlToAsset(
     };
   } catch (error) {
     console.warn('[assetLibrary] import image url failed', imageUrl, error);
+    return null;
+  }
+}
+
+/** 将画布视频 URL/本地路径复制为素材库视频，并保留可播放的本地源文件。 */
+export async function importVideoUrlToAsset(
+  videoUrl: string,
+  libraryId: string,
+  categoryId: string | null
+): Promise<LibraryAsset | null> {
+  try {
+    const displayUrl = videoUrl.startsWith('data:') || /^https?:\/\//i.test(videoUrl)
+      ? videoUrl
+      : resolveImageDisplayUrl(videoUrl);
+    const response = await fetch(displayUrl);
+    if (!response.ok) {
+      return null;
+    }
+    const blob = await response.blob();
+    const mime = blob.type || 'video/mp4';
+    const extension = mime.split('/')[1]?.split(';')[0] || 'mp4';
+    const sourcePath = isTauri()
+      ? await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension)
+      : displayUrl;
+    const previewImageUrl = isTauri() ? await extractVideoThumbnail(sourcePath) : null;
+    const fileName = `canvas-video-${Date.now()}.${extension}`;
+    return {
+      id: createAssetId(),
+      libraryId,
+      categoryId,
+      name: `画布视频 ${new Date().toLocaleTimeString()}`,
+      mediaType: 'video',
+      sourcePath,
+      previewImageUrl,
+      aspectRatio: null,
+      sourceFileName: fileName,
+      tags: [],
+      createdAt: Date.now(),
+    };
+  } catch (error) {
+    console.warn('[assetLibrary] import video url failed', videoUrl, error);
     return null;
   }
 }

@@ -12,6 +12,12 @@ export type ThemeTonePreset = 'neutral' | 'warm' | 'cool';
 export type CanvasEdgeRoutingMode = 'spline' | 'orthogonal' | 'smartOrthogonal';
 export type ProviderApiKeys = Record<string, string>;
 export const DEFAULT_GRSAI_NANO_BANANA_PRO_MODEL = 'nano-banana-pro';
+export const DEFAULT_JIMENG_CLI_EXECUTABLE = 'dreamina';
+
+/** 即梦 CLI 是本地命令行工具，不使用 OpenAI 兼容平台的 API Key 配置。 */
+export interface JimengCliSettings {
+  executable: string;
+}
 
 /** 视频模型必须与图片模型分开注册，避免通用模型拉取结果污染图片节点。 */
 export function isVideoGenerationModelName(model: string): boolean {
@@ -57,6 +63,7 @@ interface SettingsState {
   isHydrated: boolean;
   apiKeys: ProviderApiKeys;
   customApis: CustomApiProvider[];
+  jimengCli: JimengCliSettings;
   grsaiNanoBananaProModel: string;
   hideProviderGuidePopover: boolean;
   downloadPresetPaths: string[];
@@ -83,6 +90,7 @@ interface SettingsState {
   /** 最近一次使用的图片生成模型 id(新建 AI 图片节点默认选中) */
   lastImageModelId: string | null;
   setProviderApiKey: (providerId: string, key: string) => void;
+  setJimengCliExecutable: (executable: string) => void;
   addCustomApi: (input: Omit<CustomApiProvider, 'id' | 'createdAt'>) => CustomApiProvider;
   updateCustomApi: (id: string, patch: Partial<Omit<CustomApiProvider, 'id'>>) => void;
   removeCustomApi: (id: string) => void;
@@ -191,6 +199,17 @@ function normalizeApiKeys(input: ProviderApiKeys | null | undefined): ProviderAp
   }, {});
 }
 
+function normalizeJimengCliSettings(input: unknown): JimengCliSettings {
+  const executable =
+    input && typeof input === 'object' && 'executable' in input
+      ? String((input as { executable?: unknown }).executable ?? '').trim()
+      : '';
+
+  return {
+    executable: executable.slice(0, 512) || DEFAULT_JIMENG_CLI_EXECUTABLE,
+  };
+}
+
 function normalizeCustomApis(input: unknown): CustomApiProvider[] {
   if (!Array.isArray(input)) {
     return [];
@@ -270,6 +289,7 @@ export const useSettingsStore = create<SettingsState>()(
       isHydrated: false,
       apiKeys: {},
       customApis: [],
+      jimengCli: { executable: DEFAULT_JIMENG_CLI_EXECUTABLE },
       grsaiNanoBananaProModel: DEFAULT_GRSAI_NANO_BANANA_PRO_MODEL,
       hideProviderGuidePopover: false,
       downloadPresetPaths: [],
@@ -300,6 +320,8 @@ export const useSettingsStore = create<SettingsState>()(
             [providerId]: normalizeApiKey(key),
           },
         })),
+      setJimengCliExecutable: (executable) =>
+        set({ jimengCli: normalizeJimengCliSettings({ executable }) }),
       addCustomApi: (input) => {
         const existingIds = new Set(get().customApis.map((item) => item.id));
         const id = deriveCustomApiId(input.name, existingIds);
@@ -388,7 +410,7 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'settings-storage',
-      version: 14,
+      version: 15,
       onRehydrateStorage: () => {
         return (_state, error) => {
           if (error) {
@@ -420,6 +442,7 @@ export const useSettingsStore = create<SettingsState>()(
           usdToCnyRate?: number | string;
           preferDiscountedPrice?: boolean;
           grsaiCreditTierId?: GrsaiCreditTierId | string;
+          jimengCli?: unknown;
         };
 
         const migratedApiKeys = normalizeApiKeys(state.apiKeys);
@@ -434,6 +457,7 @@ export const useSettingsStore = create<SettingsState>()(
             isHydrated: true,
             apiKeys: migratedApiKeys,
             customApis,
+            jimengCli: normalizeJimengCliSettings(state.jimengCli),
             ignoreAtTagWhenCopyingAndGenerating,
             grsaiNanoBananaProModel: normalizeGrsaiNanoBananaProModel(
               state.grsaiNanoBananaProModel
@@ -463,6 +487,7 @@ export const useSettingsStore = create<SettingsState>()(
           isHydrated: true,
           apiKeys: state.apiKey ? { ppio: normalizeApiKey(state.apiKey) } : {},
           customApis,
+          jimengCli: normalizeJimengCliSettings(state.jimengCli),
           ignoreAtTagWhenCopyingAndGenerating,
           grsaiNanoBananaProModel: normalizeGrsaiNanoBananaProModel(
             state.grsaiNanoBananaProModel

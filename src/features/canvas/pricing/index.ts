@@ -174,6 +174,28 @@ export function createGrsaiPointsPricing(
   };
 }
 
+/** 供应商直接以积分计费、且没有可信货币兑换规则时，只显示本次所需积分。 */
+export function createPointsOnlyPricing(
+  resolvePointsCost: (context: PriceComputationContext) => number
+): ModelPricingDefinition {
+  return {
+    quote: (context) => {
+      const pointsCost = resolvePointsCost(context);
+      if (!Number.isFinite(pointsCost) || pointsCost <= 0) {
+        return null;
+      }
+
+      return {
+        // amount 不参与展示；ModelPriceQuote 保留该字段以兼容现有价格管线。
+        amount: 0,
+        currency: 'CNY',
+        pointsCost,
+        metadata: { priceDisplay: 'points-only' },
+      };
+    },
+  };
+}
+
 export function resolveModelPriceDisplay(
   model: Pick<ImageModelDefinition, 'pricing'>,
   options: {
@@ -198,6 +220,17 @@ export function resolveModelPriceDisplay(
   });
   if (!quote) {
     return null;
+  }
+
+  const pointsOnly = quote.metadata?.priceDisplay === 'points-only';
+  if (pointsOnly && quote.pointsCost != null) {
+    const points = Math.round(quote.pointsCost).toLocaleString(
+      options.language.startsWith('zh') ? 'zh-CN' : 'en-US'
+    );
+    return {
+      label: options.language.startsWith('zh') ? `${points} 积分/次` : `${points} credits/run`,
+      pointsCost: quote.pointsCost,
+    };
   }
 
   const displayCurrency = resolvePriceDisplayCurrency(
@@ -241,7 +274,6 @@ export function resolveModelPriceDisplay(
 export function isHighThinkingEnabled(extraParams: Record<string, unknown> | undefined): boolean {
   return normalizeStringParam(extraParams?.thinking_level) === 'high';
 }
-
 
 
 

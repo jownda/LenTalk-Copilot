@@ -1,5 +1,6 @@
 import {
   generateImage,
+  generateJimengCliVideo,
   generateVideo,
   getGenerateImageJob,
   setApiKey,
@@ -11,6 +12,7 @@ import {
   imageUrlToDataUrl,
 } from '@/features/canvas/application/imageData';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { JIMENG_CLI_PROVIDER_ID } from '@/features/canvas/models';
 
 import type { AiGateway, GenerateImagePayload, GenerateVideoPayload } from '../application/ports';
 
@@ -61,6 +63,14 @@ function injectCustomApiRequestMode(payload: GenerateImagePayload): GenerateImag
   if (customApi?.baseUrl) {
     extraParams.provider_base_url = customApi.baseUrl;
   }
+  // WGSPAI 的视频模型使用其 OpenAI Video API，不走聊天或网站工作台接口。
+  // 仅按平台 id 注入，不影响其它 custom:* 平台的通用视频链路。
+  if (providerId === 'wgspai') {
+    const apiModel = payload.model.split('/').slice(1).join('/').trim().toLowerCase();
+    extraParams.video_transport = apiModel === 'minimax-h3'
+      ? 'wgspai-minimax-h3'
+      : 'wgspai-openai-video';
+  }
   extraParams.reference_image_field = referenceImageField;
   return {
     ...payload,
@@ -87,6 +97,11 @@ export function localizeReferenceTokens(prompt: string, model: string): string {
   );
 }
 
+function normalizeWgspaiVideoModelName(model: string): string {
+  const trimmed = model.trim();
+  return trimmed.toLowerCase() === 'minimax-h3' ? 'MiniMax-H3' : trimmed;
+}
+
 /** 参考图片直传: http(s) URL 直接透传(平台可下载); 本地路径/dataURL 转 base64 内嵌。 */
 async function normalizeReferenceUrls(
   urls: string[] | undefined
@@ -100,42 +115,37 @@ async function normalizeReferenceUrls(
   );
 }
 
-/** 视频参考图: http(s) URL 直接透传; 本地路径/dataURL 上传到平台 /v1/files 换公开 URL。 */
+/** 视频参考图默认使用 OpenAI Video API 可接受的 URL / Data URL。 */
 async function normalizeVideoReferenceImages(
   imageUrls: string[] | undefined,
   extraParams: Record<string, unknown> | undefined,
   modelId: string
 ): Promise<string[] | undefined> {
   if (!imageUrls?.length) return undefined;
-
+  const useWgspaiUpload = extraParams?.video_transport === 'wgspai-openai-video'
+    || extraParams?.video_transport === 'wgspai-minimax-h3';
   const providerBaseUrl = typeof extraParams?.provider_base_url === 'string'
     ? extraParams.provider_base_url.trim().replace(/\/+$/, '').replace(/\/v1$/i, '')
     : '';
   const providerId = modelId.split('/')[0] ?? '';
-  const apiModel = modelId.split('/').slice(1).join('/') || modelId;
+  const apiModel = normalizeWgspaiVideoModelName(modelId.split('/').slice(1).join('/') || modelId);
   const apiKey = useSettingsStore.getState().apiKeys[providerId] ?? '';
 
   return await Promise.all(imageUrls.map(async (imageUrl) => {
     const source = imageUrl.trim();
     if (!source) return source;
-    // 公开 URL 直接透传(平台可下载)
-    if (/^https?:\/\//i.test(source)) {
-      return source;
-    }
+    if (/^https?:\/\//i.test(source)) return source;
+    const dataUrl = await imageUrlToDataUrl(source);
+    if (!useWgspaiUpload) return dataUrl;
     if (!providerBaseUrl || !apiKey || !apiModel) {
-      throw new Error('参考图片上传需要先在设置中配置视频模型的 Base URL、API Key 和模型名称');
+      throw new Error('WGSPAI 参考图片上传需要配置 Base URL、API Key 和模型名称');
     }
-    return await uploadVideoReferenceImage(
-      await imageUrlToDataUrl(source),
-      providerBaseUrl,
-      apiKey,
-      apiModel
-    );
+    return await uploadWgspaiVideoReferenceImage(dataUrl, providerBaseUrl, apiKey, apiModel);
   }));
 }
 
-/** 上传本地参考图到平台 /v1/files, 返回可公开访问的 URL。 */
-async function uploadVideoReferenceImage(
+/** WGSPAI 的上游视频模型会下载图片 URL，不接受 data: URL。 */
+async function uploadWgspaiVideoReferenceImage(
   dataUrl: string,
   baseUrl: string,
   apiKey: string,
@@ -149,34 +159,35 @@ async function uploadVideoReferenceImage(
   const formData = new FormData();
   formData.append('file', imageBlob, imageFileName(imageBlob));
   formData.append('purpose', 'assistants');
-  // WGSPAI 的文件接口要求模型名; 使用不含 custom: 前缀的平台模型名。
   formData.append('model', model);
+  formData.append('model_name', model);
 
-  const response = await fetch(`${baseUrl}/v1/files`, {
+  const uploadUrl = `${baseUrl}/v1/files?model=${encodeURIComponent(model)}`;
+  const response = await fetch(uploadUrl, {
     method: 'POST',
     headers: { Authorization: `Bearer ${apiKey}` },
     body: formData,
   });
   const rawResponse = await response.text();
-  let uploadPayload: unknown = null;
+  let payload: unknown = null;
   try {
-    uploadPayload = JSON.parse(rawResponse);
+    payload = JSON.parse(rawResponse);
   } catch {
-    uploadPayload = null;
+    payload = null;
   }
   if (!response.ok) {
-    const record = uploadPayload as Record<string, unknown> | null;
+    const record = payload as Record<string, unknown> | null;
     const errorMessage = record && typeof record.error === 'object'
       ? String((record.error as Record<string, unknown>).message ?? '')
       : '';
     throw new Error(
-      `参考图片上传失败: HTTP ${response.status}${errorMessage ? `: ${errorMessage}` : ''}`
+      `WGSPAI 参考图片上传失败: HTTP ${response.status}${errorMessage ? `: ${errorMessage}` : ''} (model: ${model})`
     );
   }
 
-  const assetUrl = extractUploadedAssetUrl(uploadPayload, baseUrl);
+  const assetUrl = extractUploadedAssetUrl(payload, baseUrl);
   if (!assetUrl) {
-    throw new Error('参考图片上传成功但平台未返回可访问地址');
+    throw new Error('WGSPAI 参考图片上传成功但未返回可访问地址');
   }
   return assetUrl;
 }
@@ -191,7 +202,6 @@ function imageFileName(blob: Blob): string {
   return `reference.${extensionByMime[blob.type.toLowerCase()] ?? 'png'}`;
 }
 
-/** 从上传响应里递归提取可访问 URL(参考 Infinite Canvas 的多 key 提取策略)。 */
 function extractUploadedAssetUrl(payload: unknown, baseUrl: string): string {
   if (Array.isArray(payload)) {
     for (const item of payload) {
@@ -203,24 +213,19 @@ function extractUploadedAssetUrl(payload: unknown, baseUrl: string): string {
   if (!payload || typeof payload !== 'object') return '';
 
   const record = payload as Record<string, unknown>;
-  // 优先找完整的 http(s) URL
   for (const key of ['url', 'asset_url', 'assetUrl', 'uri', 'file_url', 'fileUrl', 'download_url']) {
     const value = record[key];
-    if (typeof value === 'string' && /^https?:\/\//i.test(value.trim())) {
-      return value.trim();
-    }
+    if (typeof value === 'string' && /^https?:\/\//i.test(value.trim())) return value.trim();
   }
-  // 其次找文件 id, 拼出平台内可访问地址
   for (const key of ['id', 'file_id', 'fileId', 'asset_id', 'assetId']) {
     const value = record[key];
     if (typeof value === 'string' && value.trim()) {
       return `${baseUrl}/v1/files/${encodeURIComponent(value.trim())}/content`;
     }
   }
-  // 递归进常见容器字段
   for (const key of ['data', 'file', 'asset', 'result', 'file_info', 'response']) {
-    const found = extractUploadedAssetUrl(record[key], baseUrl);
-    if (found) return found;
+    const assetUrl = extractUploadedAssetUrl(record[key], baseUrl);
+    if (assetUrl) return assetUrl;
   }
   return '';
 }
@@ -266,9 +271,29 @@ export const tauriAiGateway: AiGateway = {
   },
   getGenerateImageJob,
   generateVideo: async (payload: GenerateVideoPayload) => {
+    if (payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`)) {
+      const referenceImages = await normalizeReferenceUrls(payload.referenceImages);
+      const referenceAudio = payload.referenceAudio
+        ?.map((audioUrl) => audioUrl.trim())
+        .filter(Boolean);
+      const modelVersion = payload.model.slice(`${JIMENG_CLI_PROVIDER_ID}/`.length);
+
+      return await generateJimengCliVideo({
+        client_job_id: payload.clientJobId,
+        executable: useSettingsStore.getState().jimengCli.executable,
+        prompt: payload.prompt,
+        model_version: modelVersion,
+        duration: payload.duration,
+        aspect_ratio: payload.aspectRatio,
+        video_resolution: payload.videoResolution,
+        image_mode: payload.imageMode,
+        reference_images: referenceImages,
+        reference_audio: referenceAudio,
+      });
+    }
+
     const injected = injectCustomApiRequestMode(payload as unknown as GenerateImagePayload);
-    // 视频参考图: http URL 直传; 本地图片上传平台 /v1/files 换公开 URL
-    // (WGSPAI 视频接口只接受可下载的 http URL, 不接受本地路径/base64)
+    // 视频参考图:WGSPAI 上传本地资源获取可下载 URL，其它平台保留 Data URL。
     const referenceImages = await normalizeVideoReferenceImages(
       payload.referenceImages,
       injected.extraParams,
@@ -284,6 +309,7 @@ export const tauriAiGateway: AiGateway = {
       model: payload.model,
       duration: payload.duration,
       aspect_ratio: payload.aspectRatio,
+      video_resolution: payload.videoResolution,
       image_mode: payload.imageMode,
       reference_images: referenceImages,
       reference_audio: referenceAudio,

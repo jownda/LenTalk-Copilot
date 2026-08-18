@@ -92,6 +92,7 @@ export interface VideoGenNodeData extends NodeDisplayData {
   model: string;
   duration: number;
   aspectRatio: string;
+  resolution?: string;
   imageMode?: 'reference' | 'first-last';
   firstFrameImageUrl?: string | null;
   firstFramePreviewImageUrl?: string | null;

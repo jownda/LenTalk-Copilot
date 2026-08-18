@@ -18,10 +18,24 @@ export interface GenerateVideoRequest {
   model: string;
   duration: number;
   aspect_ratio: string;
+  video_resolution?: string;
   image_mode?: 'reference' | 'first-last';
   reference_images?: string[];
   reference_audio?: string[];
   extra_params?: Record<string, unknown>;
+}
+
+interface GenerateJimengCliVideoRequest {
+  client_job_id?: string;
+  executable: string;
+  prompt: string;
+  model_version: string;
+  duration: number;
+  aspect_ratio: string;
+  video_resolution?: string;
+  image_mode?: 'reference' | 'first-last';
+  reference_images?: string[];
+  reference_audio?: string[];
 }
 
 export type GenerationJobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'not_found';
@@ -152,10 +166,13 @@ function mapGptImageSize(aspectRatio: string): string {
 const browserGenerationJobs = new Map<string, GenerationJobStatus>();
 
 function getVideoResultUrl(payload: unknown): string | null {
-  const urls: string[] = [];
+  const urls = new Set<string>();
   const visit = (value: unknown): void => {
     if (typeof value === 'string') {
-      if (/^(https?:|data:)/.test(value)) urls.push(value);
+      const url = value.trim();
+      if (/^(https?:|data:video\/)/i.test(url)) urls.add(url);
+      const embeddedUrl = url.match(/https?:\/\/[^\s\])}",]+/i)?.[0];
+      if (embeddedUrl) urls.add(embeddedUrl);
       return;
     }
     if (!value || typeof value !== 'object') return;
@@ -164,10 +181,30 @@ function getVideoResultUrl(payload: unknown): string | null {
       return;
     }
     const record = value as Record<string, unknown>;
-    ['videos', 'outputs', 'output', 'data', 'detail', 'result', 'results', 'content', 'video_url', 'videoUrl', 'url', 'output_url', 'download_url'].forEach((key) => visit(record[key]));
+    [
+      'video_url',
+      'videoUrl',
+      'url',
+      'uri',
+      'value',
+      'output_url',
+      'download_url',
+      'downloadUrl',
+      'data',
+      'videos',
+      'video_urls',
+      'videoUrls',
+      'output_videos',
+      'outputs',
+      'output',
+      'results',
+      'files',
+      'task',
+      'content',
+    ].forEach((key) => visit(record[key]));
   };
   visit(payload);
-  return urls[0] ?? null;
+  return urls.values().next().value ?? null;
 }
 
 function getVideoTaskId(payload: unknown): string | null {
@@ -228,7 +265,7 @@ function getVideoTaskStatus(payload: unknown): string {
   for (const key of ['status', 'task_status', 'state']) {
     if (typeof record[key] === 'string') return record[key].toUpperCase();
   }
-  for (const key of ['data', 'detail', 'result']) {
+  for (const key of ['data', 'detail', 'result', 'task']) {
     const status = getVideoTaskStatus(record[key]);
     if (status) return status;
   }
@@ -408,27 +445,228 @@ async function generateWgspaiStudioVideo(
   }
 }
 
+function resolveMinimaxH3Resolution(value: string | undefined): '768P' | '2K' {
+  return value?.trim().toUpperCase() === '768P' ? '768P' : '2K';
+}
+
+function normalizeMinimaxH3ModelName(model: string): string {
+  return model.trim().toLowerCase() === 'minimax-h3' ? 'MiniMax-H3' : model;
+}
+
+/**
+ * WGSPAI 的 Minimax H3 适配：请求体按 MiniMax V2 的多模态 content 语义构造，
+ * 但仍使用 WGSPAI 已验证的 /v1/video/generations 提交与查询入口。
+ */
+async function generateWgspaiMinimaxH3Video(
+  request: GenerateVideoRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>
+): Promise<string> {
+  const isFirstLast = request.image_mode === 'first-last';
+  const videoImages = request.reference_images?.slice(0, isFirstLast ? 2 : undefined) ?? [];
+  const referenceAudio = request.reference_audio?.filter((value) => value.trim().length > 0) ?? [];
+
+  if (isFirstLast && videoImages.length !== 2) {
+    throw new Error('MiniMax H3 首尾帧模式需要首帧和尾帧两张图片');
+  }
+  if (isFirstLast && referenceAudio.length > 0) {
+    throw new Error('MiniMax H3 首尾帧模式不能同时使用参考音频');
+  }
+
+  const content: Array<Record<string, unknown>> = [
+    { type: 'text', text: request.prompt },
+  ];
+  if (isFirstLast) {
+    content.push(
+      { type: 'image_url', image_url: { url: videoImages[0] }, role: 'first_frame' },
+      { type: 'image_url', image_url: { url: videoImages[1] }, role: 'last_frame' },
+    );
+  } else {
+    for (const image of videoImages) {
+      content.push({ type: 'image_url', image_url: { url: image }, role: 'reference_image' });
+    }
+    for (const audio of referenceAudio) {
+      content.push({ type: 'audio_url', audio_url: { url: audio }, role: 'reference_audio' });
+    }
+  }
+
+  const body = {
+    model: apiModel,
+    prompt: request.prompt,
+    content,
+    duration: Math.max(4, Math.min(15, Math.round(request.duration))),
+    // MiniMax H3 的 i2va(首尾帧)比例必须使用 adaptive，由输入图片决定。
+    ratio: isFirstLast ? 'adaptive' : request.aspect_ratio,
+    resolution: resolveMinimaxH3Resolution(request.video_resolution),
+    // 保留 WGSPAI 当前视频网关已兼容的字段，content 则提供 H3 官方角色语义。
+    ...(videoImages.length ? {
+      images: videoImages,
+      ...(videoImages.length === 1 ? {
+        image: videoImages[0],
+        input_reference: videoImages[0],
+      } : {}),
+    } : {}),
+    ...(referenceAudio.length ? {
+      audio_url: referenceAudio[0],
+      audio_urls: referenceAudio,
+    } : {}),
+  };
+  const submitUrl = `${baseUrl}/v1/video/generations`;
+  const response = await fetch(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`MiniMax H3 视频生成请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`MiniMax H3 视频生成请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  }
+  const immediateResult = getVideoResultUrl(payload);
+  if (immediateResult) return immediateResult;
+  const taskId = getVideoTaskId(payload);
+  if (!taskId) {
+    throw new Error(`MiniMax H3 视频响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
+  }
+
+  const taskUrl = `${submitUrl}/${encodeURIComponent(taskId)}`;
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const taskResponse = await fetch(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    try {
+      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`MiniMax H3 视频查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`MiniMax H3 视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const videoUrl = getVideoResultUrl(payload);
+    if (videoUrl) return videoUrl;
+    const status = getVideoTaskStatus(payload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`MiniMax H3 视频生成失败: ${status}`);
+    }
+  }
+}
+
+async function generateWgspaiOpenAiVideo(
+  request: GenerateVideoRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>
+): Promise<string> {
+  const videoImages = request.image_mode === 'first-last'
+    ? request.reference_images?.slice(0, 2)
+    : request.reference_images;
+  const [width, height] = resolveWgspaiVideoStudioSize(request.aspect_ratio)
+    .split('x')
+    .map((value: string) => Number(value));
+  const body = {
+    model: apiModel,
+    prompt: request.prompt,
+    duration: Math.max(1, Math.round(request.duration)),
+    // WGSPAI 的 OpenAI Video 网关以 size 作为标准任务字段；仅传 width/height
+    // 会被网关忽略并回退到模型默认画幅（常见为 9:16）。
+    size: `${width}x${height}`,
+    width,
+    height,
+    n: 1,
+    response_format: 'url',
+    metadata: {
+      aspect_ratio: request.aspect_ratio,
+      width,
+      height,
+    },
+    ...(videoImages?.length === 1 ? {
+      image: videoImages[0],
+      input_reference: videoImages[0],
+    } : videoImages?.length ? {
+      // WGSPAI Video Studio 对多图使用有序 images 数组。首尾帧模式严格保持
+      // [首帧, 尾帧]，不混入未公开支持的 generation_type / first_frame 字段。
+      images: videoImages,
+    } : {}),
+  };
+  const submitUrl = `${baseUrl}/v1/video/generations`;
+  const response = await fetch(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`WGSPAI 视频生成请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`WGSPAI 视频生成请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  }
+  const immediateResult = getVideoResultUrl(payload);
+  if (immediateResult) return immediateResult;
+  const taskId = getVideoTaskId(payload);
+  if (!taskId) {
+    throw new Error(`WGSPAI 视频响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
+  }
+
+  const taskUrl = `${submitUrl}/${encodeURIComponent(taskId)}`;
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const taskResponse = await fetch(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    try {
+      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`WGSPAI 视频查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`WGSPAI 视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const videoUrl = getVideoResultUrl(payload);
+    if (videoUrl) return videoUrl;
+    const status = getVideoTaskStatus(payload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`WGSPAI 视频生成失败: ${status}`);
+    }
+  }
+}
+
 export async function generateVideo(request: GenerateVideoRequest): Promise<string> {
   if (!isCustomModel(request.model)) {
     throw new Error('视频生成仅支持自定义平台(custom:*)模型');
   }
   const providerId = request.model.split('/')[0] ?? '';
-  const apiModel = request.model.split('/').slice(1).join('/');
+  const apiModel = normalizeMinimaxH3ModelName(request.model.split('/').slice(1).join('/'));
   const configuredBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
     ? request.extra_params.provider_base_url
     : '';
   const baseUrl = normalizeVideoProviderBaseUrl(configuredBaseUrl);
-  // WGSPAI 视频工作台用独立的 access token(优先), 其他平台用 API Key。
+  // WGSPAI 文档规定所有 API 请求都使用 Bearer API Key。保留旧视频令牌
+  // 仅作兼容备用，不能覆盖「密钥」页中当前有效的 API Key。
   const settingsState = useSettingsStore.getState();
   const customApi = settingsState.customApis.find(
     (item) => buildCustomProviderId(item.id) === providerId
   );
   const wgspaiAccessToken = customApi?.videoAccessToken?.trim() ?? '';
-  const apiKey = wgspaiAccessToken || (settingsState.apiKeys[providerId] ?? '');
+  const apiKey = (settingsState.apiKeys[providerId] ?? '').trim() || wgspaiAccessToken;
   if (!baseUrl || !apiKey || !apiModel) {
     throw new Error('请在设置中配置视频模型对应的 Base URL、API Key 和模型名称');
   }
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  if (request.extra_params?.video_transport === 'wgspai-minimax-h3') {
+    return await generateWgspaiMinimaxH3Video(request, baseUrl, apiModel, headers);
+  }
+  if (request.extra_params?.video_transport === 'wgspai-openai-video') {
+    return await generateWgspaiOpenAiVideo(request, baseUrl, apiModel, headers);
+  }
   if (request.extra_params?.video_transport === 'wgspai-studio') {
     return await generateWgspaiStudioVideo(request, baseUrl, apiKey, apiModel, headers);
   }
@@ -439,8 +677,6 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
     model: apiModel,
     prompt: request.prompt,
     duration: Math.max(1, Math.round(request.duration)),
-    seconds: String(Math.max(1, Math.round(request.duration))),
-    size: request.aspect_ratio,
     aspect_ratio: request.aspect_ratio,
     ...(videoImages?.length ? {
       images: videoImages,
@@ -453,75 +689,61 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
       }
       : {}),
   };
-  // New API uses the singular `/v1/video/generations` route. Other OpenAI-compatible
-  // relays use `/v1/videos` or the older plural generations endpoints.
-  const submitUrls = [
-    `${baseUrl}/v1/video/generations`,
-    `${baseUrl}/v1/videos`,
-    `${baseUrl}/v1/videos/generations`,
-    `${baseUrl}/v2/videos/generations`,
-  ];
+  // 自定义平台的 Base URL 统一按站点根路径保存，因此这里固定使用
+  // OpenAI 兼容视频入口。不要为同一请求探测多个端点，以免重复扣费。
+  const submitUrl = `${baseUrl}/v1/videos/generations`;
+  const response = await fetch(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
   let payload: unknown = null;
-  let submitUrl = '';
-  const attemptErrors: string[] = [];
-  for (const url of submitUrls) {
-    const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
-    const contentType = response.headers.get('content-type') ?? '';
-    const rawResponse = await response.text();
-    try {
-      payload = JSON.parse(rawResponse);
-    } catch {
-      payload = null;
-    }
-    if (!response.ok) {
-      attemptErrors.push(buildHttpErrorSummary(response.status, rawResponse, url));
-      continue;
-    }
-    if (getVideoResultUrl(payload) || getVideoTaskId(payload)) {
-      submitUrl = url;
-      break;
-    }
-    if (payload) {
-      attemptErrors.push(`平台未返回任务信息: ${describeVideoResponse(payload)} (${url})`);
-    } else {
-      attemptErrors.push(`平台返回了非 JSON 响应${contentType ? ` (${contentType})` : ''} (${url})`);
-    }
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`视频生成请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
   }
-  if (!submitUrl) {
-    // 优先展示 HTTP 状态码错误(如 401 鉴权失败 / 404 端点不存在 / 429 限流), 比非 JSON 响应更有诊断价值。
-    // 部分中转平台对不存在的路径返回 200 + HTML(SPA 页面), 会掩盖真实的鉴权/路径错误。
-    const httpError = attemptErrors.find((entry) => /^HTTP \d{3}/.test(entry));
-    throw new Error(`视频生成请求失败: ${httpError ?? attemptErrors[attemptErrors.length - 1] ?? '平台未返回有效响应'}`);
+  if (!response.ok) {
+    throw new Error(`视频生成请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
   }
   const immediateResult = getVideoResultUrl(payload);
   if (immediateResult) return immediateResult;
   const taskId = getVideoTaskId(payload);
-  if (!taskId) throw new Error('视频平台响应中未找到任务 ID 或视频地址');
-  const taskUrls = [
-    `${baseUrl}/v1/video/generations/${encodeURIComponent(taskId)}`,
-    `${baseUrl}/v1/videos/${encodeURIComponent(taskId)}`,
-    `${baseUrl}/v1/videos/generations/${encodeURIComponent(taskId)}`,
-    `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`,
-    submitUrl === `${baseUrl}/v2/videos/generations`
-      ? `${baseUrl}/v2/videos/generations/${encodeURIComponent(taskId)}`
-      : '',
-  ].filter(Boolean);
+  if (!taskId) {
+    throw new Error(`视频平台响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
+  }
+  const taskUrl = `${submitUrl}/${encodeURIComponent(taskId)}`;
   // 视频生成耗时受排队、模型和时长影响，持续轮询直到平台给出终态。
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 3000));
-    for (const url of taskUrls) {
-      const response = await fetch(url, { headers });
-      if (!response.ok) continue;
-      try { payload = await response.json(); } catch { continue; }
-      const videoUrl = getVideoResultUrl(payload);
-      if (videoUrl) return videoUrl;
-      const status = getVideoTaskStatus(payload);
-      if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
-        throw new Error(`视频生成失败: ${status}`);
-      }
-      break;
+    const taskResponse = await fetch(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    try {
+      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`视频生成查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`视频生成查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const videoUrl = getVideoResultUrl(payload);
+    if (videoUrl) return videoUrl;
+    const status = getVideoTaskStatus(payload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`视频生成失败: ${status}`);
     }
   }
+}
+
+export async function generateJimengCliVideo(
+  request: GenerateJimengCliVideoRequest
+): Promise<string> {
+  if (!isTauri()) {
+    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再生成。');
+  }
+
+  return await invoke<string>('generate_jimeng_cli_video', { request });
 }
 
 function isCustomModel(model: string): boolean {

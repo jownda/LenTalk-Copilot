@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight } from 'lucide-react';
+import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Terminal } from 'lucide-react';
 import { Trans, useTranslation } from 'react-i18next';
 import { isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
 import { fetchProviderModels, testProviderConnection, verifyProviderUrl } from '@/commands/ai';
@@ -93,6 +93,7 @@ export function SettingsDialog({
   const {
     apiKeys,
     customApis,
+    jimengCli,
     grsaiNanoBananaProModel,
     useUploadFilenameAsNodeTitle,
     storyboardGenKeepStyleConsistent,
@@ -113,6 +114,7 @@ export function SettingsDialog({
     autoCheckAppUpdateOnLaunch,
     enableUpdateDialog,
     setProviderApiKey,
+    setJimengCliExecutable,
     addCustomApi,
     updateCustomApi,
     removeCustomApi,
@@ -196,6 +198,8 @@ export function SettingsDialog({
   const [revealedApiKeys, setRevealedApiKeys] = useState<Record<string, boolean>>({});
   const [expandedProviderIds, setExpandedProviderIds] = useState<Record<string, boolean>>({});
   const [recommendedApisExpanded, setRecommendedApisExpanded] = useState(false);
+  const [showJimengCliSettings, setShowJimengCliSettings] = useState(false);
+  const [localJimengCliExecutable, setLocalJimengCliExecutable] = useState(jimengCli.executable);
   const customApiSectionRef = useRef<HTMLDivElement>(null);
   const [showAddCustomApi, setShowAddCustomApi] = useState(false);
   const [editingCustomApiId, setEditingCustomApiId] = useState<string | null>(null);
@@ -240,6 +244,16 @@ export function SettingsDialog({
       customApiSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
   }, []);
+
+  const openJimengCliSettings = useCallback(() => {
+    setLocalJimengCliExecutable(jimengCli.executable);
+    setShowJimengCliSettings(true);
+  }, [jimengCli.executable]);
+
+  const saveJimengCliSettings = useCallback(() => {
+    setJimengCliExecutable(localJimengCliExecutable);
+    setShowJimengCliSettings(false);
+  }, [localJimengCliExecutable, setJimengCliExecutable]);
 
   /** 验证链接:仅检查 Base URL 是否可达(不需要 Key) */
   const handleVerifyCustomUrl = useCallback(async () => {
@@ -939,6 +953,29 @@ export function SettingsDialog({
                     )}
                   </div>
 
+                  <div className="rounded-lg border border-border-dark bg-bg-dark/60 p-4">
+                    <button
+                      type="button"
+                      onClick={openJimengCliSettings}
+                      className="flex w-full items-start gap-3 text-left transition-colors hover:opacity-80"
+                    >
+                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-accent/10 text-accent">
+                        <Terminal className="h-4 w-4" />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-center justify-between gap-3">
+                          <span className="text-sm font-medium text-text-dark">
+                            {t('settings.jimengCliTitle')}
+                          </span>
+                          <ChevronRight className="h-4 w-4 shrink-0 text-text-muted" />
+                        </span>
+                        <span className="mt-0.5 block text-xs text-text-muted">
+                          {t('settings.jimengCliDesc')}
+                        </span>
+                      </span>
+                    </button>
+                  </div>
+
                   {/* 自定义平台(OpenAI 兼容) */}
                   <div ref={customApiSectionRef} className="rounded-lg border border-border-dark bg-bg-dark/60 p-4">
                     <div className="mb-3 flex items-center justify-between">
@@ -1274,6 +1311,60 @@ export function SettingsDialog({
                 </div>
               </>
             )}
+
+            <UiModal
+              isOpen={showJimengCliSettings}
+              title={t('settings.jimengCliTitle')}
+              onClose={() => setShowJimengCliSettings(false)}
+              widthClassName="w-[520px]"
+              footer={
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setShowJimengCliSettings(false)}
+                    className="rounded-md border border-border-dark px-3 py-1.5 text-xs text-text-muted transition-colors hover:text-text-dark"
+                  >
+                    {t('common.cancel')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveJimengCliSettings}
+                    className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/85"
+                  >
+                    {t('common.save')}
+                  </button>
+                </>
+              }
+            >
+              <div className="space-y-4">
+                <p className="text-xs leading-5 text-text-muted">{t('settings.jimengCliDialogDesc')}</p>
+
+                <label className="block text-xs font-medium text-text-dark">
+                  {t('settings.jimengCliExecutable')}
+                  <input
+                    value={localJimengCliExecutable}
+                    onChange={(event) => setLocalJimengCliExecutable(event.target.value)}
+                    placeholder="dreamina"
+                    className="mt-1.5 w-full rounded border border-border-dark bg-surface-dark px-2.5 py-2 text-xs text-text-dark placeholder:text-text-muted"
+                  />
+                  <span className="mt-1 block text-[11px] font-normal leading-4 text-text-muted">
+                    {t('settings.jimengCliExecutableDesc')}
+                  </span>
+                </label>
+
+                <div className="space-y-2 rounded-md border border-border-dark bg-surface-dark/50 p-3 text-xs text-text-muted">
+                  <p>{t('settings.jimengCliInstallStep')}</p>
+                  <code className="block overflow-x-auto rounded bg-bg-dark px-2 py-1.5 text-[11px] text-text-dark">
+                    curl -fsSL https://jimeng.jianying.com/cli | bash
+                  </code>
+                  <p>{t('settings.jimengCliLoginStep')}</p>
+                  <code className="block rounded bg-bg-dark px-2 py-1.5 text-[11px] text-text-dark">
+                    dreamina login
+                  </code>
+                  <p>{t('settings.jimengCliVideoNote')}</p>
+                </div>
+              </div>
+            </UiModal>
 
             {activeCategory === 'appearance' && (
               <>

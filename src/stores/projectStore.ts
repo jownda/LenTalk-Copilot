@@ -206,6 +206,19 @@ function mapNodeImageReferences(
         mapImageUrl(nextData.outputPreviewImageUrl as string | null | undefined) ?? null;
     }
 
+    // 视频首尾帧是独立上传的图片，也必须进入 imagePool，避免项目保存时
+    // Rust 端将它们误判为未引用文件并清理掉。
+    for (const key of [
+      'firstFrameImageUrl',
+      'firstFramePreviewImageUrl',
+      'lastFrameImageUrl',
+      'lastFramePreviewImageUrl',
+    ]) {
+      if (key in nextData) {
+        nextData[key] = mapImageUrl(nextData[key] as string | null | undefined) ?? null;
+      }
+    }
+
     if (Array.isArray(nextData.frames)) {
       nextData.frames = nextData.frames.map((frame) => {
         if (!frame || typeof frame !== 'object') {

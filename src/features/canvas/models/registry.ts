@@ -12,7 +12,7 @@ import {
   useSettingsStore,
 } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
-import { createFixedResolutionPricing } from '@/features/canvas/pricing';
+import { createFixedResolutionPricing, createPointsOnlyPricing } from '@/features/canvas/pricing';
 
 const providerModules = import.meta.glob<{ provider: ModelProviderDefinition }>(
   './providers/*.ts',
@@ -41,6 +41,20 @@ const imageModelMap = new Map<string, ImageModelDefinition>(
 );
 
 export const DEFAULT_IMAGE_MODEL_ID = 'kie/nano-banana-2';
+export const JIMENG_CLI_PROVIDER_ID = 'jimeng-cli';
+const JIMENG_CLI_PROVIDER: ModelProviderDefinition = {
+  id: JIMENG_CLI_PROVIDER_ID,
+  name: '即梦 CLI',
+  label: '即梦 CLI',
+};
+const JIMENG_CLI_VIDEO_POINTS_PER_SECOND: Record<string, number> = {
+  'seedance2.0_vip': 14,
+  'seedance2.5': 26,
+  'seedance2.0mini': 6,
+  'seedance2.0fast_vip': 6,
+  'seedance2.0fast': 2,
+  'seedance2.0': 3,
+};
 const WINDOWS_UNCONFIGURED_IMAGE_MODEL_ID = 'custom:unconfigured/configure-api';
 const WINDOWS_UNCONFIGURED_IMAGE_MODEL: ImageModelDefinition = {
   id: WINDOWS_UNCONFIGURED_IMAGE_MODEL_ID,
@@ -99,24 +113,38 @@ export function getDefaultImageModelId(): string {
 }
 
 export function listVideoModels(): VideoModelDefinition[] {
-  return useSettingsStore.getState().customApis.flatMap((api) =>
+  const customVideoModels: VideoModelDefinition[] = useSettingsStore.getState().customApis.flatMap((api) =>
     Array.from(new Set([
       ...api.videoModels,
       ...api.models.filter(isVideoGenerationModelName),
-    ])).map((model) => ({
-      id: buildCustomModelId(api.id, model),
-      mediaType: 'video',
-      displayName: `${api.name} · ${model}`,
-      providerId: buildCustomProviderId(api.id),
-      description: `${api.name} · ${model}`,
-      expectedDurationMs: 180000,
-      aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
-      defaultAspectRatio: '16:9',
-      durationOptions: Array.from({ length: 30 }, (_, index) => index + 1),
-      defaultDuration: 5,
-      pricing: resolveCustomVideoPricing(api.name, model),
-    }))
+    ])).map((model) => {
+      const isMinimaxH3 = model.trim().toLowerCase() === 'minimax-h3';
+      return {
+        id: buildCustomModelId(api.id, model),
+        mediaType: 'video' as const,
+        displayName: `${api.name} · ${model}`,
+        providerId: buildCustomProviderId(api.id),
+        description: `${api.name} · ${model}`,
+        expectedDurationMs: 180000,
+        aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
+        defaultAspectRatio: '16:9',
+        durationOptions: isMinimaxH3
+          ? Array.from({ length: 12 }, (_, index) => index + 4)
+          : Array.from({ length: 30 }, (_, index) => index + 1),
+        defaultDuration: 5,
+        ...(isMinimaxH3 ? {
+          resolutions: [
+            { value: '768P', label: '768P' },
+            { value: '2K', label: '2K' },
+          ],
+          defaultResolution: '2K',
+        } : {}),
+        pricing: resolveCustomVideoPricing(api.name, model),
+      };
+    })
   );
+
+  return [...customVideoModels, ...buildJimengCliVideoModels()];
 }
 
 export function getVideoModel(modelId: string): VideoModelDefinition | undefined {
@@ -125,6 +153,35 @@ export function getVideoModel(modelId: string): VideoModelDefinition | undefined
 
 export function getDefaultVideoModelId(): string {
   return listVideoModels()[0]?.id ?? '';
+}
+
+function buildJimengCliVideoModels(): VideoModelDefinition[] {
+  const models = [
+    { version: 'seedance2.0fast', label: 'Seedance 2.0 Fast', maxDuration: 15, resolutions: ['720p'] },
+    { version: 'seedance2.0', label: 'Seedance 2.0', maxDuration: 15, resolutions: ['720p'] },
+    { version: 'seedance2.0fast_vip', label: 'Seedance 2.0 Fast VIP', maxDuration: 15, resolutions: ['720p'] },
+    { version: 'seedance2.0_vip', label: 'Seedance 2.0 VIP', maxDuration: 15, resolutions: ['720p', '1080p', '4k'] },
+    { version: 'seedance2.0mini', label: 'Seedance 2.0 Mini', maxDuration: 15, resolutions: ['720p'] },
+    { version: 'seedance2.5', label: 'Seedance 2.5', maxDuration: 30, resolutions: ['480p', '720p', '1080p'] },
+  ] as const;
+
+  return models.map(({ version, label, maxDuration, resolutions }) => ({
+    id: `${JIMENG_CLI_PROVIDER_ID}/${version}`,
+    mediaType: 'video' as const,
+    displayName: `即梦 CLI · ${label}`,
+    providerId: JIMENG_CLI_PROVIDER_ID,
+    description: `即梦 CLI · ${label}`,
+    expectedDurationMs: 300000,
+    aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
+    defaultAspectRatio: '16:9',
+    durationOptions: Array.from({ length: maxDuration - 3 }, (_, index) => index + 4),
+    defaultDuration: 5,
+    resolutions: resolutions.map((value) => ({ value, label: value.toUpperCase() })),
+    defaultResolution: resolutions[0],
+    pricing: createPointsOnlyPricing(({ extraParams }) =>
+      (JIMENG_CLI_VIDEO_POINTS_PER_SECOND[version] ?? 0) * Math.max(1, Number(extraParams?.duration) || 5)
+    ),
+  }));
 }
 
 export function resolveImageModelResolutions(
@@ -153,6 +210,9 @@ export function resolveImageModelResolution(
 }
 
 export function getModelProvider(providerId: string): ModelProviderDefinition {
+  if (providerId === JIMENG_CLI_PROVIDER_ID) {
+    return JIMENG_CLI_PROVIDER;
+  }
   const builtin = providerMap.get(providerId);
   if (builtin) {
     return builtin;

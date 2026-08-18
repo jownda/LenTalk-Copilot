@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NodeToolbar as ReactFlowNodeToolbar } from '@xyflow/react';
-import { Copy, Crop, Download, FolderOpen, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Trash2, Unlink2 } from 'lucide-react';
+import { Copy, Crop, Download, FolderOpen, Library, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Trash2, Unlink2 } from 'lucide-react';
 import { save } from '@tauri-apps/plugin-dialog';
 import { useTranslation } from 'react-i18next';
 
@@ -19,7 +19,7 @@ import {
 import { canvasEventBus } from '@/features/canvas/application/canvasServices';
 import { getNodeToolPlugins } from '@/features/canvas/tools';
 import type { ToolIconKey } from '@/features/canvas/tools';
-import { UiChipButton, UiPanel } from '@/components/ui';
+import { UiChipButton, UiPanel, UiModal } from '@/components/ui';
 import {
   saveImageSourceToDirectory,
   saveImageSourceToPath,
@@ -29,6 +29,8 @@ import { useCanvasStore } from '@/stores/canvasStore';
 import { UI_POPOVER_TRANSITION_MS } from '@/components/ui/motion';
 import { sanitizeStoryboardText } from '@/features/canvas/application/storyboardText';
 import { buildGenerationErrorReport } from '@/features/canvas/application/generationErrorReport';
+import { importVideoUrlToAsset } from '@/features/library/importAssets';
+import { useAssetLibraryStore } from '@/features/library/assetStore';
 import {
   NODE_TOOLBAR_ALIGN,
   NODE_TOOLBAR_CLASS,
@@ -64,11 +66,17 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const ungroupNode = useCanvasStore((state) => state.ungroupNode);
   const canReupload = isUploadNode(node) && Boolean(node.data.imageUrl);
   const downloadPresetPaths = useSettingsStore((state) => state.downloadPresetPaths);
+  const libraries = useAssetLibraryStore((state) => state.libraries);
+  const categories = useAssetLibraryStore((state) => state.categories);
+  const activeLibraryId = useAssetLibraryStore((state) => state.activeLibraryId);
+  const addAssets = useAssetLibraryStore((state) => state.addAssets);
   const ignoreAtTagWhenCopyingAndGenerating = useSettingsStore(
     (state) => state.ignoreAtTagWhenCopyingAndGenerating
   );
   const [downloadMenu, setDownloadMenu] = useState<{ x: number; y: number } | null>(null);
   const [isDownloadMenuVisible, setIsDownloadMenuVisible] = useState(false);
+  const [isLibraryDialogOpen, setIsLibraryDialogOpen] = useState(false);
+  const [isSavingToLibrary, setIsSavingToLibrary] = useState(false);
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
   const downloadMenuRef = useRef<HTMLDivElement | null>(null);
@@ -81,7 +89,15 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     }
     return null;
   }, [node]);
-  const canHandleImage = Boolean(imageSource);
+  const videoSource = isGeneratedVideoNode
+    ? ((node.data as { sourcePath?: string | null }).sourcePath ?? null)
+    : null;
+  const downloadSource = imageSource || videoSource;
+  const canHandleMedia = Boolean(downloadSource);
+  const libraryCategories = useMemo(
+    () => categories.filter((category) => category.libraryId === (activeLibraryId || libraries[0]?.id)),
+    [activeLibraryId, categories, libraries]
+  );
   const generationError =
     (isExportImageNode(node) || isGeneratedVideoNode)
     && typeof (node.data as { generationError?: unknown }).generationError === 'string'
@@ -250,38 +266,60 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   }, [canCopyGenerationError, generationErrorReport]);
 
   const handleDownloadSaveAs = useCallback(async () => {
-    if (!imageSource) {
+    if (!downloadSource) {
       return;
     }
 
     try {
       const selectedPath = await save({
-        defaultPath: `node-${node.id}.png`,
+        defaultPath: `node-${node.id}.${videoSource ? 'mp4' : 'png'}`,
       });
       if (!selectedPath || Array.isArray(selectedPath)) {
         return;
       }
-      await saveImageSourceToPath(imageSource, selectedPath);
+      await saveImageSourceToPath(downloadSource, selectedPath);
       closeDownloadMenu();
     } catch (error) {
       console.error('Failed to save image with save-as', error);
     }
-  }, [closeDownloadMenu, imageSource, node.id]);
+  }, [closeDownloadMenu, downloadSource, node.id, videoSource]);
 
   const handleDownloadToPreset = useCallback(
     async (targetDir: string) => {
-      if (!imageSource) {
+      if (!downloadSource) {
         return;
       }
       try {
-        await saveImageSourceToDirectory(imageSource, targetDir, `node-${node.id}`);
+        await saveImageSourceToDirectory(downloadSource, targetDir, `node-${node.id}`);
         closeDownloadMenu();
       } catch (error) {
         console.error('Failed to save image to preset dir', error);
       }
     },
-    [closeDownloadMenu, imageSource, node.id]
+    [closeDownloadMenu, downloadSource, node.id]
   );
+
+  const handleAddVideoToLibrary = useCallback(async (categoryId: string | null) => {
+    if (!videoSource || isSavingToLibrary) {
+      return;
+    }
+    const libraryId = activeLibraryId || libraries[0]?.id;
+    if (!libraryId) {
+      return;
+    }
+    setIsSavingToLibrary(true);
+    try {
+      const asset = await importVideoUrlToAsset(videoSource, libraryId, categoryId);
+      if (asset) {
+        addAssets([asset]);
+        setIsLibraryDialogOpen(false);
+      }
+    } catch (error) {
+      console.error('Failed to add video to asset library', error);
+    } finally {
+      setIsSavingToLibrary(false);
+    }
+  }, [activeLibraryId, addAssets, isSavingToLibrary, libraries, videoSource]);
 
   return (
     <ReactFlowNodeToolbar
@@ -358,7 +396,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             {isCopyErrorSuccess ? t('nodeToolbar.copied') : t('nodeToolbar.copyErrorReport')}
           </UiChipButton>
         )}
-        {!isImageEdit && canHandleImage && (
+        {!isImageEdit && canHandleMedia && (
           <UiChipButton
             key="image-download"
             className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
@@ -377,6 +415,20 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           >
             <Download className="h-3.5 w-3.5" />
             {t('nodeToolbar.download')}
+          </UiChipButton>
+        )}
+        {!isImageEdit && isGeneratedVideoNode && videoSource && (
+          <UiChipButton
+            key="video-library"
+            className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+            disabled={isSavingToLibrary}
+            onClick={(event) => {
+              event.stopPropagation();
+              setIsLibraryDialogOpen(true);
+            }}
+          >
+            <Library className="h-3.5 w-3.5" />
+            {isSavingToLibrary ? '保存中…' : '添加到素材库'}
           </UiChipButton>
         )}
         {!isImageEdit && isGroupNode(node) && (
@@ -447,6 +499,51 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             </div>
           )}
         </div>
+      )}
+      {!isImageEdit && (
+        <UiModal
+          isOpen={isLibraryDialogOpen}
+          title="添加到素材库"
+          onClose={() => setIsLibraryDialogOpen(false)}
+          widthClassName="w-[360px]"
+        >
+          <div className="space-y-2">
+            {!activeLibraryId && libraries.length === 0 ? (
+              <p className="py-4 text-center text-xs text-text-muted/70">
+                请先在素材库面板创建一个素材库
+              </p>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  disabled={isSavingToLibrary}
+                  className="flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-left text-xs text-text-dark transition-colors hover:bg-bg-dark disabled:opacity-50"
+                  onClick={() => void handleAddVideoToLibrary(null)}
+                >
+                  <Library className="h-3.5 w-3.5 text-text-muted" />
+                  未分类
+                </button>
+                <div className="max-h-60 space-y-1 overflow-y-auto border-t border-white/10 pt-2">
+                  {libraryCategories.map((category) => (
+                    <button
+                      key={category.id}
+                      type="button"
+                      disabled={isSavingToLibrary}
+                      className="flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-left text-xs text-text-dark transition-colors hover:bg-bg-dark disabled:opacity-50"
+                      onClick={() => void handleAddVideoToLibrary(category.id)}
+                    >
+                      <Library className="h-3.5 w-3.5 text-accent" />
+                      <span className="truncate">{category.name}</span>
+                    </button>
+                  ))}
+                  {libraryCategories.length === 0 && (
+                    <p className="py-3 text-center text-xs text-text-muted/60">暂无分组, 将保存到未分类</p>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </UiModal>
       )}
     </ReactFlowNodeToolbar>
   );

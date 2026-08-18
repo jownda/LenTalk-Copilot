@@ -131,7 +131,7 @@ const videoGenNodeDefinition: CanvasNodeDefinition<VideoGenNodeData> = {
   connectivity: { sourceHandle: true, targetHandle: true, connectMenu: { fromSource: true, fromTarget: false } },
   createDefaultData: () => ({
     displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.videoGen],
-    prompt: '', model: '', duration: 5, aspectRatio: '16:9', imageMode: 'reference',
+    prompt: '', model: '', duration: 5, aspectRatio: '16:9', resolution: '720p', imageMode: 'reference',
   }),
   defaultSize: { width: 420, height: 360 },
 };

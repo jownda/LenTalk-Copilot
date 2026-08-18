@@ -45,10 +45,12 @@ export interface GenerateImagePayload {
 }
 
 export interface GenerateVideoPayload {
+  clientJobId?: string;
   prompt: string;
   model: string;
   duration: number;
   aspectRatio: string;
+  videoResolution?: string;
   imageMode?: 'reference' | 'first-last';
   referenceImages?: string[];
   referenceAudio?: string[];

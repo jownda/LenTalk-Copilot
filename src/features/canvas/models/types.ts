@@ -71,5 +71,8 @@ export interface VideoModelDefinition {
   defaultAspectRatio: string;
   durationOptions: number[];
   defaultDuration: number;
+  /** 仅在供应商公开了视频分辨率约束时显示。 */
+  resolutions?: ResolutionOption[];
+  defaultResolution?: string;
   pricing?: ModelPricingDefinition;
 }

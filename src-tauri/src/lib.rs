@@ -7,6 +7,7 @@ use std::time::Duration;
 use commands::ai as ai_commands;
 use commands::asset_library;
 use commands::image;
+use commands::jimeng_cli;
 use commands::project_state;
 use commands::system;
 use commands::update;
@@ -190,6 +191,7 @@ pub fn run() {
             ai_commands::submit_generate_image_job,
             ai_commands::get_generate_image_job,
             ai_commands::generate_image,
+            jimeng_cli::generate_jimeng_cli_video,
             ai_commands::list_models,
             project_state::list_project_summaries,
             project_state::get_project_record,

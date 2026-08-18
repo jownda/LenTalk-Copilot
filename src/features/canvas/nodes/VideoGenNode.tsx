@@ -10,8 +10,9 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { listen } from '@tauri-apps/api/event';
 import { Handle, Position, useUpdateNodeInternals } from '@xyflow/react';
-import { AudioLines, ChevronDown, Clapperboard, LoaderCircle, Plus, Sparkles } from 'lucide-react';
+import { AudioLines, ChevronDown, Clapperboard, ImagePlus, LoaderCircle, Plus, Sparkles, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { CANVAS_NODE_TYPES, EXPORT_RESULT_NODE_MIN_HEIGHT, EXPORT_RESULT_NODE_MIN_WIDTH, type VideoGenNodeData } from '@/features/canvas/domain/canvasNodes';
@@ -19,7 +20,7 @@ import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { canvasAiGateway, graphImageResolver } from '@/features/canvas/application/canvasServices';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
 import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
-import { getDefaultVideoModelId, getModelProvider, getVideoModel, listVideoModels } from '@/features/canvas/models';
+import { getDefaultVideoModelId, getModelProvider, getVideoModel, JIMENG_CLI_PROVIDER_ID, listVideoModels } from '@/features/canvas/models';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
@@ -58,6 +59,12 @@ interface ReferencePickerItem {
 }
 
 type FrameSlot = 'first' | 'last';
+
+type JimengCliStatus = {
+  status: 'queued' | 'running' | 'succeeded' | 'failed';
+  queueCount?: number | null;
+  message?: string | null;
+};
 
 const PICKER_FALLBACK_ANCHOR: PickerAnchor = { left: 8, top: 8 };
 const PICKER_Y_OFFSET_PX = 20;
@@ -300,6 +307,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const priceDisplayCurrencyMode = useSettingsStore((state) => state.priceDisplayCurrencyMode);
   const usdToCnyRate = useSettingsStore((state) => state.usdToCnyRate);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [jimengCliStatus, setJimengCliStatus] = useState<JimengCliStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showImagePicker, setShowImagePicker] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
@@ -322,10 +330,21 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const models = listVideoModels();
   const selectedModel = getVideoModel(data.model) ?? getVideoModel(getDefaultVideoModelId());
   const imageMode = data.imageMode === 'first-last' ? 'first-last' : 'reference';
+  const isJimengCli = selectedModel?.providerId === JIMENG_CLI_PROVIDER_ID;
   const [modelPickerProviderId, setModelPickerProviderId] = useState(
     selectedModel?.providerId ?? ''
   );
-  const selectedDuration = Math.max(1, Math.min(30, Math.round(Number(data.duration) || 5)));
+  const durationOptions = selectedModel?.durationOptions ?? Array.from({ length: 30 }, (_, index) => index + 1);
+  const durationMinimum = durationOptions[0] ?? 1;
+  const durationMaximum = durationOptions[durationOptions.length - 1] ?? 30;
+  const resolutionOptions = selectedModel?.resolutions ?? [];
+  const selectedVideoResolution = resolutionOptions.some((option) => option.value === data.resolution)
+    ? data.resolution!
+    : (selectedModel?.defaultResolution ?? resolutionOptions[0]?.value ?? '720p');
+  const selectedDuration = Math.max(
+    durationMinimum,
+    Math.min(durationMaximum, Math.round(Number(data.duration) || 5))
+  );
   const videoModelProviders = useMemo(
     () => Array.from(new Set(models.map((model) => model.providerId))).map(getModelProvider),
     [models]
@@ -499,6 +518,40 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [previewState]);
 
+  useEffect(() => {
+    if (!isGenerating || !isJimengCli) {
+      return;
+    }
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{
+      client_job_id?: string;
+      status?: JimengCliStatus['status'];
+      queue_count?: number | null;
+      message?: string | null;
+    }>('jimeng-cli-status', (event) => {
+      const payload = event.payload;
+      if (payload.client_job_id !== id || !payload.status) {
+        return;
+      }
+      setJimengCliStatus({
+        status: payload.status,
+        queueCount: payload.queue_count,
+        message: payload.message,
+      });
+    }).then((remove) => {
+      if (disposed) {
+        remove();
+      } else {
+        unlisten = remove;
+      }
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [id, isGenerating, isJimengCli]);
+
   // 浮层: 点击节点外部关闭
   useEffect(() => {
     const handleOutside = (event: MouseEvent) => {
@@ -644,6 +697,27 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     }
   }, [id, t, updateNodeData]);
 
+  const openFrameFilePicker = useCallback((slot: FrameSlot) => {
+    if (slot === 'first') {
+      firstFrameInputRef.current?.click();
+      return;
+    }
+    lastFrameInputRef.current?.click();
+  }, []);
+
+  const clearFrame = useCallback((slot: FrameSlot) => {
+    updateNodeData(id, slot === 'first'
+      ? {
+        firstFrameImageUrl: null,
+        firstFramePreviewImageUrl: null,
+      }
+      : {
+        lastFrameImageUrl: null,
+        lastFramePreviewImageUrl: null,
+      });
+    setError(null);
+  }, [id, updateNodeData]);
+
   const handleGenerate = useCallback(async () => {
     if (!selectedModel) {
       const message = '请先在设置中添加视频模型';
@@ -663,14 +737,14 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       return;
     }
     const apiKey = apiKeys[selectedModel.providerId] ?? '';
-    if (!apiKey) {
+    if (!isJimengCli && !apiKey) {
       const message = '请在设置中填写 API Key';
       setError(message);
       void showErrorDialog(message, t('common.error'));
       return;
     }
     const customId = selectedModel.providerId.slice('custom:'.length);
-    const baseUrl = customApis.find((api) => api.id === customId)?.baseUrl;
+    const baseUrl = isJimengCli ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
     // 立即创建下游视频节点(生成中状态), 成功后再填充视频地址, 失败时把错误写入节点。
     // 与 AI 图片节点一致: 点击生成即出现结果节点 + 连线, 报错信息显示在节点上。
     // 尺寸采用与图片结果节点相同的紧凑算法, 避免下游节点过大。
@@ -693,14 +767,19 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     updateNodeSize(outputId, compactSize.width, compactSize.height);
     addEdge(id, outputId);
     setIsGenerating(true);
+    setJimengCliStatus(isJimengCli ? { status: 'queued' } : null);
     setError(null);
     try {
-      await canvasAiGateway.setApiKey(selectedModel.providerId, apiKey);
+      if (!isJimengCli) {
+        await canvasAiGateway.setApiKey(selectedModel.providerId, apiKey);
+      }
       const videoUrl = await canvasAiGateway.generateVideo({
+        clientJobId: isJimengCli ? id : undefined,
         prompt,
         model: selectedModel.id,
         duration: selectedDuration,
         aspectRatio: data.aspectRatio,
+        videoResolution: selectedVideoResolution,
         imageMode,
         referenceImages: videoReferenceImages,
         referenceAudio: inputAudio,
@@ -725,7 +804,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     } finally {
       setIsGenerating(false);
     }
-  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, id, imageMode, inputAudio, inputText, selectedDuration, selectedModel, t, updateNodeData, updateNodeSize, videoReferenceImages]);
+  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, id, imageMode, inputAudio, inputText, selectedDuration, selectedModel, selectedVideoResolution, t, updateNodeData, updateNodeSize, videoReferenceImages]);
 
   return (
     <div
@@ -873,55 +952,127 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         <div className="grid grid-cols-2 gap-2">
           <div className="min-w-0">
             <span className="mb-1 block text-[11px] text-text-muted">{t('node.videoGen.firstFrame')}</span>
-            <button
-              type="button"
-              className="nodrag flex h-[68px] w-full items-center justify-center overflow-hidden rounded-md border border-dashed border-border-dark bg-bg-dark text-text-muted transition-colors hover:border-accent/60 hover:bg-accent/5 hover:text-text-dark"
-              onClick={(event) => {
-                event.stopPropagation();
-                firstFrameInputRef.current?.click();
-              }}
-              onMouseDown={(event) => event.stopPropagation()}
-              title={t('node.videoGen.uploadFirstFrame')}
-              aria-label={t('node.videoGen.uploadFirstFrame')}
-            >
-              {data.firstFrameImageUrl ? (
-                <CanvasNodeImage
-                  src={resolveImageDisplayUrl(data.firstFramePreviewImageUrl || data.firstFrameImageUrl)}
-                  alt={t('node.videoGen.firstFrame')}
-                  disableViewer
-                  draggable={false}
-                  className="pointer-events-none h-full w-full object-cover"
-                />
-              ) : (
-                <Plus className="h-5 w-5" aria-hidden="true" />
+            <div className="relative h-[68px]">
+              <button
+                type="button"
+                className="nodrag flex h-full w-full items-center justify-center overflow-hidden rounded-md border border-dashed border-border-dark bg-bg-dark text-text-muted transition-colors hover:border-accent/60 hover:bg-accent/5 hover:text-text-dark"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  openFrameFilePicker('first');
+                }}
+                onMouseDown={(event) => event.stopPropagation()}
+                title={data.firstFrameImageUrl
+                  ? t('node.videoGen.replaceFirstFrame')
+                  : t('node.videoGen.uploadFirstFrame')}
+                aria-label={data.firstFrameImageUrl
+                  ? t('node.videoGen.replaceFirstFrame')
+                  : t('node.videoGen.uploadFirstFrame')}
+              >
+                {data.firstFrameImageUrl ? (
+                  <CanvasNodeImage
+                    src={resolveImageDisplayUrl(data.firstFramePreviewImageUrl || data.firstFrameImageUrl)}
+                    alt={t('node.videoGen.firstFrame')}
+                    disableViewer
+                    draggable={false}
+                    className="pointer-events-none h-full w-full object-contain"
+                  />
+                ) : (
+                  <Plus className="h-5 w-5" aria-hidden="true" />
+                )}
+              </button>
+              {data.firstFrameImageUrl && (
+                <div className="absolute right-1 top-1 flex gap-1">
+                  <button
+                    type="button"
+                    className="nodrag flex h-6 w-6 items-center justify-center rounded border border-white/20 bg-black/65 text-white transition-colors hover:bg-black/85"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openFrameFilePicker('first');
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    title={t('node.videoGen.replaceFirstFrame')}
+                    aria-label={t('node.videoGen.replaceFirstFrame')}
+                  >
+                    <ImagePlus className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="nodrag flex h-6 w-6 items-center justify-center rounded border border-white/20 bg-black/65 text-white transition-colors hover:bg-red-700/85"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      clearFrame('first');
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    title={t('node.videoGen.removeFirstFrame')}
+                    aria-label={t('node.videoGen.removeFirstFrame')}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                </div>
               )}
-            </button>
+            </div>
           </div>
           <div className="min-w-0">
             <span className="mb-1 block text-[11px] text-text-muted">{t('node.videoGen.lastFrame')}</span>
-            <button
-              type="button"
-              className="nodrag flex h-[68px] w-full items-center justify-center overflow-hidden rounded-md border border-dashed border-border-dark bg-bg-dark text-text-muted transition-colors hover:border-accent/60 hover:bg-accent/5 hover:text-text-dark"
-              onClick={(event) => {
-                event.stopPropagation();
-                lastFrameInputRef.current?.click();
-              }}
-              onMouseDown={(event) => event.stopPropagation()}
-              title={t('node.videoGen.uploadLastFrame')}
-              aria-label={t('node.videoGen.uploadLastFrame')}
-            >
-              {data.lastFrameImageUrl ? (
-                <CanvasNodeImage
-                  src={resolveImageDisplayUrl(data.lastFramePreviewImageUrl || data.lastFrameImageUrl)}
-                  alt={t('node.videoGen.lastFrame')}
-                  disableViewer
-                  draggable={false}
-                  className="pointer-events-none h-full w-full object-cover"
-                />
-              ) : (
-                <Plus className="h-5 w-5" aria-hidden="true" />
+            <div className="relative h-[68px]">
+              <button
+                type="button"
+                className="nodrag flex h-full w-full items-center justify-center overflow-hidden rounded-md border border-dashed border-border-dark bg-bg-dark text-text-muted transition-colors hover:border-accent/60 hover:bg-accent/5 hover:text-text-dark"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  openFrameFilePicker('last');
+                }}
+                onMouseDown={(event) => event.stopPropagation()}
+                title={data.lastFrameImageUrl
+                  ? t('node.videoGen.replaceLastFrame')
+                  : t('node.videoGen.uploadLastFrame')}
+                aria-label={data.lastFrameImageUrl
+                  ? t('node.videoGen.replaceLastFrame')
+                  : t('node.videoGen.uploadLastFrame')}
+              >
+                {data.lastFrameImageUrl ? (
+                  <CanvasNodeImage
+                    src={resolveImageDisplayUrl(data.lastFramePreviewImageUrl || data.lastFrameImageUrl)}
+                    alt={t('node.videoGen.lastFrame')}
+                    disableViewer
+                    draggable={false}
+                    className="pointer-events-none h-full w-full object-contain"
+                  />
+                ) : (
+                  <Plus className="h-5 w-5" aria-hidden="true" />
+                )}
+              </button>
+              {data.lastFrameImageUrl && (
+                <div className="absolute right-1 top-1 flex gap-1">
+                  <button
+                    type="button"
+                    className="nodrag flex h-6 w-6 items-center justify-center rounded border border-white/20 bg-black/65 text-white transition-colors hover:bg-black/85"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openFrameFilePicker('last');
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    title={t('node.videoGen.replaceLastFrame')}
+                    aria-label={t('node.videoGen.replaceLastFrame')}
+                  >
+                    <ImagePlus className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="nodrag flex h-6 w-6 items-center justify-center rounded border border-white/20 bg-black/65 text-white transition-colors hover:bg-red-700/85"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      clearFrame('last');
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    title={t('node.videoGen.removeLastFrame')}
+                    aria-label={t('node.videoGen.removeLastFrame')}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                </div>
               )}
-            </button>
+            </div>
           </div>
           <input
             ref={firstFrameInputRef}
@@ -939,7 +1090,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           />
         </div>
       )}
-      <div className="grid grid-cols-[minmax(0,1fr)_72px_78px] gap-1.5">
+      <div className={`grid gap-1.5 ${imageMode === 'first-last'
+        ? (resolutionOptions.length > 0 ? 'grid-cols-[minmax(0,1fr)_58px_72px]' : 'grid-cols-[minmax(0,1fr)_78px]')
+        : (resolutionOptions.length > 0 ? 'grid-cols-[minmax(0,1fr)_58px_58px_72px]' : 'grid-cols-[minmax(0,1fr)_72px_78px]')}`}>
         <div className="relative min-w-0">
           <button
             type="button"
@@ -1027,12 +1180,29 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             </div>
           )}
         </div>
-        <select className="nodrag h-8 rounded border border-border-dark bg-bg-dark px-1 text-xs text-text-dark" value={data.aspectRatio} onChange={(event) => {
-          setShowModelPicker(false);
-          updateNodeData(id, { aspectRatio: event.target.value });
-        }}>
-          {(selectedModel?.aspectRatios ?? []).map((ratio) => <option key={ratio.value} value={ratio.value}>{ratio.label}</option>)}
-        </select>
+        {imageMode !== 'first-last' && (
+          <select className="nodrag h-8 rounded border border-border-dark bg-bg-dark px-1 text-xs text-text-dark" value={data.aspectRatio} onChange={(event) => {
+            setShowModelPicker(false);
+            updateNodeData(id, { aspectRatio: event.target.value });
+          }}>
+            {(selectedModel?.aspectRatios ?? []).map((ratio) => <option key={ratio.value} value={ratio.value}>{ratio.label}</option>)}
+          </select>
+        )}
+        {resolutionOptions.length > 0 && (
+          <select
+            className="nodrag h-8 rounded border border-border-dark bg-bg-dark px-1 text-xs text-text-dark"
+            value={selectedVideoResolution}
+            onChange={(event) => {
+              setShowModelPicker(false);
+              updateNodeData(id, { resolution: event.target.value });
+            }}
+            aria-label="视频分辨率"
+          >
+            {resolutionOptions.map((resolution) => (
+              <option key={resolution.value} value={resolution.value}>{resolution.label}</option>
+            ))}
+          </select>
+        )}
         <div className="relative">
           <button
             type="button"
@@ -1057,14 +1227,14 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
               onWheelCapture={(event) => event.stopPropagation()}
             >
               <div className="mb-2 flex items-center justify-between text-[11px] text-text-muted">
-                <span>1秒</span>
+                <span>{durationMinimum}秒</span>
                 <span className="font-medium text-text-dark">{selectedDuration} 秒</span>
-                <span>30秒</span>
+                <span>{durationMaximum}秒</span>
               </div>
               <input
                 type="range"
-                min="1"
-                max="30"
+                min={durationMinimum}
+                max={durationMaximum}
                 step="1"
                 value={selectedDuration}
                 onChange={(event) => updateNodeData(id, { duration: Number(event.target.value) })}
@@ -1075,6 +1245,18 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           )}
         </div>
       </div>
+      {isJimengCli && isGenerating && jimengCliStatus && (
+        <div className="text-[11px] text-text-muted">
+          {jimengCliStatus.status === 'queued'
+            ? `排队中${typeof jimengCliStatus.queueCount === 'number' ? ` · 当前排队 ${jimengCliStatus.queueCount}` : ''}`
+            : jimengCliStatus.status === 'running'
+              ? '已进入生成阶段，无法取消'
+              : '即梦 CLI 处理中'}
+          {jimengCliStatus.status === 'queued' && (
+            <span className="ml-1 text-text-muted/70">（CLI 未提供远端取消功能）</span>
+          )}
+        </div>
+      )}
       {error && <span className="line-clamp-2 text-[11px] text-red-400">{error}</span>}
       <button type="button" disabled={isGenerating || !selectedModel || (!promptDraft.trim() && inputText.length === 0)} onClick={() => void handleGenerate()} className="nodrag mt-auto flex h-8 items-center justify-center gap-1.5 rounded-md bg-accent text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-45">
         {isGenerating ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
