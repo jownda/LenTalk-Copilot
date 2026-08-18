@@ -187,9 +187,11 @@ fn source_path(source: &str) -> PathBuf {
     let trimmed = source.trim();
     if let Some(path) = trimmed.strip_prefix("file://") {
         let decoded = urlencoding::decode(path).unwrap_or_else(|_| path.into());
+        let decoded_str: &str = decoded.as_ref();
+        // Windows 下 file:// 路径形如 /C:/xxx, 去掉前导斜杠
         #[cfg(target_os = "windows")]
-        let decoded = decoded.strip_prefix('/').unwrap_or(&decoded);
-        return PathBuf::from(decoded.as_ref());
+        let decoded_str = decoded_str.strip_prefix('/').unwrap_or(decoded_str);
+        return PathBuf::from(decoded_str);
     }
     PathBuf::from(trimmed)
 }
