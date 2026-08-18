@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Handle, Position } from '@xyflow/react';
-import { AlertTriangle, AudioLines, Camera, LoaderCircle, Music2, Upload, Video, X } from 'lucide-react';
+import { AlertTriangle, AudioLines, Camera, LoaderCircle, Music2, Play, Upload, Video, X } from 'lucide-react';
 
 import { CANVAS_NODE_TYPES, type AudioNodeData } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
@@ -162,6 +162,35 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   }, [id, updateNodeData]);
 
   /** 视频截图: 当前帧绘制到 canvas → 生成图片节点到下游(右侧)并连线 */
+  /** 视频加载后自动截首帧作为缩略图(存 previewImageUrl), 生成过则跳过。 */
+  const handleAutoCaptureThumbnail = useCallback(async () => {
+    const videoEl = videoRef.current;
+    if (!videoEl || data.previewImageUrl) {
+      return;
+    }
+    try {
+      await waitForDecodedVideoFrame(videoEl);
+      if (!videoEl.videoWidth || !videoEl.videoHeight) {
+        return;
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = videoEl.videoWidth;
+      canvas.height = videoEl.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        return;
+      }
+      ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL('image/png');
+      const prepared = await prepareNodeImage(dataUrl);
+      updateNodeData(id, {
+        previewImageUrl: prepared.previewImageUrl ?? prepared.imageUrl ?? dataUrl,
+      });
+    } catch {
+      // 首帧截图失败时保持 video 播放器显示
+    }
+  }, [data.previewImageUrl, id, updateNodeData]);
+
   const handleCaptureFrame = useCallback(async () => {
     const videoEl = videoRef.current;
     if (!videoEl) {
@@ -247,34 +276,66 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       {mediaSrc ? (
         isVideo ? (
           <>
-            {/* 视频画面顶到上部, 铺满可用空间 */}
-            <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border border-[rgba(255,255,255,0.1)] bg-black/45">
+            {/* 视频画面顶到上部, 铺满可用空间; 有缩略图时显示静态缩略图 */}
+            <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border border-[rgba(255,255,255,0.1)] bg-black/45">
               <video
                 ref={videoRef}
-                controls
+                controls={!data.previewImageUrl}
                 crossOrigin={/^https?:\/\//i.test(mediaSrc) ? 'anonymous' : undefined}
                 src={mediaSrc}
                 preload="metadata"
-                className="nodrag h-full w-full object-contain"
+                className={`nodrag h-full w-full object-contain ${data.previewImageUrl ? 'hidden' : ''}`}
+                onLoadedData={() => void handleAutoCaptureThumbnail()}
                 onDoubleClick={(event) => {
                   event.stopPropagation();
                   setIsVideoViewerOpen(true);
                 }}
               />
+              {data.previewImageUrl && (
+                <>
+                  <img
+                    src={data.previewImageUrl}
+                    alt=""
+                    className="nodrag h-full w-full cursor-pointer object-contain"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setIsVideoViewerOpen(true);
+                    }}
+                    onDoubleClick={(event) => {
+                      event.stopPropagation();
+                      setIsVideoViewerOpen(true);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="absolute left-1/2 top-1/2 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-white/25 bg-black/55 text-white transition-colors hover:bg-black/70"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setIsVideoViewerOpen(true);
+                    }}
+                    title="播放视频"
+                    aria-label="播放视频"
+                  >
+                    <Play className="ml-0.5 h-5 w-5" />
+                  </button>
+                </>
+              )}
             </div>
-            {/* 底部操作行 */}
-            <div className="mt-1.5 flex shrink-0 items-center gap-2">
-              <button
-                type="button"
-                disabled={isCapturing}
-                onClick={() => void handleCaptureFrame()}
-                className="flex h-7 items-center gap-1.5 rounded-md border border-border-dark bg-bg-dark px-2.5 text-xs text-text-dark transition-colors hover:border-accent/60 hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <Camera className="h-3.5 w-3.5" />
-                {isCapturing ? '截图…' : '截图'}
-              </button>
-              {captureError && <span className="text-[11px] text-red-400">{captureError}</span>}
-            </div>
+            {/* 底部操作行(仅无缩略图时提供手动截图) */}
+            {!data.previewImageUrl && (
+              <div className="mt-1.5 flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  disabled={isCapturing}
+                  onClick={() => void handleCaptureFrame()}
+                  className="flex h-7 items-center gap-1.5 rounded-md border border-border-dark bg-bg-dark px-2.5 text-xs text-text-dark transition-colors hover:border-accent/60 hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Camera className="h-3.5 w-3.5" />
+                  {isCapturing ? '截图…' : '截图'}
+                </button>
+                {captureError && <span className="text-[11px] text-red-400">{captureError}</span>}
+              </div>
+            )}
           </>
         ) : (
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2.5 rounded-lg border border-[rgba(255,255,255,0.1)] bg-bg-dark/45 p-2">
