@@ -1,14 +1,15 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { isTauri } from '@tauri-apps/api/core';
 import { Handle, Position } from '@xyflow/react';
-import { AlertTriangle, AudioLines, Camera, LoaderCircle, Music2, Play, Upload, Video, X } from 'lucide-react';
+import { AlertTriangle, AudioLines, Camera, LoaderCircle, Music2, Upload, Video, X } from 'lucide-react';
 
 import { CANVAS_NODE_TYPES, type AudioNodeData } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { prepareNodeImage, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
-import { persistLibraryAssetBinary } from '@/commands/assetLibrary';
+import { extractVideoThumbnail, persistLibraryAssetBinary } from '@/commands/assetLibrary';
 import { useCanvasStore } from '@/stores/canvasStore';
 
 type AudioNodeProps = {
@@ -191,6 +192,22 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     }
   }, [data.previewImageUrl, id, updateNodeData]);
 
+  // 本地桌面视频优先使用系统抽帧，避免 WKWebView 对视频 canvas 截图的限制。
+  useEffect(() => {
+    if (!isVideo || !isTauri() || data.previewImageUrl || !data.sourcePath) {
+      return;
+    }
+    let disposed = false;
+    void extractVideoThumbnail(data.sourcePath).then((thumbnail) => {
+      if (!disposed && thumbnail) {
+        updateNodeData(id, { previewImageUrl: thumbnail });
+      }
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [data.previewImageUrl, data.sourcePath, id, isVideo, updateNodeData]);
+
   const handleCaptureFrame = useCallback(async () => {
     const videoEl = videoRef.current;
     if (!videoEl) {
@@ -276,54 +293,24 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       {mediaSrc ? (
         isVideo ? (
           <>
-            {/* 视频画面顶到上部, 铺满可用空间; 有缩略图时显示静态缩略图 */}
+            {/* 视频画面顶到上部, 铺满可用空间; 缩略图作为 poster, 单击使用节点内播放器 */}
             <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border border-[rgba(255,255,255,0.1)] bg-black/45">
               <video
                 ref={videoRef}
-                controls={!data.previewImageUrl}
-                crossOrigin={/^https?:\/\//i.test(mediaSrc) ? 'anonymous' : undefined}
+                controls
                 src={mediaSrc}
                 preload="metadata"
-                className={`nodrag h-full w-full object-contain ${data.previewImageUrl ? 'hidden' : ''}`}
+                poster={data.previewImageUrl ? resolveImageDisplayUrl(data.previewImageUrl) : undefined}
+                className="nodrag h-full w-full object-contain"
                 onLoadedData={() => void handleAutoCaptureThumbnail()}
                 onDoubleClick={(event) => {
                   event.stopPropagation();
                   setIsVideoViewerOpen(true);
                 }}
               />
-              {data.previewImageUrl && (
-                <>
-                  <img
-                    src={data.previewImageUrl}
-                    alt=""
-                    className="nodrag h-full w-full cursor-pointer object-contain"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      setIsVideoViewerOpen(true);
-                    }}
-                    onDoubleClick={(event) => {
-                      event.stopPropagation();
-                      setIsVideoViewerOpen(true);
-                    }}
-                  />
-                  <button
-                    type="button"
-                    className="absolute left-1/2 top-1/2 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-white/25 bg-black/55 text-white transition-colors hover:bg-black/70"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      setIsVideoViewerOpen(true);
-                    }}
-                    title="播放视频"
-                    aria-label="播放视频"
-                  >
-                    <Play className="ml-0.5 h-5 w-5" />
-                  </button>
-                </>
-              )}
             </div>
-            {/* 底部操作行(仅无缩略图时提供手动截图) */}
-            {!data.previewImageUrl && (
-              <div className="mt-1.5 flex shrink-0 items-center gap-2">
+            {/* 底部操作行 */}
+            <div className="mt-1.5 flex shrink-0 items-center gap-2">
                 <button
                   type="button"
                   disabled={isCapturing}
@@ -334,8 +321,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                   {isCapturing ? '截图…' : '截图'}
                 </button>
                 {captureError && <span className="text-[11px] text-red-400">{captureError}</span>}
-              </div>
-            )}
+            </div>
           </>
         ) : (
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2.5 rounded-lg border border-[rgba(255,255,255,0.1)] bg-bg-dark/45 p-2">
