@@ -75,4 +75,8 @@ export interface VideoModelDefinition {
   resolutions?: ResolutionOption[];
   defaultResolution?: string;
   pricing?: ModelPricingDefinition;
+  profileId?: string;
+  profileStatus?: 'verified' | 'pending-adaptation';
+  profileLabel?: string;
+  profileUnavailableReason?: string;
 }

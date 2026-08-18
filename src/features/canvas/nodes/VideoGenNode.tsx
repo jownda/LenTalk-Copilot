@@ -20,7 +20,7 @@ import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { canvasAiGateway, graphImageResolver } from '@/features/canvas/application/canvasServices';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
 import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
-import { getDefaultVideoModelId, getModelProvider, getVideoModel, JIMENG_CLI_PROVIDER_ID, listVideoModels } from '@/features/canvas/models';
+import { getDefaultVideoModelId, getModelProvider, getVideoModel, JIMENG_CLI_PROVIDER_ID, listVideoModels, resolveVideoModelProfile } from '@/features/canvas/models';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
@@ -331,6 +331,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const selectedModel = getVideoModel(data.model) ?? getVideoModel(getDefaultVideoModelId());
   const imageMode = data.imageMode === 'first-last' ? 'first-last' : 'reference';
   const isJimengCli = selectedModel?.providerId === JIMENG_CLI_PROVIDER_ID;
+  const selectedProfile = selectedModel ? resolveVideoModelProfile(selectedModel.id) : null;
   const [modelPickerProviderId, setModelPickerProviderId] = useState(
     selectedModel?.providerId ?? ''
   );
@@ -725,6 +726,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       void showErrorDialog(message, t('common.error'));
       return;
     }
+    if (selectedProfile?.status === 'pending-adaptation') {
+      const message = selectedProfile.unavailableReason ?? '该视频模型尚未完成独立适配';
+      setError(message);
+      void showErrorDialog(message, t('common.error'));
+      return;
+    }
     const prompt = [
       promptDraftRef.current.replace(/@(?=(?:图|音频)\d+)/g, '').trim(),
       ...inputText,
@@ -804,7 +811,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     } finally {
       setIsGenerating(false);
     }
-  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, id, imageMode, inputAudio, inputText, selectedDuration, selectedModel, selectedVideoResolution, t, updateNodeData, updateNodeSize, videoReferenceImages]);
+  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, id, imageMode, inputAudio, inputText, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, t, updateNodeData, updateNodeSize, videoReferenceImages]);
 
   return (
     <div
@@ -1256,6 +1263,11 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             <span className="ml-1 text-text-muted/70">（CLI 未提供远端取消功能）</span>
           )}
         </div>
+      )}
+      {selectedProfile && !isJimengCli && (
+        <span className={`text-[11px] ${selectedProfile.status === 'verified' ? 'text-text-muted' : 'text-amber-400'}`}>
+          {selectedProfile.protocolLabel}
+        </span>
       )}
       {error && <span className="line-clamp-2 text-[11px] text-red-400">{error}</span>}
       <button type="button" disabled={isGenerating || !selectedModel || (!promptDraft.trim() && inputText.length === 0)} onClick={() => void handleGenerate()} className="nodrag mt-auto flex h-8 items-center justify-center gap-1.5 rounded-md bg-accent text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-45">

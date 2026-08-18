@@ -12,7 +12,8 @@ import {
   imageUrlToDataUrl,
 } from '@/features/canvas/application/imageData';
 import { useSettingsStore } from '@/stores/settingsStore';
-import { JIMENG_CLI_PROVIDER_ID } from '@/features/canvas/models';
+import { JIMENG_CLI_PROVIDER_ID, resolveVideoModelProfile } from '@/features/canvas/models';
+import { toVideoGenerationRequest } from '@/features/canvas/application/videoGeneration';
 
 import type { AiGateway, GenerateImagePayload, GenerateVideoPayload } from '../application/ports';
 
@@ -162,7 +163,10 @@ async function uploadWgspaiVideoReferenceImage(
   formData.append('model', model);
   formData.append('model_name', model);
 
-  const uploadUrl = `${baseUrl}/v1/files?model=${encodeURIComponent(model)}`;
+  // WGSPAI 的不同文件上传通道对模型字段的读取位置不一致：有的读 multipart
+  // `model`，有的只读 query 的 `model_name`。两种命名同时传递，不改变视频链路。
+  const encodedModel = encodeURIComponent(model);
+  const uploadUrl = `${baseUrl}/v1/files?model=${encodedModel}&model_name=${encodedModel}`;
   const response = await fetch(uploadUrl, {
     method: 'POST',
     headers: { Authorization: `Bearer ${apiKey}` },
@@ -293,23 +297,34 @@ export const tauriAiGateway: AiGateway = {
     }
 
     const injected = injectCustomApiRequestMode(payload as unknown as GenerateImagePayload);
+    const profile = resolveVideoModelProfile(payload.model);
+    if (profile.status === 'pending-adaptation') {
+      throw new Error(profile.unavailableReason ?? '该视频模型尚未完成独立适配');
+    }
+    const unifiedRequest = toVideoGenerationRequest(payload);
+    const imageResources = payload.imageMode === 'first-last'
+      ? [unifiedRequest.firstFrame, unifiedRequest.lastFrame].filter(
+        (resource): resource is NonNullable<typeof resource> => Boolean(resource)
+      )
+      : unifiedRequest.referenceImages;
     // 视频参考图:WGSPAI 上传本地资源获取可下载 URL，其它平台保留 Data URL。
     const referenceImages = await normalizeVideoReferenceImages(
-      payload.referenceImages,
+      imageResources.map((resource) => resource.source),
       injected.extraParams,
-      payload.model
+      unifiedRequest.modelId
     );
     // 音频直传: 直接把上游音频 URL 数组透传给后端(不做 /v1/files 上传),
     // 由后端按 audio_url / audio_urls 字段提交给平台。
-    const referenceAudio = payload.referenceAudio
-      ?.map((audioUrl) => audioUrl.trim())
+    const referenceAudio = unifiedRequest.referenceAudio
+      .map((resource) => resource.source)
+      .map((audioUrl) => audioUrl.trim())
       .filter(Boolean);
     return await generateVideo({
-      prompt: payload.prompt,
-      model: payload.model,
-      duration: payload.duration,
-      aspect_ratio: payload.aspectRatio,
-      video_resolution: payload.videoResolution,
+      prompt: unifiedRequest.prompt,
+      model: unifiedRequest.modelId,
+      duration: unifiedRequest.duration,
+      aspect_ratio: unifiedRequest.aspectRatio,
+      video_resolution: unifiedRequest.videoResolution,
       image_mode: payload.imageMode,
       reference_images: referenceImages,
       reference_audio: referenceAudio,

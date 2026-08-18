@@ -56,6 +56,30 @@ export interface GenerateVideoPayload {
   referenceAudio?: string[];
 }
 
+export type VideoReferenceSourceKind = 'public-url' | 'data-url' | 'local-file' | 'platform-file';
+
+export interface VideoReferenceResource {
+  source: string;
+  sourceKind: VideoReferenceSourceKind;
+}
+
+/**
+ * 视频节点提交给适配层的统一任务。供应商专用字段只能由模型 profile 生成，
+ * 节点层不再决定 endpoint、images、size 或首尾帧字段名。
+ */
+export interface VideoGenerationRequest {
+  clientJobId?: string;
+  modelId: string;
+  prompt: string;
+  duration: number;
+  aspectRatio: string;
+  videoResolution?: string;
+  referenceImages: VideoReferenceResource[];
+  referenceAudio: VideoReferenceResource[];
+  firstFrame?: VideoReferenceResource;
+  lastFrame?: VideoReferenceResource;
+}
+
 export interface AiGateway {
   setApiKey: (provider: string, apiKey: string) => Promise<void>;
   generateImage: (payload: GenerateImagePayload) => Promise<string>;

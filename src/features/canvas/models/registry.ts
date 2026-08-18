@@ -13,6 +13,7 @@ import {
 } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
 import { createFixedResolutionPricing, createPointsOnlyPricing } from '@/features/canvas/pricing';
+import { resolveVideoModelProfile } from './videoProfiles';
 
 const providerModules = import.meta.glob<{ provider: ModelProviderDefinition }>(
   './providers/*.ts',
@@ -119,6 +120,7 @@ export function listVideoModels(): VideoModelDefinition[] {
       ...api.models.filter(isVideoGenerationModelName),
     ])).map((model) => {
       const isMinimaxH3 = model.trim().toLowerCase() === 'minimax-h3';
+      const profile = resolveVideoModelProfile(model);
       return {
         id: buildCustomModelId(api.id, model),
         mediaType: 'video' as const,
@@ -140,6 +142,10 @@ export function listVideoModels(): VideoModelDefinition[] {
           defaultResolution: '2K',
         } : {}),
         pricing: resolveCustomVideoPricing(api.name, model),
+        profileId: profile.id,
+        profileStatus: profile.status,
+        profileLabel: profile.protocolLabel,
+        profileUnavailableReason: profile.unavailableReason,
       };
     })
   );

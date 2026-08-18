@@ -110,4 +110,18 @@ export const recommendedApis: RecommendedApi[] = [
     advantages: ['图像 / 视频 / LLM 全覆盖', 'Seedance 视频模型', 'OpenAPI 工作流'],
     models: ['nano-banana'],
   },
+  {
+    id: 'modelscope',
+    name: 'ModelScope',
+    baseUrl: 'https://api-inference.modelscope.cn/v1',
+    registerUrl: 'https://www.modelscope.cn/my/access/token',
+    summary: 'ModelScope 提供免费额度和模型广场接入，适合基础图像与 LLM 测试',
+    advantages: ['免费额度可用', '需要绑定阿里云账号', '适合基础图像与 LLM 测试'],
+    models: [
+      'Tongyi-MAI/Z-Image-Turbo',
+      'Qwen/Qwen-Image-2512',
+      'Qwen/Qwen-Image-Edit-2511',
+      'black-forest-labs/FLUX.2-klein-9B',
+    ],
+  },
 ];
