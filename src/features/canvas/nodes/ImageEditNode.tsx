@@ -623,7 +623,15 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     const generationDurationMs = selectedModel.expectedDurationMs ?? 60000;
     const generationStartedAt = Date.now();
     const resultNodeTitle = buildAiResultNodeTitle(prompt, t('node.imageEdit.resultTitle'));
-    const runtimeDiagnostics = await getRuntimeDiagnostics();
+    // 诊断信息只用于错误报告，不能阻塞首次生成。Windows 首次调用会触发
+    // Tauri 版本/系统信息初始化，改为与生成请求并行采集。
+    const runtimeDiagnosticsPromise = Promise.resolve().then(() => getRuntimeDiagnostics()).catch(() => ({
+      appVersion: 'unknown',
+      osName: 'Unknown',
+      osVersion: 'unknown',
+      osBuild: 'unknown',
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent || '' : '',
+    }));
     setError(null);
 
     const newNodePosition = findNodePosition(
@@ -675,6 +683,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         referenceImages: incomingImages,
         extraParams: effectiveExtraParams,
       });
+      const runtimeDiagnostics = await runtimeDiagnosticsPromise;
       const generationDebugContext: GenerationDebugContext = {
         sourceType: 'imageEdit',
         providerId: selectedModel.providerId,
@@ -701,6 +710,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
       });
     } catch (generationError) {
       const resolvedError = resolveErrorContent(generationError, t('ai.error'));
+      const runtimeDiagnostics = await runtimeDiagnosticsPromise;
       const generationDebugContext: GenerationDebugContext = {
         sourceType: 'imageEdit',
         providerId: selectedModel.providerId,

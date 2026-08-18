@@ -236,16 +236,25 @@ pub fn extract_video_thumbnail(
         return Ok(Some(output.to_string_lossy().to_string()));
     }
 
-    let status = std::process::Command::new("qlmanage")
-        .args(["-t", "-s", "480", "-o"])
-        .arg(parent)
-        .arg(&video_path)
-        .status()
-        .map_err(|error| format!("Failed to run qlmanage: {error}"))?;
+    // qlmanage 是 macOS 专用 QuickLook 抽帧工具; 其他平台返回 None 由前端回退 canvas 截图。
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("qlmanage")
+            .args(["-t", "-s", "480", "-o"])
+            .arg(parent)
+            .arg(&video_path)
+            .status()
+            .map_err(|error| format!("Failed to run qlmanage: {error}"))?;
 
-    if status.success() && output.exists() {
-        Ok(Some(output.to_string_lossy().to_string()))
-    } else {
+        if status.success() && output.exists() {
+            return Ok(Some(output.to_string_lossy().to_string()));
+        }
+        Ok(None)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&parent, &output);
         Ok(None)
     }
 }

@@ -1076,7 +1076,14 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
 
     const generationDurationMs = selectedModel.expectedDurationMs ?? 60000;
     const generationStartedAt = Date.now();
-    const runtimeDiagnostics = await getRuntimeDiagnostics();
+    // 诊断信息仅用于错误报告，后台采集，避免 Windows 首次生成被系统信息初始化阻塞。
+    const runtimeDiagnosticsPromise = Promise.resolve().then(() => getRuntimeDiagnostics()).catch(() => ({
+      appVersion: 'unknown',
+      osName: 'Unknown',
+      osVersion: 'unknown',
+      osBuild: 'unknown',
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent || '' : '',
+    }));
 
     // Create new image node with generating state immediately
     // Use auto-positioning to avoid collisions with existing nodes
@@ -1136,6 +1143,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
         referenceImages: allReferenceImages,
         extraParams: effectiveExtraParams,
       });
+      const runtimeDiagnostics = await runtimeDiagnosticsPromise;
       const generationDebugContext: GenerationDebugContext = {
         sourceType: 'storyboardGen',
         providerId: selectedModel.providerId,
@@ -1166,6 +1174,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
       });
     } catch (generationError) {
       const resolvedError = resolveErrorContent(generationError, '生成失败');
+      const runtimeDiagnostics = await runtimeDiagnosticsPromise;
       const generationDebugContext: GenerationDebugContext = {
         sourceType: 'storyboardGen',
         providerId: selectedModel.providerId,
