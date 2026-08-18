@@ -42,8 +42,6 @@ export interface CustomApiProvider {
   protocol: 'images' | 'responses';
   /** Images 协议的参考图字段: 大多数中转平台用 image, 原生 GPT Image 用 input_image。 */
   referenceImageField: 'image' | 'input_image';
-  /** WGSPAI 视频工作台 access token(与 API Key 分开, 视频工作台用它认证) */
-  videoAccessToken?: string;
 }
 
 export type CustomApiRequestMode = CustomApiProvider['requestMode'];
@@ -238,7 +236,6 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         name: String(item.name ?? '').trim(),
         baseUrl: String(item.baseUrl ?? '').trim().replace(/\/+$/, ''),
         apiKey: normalizeApiKey(String(item.apiKey ?? '')),
-        videoAccessToken: normalizeApiKey(String(item.videoAccessToken ?? '')),
         models,
         videoModels,
         createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),

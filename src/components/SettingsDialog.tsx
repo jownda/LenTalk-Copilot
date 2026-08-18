@@ -207,7 +207,6 @@ export function SettingsDialog({
     name: '',
     baseUrl: '',
     apiKey: '',
-    videoAccessToken: '',
     modelsText: '',
     videoModelsText: '',
     requestMode: 'async' as 'sync' | 'async',
@@ -230,7 +229,6 @@ export function SettingsDialog({
       name: api.name,
       baseUrl: api.baseUrl,
       apiKey: '',
-      videoAccessToken: '',
       modelsText: api.models.join('\n'),
       videoModelsText: (api.videoModels ?? []).join('\n'),
       requestMode: 'async',
@@ -422,7 +420,6 @@ export function SettingsDialog({
       name: api.name,
       baseUrl: api.baseUrl,
       apiKey: api.apiKey,
-      videoAccessToken: api.videoAccessToken ?? '',
       modelsText: api.models.join('\n'),
       videoModelsText: api.videoModels.join('\n'),
       requestMode: api.requestMode,
@@ -439,7 +436,6 @@ export function SettingsDialog({
       name: '',
       baseUrl: '',
       apiKey: '',
-      videoAccessToken: '',
       modelsText: '',
       videoModelsText: '',
       requestMode: 'async',
@@ -471,7 +467,6 @@ export function SettingsDialog({
         name,
         baseUrl,
         apiKey: customApiDraft.apiKey.trim(),
-        videoAccessToken: customApiDraft.videoAccessToken.trim(),
         models: imageModels,
         videoModels,
         requestMode: customApiDraft.requestMode,
@@ -483,7 +478,6 @@ export function SettingsDialog({
         name,
         baseUrl,
         apiKey: customApiDraft.apiKey.trim(),
-        videoAccessToken: customApiDraft.videoAccessToken.trim(),
         models: imageModels,
         videoModels,
         requestMode: customApiDraft.requestMode,
@@ -1054,26 +1048,6 @@ export function SettingsDialog({
                               setCustomApiDraft({ ...customApiDraft, apiKey: event.target.value })
                             }
                             placeholder={t('settings.customApiKeyPlaceholder')}
-                            className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
-                          />
-                        </label>
-                        <label className="block">
-                          <span className="mb-1 block text-[11px] text-text-muted">
-                            {t('settings.customApiVideoAccessToken', '视频工作台 Access Token')}
-                          </span>
-                          <input
-                            type="password"
-                            value={customApiDraft.videoAccessToken}
-                            onChange={(event) =>
-                              setCustomApiDraft({
-                                ...customApiDraft,
-                                videoAccessToken: event.target.value,
-                              })
-                            }
-                            placeholder={t(
-                              'settings.customApiVideoAccessTokenPlaceholder',
-                              'WGSPAI 视频工作台专用, 与 API Key 不同'
-                            )}
                             className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
                           />
                         </label>

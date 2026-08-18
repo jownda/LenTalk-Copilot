@@ -1,5 +1,5 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import { buildCustomProviderId, CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from '@/stores/settingsStore';
+import { CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
 
 export interface GenerateRequest {
@@ -649,14 +649,8 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
     ? request.extra_params.provider_base_url
     : '';
   const baseUrl = normalizeVideoProviderBaseUrl(configuredBaseUrl);
-  // WGSPAI 文档规定所有 API 请求都使用 Bearer API Key。保留旧视频令牌
-  // 仅作兼容备用，不能覆盖「密钥」页中当前有效的 API Key。
-  const settingsState = useSettingsStore.getState();
-  const customApi = settingsState.customApis.find(
-    (item) => buildCustomProviderId(item.id) === providerId
-  );
-  const wgspaiAccessToken = customApi?.videoAccessToken?.trim() ?? '';
-  const apiKey = (settingsState.apiKeys[providerId] ?? '').trim() || wgspaiAccessToken;
+  // WGSPAI 文档规定所有 API 请求都使用 Bearer API Key。
+  const apiKey = (useSettingsStore.getState().apiKeys[providerId] ?? '').trim();
   if (!baseUrl || !apiKey || !apiModel) {
     throw new Error('请在设置中配置视频模型对应的 Base URL、API Key 和模型名称');
   }
