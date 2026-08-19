@@ -87,7 +87,12 @@ export const recommendedApis: RecommendedApi[] = [
     baseUrl: 'https://www.fhl.mom',
     registerUrl: 'https://www.fhl.mom/register?aff=86L574B4T2N9',
     summary: '稳定便宜接入 codex / Claude / GPT Image 2 出图',
-    advantages: ['OpenAI Images 生图直连', '预填 gpt-image-2 全系', '价格实惠'],
+    advantages: [
+      'OpenAI Images 生图直连',
+      '预填 gpt-image-2 全系',
+      '1K/2K ¥0.04/张',
+      '4K ¥0.06/张',
+    ],
     models: ['gpt-image-2', 'gpt-image-2-2k', 'gpt-image-2-4k', 'nano-banana'],
   },
   {
