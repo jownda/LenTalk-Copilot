@@ -3,11 +3,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
 
 use base64::Engine;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
+
+// The Dreamina CLI refreshes and persists the OAuth record during normal
+// commands. Running two CLI processes at once can make its keyring backend
+// return "store unavailable" (especially on Windows Credential Manager).
+static JIMENG_CLI_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 pub struct GenerateJimengCliVideoRequest {
@@ -340,7 +346,10 @@ fn emit_task_status(
 }
 
 fn queue_count(executable: &str) -> Option<usize> {
-    let output = Command::new(executable)
+    let lock = JIMENG_CLI_PROCESS_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().ok()?;
+    let resolved = resolve_executable(executable).ok()?;
+    let output = build_cli_command(&resolved)
         .args(["list_task", "--limit=100"])
         .output()
         .ok()?;
@@ -396,22 +405,144 @@ fn append_generation_args(
 }
 
 fn run_cli(executable: &str, arguments: &[String]) -> Result<String, String> {
-    let output = Command::new(executable)
+    let lock = JIMENG_CLI_PROCESS_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "即梦 CLI 调用锁异常，请重启应用后重试".to_string())?;
+    let resolved = resolve_executable(executable)?;
+    let output = build_cli_command(&resolved)
         .args(arguments)
         .output()
         .map_err(|error| {
             format!(
-                "无法启动即梦 CLI（{executable}）: {error}。请确认已安装 CLI，并在设置中填写正确命令或完整路径"
+                "无法启动即梦 CLI（{resolved}）: {error}。请确认已安装 CLI，并在设置中填写正确命令或完整路径"
             )
         })?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}\n{stderr}");
+    drop(lock);
     if output.status.success() {
         Ok(combined)
     } else {
         Err(format!("即梦 CLI 命令执行失败: {}", output_summary(&combined)))
     }
+}
+
+/// GUI applications inherit a minimal environment. Keep the CLI's user
+/// profile and executable search paths explicit so its credential backend and
+/// helper commands behave the same as when launched from a terminal.
+fn build_cli_command(resolved: &str) -> Command {
+    let mut command = Command::new(resolved);
+    if let Some(home) = current_user_home() {
+        command.env("HOME", &home);
+        #[cfg(target_os = "windows")]
+        {
+            command.env("USERPROFILE", &home);
+            command.env("APPDATA", PathBuf::from(&home).join("AppData/Roaming"));
+            command.env("LOCALAPPDATA", PathBuf::from(&home).join("AppData/Local"));
+        }
+        if let Some(parent) = Path::new(resolved).parent() {
+            let mut paths = vec![parent.to_path_buf()];
+            if let Some(existing) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(joined) = std::env::join_paths(paths) {
+                command.env("PATH", joined);
+            }
+        }
+        // Avoid an invalid working directory inherited from a desktop shell.
+        command.current_dir(home);
+    }
+    command
+}
+
+fn current_user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+}
+
+/// 解析即梦 CLI 可执行文件:
+/// - 绝对路径/含斜杠 → 直接校验文件存在;
+/// - 命令名 → 先查当前进程 PATH, 再查常见安装目录。
+/// macOS GUI 应用(从 Finder 启动)不继承 shell 的 PATH(~/.local/bin 不在其中),
+/// 因此必须主动探测常见安装位置, 否则会报 "No such file or directory"。
+fn resolve_executable(requested: &str) -> Result<String, String> {
+    let trimmed = requested.trim();
+    if trimmed.is_empty() {
+        return Err("请先在「设置 - 密钥 - 即梦 CLI」中填写 CLI 可执行命令".to_string());
+    }
+    if Path::new(trimmed).is_absolute() || trimmed.contains('/') {
+        if Path::new(trimmed).is_file() {
+            return Ok(trimmed.to_string());
+        }
+        return Err(format!(
+            "即梦 CLI 路径不存在: {trimmed}，请检查设置中填写的完整路径"
+        ));
+    }
+    if let Some(found) = find_in_path(trimmed) {
+        return Ok(found);
+    }
+    for candidate in common_locations(trimmed) {
+        if Path::new(&candidate).is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "未找到即梦 CLI（{trimmed}）。请确认已安装：curl -fsSL https://jimeng.jianying.com/cli | bash，或在设置中填写完整路径（如 ~/.local/bin/dreamina）"
+    ))
+}
+
+fn find_in_path(command: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(command);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+        #[cfg(target_os = "windows")]
+        if candidate.extension().is_none() {
+            let windows_candidate = candidate.with_extension("exe");
+            if windows_candidate.is_file() {
+                return Some(windows_candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// 常见安装目录(覆盖 GUI 启动无 shell PATH 的场景)
+fn common_locations(command: &str) -> Vec<String> {
+    let home = current_user_home().unwrap_or_default();
+    [
+        home.join(".local/bin"),
+        home.join(".dreamina_cli/bin"),
+        home.join(".dreamina_cli"),
+        home.join(".cargo/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/opt/local/bin"),
+        PathBuf::from("/usr/bin"),
+    ]
+    .into_iter()
+    .flat_map(|dir| {
+        let path = dir.join(command);
+        #[cfg(target_os = "windows")]
+        {
+            let mut paths = vec![path.to_string_lossy().into_owned()];
+            if path.extension().is_none() {
+                paths.push(path.with_extension("exe").to_string_lossy().into_owned());
+            }
+            paths
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            vec![path.to_string_lossy().into_owned()]
+        }
+    })
+    .collect()
 }
 
 fn extract_field(output: &str, names: &[&str]) -> Option<String> {
@@ -658,5 +789,33 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
     #[test]
     fn returns_none_without_url() {
         assert_eq!(extract_url_field("已复用当前本地 OAuth 登录态。"), None);
+    }
+
+    #[test]
+    fn resolves_absolute_path_when_file_exists() {
+        let current = std::env::current_exe().expect("current exe");
+        let path = current.to_string_lossy().into_owned();
+        assert_eq!(resolve_executable(&path).expect("absolute path"), path);
+    }
+
+    #[test]
+    fn rejects_missing_absolute_path() {
+        let error = resolve_executable("/nonexistent/dreamina").expect_err("should fail");
+        assert!(error.contains("路径不存在"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn resolves_command_via_common_locations() {
+        // 本机已装 ~/.local/bin/dreamina 时应能解析成功(不依赖 GUI 的 PATH)
+        if let Ok(resolved) = resolve_executable("dreamina") {
+            assert!(std::path::Path::new(&resolved).is_file(), "resolved file exists");
+        }
+    }
+
+    #[test]
+    fn common_locations_include_home_dirs() {
+        let locations = common_locations("dreamina");
+        assert!(locations.iter().any(|p| p.ends_with(".local/bin/dreamina")));
+        assert!(locations.iter().any(|p| p.ends_with(".cargo/bin/dreamina")));
     }
 }

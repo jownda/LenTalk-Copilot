@@ -29,25 +29,62 @@ function stringifyUnknown(value: unknown): string | undefined {
   }
 }
 
+/** 余额不足错误的常见特征(大小写不敏感): OpenAI 兼容平台标准码 + 各平台变体 + 中文 */
+const BALANCE_INSUFFICIENT_PATTERNS = [
+  /insufficient[ _-]?balance/i,
+  /insufficient[ _-]?account[ _-]?balance/i,
+  /insufficient[ _-]?credits?/i,
+  /not[ _-]?enough[ _-]?balance/i,
+  /balance[ _-]?is[ _-]?insufficient/i,
+  /余额不足/,
+  /积分不足/,
+  /余额不够/,
+];
+
+/** 判断错误文本是否为"余额/积分不足"类错误 */
+export function isBalanceInsufficientError(text: string): boolean {
+  if (!text) {
+    return false;
+  }
+  return BALANCE_INSUFFICIENT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/** 余额不足时的用户可读提示(避免用户误以为是系统故障) */
+export const BALANCE_INSUFFICIENT_MESSAGE =
+  '余额不足：当前所选平台的账户余额/积分不足以完成本次生成。\n' +
+  '请到对应平台（模型选择里显示的供应商）官网充值或购买积分后重试；刚充值过可稍等 1~2 分钟再试。';
+
+/** 若命中余额不足, 把原始错误降级为 details, message 换成明确的充值提示 */
+function resolveBalanceInsufficient(
+  message: string,
+  details: string | undefined
+): { message: string; details?: string } {
+  const combined = `${message} ${details ?? ''}`;
+  if (!isBalanceInsufficientError(combined)) {
+    return { message, details };
+  }
+  const rawDetails = message && message !== BALANCE_INSUFFICIENT_MESSAGE
+    ? (details ? `${message}\n${details}` : message)
+    : details;
+  return { message: BALANCE_INSUFFICIENT_MESSAGE, details: rawDetails?.trim() || undefined };
+}
+
 export function resolveErrorContent(error: unknown, fallbackMessage: string): ResolvedErrorContent {
+  let resolved: ResolvedErrorContent;
   if (error instanceof Error) {
     const errorWithDetails = error as ErrorWithDetails;
     const details = stringifyUnknown(errorWithDetails.details);
-    return {
+    resolved = {
       message: error.message?.trim() || fallbackMessage,
       details: details?.trim() || undefined,
     };
-  }
-
-  if (typeof error === 'string') {
+  } else if (typeof error === 'string') {
     const content = error.trim();
-    return {
+    resolved = {
       message: content || fallbackMessage,
       details: content || undefined,
     };
-  }
-
-  if (error && typeof error === 'object') {
+  } else if (error && typeof error === 'object') {
     const record = error as Record<string, unknown>;
     const candidate =
       (typeof record.message === 'string' && record.message) ||
@@ -56,13 +93,15 @@ export function resolveErrorContent(error: unknown, fallbackMessage: string): Re
       (typeof record.msg === 'string' && record.msg) ||
       '';
     const details = stringifyUnknown(record);
-    return {
+    resolved = {
       message: candidate.trim() || fallbackMessage,
       details: details?.trim() || undefined,
     };
+  } else {
+    resolved = { message: fallbackMessage };
   }
 
-  return { message: fallbackMessage };
+  return resolveBalanceInsufficient(resolved.message, resolved.details);
 }
 
 export async function showErrorDialog(
@@ -76,10 +115,11 @@ export async function showErrorDialog(
     return;
   }
 
+  const resolved = resolveBalanceInsufficient(content, details?.trim() || undefined);
   openGlobalErrorDialog({
     title,
-    message: content,
-    details: details?.trim() || undefined,
+    message: resolved.message,
+    details: resolved.details,
     copyText: copyText?.trim() || undefined,
   });
 }

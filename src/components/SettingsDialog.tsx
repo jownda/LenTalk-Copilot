@@ -190,6 +190,7 @@ export function SettingsDialog({
   const [jimengLoginInfo, setJimengLoginInfo] = useState<{ verificationUri: string; userCode: string; deviceCode: string } | null>(null);
   const [jimengLoginMessage, setJimengLoginMessage] = useState('');
   const jimengLoginTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const jimengLoginCheckingRef = useRef(false);
   const customApiSectionRef = useRef<HTMLDivElement>(null);
   const [showAddCustomApi, setShowAddCustomApi] = useState(false);
   const [editingCustomApiId, setEditingCustomApiId] = useState<string | null>(null);
@@ -245,6 +246,7 @@ export function SettingsDialog({
         clearInterval(jimengLoginTimerRef.current);
         jimengLoginTimerRef.current = null;
       }
+      jimengLoginCheckingRef.current = false;
     };
   }, []);
 
@@ -283,6 +285,11 @@ export function SettingsDialog({
       const deviceCode = result.deviceCode;
       let attempts = 0;
       jimengLoginTimerRef.current = setInterval(async () => {
+        // A CLI keyring write can take longer than the polling interval. Do
+        // not overlap checklogin processes, otherwise concurrent OAuth saves
+        // can make the CLI report "store unavailable".
+        if (jimengLoginCheckingRef.current) return;
+        jimengLoginCheckingRef.current = true;
         attempts += 1;
         const stopPolling = () => {
           if (jimengLoginTimerRef.current) {
@@ -318,6 +325,8 @@ export function SettingsDialog({
             setJimengLoginState('error');
             setJimengLoginMessage(error instanceof Error ? error.message : String(error));
           }
+        } finally {
+          jimengLoginCheckingRef.current = false;
         }
       }, 3000);
     } catch (error) {

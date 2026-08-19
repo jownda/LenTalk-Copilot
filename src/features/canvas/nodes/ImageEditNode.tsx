@@ -1119,6 +1119,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
             <img
               src={previewState.url}
               alt="参考图预览"
+              draggable={false}
               className="h-full w-full object-contain"
               onLoad={(event) => {
                 const img = event.currentTarget;

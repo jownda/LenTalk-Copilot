@@ -62,6 +62,10 @@ export const CanvasNodeImage = memo(({
     <img
       {...props}
       src={src}
+      // 禁用浏览器原生图片拖拽(幽灵图): 否则按住图片拖动会触发原生拖拽,
+      // React Flow 收不到 mousedown 拖动, 节点就拖不动。统一 false 后
+      // 整个节点(含图片区)左键按住即可拖动节点, 与文本节点一致。
+      draggable={false}
       data-viewer-src={
         typeof viewerSourceUrl === 'string' && viewerSourceUrl.trim().length > 0
           ? viewerSourceUrl.trim()

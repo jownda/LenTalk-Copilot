@@ -2,6 +2,17 @@
 
 即梦 CLI 是字节跳动即梦（Dreamina）官方的命令行工具，专为智能体/脚本调用即梦的生图、生视频能力设计。LenTalk-Copilot 通过它调用即梦生成视频（文生视频 / 图生视频 / 首尾帧 / 多模态），**不需要 API Key，直接用你的即梦账号积分**。
 
+> 参考：即梦官方《即梦 CLI 体验指南》（飞书 wiki）：
+> https://bytedance.larkoffice.com/wiki/FVTwwm0bGiishxkKOoScdHR2nsg
+
+## ⚠️ 使用前必须知道（官方原文要点）
+
+1. **仅高级会员以上可用**：生成任务会消耗账户权益或积分，目前仅供**高级会员以上**账号使用；
+2. **积分标准**：与即梦网页端 Agent 模式下相同生成能力的积分消耗标准一致；
+3. **视频生成必须先网页端生成一次**：由于合规要求，**需要先在即梦网页端完成第一次视频生成**，之后才能在 CLI 内提交视频生成任务（否则 CLI 会返回合规授权类错误，如 `AigcComplianceConfirmationRequired`）；
+4. **异步任务**：大多数生成任务是异步的，提交（拿到 `submit_id`）和查询是两个步骤；
+5. **排查问题**：报错日志位于 `~/.dreamina_cli/logs/`，反馈前先贴日志；优先更新 CLI 再重试（`curl -fsSL https://jimeng.jianying.com/cli | bash`）。
+
 ---
 
 ## 一、安装
@@ -170,21 +181,25 @@ dreamina session create --name=xx  # 新建会话
 **2. 提示积分/余额不足**
 `dreamina user_credit` 查余额。即梦视频按生成时长扣积分（单次约 30 积分，具体看模型），余额不足去即梦官网充值或开通会员。
 
-**3. 返回 `AigcComplianceConfirmationRequired`**
-模型/素材需要在**即梦网页端完成一次性合规授权**。去即梦官网（jimeng.jianying.com）登录，在设置/创作中心里完成相应授权（或先手工在网页上生成一次同类内容），再回画布重试。
+**3. 返回 `AigcComplianceConfirmationRequired` / 视频任务被拒**
+**合规要求：必须先登录即梦网页端（jimeng.jianying.com）完成至少一次视频生成**，之后 CLI 才能提交视频任务（官方文档明确要求）。先在网页端生成一次同类型视频，再回画布重试；个别模型/素材还可能需要网页端一次性授权确认。
 
-**4. 素材含人脸被拒**
+**4. 报错排查**
+报错日志在 `~/.dreamina_cli/logs/` 目录下，把相关日志贴给客服/排查时带上；先执行更新命令 `curl -fsSL https://jimeng.jianying.com/cli | bash` 升到最新版再重试（很多问题新版已修复）。
+
+**5. 素材含人脸被拒**
 即梦对真人脸素材有限制（如"识别到素材中包含人脸信息，请调整素材后再试试"）。换素材或加风格化处理。
 
-**5. `无法启动即梦 CLI`**
+**6. `无法启动即梦 CLI`**
 - 确认终端里 `which dreamina` 能找到；
 - 设置里填的命令要能直接执行：填 `dreamina` 或完整路径；
+- macOS 上从桌面/Finder 启动的应用**不继承终端 PATH**——LenTalk 已内置常见目录自动探测（`~/.local/bin`、`~/.cargo/bin`、`/usr/local/bin` 等），若仍找不到请在设置里填完整路径（如 `/Users/你的用户名/.local/bin/dreamina`）；
 - 改完 PATH 后需要重启应用（应用读取的是启动时的 PATH）。
 
-**6. `authsdk: store unavailable`（macOS）**
+**7. `authsdk: store unavailable`（macOS）**
 登录态存在 macOS 钥匙串（Keychain），首次使用会弹系统授权框，点「允许」即可。如果命令行报这个错，检查钥匙串里是否拒绝了 dreamina 的访问（系统设置 → 密码与钥匙串 → 钥匙串访问权限）。
 
-**7. 模型不支持**
+**8. 模型不支持**
 在节点里选的模型要在上表范围内；`seedance2.5` 只支持 4–30 秒，其他模型 4–15 秒；分辨率按表格选（比如 `seedance2.0` 只支持 720p）。
 
 ---

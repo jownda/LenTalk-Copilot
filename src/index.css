@@ -266,3 +266,10 @@ html[data-platform='macos'] #root {
     animation: none;
   }
 }
+
+/* 隐藏媒体节点视频原生控件中的「全屏」与「画中画(小窗播放)」按钮(macOS WebKit),
+   只隐藏这两个按钮, 播放/进度/音量等控件保留 */
+video::-webkit-media-controls-fullscreen-button,
+video::-webkit-media-controls-picture-in-picture-button {
+  display: none !important;
+}
