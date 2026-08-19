@@ -1,26 +1,44 @@
 {
-  "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "opener:default",
-    "dialog:default",
+ "$schema": "../gen/schemas/desktop-schema.json",
+ "identifier": "default",
+ "description": "Capability for the main window",
+ "windows": [
+  "main"
+ ],
+ "permissions": [
+  "core:default",
+  "opener:default",
+  "dialog:default",
+  {
+   "identifier": "fs:allow-read-file",
+   "allow": [
     {
-      "identifier": "fs:allow-read-file",
-      "allow": [{ "path": "$HOME/**" }, { "path": "$TEMP/**" }]
+     "path": "$HOME/**"
     },
     {
-      "identifier": "fs:allow-write-file",
-      "allow": [{ "path": "$HOME/**" }, { "path": "$TEMP/**" }]
+     "path": "$TEMP/**"
+    }
+   ]
+  },
+  {
+   "identifier": "fs:allow-write-file",
+   "allow": [
+    {
+     "path": "$HOME/**"
     },
-    "core:window:allow-minimize",
-    "core:window:allow-maximize",
-    "core:window:allow-unmaximize",
-    "core:window:allow-close",
-    "core:window:allow-is-maximized",
-    "core:window:allow-start-dragging",
-    "core:window:allow-is-minimized"
-  ]
+    {
+     "path": "$TEMP/**"
+    }
+   ]
+  },
+  "core:window:allow-minimize",
+  "core:window:allow-maximize",
+  "core:window:allow-unmaximize",
+  "core:window:allow-close",
+  "core:window:allow-is-maximized",
+  "core:window:allow-start-dragging",
+  "core:window:allow-is-minimized",
+  "updater:default",
+  "process:default"
+ ]
 }

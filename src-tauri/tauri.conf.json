@@ -64,6 +64,16 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcxQkJFOTI5MTUxRTMxNDIKUldSQ01SNFZLZW03Y1hFN3VLVlhJMlBjRHE5M1dITnlRZDhWYUIwT09MR3FtUzM0aHc4MWpKWDgK",
+      "endpoints": [
+        "https://github.com/jownda/LenTalk-Copilot/releases/latest/download/latest-macos.json",
+        "https://github.com/jownda/LenTalk-Copilot/releases/latest/download/latest-windows.json"
+      ]
+    }
   }
 }

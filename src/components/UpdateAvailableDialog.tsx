@@ -1,9 +1,9 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { check } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
 import { UiButton, UiModal, UiSelect } from '@/components/ui';
 
-const GITHUB_RELEASES_URL = 'https://github.com/jownda/LenTalk-Copilot/releases';
 export type UpdateIgnoreMode = 'today-version' | 'forever-version' | 'forever-all';
 
 interface UpdateAvailableDialogProps {
@@ -22,13 +22,13 @@ export function UpdateAvailableDialog({
   onClose,
   latestVersion,
   currentVersion,
-  downloadUrl,
-  releaseUrl,
   releaseNotes,
   onApplyIgnore
 }: UpdateAvailableDialogProps) {
   const { t } = useTranslation();
   const [ignoreMode, setIgnoreMode] = useState<UpdateIgnoreMode>('today-version');
+  const [updateState, setUpdateState] = useState<'idle' | 'downloading' | 'installing' | 'error'>('idle');
+  const [updateError, setUpdateError] = useState<string | null>(null);
 
   const ignoreOptions = useMemo(
     () => [
@@ -39,9 +39,28 @@ export function UpdateAvailableDialog({
     [t]
   );
 
-  const handleOpenGithub = useCallback(() => {
-    void openUrl(downloadUrl ?? releaseUrl ?? GITHUB_RELEASES_URL);
-  }, [downloadUrl, releaseUrl]);
+  /** OTA 更新: 下载 → 安装 → 自动重启 */
+  const handleUpdate = useCallback(async () => {
+    if (updateState === 'downloading' || updateState === 'installing') {
+      return;
+    }
+    setUpdateState('downloading');
+    setUpdateError(null);
+    try {
+      const update = await check();
+      if (!update) {
+        setUpdateState('error');
+        setUpdateError(t('update.noUpdateAvailable', '没有可用更新'));
+        return;
+      }
+      await update.downloadAndInstall();
+      setUpdateState('installing');
+      await relaunch();
+    } catch (error) {
+      setUpdateState('error');
+      setUpdateError(error instanceof Error ? error.message : String(error));
+    }
+  }, [t, updateState]);
 
   const handleApplyIgnore = useCallback(() => {
     onApplyIgnore?.(ignoreMode);
@@ -58,8 +77,16 @@ export function UpdateAvailableDialog({
           <UiButton variant="muted" onClick={onClose}>
             {t('common.cancel')}
           </UiButton>
-          <UiButton variant="primary" onClick={handleOpenGithub}>
-            {t(downloadUrl ? 'update.downloadGithubInstaller' : 'update.goToGithubDownload')}
+          <UiButton
+            variant="primary"
+            onClick={() => void handleUpdate()}
+            disabled={updateState === 'downloading' || updateState === 'installing'}
+          >
+            {updateState === 'downloading'
+              ? t('update.downloading', '正在下载更新…')
+              : updateState === 'installing'
+                ? t('update.installing', '正在安装…')
+                : t('update.updateNow', '更新并重启')}
           </UiButton>
           <UiButton variant="ghost" onClick={handleApplyIgnore}>
             {t('update.applyIgnore')}
@@ -67,6 +94,9 @@ export function UpdateAvailableDialog({
         </>
       }
     >
+      {updateState === 'error' && updateError && (
+        <p className="mb-3 text-xs text-red-400">{updateError}</p>
+      )}
       <div className="text-sm text-text-muted leading-6">
         <p>{t('update.dialogDescription')}</p>
         {(latestVersion || currentVersion) && (
