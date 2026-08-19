@@ -54,6 +54,7 @@ jobs:
         run: npm run tauri build -- --bundles nsis,msi
 
       - name: Generate updater metadata (windows)
+        shell: bash
         run: |
           set -e
           VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
