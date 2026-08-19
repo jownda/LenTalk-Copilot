@@ -20,6 +20,7 @@ import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { canvasAiGateway, graphImageResolver } from '@/features/canvas/application/canvasServices';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
 import { CURRENT_RUNTIME_SESSION_ID } from '@/features/canvas/application/generationErrorReport';
+import { recordGenerationOutcome } from '@/features/canvas/application/usageRecording';
 import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
 import { getDefaultVideoModelId, getModelProvider, getVideoModel, JIMENG_CLI_PROVIDER_ID, listVideoModels, resolveVideoModelProfile } from '@/features/canvas/models';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
@@ -807,6 +808,17 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         referenceImages: videoReferenceImages,
         referenceAudio: inputAudio,
       });
+      recordGenerationOutcome({
+        nodeId: outputId,
+        kind: 'video',
+        providerId: selectedModel.providerId,
+        modelId: selectedModel.id,
+        size: selectedVideoResolution,
+        duration: selectedDuration,
+        referenceCount: videoReferenceImages.length,
+        status: 'succeeded',
+        durationMs: Date.now() - generationStartedAt,
+      });
       updateNodeData(outputId, {
         sourcePath: videoUrl,
         isGenerating: false,
@@ -819,6 +831,18 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     } catch (generationError) {
       const resolved = resolveErrorContent(generationError, '视频生成失败');
       setError(resolved.message);
+      recordGenerationOutcome({
+        nodeId: outputId,
+        kind: 'video',
+        providerId: selectedModel.providerId,
+        modelId: selectedModel.id,
+        size: selectedVideoResolution,
+        duration: selectedDuration,
+        referenceCount: videoReferenceImages.length,
+        status: 'failed',
+        errorMessage: resolved.message,
+        durationMs: Date.now() - generationStartedAt,
+      });
       updateNodeData(outputId, {
         isGenerating: false,
         generationStartedAt: null,

@@ -11,6 +11,7 @@ use commands::jimeng_cli;
 use commands::project_state;
 use commands::system;
 use commands::update;
+use commands::usage_log;
 use tauri::Manager;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -199,6 +200,9 @@ pub fn run() {
             project_state::update_project_viewport_record,
             project_state::rename_project_record,
             project_state::delete_project_record,
+            usage_log::append_usage_record,
+            usage_log::query_usage_records,
+            usage_log::query_usage_summary,
             system::get_runtime_system_info,
             update::get_latest_release_info,
         ])

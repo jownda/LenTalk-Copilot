@@ -48,6 +48,7 @@ import {
   CURRENT_RUNTIME_SESSION_ID,
 } from '@/features/canvas/application/generationErrorReport';
 import { showErrorDialog } from '@/features/canvas/application/errorDialog';
+import { recordGenerationOutcome } from '@/features/canvas/application/usageRecording';
 import {
   getConnectMenuNodeTypes,
   nodeHasSourceHandle,
@@ -460,7 +461,7 @@ export function Canvas() {
   const setFlashGroupId = useCanvasStore((state) => state.setFlashGroupId);
   const setChargingGroupId = useCanvasStore((state) => state.setChargingGroupId);
   const alignNodes = useCanvasStore((state) => state.alignNodes);
-  const snapAllNodesToGrid = useCanvasStore((state) => state.snapAllNodesToGrid);
+  const snapAllNodesToNeighbors = useCanvasStore((state) => state.snapAllNodesToNeighbors);
   const undo = useCanvasStore((state) => state.undo);
   const redo = useCanvasStore((state) => state.redo);
   const openToolDialog = useCanvasStore((state) => state.openToolDialog);
@@ -714,6 +715,17 @@ export function Canvas() {
             }
 
             if (status.status === 'succeeded' && typeof status.result === 'string' && status.result.trim()) {
+              recordGenerationOutcome({
+                nodeId: pendingNode.id,
+                kind: 'image',
+                providerId: generationProviderId,
+                modelId: requestModel,
+                size: typeof generationRequest?.size === 'string' ? generationRequest.size : '1K',
+                referenceCount: Array.isArray(generationRequest?.referenceImages)
+                  ? generationRequest.referenceImages.length
+                  : 0,
+                status: 'succeeded',
+              });
               const prepared = await prepareNodeImage(status.result);
               const storyboardMetadataRaw = currentData.generationStoryboardMetadata as GenerationStoryboardMetadata | undefined;
               const hasStoryboardMetadata = Boolean(
@@ -759,6 +771,18 @@ export function Canvas() {
             }
 
             const errorMessage = status.error ?? (status.status === 'not_found' ? 'generation job not found' : 'generation failed');
+            recordGenerationOutcome({
+              nodeId: pendingNode.id,
+              kind: 'image',
+              providerId: generationProviderId,
+              modelId: requestModel,
+              size: typeof generationRequest?.size === 'string' ? generationRequest.size : '1K',
+              referenceCount: Array.isArray(generationRequest?.referenceImages)
+                ? generationRequest.referenceImages.length
+                : 0,
+              status: 'failed',
+              errorMessage,
+            });
             const generationClientSessionId = typeof currentData.generationClientSessionId === 'string'
               ? currentData.generationClientSessionId
               : '';
@@ -810,6 +834,26 @@ export function Canvas() {
       if (activeVideoRecoveryNodeIdsRef.current.has(pendingNode.id)) continue;
       activeVideoRecoveryNodeIdsRef.current.add(pendingNode.id);
       void (async () => {
+        // 在 try 外解析恢复请求快照: catch 分支记账时也要用到(避免 try 作用域丢失)
+        const recoveryNode = useCanvasStore.getState().nodes.find((node) => node.id === pendingNode.id);
+        const recoveryData = recoveryNode?.data as Record<string, unknown> | undefined;
+        const recoveryRequest = recoveryData?.generationRequest as {
+          kind?: unknown;
+          clientJobId?: unknown;
+          prompt?: unknown;
+          model?: unknown;
+          duration?: unknown;
+          aspectRatio?: unknown;
+          videoResolution?: unknown;
+          imageMode?: unknown;
+          referenceImages?: unknown;
+          referenceAudio?: unknown;
+        } | undefined;
+        if (!recoveryRequest || recoveryRequest.kind !== 'video') return;
+        const recoveryModel = typeof recoveryRequest.model === 'string' ? recoveryRequest.model : '';
+        const recoveryProviderId = typeof recoveryData?.generationProviderId === 'string'
+          ? recoveryData.generationProviderId
+          : recoveryModel.split('/')[0] ?? '';
         try {
           const currentNode = useCanvasStore.getState().nodes.find((node) => node.id === pendingNode.id);
           const currentData = currentNode?.data as Record<string, unknown> | undefined;
@@ -851,6 +895,16 @@ export function Canvas() {
               ? request.referenceAudio.filter((value): value is string => typeof value === 'string')
               : [],
           });
+          recordGenerationOutcome({
+            nodeId: pendingNode.id,
+            kind: 'video',
+            providerId,
+            modelId: model,
+            size: typeof request.videoResolution === 'string' ? request.videoResolution : undefined,
+            duration: typeof request.duration === 'number' ? request.duration : 0,
+            referenceCount: Array.isArray(request.referenceImages) ? request.referenceImages.length : 0,
+            status: 'succeeded',
+          });
           updateNodeData(pendingNode.id, {
             sourcePath: videoUrl,
             isGenerating: false,
@@ -861,6 +915,17 @@ export function Canvas() {
           });
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
+          recordGenerationOutcome({
+            nodeId: pendingNode.id,
+            kind: 'video',
+            providerId: recoveryProviderId,
+            modelId: recoveryModel,
+            size: typeof recoveryRequest.videoResolution === 'string' ? recoveryRequest.videoResolution : undefined,
+            duration: typeof recoveryRequest.duration === 'number' ? recoveryRequest.duration : 0,
+            referenceCount: Array.isArray(recoveryRequest.referenceImages) ? recoveryRequest.referenceImages.length : 0,
+            status: 'failed',
+            errorMessage,
+          });
           updateNodeData(pendingNode.id, {
             isGenerating: false,
             generationStartedAt: null,
@@ -2743,8 +2808,8 @@ export function Canvas() {
           <button
             onClick={() => {
               if (selectedNodeIds.length < 2) {
-                // 未选中多个节点:一键让全画布节点吸附最近网格并防重叠
-                const changed = snapAllNodesToGrid(20);
+                // 未选中多个节点:一键让全画布节点对齐附近节点/组边框并防重叠
+                const changed = snapAllNodesToNeighbors();
                 if (changed) {
                   scheduleCanvasPersist(0);
                 }
@@ -2755,7 +2820,7 @@ export function Canvas() {
             className="flex h-9 w-9 items-center justify-center rounded-lg border border-border-dark bg-surface-dark shadow-lg transition-colors text-text-dark hover:bg-bg-dark"
             title={
               selectedNodeIds.length < 2
-                ? t('canvas.toolbar.alignAll', '一键整理:全部节点吸附最近网格并对齐,自动防重叠')
+                ? t('canvas.toolbar.alignAll', '一键整理:全部节点对齐到附近节点/组的边缘与中心线,自动防重叠')
                 : t('canvas.toolbar.align', '对齐选中节点')
             }
           >

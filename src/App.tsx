@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Canvas } from './features/canvas/Canvas';
 import { TitleBar } from './components/TitleBar';
 import { SettingsDialog } from './components/SettingsDialog';
+import { BillingDialog } from './components/BillingDialog';
 import { UpdateAvailableDialog, type UpdateIgnoreMode } from './components/UpdateAvailableDialog';
 import { GlobalErrorDialog } from './components/GlobalErrorDialog';
 import { ProjectManager } from './features/project/ProjectManager';
@@ -38,6 +39,7 @@ function App() {
   const enableUpdateDialog = useSettingsStore((state) => state.enableUpdateDialog);
   const setEnableUpdateDialog = useSettingsStore((state) => state.setEnableUpdateDialog);
   const [showSettings, setShowSettings] = useState(false);
+  const [showBilling, setShowBilling] = useState(false);
   const [settingsInitialCategory, setSettingsInitialCategory] = useState<SettingsCategory>('general');
   const [showUpdateDialog, setShowUpdateDialog] = useState(false);
   const [latestVersion, setLatestVersion] = useState<string>('');
@@ -217,6 +219,7 @@ function App() {
             setSettingsInitialCategory('general');
             setShowSettings(true);
           }}
+          onBillingClick={() => setShowBilling(true)}
           showBackButton={!!currentProjectId}
           onBackClick={closeProject}
         />
@@ -229,6 +232,7 @@ function App() {
           initialCategory={settingsInitialCategory}
           onCheckUpdate={handleManualCheckUpdate}
         />
+        <BillingDialog isOpen={showBilling} onClose={() => setShowBilling(false)} />
         <UpdateAvailableDialog
           isOpen={showUpdateDialog}
           onClose={() => setShowUpdateDialog(false)}

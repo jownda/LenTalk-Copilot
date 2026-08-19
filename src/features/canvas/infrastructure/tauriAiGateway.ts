@@ -138,10 +138,10 @@ async function normalizeVideoReferenceImages(
   const apiModel = normalizeWgspaiVideoModelName(modelId.split('/').slice(1).join('/') || modelId);
   const apiKey = useSettingsStore.getState().apiKeys[providerId] ?? '';
   // zzdh 官方文档: 素材支持 data: base64, 单图上限 20MB。
-  // 本地图最清晰策略: 先转无损原始 data URL, 未超预算直接使用;
-  // 超预算才压缩到 2048px / 0.9 质量(接近视觉无损)。预算按总请求体约 16MB
-  // 在图片间分摊, 单图下限 1MB, 避免参考生多图时被摊薄变模糊。
-  const zzdhImageBudget = Math.max(1_000_000, Math.floor(16_000_000 / Math.max(1, imageUrls.length)));
+  // 但整包 task payload 有限制(实测传大图会 HTTP 400 task payload too large)。
+  // 本地图策略: 小图(≤预算)无损直传, 大图压缩到 2048px/0.9(接近视觉无损);
+  // 总 data URL 预算控制在 ~3MB, 多图按图数分摊, 单图下限 400KB。
+  const zzdhImageBudget = Math.max(400_000, Math.floor(3_000_000 / Math.max(1, imageUrls.length)));
   const zzdhMaxDimension = 2048;
   const zzdhQuality = 0.9;
 

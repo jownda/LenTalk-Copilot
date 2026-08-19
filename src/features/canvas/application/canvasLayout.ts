@@ -303,40 +303,159 @@ function resolveNonOverlapAlongX(
   }
 }
 
+/** 智能吸附阈值(px): 与附近节点/组边框边缘或中心线距离小于该值才吸附 */
+export const SMART_SNAP_THRESHOLD = 24;
+
+/** 边缘贴合时保留的间隙(px): 右缘贴左缘 / 左缘贴右缘 / 上下贴合时中间留空隙, 不紧紧挨着 */
+export const SNAP_EDGE_GAP = 24;
+
+interface SnapBox {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  cx: number;
+  cy: number;
+  width: number;
+  height: number;
+}
+
 /**
- * 全画布网格对齐 + 防重叠:
- * - 只布局顶层节点(组内子节点随组节点整体移动);
- * - 每个节点吸附到最近的网格交点;
+ * 全画布智能对齐 + 防重叠:
+ * - 只布局顶层节点(组内子节点随组节点整体移动, 不单独吸附);
+ * - 按 y 顺序贪心处理: 先处理的节点作为固定基准(自身不动, 也不被后续节点拉动),
+ *   后续节点吸附到「已固定节点/组边框」的边缘或中心线(左/中/右、上/中/下),
+ *   距离小于阈值(SMART_SNAP_THRESHOLD)才吸附;
  * - 保持节点原有上下相对顺序, 对齐后若有纵向重叠则自动下移错开, 保证不叠在一起。
  * 返回 nodeId -> 绝对坐标(与 computeAlignment 的返回值形式一致)。
  */
-export function computeGridSnapLayout(
+export function computeSmartSnapLayout(
   nodes: CanvasNode[],
-  gridSize: number
+  threshold = SMART_SNAP_THRESHOLD
 ): Map<string, { x: number; y: number }> {
   const result = new Map<string, { x: number; y: number }>();
-  const grid = gridSize > 0 ? gridSize : 20;
+  const snap = threshold > 0 ? threshold : SMART_SNAP_THRESHOLD;
   const topLevelNodes = nodes.filter((node) => !node.parentId);
-  if (topLevelNodes.length === 0) {
+  if (topLevelNodes.length < 2) {
     return result;
   }
 
-  const items: AlignableItem[] = topLevelNodes.map((node) => {
+  // 快照所有顶层节点的包围盒(基于当前绝对坐标)
+  const boxes = new Map<string, SnapBox>();
+  for (const node of topLevelNodes) {
     const size = getNodeSize(node);
-    return {
-      id: node.id,
-      x: Math.round(node.position.x / grid) * grid,
-      y: Math.round(node.position.y / grid) * grid,
+    const left = node.position.x;
+    const top = node.position.y;
+    boxes.set(node.id, {
+      left,
+      right: left + size.width,
+      top,
+      bottom: top + size.height,
+      cx: left + size.width / 2,
+      cy: top + size.height / 2,
       width: size.width,
       height: size.height,
-    };
-  });
+    });
+  }
 
-  for (const item of items) {
-    result.set(item.id, { x: item.x, y: item.y });
+  // 初始化: 全部节点保持原位(防重叠逻辑需要每个节点都有条目)
+  for (const node of topLevelNodes) {
+    const box = boxes.get(node.id) as SnapBox;
+    result.set(node.id, { x: Math.round(box.left), y: Math.round(box.top) });
+  }
+
+  // 按 y 排序保证处理顺序确定且稳定(水平并排节点保持原始相对顺序)
+  const ordered = topLevelNodes
+    .slice()
+    .sort((a, b) => (boxes.get(a.id) as SnapBox).top - (boxes.get(b.id) as SnapBox).top);
+
+  // 已固定节点的最终包围盒(作为后续节点的吸附参考线)
+  const fixed: SnapBox[] = [];
+
+  for (const node of ordered) {
+    const self = boxes.get(node.id) as SnapBox;
+    let targetX: number | null = null;
+    let targetY: number | null = null;
+    let bestXDist = snap + 1;
+    let bestYDist = snap + 1;
+
+    for (const other of fixed) {
+      const xCandidates: Array<[number, number]> = [
+        // self.left 对齐 other 的 left / cx / right(右缘贴左缘时留 SNAP_EDGE_GAP 空隙) → 目标 x
+        [other.left, Math.abs(self.left - other.left)],
+        [other.cx - self.width / 2, Math.abs(self.left - other.cx)],
+        [other.right + SNAP_EDGE_GAP, Math.abs(self.left - other.right)],
+        // self.cx 对齐 other 的 left / cx / right → 目标 x
+        [other.left - self.width / 2, Math.abs(self.cx - other.left)],
+        [other.cx - self.width / 2, Math.abs(self.cx - other.cx)],
+        [other.right - self.width / 2, Math.abs(self.cx - other.right)],
+        // self.right 对齐 other 的 left(留 SNAP_EDGE_GAP 空隙) / cx / right → 目标 x
+        [other.left - self.width - SNAP_EDGE_GAP, Math.abs(self.right - other.left)],
+        [other.cx - self.width / 2, Math.abs(self.right - other.cx)],
+        [other.right - self.width, Math.abs(self.right - other.right)],
+      ];
+      for (const [target, dist] of xCandidates) {
+        if (dist < bestXDist) {
+          bestXDist = dist;
+          targetX = target;
+        }
+      }
+
+      const yCandidates: Array<[number, number]> = [
+        // self.top 对齐 other 的 top / cy / bottom(下缘贴上缘时留空隙) → 目标 y
+        [other.top, Math.abs(self.top - other.top)],
+        [other.cy - self.height / 2, Math.abs(self.top - other.cy)],
+        [other.bottom + SNAP_EDGE_GAP, Math.abs(self.top - other.bottom)],
+        // self.cy 对齐 other 的 top / cy / bottom → 目标 y
+        [other.top - self.height / 2, Math.abs(self.cy - other.top)],
+        [other.cy - self.height / 2, Math.abs(self.cy - other.cy)],
+        [other.bottom - self.height / 2, Math.abs(self.cy - other.bottom)],
+        // self.bottom 对齐 other 的 top(留空隙) / cy / bottom → 目标 y
+        [other.top - self.height - SNAP_EDGE_GAP, Math.abs(self.bottom - other.top)],
+        [other.cy - self.height / 2, Math.abs(self.bottom - other.cy)],
+        [other.bottom - self.height, Math.abs(self.bottom - other.bottom)],
+      ];
+      for (const [target, dist] of yCandidates) {
+        if (dist < bestYDist) {
+          bestYDist = dist;
+          targetY = target;
+        }
+      }
+    }
+
+    if (targetX !== null || targetY !== null) {
+      result.set(node.id, {
+        x: targetX !== null ? Math.round(targetX) : Math.round(self.left),
+        y: targetY !== null ? Math.round(targetY) : Math.round(self.top),
+      });
+    }
+
+    // 用最终位置加入固定参考(后续节点吸到实际位置)
+    const final = result.get(node.id) as { x: number; y: number };
+    fixed.push({
+      left: final.x,
+      right: final.x + self.width,
+      top: final.y,
+      bottom: final.y + self.height,
+      cx: final.x + self.width / 2,
+      cy: final.y + self.height / 2,
+      width: self.width,
+      height: self.height,
+    });
   }
 
   // 防重叠: 保持上下相对顺序, 重叠时下移错开
+  const items: AlignableItem[] = topLevelNodes.map((node) => {
+    const box = boxes.get(node.id) as SnapBox;
+    const pos = result.get(node.id) as { x: number; y: number };
+    return {
+      id: node.id,
+      x: pos.x,
+      y: pos.y,
+      width: box.width,
+      height: box.height,
+    };
+  });
   resolveNonOverlapAlongY(items, result);
   return result;
 }

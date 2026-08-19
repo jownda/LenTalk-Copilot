@@ -35,7 +35,7 @@ import {
 import { EXPORT_RESULT_DISPLAY_NAME } from '@/features/canvas/domain/nodeDisplay';
 import { nodeCatalog } from '@/features/canvas/application/nodeCatalog';
 import { canvasNodeFactory } from '@/features/canvas/application/canvasServices';
-import { computeAutoLayout, computeAlignment, computeGridSnapLayout } from '@/features/canvas/application/canvasLayout';
+import { computeAutoLayout, computeAlignment, computeSmartSnapLayout } from '@/features/canvas/application/canvasLayout';
 import type { NodeAlignMode } from '@/features/canvas/application/canvasLayout';
 import {
   ensureAtLeastOneMinEdge,
@@ -153,8 +153,8 @@ interface CanvasState {
   autoLayoutCanvas: () => boolean;
   /** 对齐选中节点(左/中/右/上/垂直中/下/水平等距/垂直等距), 返回是否发生变更 */
   alignNodes: (nodeIds: string[], mode: NodeAlignMode) => boolean;
-  /** 全画布网格对齐 + 防重叠: 所有顶层节点吸附最近网格, 重叠时自动错开 */
-  snapAllNodesToGrid: (gridSize: number) => boolean;
+  /** 全画布智能对齐 + 防重叠: 顶层节点吸附到附近节点/组边框的边缘或中心线, 重叠时自动错开 */
+  snapAllNodesToNeighbors: (threshold?: number) => boolean;
   deleteEdge: (edgeId: string) => void;
   setSelectedNode: (nodeId: string | null) => void;
   setHoveredGroupId: (groupId: string | null) => void;
@@ -1854,8 +1854,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     return true;
   },
 
-  /** 全画布网格对齐 + 防重叠: 所有顶层节点吸附最近网格, 纵向重叠时自动下移错开 */
-  snapAllNodesToGrid: (gridSize) => {
+  /** 全画布智能对齐 + 防重叠: 顶层节点吸附到附近节点/组边框的边缘或中心线 */
+  snapAllNodesToNeighbors: (threshold) => {
     const state = get();
     const nodeMap = new Map(state.nodes.map((node) => [node.id, node] as const));
     const topLevelNodes = state.nodes.filter((node) => !node.parentId);
@@ -1863,7 +1863,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return false;
     }
 
-    const targets = computeGridSnapLayout(state.nodes, gridSize);
+    const targets = computeSmartSnapLayout(state.nodes, threshold);
     if (targets.size === 0) {
       return false;
     }

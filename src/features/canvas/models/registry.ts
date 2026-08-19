@@ -41,7 +41,7 @@ const imageModelMap = new Map<string, ImageModelDefinition>(
   imageModels.map((model) => [model.id, model])
 );
 
-export const DEFAULT_IMAGE_MODEL_ID = 'kie/nano-banana-2';
+export const DEFAULT_IMAGE_MODEL_ID = 'builtin:default';
 export const JIMENG_CLI_PROVIDER_ID = 'jimeng-cli';
 const JIMENG_CLI_PROVIDER: ModelProviderDefinition = {
   id: JIMENG_CLI_PROVIDER_ID,
@@ -75,10 +75,7 @@ const WINDOWS_UNCONFIGURED_IMAGE_MODEL: ImageModelDefinition = {
   }),
 };
 
-const imageModelAliasMap = new Map<string, string>([
-  ['gemini-3.1-flash', 'ppio/gemini-3.1-flash'],
-  ['gemini-3.1-flash-edit', 'ppio/gemini-3.1-flash'],
-]);
+const imageModelAliasMap = new Map<string, string>([]);
 
 export function listImageModels(): ImageModelDefinition[] {
   if (isWindowsDesktopRuntime()) {
@@ -106,7 +103,12 @@ export function getImageModel(modelId: string): ImageModelDefinition {
     return buildCustomImageModels()[0] ?? WINDOWS_UNCONFIGURED_IMAGE_MODEL;
   }
 
-  return imageModelMap.get(resolvedModelId) ?? imageModelMap.get(DEFAULT_IMAGE_MODEL_ID)!;
+  // 旧节点可能引用已移除平台的模型(如 grsai/kie/ppio/fal): 找不到时兜底到
+  // 第一个可用模型(自定义平台优先), 绝不允许返回 undefined 导致界面崩溃。
+  return imageModelMap.get(resolvedModelId)
+    ?? imageModelMap.get(DEFAULT_IMAGE_MODEL_ID)
+    ?? listImageModels()[0]
+    ?? WINDOWS_UNCONFIGURED_IMAGE_MODEL;
 }
 
 export function getDefaultImageModelId(): string {
