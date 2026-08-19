@@ -50,22 +50,6 @@ export const recommendedApis: RecommendedApi[] = [
     ],
   },
   {
-    id: 'wgspai',
-    name: 'WGSPAI',
-    baseUrl: 'https://api.wgspai.cn',
-    registerUrl: 'https://api.wgspai.cn/pricing',
-    pricingUrl: 'https://api.wgspai.cn/pricing',
-    summary: 'OpenAI 兼容平台，图像与视频模型价格有竞争力',
-    advantages: [
-      'GPT Image 2K ¥0.10/次',
-      'Seedance V2 720p Fast ¥0.17/秒起',
-      'Minimax H3 ¥1.50/次',
-      '视频生成价格优势',
-    ],
-    models: ['gpt-image-2-2k'],
-    videoModels: ['seedance-v2-720p-fast', 'seedance-v2-720p', 'grok-imagine-video-6s', 'Minimax-h3'],
-  },
-  {
     id: 'comfly',
     name: 'COMFly',
     baseUrl: 'https://ai.comfly.org',
