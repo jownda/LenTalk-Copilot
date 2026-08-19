@@ -141,8 +141,8 @@ export function SettingsDialog({
   const providers = useMemo(() => {
     const providerOrder = ['kie', 'ppio', 'fal', 'grsai'];
     const providerIndex = new Map(providerOrder.map((id, index) => [id, index]));
-    // 推荐平台列表: 隐藏 KIE / 派欧云(ppio) / fal, 仅保留 grsai 等
-    const hiddenProviderIds = new Set(['kie', 'ppio', 'fal']);
+    // 推荐平台列表: 隐藏 KIE / 派欧云(ppio) / fal / GRSAI
+    const hiddenProviderIds = new Set(['kie', 'ppio', 'fal', 'grsai']);
     return (
       listModelProviders()
         .filter((provider) => !provider.id.startsWith('custom:'))
