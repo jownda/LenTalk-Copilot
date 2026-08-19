@@ -47,6 +47,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Clean stale bundle artifacts
+        run: rm -rf src-tauri/target/release/bundle
+
       - name: Build Windows installers
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -117,6 +120,9 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Clean stale bundle artifacts
+        run: rm -rf src-tauri/target/release/bundle
 
       # 只打 .app(tauri 自带 dmg 脚本有 bug),dmg 用 hdiutil 手动打
       - name: Build macOS app bundle
