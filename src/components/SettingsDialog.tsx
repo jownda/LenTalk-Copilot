@@ -102,7 +102,6 @@ export function SettingsDialog({
     showNodePrice,
     priceDisplayCurrencyMode,
     usdToCnyRate,
-    preferDiscountedPrice,
     uiRadiusPreset,
     themeTonePreset,
     accentColor,
@@ -124,7 +123,6 @@ export function SettingsDialog({
     setShowNodePrice,
     setPriceDisplayCurrencyMode,
     setUsdToCnyRate,
-    setPreferDiscountedPrice,
     setUiRadiusPreset,
     setThemeTonePreset,
     setAccentColor,
@@ -173,9 +171,6 @@ export function SettingsDialog({
     priceDisplayCurrencyMode
   );
   const [localUsdToCnyRate, setLocalUsdToCnyRate] = useState(String(usdToCnyRate));
-  const [localPreferDiscountedPrice, setLocalPreferDiscountedPrice] = useState(
-    preferDiscountedPrice
-  );
   const [localUiRadiusPreset, setLocalUiRadiusPreset] = useState(uiRadiusPreset);
   const [localThemeTonePreset, setLocalThemeTonePreset] = useState(themeTonePreset);
   const [localAccentColor, setLocalAccentColor] = useState(accentColor);
@@ -493,7 +488,6 @@ export function SettingsDialog({
     setLocalShowNodePrice(showNodePrice);
     setLocalPriceDisplayCurrencyMode(priceDisplayCurrencyMode);
     setLocalUsdToCnyRate(String(usdToCnyRate));
-    setLocalPreferDiscountedPrice(preferDiscountedPrice);
     setLocalUiRadiusPreset(uiRadiusPreset);
     setLocalThemeTonePreset(themeTonePreset);
     setLocalAccentColor(accentColor);
@@ -528,7 +522,6 @@ export function SettingsDialog({
     setShowNodePrice(localShowNodePrice);
     setPriceDisplayCurrencyMode(localPriceDisplayCurrencyMode);
     setUsdToCnyRate(Number(localUsdToCnyRate));
-    setPreferDiscountedPrice(localPreferDiscountedPrice);
     setUiRadiusPreset(localUiRadiusPreset);
     setThemeTonePreset(localThemeTonePreset);
     setAccentColor(localAccentColor);
@@ -548,7 +541,6 @@ export function SettingsDialog({
     localShowNodePrice,
     localPriceDisplayCurrencyMode,
     localUsdToCnyRate,
-    localPreferDiscountedPrice,
     localUiRadiusPreset,
     localThemeTonePreset,
     localAccentColor,
@@ -567,7 +559,6 @@ export function SettingsDialog({
     setShowNodePrice,
     setPriceDisplayCurrencyMode,
     setUsdToCnyRate,
-    setPreferDiscountedPrice,
     setUiRadiusPreset,
     setThemeTonePreset,
     setAccentColor,
@@ -1470,13 +1461,6 @@ export function SettingsDialog({
                       />
                     </div>
                   </div>
-
-                  <SettingsCheckboxCard
-                    checked={localPreferDiscountedPrice}
-                    onCheckedChange={setLocalPreferDiscountedPrice}
-                    title={t('settings.preferDiscountedPrice')}
-                    description={t('settings.preferDiscountedPriceDesc')}
-                  />
 
                 </div>
 
