@@ -955,7 +955,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     const sourceWidth = sourceNode.measured?.width ?? DEFAULT_NODE_WIDTH;
     const sourceHeight = sourceNode.measured?.height ?? 200;
-    const anchorX = sourceNode.position.x + sourceWidth + 20;
+    // 下游生成节点尽量贴近母节点右侧(最近间隔 24px)
+    const anchorX = sourceNode.position.x + sourceWidth + 24;
     const anchorY = sourceNode.position.y;
 
     const zoom = Math.max(0.01, state.currentViewport.zoom || 1);
@@ -1011,6 +1012,15 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     // 输出节点优先沿来源节点右边排列，右侧被占用时仅做就近的上下错位。
     for (const offsetY of rightSideOffsets) {
       evaluateCandidate(anchorX, anchorY + offsetY * stepY);
+    }
+
+    // 细粒度右移采样: 在母节点右侧 0~96px 内小步进找最近空位,
+    // 避免 anchorX 被占时直接跳到很远的第一列(column*stepX)。
+    const fineOffsets = [12, 24, 48, 72, 96];
+    for (const offsetX of fineOffsets) {
+      for (const offsetY of rightSideOffsets) {
+        evaluateCandidate(anchorX + offsetX, anchorY + offsetY * stepY);
+      }
     }
 
     for (let column = 1; column <= 4; column += 1) {

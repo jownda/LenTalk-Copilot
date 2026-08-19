@@ -728,12 +728,6 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       void showErrorDialog(message, t('common.error'));
       return;
     }
-    if (selectedProfile?.status === 'pending-adaptation') {
-      const message = selectedProfile.unavailableReason ?? '该视频模型尚未完成独立适配';
-      setError(message);
-      void showErrorDialog(message, t('common.error'));
-      return;
-    }
     const prompt = [
       promptDraftRef.current.replace(/@(?=(?:图|音频)\d+)/g, '').trim(),
       ...inputText,

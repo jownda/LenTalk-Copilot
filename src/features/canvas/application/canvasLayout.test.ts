@@ -101,6 +101,22 @@ describe('computeSmartSnapLayout', () => {
     expect(result.get('c')).toEqual({ x: 100, y: 1000 });
   });
 
+  it('4 个同尺寸方块整理后拼成方阵(横平竖直, 不推远)', () => {
+    // 每个方块都略微偏移(≤阈值): a 固定, b 右上(微偏), c 左下(微偏), d 右下(微偏)
+    const nodes = [
+      createNode('a', 0, 0, 200, 200),
+      createNode('b', 190, 5, 200, 200),
+      createNode('c', 5, 190, 200, 200),
+      createNode('d', 195, 195, 200, 200),
+    ];
+    const result = computeSmartSnapLayout(nodes, SMART_SNAP_THRESHOLD);
+    // 整理后拼成 2×2 方阵(中间留 SNAP_EDGE_GAP 缝隙), 各节点位移都很小
+    expect(result.get('a')).toEqual({ x: 0, y: 0 });
+    expect(result.get('b')).toEqual({ x: 200 + SNAP_EDGE_GAP, y: 0 });
+    expect(result.get('c')).toEqual({ x: 0, y: 200 + SNAP_EDGE_GAP });
+    expect(result.get('d')).toEqual({ x: 200 + SNAP_EDGE_GAP, y: 200 + SNAP_EDGE_GAP });
+  });
+
   it('吸附后纵向重叠时自动错开(y 方向)', () => {
     // c 固定; a.left=6 → 吸到 c.left=0; b(宽100) cx 距 c.cx 10px → 吸到 x=60;
     // a(0..220, 300..500) 与 b(60..160, 320..420) x/y 均重叠 → b 下移错开

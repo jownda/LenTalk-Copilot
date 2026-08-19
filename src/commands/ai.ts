@@ -901,6 +901,38 @@ export async function generateJimengCliVideo(
   return await invoke<string>('generate_jimeng_cli_video', { request });
 }
 
+export interface JimengCliLoginStartResult {
+  needAuth: boolean;
+  verificationUri: string | null;
+  userCode: string | null;
+  deviceCode: string | null;
+  message: string;
+}
+
+export interface JimengCliLoginCheckResult {
+  success: boolean;
+  message: string;
+}
+
+/** 开始即梦 CLI 登录: 返回设备码登录材料(验证地址/用户码/设备码), 由调用方打开浏览器并轮询检查 */
+export async function jimengCliLoginStart(executable: string): Promise<JimengCliLoginStartResult> {
+  if (!isTauri()) {
+    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。');
+  }
+  return await invoke<JimengCliLoginStartResult>('jimeng_cli_login_start', { executable });
+}
+
+/** 查询即梦 CLI 设备码登录是否完成 */
+export async function jimengCliLoginCheck(
+  executable: string,
+  deviceCode: string
+): Promise<JimengCliLoginCheckResult> {
+  if (!isTauri()) {
+    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。');
+  }
+  return await invoke<JimengCliLoginCheckResult>('jimeng_cli_login_check', { executable, device_code: deviceCode });
+}
+
 function isCustomModel(model: string): boolean {
   return model.startsWith(CUSTOM_API_PROVIDER_PREFIX);
 }

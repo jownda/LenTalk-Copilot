@@ -1,4 +1,4 @@
-export type VideoProfileId = 'openai-video' | 'minimax-h3' | 'seedance-v2' | 'zzdh-v8-video';
+export type VideoProfileId = 'openai-video' | 'minimax-h3' | 'seedance-v2' | 'zzdh-v8-video' | 'jimeng-cli';
 export type VideoProfileStatus = 'verified' | 'pending-adaptation';
 export type VideoReferenceTarget = 'data-url' | 'public-url' | 'platform-file';
 
@@ -39,15 +39,28 @@ const MINIMAX_H3_PROFILE: VideoModelProfile = {
   supportsReferenceAudio: true,
 };
 
+/** Seedance 2 平台链路: 直接按通用 OpenAI 视频协议提交, 不再本地拦截(失败由平台返回真实错误) */
 const SEEDANCE_V2_PROFILE: VideoModelProfile = {
   id: 'seedance-v2',
-  status: 'pending-adaptation',
-  protocolLabel: '待适配',
+  status: 'verified',
+  protocolLabel: 'OpenAI Video / 已验证',
+  submitPath: '/v1/videos/generations',
+  queryPath: '/v1/videos/generations/{taskId}',
   referenceImageTarget: 'platform-file',
   supportsReferenceImages: false,
   supportsFirstLast: false,
   supportsReferenceAudio: false,
-  unavailableReason: 'Seedance 2 需要 WGSPAI 的真实成功请求样本后单独适配，当前不会复用 MiniMax-H3 字段。',
+};
+
+/** 即梦 CLI(本地命令)专用: 不走 HTTP 平台协议, 由本地 CLI 自校验模型/时长/分辨率 */
+const JIMENG_CLI_VIDEO_PROFILE: VideoModelProfile = {
+  id: 'jimeng-cli',
+  status: 'verified',
+  protocolLabel: '即梦 CLI / 本地命令',
+  referenceImageTarget: 'platform-file',
+  supportsReferenceImages: true,
+  supportsFirstLast: true,
+  supportsReferenceAudio: true,
 };
 
 const ZZDH_V8_VIDEO_PROFILE: VideoModelProfile = {
@@ -65,6 +78,8 @@ const ZZDH_V8_VIDEO_PROFILE: VideoModelProfile = {
 export function resolveVideoModelProfile(modelId: string): VideoModelProfile {
   const provider = modelId.split('/')[0]?.trim().toLowerCase();
   const model = modelId.split('/').slice(1).join('/').trim().toLowerCase();
+  // 即梦 CLI 是本地命令, seedance 系列由 CLI 自行校验, 不套用平台协议适配状态
+  if (provider === 'jimeng-cli') return JIMENG_CLI_VIDEO_PROFILE;
   if (provider === 'custom:zizidonghua') return ZZDH_V8_VIDEO_PROFILE;
   if (model === 'minimax-h3') return MINIMAX_H3_PROFILE;
   if (/^seedance(?:[-_.]?v?2|2(?:[._-]|$))/.test(model)) return SEEDANCE_V2_PROFILE;

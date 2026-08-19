@@ -2,7 +2,8 @@ import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Terminal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
-import { fetchProviderModels, testProviderConnection, verifyProviderUrl } from '@/commands/ai';
+import { fetchProviderModels, testProviderConnection, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck } from '@/commands/ai';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { recommendedApis } from '@/features/settings/recommendedApis';
 import { UiCheckbox, UiModal, UiSelect } from '@/components/ui';
 import { UI_CONTENT_OVERLAY_INSET_CLASS, UI_DIALOG_TRANSITION_MS } from '@/components/ui/motion';
@@ -185,6 +186,10 @@ export function SettingsDialog({
   const [recommendedApisExpanded, setRecommendedApisExpanded] = useState(false);
   const [showJimengCliSettings, setShowJimengCliSettings] = useState(false);
   const [localJimengCliExecutable, setLocalJimengCliExecutable] = useState(jimengCli.executable);
+  const [jimengLoginState, setJimengLoginState] = useState<'idle' | 'opening' | 'polling' | 'success' | 'error'>('idle');
+  const [jimengLoginInfo, setJimengLoginInfo] = useState<{ verificationUri: string; userCode: string; deviceCode: string } | null>(null);
+  const [jimengLoginMessage, setJimengLoginMessage] = useState('');
+  const jimengLoginTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const customApiSectionRef = useRef<HTMLDivElement>(null);
   const [showAddCustomApi, setShowAddCustomApi] = useState(false);
   const [editingCustomApiId, setEditingCustomApiId] = useState<string | null>(null);
@@ -232,6 +237,94 @@ export function SettingsDialog({
     setLocalJimengCliExecutable(jimengCli.executable);
     setShowJimengCliSettings(true);
   }, [jimengCli.executable]);
+
+  // 组件卸载/关闭时清理登录轮询
+  useEffect(() => {
+    return () => {
+      if (jimengLoginTimerRef.current) {
+        clearInterval(jimengLoginTimerRef.current);
+        jimengLoginTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  /** 一键登录即梦: 获取设备码 → 自动打开浏览器 → 轮询登录结果 */
+  const startJimengLogin = useCallback(async () => {
+    const executable = localJimengCliExecutable.trim() || 'dreamina';
+    setJimengLoginState('opening');
+    setJimengLoginMessage('');
+    setJimengLoginInfo(null);
+    if (jimengLoginTimerRef.current) {
+      clearInterval(jimengLoginTimerRef.current);
+      jimengLoginTimerRef.current = null;
+    }
+    try {
+      const result = await jimengCliLoginStart(executable);
+      if (!result.needAuth) {
+        setJimengLoginState('success');
+        setJimengLoginMessage(result.message || '已登录即梦账号');
+        return;
+      }
+      if (!result.verificationUri || !result.userCode || !result.deviceCode) {
+        throw new Error(result.message || '无法获取登录信息，请确认 CLI 已安装且可执行');
+      }
+      setJimengLoginInfo({
+        verificationUri: result.verificationUri,
+        userCode: result.userCode,
+        deviceCode: result.deviceCode,
+      });
+      try {
+        await openUrl(result.verificationUri);
+      } catch {
+        setJimengLoginMessage(`请在浏览器手动打开: ${result.verificationUri}`);
+      }
+      setJimengLoginState('polling');
+
+      const deviceCode = result.deviceCode;
+      let attempts = 0;
+      jimengLoginTimerRef.current = setInterval(async () => {
+        attempts += 1;
+        const stopPolling = () => {
+          if (jimengLoginTimerRef.current) {
+            clearInterval(jimengLoginTimerRef.current);
+            jimengLoginTimerRef.current = null;
+          }
+        };
+        try {
+          const check = await jimengCliLoginCheck(executable, deviceCode);
+          if (check.success) {
+            stopPolling();
+            setJimengLoginState('success');
+            setJimengLoginMessage(check.message || '登录成功');
+            return;
+          }
+          const lower = check.message.toLowerCase();
+          if (lower.includes('fail') || lower.includes('expired') || lower.includes('invalid') || check.message.includes('过期') || check.message.includes('失效')) {
+            stopPolling();
+            setJimengLoginState('error');
+            setJimengLoginMessage(check.message || '登录失败，请重试');
+            return;
+          }
+          if (attempts >= 60) {
+            stopPolling();
+            setJimengLoginState('error');
+            setJimengLoginMessage('等待授权超时。若已在浏览器完成授权，可在终端手动执行: dreamina login checklogin --device_code=<设备码>');
+            return;
+          }
+          setJimengLoginMessage(`等待浏览器授权完成…（已等待 ${attempts * 3} 秒）`);
+        } catch (error) {
+          if (attempts >= 60) {
+            stopPolling();
+            setJimengLoginState('error');
+            setJimengLoginMessage(error instanceof Error ? error.message : String(error));
+          }
+        }
+      }, 3000);
+    } catch (error) {
+      setJimengLoginState('error');
+      setJimengLoginMessage(error instanceof Error ? error.message : String(error));
+    }
+  }, [localJimengCliExecutable]);
 
   const saveJimengCliSettings = useCallback(() => {
     setJimengCliExecutable(localJimengCliExecutable);
@@ -1263,6 +1356,52 @@ export function SettingsDialog({
                     {t('settings.jimengCliExecutableDesc')}
                   </span>
                 </label>
+
+                <div className="rounded-md border border-border-dark bg-surface-dark/50 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-medium text-text-dark">
+                        {t('settings.jimengCliLoginTitle', '即梦账号登录')}
+                      </p>
+                      <p className="mt-0.5 text-[11px] leading-4 text-text-muted">
+                        {t('settings.jimengCliLoginDesc', '点击后自动打开浏览器完成授权，无需手动执行命令')}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={startJimengLogin}
+                      disabled={jimengLoginState === 'opening' || jimengLoginState === 'polling'}
+                      className="shrink-0 rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {jimengLoginState === 'opening'
+                        ? t('settings.jimengCliLogining', '获取授权中…')
+                        : jimengLoginState === 'polling'
+                          ? t('settings.jimengCliWaitingAuth', '等待授权…')
+                          : t('settings.jimengCliLoginBtn', '一键登录')}
+                    </button>
+                  </div>
+
+                  {jimengLoginInfo && (
+                    <div className="mt-3 rounded-md bg-bg-dark p-3 text-center">
+                      <p className="text-[11px] text-text-muted">
+                        {t('settings.jimengCliUserCodeHint', '请在浏览器打开的页面中输入以下代码')}
+                      </p>
+                      <p className="mt-1 font-mono text-2xl font-bold tracking-[0.3em] text-accent">
+                        {jimengLoginInfo.userCode}
+                      </p>
+                    </div>
+                  )}
+
+                  {jimengLoginMessage && (
+                    <p className={`mt-2 break-all text-[11px] leading-4 ${
+                      jimengLoginState === 'error' ? 'text-red-400' : 'text-text-muted'
+                    }`}>
+                      {jimengLoginState === 'error' && '✗ '}
+                      {jimengLoginState === 'success' && '✓ '}
+                      {jimengLoginMessage}
+                    </p>
+                  )}
+                </div>
 
                 <div className="space-y-2 rounded-md border border-border-dark bg-surface-dark/50 p-3 text-xs text-text-muted">
                   <p>{t('settings.jimengCliInstallStep')}</p>

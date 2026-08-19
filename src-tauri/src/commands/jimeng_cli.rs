@@ -477,3 +477,186 @@ fn output_summary(output: &str) -> String {
         compact
     }
 }
+
+#[derive(Debug, serde::Serialize)]
+pub struct JimengCliLoginStartResult {
+    /// true = 需要用户在浏览器完成授权; false = 已复用本地登录态
+    pub need_auth: bool,
+    pub verification_uri: Option<String>,
+    pub user_code: Option<String>,
+    pub device_code: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct JimengCliLoginCheckResult {
+    pub success: bool,
+    pub message: String,
+}
+
+/// 开始即梦 CLI 登录: 运行 `dreamina login --headless` 获取设备码登录材料。
+/// - 已登录 → need_auth=false
+/// - 未登录 → 解析出 verification_uri / user_code / device_code, 由前端打开浏览器并轮询 checklogin
+#[tauri::command]
+pub async fn jimeng_cli_login_start(executable: String) -> Result<JimengCliLoginStartResult, String> {
+    let executable = executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先在「设置 - 密钥 - 即梦 CLI」中填写 CLI 可执行命令".to_string());
+    }
+    let value = executable.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli(&value, &["login".to_string(), "--headless".to_string()])
+    })
+    .await
+    .map_err(|error| format!("即梦 CLI 登录任务中断: {error}"))??;
+
+    let lower = output.to_ascii_lowercase();
+    let already_logged_in = lower.contains("复用") || lower.contains("已登录")
+        || lower.contains("already logged") || lower.contains("reuse") || lower.contains("logged in");
+    if already_logged_in {
+        return Ok(JimengCliLoginStartResult {
+            need_auth: false,
+            verification_uri: None,
+            user_code: None,
+            device_code: None,
+            message: output.trim().to_string(),
+        });
+    }
+
+    let verification_uri = extract_url_field(&output);
+    let user_code = extract_field(&output, &["user_code", "userCode"]);
+    let device_code = extract_field(&output, &["device_code", "deviceCode"]);
+
+    let Some(verification_uri) = verification_uri else {
+        return Err(format!(
+            "无法从即梦 CLI 输出中找到验证地址，请手动在终端执行 `{} login` 完成登录。原始输出: {}",
+            executable,
+            output_summary(&output)
+        ));
+    };
+    if user_code.is_none() || device_code.is_none() {
+        return Err(format!(
+            "无法从即梦 CLI 输出中解析用户码/设备码，请手动在终端执行 `{} login` 完成登录。原始输出: {}",
+            executable,
+            output_summary(&output)
+        ));
+    }
+
+    Ok(JimengCliLoginStartResult {
+        need_auth: true,
+        verification_uri: Some(verification_uri),
+        user_code,
+        device_code,
+        message: output.trim().to_string(),
+    })
+}
+
+/// 查询即梦 CLI 设备码登录是否完成: `dreamina login checklogin --device_code=xxx`。
+/// 前端每 2~3 秒轮询一次, 直到 success=true 或出现失败/过期。
+#[tauri::command]
+pub async fn jimeng_cli_login_check(
+    executable: String,
+    device_code: String,
+) -> Result<JimengCliLoginCheckResult, String> {
+    let executable = executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先在「设置 - 密钥 - 即梦 CLI」中填写 CLI 可执行命令".to_string());
+    }
+    let device_code = device_code.trim().to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli(&executable, &[
+            "login".to_string(),
+            "checklogin".to_string(),
+            format!("--device_code={device_code}"),
+        ])
+    })
+    .await
+    .map_err(|error| format!("即梦 CLI 登录检查中断: {error}"))??;
+
+    let lower = output.to_ascii_lowercase();
+    let success = lower.contains("成功") || lower.contains("已登录")
+        || lower.contains("success") || lower.contains("logged in");
+    Ok(JimengCliLoginCheckResult {
+        success,
+        message: output.trim().to_string(),
+    })
+}
+
+/// 从 CLI 输出中提取 http(s) 验证地址(优先取 verification_uri/verification_url 字段, 兜底找任意 http 链接)。
+fn extract_url_field(output: &str) -> Option<String> {
+    for name in ["verification_uri", "verification_url", "verificationUrl"] {
+        if let Some(index) = output.find(name) {
+            let remainder = output[index + name.len()..].trim_start_matches(
+                |character: char| character == ' ' || character == ':' || character == '=' || character == '"' || character == '\'',
+            );
+            let value = remainder
+                .chars()
+                .take_while(|character| !character.is_whitespace() && !matches!(character, '"' | '\'' | ',' | ')'))
+                .collect::<String>();
+            if value.starts_with("http") {
+                return Some(value);
+            }
+        }
+    }
+    // 兜底: 输出里任意 https?:// 开头直到空白
+    for prefix in ["https://", "http://"] {
+        if let Some(index) = output.find(prefix) {
+            let value = output[index..]
+                .chars()
+                .take_while(|character| !character.is_whitespace() && !matches!(character, '"' | '\'' | ')' | ']' | ','))
+                .collect::<String>();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_verification_url_and_codes() {
+        let output = r#"
+verification_uri: https://jimeng.jianying.com/oauth/device/activate
+user_code: ABCD-EFGH
+device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
+"#;
+        assert_eq!(
+            extract_url_field(output).as_deref(),
+            Some("https://jimeng.jianying.com/oauth/device/activate")
+        );
+        assert_eq!(extract_field(output, &["user_code"]).as_deref(), Some("ABCD-EFGH"));
+        assert_eq!(
+            extract_field(output, &["device_code"]).as_deref(),
+            Some("8f3a2b9c1d4e5f6a7b8c9d0e")
+        );
+    }
+
+    #[test]
+    fn extracts_url_from_json_output() {
+        let output = r#"{"verification_uri":"https://jimeng.jianying.com/activate","user_code":"1234-5678","device_code":"abc123"}"#;
+        assert_eq!(
+            extract_url_field(output).as_deref(),
+            Some("https://jimeng.jianying.com/activate")
+        );
+        assert_eq!(extract_field(output, &["user_code"]).as_deref(), Some("1234-5678"));
+        assert_eq!(extract_field(output, &["device_code"]).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn falls_back_to_any_http_url() {
+        let output = "请打开 https://jimeng.jianying.com/oauth/device 完成授权";
+        assert_eq!(
+            extract_url_field(output).as_deref(),
+            Some("https://jimeng.jianying.com/oauth/device")
+        );
+    }
+
+    #[test]
+    fn returns_none_without_url() {
+        assert_eq!(extract_url_field("已复用当前本地 OAuth 登录态。"), None);
+    }
+}

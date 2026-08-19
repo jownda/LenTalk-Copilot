@@ -306,8 +306,12 @@ function resolveNonOverlapAlongX(
 /** 智能吸附阈值(px): 与附近节点/组边框边缘或中心线距离小于该值才吸附 */
 export const SMART_SNAP_THRESHOLD = 24;
 
-/** 边缘贴合时保留的间隙(px): 右缘贴左缘 / 左缘贴右缘 / 上下贴合时中间留空隙, 不紧紧挨着 */
-export const SNAP_EDGE_GAP = 24;
+/**
+ * 边缘贴合时保留的间隙(px): 右缘贴左缘 / 左缘贴右缘 / 上下贴合时中间留一点空隙。
+ * 不宜过大——间隙大于节点原有间距会把近的节点"推远"; 8px 既能避免贴死,
+ * 又能让 4 个同尺寸方块整理后拼成整齐方阵(横平竖直)。
+ */
+export const SNAP_EDGE_GAP = 8;
 
 interface SnapBox {
   left: number;

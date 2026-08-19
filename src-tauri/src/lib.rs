@@ -193,6 +193,8 @@ pub fn run() {
             ai_commands::get_generate_image_job,
             ai_commands::generate_image,
             jimeng_cli::generate_jimeng_cli_video,
+            jimeng_cli::jimeng_cli_login_start,
+            jimeng_cli::jimeng_cli_login_check,
             ai_commands::list_models,
             project_state::list_project_summaries,
             project_state::get_project_record,
