@@ -59,7 +59,7 @@ jobs:
           set -e
           VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
           VERSION_NUM="${VERSION#v}"
-          EXE=$(ls src-tauri/target/release/bundle/nsis/LenTalk_${VERSION_NUM}_*_setup.exe | head -1)
+          EXE=$(ls src-tauri/target/release/bundle/nsis/LenTalk_${VERSION_NUM}_*-setup.exe | head -1)
           EXE_NAME=$(basename "$EXE")
           SIG=$(cat "${EXE}.sig")
           cat > latest-windows.json <<EOF
