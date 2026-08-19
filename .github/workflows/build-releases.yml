@@ -77,7 +77,7 @@ jobs:
           EOF
 
       - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v2.4.2
+        uses: softprops/action-gh-release@v2.5.1
         with:
           tag_name: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
           name: LenTalk ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
@@ -157,7 +157,7 @@ jobs:
           EOF
 
       - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v2.4.2
+        uses: softprops/action-gh-release@v2.5.1
         with:
           tag_name: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
           name: LenTalk ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
