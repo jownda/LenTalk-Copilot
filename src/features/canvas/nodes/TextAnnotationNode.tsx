@@ -1,4 +1,10 @@
-import { memo, useCallback } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { FileText } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
@@ -35,7 +41,9 @@ export const TextAnnotationNode = memo(({
 }: TextAnnotationNodeProps) => {
   const { t } = useTranslation();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
+  const selectedNodeId = useCanvasStore((state) => state.selectedNodeId);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const [isEditing, setIsEditing] = useState(false);
   const content = typeof data.content === 'string' ? data.content : '';
   const resolvedTitle = resolveNodeDisplayName(CANVAS_NODE_TYPES.textAnnotation, data);
   const resolvedWidth = Math.max(MIN_WIDTH, Math.round(width ?? DEFAULT_WIDTH));
@@ -47,6 +55,23 @@ export const TextAnnotationNode = memo(({
     void openUrl(href);
   }, []);
 
+  // 单击(未拖动)进入编辑; 链接/表单控件/标题按钮上的单击不进入编辑
+  const handleNodeClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement | null;
+    if (target?.closest('a, button, input, textarea, select')) {
+      return;
+    }
+    setSelectedNode(id);
+    setIsEditing(true);
+  }, [id, setSelectedNode]);
+
+  // 选中状态变化(点击其他节点/画布空白/多选)时退出编辑
+  useEffect(() => {
+    if (selectedNodeId !== id) {
+      setIsEditing(false);
+    }
+  }, [id, selectedNodeId]);
+
   return (
     <div
       className={`
@@ -56,7 +81,7 @@ export const TextAnnotationNode = memo(({
           : 'border-[rgba(15,23,42,0.22)] hover:border-[rgba(15,23,42,0.34)] dark:border-[rgba(255,255,255,0.22)] dark:hover:border-[rgba(255,255,255,0.34)]'}
       `}
       style={{ width: resolvedWidth, height: resolvedHeight }}
-      onClick={() => setSelectedNode(id)}
+      onClick={handleNodeClick}
     >
       <NodeHeader
         className={NODE_HEADER_FLOATING_POSITION_CLASS}
@@ -79,7 +104,7 @@ export const TextAnnotationNode = memo(({
         className="!h-2 !w-2 !border-surface-dark !bg-accent"
       />
 
-      {selected ? (
+      {isEditing ? (
         <textarea
           autoFocus
           value={content}
@@ -91,7 +116,7 @@ export const TextAnnotationNode = memo(({
           className="nodrag nowheel h-full w-full resize-none border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-text-dark outline-none placeholder:text-text-muted/70"
         />
       ) : (
-        <div className="nodrag nowheel h-full w-full overflow-auto px-1 py-0.5 text-sm leading-6 text-text-dark">
+        <div className="nowheel h-full w-full cursor-grab select-none overflow-auto px-1 py-0.5 text-sm leading-6 text-text-dark active:cursor-grabbing">
           {content.trim().length > 0 ? (
             <div className="markdown-body break-words [&_a]:text-accent [&_blockquote]:border-l-2 [&_blockquote]:border-white/20 [&_blockquote]:pl-3 [&_code]:rounded [&_code]:bg-white/10 [&_code]:px-1 [&_code]:py-0.5 [&_h1]:text-base [&_h1]:font-semibold [&_h2]:text-[15px] [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-semibold [&_hr]:border-white/10 [&_li]:my-0.5 [&_ol]:list-decimal [&_ol]:pl-5 [&_p]:my-0 [&_p+_p]:mt-4 [&_pre]:overflow-auto [&_pre]:rounded-md [&_pre]:bg-black/30 [&_pre]:p-2 [&_table]:w-full [&_table]:border-collapse [&_table]:text-xs [&_td]:border [&_td]:border-white/10 [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:border-white/10 [&_th]:px-2 [&_th]:py-1 [&_ul]:list-disc [&_ul]:pl-5">
               <ReactMarkdown

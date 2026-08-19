@@ -295,41 +295,12 @@ impl OpenAICompatibleProvider {
             .unwrap_or(false)
     }
 
-    /// WGSPAI 将 gpt-image 模型映射到 Chat Completions，而不是 Images API。
-    /// 这是一条平台专用兼容分支，其他自定义平台继续使用其原有协议。
-    fn uses_wgspai_chat_completions(provider_id: &str) -> bool {
-        provider_id == "custom:wgspai"
-    }
-
-    fn build_wgspai_chat_completions_body(
-        api_model: &str,
-        prompt: &str,
-        reference_images: Option<&Vec<String>>,
-    ) -> Result<Value, AIError> {
-        let images = reference_images
-            .map(|references| {
-                references
-                    .iter()
-                    .filter_map(|reference| Self::reference_image_to_image_field(reference).transpose())
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let content = if images.is_empty() {
-            Value::String(prompt.to_string())
-        } else {
-            let mut parts = vec![json!({ "type": "text", "text": prompt })];
-            parts.extend(images.into_iter().map(|image_url| {
-                json!({ "type": "image_url", "image_url": { "url": image_url } })
-            }));
-            Value::Array(parts)
-        };
-
-        Ok(json!({
-            "model": api_model,
-            "messages": [{ "role": "user", "content": content }],
-            "temperature": 0.7,
-        }))
+    /// WGSPAI 的 gpt-image-2-2k 是 gpt-image-2 的 2K 档变体: OpenAI 只通过
+    /// Responses API(image_generation tool)提供该模型生成能力, 走
+    /// /v1/chat/completions 或 /v1/images/generations 都会得到 404。
+    /// 这是平台专用兼容分支, 其它自定义平台不受影响。
+    fn uses_wgspai_responses(provider_id: &str, api_model: &str) -> bool {
+        provider_id == "custom:wgspai" && api_model.to_ascii_lowercase().contains("gpt-image")
     }
 
     /// 构造 Responses API 请求体: input_text + input_image + image_generation tool。
@@ -480,7 +451,8 @@ impl OpenAICompatibleProvider {
                 }
             }
         }
-        Self::extract_wgspai_chat_image(payload)
+        Self::extract_responses_image(payload)
+            .or_else(|| Self::extract_wgspai_chat_image(payload))
     }
 
     /// 从提交响应中提取任务 id(各平台非标字段名)。
@@ -643,20 +615,11 @@ impl AIProvider for OpenAICompatibleProvider {
             .trim_end_matches('/')
             .to_string();
         let client = Self::build_client();
-        let is_wgspai_chat = Self::uses_wgspai_chat_completions(provider_id);
-        let is_responses = Self::is_responses_protocol(&request.extra_params);
+        let force_wgspai_responses = Self::uses_wgspai_responses(provider_id, api_model);
+        let is_responses = Self::is_responses_protocol(&request.extra_params) || force_wgspai_responses;
         let reference_image_field = Self::resolve_reference_image_field(&request.extra_params, api_model);
         let reference_image_count = request.reference_images.as_ref().map(|images| images.len()).unwrap_or(0);
-        let (endpoint, body) = if is_wgspai_chat {
-            (
-                format!("{}/v1/chat/completions", base_url),
-                Self::build_wgspai_chat_completions_body(
-                    api_model,
-                    &request.prompt,
-                    request.reference_images.as_ref(),
-                )?,
-            )
-        } else if is_responses {
+        let (endpoint, body) = if is_responses {
             (
                 format!("{}/v1/responses", base_url),
                 Self::build_responses_body(
@@ -678,13 +641,15 @@ impl AIProvider for OpenAICompatibleProvider {
                 )?,
             )
         };
+        // 记录最终使用的协议, WGSPAI 降级后会从 responses 切到 images
+        let mut active_protocol = if is_responses { "responses" } else { "images" };
 
         info!(
             "[OpenAI Compatible Request] model: {}, protocol: {}, reference_images: {}, reference_image_field: {}",
             api_model,
-            if is_wgspai_chat { "wgspai-chat" } else if is_responses { "responses" } else { "images" },
+            active_protocol,
             reference_image_count,
-            if is_wgspai_chat || is_responses { "image_url" } else { reference_image_field },
+            if is_responses { "image_url" } else { reference_image_field },
         );
 
         let response = client
@@ -697,7 +662,35 @@ impl AIProvider for OpenAICompatibleProvider {
         let mut status = response.status();
         // 先读文本, 再尝试 JSON: 4xx/5xx 平台可能返回 HTML/空 body, 避免笼统的 "decoding response body"
         let mut body_text = response.text().await?;
-        if !is_wgspai_chat && !is_responses && Self::should_retry_with_alternate_reference_field(
+
+        // WGSPAI gpt-image: 部分渠道的 Responses 路由未挂载时返回 404, 降级到
+        // Images API + input_image 重试一次(该平台模型在 images 通道也可能可用)。
+        if force_wgspai_responses
+            && status == reqwest::StatusCode::NOT_FOUND
+            && body_text.to_ascii_lowercase().contains("not found")
+        {
+            let fallback_body = Self::build_request_body(
+                api_model,
+                &request.prompt,
+                &request.aspect_ratio,
+                request.reference_images.as_ref(),
+                "input_image",
+            )?;
+            info!(
+                "[OpenAI Compatible Request] WGSPAI gpt-image Responses 404, falling back to /v1/images/generations"
+            );
+            let fallback_response = client
+                .post(format!("{}/v1/images/generations", base_url))
+                .bearer_auth(&api_key)
+                .json(&fallback_body)
+                .send()
+                .await?;
+            status = fallback_response.status();
+            body_text = fallback_response.text().await?;
+            active_protocol = "images";
+        }
+
+        if !force_wgspai_responses && !is_responses && Self::should_retry_with_alternate_reference_field(
             status,
             &body_text,
             reference_image_count,
@@ -749,7 +742,7 @@ impl AIProvider for OpenAICompatibleProvider {
             )));
         }
 
-        if is_responses {
+        if active_protocol == "responses" {
             if let Some(image) = Self::extract_responses_image(&payload) {
                 return Ok(image);
             }
@@ -792,14 +785,16 @@ impl AIProvider for OpenAICompatibleProvider {
             .resolve_base_url_and_key(provider_id, &request.extra_params)
             .await?;
         let client = Self::build_client();
-        let is_wgspai_chat = Self::uses_wgspai_chat_completions(provider_id);
+        let force_wgspai_responses = Self::uses_wgspai_responses(provider_id, api_model);
+        let is_responses = Self::is_responses_protocol(&request.extra_params) || force_wgspai_responses;
         let reference_image_field = Self::resolve_reference_image_field(&request.extra_params, api_model);
-        let (endpoint, body) = if is_wgspai_chat {
+        let (endpoint, body) = if is_responses {
             (
-                format!("{}/v1/chat/completions", base_url),
-                Self::build_wgspai_chat_completions_body(
+                format!("{}/v1/responses", base_url),
+                Self::build_responses_body(
                     api_model,
                     &request.prompt,
+                    &request.aspect_ratio,
                     request.reference_images.as_ref(),
                 )?,
             )
@@ -825,7 +820,33 @@ impl AIProvider for OpenAICompatibleProvider {
         let mut status = response.status();
         let mut body_text = response.text().await?;
         let reference_image_count = request.reference_images.as_ref().map(|images| images.len()).unwrap_or(0);
-        if !is_wgspai_chat && Self::should_retry_with_alternate_reference_field(
+
+        // WGSPAI gpt-image: Responses 404 时降级到 Images API + input_image 重试一次。
+        if force_wgspai_responses
+            && status == reqwest::StatusCode::NOT_FOUND
+            && body_text.to_ascii_lowercase().contains("not found")
+        {
+            let fallback_body = Self::build_request_body(
+                api_model,
+                &request.prompt,
+                &request.aspect_ratio,
+                request.reference_images.as_ref(),
+                "input_image",
+            )?;
+            info!(
+                "[OpenAI Compatible Request] async: WGSPAI gpt-image Responses 404, falling back to /v1/images/generations"
+            );
+            let fallback_response = client
+                .post(format!("{}/v1/images/generations", base_url))
+                .bearer_auth(&api_key)
+                .json(&fallback_body)
+                .send()
+                .await?;
+            status = fallback_response.status();
+            body_text = fallback_response.text().await?;
+        }
+
+        if !force_wgspai_responses && !is_responses && Self::should_retry_with_alternate_reference_field(
             status,
             &body_text,
             reference_image_count,
@@ -1011,25 +1032,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_wgspai_chat_request_with_reference_images() {
-        let references = vec![
-            "data:image/png;base64,QUJD".to_string(),
-            "https://example.com/reference.png".to_string(),
-        ];
-        let body = OpenAICompatibleProvider::build_wgspai_chat_completions_body(
-            "gpt-image-2-2k",
-            "edit the product image",
-            Some(&references),
-        )
-        .expect("WGSPAI chat body should be built");
-
-        assert_eq!(body["model"], "gpt-image-2-2k");
-        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
-        assert_eq!(body["messages"][0]["content"][1]["image_url"]["url"], references[0]);
-        assert_eq!(body["messages"][0]["content"][2]["image_url"]["url"], references[1]);
-    }
-
-    #[test]
     fn extracts_wgspai_chat_image_url_from_markdown_content() {
         let payload = serde_json::json!({
             "choices": [{
@@ -1127,5 +1129,27 @@ mod tests {
         .expect("request body should be built");
 
         assert_eq!(body["input_image"], serde_json::json!(["QUJD", "REVG"]));
+    }
+
+    #[test]
+    fn wgspai_gpt_image_uses_responses_protocol() {
+        assert!(OpenAICompatibleProvider::uses_wgspai_responses(
+            "custom:wgspai",
+            "gpt-image-2-2k"
+        ));
+        assert!(OpenAICompatibleProvider::uses_wgspai_responses(
+            "custom:wgspai",
+            "GPT-Image-2-2k"
+        ));
+        // 其它平台不受影响
+        assert!(!OpenAICompatibleProvider::uses_wgspai_responses(
+            "custom:comfly",
+            "gpt-image-2-2k"
+        ));
+        // 非 gpt-image 模型(如视频)不受影响
+        assert!(!OpenAICompatibleProvider::uses_wgspai_responses(
+            "custom:wgspai",
+            "seedance-v2-720p"
+        ));
     }
 }

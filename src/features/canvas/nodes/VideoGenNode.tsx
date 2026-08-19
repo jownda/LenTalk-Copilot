@@ -19,6 +19,7 @@ import { CANVAS_NODE_TYPES, EXPORT_RESULT_NODE_MIN_HEIGHT, EXPORT_RESULT_NODE_MI
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { canvasAiGateway, graphImageResolver } from '@/features/canvas/application/canvasServices';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
+import { CURRENT_RUNTIME_SESSION_ID } from '@/features/canvas/application/generationErrorReport';
 import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
 import { getDefaultVideoModelId, getModelProvider, getVideoModel, JIMENG_CLI_PROVIDER_ID, listVideoModels, resolveVideoModelProfile } from '@/features/canvas/models';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
@@ -766,10 +767,25 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       aspectRatio: data.aspectRatio,
       isGenerating: true,
       generationStartedAt,
+      // 标记本次运行会话, 避免 Canvas 的"生成中节点自动恢复"逻辑把本次正常提交
+      // 误判为重启残留任务而重复提交(重复扣费)
+      generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
       generationDurationMs: selectedModel.expectedDurationMs ?? 180000,
       generationProviderId: selectedModel.providerId,
       generationModel: selectedModel.id,
       providerBaseUrl: baseUrl,
+      generationRequest: {
+        kind: 'video',
+        clientJobId: isJimengCli ? id : undefined,
+        prompt,
+        model: selectedModel.id,
+        duration: selectedDuration,
+        aspectRatio: data.aspectRatio,
+        videoResolution: selectedVideoResolution,
+        imageMode,
+        referenceImages: videoReferenceImages,
+        referenceAudio: inputAudio,
+      },
     });
     updateNodeSize(outputId, compactSize.width, compactSize.height);
     addEdge(id, outputId);
@@ -797,6 +813,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         generationStartedAt: null,
         generationError: null,
         generationErrorDetails: null,
+        generationClientSessionId: null,
+        generationRequest: undefined,
       });
     } catch (generationError) {
       const resolved = resolveErrorContent(generationError, '视频生成失败');
@@ -806,6 +824,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         generationStartedAt: null,
         generationError: resolved.message,
         generationErrorDetails: resolved.details ?? null,
+        generationClientSessionId: null,
       });
       void showErrorDialog(resolved.message, t('common.error'), resolved.details);
     } finally {

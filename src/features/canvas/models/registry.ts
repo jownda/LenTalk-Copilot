@@ -120,9 +120,16 @@ export function listVideoModels(): VideoModelDefinition[] {
       ...api.models.filter(isVideoGenerationModelName),
     ])).map((model) => {
       const isMinimaxH3 = model.trim().toLowerCase() === 'minimax-h3';
-      const profile = resolveVideoModelProfile(model);
+      const modelId = buildCustomModelId(api.id, model);
+      const profile = resolveVideoModelProfile(modelId);
+      const isZzdh = api.id.trim().toLowerCase() === 'zizidonghua'
+        || api.baseUrl.trim().toLowerCase().includes('zizidonghua.com');
+      const modelResolution = model.trim().match(/(?:^|[-_])(480p|720p|1080p|2k)(?:[-_]|$)/i)?.[1]?.toLowerCase();
+      const resolutionValues = isZzdh
+        ? (modelResolution ? [modelResolution] : ['720p', '1080p'])
+        : undefined;
       return {
-        id: buildCustomModelId(api.id, model),
+        id: modelId,
         mediaType: 'video' as const,
         displayName: `${api.name} · ${model}`,
         providerId: buildCustomProviderId(api.id),
@@ -140,6 +147,13 @@ export function listVideoModels(): VideoModelDefinition[] {
             { value: '2K', label: '2K' },
           ],
           defaultResolution: '2K',
+        } : {}),
+        ...(resolutionValues ? {
+          resolutions: resolutionValues.map((value) => ({
+            value,
+            label: value.toUpperCase(),
+          })),
+          defaultResolution: resolutionValues[0],
         } : {}),
         pricing: resolveCustomVideoPricing(api.name, model),
         profileId: profile.id,
@@ -262,6 +276,44 @@ const WGSPAI_GPT_IMAGE_2_2K_PRICING = createFixedResolutionPricing({
   },
 });
 
+const ZZDH_VIDEO_PRICE_PER_SECOND: Record<string, number> = {
+  'zzdh-minimax-h3-480p': 0.06,
+  'zzdh-minimax-h3-720p': 0.09,
+  'zzdh-minimax-h3-1080p': 0.12,
+  'zzdh-minimax-h3-2k': 0.16,
+  'kling-v3-omni': 0.8,
+  'kling-3.0-omni-720p-noref-mute': 0.51,
+  'kling-3.0-omni-720p-noref-audio': 0.68,
+  'kling-3.0-omni-720p-ref-mute': 0.77,
+  'kling-3.0-omni-720p-ref-audio': 0.94,
+  'kling-3.0-omni-1080p-noref-mute': 0.68,
+  'kling-3.0-omni-1080p-noref-audio': 0.85,
+  'kling-3.0-omni-1080p-ref-mute': 1.19,
+  'kling-3.0-omni-1080p-ref-audio': 1.02,
+  'doubao-seedance-2-480p': 0.49,
+  'doubao-seedance-2-720p': 1.09,
+  'doubao-seedance-2-1080p': 2.7,
+  'doubao-seedance-2-4k': 5.56,
+  'doubao-seedance-2-0-fast-480p': 0.4,
+  'doubao-seedance-2-0-fast-720p': 0.88,
+  'doubao-seedance-2-0-mini-480p': 0.25,
+  'doubao-seedance-2-0-mini-720p': 0.55,
+  'doubao-seedance-2-5-480p': 0.84,
+  'doubao-seedance-2-5-720p': 1.81,
+  'doubao-seedance-2-video-480p': 0.3,
+  'doubao-seedance-2-video-720p': 0.67,
+  'doubao-seedance-2-video-1080p': 1.66,
+  'doubao-seedance-2-video-4k': 3.42,
+  'doubao-seedance-2-0-fast-video-480p': 0.24,
+  'doubao-seedance-2-0-fast-video-720p': 0.52,
+  'doubao-seedance-2-0-mini-video-480p': 0.15,
+  'doubao-seedance-2-0-mini-video-720p': 0.33,
+  'doubao-seedance-2-5-video-480p': 0.51,
+  'doubao-seedance-2-5-video-720p': 1.09,
+  'doubao-seedance-2-video-优惠版-720p': 0.6,
+  'doubao-seedance-2-video-优惠版-1080p': 1.2,
+};
+
 function resolveCustomImagePricing(apiName: string, model: string) {
   if (apiName.trim().toLowerCase() === 'wgspai' && model.trim().toLowerCase() === 'gpt-image-2-2k') {
     return WGSPAI_GPT_IMAGE_2_2K_PRICING;
@@ -270,8 +322,21 @@ function resolveCustomImagePricing(apiName: string, model: string) {
 }
 
 function resolveCustomVideoPricing(apiName: string, model: string) {
-  if (apiName.trim().toLowerCase() !== 'wgspai') return undefined;
+  const normalizedApiName = apiName.trim().toLowerCase();
   const normalized = model.trim().toLowerCase();
+  if (normalizedApiName === '字子动画' || normalizedApiName === '字字动画' || normalizedApiName === 'zizidonghua') {
+    const perSecond = ZZDH_VIDEO_PRICE_PER_SECOND[normalized];
+    if (perSecond != null) {
+      return {
+        quote: ({ extraParams }: { extraParams?: Record<string, unknown> }) => ({
+          amount: perSecond * Math.max(1, Number(extraParams?.duration) || 5),
+          currency: 'CNY' as const,
+        }),
+      };
+    }
+    return undefined;
+  }
+  if (normalizedApiName !== 'wgspai') return undefined;
   const perSecondRates: Record<string, number> = {
     'seedance-v2-720p-fast': 0.17,
     'seedance-v2-720p': 0.3,

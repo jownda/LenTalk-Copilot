@@ -219,6 +219,25 @@ function mapNodeImageReferences(
       }
     }
 
+    // Generation recovery requests may contain reference images/audio URLs.
+    // Encode those values through the same image pool so a restart does not
+    // lose the inputs or make the project record unnecessarily large.
+    const generationRequest = nextData.generationRequest;
+    if (generationRequest && typeof generationRequest === 'object') {
+      const requestRecord = generationRequest as Record<string, unknown>;
+      const nextRequest: Record<string, unknown> = { ...requestRecord };
+      if (Array.isArray(requestRecord.referenceImages)) {
+        nextRequest.referenceImages = requestRecord.referenceImages.map((value) =>
+          typeof value === 'string' ? mapImageUrl(value) ?? null : value
+        );
+      }
+      if (Array.isArray(requestRecord.referenceAudio)) {
+        // Audio URLs/paths are not image-pool entries; preserve them verbatim.
+        nextRequest.referenceAudio = [...requestRecord.referenceAudio];
+      }
+      nextData.generationRequest = nextRequest;
+    }
+
     if (Array.isArray(nextData.frames)) {
       nextData.frames = nextData.frames.map((frame) => {
         if (!frame || typeof frame !== 'object') {

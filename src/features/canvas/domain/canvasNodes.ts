@@ -60,8 +60,36 @@ export type ExportImageNodeResultKind =
   | 'storyboardSplitExport'
   | 'storyboardFrameEdit';
 
+/** Persisted input needed to recover a generation after an app restart. */
+export interface ImageGenerationRequestData {
+  kind: 'image';
+  prompt: string;
+  negativePrompt?: string;
+  model: string;
+  size: string;
+  aspectRatio: string;
+  referenceImages?: string[];
+  extraParams?: Record<string, unknown>;
+}
+
+export interface VideoGenerationRequestData {
+  kind: 'video';
+  clientJobId?: string;
+  prompt: string;
+  model: string;
+  duration: number;
+  aspectRatio: string;
+  videoResolution?: string;
+  imageMode?: 'reference' | 'first-last';
+  referenceImages?: string[];
+  referenceAudio?: string[];
+}
+
+export type PersistedGenerationRequest = ImageGenerationRequestData | VideoGenerationRequestData;
+
 export interface ExportImageNodeData extends NodeImageData {
   resultKind?: ExportImageNodeResultKind;
+  generationRequest?: ImageGenerationRequestData;
 }
 
 export interface GroupNodeData extends NodeDisplayData {
@@ -202,6 +230,7 @@ export interface AudioNodeData extends NodeDisplayData {
   generationProviderId?: string | null;
   generationModel?: string | null;
   providerBaseUrl?: string | null;
+  generationRequest?: VideoGenerationRequestData;
   [key: string]: unknown;
 }
 

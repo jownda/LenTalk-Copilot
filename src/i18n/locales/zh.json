@@ -106,6 +106,7 @@
     "copy": "复制",
     "copyText": "复制文本",
     "copyErrorReport": "复制报错",
+    "retryGeneration": "重试生成",
     "copied": "已复制",
     "download": "下载",
     "ungroup": "解散",

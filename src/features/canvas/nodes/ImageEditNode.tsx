@@ -646,6 +646,18 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         isGenerating: true,
         generationStartedAt,
         generationDurationMs,
+        // 创建即标记当前运行会话: 提交拿到 jobId 前的窗口期内, Canvas 的
+        // "无 jobId 自动恢复"逻辑不会把本节点当作残留任务重复提交(重复扣费)
+        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+        generationRequest: {
+          kind: 'image',
+          prompt,
+          model: requestResolution.requestModel,
+          size: selectedResolution.value,
+          aspectRatio: selectedAspectRatio.value,
+          referenceImages: incomingImages,
+          extraParams: effectiveExtraParams,
+        },
         resultKind: 'generic',
         displayName: resultNodeTitle,
       }
@@ -674,6 +686,21 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
       }
 
       const negativePrompt = String((data as Record<string, unknown>).negativePrompt ?? '').trim();
+      updateNodeData(newNodeId, {
+        // 先标记当前运行会话: 提交拿到 jobId 前的窗口期内, Canvas 的
+        // "无 jobId 自动恢复"逻辑不会把本节点当作残留任务重复提交
+        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+        generationRequest: {
+          kind: 'image',
+          prompt,
+          negativePrompt: negativePrompt || undefined,
+          model: requestResolution.requestModel,
+          size: selectedResolution.value,
+          aspectRatio: resolvedRequestAspectRatio,
+          referenceImages: incomingImages,
+          extraParams: effectiveExtraParams,
+        },
+      });
       const jobId = await canvasAiGateway.submitGenerateImageJob({
         prompt,
         negativePrompt: negativePrompt || undefined,

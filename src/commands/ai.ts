@@ -256,7 +256,7 @@ function normalizeVideoProviderBaseUrl(baseUrl: string): string {
   const normalized = baseUrl.trim().replace(/\/+$/, '');
   // 设置页的 Base URL 约定为站点根路径。兼容用户粘贴 OpenAI 常见的
   // `.../v1` 地址，避免最终请求被拼成 `/v1/v1/video/generations`。
-  return normalized.replace(/\/v1$/i, '');
+  return normalized.replace(/\/v(?:1|8)$/i, '');
 }
 
 function getVideoTaskStatus(payload: unknown): string {
@@ -320,6 +320,164 @@ function resolveWgspaiVideoStudioSize(aspectRatio: string): string {
     '1:1': '1024x1024',
   };
   return sizeByRatio[aspectRatio] ?? '1280x720';
+}
+
+function resolveZzdhVideoResolution(value: string | undefined, aspectRatio: string, model: string): string {
+  const requested = value?.trim().toLowerCase() ?? '';
+  // 模型名锁定档位时按官方大写档位交付(720P / 1080P / 2K), 与模型名交付分辨率一致
+  const modelLocked = model.trim().toLowerCase().match(/(?:^|[-_])(480p|540p|720p|1080p|2k)(?:[-_]|$)/)?.[1];
+  if (modelLocked) return modelLocked.toUpperCase();
+  if (/^\d+x\d+$/.test(requested)) return requested;
+  const dimensions: Record<string, Record<string, string>> = {
+    '16:9': { '480p': '854x480', '720p': '1280x720', '1080p': '1920x1080', '2k': '2560x1440' },
+    '9:16': { '480p': '480x854', '720p': '720x1280', '1080p': '1080x1920', '2k': '1440x2560' },
+    '1:1': { '480p': '480x480', '720p': '720x720', '1080p': '1080x1080', '2k': '2048x2048' },
+  };
+  return dimensions[aspectRatio.trim()]?.[requested]
+    ?? dimensions[aspectRatio.trim()]?.['720p']
+    ?? '1280x720';
+}
+
+/** 读取图片实际宽高(供首尾帧画幅跟随首帧), 失败返回 null */
+function loadImageDimensions(source: string): Promise<{ width: number; height: number } | null> {
+  return new Promise((resolve) => {
+    try {
+      const image = new Image();
+      image.onload = () => {
+        const width = image.naturalWidth;
+        const height = image.naturalHeight;
+        resolve(width > 0 && height > 0 ? { width, height } : null);
+      };
+      image.onerror = () => resolve(null);
+      image.src = source;
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/** zzdh 官方支持的画幅枚举(文档无 adaptive, 首尾帧必须显式传画幅) */
+const ZZDH_ASPECT_RATIO_VALUES: Array<{ label: string; value: number }> = [
+  { label: '16:9', value: 16 / 9 },
+  { label: '9:16', value: 9 / 16 },
+  { label: '1:1', value: 1 },
+  { label: '4:3', value: 4 / 3 },
+  { label: '3:4', value: 3 / 4 },
+  { label: '21:9', value: 21 / 9 },
+];
+
+/** 把图片宽高映射到 zzdh 支持的画幅标签(取最接近) */
+function resolveZzdhAspectRatioLabel(width: number, height: number): string {
+  if (width <= 0 || height <= 0) return '16:9';
+  const ratio = width / height;
+  let best = ZZDH_ASPECT_RATIO_VALUES[0];
+  let bestDiff = Number.POSITIVE_INFINITY;
+  for (const candidate of ZZDH_ASPECT_RATIO_VALUES) {
+    const diff = Math.abs(candidate.value - ratio);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = candidate;
+    }
+  }
+  return best.label;
+}
+
+/**
+ * 首尾帧画幅: zzdh 网关对 H3 默认 16:9 且不自动跟随图片,
+ * 必须显式传 aspect_ratio(官方枚举)才能得到正确画幅。
+ * 从首帧读取宽高映射到支持画幅, 读不到时回退 UI 选择的画幅。
+ */
+async function resolveZzdhFirstLastAspectRatio(
+  firstFrameSource: string | undefined,
+  fallbackAspectRatio: string
+): Promise<string> {
+  const dimensions = await loadImageDimensions(firstFrameSource ?? '');
+  if (!dimensions) return fallbackAspectRatio;
+  return resolveZzdhAspectRatioLabel(dimensions.width, dimensions.height);
+}
+
+async function generateZzdhVideo(
+  request: GenerateVideoRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>
+): Promise<string> {
+  const isFirstLast = request.image_mode === 'first-last';
+  const isMinimaxH3 = apiModel.trim().toLowerCase().includes('minimax');
+  const images = request.reference_images?.slice(0, isFirstLast ? 2 : undefined) ?? [];
+  // role 按官方文档判定生成模式: 首尾帧用 first_frame/last_frame;
+  // 参考生必须显式标 reference_image(否则 1~2 张图会被误判为首尾帧)
+  const referenceImages = images.map((url, index) => ({
+    url,
+    ...(isFirstLast
+      ? { role: index === 0 ? 'first_frame' : 'last_frame' }
+      : { role: 'reference_image' }),
+  }));
+  // 画幅: zzdh 网关默认 16:9, 必须显式传 aspect_ratio(官方枚举);
+  // 首尾帧从首帧推导画幅跟随图片, 其它模式用 UI 选择的画幅。
+  const aspectRatio = isFirstLast
+    ? await resolveZzdhFirstLastAspectRatio(images[0], request.aspect_ratio)
+    : request.aspect_ratio;
+  // 分辨率: H3 模型名已锁定交付档位, 官方文档要求不传(传则必须与模型名一致, 否则被拒);
+  // 其它模型(如 Kling)按原逻辑传精确尺寸/档位。
+  const resolution = isMinimaxH3
+    ? undefined
+    : resolveZzdhVideoResolution(request.video_resolution, request.aspect_ratio, apiModel);
+  // H3 时长限制 5~15 秒(官方文档)
+  const duration = isMinimaxH3
+    ? Math.max(5, Math.min(15, Math.round(request.duration)))
+    : Math.max(1, Math.round(request.duration));
+  const body = {
+    model: apiModel,
+    prompt: request.prompt,
+    duration,
+    aspect_ratio: aspectRatio,
+    ...(resolution ? { resolution } : {}),
+    ...(referenceImages.length ? { reference_images: referenceImages } : {}),
+  };
+  const submitUrl = `${baseUrl}/v8/videos/generations`;
+  const response = await fetch(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`字子动画视频请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`字子动画视频请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  }
+  const immediateResult = getVideoResultUrl(payload);
+  if (immediateResult) return immediateResult;
+  const taskId = getVideoTaskId(payload);
+  if (!taskId) {
+    throw new Error(`字子动画视频响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
+  }
+
+  const taskUrl = `${submitUrl}/${encodeURIComponent(taskId)}`;
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const taskResponse = await fetch(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    try {
+      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`字子动画视频查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`字子动画视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const videoUrl = getVideoResultUrl(payload);
+    if (videoUrl) return videoUrl;
+    const status = getVideoTaskStatus(payload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`字子动画视频生成失败: ${status}`);
+    }
+  }
 }
 
 function getWgspaiStudioError(payload: unknown): string {
@@ -663,6 +821,9 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   }
   if (request.extra_params?.video_transport === 'wgspai-studio') {
     return await generateWgspaiStudioVideo(request, baseUrl, apiKey, apiModel, headers);
+  }
+  if (request.extra_params?.video_transport === 'zzdh-v8-video') {
+    return await generateZzdhVideo(request, baseUrl, apiModel, headers);
   }
   const videoImages = request.image_mode === 'first-last'
     ? request.reference_images?.slice(0, 2)

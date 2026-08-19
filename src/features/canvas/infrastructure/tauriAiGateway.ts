@@ -9,6 +9,7 @@ import {
 import {
 } from '@tauri-apps/api/core';
 import {
+  createCompactImageDataUrl,
   imageUrlToDataUrl,
 } from '@/features/canvas/application/imageData';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -72,6 +73,10 @@ function injectCustomApiRequestMode(payload: GenerateImagePayload): GenerateImag
       ? 'wgspai-minimax-h3'
       : 'wgspai-openai-video';
   }
+  const providerBaseUrl = customApi?.baseUrl?.trim().toLowerCase() ?? '';
+  if (providerId === 'zizidonghua' || providerBaseUrl.includes('zizidonghua.com')) {
+    extraParams.video_transport = 'zzdh-v8-video';
+  }
   extraParams.reference_image_field = referenceImageField;
   return {
     ...payload,
@@ -125,24 +130,66 @@ async function normalizeVideoReferenceImages(
   if (!imageUrls?.length) return undefined;
   const useWgspaiUpload = extraParams?.video_transport === 'wgspai-openai-video'
     || extraParams?.video_transport === 'wgspai-minimax-h3';
+  const useZzdhCompactImage = extraParams?.video_transport === 'zzdh-v8-video';
   const providerBaseUrl = typeof extraParams?.provider_base_url === 'string'
     ? extraParams.provider_base_url.trim().replace(/\/+$/, '').replace(/\/v1$/i, '')
     : '';
   const providerId = modelId.split('/')[0] ?? '';
   const apiModel = normalizeWgspaiVideoModelName(modelId.split('/').slice(1).join('/') || modelId);
   const apiKey = useSettingsStore.getState().apiKeys[providerId] ?? '';
+  // zzdh 官方文档: 素材支持 data: base64, 单图上限 20MB。
+  // 本地图最清晰策略: 先转无损原始 data URL, 未超预算直接使用;
+  // 超预算才压缩到 2048px / 0.9 质量(接近视觉无损)。预算按总请求体约 16MB
+  // 在图片间分摊, 单图下限 1MB, 避免参考生多图时被摊薄变模糊。
+  const zzdhImageBudget = Math.max(1_000_000, Math.floor(16_000_000 / Math.max(1, imageUrls.length)));
+  const zzdhMaxDimension = 2048;
+  const zzdhQuality = 0.9;
 
   return await Promise.all(imageUrls.map(async (imageUrl) => {
     const source = imageUrl.trim();
     if (!source) return source;
-    if (/^https?:\/\//i.test(source)) return source;
-    const dataUrl = await imageUrlToDataUrl(source);
+    if (/^https?:\/\//i.test(source)) {
+      if (!useZzdhCompactImage) return source;
+      // 官方文档: 素材支持公网 HTTP(S) URL 或 data: Base64。
+      // 公网 URL 且路径带图片扩展名 → 直接无损透传(官方最清晰方式);
+      // 无扩展名的签名 URL 可能被上游拒绝(Kling 文档), 才压缩成 data URL 兜底。
+      if (/\.(jpe?g|png|webp|gif|bmp|heic)(\?|#|$)/i.test(source)) {
+        return source;
+      }
+      try {
+        return await createCompactImageDataUrl(source, zzdhMaxDimension, zzdhQuality, zzdhImageBudget);
+      } catch {
+        // If a remote host blocks browser-side image reads, its public URL is
+        // still usable by the provider and is much smaller than a data URL.
+        return source;
+      }
+    }
+    const dataUrl = useZzdhCompactImage
+      ? await resolveZzdhReferenceDataUrl(source, zzdhMaxDimension, zzdhQuality, zzdhImageBudget)
+      : await imageUrlToDataUrl(source);
     if (!useWgspaiUpload) return dataUrl;
     if (!providerBaseUrl || !apiKey || !apiModel) {
       throw new Error('WGSPAI 参考图片上传需要配置 Base URL、API Key 和模型名称');
     }
     return await uploadWgspaiVideoReferenceImage(dataUrl, providerBaseUrl, apiKey, apiModel);
   }));
+}
+
+/**
+ * 本地图最清晰策略: 先转无损原始 data URL, 未超预算直接使用(完全不损失画质);
+ * 超预算(大图/多图)才压缩到 maxDimension / quality, 保证请求体不超限。
+ */
+async function resolveZzdhReferenceDataUrl(
+  source: string,
+  maxDimension: number,
+  quality: number,
+  budget: number
+): Promise<string> {
+  const rawDataUrl = await imageUrlToDataUrl(source);
+  if (rawDataUrl.length <= budget) {
+    return rawDataUrl;
+  }
+  return await createCompactImageDataUrl(source, maxDimension, quality, budget);
 }
 
 /** WGSPAI 的上游视频模型会下载图片 URL，不接受 data: URL。 */
@@ -152,20 +199,56 @@ async function uploadWgspaiVideoReferenceImage(
   apiKey: string,
   model: string
 ): Promise<string> {
+  const encodedModel = encodeURIComponent(model);
   const imageResponse = await fetch(dataUrl);
   if (!imageResponse.ok) {
     throw new Error(`无法读取参考图片: HTTP ${imageResponse.status}`);
   }
   const imageBlob = await imageResponse.blob();
+  const filename = imageFileName(imageBlob);
+
+  // WGSPAI runs the New API distributor in front of /v1/files. That
+  // distributor does not extract `model` from multipart requests, so a
+  // multipart upload reaches the router with an empty model and is rejected
+  // before the file handler runs. Send a JSON/base64 request first so the
+  // distributor can select the model from the body.
+  const jsonResponse = await fetch(
+    `${baseUrl}/v1/files?model=${encodedModel}&model_name=${encodedModel}`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        model_name: model,
+        purpose: 'assistants',
+        filename,
+        file: dataUrl,
+      }),
+    }
+  );
+  const jsonRawResponse = await jsonResponse.text();
+  let jsonPayload: unknown = null;
+  try {
+    jsonPayload = JSON.parse(jsonRawResponse);
+  } catch {
+    jsonPayload = null;
+  }
+  if (jsonResponse.ok) {
+    const assetUrl = extractUploadedAssetUrl(jsonPayload, baseUrl);
+    if (assetUrl) return assetUrl;
+  }
+
   const formData = new FormData();
-  formData.append('file', imageBlob, imageFileName(imageBlob));
+  formData.append('file', imageBlob, filename);
   formData.append('purpose', 'assistants');
   formData.append('model', model);
   formData.append('model_name', model);
 
-  // WGSPAI 的不同文件上传通道对模型字段的读取位置不一致：有的读 multipart
-  // `model`，有的只读 query 的 `model_name`。两种命名同时传递，不改变视频链路。
-  const encodedModel = encodeURIComponent(model);
+  // Older WGSPAI deployments still expose the OpenAI multipart shape. Keep it
+  // as a fallback for those deployments after the JSON route above.
   const uploadUrl = `${baseUrl}/v1/files?model=${encodedModel}&model_name=${encodedModel}`;
   const response = await fetch(uploadUrl, {
     method: 'POST',
@@ -184,8 +267,12 @@ async function uploadWgspaiVideoReferenceImage(
     const errorMessage = record && typeof record.error === 'object'
       ? String((record.error as Record<string, unknown>).message ?? '')
       : '';
+    const jsonError = jsonPayload && typeof jsonPayload === 'object'
+      ? String((jsonPayload as Record<string, unknown>).error ?? '')
+      : '';
     throw new Error(
-      `WGSPAI 参考图片上传失败: HTTP ${response.status}${errorMessage ? `: ${errorMessage}` : ''} (model: ${model})`
+      `WGSPAI 参考图片上传失败: HTTP ${response.status}${errorMessage ? `: ${errorMessage}` : ''}`
+      + `${jsonError && jsonError !== errorMessage ? `; JSON 上传: ${jsonError}` : ''} (model: ${model})`
     );
   }
 

@@ -419,6 +419,7 @@ export function Canvas() {
   const pasteIterationRef = useRef(0);
   const pasteImageHandledRef = useRef(false);
   const activeGenerationPollNodeIdsRef = useRef(new Set<string>());
+  const activeVideoRecoveryNodeIdsRef = useRef(new Set<string>());
   const duplicateNodesRef = useRef<((sourceNodeIds: string[]) => string | null) | null>(null);
   const altDragCopyRef = useRef<{
     sourceNodeIds: string[];
@@ -596,7 +597,12 @@ export function Canvas() {
         return false;
       }
       const data = node.data as Record<string, unknown>;
-      return data.isGenerating === true && typeof data.generationJobId === 'string' && data.generationJobId.length > 0;
+      const request = data.generationRequest;
+      const hasRecoverableRequest = request && typeof request === 'object'
+        && (request as { kind?: unknown }).kind === 'image';
+      return data.isGenerating === true
+        && ((typeof data.generationJobId === 'string' && data.generationJobId.length > 0)
+          || hasRecoverableRequest);
     });
 
     for (const pendingNode of pendingExportNodes) {
@@ -616,13 +622,24 @@ export function Canvas() {
             const currentData = currentNode.data as Record<string, unknown>;
             const jobId = typeof currentData.generationJobId === 'string' ? currentData.generationJobId : '';
             const isGenerating = currentData.isGenerating === true;
-            if (!jobId || !isGenerating) {
+            const generationRequest = currentData.generationRequest as {
+              kind?: unknown;
+              prompt?: unknown;
+              negativePrompt?: unknown;
+              model?: unknown;
+              size?: unknown;
+              aspectRatio?: unknown;
+              referenceImages?: unknown;
+              extraParams?: unknown;
+            } | undefined;
+            if (!isGenerating || (!jobId && generationRequest?.kind !== 'image')) {
               break;
             }
 
+            const requestModel = typeof generationRequest?.model === 'string' ? generationRequest.model : '';
             const generationProviderId = typeof currentData.generationProviderId === 'string'
               ? currentData.generationProviderId
-              : '';
+              : requestModel.split('/')[0] ?? '';
             if (generationProviderId) {
               const providerApiKey = apiKeys[generationProviderId] ?? '';
               if (providerApiKey) {
@@ -633,6 +650,52 @@ export function Canvas() {
                     error,
                   });
                 });
+              }
+            }
+
+            // A user-triggered retry has no provider job id yet: submit the
+            // persisted request and then use the normal job poller.
+            if (!jobId && generationRequest?.kind === 'image') {
+              // 当前运行会话正常提交的节点: 提交方马上会写入 jobId,
+              // 无 jobId 只是窗口期, 直接等待下一轮轮询, 绝不重复提交(重复扣费)
+              if (currentData.generationClientSessionId === CURRENT_RUNTIME_SESSION_ID) {
+                await sleep(GENERATION_JOB_POLL_INTERVAL_MS);
+                continue;
+              }
+              try {
+                const submittedJobId = await canvasAiGateway.submitGenerateImageJob({
+                  prompt: typeof generationRequest.prompt === 'string' ? generationRequest.prompt : '',
+                  negativePrompt: typeof generationRequest.negativePrompt === 'string'
+                    ? generationRequest.negativePrompt
+                    : undefined,
+                  model: requestModel,
+                  size: typeof generationRequest.size === 'string' ? generationRequest.size : '1K',
+                  aspectRatio: typeof generationRequest.aspectRatio === 'string'
+                    ? generationRequest.aspectRatio
+                    : '1:1',
+                  referenceImages: Array.isArray(generationRequest.referenceImages)
+                    ? generationRequest.referenceImages.filter((value): value is string => typeof value === 'string')
+                    : [],
+                  extraParams: generationRequest.extraParams && typeof generationRequest.extraParams === 'object'
+                    ? generationRequest.extraParams as Record<string, unknown>
+                    : undefined,
+                });
+                updateNodeData(pendingNode.id, {
+                  generationJobId: submittedJobId,
+                  generationProviderId: generationProviderId || null,
+                  generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+                });
+                await sleep(GENERATION_JOB_POLL_INTERVAL_MS);
+                continue;
+              } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                updateNodeData(pendingNode.id, {
+                  isGenerating: false,
+                  generationStartedAt: null,
+                  generationError: errorMessage,
+                  generationErrorDetails: errorMessage,
+                });
+                break;
               }
             }
 
@@ -690,6 +753,7 @@ export function Canvas() {
                 generationError: null,
                 generationErrorDetails: null,
                 generationDebugContext: undefined,
+                generationRequest: undefined,
               });
               break;
             }
@@ -721,6 +785,90 @@ export function Canvas() {
           }
         } finally {
           activeGenerationPollNodeIdsRef.current.delete(pendingNode.id);
+        }
+      })();
+    }
+  }, [apiKeys, nodes, updateNodeData]);
+
+  // Video generation currently uses provider-specific HTTP flows without a
+  // shared task-status command. A restart leaves the request available for
+  // an explicit user-triggered retry from the result node toolbar.
+  useEffect(() => {
+    const pendingVideoNodes = nodes.filter((node) => {
+      if (node.type !== CANVAS_NODE_TYPES.audio) return false;
+      const data = node.data as Record<string, unknown>;
+      const request = data.generationRequest;
+      // 本次运行会话已提交的任务跳过自动恢复: 正常点击生成时节点刚创建,
+      // 若不排除会与节点自身的提交重复(同一任务提交两次、重复扣费)。
+      if (data.generationClientSessionId === CURRENT_RUNTIME_SESSION_ID) return false;
+      return data.isGenerating === true
+        && request && typeof request === 'object'
+        && (request as { kind?: unknown }).kind === 'video';
+    });
+
+    for (const pendingNode of pendingVideoNodes) {
+      if (activeVideoRecoveryNodeIdsRef.current.has(pendingNode.id)) continue;
+      activeVideoRecoveryNodeIdsRef.current.add(pendingNode.id);
+      void (async () => {
+        try {
+          const currentNode = useCanvasStore.getState().nodes.find((node) => node.id === pendingNode.id);
+          const currentData = currentNode?.data as Record<string, unknown> | undefined;
+          const request = currentData?.generationRequest as {
+            kind?: unknown;
+            clientJobId?: unknown;
+            prompt?: unknown;
+            model?: unknown;
+            duration?: unknown;
+            aspectRatio?: unknown;
+            videoResolution?: unknown;
+            imageMode?: unknown;
+            referenceImages?: unknown;
+            referenceAudio?: unknown;
+          } | undefined;
+          if (!request || request.kind !== 'video') return;
+
+          const model = typeof request.model === 'string' ? request.model : '';
+          const providerId = typeof currentData?.generationProviderId === 'string'
+            ? currentData.generationProviderId
+            : model.split('/')[0] ?? '';
+          if (providerId && !model.startsWith('jimeng-cli/')) {
+            const providerApiKey = apiKeys[providerId] ?? '';
+            if (providerApiKey) await canvasAiGateway.setApiKey(providerId, providerApiKey);
+          }
+
+          const videoUrl = await canvasAiGateway.generateVideo({
+            clientJobId: typeof request.clientJobId === 'string' ? request.clientJobId : undefined,
+            prompt: typeof request.prompt === 'string' ? request.prompt : '',
+            model,
+            duration: typeof request.duration === 'number' ? request.duration : 5,
+            aspectRatio: typeof request.aspectRatio === 'string' ? request.aspectRatio : '16:9',
+            videoResolution: typeof request.videoResolution === 'string' ? request.videoResolution : undefined,
+            imageMode: request.imageMode === 'first-last' ? 'first-last' : 'reference',
+            referenceImages: Array.isArray(request.referenceImages)
+              ? request.referenceImages.filter((value): value is string => typeof value === 'string')
+              : [],
+            referenceAudio: Array.isArray(request.referenceAudio)
+              ? request.referenceAudio.filter((value): value is string => typeof value === 'string')
+              : [],
+          });
+          updateNodeData(pendingNode.id, {
+            sourcePath: videoUrl,
+            isGenerating: false,
+            generationStartedAt: null,
+            generationError: null,
+            generationErrorDetails: null,
+            generationRequest: undefined,
+          });
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          updateNodeData(pendingNode.id, {
+            isGenerating: false,
+            generationStartedAt: null,
+            generationError: errorMessage,
+            generationErrorDetails: errorMessage,
+          });
+        } finally {
+          activeVideoRecoveryNodeIdsRef.current.delete(pendingNode.id);
         }
       })();
     }
@@ -2533,6 +2681,8 @@ export function Canvas() {
         snapGrid={[20, 20]}
         // 左/中/右键拖拽均可平移画布; 框选改用「双击第二下按住拖拽」(自定义实现)
         panOnDrag={[0, 1, 2]}
+        // 拖拽阈值: 移动超过 4px 才算拖动, 避免单击(想进入编辑)时轻微手抖被误判成拖动
+        nodeDragThreshold={4}
         // 禁用空格临时平移(默认 Space 会让光标随按键重复闪烁)
         panActivationKeyCode={null}
         onPaneContextMenu={handleCanvasContextMenu}

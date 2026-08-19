@@ -106,6 +106,7 @@
     "copy": "Copy",
     "copyText": "Copy Text",
     "copyErrorReport": "Copy Error",
+    "retryGeneration": "Retry Generation",
     "copied": "Copied",
     "download": "Download",
     "ungroup": "Ungroup",

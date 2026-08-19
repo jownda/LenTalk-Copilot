@@ -264,16 +264,27 @@ function normalizeNodes(rawNodes: CanvasNode[]): CanvasNode[] {
         mergedData.aspectRatio = DEFAULT_ASPECT_RATIO;
       }
 
-      // Keep generation state only when there is a recoverable job id.
+      // Keep the original request when there is no provider job id so the user
+      // can explicitly retry an interrupted generation after restarting.
       if ('isGenerating' in mergedData && mergedData.isGenerating) {
         const generationJobId =
           typeof (mergedData as { generationJobId?: unknown }).generationJobId === 'string'
             ? (mergedData as { generationJobId?: string }).generationJobId?.trim() ?? ''
             : '';
-        if (!generationJobId) {
+        const generationRequest = (mergedData as { generationRequest?: unknown }).generationRequest;
+        if (!generationJobId && (!generationRequest || typeof generationRequest !== 'object')) {
           mergedData.isGenerating = false;
           if ('generationStartedAt' in mergedData) {
             mergedData.generationStartedAt = null;
+          }
+        } else if (!generationJobId) {
+          mergedData.isGenerating = false;
+          if ('generationStartedAt' in mergedData) {
+            mergedData.generationStartedAt = null;
+          }
+          if (!mergedData.generationError) {
+            mergedData.generationError = '应用重启时生成被中断，请点击重试生成';
+            mergedData.generationErrorDetails = 'generation interrupted by app restart';
           }
         }
       }
@@ -303,13 +314,85 @@ function normalizeHistory(history?: CanvasHistoryState): CanvasHistoryState {
   };
 
   return {
-    past: history.past.slice(-MAX_HISTORY_STEPS).map(normalizeSnapshot),
-    future: history.future.slice(-MAX_HISTORY_STEPS).map(normalizeSnapshot),
+    past: dedupeSnapshots(history.past.slice(-MAX_HISTORY_STEPS).map(normalizeSnapshot)),
+    future: dedupeSnapshots(history.future.slice(-MAX_HISTORY_STEPS).map(normalizeSnapshot)),
   };
 }
 
 function createSnapshot(nodes: CanvasNode[], edges: CanvasEdge[]): CanvasHistorySnapshot {
   return { nodes, edges };
+}
+
+/** 深度比较两个快照/任意结构的内容是否一致(用于历史栈内容级去重) */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (typeof a !== typeof b || a === null || b === null) {
+    return false;
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    for (let index = 0; index < a.length; index += 1) {
+      if (!deepEqual(a[index], b[index])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (typeof a === 'object' && typeof b === 'object') {
+    const aRecord = a as Record<string, unknown>;
+    const bRecord = b as Record<string, unknown>;
+    const aKeys = Object.keys(aRecord);
+    const bKeys = Object.keys(bRecord);
+    if (aKeys.length !== bKeys.length) {
+      return false;
+    }
+    for (const key of aKeys) {
+      if (!deepEqual(aRecord[key], bRecord[key])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 比较前后节点是否发生了"用户可感知"的几何变化(位置/尺寸)。
+ * 忽略 selected 等非几何字段: 单击选中节点也会触发 drag 起止(position change),
+ * 但位置没变就不应写入历史, 否则 undo 会被"无变化"的快照塞满而看起来失效。
+ */
+function nodesGeometryEqual(before: CanvasNode[], after: CanvasNode[]): boolean {
+  if (before.length !== after.length) {
+    return false;
+  }
+  const afterMap = new Map(after.map((node) => [node.id, node] as const));
+  for (const nodeBefore of before) {
+    const nodeAfter = afterMap.get(nodeBefore.id);
+    if (!nodeAfter) {
+      return false;
+    }
+    if (
+      nodeBefore.position.x !== nodeAfter.position.x
+      || nodeBefore.position.y !== nodeAfter.position.y
+    ) {
+      return false;
+    }
+    const widthBefore = nodeBefore.measured?.width ?? nodeBefore.width;
+    const widthAfter = nodeAfter.measured?.width ?? nodeAfter.width;
+    if (widthBefore !== widthAfter) {
+      return false;
+    }
+    const heightBefore = nodeBefore.measured?.height ?? nodeBefore.height;
+    const heightAfter = nodeAfter.measured?.height ?? nodeAfter.height;
+    if (heightBefore !== heightAfter) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function collectNodeIdsWithDescendants(nodes: CanvasNode[], seedIds: string[]): Set<string> {
@@ -511,7 +594,9 @@ function pushSnapshot(
   snapshot: CanvasHistorySnapshot
 ): CanvasHistorySnapshot[] {
   const last = snapshots[snapshots.length - 1];
-  if (last && last.nodes === snapshot.nodes && last.edges === snapshot.edges) {
+  // 内容级去重: 仅引用不同但内容相同(如纯选中/测量/重复点击)时不重复入栈,
+  // 否则 undo 会被无意义快照塞满, 按很多次都看不到实际变化
+  if (last && deepEqual(last, snapshot)) {
     return snapshots;
   }
 
@@ -520,6 +605,19 @@ function pushSnapshot(
     next.shift();
   }
   return next;
+}
+
+/** 相邻内容相同的快照去重(用于清理旧项目持久化历史中的垃圾条目) */
+function dedupeSnapshots(snapshots: CanvasHistorySnapshot[]): CanvasHistorySnapshot[] {
+  const result: CanvasHistorySnapshot[] = [];
+  for (const snapshot of snapshots) {
+    const last = result[result.length - 1];
+    if (last && deepEqual(last, snapshot)) {
+      continue;
+    }
+    result.push(snapshot);
+  }
+  return result;
 }
 
 function getDerivedNodePosition(nodes: CanvasNode[], sourceNodeId: string): { x: number; y: number } {
@@ -608,7 +706,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
           return withManualSizeLock(node);
         });
       }
-      const hasMeaningfulChange = changes.some((change) => change.type !== 'select');
+      // 首次渲染/内容变化触发的尺寸测量(dimensions 无 resizing 字段)不是用户操作, 不写入历史
+      const isMeasurementChange = (change: NodeChange<CanvasNode>): boolean =>
+        change.type === 'dimensions' && !('resizing' in change);
+      const hasMeaningfulChange = changes.some(
+        (change) => change.type !== 'select' && !isMeasurementChange(change)
+      );
       const hasDragMove = changes.some(
         (change) =>
           change.type === 'position' &&
@@ -645,10 +748,15 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
       if (hasInteractionEnd) {
         const snapshot = nextDragHistorySnapshot ?? createSnapshot(state.nodes, state.edges);
-        nextHistory = {
-          past: pushSnapshot(state.history.past, snapshot),
-          future: [],
-        };
+        // 拖/缩没有产生实际位置/尺寸变化(如单击选中节点、点到 resize 角即松开):
+        // 不写历史, 且保留 redo 栈, 否则 undo 后随便点一下 redo 就失效了
+        const currentSnapshot: CanvasHistorySnapshot = { nodes: nextNodes, edges: state.edges };
+        if (!nodesGeometryEqual(snapshot.nodes, currentSnapshot.nodes)) {
+          nextHistory = {
+            past: pushSnapshot(state.history.past, snapshot),
+            future: [],
+          };
+        }
         nextDragHistorySnapshot = null;
       } else if (hasMeaningfulChange && !hasInteractionMove) {
         nextHistory = {

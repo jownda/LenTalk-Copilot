@@ -356,6 +356,65 @@ export async function createPreviewDataUrl(
   return renderPreviewDataUrl(image, normalizedDataUrl, safeMaxDimension);
 }
 
+/**
+ * Create a compact JPEG data URL for providers that accept inline images but
+ * enforce a small JSON request limit. This is intentionally separate from the
+ * canvas preview so generation references are compressed even when the source
+ * image is already below the preview dimension threshold.
+ */
+export async function createCompactImageDataUrl(
+  imageUrl: string,
+  maxDimension = 768,
+  quality = 0.58,
+  maxDataUrlLength = 60_000
+): Promise<string> {
+  const normalizedDataUrl = await imageUrlToDataUrl(imageUrl);
+  const image = await loadImageElement(normalizedDataUrl);
+  const safeMaxDimension = Math.max(64, Math.floor(maxDimension));
+  const longestSide = Math.max(image.naturalWidth, image.naturalHeight);
+  const boundedLength = Math.max(12_000, Math.floor(maxDataUrlLength));
+  let dimension = Math.min(safeMaxDimension, Math.max(image.naturalWidth, image.naturalHeight));
+  let jpegQuality = Math.min(0.9, Math.max(0.25, quality));
+
+  // Some video gateways reject otherwise valid requests when inline images
+  // make the JSON body too large. Re-encode progressively until the data URL
+  // is below the explicit per-image budget.
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const scale = longestSide > dimension ? dimension / longestSide : 1;
+    const targetWidth = Math.max(1, Math.round(image.naturalWidth * scale));
+    const targetHeight = Math.max(1, Math.round(image.naturalHeight * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const context = canvas.getContext('2d');
+    if (!context) return normalizedDataUrl;
+
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = 'high';
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, targetWidth, targetHeight);
+    context.drawImage(image, 0, 0, targetWidth, targetHeight);
+    const result = canvas.toDataURL('image/jpeg', jpegQuality);
+    if (result.length <= boundedLength) return result;
+
+    jpegQuality = Math.max(0.25, jpegQuality - 0.08);
+    dimension = Math.max(128, Math.floor(dimension * 0.78));
+  }
+
+  // Keep the final result bounded even for unusually noisy images. The last
+  // iteration is already the smallest representation produced above.
+  const scale = Math.min(1, 256 / Math.max(1, longestSide));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext('2d');
+  if (!context) return normalizedDataUrl;
+  context.fillStyle = '#ffffff';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/jpeg', 0.25);
+}
+
 export async function prepareNodeImage(
   imageUrl: string,
   maxPreviewDimension = DEFAULT_PREVIEW_MAX_DIMENSION

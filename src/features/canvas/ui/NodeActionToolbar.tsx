@@ -63,6 +63,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const canCopyStoryboardText = isStoryboardGen || isStoryboardSplit;
   const tools = useMemo(() => getNodeToolPlugins(node), [node]);
   const deleteNode = useCanvasStore((state) => state.deleteNode);
+  const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const ungroupNode = useCanvasStore((state) => state.ungroupNode);
   const canReupload = isUploadNode(node) && Boolean(node.data.imageUrl);
   const downloadPresetPaths = useSettingsStore((state) => state.downloadPresetPaths);
@@ -110,6 +111,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       : '';
   const canCopyGenerationError =
     (isExportImageNode(node) || isGeneratedVideoNode) && generationError.length > 0;
+  const canRetryGeneration = canCopyGenerationError
+    && Boolean((node.data as { generationRequest?: unknown }).generationRequest);
   const generationErrorReport = useMemo(
     () =>
       buildGenerationErrorReport({
@@ -265,6 +268,20 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     }
   }, [canCopyGenerationError, generationErrorReport]);
 
+  const handleRetryGeneration = useCallback(() => {
+    if (!canRetryGeneration) {
+      return;
+    }
+    updateNodeData(node.id, {
+      isGenerating: true,
+      generationStartedAt: Date.now(),
+      generationError: null,
+      generationErrorDetails: null,
+      generationJobId: null,
+      generationClientSessionId: null,
+    });
+  }, [canRetryGeneration, node.id, updateNodeData]);
+
   const handleDownloadSaveAs = useCallback(async () => {
     if (!downloadSource) {
       return;
@@ -394,6 +411,20 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           >
             <Copy className="h-3.5 w-3.5" />
             {isCopyErrorSuccess ? t('nodeToolbar.copied') : t('nodeToolbar.copyErrorReport')}
+          </UiChipButton>
+        )}
+        {!isImageEdit && canRetryGeneration && (
+          <UiChipButton
+            key="generation-retry"
+            className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} border-amber-400/50 bg-amber-500/15 px-2.5 text-xs text-amber-200 hover:bg-amber-500/25`}
+            onClick={(event) => {
+              event.stopPropagation();
+              handleRetryGeneration();
+            }}
+            title={t('nodeToolbar.retryGeneration')}
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            {t('nodeToolbar.retryGeneration')}
           </UiChipButton>
         )}
         {!isImageEdit && canHandleMedia && (
