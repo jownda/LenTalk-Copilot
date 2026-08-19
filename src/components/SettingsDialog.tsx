@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Terminal } from 'lucide-react';
-import { Trans, useTranslation } from 'react-i18next';
+import { useTranslation } from 'react-i18next';
 import { isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
 import { fetchProviderModels, testProviderConnection, verifyProviderUrl } from '@/commands/ai';
 import { recommendedApis } from '@/features/settings/recommendedApis';
@@ -8,8 +8,6 @@ import { UiCheckbox, UiModal, UiSelect } from '@/components/ui';
 import { UI_CONTENT_OVERLAY_INSET_CLASS, UI_DIALOG_TRANSITION_MS } from '@/components/ui/motion';
 import { useDialogTransition } from '@/components/ui/useDialogTransition';
 import { listModelProviders } from '@/features/canvas/models';
-import { GRSAI_NANO_BANANA_PRO_MODEL_OPTIONS } from '@/features/canvas/models/providers/grsai';
-import { GRSAI_CREDIT_TIERS } from '@/features/canvas/pricing/types';
 import type { SettingsCategory } from '@/features/settings/settingsEvents';
 
 interface SettingsDialogProps {
@@ -94,7 +92,6 @@ export function SettingsDialog({
     apiKeys,
     customApis,
     jimengCli,
-    grsaiNanoBananaProModel,
     useUploadFilenameAsNodeTitle,
     storyboardGenKeepStyleConsistent,
     storyboardGenDisableTextInImage,
@@ -106,7 +103,6 @@ export function SettingsDialog({
     priceDisplayCurrencyMode,
     usdToCnyRate,
     preferDiscountedPrice,
-    grsaiCreditTierId,
     uiRadiusPreset,
     themeTonePreset,
     accentColor,
@@ -118,7 +114,6 @@ export function SettingsDialog({
     addCustomApi,
     updateCustomApi,
     removeCustomApi,
-    setGrsaiNanoBananaProModel,
     setUseUploadFilenameAsNodeTitle,
     setStoryboardGenKeepStyleConsistent,
     setStoryboardGenDisableTextInImage,
@@ -130,7 +125,6 @@ export function SettingsDialog({
     setPriceDisplayCurrencyMode,
     setUsdToCnyRate,
     setPreferDiscountedPrice,
-    setGrsaiCreditTierId,
     setUiRadiusPreset,
     setThemeTonePreset,
     setAccentColor,
@@ -139,7 +133,7 @@ export function SettingsDialog({
     setEnableUpdateDialog,
   } = useSettingsStore();
   const providers = useMemo(() => {
-    const providerOrder = ['kie', 'ppio', 'fal', 'grsai'];
+    const providerOrder = ['kie', 'ppio', 'fal'];
     const providerIndex = new Map(providerOrder.map((id, index) => [id, index]));
     // 推荐平台列表: 隐藏 KIE / 派欧云(ppio) / fal / GRSAI
     const hiddenProviderIds = new Set(['kie', 'ppio', 'fal', 'grsai']);
@@ -157,9 +151,6 @@ export function SettingsDialog({
   }, []);
   const [activeCategory, setActiveCategory] = useState<SettingsCategory>(initialCategory);
   const [localApiKeys, setLocalApiKeys] = useState<Record<string, string>>(apiKeys);
-  const [localGrsaiNanoBananaProModel, setLocalGrsaiNanoBananaProModel] = useState(
-    grsaiNanoBananaProModel
-  );
   const [localUseUploadFilenameAsNodeTitle, setLocalUseUploadFilenameAsNodeTitle] = useState(
     useUploadFilenameAsNodeTitle
   );
@@ -185,7 +176,6 @@ export function SettingsDialog({
   const [localPreferDiscountedPrice, setLocalPreferDiscountedPrice] = useState(
     preferDiscountedPrice
   );
-  const [localGrsaiCreditTierId, setLocalGrsaiCreditTierId] = useState(grsaiCreditTierId);
   const [localUiRadiusPreset, setLocalUiRadiusPreset] = useState(uiRadiusPreset);
   const [localThemeTonePreset, setLocalThemeTonePreset] = useState(themeTonePreset);
   const [localAccentColor, setLocalAccentColor] = useState(accentColor);
@@ -493,7 +483,6 @@ export function SettingsDialog({
       return;
     }
     setLocalApiKeys(apiKeys);
-    setLocalGrsaiNanoBananaProModel(grsaiNanoBananaProModel);
     setLocalUseUploadFilenameAsNodeTitle(useUploadFilenameAsNodeTitle);
     setLocalStoryboardGenKeepStyleConsistent(storyboardGenKeepStyleConsistent);
     setLocalStoryboardGenDisableTextInImage(storyboardGenDisableTextInImage);
@@ -505,7 +494,6 @@ export function SettingsDialog({
     setLocalPriceDisplayCurrencyMode(priceDisplayCurrencyMode);
     setLocalUsdToCnyRate(String(usdToCnyRate));
     setLocalPreferDiscountedPrice(preferDiscountedPrice);
-    setLocalGrsaiCreditTierId(grsaiCreditTierId);
     setLocalUiRadiusPreset(uiRadiusPreset);
     setLocalThemeTonePreset(themeTonePreset);
     setLocalAccentColor(accentColor);
@@ -530,7 +518,6 @@ export function SettingsDialog({
     providers.forEach((provider) => {
       setProviderApiKey(provider.id, localApiKeys[provider.id] ?? '');
     });
-    setGrsaiNanoBananaProModel(localGrsaiNanoBananaProModel);
     setUseUploadFilenameAsNodeTitle(localUseUploadFilenameAsNodeTitle);
     setStoryboardGenKeepStyleConsistent(localStoryboardGenKeepStyleConsistent);
     setStoryboardGenDisableTextInImage(localStoryboardGenDisableTextInImage);
@@ -542,7 +529,6 @@ export function SettingsDialog({
     setPriceDisplayCurrencyMode(localPriceDisplayCurrencyMode);
     setUsdToCnyRate(Number(localUsdToCnyRate));
     setPreferDiscountedPrice(localPreferDiscountedPrice);
-    setGrsaiCreditTierId(localGrsaiCreditTierId);
     setUiRadiusPreset(localUiRadiusPreset);
     setThemeTonePreset(localThemeTonePreset);
     setAccentColor(localAccentColor);
@@ -552,7 +538,6 @@ export function SettingsDialog({
     onClose();
   }, [
     localApiKeys,
-    localGrsaiNanoBananaProModel,
     localUseUploadFilenameAsNodeTitle,
     localStoryboardGenKeepStyleConsistent,
     localStoryboardGenDisableTextInImage,
@@ -564,7 +549,6 @@ export function SettingsDialog({
     localPriceDisplayCurrencyMode,
     localUsdToCnyRate,
     localPreferDiscountedPrice,
-    localGrsaiCreditTierId,
     localUiRadiusPreset,
     localThemeTonePreset,
     localAccentColor,
@@ -573,7 +557,6 @@ export function SettingsDialog({
     localEnableUpdateDialog,
     providers,
     setProviderApiKey,
-    setGrsaiNanoBananaProModel,
     setUseUploadFilenameAsNodeTitle,
     setStoryboardGenKeepStyleConsistent,
     setStoryboardGenDisableTextInImage,
@@ -585,7 +568,6 @@ export function SettingsDialog({
     setPriceDisplayCurrencyMode,
     setUsdToCnyRate,
     setPreferDiscountedPrice,
-    setGrsaiCreditTierId,
     setUiRadiusPreset,
     setThemeTonePreset,
     setAccentColor,
@@ -855,41 +837,6 @@ export function SettingsDialog({
                                   </button>
                                 </div>
 
-                                {provider.id === 'grsai' && (
-                                  <div className="mt-2.5">
-                                    <div className="mb-1 text-[11px] font-medium text-text-dark">
-                                      {t('settings.nanoBananaProModel')}
-                                    </div>
-                                    <p className="mb-1.5 text-[10px] text-text-muted">
-                                      <Trans
-                                        i18nKey="settings.nanoBananaProModelDesc"
-                                        components={{
-                                          modelListLink: (
-                                            <a
-                                              href="https://grsai.com/zh/dashboard/models"
-                                              target="_blank"
-                                              rel="noreferrer"
-                                              className="text-accent hover:underline"
-                                            />
-                                          ),
-                                        }}
-                                      />
-                                    </p>
-                                    <UiSelect
-                                      value={localGrsaiNanoBananaProModel}
-                                      onChange={(event) =>
-                                        setLocalGrsaiNanoBananaProModel(event.target.value)
-                                      }
-                                      className="h-8 text-xs"
-                                    >
-                                      {GRSAI_NANO_BANANA_PRO_MODEL_OPTIONS.map((option) => (
-                                        <option key={option} value={option}>
-                                          {option}
-                                        </option>
-                                      ))}
-                                    </UiSelect>
-                                  </div>
-                                )}
                               </div>
                             )}
                           </div>
@@ -1531,32 +1478,6 @@ export function SettingsDialog({
                     description={t('settings.preferDiscountedPriceDesc')}
                   />
 
-                  <div className="rounded-lg border border-border-dark bg-bg-dark p-4">
-                    <h3 className="text-sm font-medium text-text-dark">
-                      {t('settings.grsaiCreditTier')}
-                    </h3>
-                    <p className="mt-1 text-xs text-text-muted">
-                      {t('settings.grsaiCreditTierDesc')}
-                    </p>
-                    <div className="mt-3">
-                      <UiSelect
-                        value={localGrsaiCreditTierId}
-                        onChange={(event) =>
-                          setLocalGrsaiCreditTierId(event.target.value as typeof localGrsaiCreditTierId)
-                        }
-                        className="h-9 text-sm"
-                      >
-                        {GRSAI_CREDIT_TIERS.map((tier) => (
-                          <option key={tier.id} value={tier.id}>
-                            {t('settings.grsaiCreditTierOption', {
-                              price: tier.priceCny.toFixed(2),
-                              credits: tier.credits.toLocaleString(i18n.language.startsWith('zh') ? 'zh-CN' : 'en-US'),
-                            })}
-                          </option>
-                        ))}
-                      </UiSelect>
-                    </div>
-                  </div>
                 </div>
 
                 <div className="flex justify-end border-t border-border-dark px-6 py-4">

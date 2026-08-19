@@ -60,9 +60,6 @@ import {
   resolveImageModelResolution,
   resolveImageModelResolutions,
 } from '@/features/canvas/models';
-import { GRSAI_NANO_BANANA_PRO_MODEL_ID } from '@/features/canvas/models/image/grsai/nanoBananaPro';
-import { FAL_NANO_BANANA_2_MODEL_ID } from '@/features/canvas/models/image/fal/nanoBanana2';
-import { KIE_NANO_BANANA_2_MODEL_ID } from '@/features/canvas/models/image/kie/nanoBanana2';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { ModelParamsControls } from '@/features/canvas/ui/ModelParamsControls';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
@@ -634,9 +631,6 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     () => ({
       ...(nodeData.extraParams ?? {}),
       ...(customApiBaseUrl ? { provider_base_url: customApiBaseUrl } : {}),
-      ...(selectedModel.id === GRSAI_NANO_BANANA_PRO_MODEL_ID
-        ? { grsai_pro_model: grsaiNanoBananaProModel }
-        : {}),
     }),
     [customApiBaseUrl, grsaiNanoBananaProModel, nodeData.extraParams, selectedModel.id]
   );
@@ -730,9 +724,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
   const requestResolution = selectedModel.resolveRequest({
     referenceImageCount: incomingImages.length,
   });
-  const showWebSearchToggle =
-    selectedModel.id === FAL_NANO_BANANA_2_MODEL_ID ||
-    selectedModel.id === KIE_NANO_BANANA_2_MODEL_ID;
+  // fal/kie 平台已移除, web search 开关不再出现
+  const showWebSearchToggle = false;
   const webSearchEnabled = Boolean(nodeData.extraParams?.enable_web_search);
   const resolvedPriceDisplay = useMemo(
     () =>
