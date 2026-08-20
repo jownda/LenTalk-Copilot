@@ -371,7 +371,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     () => graphImageResolver.collectInputText(id, nodes, edges),
     [edges, id, nodes]
   );
-  const incomingTextDisplay = incomingText.join('\n\n');
+  // 文本引用预览现在按行渲染(每行一个上游文本), 不再需要合并字符串
 
   const incomingImageItems = useMemo(
     () =>
@@ -961,15 +961,23 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
             onScroll={syncPromptHighlightScroll}
             onMouseDown={(event) => event.stopPropagation()}
             placeholder={t('node.imageEdit.promptPlaceholder')}
-            className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${incomingTextDisplay ? 'pb-16' : ''}`}
+            className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-text-muted outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${incomingText.length > 0 ? 'pb-20' : ''}`}
             style={{ scrollbarGutter: 'stable' }}
           />
-          {incomingTextDisplay && (
+          {incomingText.length > 0 && (
             <div
               aria-hidden="true"
-              className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 line-clamp-3 whitespace-pre-wrap break-words bg-bg-dark/90 px-1 py-0.5 text-sm leading-6 text-text-muted"
+              className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 flex flex-col gap-0 bg-bg-dark/90 px-1 py-0.5 text-sm leading-6 text-text-muted"
             >
-              {incomingTextDisplay}
+              {incomingText.slice(0, 3).map((text, index) => (
+                <div
+ key={`incoming-text-${index}`}
+ className="overflow-hidden text-ellipsis whitespace-nowrap"
+ title={text}
+ >
+ {text}
+ </div>
+              ))}
             </div>
           )}
         </div>

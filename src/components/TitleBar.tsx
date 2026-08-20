@@ -68,6 +68,15 @@ export function TitleBar({ onSettingsClick, onBillingClick, showBackButton, onBa
     await appWindow.startDragging();
   }, [appWindow]);
 
+  // 双击标题栏空白处 = 最大化/还原窗口(macOS 习惯); 按钮上不触发
+  const handleTitleDoubleClick = useCallback((e: React.MouseEvent) => {
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('button') || target?.closest('[data-no-drag="true"]')) {
+      return;
+    }
+    void handleMaximize();
+  }, [handleMaximize]);
+
   const handleLanguageClick = useCallback(() => {
     const newLang = i18n.language.startsWith('zh') ? 'en' : 'zh';
     i18n.changeLanguage(newLang);
@@ -120,6 +129,7 @@ export function TitleBar({ onSettingsClick, onBillingClick, showBackButton, onBa
       <div
         className="flex-1 h-full flex items-center px-4 cursor-move"
         onMouseDown={handleDragStart}
+        onDoubleClick={handleTitleDoubleClick}
       >
         {showBackButton && onBackClick && (
           <button

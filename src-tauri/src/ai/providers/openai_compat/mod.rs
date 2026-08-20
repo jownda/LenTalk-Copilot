@@ -304,7 +304,7 @@ impl OpenAICompatibleProvider {
     }
 
     /// 构造 Responses API 请求体: input_text + input_image + image_generation tool。
-    fn build_responses_body(
+    async fn build_responses_body(
         api_model: &str,
         prompt: &str,
         aspect_ratio: &str,
@@ -313,8 +313,9 @@ impl OpenAICompatibleProvider {
         let mut content: Vec<Value> = vec![json!({ "type": "input_text", "text": prompt })];
         if let Some(images) = reference_images {
             for reference in images.iter() {
-                if let Some(field) = Self::reference_image_to_image_field(reference)? {
-                    content.push(json!({ "type": "input_image", "image_url": field }));
+                if let Some(base64_data) = Self::reference_image_to_responses_base64(reference).await? {
+                    // comfly 等 responses 平台期望纯 base64(无 data: 前缀), URL 需下载转 base64
+                    content.push(json!({ "type": "input_image", "image_url": base64_data }));
                 }
             }
         }
@@ -331,6 +332,49 @@ impl OpenAICompatibleProvider {
             "tools": [tool],
             "tool_choice": { "type": "image_generation" },
         }))
+    }
+
+    /// Responses 协议的 input_image.image_url: comfly 等平台期望纯 base64
+    /// (直接把值当 base64 解码)。URL 需下载转 base64, data: 去前缀, 本地路径读文件。
+    async fn reference_image_to_responses_base64(source: &str) -> Result<Option<String>, AIError> {
+        let trimmed = source.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if trimmed.starts_with("data:") {
+            // 去掉 data:image/png;base64, 前缀, 只留纯 base64
+            if let Some((_, base64_part)) = trimmed.split_once(',') {
+                return Ok(Some(base64_part.to_string()));
+            }
+            return Ok(Some(trimmed.to_string()));
+        }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            let client = Self::build_short_timeout_client();
+            let response = client
+                .get(trimmed)
+                .send()
+                .await
+                .map_err(|error| AIError::TaskFailed(format!("下载参考图失败: {error}")))?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| AIError::TaskFailed(format!("读取参考图失败: {error}")))?;
+            return Ok(Some(STANDARD.encode(bytes)));
+        }
+        // 本地路径/asset: 读文件转 base64
+        let path = if trimmed.starts_with("file://") {
+            PathBuf::from(Self::decode_file_url_path(trimmed))
+        } else {
+            PathBuf::from(trimmed)
+        };
+        let bytes = std::fs::read(&path).map_err(|error| {
+            AIError::InvalidRequest(format!(
+                "读取参考图失败 \"{}\": {}",
+                path.to_string_lossy(),
+                error
+            ))
+        })?;
+        Ok(Some(STANDARD.encode(bytes)))
     }
 
     /// 解析 Responses 输出: output[] 里 image_generation_call.result(b64/url) 或 image.image_url。
@@ -627,7 +671,8 @@ impl AIProvider for OpenAICompatibleProvider {
                     &request.prompt,
                     &request.aspect_ratio,
                     request.reference_images.as_ref(),
-                )?,
+                )
+                .await?,
             )
         } else {
             (
@@ -796,7 +841,8 @@ impl AIProvider for OpenAICompatibleProvider {
                     &request.prompt,
                     &request.aspect_ratio,
                     request.reference_images.as_ref(),
-                )?,
+                )
+                .await?,
             )
         } else {
             (

@@ -433,6 +433,15 @@ fn run_cli(executable: &str, arguments: &[String]) -> Result<String, String> {
 /// profile and executable search paths explicit so its credential backend and
 /// helper commands behave the same as when launched from a terminal.
 fn build_cli_command(resolved: &str) -> Command {
+    #[cfg(target_os = "windows")]
+    let mut command = if is_windows_script(resolved) {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/S", "/C", resolved]);
+        command
+    } else {
+        Command::new(resolved)
+    };
+    #[cfg(not(target_os = "windows"))]
     let mut command = Command::new(resolved);
     if let Some(home) = current_user_home() {
         command.env("HOME", &home);
@@ -457,7 +466,28 @@ fn build_cli_command(resolved: &str) -> Command {
     command
 }
 
+#[cfg(target_os = "windows")]
+fn is_windows_script(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("cmd" | "bat")
+    )
+}
+
 fn current_user_home() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        return std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir());
+    }
+
+    #[cfg(not(target_os = "windows"))]
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -470,53 +500,124 @@ fn current_user_home() -> Option<PathBuf> {
 /// macOS GUI 应用(从 Finder 启动)不继承 shell 的 PATH(~/.local/bin 不在其中),
 /// 因此必须主动探测常见安装位置, 否则会报 "No such file or directory"。
 fn resolve_executable(requested: &str) -> Result<String, String> {
-    let trimmed = requested.trim();
+    let trimmed = requested.trim().trim_matches(['"', '\'']);
     if trimmed.is_empty() {
         return Err("请先在「设置 - 密钥 - 即梦 CLI」中填写 CLI 可执行命令".to_string());
     }
-    if Path::new(trimmed).is_absolute() || trimmed.contains('/') {
-        if Path::new(trimmed).is_file() {
-            return Ok(trimmed.to_string());
+    let expanded = expand_windows_path(trimmed);
+    if Path::new(&expanded).is_absolute() || expanded.contains('/') || expanded.contains('\\') {
+        if Path::new(&expanded).is_file() {
+            return Ok(expanded);
         }
         return Err(format!(
             "即梦 CLI 路径不存在: {trimmed}，请检查设置中填写的完整路径"
         ));
     }
-    if let Some(found) = find_in_path(trimmed) {
+    if let Some(found) = find_in_path(&expanded) {
         return Ok(found);
     }
-    for candidate in common_locations(trimmed) {
+    for candidate in common_locations(&expanded) {
         if Path::new(&candidate).is_file() {
             return Ok(candidate);
         }
     }
     Err(format!(
-        "未找到即梦 CLI（{trimmed}）。请确认已安装：curl -fsSL https://jimeng.jianying.com/cli | bash，或在设置中填写完整路径（如 ~/.local/bin/dreamina）"
+        "未找到即梦 CLI（{trimmed}）。请先在终端运行 `dreamina -h` 验证安装，或在设置中填写完整路径（Windows 示例：%USERPROFILE%\\.dreamina_cli\\dreamina.exe）"
     ))
+}
+
+fn expand_windows_path(path: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let mut expanded = path.to_string();
+        if expanded == "~" || expanded.starts_with("~\\") || expanded.starts_with("~/") {
+            if let Some(home) = current_user_home() {
+                expanded = format!("{}{}", home.display(), &expanded[1..]);
+            }
+        }
+        let mut output = String::with_capacity(expanded.len());
+        let mut remainder = expanded.as_str();
+        while let Some(start) = remainder.find('%') {
+            output.push_str(&remainder[..start]);
+            let after_start = &remainder[start + 1..];
+            let Some(end) = after_start.find('%') else {
+                output.push('%');
+                output.push_str(after_start);
+                remainder = "";
+                break;
+            };
+            let variable = &after_start[..end];
+            if let Some(value) = std::env::var_os(variable) {
+                output.push_str(&value.to_string_lossy());
+            } else {
+                output.push('%');
+                output.push_str(variable);
+                output.push('%');
+            }
+            remainder = &after_start[end + 1..];
+        }
+        output.push_str(remainder);
+        return output;
+    }
+
+    path.to_string()
 }
 
 fn find_in_path(command: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(command);
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
         #[cfg(target_os = "windows")]
-        if candidate.extension().is_none() {
-            let windows_candidate = candidate.with_extension("exe");
-            if windows_candidate.is_file() {
-                return Some(windows_candidate.to_string_lossy().into_owned());
+        {
+            for suffix in windows_command_suffixes(command) {
+                let candidate = dir.join(format!("{command}{suffix}"));
+                if candidate.is_file() {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let candidate = dir.join(command);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
             }
         }
     }
     None
 }
 
+#[cfg(target_os = "windows")]
+fn windows_command_suffixes(command: &str) -> Vec<&'static str> {
+    if Path::new(command).extension().is_some() {
+        return vec![""];
+    }
+    // The installer may produce an .exe, while npm/npm.cmd and shell shims
+    // commonly expose .cmd or .bat. PATHEXT is preferred when available.
+    let mut suffixes = Vec::new();
+    if let Some(path_ext) = std::env::var_os("PATHEXT") {
+        for extension in path_ext.to_string_lossy().split(';') {
+            match extension.to_ascii_lowercase().as_str() {
+                ".com" => suffixes.push(".com"),
+                ".exe" => suffixes.push(".exe"),
+                ".bat" => suffixes.push(".bat"),
+                ".cmd" => suffixes.push(".cmd"),
+                _ => {}
+            }
+        }
+    }
+    for suffix in [".exe", ".cmd", ".bat", ""] {
+        if !suffixes.contains(&suffix) {
+            suffixes.push(suffix);
+        }
+    }
+    suffixes
+}
+
 /// 常见安装目录(覆盖 GUI 启动无 shell PATH 的场景)
 fn common_locations(command: &str) -> Vec<String> {
     let home = current_user_home().unwrap_or_default();
-    [
+    #[allow(unused_mut)]
+    let mut directories = vec![
         home.join(".local/bin"),
         home.join(".dreamina_cli/bin"),
         home.join(".dreamina_cli"),
@@ -525,17 +626,29 @@ fn common_locations(command: &str) -> Vec<String> {
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/opt/local/bin"),
         PathBuf::from("/usr/bin"),
-    ]
+    ];
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            directories.push(PathBuf::from(app_data).join("npm"));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            directories.push(PathBuf::from(local_app_data).join("Programs"));
+            directories.push(PathBuf::from(local_app_data).join("dreamina"));
+        }
+        directories.push(home.join("AppData/Roaming/npm"));
+        directories.push(home.join("AppData/Local/Programs"));
+    }
+    directories
     .into_iter()
     .flat_map(|dir| {
         let path = dir.join(command);
         #[cfg(target_os = "windows")]
         {
-            let mut paths = vec![path.to_string_lossy().into_owned()];
-            if path.extension().is_none() {
-                paths.push(path.with_extension("exe").to_string_lossy().into_owned());
-            }
-            paths
+            windows_command_suffixes(command)
+                .into_iter()
+                .map(|suffix| format!("{}{}", path.display(), suffix))
+                .collect()
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -699,6 +812,7 @@ pub async fn jimeng_cli_login_check(
             "login".to_string(),
             "checklogin".to_string(),
             format!("--device_code={device_code}"),
+            "--poll=0".to_string(),
         ])
     })
     .await

@@ -376,7 +376,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     () => graphImageResolver.collectInputText(id, nodes, edges),
     [edges, id, nodes]
   );
-  const inputTextDisplay = inputText.join('\n\n');
+  // 文本引用预览现在按行渲染(每行一个上游文本), 不再需要合并字符串
   // 首尾帧与上游参考图是两种互斥输入方式。首尾帧只使用节点内上传的两张图。
   const referenceInputImages = imageMode === 'reference' ? inputImages : [];
   const firstLastFrameImages = useMemo(
@@ -900,15 +900,23 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             onScroll={syncPromptHighlightScroll}
             onMouseDown={(event) => event.stopPropagation()}
             placeholder="描述要生成的视频"
-            className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent p-2 text-xs leading-5 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${inputTextDisplay ? 'pb-16' : ''}`}
+            className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent p-2 text-xs leading-5 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${inputText.length > 0 ? 'pb-20' : ''}`}
             style={{ scrollbarGutter: 'stable' }}
           />
-          {inputTextDisplay && (
+          {inputText.length > 0 && (
             <div
               aria-hidden="true"
-              className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 line-clamp-3 whitespace-pre-wrap break-words bg-bg-dark/90 p-2 text-xs leading-5 text-text-muted"
+              className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 flex flex-col gap-0 bg-bg-dark/90 p-2 text-xs leading-5 text-text-muted"
             >
-              {inputTextDisplay}
+              {inputText.slice(0, 3).map((text, index) => (
+                <div
+ key={`input-text-${index}`}
+ className="overflow-hidden text-ellipsis whitespace-nowrap"
+ title={text}
+ >
+ {text}
+ </div>
+              ))}
             </div>
           )}
         </div>

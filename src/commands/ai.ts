@@ -145,7 +145,7 @@ export async function setApiKey(provider: string, apiKey: string): Promise<void>
     apiKeyMasked: apiKey ? `${apiKey.slice(0, 4)}***${apiKey.slice(-2)}` : '',
     tauri: isTauri(),
   });
-  if (!isTauri() || isWindowsDesktopRuntime()) {
+  if (!isTauri()) {
     // 浏览器降级:key 已存于 settingsStore,无需传给 Rust
     return;
   }
@@ -937,12 +937,14 @@ function isCustomModel(model: string): boolean {
   return model.startsWith(CUSTOM_API_PROVIDER_PREFIX);
 }
 
-function shouldUseWebviewGeneration(request: GenerateRequest): boolean {
-  return !isTauri() || (isWindowsDesktopRuntime() && isCustomModel(request.model));
+function shouldUseWebviewGeneration(_request: GenerateRequest): boolean {
+  // Desktop builds use the native Rust HTTP client. Windows must not fall
+  // back to WebView fetch because custom providers commonly reject CORS.
+  return !isTauri();
 }
 
 function shouldUseWebviewProviderRequests(): boolean {
-  return !isTauri() || isWindowsDesktopRuntime();
+  return !isTauri();
 }
 
 function assertWindowsModelSupported(request: GenerateRequest): void {
