@@ -95,11 +95,15 @@ interface CanvasState {
   setCanvasData: (nodes: CanvasNode[], edges: CanvasEdge[], history?: CanvasHistoryState) => void;
   addNode: (
     type: CanvasNodeType,
-    position: { x: number; y: number },
+    position: { x: number; y: number; parentId?: string; groupResize?: { id: string; width: number; height: number } },
     data?: Partial<CanvasNodeData>
   ) => string;
   addEdge: (source: string, target: string) => string | null;
-  findNodePosition: (sourceNodeId: string, newNodeWidth: number, newNodeHeight: number) => { x: number; y: number };
+  findNodePosition: (
+    sourceNodeId: string,
+    newNodeWidth: number,
+    newNodeHeight: number
+  ) => { x: number; y: number; parentId?: string; groupResize?: { id: string; width: number; height: number } };
   addDerivedUploadNode: (
     sourceNodeId: string,
     imageUrl: string,
@@ -128,6 +132,7 @@ interface CanvasState {
   ) => string | null;
 
   updateNodeData: (nodeId: string, data: Partial<CanvasNodeData>) => void;
+  updateNodeDataTransient: (nodeId: string, data: Partial<CanvasNodeData>) => void;
   updateNodePosition: (nodeId: string, position: { x: number; y: number }) => void;
   updateNodeSize: (nodeId: string, width: number, height: number) => void;
   updateStoryboardFrame: (
@@ -143,7 +148,7 @@ interface CanvasState {
 
   deleteNode: (nodeId: string) => void;
   deleteNodes: (nodeIds: string[]) => void;
-  groupNodes: (nodeIds: string[]) => string | null;
+  groupNodes: (nodeIds: string[], groupName?: string) => string | null;
   ungroupNode: (groupNodeId: string) => boolean;
   /** 把节点加入已有分组(拖入), 返回是否发生变更 */
   addNodesToGroup: (nodeIds: string[], groupId: string) => boolean;
@@ -566,6 +571,114 @@ function maybeApplyImageAutoResize(node: CanvasNode, patch: Partial<CanvasNodeDa
   };
 }
 
+/** 组内生成下游节点时的内边距(组扩容时保留的呼吸空间) */
+const GROUP_PADDING = 24;
+
+/**
+ * 组内生成下游节点: 返回组内相对坐标 + parentId + 可选扩组信息。
+ * - 锚定在来源节点右侧(最近 24px), 碰撞检测仅与同组兄弟节点比较;
+ * - 组内空间不足时返回 groupResize, 由创建节点的调用方在同一个 set 中应用
+ *   (与节点创建一起入历史快照, 避免独立扩组快照)。
+ */
+function placeNodeInsideGroup(
+  state: { nodes: CanvasNode[] },
+  groupNode: CanvasNode,
+  sourceNode: CanvasNode,
+  newNodeWidth: number,
+  newNodeHeight: number
+): { x: number; y: number; parentId: string; groupResize?: { id: string; width: number; height: number } } {
+  const groupSize = getNodeSize(groupNode);
+  const siblingIds = new Set<string>();
+  for (const node of state.nodes) {
+    if (node.parentId === groupNode.id && node.id !== sourceNode.id) {
+      siblingIds.add(node.id);
+    }
+  }
+
+  const collides = (x: number, y: number, width: number, height: number): boolean => {
+    const margin = 8;
+    for (const node of state.nodes) {
+      if (!siblingIds.has(node.id)) {
+        continue;
+      }
+      const nodeWidth = node.measured?.width ?? DEFAULT_NODE_WIDTH;
+      const nodeHeight = node.measured?.height ?? 200;
+      if (
+        x < node.position.x + nodeWidth + margin
+        && x + width + margin > node.position.x
+        && y < node.position.y + nodeHeight + margin
+        && y + height + margin > node.position.y
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // 来源节点在组内的相对坐标(position 已是相对组坐标)
+  const sourceWidth = sourceNode.measured?.width ?? DEFAULT_NODE_WIDTH;
+  const sourceHeight = sourceNode.measured?.height ?? 200;
+  const anchorX = sourceNode.position.x + sourceWidth + 24;
+  const anchorY = sourceNode.position.y;
+
+  const stepX = Math.max(newNodeWidth + 16, 110);
+  const stepY = Math.max(newNodeHeight + 16, 112);
+  const rightSideOffsets = [0, 1, -1, 2, -2];
+  let best: { x: number; y: number; score: number } | null = null;
+
+  const evaluate = (x: number, y: number) => {
+    if (x < GROUP_PADDING || y < GROUP_PADDING) {
+      return;
+    }
+    if (collides(x, y, newNodeWidth, newNodeHeight)) {
+      return;
+    }
+    const dx = x - anchorX;
+    const dy = y - anchorY;
+    const distanceScore = Math.hypot(dx, dy);
+    const nonRightPenalty = x < anchorX ? Math.max(80, Math.round(newNodeWidth * 0.75)) : 0;
+    const upwardPenalty = dy < 0 ? Math.round(newNodeHeight * 0.35) : 0;
+    const score = distanceScore + nonRightPenalty + upwardPenalty;
+    if (!best || score < best.score) {
+      best = { x, y, score };
+    }
+  };
+
+  for (const offsetY of rightSideOffsets) {
+    evaluate(anchorX, anchorY + offsetY * stepY);
+  }
+  // 从来源右侧开始逐列搜索; 空间不足时扩组, 不用大偏移把结果甩远。
+  for (let column = 1; column <= 2; column += 1) {
+    for (const offsetY of rightSideOffsets) {
+      evaluate(anchorX + column * stepX, anchorY + offsetY * stepY);
+    }
+  }
+  if (!best) {
+    evaluate(sourceNode.position.x, sourceNode.position.y + sourceHeight + 20);
+    evaluate(sourceNode.position.x - newNodeWidth - 20, sourceNode.position.y);
+    evaluate(sourceNode.position.x, sourceNode.position.y - newNodeHeight - 20);
+  }
+
+  const resolved = best ?? {
+    x: Math.max(GROUP_PADDING, anchorX + stepX),
+    y: Math.max(GROUP_PADDING, anchorY),
+  };
+  const needRight = resolved.x + newNodeWidth;
+  const needBottom = resolved.y + newNodeHeight;
+
+  let groupResize: { id: string; width: number; height: number } | undefined;
+  // 组空间不足 → 自适应扩组(仅扩右下, 保持组左上锚点不动)
+  if (needRight > groupSize.width - GROUP_PADDING || needBottom > groupSize.height - GROUP_PADDING) {
+    groupResize = {
+      id: groupNode.id,
+      width: Math.max(groupSize.width, Math.ceil(needRight + GROUP_PADDING)),
+      height: Math.max(groupSize.height, Math.ceil(needBottom + GROUP_PADDING)),
+    };
+  }
+
+  return { x: Math.round(resolved.x), y: Math.round(resolved.y), parentId: groupNode.id, groupResize };
+}
+
 function resolveAbsolutePosition(
   node: CanvasNode,
   nodeMap: Map<string, CanvasNode>
@@ -618,18 +731,6 @@ function dedupeSnapshots(snapshots: CanvasHistorySnapshot[]): CanvasHistorySnaps
     result.push(snapshot);
   }
   return result;
-}
-
-function getDerivedNodePosition(nodes: CanvasNode[], sourceNodeId: string): { x: number; y: number } {
-  const sourceNode = nodes.find((node) => node.id === sourceNodeId);
-  if (!sourceNode) {
-    return { x: 100, y: 100 };
-  }
-
-  return {
-    x: sourceNode.position.x + DEFAULT_NODE_WIDTH + 100,
-    y: sourceNode.position.y,
-  };
 }
 
 function resolveSelectedNodeId(selectedNodeId: string | null, nodes: CanvasNode[]): string | null {
@@ -885,9 +986,31 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
   addNode: (type, position, data = {}) => {
     const state = get();
-    const newNode = canvasNodeFactory.createNode(type, position, data);
+    const nodePosition = { x: position.x, y: position.y };
+    const newNode = canvasNodeFactory.createNode(type, nodePosition, data);
+    if (position.parentId) {
+      newNode.parentId = position.parentId;
+    }
+    // 组内生成: 组空间不足时随节点一起扩组(同一 set, 同入历史快照)
+    let nextNodes = [...state.nodes, newNode];
+    if (position.groupResize) {
+      nextNodes = nextNodes.map((node) =>
+        node.id === position.groupResize?.id
+          ? {
+              ...node,
+              width: position.groupResize!.width,
+              height: position.groupResize!.height,
+              style: {
+                ...(node.style ?? {}),
+                width: position.groupResize!.width,
+                height: position.groupResize!.height,
+              },
+            }
+          : node
+      );
+    }
     set({
-      nodes: [...state.nodes, newNode],
+      nodes: nextNodes,
       history: {
         past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
         future: [],
@@ -936,6 +1059,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const sourceNode = state.nodes.find((n) => n.id === sourceNodeId);
     if (!sourceNode) {
       return { x: 100, y: 100 };
+    }
+
+    // ---- 组内生成: 下游节点保持在组内, 组空间不足自动扩组 ----
+    if (sourceNode.parentId) {
+      const groupNode = state.nodes.find((n) => n.id === sourceNode.parentId && n.type === CANVAS_NODE_TYPES.group);
+      if (groupNode) {
+        return placeNodeInsideGroup(state, groupNode, sourceNode, newNodeWidth, newNodeHeight);
+      }
     }
 
     // Helper to check if a position collides with existing nodes.
@@ -1071,15 +1202,19 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
   addDerivedUploadNode: (sourceNodeId, imageUrl, aspectRatio, previewImageUrl) => {
     const state = get();
-    const position = getDerivedNodePosition(state.nodes, sourceNodeId);
     const sourceNode = state.nodes.find((node) => node.id === sourceNodeId);
     const resolvedAspectRatio = resolveDerivedAspectRatio(sourceNode, aspectRatio);
+    const derivedSize = resolveGeneratedImageNodeDimensions(resolvedAspectRatio);
+    const placement = state.findNodePosition(sourceNodeId, derivedSize.width, derivedSize.height);
+    const position = { x: placement.x, y: placement.y };
     const node = canvasNodeFactory.createNode(CANVAS_NODE_TYPES.upload, position, {
       imageUrl,
       previewImageUrl: previewImageUrl ?? null,
       aspectRatio: resolvedAspectRatio,
     });
-    const derivedSize = resolveGeneratedImageNodeDimensions(resolvedAspectRatio);
+    if (placement.parentId) {
+      node.parentId = placement.parentId;
+    }
     node.width = derivedSize.width;
     node.height = derivedSize.height;
     node.style = {
@@ -1088,8 +1223,27 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       height: derivedSize.height,
     };
 
+    // 组内生成: 组空间不足时随节点一起扩组(同一 set, 同入历史快照)
+    let nextNodes = [...state.nodes, node];
+    if (placement.groupResize) {
+      nextNodes = nextNodes.map((item) =>
+        item.id === placement.groupResize?.id
+          ? {
+              ...item,
+              width: placement.groupResize!.width,
+              height: placement.groupResize!.height,
+              style: {
+                ...(item.style ?? {}),
+                width: placement.groupResize!.width,
+                height: placement.groupResize!.height,
+              },
+            }
+          : item
+      );
+    }
+
     set({
-      nodes: [...state.nodes, node],
+      nodes: nextNodes,
       selectedNodeId: node.id,
       activeToolDialog: null,
       history: {
@@ -1129,11 +1283,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         height: Math.max(1, Math.round(sourceSize.height)),
       };
     }
-    const position = state.findNodePosition(
+    const placement = state.findNodePosition(
       sourceNodeId,
       derivedSize.width,
       derivedSize.height
     );
+    const position = { x: placement.x, y: placement.y };
     const exportNodeData: Partial<CanvasNodeData> = {
       imageUrl,
       previewImageUrl: previewImageUrl ?? null,
@@ -1152,6 +1307,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const node = canvasNodeFactory.createNode(CANVAS_NODE_TYPES.exportImage, position, {
       ...exportNodeData,
     });
+    if (placement.parentId) {
+      node.parentId = placement.parentId;
+    }
     node.width = derivedSize.width;
     node.height = derivedSize.height;
     node.style = {
@@ -1160,8 +1318,27 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       height: derivedSize.height,
     };
 
+    // 组内生成: 组空间不足时随节点一起扩组(同一 set, 同入历史快照)
+    let nextNodes = [...state.nodes, node];
+    if (placement.groupResize) {
+      nextNodes = nextNodes.map((item) =>
+        item.id === placement.groupResize?.id
+          ? {
+              ...item,
+              width: placement.groupResize!.width,
+              height: placement.groupResize!.height,
+              style: {
+                ...(item.style ?? {}),
+                width: placement.groupResize!.width,
+                height: placement.groupResize!.height,
+              },
+            }
+          : item
+      );
+    }
+
     set({
-      nodes: [...state.nodes, node],
+      nodes: nextNodes,
       selectedNodeId: node.id,
       activeToolDialog: null,
       history: {
@@ -1176,7 +1353,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
   addStoryboardSplitNode: (sourceNodeId, rows, cols, frames, frameAspectRatio) => {
     const state = get();
-    const position = getDerivedNodePosition(state.nodes, sourceNodeId);
+    const placement = state.findNodePosition(sourceNodeId, 320, 240);
+    const position = { x: placement.x, y: placement.y };
     const resolvedFrameAspectRatio =
       frameAspectRatio ??
       frames.find((frame) => typeof frame.aspectRatio === 'string')?.aspectRatio ??
@@ -1190,9 +1368,31 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       frameAspectRatio: resolvedFrameAspectRatio,
       exportOptions: createDefaultStoryboardExportOptions(),
     });
+    if (placement.parentId) {
+      node.parentId = placement.parentId;
+    }
+
+    // 组内生成: 组空间不足时随节点一起扩组(同一 set, 同入历史快照)
+    let nextNodes = [...state.nodes, node];
+    if (placement.groupResize) {
+      nextNodes = nextNodes.map((item) =>
+        item.id === placement.groupResize?.id
+          ? {
+              ...item,
+              width: placement.groupResize!.width,
+              height: placement.groupResize!.height,
+              style: {
+                ...(item.style ?? {}),
+                width: placement.groupResize!.width,
+                height: placement.groupResize!.height,
+              },
+            }
+          : item
+      );
+    }
 
     set({
-      nodes: [...state.nodes, node],
+      nodes: nextNodes,
       selectedNodeId: node.id,
       activeToolDialog: null,
       history: {
@@ -1249,6 +1449,23 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         },
         dragHistorySnapshot: null,
       };
+    });
+  },
+
+  updateNodeDataTransient: (nodeId, data) => {
+    set((state) => {
+      let changed = false;
+      const nextNodes = state.nodes.map((node) => {
+        if (node.id !== nodeId) return node;
+        const hasDataChange = Object.entries(data).some(([key, nextValue]) =>
+          !Object.is((node.data as Record<string, unknown>)[key], nextValue)
+        );
+        if (!hasDataChange) return node;
+        changed = true;
+        const mergedData = { ...node.data, ...data } as CanvasNodeData;
+        return maybeApplyImageAutoResize({ ...node, data: mergedData }, data);
+      });
+      return changed ? { nodes: nextNodes } : {};
     });
   },
 
@@ -1457,7 +1674,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     });
   },
 
-  groupNodes: (nodeIds) => {
+  groupNodes: (nodeIds, groupName) => {
     const uniqueIds = Array.from(new Set(nodeIds.filter((nodeId) => nodeId.trim().length > 0)));
     if (uniqueIds.length < 2) {
       return null;
@@ -1528,7 +1745,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     );
 
     const existingGroupCount = state.nodes.filter((node) => node.type === CANVAS_NODE_TYPES.group).length;
-    const groupDisplayName = `组 ${existingGroupCount + 1}`;
+    const groupDisplayName = groupName?.trim() || `组 ${existingGroupCount + 1}`;
     const groupNode = canvasNodeFactory.createNode(
       CANVAS_NODE_TYPES.group,
       { x: groupX, y: groupY },

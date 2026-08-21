@@ -34,6 +34,11 @@
     "generate": "生成",
     "emptyHintTitle": "双击鼠标添加节点",
     "emptyHintSubtitle": "Double-click to add a node",
+    "groupDialog": {
+      "title": "创建分组",
+      "renameTitle": "重命名分组",
+      "placeholder": "请输入分组名称"
+    },
     "toolbar": {
       "zoomIn": "放大",
       "zoomOut": "缩小",
@@ -107,6 +112,9 @@
     "copyText": "复制文本",
     "copyErrorReport": "复制报错",
     "retryGeneration": "重试生成",
+    "retryWithEncoding": "切换编码并重试",
+    "rename": "重命名",
+    "confirmEncodingRetry": "将使用另一种参考图编码提交新的生成请求，平台可能计费。继续吗？",
     "copied": "已复制",
     "download": "下载",
     "ungroup": "解散",
@@ -142,7 +150,8 @@
       "textAnnotation": "文本",
       "panorama": "360 全景",
       "directorDesk": "3D 导演台",
-      "audio": "媒体"
+      "audio": "媒体",
+      "seamlessMosaic": "无缝拼图"
     },
     "imageNode": {
       "title": "图片节点",
@@ -222,6 +231,9 @@
       "noInput": "等待全景图输入",
       "uploadHint": "点击上传全景图\n或从上游节点连线",
       "replaceImage": "更换"
+    },
+    "seamlessMosaic": {
+      "hint": "连接图片自动导入 · 双击编辑"
     }
   },
   "viewer": {
@@ -417,7 +429,7 @@
     "customApiFetch": "拉取模型",
     "customApiFetching": "拉取中…",
     "customApiTestNeedUrl": "请先填写 Base URL",
-    "customApiTestOk": "协议验证成功,检测到 {{count}} 个模型(可点「拉取模型」导入)",
+    "customApiTestOk": "协议探测完成: {{protocol}},参考图字段 {{field}},编码 {{encoding}},置信度{{confidence}};检测到 {{count}} 个模型。结果已填入当前表单,请点击保存",
     "customApiTestFailed": "连接失败:",
     "customApiFetched": "已拉取 {{count}} 个模型并填入列表",
     "customApiFetchFailed": "拉取失败:",
@@ -425,7 +437,12 @@
     "customApiVerifyProtocol": "验证协议",
     "customApiUrlOk": "链接可达(HTTP {{status}})",
     "customApiUrlFailed": "链接不可达(HTTP {{status}})",
-    "customApiUrlFailed2": "验证链接失败:"
+    "customApiUrlFailed2": "验证链接失败:",
+    "customApiProtocol": "图片协议",
+    "customApiReferenceField": "参考图字段",
+    "customApiReferenceEncoding": "参考图编码",
+    "customApiReferenceEncodingAuto": "自动(按字段)",
+    "customApiProbeHint": "验证协议只使用 /v1/models 和 OPTIONS 等非计费探测，会自动填写图片协议、参考图字段和编码；同步/异步无法安全探测，请手动选择。"
   },
   "pricing": {
     "nativePrice": "原币种：{{value}}",
@@ -464,7 +481,7 @@
     "moveTo": "移动到分组",
     "uncategorized": "未分组",
     "more": "更多操作",
-    "noCategories": "暂无分组",
+    "noCategories": "还没有分组，点击「新建分组」创建",
     "count": "{{count}} 个素材",
     "clear": "清空",
     "clearConfirm": "确定清空当前分组的全部素材吗?",
@@ -497,7 +514,6 @@
     "builtinCategoryHint": "角色、场景、道具为内置分组，不能重命名或删除。",
     "addSubCategory": "新建子分组",
     "subCategoryPrompt": "输入子分组名称:",
-    "noCategories": "还没有分组，点击「新建分组」创建",
     "backup": "备份",
     "backupHint": "导出素材库和提示词库为 zip 备份文件",
     "importBackup": "导入",

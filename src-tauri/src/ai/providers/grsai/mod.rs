@@ -102,7 +102,7 @@ pub struct GrsaiProvider {
 impl GrsaiProvider {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder().no_proxy().timeout(Duration::from_secs(60)).build().unwrap_or_else(|_| Client::new()),
             api_key: Arc::new(RwLock::new(None)),
             base_url: DEFAULT_BASE_URL.to_string(),
         }
@@ -288,7 +288,11 @@ impl GrsaiProvider {
     }
 
     async fn poll_result_until_complete(&self, task_id: &str) -> Result<String, AIError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AIError::TaskFailed("GRSAI task timed out after 30 minutes".to_string()));
+            }
             match self.poll_result_once(task_id).await? {
                 ProviderTaskPollResult::Running => sleep(Duration::from_millis(POLL_INTERVAL_MS)).await,
                 ProviderTaskPollResult::Succeeded(url) => return Ok(url),

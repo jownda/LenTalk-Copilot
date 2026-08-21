@@ -41,12 +41,37 @@ const BALANCE_INSUFFICIENT_PATTERNS = [
   /余额不够/,
 ];
 
+const IMAGE_EDITS_NETWORK_ERROR_PATTERN = /network error[\s\S]*\/v1\/images\/edits/i;
+
+export const IMAGE_EDITS_NETWORK_ERROR_MESSAGE =
+  '当前平台无法使用 /v1/images/edits 上传参考图。请到 API 配置中将图生图适配器切换为 /v1/images JSON 后重试。';
+
 /** 判断错误文本是否为"余额/积分不足"类错误 */
 export function isBalanceInsufficientError(text: string): boolean {
   if (!text) {
     return false;
   }
   return BALANCE_INSUFFICIENT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/** 图生图 multipart 端点不可用时，提示用户改用图片 JSON 协议。 */
+export function isImageEditsNetworkError(message: string, details?: string): boolean {
+  return IMAGE_EDITS_NETWORK_ERROR_PATTERN.test(`${message}\n${details ?? ''}`);
+}
+
+function resolveImageEditsNetworkError(
+  message: string,
+  details: string | undefined
+): { message: string; details?: string } {
+  if (!isImageEditsNetworkError(message, details)) {
+    return { message, details };
+  }
+
+  const rawDetails = details || message;
+  return {
+    message: IMAGE_EDITS_NETWORK_ERROR_MESSAGE,
+    details: rawDetails.trim() || undefined,
+  };
 }
 
 /** 余额不足时的用户可读提示(避免用户误以为是系统故障) */
@@ -101,7 +126,8 @@ export function resolveErrorContent(error: unknown, fallbackMessage: string): Re
     resolved = { message: fallbackMessage };
   }
 
-  return resolveBalanceInsufficient(resolved.message, resolved.details);
+  const balanceResolved = resolveBalanceInsufficient(resolved.message, resolved.details);
+  return resolveImageEditsNetworkError(balanceResolved.message, balanceResolved.details);
 }
 
 export async function showErrorDialog(

@@ -54,6 +54,7 @@ export interface GenerateVideoPayload {
   imageMode?: 'reference' | 'first-last';
   referenceImages?: string[];
   referenceAudio?: string[];
+  extraParams?: Record<string, unknown>;
 }
 
 export type VideoReferenceSourceKind = 'public-url' | 'data-url' | 'local-file' | 'platform-file';
@@ -132,6 +133,9 @@ export interface CanvasEventMap {
   'upload-node/paste-image': {
     nodeId: string;
     file: File;
+  };
+  'group-node/rename': {
+    nodeId: string;
   };
 }
 

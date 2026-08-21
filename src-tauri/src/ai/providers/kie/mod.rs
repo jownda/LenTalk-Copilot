@@ -67,7 +67,7 @@ pub struct KieProvider {
 impl KieProvider {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder().no_proxy().timeout(Duration::from_secs(60)).build().unwrap_or_else(|_| Client::new()),
             api_key: Arc::new(RwLock::new(None)),
         }
     }
@@ -416,7 +416,11 @@ impl KieProvider {
     }
 
     async fn poll_task_until_complete(&self, api_key: &str, task_id: &str) -> Result<String, AIError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AIError::TaskFailed("KIE task timed out after 30 minutes".to_string()));
+            }
             match self.poll_task_once(api_key, task_id).await? {
                 ProviderTaskPollResult::Running => sleep(Duration::from_millis(POLL_INTERVAL_MS)).await,
                 ProviderTaskPollResult::Succeeded(url) => return Ok(url),

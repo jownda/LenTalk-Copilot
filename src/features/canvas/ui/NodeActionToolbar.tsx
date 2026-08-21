@@ -42,6 +42,41 @@ interface NodeActionToolbarProps {
   node: CanvasNode;
 }
 
+const REFERENCE_ENCODINGS = ['data_url', 'raw_base64', 'url'] as const;
+
+function isReferenceEncodingError(message: string): boolean {
+  return /(invalid\s+base64|base64\s+(?:format|decode)|invalid\s+(?:image|media)\s+format|failed\s+to\s+parse\s+request\s+body|unsupported\s+(?:image|reference)\s+(?:field|format)|(?:编码|格式).*(?:不匹配|错误|base64|参考图)|(?:base64|参考图).*(?:编码|格式))/i.test(message);
+}
+
+function prepareEncodingRetry(node: CanvasNode, errorMessage: string): Record<string, unknown> | undefined {
+  if (!isReferenceEncodingError(errorMessage)) return undefined;
+  const data = node.data as Record<string, unknown>;
+  const request = data.generationRequest;
+  if (!request || typeof request !== 'object') return undefined;
+  const requestRecord = request as Record<string, unknown>;
+  const extras = requestRecord.extraParams && typeof requestRecord.extraParams === 'object'
+    ? { ...(requestRecord.extraParams as Record<string, unknown>) }
+    : {};
+  const isVideo = requestRecord.kind === 'video';
+  const key = isVideo ? 'video_reference_encoding' : 'reference_image_encoding';
+  const fieldKey = isVideo ? undefined : 'reference_image_field';
+  const configured = typeof extras[key] === 'string' ? String(extras[key]).toLowerCase() : 'auto';
+  const field = fieldKey && extras[fieldKey] === 'input_image' ? 'input_image' : 'image';
+  const current = configured === 'raw_base64' || configured === 'data_url' || configured === 'url'
+    ? configured
+    : field === 'input_image' ? 'raw_base64' : 'data_url';
+  const currentIndex = REFERENCE_ENCODINGS.indexOf(current as (typeof REFERENCE_ENCODINGS)[number]);
+  const retryCount = typeof data.generationEncodingRetryCount === 'number'
+    ? data.generationEncodingRetryCount
+    : 0;
+  if (retryCount >= REFERENCE_ENCODINGS.length - 1 || currentIndex < 0) return undefined;
+  extras[key] = REFERENCE_ENCODINGS[currentIndex + 1];
+  return {
+    generationRequest: { ...requestRecord, extraParams: extras },
+    generationEncodingRetryCount: retryCount + 1,
+  };
+}
+
 const toolIconMap: Record<ToolIconKey, typeof Crop> = {
   crop: Crop,
   annotate: PenLine,
@@ -66,6 +101,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const ungroupNode = useCanvasStore((state) => state.ungroupNode);
   const canReupload = isUploadNode(node) && Boolean(node.data.imageUrl);
+  const canReuploadMedia = isAudioNode(node) && Boolean(node.data.sourcePath);
   const downloadPresetPaths = useSettingsStore((state) => state.downloadPresetPaths);
   const libraries = useAssetLibraryStore((state) => state.libraries);
   const categories = useAssetLibraryStore((state) => state.categories);
@@ -113,6 +149,9 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     (isExportImageNode(node) || isGeneratedVideoNode) && generationError.length > 0;
   const canRetryGeneration = canCopyGenerationError
     && Boolean((node.data as { generationRequest?: unknown }).generationRequest);
+  const encodingRetryAvailable = Boolean(
+    prepareEncodingRetry(node, `${generationError}\n${generationErrorDetails}`)
+  );
   const generationErrorReport = useMemo(
     () =>
       buildGenerationErrorReport({
@@ -272,15 +311,24 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     if (!canRetryGeneration) {
       return;
     }
+    const encodingRetry = prepareEncodingRetry(node, `${generationError}\n${generationErrorDetails}`);
+    if (encodingRetry && !window.confirm(t(
+      'nodeToolbar.confirmEncodingRetry',
+      '将使用另一种参考图编码提交新的生成请求，平台可能计费。继续吗？'
+    ))) {
+      return;
+    }
     updateNodeData(node.id, {
+      ...(encodingRetry ?? {}),
       isGenerating: true,
       generationStartedAt: Date.now(),
       generationError: null,
       generationErrorDetails: null,
       generationJobId: null,
       generationClientSessionId: null,
+      generationRetryRequested: true,
     });
-  }, [canRetryGeneration, node.id, updateNodeData]);
+  }, [canRetryGeneration, generationError, generationErrorDetails, node, node.id, t, updateNodeData]);
 
   const handleDownloadSaveAs = useCallback(async () => {
     if (!downloadSource) {
@@ -421,13 +469,31 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               event.stopPropagation();
               handleRetryGeneration();
             }}
-            title={t('nodeToolbar.retryGeneration')}
-          >
+            title={encodingRetryAvailable
+              ? t('nodeToolbar.retryWithEncoding', '切换编码并重试')
+              : t('nodeToolbar.retryGeneration')}
+            >
             <RefreshCw className="h-3.5 w-3.5" />
-            {t('nodeToolbar.retryGeneration')}
+            {encodingRetryAvailable
+              ? t('nodeToolbar.retryWithEncoding', '切换编码并重试')
+              : t('nodeToolbar.retryGeneration')}
           </UiChipButton>
         )}
         {!isImageEdit && canHandleMedia && (
+          <>
+            {canReuploadMedia && (
+              <UiChipButton
+                key="media-reupload"
+                className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  canvasEventBus.publish('upload-node/reupload', { nodeId: node.id });
+                }}
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                {t('nodeToolbar.reupload')}
+              </UiChipButton>
+            )}
           <UiChipButton
             key="image-download"
             className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
@@ -447,6 +513,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             <Download className="h-3.5 w-3.5" />
             {t('nodeToolbar.download')}
           </UiChipButton>
+          </>
         )}
         {!isImageEdit && isGeneratedVideoNode && videoSource && (
           <UiChipButton
@@ -463,18 +530,32 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           </UiChipButton>
         )}
         {!isImageEdit && isGroupNode(node) && (
-          <UiChipButton
-            key="group-ungroup"
-            className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS} hover:!border-amber-400/60 hover:!bg-amber-500/20 hover:!text-amber-200`}
-            onClick={(event) => {
-              event.stopPropagation();
-              closeDownloadMenu();
-              ungroupNode(node.id);
-            }}
-          >
-            <Unlink2 className="h-3.5 w-3.5" />
-            {t('nodeToolbar.ungroup')}
-          </UiChipButton>
+          <>
+            <UiChipButton
+              key="group-rename"
+              className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                closeDownloadMenu();
+                canvasEventBus.publish('group-node/rename', { nodeId: node.id });
+              }}
+            >
+              <PenLine className="h-3.5 w-3.5" />
+              {t('nodeToolbar.rename')}
+            </UiChipButton>
+            <UiChipButton
+              key="group-ungroup"
+              className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS} hover:!border-amber-400/60 hover:!bg-amber-500/20 hover:!text-amber-200`}
+              onClick={(event) => {
+                event.stopPropagation();
+                closeDownloadMenu();
+                ungroupNode(node.id);
+              }}
+            >
+              <Unlink2 className="h-3.5 w-3.5" />
+              {t('nodeToolbar.ungroup')}
+            </UiChipButton>
+          </>
         )}
         <UiChipButton
           key="node-delete"

@@ -2,7 +2,6 @@ import { memo, useMemo } from 'react';
 import { Handle, Position } from '@xyflow/react';
 import { LayoutGrid } from 'lucide-react';
 
-import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { CANVAS_NODE_TYPES, type GroupNodeData } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
@@ -15,7 +14,6 @@ type GroupNodeProps = {
 };
 
 export const GroupNode = memo(({ id, data, selected }: GroupNodeProps) => {
-  const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const hoveredGroupId = useCanvasStore((state) => state.hoveredGroupId);
   const flashGroupId = useCanvasStore((state) => state.flashGroupId);
   const chargingGroupId = useCanvasStore((state) => state.chargingGroupId);
@@ -53,16 +51,10 @@ export const GroupNode = memo(({ id, data, selected }: GroupNodeProps) => {
       {isCharging && (
         <style>{`@keyframes group-charge-pulse { 0%,100% { box-shadow: 0 0 0 2px rgba(59,130,246,0.30), 0 0 10px 1px rgba(59,130,246,0.20); } 50% { box-shadow: 0 0 0 3px rgba(59,130,246,0.65), 0 0 22px 6px rgba(59,130,246,0.45); } }`}</style>
       )}
-      <NodeHeader
-        className={NODE_HEADER_FLOATING_POSITION_CLASS}
-        icon={<LayoutGrid className="h-4 w-4" />}
-        titleText={resolvedTitle}
-        editable
-        onTitleChange={(nextTitle) => updateNodeData(id, {
-          displayName: nextTitle,
-          label: nextTitle,
-        })}
-      />
+      <LayoutGrid className="pointer-events-none absolute left-3 top-3 z-0 h-4 w-4 text-text-muted/60" />
+      <span className="pointer-events-none absolute bottom-3 right-4 z-0 max-w-[75%] truncate text-right text-5xl font-semibold text-text-muted/45">
+        {resolvedTitle}
+      </span>
       <NodeResizeHandle minWidth={220} minHeight={140} maxWidth={2200} maxHeight={1600} />
 
       <Handle

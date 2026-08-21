@@ -31,11 +31,14 @@ import {
   graphImageResolver,
 } from '@/features/canvas/application/canvasServices';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
+import { recordGenerationOutcome } from '@/features/canvas/application/usageRecording';
 import {
   detectAspectRatio,
   parseAspectRatio,
+  prepareNodeImage,
   resolveImageDisplayUrl,
 } from '@/features/canvas/application/imageData';
+import { embedStoryboardImageMetadata } from '@/commands/image';
 import {
   buildGenerationErrorReport,
   CURRENT_RUNTIME_SESSION_ID,
@@ -539,10 +542,16 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
   const { t, i18n } = useTranslation();
   const { zoom } = useViewport();
   const updateNodeInternals = useUpdateNodeInternals();
+  const [isGenerating, setIsGenerating] = useState(false);
+  // 显式生成通道(Infinite-Canvas 风格): sync 直出 / async 提交任务轮询
+  // 生成通道固定为 sync 直出(移除 UI 切换按钮; async 仅用于旧项目数据兼容恢复)
+  const generationMode = 'sync' as const;
+  const generationLockRef = useRef(false);
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const nodes = useCanvasStore((state) => state.nodes);
   const edges = useCanvasStore((state) => state.edges);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const updateNodeDataTransient = useCanvasStore((state) => state.updateNodeDataTransient);
   const addNode = useCanvasStore((state) => state.addNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
@@ -1012,7 +1021,15 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
   ]);
 
   const handleGenerate = useCallback(async (previewGridOnly = false) => {
+    if (generationLockRef.current) {
+      return;
+    }
+    generationLockRef.current = true;
+    setIsGenerating(true);
+
     if (!nodeData) {
+      generationLockRef.current = false;
+      setIsGenerating(false);
       return;
     }
 
@@ -1049,6 +1066,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
       addEdge(id, previewNodeId);
       setSelectedNode(null);
       setError(null);
+      generationLockRef.current = false;
+      setIsGenerating(false);
       return;
     }
 
@@ -1057,6 +1076,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
       const errorMessage = '请填写至少一个分镜内容描述';
       setError(errorMessage);
       void showErrorDialog(errorMessage, '错误');
+      generationLockRef.current = false;
+      setIsGenerating(false);
       return;
     }
 
@@ -1064,6 +1085,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
       const errorMessage = '请在设置中填写 API Key';
       setError(errorMessage);
       void showErrorDialog(errorMessage, '错误');
+      generationLockRef.current = false;
+      setIsGenerating(false);
       return;
     }
 
@@ -1092,6 +1115,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
         isGenerating: true,
         generationStartedAt,
         generationDurationMs,
+        // 记录生成通道: Canvas 恢复/重试时按此分流(避免重试误入异步轮询卡死)
+        generationMode,
         // 创建即标记当前运行会话: 提交拿到 jobId 前的窗口期内, Canvas 的
         // "无 jobId 自动恢复"逻辑不会把本节点当作残留任务重复提交(重复扣费)
         generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
@@ -1155,14 +1180,14 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
           return sanitizeStoryboardText(description, ignoreAtTagWhenCopyingAndGenerating);
         });
 
-      const jobId = await canvasAiGateway.submitGenerateImageJob({
+      const generationPayload = {
         prompt,
         model: requestResolution.requestModel,
         size: selectedResolution.value,
         aspectRatio: resolvedRequestAspectRatio,
         referenceImages: allReferenceImages,
         extraParams: effectiveExtraParams,
-      });
+      };
       const runtimeDiagnostics = await runtimeDiagnosticsPromise;
       const generationDebugContext: GenerationDebugContext = {
         sourceType: 'storyboardGen',
@@ -1180,18 +1205,60 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
         osBuild: runtimeDiagnostics.osBuild,
         userAgent: runtimeDiagnostics.userAgent,
       };
-      updateNodeData(newNodeId, {
-        generationJobId: jobId,
-        generationSourceType: 'storyboardGen',
-        generationProviderId: selectedModel.providerId,
-        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
-        generationDebugContext,
-        generationStoryboardMetadata: {
-          gridRows: safeRows,
-          gridCols: safeCols,
-          frameNotes: metadataFrameNotes,
-        },
-      });
+      const storyboardMetadata = {
+        gridRows: safeRows,
+        gridCols: safeCols,
+        frameNotes: metadataFrameNotes,
+      };
+      if (generationMode === 'sync') {
+        // 同步通道(等价 Infinite-Canvas /api/generate): generate_image 直出
+        const imageSource = await canvasAiGateway.generateImage(generationPayload);
+        const prepared = await prepareNodeImage(imageSource);
+        const hasStoryboardMetadata = Number.isFinite(storyboardMetadata.gridRows)
+          && Number.isFinite(storyboardMetadata.gridCols)
+          && Array.isArray(storyboardMetadata.frameNotes);
+        const imageWithMetadata = hasStoryboardMetadata
+          ? await embedStoryboardImageMetadata(prepared.imageUrl, storyboardMetadata).catch(() => prepared.imageUrl)
+          : prepared.imageUrl;
+        const previewWithMetadata = prepared.previewImageUrl === prepared.imageUrl
+          ? imageWithMetadata
+          : prepared.previewImageUrl;
+        recordGenerationOutcome({
+          nodeId: newNodeId,
+          kind: 'image',
+          providerId: selectedModel.providerId,
+          modelId: requestResolution.requestModel,
+          size: selectedResolution.value,
+          referenceCount: allReferenceImages.length,
+          status: 'succeeded',
+        });
+        updateNodeDataTransient(newNodeId, {
+          imageUrl: imageWithMetadata,
+          previewImageUrl: previewWithMetadata,
+          aspectRatio: prepared.aspectRatio,
+          isGenerating: false,
+          generationStartedAt: null,
+          generationJobId: null,
+          generationProviderId: null,
+          generationClientSessionId: null,
+          generationStoryboardMetadata: storyboardMetadata,
+          generationError: null,
+          generationErrorDetails: null,
+          generationDebugContext,
+          generationRequest: undefined,
+        });
+      } else {
+        // 异步通道(等价 Infinite-Canvas /api/canvas-image-tasks): 提交任务后由 Canvas 轮询
+        const jobId = await canvasAiGateway.submitGenerateImageJob(generationPayload);
+        updateNodeData(newNodeId, {
+          generationJobId: jobId,
+          generationSourceType: 'storyboardGen',
+          generationProviderId: selectedModel.providerId,
+          generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+          generationDebugContext,
+          generationStoryboardMetadata: storyboardMetadata,
+        });
+      }
     } catch (generationError) {
       const resolvedError = resolveErrorContent(generationError, '生成失败');
       const runtimeDiagnostics = await runtimeDiagnosticsPromise;
@@ -1230,6 +1297,9 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
         generationErrorDetails: resolvedError.details ?? null,
         generationDebugContext,
       });
+    } finally {
+      generationLockRef.current = false;
+      setIsGenerating(false);
     }
   }, [
     providerApiKey,
@@ -1251,6 +1321,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     selectedModel.id,
     findNodePosition,
     updateNodeData,
+    updateNodeDataTransient,
+    generationMode,
     mappedOverallRequestAspectRatio,
     resolveEffectiveRequestAspectRatio,
     t,
@@ -1698,6 +1770,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
         />
 
         <UiButton
+          disabled={isGenerating}
           onClick={(event: ReactMouseEvent<HTMLButtonElement>) => {
             event.stopPropagation();
             const previewGridOnly =

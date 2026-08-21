@@ -1,5 +1,6 @@
 import {
   type KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
   memo,
   useMemo,
@@ -29,9 +30,11 @@ import {
   graphImageResolver,
 } from '@/features/canvas/application/canvasServices';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
+import { recordGenerationOutcome } from '@/features/canvas/application/usageRecording';
 import {
   detectAspectRatio,
   parseAspectRatio,
+  prepareNodeImage,
   resolveImageDisplayUrl,
 } from '@/features/canvas/application/imageData';
 import {
@@ -228,7 +231,7 @@ function renderPromptWithHighlights(
   prompt: string,
   maxImageCount: number,
   imageUrls: string[],
-  onThumbnailClick?: (displayUrl: string, event: { clientX: number; clientY: number }) => void
+  onThumbnailClick: (imageIndex: number, event: ReactMouseEvent<HTMLSpanElement>) => void
 ): ReactNode {
   if (!prompt) {
     return ' ';
@@ -250,24 +253,27 @@ function renderPromptWithHighlights(
     }
 
     if (imageUrl) {
-      // 保留 token 占位以保持光标位置一致，缩略图撑满整个 token 区域(左右零空隙)。
-      // 缩略图必须 pointer-events-none: 它在高亮层(z-20)覆盖在 textarea 上方,
-      // 若可点击会拦截鼠标, 导致光标不跟手、文字无法选中/删除。
-      // token 用普通 inline span(勿用 inline-block): 保证高亮层排版与 textarea
-      // 完全一致(基线/换行), 否则光标位置与显示文字错位。
+      // 保留 token 占位以保持光标位置一致(token 文字透明, 只显示缩略图)。
+      // 高亮层(z-20)覆盖在 textarea 上方: textarea 文字透明, 用户只看到
+      // 高亮层渲染的普通文字 + 缩略图, 不会看到 @图N 字样。
+      // 缩略图以行内元素参与排版,再用同宽负外边距抵消其占位。
+      // 这样它永远跟随当前文字行,而高亮层总宽度仍与 textarea 的 @图N 完全一致。
       segments.push(
         <span
           key={`ref-${matchStart}`}
-          className="relative z-0 text-transparent"
+          data-reference-image-index={imageIndex}
+          className="pointer-events-auto relative z-0 cursor-zoom-in select-none text-transparent"
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick={(event) => {
+            event.stopPropagation();
+            onThumbnailClick(imageIndex, event);
+          }}
         >
-          {matchText}
           <span
-            className="pointer-events-auto absolute left-1/2 top-1/2 inline-flex h-[20px] w-[20px] -translate-x-1/2 -translate-y-1/2 cursor-zoom-in items-center justify-center overflow-hidden rounded-[5px] bg-accent/70"
-            onClick={(event) => {
-              event.stopPropagation();
-              onThumbnailClick?.(imageUrl, event);
-            }}
-            onMouseDown={(event) => event.stopPropagation()}
+            className="pointer-events-none relative -mr-5 inline-flex h-5 w-5 shrink-0 translate-x-1/2 align-middle items-center justify-center overflow-hidden rounded-md bg-accent/20 shadow-sm"
           >
             <img
               src={imageUrl}
@@ -276,6 +282,7 @@ function renderPromptWithHighlights(
               className="h-full w-full shrink-0 object-cover"
             />
           </span>
+          {matchText}
         </span>
       );
     } else {
@@ -297,6 +304,82 @@ function renderPromptWithHighlights(
   }
 
   return segments;
+}
+
+function restoreBrokenImageReference(
+  previousPrompt: string,
+  nextPrompt: string,
+  maxImageCount: number
+): string {
+  const previousTokens = findReferenceTokens(previousPrompt, maxImageCount);
+  let restoredPrompt = nextPrompt;
+
+  for (const token of previousTokens) {
+    if (restoredPrompt.includes(token.token)) {
+      continue;
+    }
+
+    let prefixLength = 0;
+    const maxPrefixLength = Math.min(previousPrompt.length, restoredPrompt.length);
+    while (
+      prefixLength < maxPrefixLength
+      && previousPrompt[prefixLength] === restoredPrompt[prefixLength]
+    ) {
+      prefixLength += 1;
+    }
+
+    let suffixLength = 0;
+    const maxSuffixLength = Math.min(
+      previousPrompt.length - prefixLength,
+      restoredPrompt.length - prefixLength
+    );
+    while (
+      suffixLength < maxSuffixLength
+      && previousPrompt[previousPrompt.length - 1 - suffixLength]
+        === restoredPrompt[restoredPrompt.length - 1 - suffixLength]
+    ) {
+      suffixLength += 1;
+    }
+
+    const changedStart = prefixLength;
+    const changedEnd = previousPrompt.length - suffixLength;
+    if (token.start >= changedEnd || token.end <= changedStart) {
+      continue;
+    }
+
+    restoredPrompt = `${restoredPrompt.slice(0, prefixLength)}${token.token}${
+      suffixLength > 0 ? restoredPrompt.slice(restoredPrompt.length - suffixLength) : ''
+    }`;
+  }
+
+  return restoredPrompt;
+}
+
+function resolveAtomicReferenceSelection(
+  text: string,
+  selectionStart: number,
+  selectionEnd: number,
+  maxImageCount: number
+): { start: number; end: number } | null {
+  const safeStart = Math.max(0, Math.min(selectionStart, text.length));
+  const safeEnd = Math.max(0, Math.min(selectionEnd, text.length));
+
+  for (const token of findReferenceTokens(text, maxImageCount)) {
+    if (safeStart === safeEnd && safeStart > token.start && safeStart < token.end) {
+      const midpoint = token.start + (token.end - token.start) / 2;
+      const boundary = safeStart < midpoint ? token.start : token.end;
+      return { start: boundary, end: boundary };
+    }
+
+    if (safeStart !== safeEnd && safeStart < token.end && safeEnd > token.start) {
+      return {
+        start: Math.min(safeStart, token.start),
+        end: Math.max(safeEnd, token.end),
+      };
+    }
+  }
+
+  return null;
 }
 
 function pickClosestAspectRatio(
@@ -332,6 +415,10 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const { t, i18n } = useTranslation();
   const updateNodeInternals = useUpdateNodeInternals();
   const [error, setError] = useState<string | null>(null);
+  const [isGenerating, setIsGenerating] = useState(false);
+  // 生成通道固定为 sync 直出(移除 UI 切换按钮; async 仅用于旧项目数据兼容恢复)
+  const generationMode = 'sync' as const;
+  const generationLockRef = useRef(false);
 
   const rootRef = useRef<HTMLDivElement>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
@@ -351,6 +438,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const edges = useCanvasStore((state) => state.edges);
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const updateNodeDataTransient = useCanvasStore((state) => state.updateNodeDataTransient);
   const addNode = useCanvasStore((state) => state.addNode);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
   const addEdge = useCanvasStore((state) => state.addEdge);
@@ -595,6 +683,12 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   }, []);
 
   const handleGenerate = useCallback(async () => {
+    if (generationLockRef.current) {
+      return;
+    }
+    generationLockRef.current = true;
+    setIsGenerating(true);
+
     const prompt = [
       promptDraft.replace(/@(?=图\d+)/g, '').trim(),
       ...incomingText,
@@ -603,6 +697,8 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
       const errorMessage = t('node.imageEdit.promptRequired');
       setError(errorMessage);
       void showErrorDialog(errorMessage, t('common.error'));
+      generationLockRef.current = false;
+      setIsGenerating(false);
       return;
     }
 
@@ -610,6 +706,8 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
       const errorMessage = t('node.imageEdit.apiKeyRequired');
       setError(errorMessage);
       void showErrorDialog(errorMessage, t('common.error'));
+      generationLockRef.current = false;
+      setIsGenerating(false);
       return;
     }
 
@@ -639,6 +737,8 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         isGenerating: true,
         generationStartedAt,
         generationDurationMs,
+        // 记录生成通道: Canvas 恢复/重试时按此分流(避免重试误入异步轮询卡死)
+        generationMode,
         // 创建即标记当前运行会话: 提交拿到 jobId 前的窗口期内, Canvas 的
         // "无 jobId 自动恢复"逻辑不会把本节点当作残留任务重复提交(重复扣费)
         generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
@@ -694,7 +794,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
           extraParams: effectiveExtraParams,
         },
       });
-      const jobId = await canvasAiGateway.submitGenerateImageJob({
+      const generationPayload = {
         prompt,
         negativePrompt: negativePrompt || undefined,
         model: requestResolution.requestModel,
@@ -702,7 +802,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         aspectRatio: resolvedRequestAspectRatio,
         referenceImages: incomingImages,
         extraParams: effectiveExtraParams,
-      });
+      };
       const runtimeDiagnostics = await runtimeDiagnosticsPromise;
       const generationDebugContext: GenerationDebugContext = {
         sourceType: 'imageEdit',
@@ -721,13 +821,47 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         osBuild: runtimeDiagnostics.osBuild,
         userAgent: runtimeDiagnostics.userAgent,
       };
-      updateNodeData(newNodeId, {
-        generationJobId: jobId,
-        generationSourceType: 'imageEdit',
-        generationProviderId: selectedModel.providerId,
-        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
-        generationDebugContext,
-      });
+      if (generationMode === 'sync') {
+        // 同步通道(等价 Infinite-Canvas /api/generate): generate_image 直出,
+        // 不创建异步任务, 由后端一次请求等结果返回, 避免轮询不收敛卡死。
+        const imageSource = await canvasAiGateway.generateImage(generationPayload);
+        const prepared = await prepareNodeImage(imageSource);
+        recordGenerationOutcome({
+          nodeId: newNodeId,
+          kind: 'image',
+          providerId: selectedModel.providerId,
+          modelId: requestResolution.requestModel,
+          size: selectedResolution.value,
+          referenceCount: incomingImages.length,
+          status: 'succeeded',
+        });
+        updateNodeDataTransient(newNodeId, {
+          imageUrl: prepared.imageUrl,
+          previewImageUrl: prepared.previewImageUrl,
+          aspectRatio: prepared.aspectRatio,
+          isGenerating: false,
+          generationStartedAt: null,
+          generationJobId: null,
+          generationProviderId: null,
+          generationClientSessionId: null,
+          generationStoryboardMetadata: undefined,
+          generationError: null,
+          generationErrorDetails: null,
+          generationDebugContext,
+          generationRequest: undefined,
+        });
+      } else {
+        // 异步通道(等价 Infinite-Canvas /api/canvas-image-tasks): 提交任务,
+        // 写入 jobId 后由 Canvas 统一轮询 getGenerateImageJob 收敛。
+        const jobId = await canvasAiGateway.submitGenerateImageJob(generationPayload);
+        updateNodeData(newNodeId, {
+          generationJobId: jobId,
+          generationSourceType: 'imageEdit',
+          generationProviderId: selectedModel.providerId,
+          generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+          generationDebugContext,
+        });
+      }
     } catch (generationError) {
       const resolvedError = resolveErrorContent(generationError, t('ai.error'));
       const runtimeDiagnostics = await runtimeDiagnosticsPromise;
@@ -769,6 +903,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         generationErrorDetails: resolvedError.details ?? null,
         generationDebugContext,
       });
+    } finally {
+      generationLockRef.current = false;
+      setIsGenerating(false);
     }
   }, [
     addNode,
@@ -789,6 +926,8 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     supportedAspectRatioValues,
     t,
     updateNodeData,
+    updateNodeDataTransient,
+    generationMode,
   ]);
 
   const syncPromptHighlightScroll = () => {
@@ -799,6 +938,62 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     promptHighlightRef.current.scrollTop = promptRef.current.scrollTop;
     promptHighlightRef.current.scrollLeft = promptRef.current.scrollLeft;
   };
+
+  const handlePromptAreaClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    const referenceElements = event.currentTarget.querySelectorAll<HTMLElement>(
+      '[data-reference-image-index]'
+    );
+
+    for (const element of referenceElements) {
+      const rect = element.getBoundingClientRect();
+      if (
+        event.clientX < rect.left
+        || event.clientX > rect.right
+        || event.clientY < rect.top
+        || event.clientY > rect.bottom
+      ) {
+        continue;
+      }
+
+      const imageIndex = Number(element.dataset.referenceImageIndex);
+      const image = incomingImageItems[imageIndex];
+      if (!image) {
+        return;
+      }
+
+      setPreviewState({ url: image.displayUrl, x: event.clientX, y: event.clientY });
+      setPreviewSize(null);
+      return;
+    }
+  }, [incomingImageItems]);
+
+  const handleReferenceThumbnailClick = useCallback((
+    imageIndex: number,
+    event: ReactMouseEvent<HTMLSpanElement>
+  ) => {
+    const image = incomingImageItems[imageIndex];
+    if (!image) {
+      return;
+    }
+
+    setPreviewState({ url: image.displayUrl, x: event.clientX, y: event.clientY });
+    setPreviewSize(null);
+  }, [incomingImageItems]);
+
+  const normalizePromptSelection = useCallback((textarea: HTMLTextAreaElement) => {
+    const currentPrompt = promptDraftRef.current;
+    const selectionStart = textarea.selectionStart ?? currentPrompt.length;
+    const selectionEnd = textarea.selectionEnd ?? selectionStart;
+    const normalized = resolveAtomicReferenceSelection(
+      currentPrompt,
+      selectionStart,
+      selectionEnd,
+      incomingImages.length
+    );
+    if (normalized) {
+      textarea.setSelectionRange(normalized.start, normalized.end);
+    }
+  }, [incomingImages.length]);
 
   const insertImageReference = useCallback((imageIndex: number) => {
     const marker = `@图${imageIndex + 1}`;
@@ -827,10 +1022,49 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   }, [commitPromptDraft, pickerCursor]);
 
   const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    const currentPrompt = promptDraftRef.current;
+    const selectionStart = event.currentTarget.selectionStart ?? currentPrompt.length;
+    const selectionEnd = event.currentTarget.selectionEnd ?? selectionStart;
+
+    // 引用 token 是原子内容: 光标通过键盘移动到 token 内部时,直接跳到边界;
+    // 普通输入不会插入 token 中间,避免 @图N 被拆坏。Backspace/Delete 继续走下方
+    // 的整体删除逻辑。
+    const activeImageToken = findReferenceTokens(currentPrompt, incomingImages.length).find(
+      (token) =>
+        (selectionStart !== selectionEnd
+          && selectionStart < token.end
+          && selectionEnd > token.start)
+        || (selectionStart === selectionEnd
+          && selectionStart > token.start
+          && selectionStart < token.end)
+        || (event.key === 'ArrowLeft' && selectionStart === token.end && selectionEnd === token.end)
+        || (event.key === 'ArrowRight' && selectionStart === token.start && selectionEnd === token.start)
+    );
+    if (
+      activeImageToken
+      && event.key !== 'Backspace'
+      && event.key !== 'Delete'
+      && event.key !== 'ArrowLeft'
+      && event.key !== 'ArrowRight'
+    ) {
+      event.preventDefault();
+      const nextCursor = selectionStart <= activeImageToken.start
+        ? activeImageToken.start
+        : activeImageToken.end;
+      event.currentTarget.setSelectionRange(nextCursor, nextCursor);
+      return;
+    }
+
+    if (activeImageToken && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+      event.preventDefault();
+      const nextCursor = event.key === 'ArrowLeft'
+        ? activeImageToken.start
+        : activeImageToken.end;
+      event.currentTarget.setSelectionRange(nextCursor, nextCursor);
+      return;
+    }
+
     if (event.key === 'Backspace' || event.key === 'Delete') {
-      const currentPrompt = promptDraftRef.current;
-      const selectionStart = event.currentTarget.selectionStart ?? currentPrompt.length;
-      const selectionEnd = event.currentTarget.selectionEnd ?? selectionStart;
       const deletionDirection = event.key === 'Backspace' ? 'backward' : 'forward';
       const deleteRange = resolveReferenceAwareDeleteRange(
         currentPrompt,
@@ -929,7 +1163,10 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
       />
 
       <div className="relative min-h-0 flex-1 rounded-lg border border-[rgba(255,255,255,0.1)] bg-bg-dark/45 p-2">
-        <div className="relative h-full min-h-0">
+        <div
+          className="relative h-full min-h-0"
+          onClick={handlePromptAreaClick}
+        >
           <div
             ref={promptHighlightRef}
             aria-hidden="true"
@@ -941,10 +1178,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
                 promptDraft,
                 incomingImages.length,
                 incomingImageItems.map((item) => item.displayUrl),
-                (displayUrl, event) => {
-                  setPreviewState({ url: displayUrl, x: event.clientX, y: event.clientY });
-                  setPreviewSize(null);
-                }
+                handleReferenceThumbnailClick
               )}
             </div>
           </div>
@@ -953,15 +1187,20 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
             ref={promptRef}
             value={promptDraft}
             onChange={(event) => {
-              const nextValue = event.target.value;
+              const nextValue = restoreBrokenImageReference(
+                promptDraftRef.current,
+                event.target.value,
+                incomingImages.length
+              );
               setPromptDraft(nextValue);
               commitPromptDraft(nextValue);
             }}
+            onSelect={(event) => normalizePromptSelection(event.currentTarget)}
             onKeyDown={handlePromptKeyDown}
             onScroll={syncPromptHighlightScroll}
             onMouseDown={(event) => event.stopPropagation()}
             placeholder={t('node.imageEdit.promptPlaceholder')}
-            className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-text-muted outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${incomingText.length > 0 ? 'pb-20' : ''}`}
+            className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${incomingText.length > 0 ? 'pb-20' : ''}`}
             style={{ scrollbarGutter: 'stable' }}
           />
           {incomingText.length > 0 && (
@@ -1070,6 +1309,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         <div className="ml-auto" />
 
         <UiButton
+          disabled={isGenerating}
           onClick={(event) => {
             event.stopPropagation();
             void handleGenerate();

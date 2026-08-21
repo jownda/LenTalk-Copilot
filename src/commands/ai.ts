@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from '@/stores/settingsStore';
+import type { CustomApiCapabilities } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
 
 export interface GenerateRequest {
@@ -311,17 +312,6 @@ function buildHttpErrorSummary(status: number, rawResponse: string, url: string)
   return `HTTP ${status}${bodySummary} (${url})`;
 }
 
-function resolveWgspaiVideoStudioSize(aspectRatio: string): string {
-  const sizeByRatio: Record<string, string> = {
-    '16:9': '1280x720',
-    '9:16': '720x1280',
-    '4:3': '1024x768',
-    '3:4': '768x1024',
-    '1:1': '1024x1024',
-  };
-  return sizeByRatio[aspectRatio] ?? '1280x720';
-}
-
 function resolveZzdhVideoResolution(value: string | undefined, aspectRatio: string, model: string): string {
   const requested = value?.trim().toLowerCase() ?? '';
   // 模型名锁定档位时按官方大写档位交付(720P / 1080P / 2K), 与模型名交付分辨率一致
@@ -336,6 +326,15 @@ function resolveZzdhVideoResolution(value: string | undefined, aspectRatio: stri
   return dimensions[aspectRatio.trim()]?.[requested]
     ?? dimensions[aspectRatio.trim()]?.['720p']
     ?? '1280x720';
+}
+
+function resolveProviderEndpoint(baseUrl: string, configuredPath: unknown, fallbackPath: string, taskId?: string): string {
+  const configured = typeof configuredPath === 'string' && configuredPath.trim()
+    ? configuredPath.trim()
+    : fallbackPath;
+  const resolvedPath = taskId ? configured.replace('{taskId}', encodeURIComponent(taskId)) : configured;
+  if (/^https?:\/\//i.test(resolvedPath)) return resolvedPath;
+  return `${baseUrl}${resolvedPath.startsWith('/') ? resolvedPath : `/${resolvedPath}`}`;
 }
 
 /** 读取图片实际宽高(供首尾帧画幅跟随首帧), 失败返回 null */
@@ -365,6 +364,46 @@ const ZZDH_ASPECT_RATIO_VALUES: Array<{ label: string; value: number }> = [
   { label: '3:4', value: 3 / 4 },
   { label: '21:9', value: 21 / 9 },
 ];
+
+interface ProviderJsonResponse {
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+}
+
+/**
+ * Desktop provider requests must use Rust's native HTTP client. A number of
+ * custom video gateways do not enable CORS, so WebView fetch is only retained
+ * for the browser-only build.
+ */
+export async function requestProviderJson(
+  url: string,
+  init: { method?: string; headers?: Record<string, string>; body?: string }
+): Promise<ProviderJsonResponse> {
+  if (!isTauri()) {
+    return await fetch(url, init);
+  }
+
+  let body: unknown;
+  if (init.body) {
+    try {
+      body = JSON.parse(init.body);
+    } catch {
+      throw new Error(`Provider request body is not valid JSON (${url})`);
+    }
+  }
+  const result = await invoke<{ status: number; body: string }>('request_provider_json', {
+    url,
+    method: init.method ?? 'GET',
+    headers: init.headers ?? {},
+    body,
+  });
+  return {
+    ok: result.status >= 200 && result.status < 300,
+    status: result.status,
+    text: async () => result.body,
+  };
+}
 
 /** 把图片宽高映射到 zzdh 支持的画幅标签(取最接近) */
 function resolveZzdhAspectRatioLabel(width: number, height: number): string {
@@ -436,7 +475,7 @@ async function generateZzdhVideo(
     ...(referenceImages.length ? { reference_images: referenceImages } : {}),
   };
   const submitUrl = `${baseUrl}/v8/videos/generations`;
-  const response = await fetch(submitUrl, {
+  const response = await requestProviderJson(submitUrl, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -461,7 +500,7 @@ async function generateZzdhVideo(
   const taskUrl = `${submitUrl}/${encodeURIComponent(taskId)}`;
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 3000));
-    const taskResponse = await fetch(taskUrl, { headers });
+    const taskResponse = await requestProviderJson(taskUrl, { headers });
     const taskRawResponse = await taskResponse.text();
     try {
       payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
@@ -480,348 +519,21 @@ async function generateZzdhVideo(
   }
 }
 
-function getWgspaiStudioError(payload: unknown): string {
-  if (!payload || typeof payload !== 'object') return '';
-  const record = payload as Record<string, unknown>;
-  for (const key of ['message', 'error', 'msg']) {
-    const value = record[key];
-    if (typeof value === 'string' && value.trim()) return value.trim();
-    if (value && typeof value === 'object') {
-      const nestedMessage = (value as Record<string, unknown>).message;
-      if (typeof nestedMessage === 'string' && nestedMessage.trim()) return nestedMessage.trim();
-    }
-  }
-  return '';
-}
-
-function ensureWgspaiStudioSuccess(payload: unknown): void {
-  if (!payload || typeof payload !== 'object') {
-    throw new Error('WGSPAI 视频工作台返回了无效响应');
-  }
-  const code = (payload as Record<string, unknown>).code;
-  if (typeof code === 'number' && code !== 0) {
-    throw new Error(`WGSPAI 视频工作台请求失败: ${getWgspaiStudioError(payload) || `code ${code}`}`);
-  }
-}
-
-async function postWgspaiVideoStudioRequest(
-  baseUrl: string,
-  apiKey: string,
-  action: 'create' | 'query',
-  body: Record<string, unknown>,
-  headers: Record<string, string>
-): Promise<unknown> {
-  if (isTauri()) {
-    return await invoke('post_wgspai_video_studio_request', {
-      baseUrl,
-      apiKey,
-      action,
-      body,
-    });
-  }
-
-  const url = `${baseUrl}/api/video-studio/${action}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
-  const rawResponse = await response.text();
-  if (!response.ok) {
-    throw new Error(buildHttpErrorSummary(response.status, rawResponse, url));
-  }
-  try {
-    return JSON.parse(rawResponse);
-  } catch {
-    throw new Error(`平台返回了非 JSON 响应 (${url})`);
-  }
-}
-
-async function generateWgspaiStudioVideo(
-  request: GenerateVideoRequest,
-  baseUrl: string,
-  apiKey: string,
-  apiModel: string,
-  headers: Record<string, string>
-): Promise<string> {
-  const videoImages = request.image_mode === 'first-last'
-    ? request.reference_images?.slice(0, 2)
-    : request.reference_images;
-  const body = {
-    model: apiModel,
-    prompt: request.prompt,
-    size: resolveWgspaiVideoStudioSize(request.aspect_ratio),
-    duration: Math.max(1, Math.round(request.duration)),
-    ...(videoImages?.length ? {
-      images: videoImages,
-      ...(videoImages.length === 1 ? { image: videoImages[0], input_reference: videoImages[0] } : {}),
-      ...(request.image_mode === 'first-last' ? { generation_type: 'frame' } : {}),
-    } : {}),
-    ...(request.reference_audio?.length
-      ? {
-        audios: request.reference_audio,
-        audio_url: request.reference_audio[0],
-      }
-      : {}),
-  };
-  const payload = await postWgspaiVideoStudioRequest(baseUrl, apiKey, 'create', body, headers);
-  try {
-    ensureWgspaiStudioSuccess(payload);
-  } catch (error) {
-    // 附加 token 摘要, 便于定位 401 是 token 未保存还是填错
-    const maskedToken = apiKey.length > 4
-      ? `${apiKey.slice(0, 4)}***${apiKey.slice(-2)}`
-      : apiKey
-        ? '(short)'
-        : '(empty)';
-    throw new Error(`${error instanceof Error ? error.message : String(error)} [access token: ${maskedToken}]`);
-  }
-
-  const immediateResult = getVideoResultUrl(payload);
-  if (immediateResult) return immediateResult;
-  const taskId = getVideoTaskId(payload);
-  if (!taskId) {
-    throw new Error(`WGSPAI 视频工作台响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
-  }
-
-  while (true) {
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    const queryPayload = await postWgspaiVideoStudioRequest(
-      baseUrl,
-      apiKey,
-      'query',
-      { task_id: taskId },
-      headers
-    );
-    ensureWgspaiStudioSuccess(queryPayload);
-    const videoUrl = getVideoResultUrl(queryPayload);
-    if (videoUrl) return videoUrl;
-    const status = getVideoTaskStatus(queryPayload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
-      throw new Error(`视频生成失败: ${status}`);
-    }
-  }
-}
-
-function resolveMinimaxH3Resolution(value: string | undefined): '768P' | '2K' {
-  return value?.trim().toUpperCase() === '768P' ? '768P' : '2K';
-}
-
-function normalizeMinimaxH3ModelName(model: string): string {
-  return model.trim().toLowerCase() === 'minimax-h3' ? 'MiniMax-H3' : model;
-}
-
-/**
- * WGSPAI 的 Minimax H3 适配：请求体按 MiniMax V2 的多模态 content 语义构造，
- * 但仍使用 WGSPAI 已验证的 /v1/video/generations 提交与查询入口。
- */
-async function generateWgspaiMinimaxH3Video(
-  request: GenerateVideoRequest,
-  baseUrl: string,
-  apiModel: string,
-  headers: Record<string, string>
-): Promise<string> {
-  const isFirstLast = request.image_mode === 'first-last';
-  const videoImages = request.reference_images?.slice(0, isFirstLast ? 2 : undefined) ?? [];
-  const referenceAudio = request.reference_audio?.filter((value) => value.trim().length > 0) ?? [];
-
-  if (isFirstLast && videoImages.length !== 2) {
-    throw new Error('MiniMax H3 首尾帧模式需要首帧和尾帧两张图片');
-  }
-  if (isFirstLast && referenceAudio.length > 0) {
-    throw new Error('MiniMax H3 首尾帧模式不能同时使用参考音频');
-  }
-
-  const content: Array<Record<string, unknown>> = [
-    { type: 'text', text: request.prompt },
-  ];
-  if (isFirstLast) {
-    content.push(
-      { type: 'image_url', image_url: { url: videoImages[0] }, role: 'first_frame' },
-      { type: 'image_url', image_url: { url: videoImages[1] }, role: 'last_frame' },
-    );
-  } else {
-    for (const image of videoImages) {
-      content.push({ type: 'image_url', image_url: { url: image }, role: 'reference_image' });
-    }
-    for (const audio of referenceAudio) {
-      content.push({ type: 'audio_url', audio_url: { url: audio }, role: 'reference_audio' });
-    }
-  }
-
-  const body = {
-    model: apiModel,
-    prompt: request.prompt,
-    content,
-    duration: Math.max(4, Math.min(15, Math.round(request.duration))),
-    // MiniMax H3 的 i2va(首尾帧)比例必须使用 adaptive，由输入图片决定。
-    ratio: isFirstLast ? 'adaptive' : request.aspect_ratio,
-    resolution: resolveMinimaxH3Resolution(request.video_resolution),
-    // 保留 WGSPAI 当前视频网关已兼容的字段，content 则提供 H3 官方角色语义。
-    ...(videoImages.length ? {
-      images: videoImages,
-      ...(videoImages.length === 1 ? {
-        image: videoImages[0],
-        input_reference: videoImages[0],
-      } : {}),
-    } : {}),
-    ...(referenceAudio.length ? {
-      audio_url: referenceAudio[0],
-      audio_urls: referenceAudio,
-    } : {}),
-  };
-  const submitUrl = `${baseUrl}/v1/video/generations`;
-  const response = await fetch(submitUrl, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
-  const rawResponse = await response.text();
-  let payload: unknown;
-  try {
-    payload = rawResponse ? JSON.parse(rawResponse) : {};
-  } catch {
-    throw new Error(`MiniMax H3 视频生成请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
-  }
-  if (!response.ok) {
-    throw new Error(`MiniMax H3 视频生成请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
-  }
-  const immediateResult = getVideoResultUrl(payload);
-  if (immediateResult) return immediateResult;
-  const taskId = getVideoTaskId(payload);
-  if (!taskId) {
-    throw new Error(`MiniMax H3 视频响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
-  }
-
-  const taskUrl = `${submitUrl}/${encodeURIComponent(taskId)}`;
-  while (true) {
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    const taskResponse = await fetch(taskUrl, { headers });
-    const taskRawResponse = await taskResponse.text();
-    try {
-      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
-    } catch {
-      throw new Error(`MiniMax H3 视频查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
-    }
-    if (!taskResponse.ok) {
-      throw new Error(`MiniMax H3 视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
-    }
-    const videoUrl = getVideoResultUrl(payload);
-    if (videoUrl) return videoUrl;
-    const status = getVideoTaskStatus(payload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
-      throw new Error(`MiniMax H3 视频生成失败: ${status}`);
-    }
-  }
-}
-
-async function generateWgspaiOpenAiVideo(
-  request: GenerateVideoRequest,
-  baseUrl: string,
-  apiModel: string,
-  headers: Record<string, string>
-): Promise<string> {
-  const videoImages = request.image_mode === 'first-last'
-    ? request.reference_images?.slice(0, 2)
-    : request.reference_images;
-  const [width, height] = resolveWgspaiVideoStudioSize(request.aspect_ratio)
-    .split('x')
-    .map((value: string) => Number(value));
-  const body = {
-    model: apiModel,
-    prompt: request.prompt,
-    duration: Math.max(1, Math.round(request.duration)),
-    // WGSPAI 的 OpenAI Video 网关以 size 作为标准任务字段；仅传 width/height
-    // 会被网关忽略并回退到模型默认画幅（常见为 9:16）。
-    size: `${width}x${height}`,
-    width,
-    height,
-    n: 1,
-    response_format: 'url',
-    metadata: {
-      aspect_ratio: request.aspect_ratio,
-      width,
-      height,
-    },
-    ...(videoImages?.length === 1 ? {
-      image: videoImages[0],
-      input_reference: videoImages[0],
-    } : videoImages?.length ? {
-      // WGSPAI Video Studio 对多图使用有序 images 数组。首尾帧模式严格保持
-      // [首帧, 尾帧]，不混入未公开支持的 generation_type / first_frame 字段。
-      images: videoImages,
-    } : {}),
-  };
-  const submitUrl = `${baseUrl}/v1/video/generations`;
-  const response = await fetch(submitUrl, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
-  const rawResponse = await response.text();
-  let payload: unknown;
-  try {
-    payload = rawResponse ? JSON.parse(rawResponse) : {};
-  } catch {
-    throw new Error(`WGSPAI 视频生成请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
-  }
-  if (!response.ok) {
-    throw new Error(`WGSPAI 视频生成请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
-  }
-  const immediateResult = getVideoResultUrl(payload);
-  if (immediateResult) return immediateResult;
-  const taskId = getVideoTaskId(payload);
-  if (!taskId) {
-    throw new Error(`WGSPAI 视频响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
-  }
-
-  const taskUrl = `${submitUrl}/${encodeURIComponent(taskId)}`;
-  while (true) {
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    const taskResponse = await fetch(taskUrl, { headers });
-    const taskRawResponse = await taskResponse.text();
-    try {
-      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
-    } catch {
-      throw new Error(`WGSPAI 视频查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
-    }
-    if (!taskResponse.ok) {
-      throw new Error(`WGSPAI 视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
-    }
-    const videoUrl = getVideoResultUrl(payload);
-    if (videoUrl) return videoUrl;
-    const status = getVideoTaskStatus(payload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
-      throw new Error(`WGSPAI 视频生成失败: ${status}`);
-    }
-  }
-}
-
 export async function generateVideo(request: GenerateVideoRequest): Promise<string> {
   if (!isCustomModel(request.model)) {
     throw new Error('视频生成仅支持自定义平台(custom:*)模型');
   }
   const providerId = request.model.split('/')[0] ?? '';
-  const apiModel = normalizeMinimaxH3ModelName(request.model.split('/').slice(1).join('/'));
+  const apiModel = request.model.split('/').slice(1).join('/').trim();
   const configuredBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
     ? request.extra_params.provider_base_url
     : '';
   const baseUrl = normalizeVideoProviderBaseUrl(configuredBaseUrl);
-  // WGSPAI 文档规定所有 API 请求都使用 Bearer API Key。
   const apiKey = (useSettingsStore.getState().apiKeys[providerId] ?? '').trim();
   if (!baseUrl || !apiKey || !apiModel) {
     throw new Error('请在设置中配置视频模型对应的 Base URL、API Key 和模型名称');
   }
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
-  if (request.extra_params?.video_transport === 'wgspai-minimax-h3') {
-    return await generateWgspaiMinimaxH3Video(request, baseUrl, apiModel, headers);
-  }
-  if (request.extra_params?.video_transport === 'wgspai-openai-video') {
-    return await generateWgspaiOpenAiVideo(request, baseUrl, apiModel, headers);
-  }
-  if (request.extra_params?.video_transport === 'wgspai-studio') {
-    return await generateWgspaiStudioVideo(request, baseUrl, apiKey, apiModel, headers);
-  }
   if (request.extra_params?.video_transport === 'zzdh-v8-video') {
     return await generateZzdhVideo(request, baseUrl, apiModel, headers);
   }
@@ -846,8 +558,12 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   };
   // 自定义平台的 Base URL 统一按站点根路径保存，因此这里固定使用
   // OpenAI 兼容视频入口。不要为同一请求探测多个端点，以免重复扣费。
-  const submitUrl = `${baseUrl}/v1/videos/generations`;
-  const response = await fetch(submitUrl, {
+  const submitUrl = resolveProviderEndpoint(
+    baseUrl,
+    request.extra_params?.video_submit_path,
+    '/v1/videos/generations'
+  );
+  const response = await requestProviderJson(submitUrl, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -868,11 +584,16 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   if (!taskId) {
     throw new Error(`视频平台响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
   }
-  const taskUrl = `${submitUrl}/${encodeURIComponent(taskId)}`;
+  const taskUrl = resolveProviderEndpoint(
+    baseUrl,
+    request.extra_params?.video_query_path,
+    `${request.extra_params?.video_submit_path ?? '/v1/videos/generations'}/{taskId}`,
+    taskId
+  );
   // 视频生成耗时受排队、模型和时长影响，持续轮询直到平台给出终态。
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 3000));
-    const taskResponse = await fetch(taskUrl, { headers });
+    const taskResponse = await requestProviderJson(taskUrl, { headers });
     const taskRawResponse = await taskResponse.text();
     try {
       payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
@@ -968,8 +689,9 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
   const apiModel = model.split('/').slice(1).join('/') || model;
 
   const rawBaseUrl = request.extra_params?.provider_base_url;
-  const baseUrl =
-    typeof rawBaseUrl === 'string' ? rawBaseUrl.trim().replace(/\/+$/, '') : '';
+  const baseUrl = typeof rawBaseUrl === 'string'
+    ? rawBaseUrl.trim().replace(/\/+$/, '').replace(/\/v1$/i, '').replace(/\/+$/, '')
+    : '';
   if (!baseUrl) {
     throw new Error('缺少 provider_base_url,请检查自定义平台配置');
   }
@@ -982,7 +704,12 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
   const usesResponsesProtocol =
     typeof request.extra_params?.protocol === 'string' &&
     request.extra_params.protocol.toLowerCase() === 'responses';
-  const endpoint = `${baseUrl}/v1/${usesResponsesProtocol ? 'responses' : 'images/generations'}`;
+  const usesChatProtocol =
+    typeof request.extra_params?.protocol === 'string' &&
+    request.extra_params.protocol.toLowerCase() === 'chat';
+  const endpoint = `${baseUrl}/v1/${
+    usesResponsesProtocol ? 'responses' : usesChatProtocol ? 'chat/completions' : 'images/generations'
+  }`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 180000);
   try {
@@ -1016,7 +743,10 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
             role: 'user',
             content: [
               { type: 'input_text', text: request.prompt },
-              ...referenceImages.map((image) => ({ type: 'input_image', image_url: image })),
+              ...referenceImages.map((image) => ({
+                type: 'input_image',
+                image_url: image.startsWith('data:') ? (image.split(',', 2)[1] ?? image) : image,
+              })),
             ],
           }],
           tools: [{
@@ -1026,7 +756,23 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
           }],
           tool_choice: { type: 'image_generation' },
         }
-      : buildBrowserImagesRequestBody(request, apiModel, referenceImages);
+      : usesChatProtocol
+        ? {
+            model: apiModel,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: request.prompt },
+                ...referenceImages.map((image) => ({
+                  type: 'image_url',
+                  image_url: { url: image },
+                })),
+              ],
+            }],
+            n: 1,
+            response_format: { type: 'image' },
+          }
+        : buildBrowserImagesRequestBody(request, apiModel, referenceImages);
 
     const response = await fetch(endpoint, {
       method: 'POST',
@@ -1062,6 +808,14 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
         return image;
       }
       throw new Error('Responses 响应中未找到图片，请确认该平台模型支持图像生成');
+    }
+
+    if (usesChatProtocol) {
+      const image = extractBrowserChatImage(payload);
+      if (image) {
+        return image;
+      }
+      throw new Error('Chat Completions 响应中未找到图片，请确认该平台模型支持图像生成');
     }
 
     const data =
@@ -1109,6 +863,16 @@ function buildBrowserImagesRequestBody(
   const referenceImageField = request.extra_params?.reference_image_field === 'input_image'
     ? 'input_image'
     : 'image';
+  const configuredEncoding = typeof request.extra_params?.reference_image_encoding === 'string'
+    ? request.extra_params.reference_image_encoding.toLowerCase()
+    : 'auto';
+  const referenceImageEncoding = configuredEncoding === 'raw_base64' || configuredEncoding === 'data_url' || configuredEncoding === 'url'
+    ? configuredEncoding
+    : referenceImageField === 'input_image' ? 'raw_base64' : 'data_url';
+  const normalizeReferenceImage = (image: string): string => {
+    if (referenceImageEncoding !== 'raw_base64' || !image.startsWith('data:')) return image;
+    return image.split(',', 2)[1] ?? image;
+  };
   const body: Record<string, unknown> = {
     model: apiModel,
     prompt: request.prompt,
@@ -1128,14 +892,12 @@ function buildBrowserImagesRequestBody(
   }
   if (referenceImages.length > 0) {
     if (referenceImageField === 'input_image') {
-      const normalized = referenceImages.map((image) =>
-        image.startsWith('data:') ? (image.split(',', 2)[1] ?? image) : image
-      );
+      const normalized = referenceImages.map(normalizeReferenceImage);
       body.input_image = normalized.length === 1 ? normalized[0] : normalized;
     } else {
-      body.image = referenceImages[0];
+      body.image = normalizeReferenceImage(referenceImages[0]);
       if (referenceImages.length > 1) {
-        body.images = referenceImages;
+        body.images = referenceImages.map(normalizeReferenceImage);
       }
     }
   }
@@ -1175,6 +937,76 @@ function extractBrowserResponsesImage(payload: unknown): string | null {
     }
   }
   return null;
+}
+
+/** 从 Chat Completions 响应(choices[].message.content)提取图片 URL。 */
+function extractBrowserChatImage(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+  const choices = (payload as { choices?: unknown }).choices;
+  if (!Array.isArray(choices)) {
+    return null;
+  }
+  for (const choice of choices) {
+    if (!choice || typeof choice !== 'object') {
+      continue;
+    }
+    const message = (choice as { message?: unknown }).message;
+    if (!message || typeof message !== 'object') {
+      continue;
+    }
+    const msg = message as { image_url?: unknown; content?: unknown };
+    if (typeof msg.image_url === 'string' && msg.image_url) {
+      return msg.image_url;
+    }
+    const content = msg.content;
+    if (typeof content === 'string') {
+      const url = extractUrlFromText(content);
+      if (url) {
+        return url;
+      }
+      continue;
+    }
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (!part || typeof part !== 'object') {
+          continue;
+        }
+        const partImageUrl = (part as { image_url?: unknown }).image_url;
+        if (typeof partImageUrl === 'string' && partImageUrl) {
+          return partImageUrl;
+        }
+        if (partImageUrl && typeof partImageUrl === 'object') {
+          const nestedUrl = (partImageUrl as { url?: unknown }).url;
+          if (typeof nestedUrl === 'string' && nestedUrl) {
+            return nestedUrl;
+          }
+        }
+        const text = (part as { text?: unknown }).text;
+        if (typeof text === 'string') {
+          const url = extractUrlFromText(text);
+          if (url) {
+            return url;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/** 从聊天文本中提取首个 http(s) URL。 */
+function extractUrlFromText(text: string): string | null {
+  const start = text.indexOf('https://');
+  const startFallback = start < 0 ? text.indexOf('http://') : start;
+  if (startFallback < 0) {
+    return null;
+  }
+  const candidate = text.slice(startFallback);
+  const endMatch = candidate.search(/[\s)\]}"',]/);
+  const url = endMatch < 0 ? candidate : candidate.slice(0, endMatch);
+  return url.trim() || null;
 }
 
 export async function generateImage(request: GenerateRequest): Promise<string> {
@@ -1298,6 +1130,7 @@ export interface ProviderConnectionResult {
   models?: string[];
   count?: number;
   status?: number;
+  capabilities?: CustomApiCapabilities;
 }
 
 function normalizeBaseUrl(baseUrl: string): string {
@@ -1405,6 +1238,74 @@ export async function testProviderConnection(
     };
   }
   return await invoke<ProviderConnectionResult>('test_provider_connection', { baseUrl, apiKey });
+}
+
+/** Probe metadata and OPTIONS endpoints only; never submits a billable task. */
+export async function detectProviderCapabilities(
+  baseUrl: string,
+  apiKey: string
+): Promise<{ capabilities: CustomApiCapabilities; models: string[]; endpoints: Record<string, unknown> }> {
+  if (!shouldUseWebviewProviderRequests()) {
+    return await invoke<{ capabilities: CustomApiCapabilities; models: string[]; endpoints: Record<string, unknown> }>(
+      'detect_provider_capabilities',
+      { baseUrl, apiKey }
+    );
+  }
+
+  const normalized = normalizeBaseUrl(baseUrl);
+  const headers: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
+  const modelsResponse = await httpFetchWithTimeout(`${normalized}/v1/models`, { method: 'GET', headers });
+  if (!modelsResponse.ok) {
+    throw new Error(`/v1/models 返回 HTTP ${modelsResponse.status} ${modelsResponse.statusText}`);
+  }
+  const modelsPayload = (await modelsResponse.json().catch(() => ({}))) as unknown;
+  const models = extractModelsFromPayload(modelsPayload);
+  const probe = async (path: string) => {
+    try {
+      const response = await httpFetchWithTimeout(`${normalized}${path}`, { method: 'OPTIONS', headers });
+      return response.status;
+    } catch {
+      return 0;
+    }
+  };
+  const [imagesStatus, responsesStatus, chatStatus, videosStatus] = await Promise.all([
+    probe('/v1/images/generations'),
+    probe('/v1/responses'),
+    probe('/v1/chat/completions'),
+    probe('/v1/videos/generations'),
+  ]);
+  const hasGptImage = models.some((model) => /gpt-image/i.test(model));
+  const probeAvailable = (status: number) => status !== 0 && status !== 404;
+  const imageProtocol = probeAvailable(chatStatus) && !probeAvailable(imagesStatus)
+    ? 'chat'
+    : probeAvailable(responsesStatus) && !probeAvailable(imagesStatus)
+      ? 'responses'
+      : 'images';
+  const imageReferenceField = hasGptImage
+    ? 'input_image'
+    : 'image';
+  const capabilities: CustomApiCapabilities = {
+    detectedAt: Date.now(),
+    detectionSource: 'probe',
+    confidence: 'low',
+    imageProtocol: imageProtocol as CustomApiCapabilities['imageProtocol'],
+    imageReferenceField,
+    imageReferenceEncoding: imageReferenceField === 'input_image' ? 'raw_base64' : 'data_url',
+    videoSubmitPath: '/v1/videos/generations',
+    videoQueryPath: '/v1/videos/generations/{taskId}',
+    videoReferenceEncoding: 'data_url',
+    taskProtocol: 'generic',
+  };
+  return {
+    capabilities,
+    models,
+    endpoints: {
+      images: { path: '/v1/images/generations', optionsStatus: imagesStatus },
+      responses: { path: '/v1/responses', optionsStatus: responsesStatus },
+      chat: { path: '/v1/chat/completions', optionsStatus: chatStatus },
+      videos: { path: '/v1/videos/generations', optionsStatus: videosStatus },
+    },
+  };
 }
 
 /** 从自定义平台拉取模型列表(OpenAI 兼容 /v1/models) */

@@ -2,6 +2,7 @@ use md5;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -205,6 +206,31 @@ pub fn persist_library_asset_binary(
             .map_err(|error| format!("Failed to persist asset file: {error}"))?;
     }
     Ok(path.to_string_lossy().to_string())
+}
+
+/// 从用户在原生文件选择器中选中的本地路径复制媒体文件，避免大文件经 IPC 转成字节数组。
+#[tauri::command]
+pub fn persist_library_asset_file(
+    app: AppHandle,
+    source_path: String,
+    extension: String,
+) -> Result<String, String> {
+    let source = PathBuf::from(source_path.trim());
+    let metadata = std::fs::metadata(&source)
+        .map_err(|error| format!("Failed to read source media file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Selected media source is not a file".to_string());
+    }
+
+    let directory = app_data_dir(&app)?.join("library-assets");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("Failed to create asset directory: {error}"))?;
+    let filename = format!("{}.{}", Uuid::new_v4(), safe_extension(&extension));
+    let destination = directory.join(filename);
+    std::fs::copy(&source, &destination)
+        .map_err(|error| format!("Failed to copy media asset: {error}"))?;
+
+    Ok(destination.to_string_lossy().to_string())
 }
 
 /**

@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::{Mutex, OnceLock};
 
 use base64::Engine;
@@ -14,6 +14,8 @@ use uuid::Uuid;
 // commands. Running two CLI processes at once can make its keyring backend
 // return "store unavailable" (especially on Windows Credential Manager).
 static JIMENG_CLI_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const CLI_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const CLI_TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Deserialize)]
 pub struct GenerateJimengCliVideoRequest {
@@ -277,7 +279,19 @@ fn run_jimeng_video_task(
 
     emit_task_status(app, request, &submit_id, "queued", queue_count(executable), None);
 
+    let task_deadline = Instant::now() + CLI_TASK_TIMEOUT;
     loop {
+        if Instant::now() >= task_deadline {
+            emit_task_status(
+                app,
+                request,
+                &submit_id,
+                "failed",
+                queue_count(executable),
+                Some("即梦 CLI 任务超过 30 分钟仍未完成，已停止轮询".to_string()),
+            );
+            return Err("即梦 CLI 任务超时（超过 30 分钟）".to_string());
+        }
         let query = run_cli(
             executable,
             &[
@@ -346,17 +360,8 @@ fn emit_task_status(
 }
 
 fn queue_count(executable: &str) -> Option<usize> {
-    let lock = JIMENG_CLI_PROCESS_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().ok()?;
-    let resolved = resolve_executable(executable).ok()?;
-    let output = build_cli_command(&resolved)
-        .args(["list_task", "--limit=100"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let output = run_cli(executable, &["list_task".to_string(), "--limit=100".to_string()]).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&output).ok()?;
     let tasks = value.as_array()?;
     Some(tasks.iter().filter(|task| {
         task.get("gen_status")
@@ -410,14 +415,48 @@ fn run_cli(executable: &str, arguments: &[String]) -> Result<String, String> {
         .lock()
         .map_err(|_| "即梦 CLI 调用锁异常，请重启应用后重试".to_string())?;
     let resolved = resolve_executable(executable)?;
-    let output = build_cli_command(&resolved)
-        .args(arguments)
-        .output()
+    let mut command = build_cli_command(&resolved);
+    #[cfg(target_os = "windows")]
+    if is_windows_script(&resolved) {
+        let command_line = std::iter::once(format!("\"{}\"", resolved.replace('"', "\\\"")))
+            .chain(arguments.iter().map(|argument| quote_windows_arg(argument)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        command.args(["/D", "/S", "/C"]).arg(command_line);
+    } else {
+        command.args(arguments);
+    }
+    #[cfg(not(target_os = "windows"))]
+    command.args(arguments);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| {
             format!(
                 "无法启动即梦 CLI（{resolved}）: {error}。请确认已安装 CLI，并在设置中填写正确命令或完整路径"
             )
         })?;
+    let started_at = Instant::now();
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break child
+                .wait_with_output()
+                .map_err(|error| format!("读取即梦 CLI 输出失败: {error}"))?,
+            Ok(None) if started_at.elapsed() >= CLI_COMMAND_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("即梦 CLI 命令超过 {} 秒未返回", CLI_COMMAND_TIMEOUT.as_secs()));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("无法检查即梦 CLI 进程状态: {error}"));
+            }
+        }
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}\n{stderr}");
@@ -435,8 +474,9 @@ fn run_cli(executable: &str, arguments: &[String]) -> Result<String, String> {
 fn build_cli_command(resolved: &str) -> Command {
     #[cfg(target_os = "windows")]
     let mut command = if is_windows_script(resolved) {
-        let mut command = Command::new("cmd.exe");
-        command.args(["/D", "/S", "/C", resolved]);
+        let command = Command::new("cmd.exe");
+        // Arguments are assembled in run_cli and passed as one /C command
+        // string so paths under `Program Files` and flags remain intact.
         command
     } else {
         Command::new(resolved)
@@ -464,6 +504,15 @@ fn build_cli_command(resolved: &str) -> Command {
         command.current_dir(home);
     }
     command
+}
+
+#[cfg(target_os = "windows")]
+fn quote_windows_arg(argument: &str) -> String {
+    if argument.is_empty() || argument.chars().any(char::is_whitespace) || argument.contains('"') {
+        format!("\"{}\"", argument.replace('"', "\\\""))
+    } else {
+        argument.to_string()
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -829,7 +878,16 @@ pub async fn jimeng_cli_login_check(
 
 /// 从 CLI 输出中提取 http(s) 验证地址(优先取 verification_uri/verification_url 字段, 兜底找任意 http 链接)。
 fn extract_url_field(output: &str) -> Option<String> {
-    for name in ["verification_uri", "verification_url", "verificationUrl"] {
+    for name in [
+        "verification_uri",
+        "verification_url",
+        "verificationUrl",
+        "verificationUri",
+        "auth_url",
+        "authUrl",
+        "login_url",
+        "loginUrl",
+    ] {
         if let Some(index) = output.find(name) {
             let remainder = output[index + name.len()..].trim_start_matches(
                 |character: char| character == ' ' || character == ':' || character == '=' || character == '"' || character == '\'',

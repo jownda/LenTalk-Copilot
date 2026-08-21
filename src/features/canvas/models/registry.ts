@@ -12,7 +12,7 @@ import {
   useSettingsStore,
 } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
-import { createFixedResolutionPricing, createPointsOnlyPricing } from '@/features/canvas/pricing';
+import { createPointsOnlyPricing } from '@/features/canvas/pricing';
 import { resolveVideoModelProfile } from './videoProfiles';
 
 const providerModules = import.meta.glob<{ provider: ModelProviderDefinition }>(
@@ -121,7 +121,6 @@ export function listVideoModels(): VideoModelDefinition[] {
       ...api.videoModels,
       ...api.models.filter(isVideoGenerationModelName),
     ])).map((model) => {
-      const isMinimaxH3 = model.trim().toLowerCase() === 'minimax-h3';
       const modelId = buildCustomModelId(api.id, model);
       const profile = resolveVideoModelProfile(modelId);
       const isZzdh = api.id.trim().toLowerCase() === 'zizidonghua'
@@ -139,17 +138,8 @@ export function listVideoModels(): VideoModelDefinition[] {
         expectedDurationMs: 180000,
         aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
         defaultAspectRatio: '16:9',
-        durationOptions: isMinimaxH3
-          ? Array.from({ length: 12 }, (_, index) => index + 4)
-          : Array.from({ length: 30 }, (_, index) => index + 1),
+        durationOptions: Array.from({ length: 30 }, (_, index) => index + 1),
         defaultDuration: 5,
-        ...(isMinimaxH3 ? {
-          resolutions: [
-            { value: '768P', label: '768P' },
-            { value: '2K', label: '2K' },
-          ],
-          defaultResolution: '2K',
-        } : {}),
         ...(resolutionValues ? {
           resolutions: resolutionValues.map((value) => ({
             value,
@@ -269,15 +259,6 @@ const CUSTOM_RESOLUTIONS: ResolutionOption[] = [
   { value: '4K', label: '4K' },
 ];
 
-const WGSPAI_GPT_IMAGE_2_2K_PRICING = createFixedResolutionPricing({
-  currency: 'CNY',
-  standardRates: {
-    '1K': 0.1,
-    '2K': 0.1,
-    '4K': 0.1,
-  },
-});
-
 const ZZDH_VIDEO_PRICE_PER_SECOND: Record<string, number> = {
   'zzdh-minimax-h3-480p': 0.06,
   'zzdh-minimax-h3-720p': 0.09,
@@ -316,13 +297,6 @@ const ZZDH_VIDEO_PRICE_PER_SECOND: Record<string, number> = {
   'doubao-seedance-2-video-优惠版-1080p': 1.2,
 };
 
-function resolveCustomImagePricing(apiName: string, model: string) {
-  if (apiName.trim().toLowerCase() === 'wgspai' && model.trim().toLowerCase() === 'gpt-image-2-2k') {
-    return WGSPAI_GPT_IMAGE_2_2K_PRICING;
-  }
-  return undefined;
-}
-
 function resolveCustomVideoPricing(apiName: string, model: string) {
   const normalizedApiName = apiName.trim().toLowerCase();
   const normalized = model.trim().toLowerCase();
@@ -337,25 +311,6 @@ function resolveCustomVideoPricing(apiName: string, model: string) {
       };
     }
     return undefined;
-  }
-  if (normalizedApiName !== 'wgspai') return undefined;
-  const perSecondRates: Record<string, number> = {
-    'seedance-v2-720p-fast': 0.17,
-    'seedance-v2-720p': 0.3,
-  };
-  if (perSecondRates[normalized] != null) {
-    return {
-      quote: ({ extraParams }: { extraParams?: Record<string, unknown> }) => ({
-        amount: perSecondRates[normalized] * Math.max(1, Number(extraParams?.duration) || 5),
-        currency: 'CNY' as const,
-      }),
-    };
-  }
-  if (normalized === 'grok-imagine-video-6s') {
-    return createFixedResolutionPricing({ currency: 'CNY', standardRates: { video: 0.1 } });
-  }
-  if (normalized === 'minimax-h3') {
-    return createFixedResolutionPricing({ currency: 'CNY', standardRates: { video: 1.5 } });
   }
   return undefined;
 }
@@ -393,7 +348,6 @@ function buildCustomImageModels(): ImageModelDefinition[] {
           defaultResolution: '1K',
           aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
           resolutions: CUSTOM_RESOLUTIONS,
-          pricing: resolveCustomImagePricing(api.name, model),
           resolveRequest: ({ referenceImageCount }) => ({
             requestModel: modelId,
             modeLabel: referenceImageCount > 0 ? '编辑模式' : '生成模式',

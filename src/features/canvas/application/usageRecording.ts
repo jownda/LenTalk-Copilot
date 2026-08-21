@@ -16,7 +16,7 @@ export interface RecordGenerationOutcomeParams {
   nodeId: string;
   kind: 'image' | 'video';
   providerId: string;
-  /** 完整模型 id, 如 custom:wgspai/gpt-image-2-2k */
+  /** 完整模型 id, 如 custom:provider/gpt-image-2 */
   modelId: string;
   size?: string;
   duration?: number;

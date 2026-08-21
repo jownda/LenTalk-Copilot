@@ -38,7 +38,7 @@ pub struct FalProvider {
 impl FalProvider {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder().no_proxy().timeout(Duration::from_secs(60)).build().unwrap_or_else(|_| Client::new()),
             api_key: Arc::new(RwLock::new(None)),
         }
     }
@@ -377,12 +377,16 @@ impl AIProvider for FalProvider {
     }
 
     async fn generate(&self, request: GenerateRequest) -> Result<String, AIError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
         let submitted = self.submit_task(request).await?;
         let handle = match submitted {
             ProviderTaskSubmission::Succeeded(result) => return Ok(result),
             ProviderTaskSubmission::Queued(handle) => handle,
         };
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AIError::TaskFailed("FAL task timed out after 30 minutes".to_string()));
+            }
             match self.poll_task(handle.clone()).await? {
                 ProviderTaskPollResult::Running => {
                     sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;

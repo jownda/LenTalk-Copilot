@@ -1,10 +1,11 @@
 {
   "name": "storyboard-copilot",
   "private": true,
-  "version": "1.1.5",
+  "version": "1.1.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "start": "tauri dev",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "lint": "eslint src/",

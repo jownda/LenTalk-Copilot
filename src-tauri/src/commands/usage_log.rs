@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use rusqlite::{params, Connection};
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
@@ -88,6 +89,12 @@ fn ensure_usage_log_table(conn: &Connection) -> Result<(), String> {
 fn open_connection(app: &AppHandle) -> Result<Connection, String> {
     let db_path = resolve_db_path(app)?;
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open db: {}", e))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| format!("Failed to set journal_mode=WAL: {}", e))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|e| format!("Failed to set synchronous=NORMAL: {}", e))?;
+    conn.busy_timeout(Duration::from_millis(3000))
+        .map_err(|e| format!("Failed to set busy timeout: {}", e))?;
     ensure_usage_log_table(&conn)?;
     Ok(conn)
 }

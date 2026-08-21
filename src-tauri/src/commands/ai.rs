@@ -55,6 +55,12 @@ pub struct GenerationJobStatusDto {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ProviderHttpResponseDto {
+    pub status: u16,
+    pub body: String,
+}
+
 #[derive(Debug)]
 struct GenerationJobRecord {
     job_id: String,
@@ -332,52 +338,142 @@ pub async fn fetch_provider_models(
     }))
 }
 
-/// WGSPAI 视频工作台未开放 CORS 给桌面 WebView。
-/// 仅允许其 create/query 两个固定端点，通过原生 HTTP 代理避免浏览器层的 Load failed。
+/// Probe only metadata/capability endpoints. This command never submits a
+/// generation task, so protocol detection cannot create a billable job.
 #[tauri::command]
-pub async fn post_wgspai_video_studio_request(
+pub async fn detect_provider_capabilities(
     base_url: String,
     api_key: String,
-    action: String,
-    body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    if action != "create" && action != "query" {
-        return Err("Unsupported WGSPAI video studio action".to_string());
+    let normalized_base_url = base_url.trim().trim_end_matches('/').trim_end_matches("/v1").trim_end_matches('/');
+    if normalized_base_url.is_empty() {
+        return Err("Base URL 为空".to_string());
     }
-
-    let normalized_base_url = base_url
-        .trim()
-        .trim_end_matches('/')
-        .trim_end_matches("/v1")
-        .trim_end_matches('/')
-        .to_string();
-    let parsed_base_url = reqwest::Url::parse(&normalized_base_url)
-        .map_err(|error| format!("Invalid WGSPAI Base URL: {}", error))?;
-    if parsed_base_url.host_str() != Some("api.wgspai.cn") {
-        return Err("WGSPAI video studio requires https://api.wgspai.cn".to_string());
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("Failed to build probe client: {}", error))?;
+    let mut models_request = client.get(format!("{}/v1/models", normalized_base_url));
+    if !api_key.trim().is_empty() {
+        models_request = models_request.bearer_auth(api_key.trim());
     }
-
-    let endpoint = format!("{}/api/video-studio/{}", normalized_base_url, action);
-    let response = reqwest::Client::new()
-        .post(&endpoint)
-        .bearer_auth(api_key)
-        .json(&body)
+    let models_response = models_request
         .send()
         .await
-        .map_err(|error| format!("WGSPAI video studio request failed: {}", error))?;
-    let status = response.status();
-    let response_text = response
-        .text()
+        .map_err(|error| format!("/v1/models 探测失败: {}", error))?;
+    let models_status = models_response.status().as_u16();
+    if !models_response.status().is_success() {
+        return Err(format!(
+            "/v1/models 探测返回 HTTP {} {}",
+            models_status,
+            models_response.status().canonical_reason().unwrap_or("")
+        ));
+    }
+    let models_payload: serde_json::Value = models_response
+        .json()
         .await
-        .map_err(|error| format!("Failed to read WGSPAI response: {}", error))?;
-    if !status.is_success() {
-        let summary: String = response_text.chars().take(600).collect();
-        return Err(format!("HTTP {}: {}", status.as_u16(), summary));
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let models = models_payload
+        .get("data")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items.iter().filter_map(|item| item.get("id").and_then(|id| id.as_str()).map(str::to_string)).collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    async fn options_status(client: &reqwest::Client, url: String, api_key: &str) -> u16 {
+        let mut request = client.request(reqwest::Method::OPTIONS, url);
+        if !api_key.trim().is_empty() {
+            request = request.bearer_auth(api_key.trim());
+        }
+        request.send().await.map(|response| response.status().as_u16()).unwrap_or(0)
     }
 
-    serde_json::from_str(&response_text).map_err(|error| {
-        let summary: String = response_text.chars().take(600).collect();
-        format!("WGSPAI video studio returned non-JSON response: {} ({})", error, summary)
+    let (images_status, responses_status, chat_status, videos_status) = tokio::join!(
+        options_status(&client, format!("{}/v1/images/generations", normalized_base_url), &api_key),
+        options_status(&client, format!("{}/v1/responses", normalized_base_url), &api_key),
+        options_status(&client, format!("{}/v1/chat/completions", normalized_base_url), &api_key),
+        options_status(&client, format!("{}/v1/videos/generations", normalized_base_url), &api_key),
+    );
+    let has_gpt_image = models.iter().any(|model| model.to_ascii_lowercase().contains("gpt-image"));
+    // OPTIONS is often handled by a gateway-wide CORS middleware, so its
+    // status is diagnostic only. 当某协议端点可明确访问(非 404)时优先推断:
+    // chat/responses 均不可用或全部不可用时回退 generic images 低置信默认。
+    fn probe_available(status: u16) -> bool {
+        status != 0 && status != 404
+    }
+    let image_protocol = if probe_available(chat_status) && !probe_available(images_status) {
+        "chat"
+    } else if probe_available(responses_status) && !probe_available(images_status) {
+        "responses"
+    } else {
+        "images"
+    };
+    let image_reference_field = if has_gpt_image { "input_image" } else { "image" };
+    let image_reference_encoding = if has_gpt_image { "raw_base64" } else { "data_url" };
+
+    Ok(serde_json::json!({
+        "ok": models_status < 500,
+        "models_status": models_status,
+        "models": models,
+        "endpoints": {
+            "images": { "path": "/v1/images/generations", "options_status": images_status },
+            "responses": { "path": "/v1/responses", "options_status": responses_status },
+            "chat": { "path": "/v1/chat/completions", "options_status": chat_status },
+            "videos": { "path": "/v1/videos/generations", "options_status": videos_status },
+        },
+        "capabilities": {
+            "detectedAt": now_ms(),
+            "detectionSource": "probe",
+            "confidence": "low",
+            "imageProtocol": image_protocol,
+            "imageReferenceField": image_reference_field,
+            "imageReferenceEncoding": image_reference_encoding,
+            "videoSubmitPath": "/v1/videos/generations",
+            "videoQueryPath": "/v1/videos/generations/{taskId}",
+            "videoReferenceEncoding": "data_url",
+            "taskProtocol": "generic",
+        },
+    }))
+}
+
+/// Execute a generic JSON request through the desktop HTTP client.
+/// WebView fetch is unavailable for providers that do not enable CORS, while
+/// this command keeps the request protocol identical on macOS and Windows.
+#[tauri::command]
+pub async fn request_provider_json(
+    url: String,
+    method: String,
+    headers: HashMap<String, String>,
+    body: Option<Value>,
+) -> Result<ProviderHttpResponseDto, String> {
+    let parsed_url = reqwest::Url::parse(url.trim())
+        .map_err(|error| format!("Invalid provider URL: {}", error))?;
+    let http_method = reqwest::Method::from_bytes(method.trim().as_bytes())
+        .map_err(|error| format!("Invalid provider HTTP method: {}", error))?;
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap_or_else(|_| reqwest::Client::new());
+    let mut request = client.request(http_method, parsed_url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    if let Some(json_body) = body {
+        request = request.json(&json_body);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Provider request failed: {}", error))?;
+    let status = response.status().as_u16();
+    let response_body = response
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read provider response: {}", error))?;
+    Ok(ProviderHttpResponseDto {
+        status,
+        body: response_body,
     })
 }
 
@@ -463,7 +559,13 @@ pub async fn submit_generate_image_job(
     let spawned_job_id = job_id.clone();
     let spawned_provider = provider.clone();
     tauri::async_runtime::spawn(async move {
-        let result = spawned_provider.generate(req).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30 * 60),
+            spawned_provider.generate(req),
+        )
+        .await
+        .map_err(|_| AIError::TaskFailed("generation timed out after 30 minutes".to_string()))
+        .and_then(|result| result);
         let update_result = match result {
             Ok(image_source) => update_generation_job(
                 &app_handle,

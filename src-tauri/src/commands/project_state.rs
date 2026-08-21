@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -229,6 +229,13 @@ fn prune_unreferenced_images(app: &AppHandle) -> Result<(), String> {
     }
 
     let images_dir = resolve_images_dir(app)?;
+    // Image persistence and project-reference persistence are separate IPC
+    // operations. Keep a generous grace period and quarantine files instead of
+    // deleting them immediately so an in-flight save cannot lose an image.
+    const IMAGE_GRACE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+    let quarantine_dir = images_dir.join(".quarantine");
+    std::fs::create_dir_all(&quarantine_dir)
+        .map_err(|e| format!("Failed to create image quarantine dir: {}", e))?;
     let entries = std::fs::read_dir(&images_dir)
         .map_err(|e| format!("Failed to read images dir: {}", e))?;
 
@@ -240,9 +247,19 @@ fn prune_unreferenced_images(app: &AppHandle) -> Result<(), String> {
         }
 
         let path_string = path.to_string_lossy().to_string();
-        if !referenced.contains(&path_string) {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("Failed to delete unreferenced image: {}", e))?;
+        let is_old_enough = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= IMAGE_GRACE_PERIOD);
+        if !referenced.contains(&path_string) && is_old_enough {
+            let Some(file_name) = path.file_name() else { continue; };
+            let target = quarantine_dir.join(file_name);
+            if target.exists() {
+                continue;
+            }
+            std::fs::rename(&path, &target)
+                .map_err(|e| format!("Failed to quarantine unreferenced image: {}", e))?;
         }
     }
 

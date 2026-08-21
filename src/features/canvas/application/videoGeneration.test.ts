@@ -5,7 +5,7 @@ import { toVideoGenerationRequest } from './videoGeneration';
 describe('toVideoGenerationRequest', () => {
   it('maps first-last references to dedicated frame fields', () => {
     const request = toVideoGenerationRequest({
-      model: 'custom:wgspai/minimax-h3',
+      model: 'custom:provider/minimax-h3',
       prompt: 'transition',
       duration: 5,
       aspectRatio: '16:9',

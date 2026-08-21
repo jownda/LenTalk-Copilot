@@ -16,12 +16,13 @@ import {
   type StoryboardGenNodeData,
   type TextAnnotationNodeData,
   type UploadImageNodeData,
+  type SeamlessMosaicNodeData,
 } from './canvasNodes';
 import { DEFAULT_NODE_DISPLAY_NAME } from './nodeDisplay';
 import { getDefaultImageModelId, getImageModel } from '../models';
 import { useSettingsStore } from '@/stores/settingsStore';
 
-export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music' | 'video';
+export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music' | 'video' | 'mosaic';
 
 export interface CanvasNodeCapabilities {
   toolbar: boolean;
@@ -370,6 +371,44 @@ const directorDeskNodeDefinition: CanvasNodeDefinition<DirectorDeskNodeData> = {
   }),
 };
 
+const seamlessMosaicNodeDefinition: CanvasNodeDefinition<SeamlessMosaicNodeData> = {
+  type: CANVAS_NODE_TYPES.seamlessMosaic,
+  menuLabelKey: 'node.menu.seamlessMosaic',
+  menuIcon: 'mosaic',
+  visibleInMenu: true,
+  capabilities: {
+    toolbar: true,
+    promptInput: false,
+  },
+  connectivity: {
+    sourceHandle: true,
+    targetHandle: true,
+    connectMenu: {
+      fromSource: true,
+      fromTarget: true,
+    },
+  },
+  createDefaultData: () => ({
+    displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.seamlessMosaic],
+    imageUrl: null,
+    previewImageUrl: null,
+    aspectRatio: DEFAULT_ASPECT_RATIO,
+    isSizeManuallyAdjusted: false,
+    layers: [],
+    template: 'grid',
+    canvasWidth: 1920,
+    canvasHeight: 1080,
+    gridCols: 3,
+    gridRows: 2,
+    gap: 8,
+    backgroundColor: '#0f1115',
+    importedSourceKeys: [],
+    outputImageUrl: null,
+    outputPreviewImageUrl: null,
+  }),
+  defaultSize: { width: 260, height: 200 },
+};
+
 export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition> = {
   [CANVAS_NODE_TYPES.upload]: uploadNodeDefinition,
   [CANVAS_NODE_TYPES.imageEdit]: imageEditNodeDefinition,
@@ -382,6 +421,7 @@ export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition>
   [CANVAS_NODE_TYPES.panorama]: panoramaNodeDefinition,
   [CANVAS_NODE_TYPES.directorDesk]: directorDeskNodeDefinition,
   [CANVAS_NODE_TYPES.audio]: audioNodeDefinition,
+  [CANVAS_NODE_TYPES.seamlessMosaic]: seamlessMosaicNodeDefinition,
 };
 
 export function getNodeDefinition(type: CanvasNodeType): CanvasNodeDefinition {

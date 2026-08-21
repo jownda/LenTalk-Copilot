@@ -14,6 +14,19 @@ export type ProviderApiKeys = Record<string, string>;
 export const DEFAULT_GRSAI_NANO_BANANA_PRO_MODEL = 'nano-banana-pro';
 export const DEFAULT_JIMENG_CLI_EXECUTABLE = 'dreamina';
 
+export interface CustomApiCapabilities {
+  detectedAt: number;
+  detectionSource: 'probe' | 'manual';
+  confidence: 'low' | 'high';
+  imageProtocol: 'images' | 'responses' | 'chat' | 'unknown';
+  imageReferenceField: 'image' | 'input_image' | 'image_urls' | 'unknown';
+  imageReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
+  videoSubmitPath: string;
+  videoQueryPath: string;
+  videoReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
+  taskProtocol: 'generic' | 'unknown';
+}
+
 /** 即梦 CLI 是本地命令行工具，不使用 OpenAI 兼容平台的 API Key 配置。 */
 export interface JimengCliSettings {
   executable: string;
@@ -38,15 +51,22 @@ export interface CustomApiProvider {
   createdAt: number;
   /** 请求模式: sync=同步等待平台返回图片; async=提交后轮询任务状态 */
   requestMode: 'sync' | 'async';
-  /** 接口协议: images=/v1/images/generations; responses=/v1/responses(gpt-image 中转平台常用) */
-  protocol: 'images' | 'responses';
+  /** 接口协议: images=/v1/images/generations; responses=/v1/responses; chat=/v1/chat/completions(gpt-image 中转平台常用) */
+  protocol: 'images' | 'responses' | 'chat';
   /** Images 协议的参考图字段: 大多数中转平台用 image, 原生 GPT Image 用 input_image。 */
   referenceImageField: 'image' | 'input_image';
+  /** 参考图编码: auto 按字段选择, 也可显式指定纯 Base64 / data URL / URL。 */
+  referenceImageEncoding: 'auto' | 'data_url' | 'raw_base64' | 'url';
+  /** Images 协议的图生图传输方式。auto 会为所有带参考图的请求使用 edits multipart。 */
+  imageTransport: 'auto' | 'generations_json' | 'edits_multipart' | 'apimart_json';
+  capabilities?: CustomApiCapabilities;
 }
 
 export type CustomApiRequestMode = CustomApiProvider['requestMode'];
 export type CustomApiProtocol = CustomApiProvider['protocol'];
 export type CustomApiReferenceImageField = CustomApiProvider['referenceImageField'];
+export type CustomApiReferenceImageEncoding = CustomApiProvider['referenceImageEncoding'];
+export type CustomApiImageTransport = CustomApiProvider['imageTransport'];
 
 /** 自定义平台在模型/密钥体系里的 provider id 前缀 */
 export const CUSTOM_API_PROVIDER_PREFIX = 'custom:';
@@ -208,6 +228,32 @@ function normalizeJimengCliSettings(input: unknown): JimengCliSettings {
   };
 }
 
+function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities | undefined {
+  if (!input || typeof input !== 'object') return undefined;
+  const value = input as Record<string, unknown>;
+  const protocol = value.imageProtocol;
+  const field = value.imageReferenceField;
+  const imageEncoding = value.imageReferenceEncoding;
+  const videoEncoding = value.videoReferenceEncoding;
+  const taskProtocol = value.taskProtocol;
+  return {
+    detectedAt: typeof value.detectedAt === 'number' ? value.detectedAt : Date.now(),
+    detectionSource: value.detectionSource === 'manual' ? 'manual' : 'probe',
+    confidence: value.confidence === 'high' ? 'high' : 'low',
+    imageProtocol: protocol === 'responses' || protocol === 'images' || protocol === 'chat' ? protocol : 'unknown',
+    imageReferenceField: field === 'input_image' || field === 'image' || field === 'image_urls' ? field : 'unknown',
+    imageReferenceEncoding: imageEncoding === 'data_url' || imageEncoding === 'raw_base64' || imageEncoding === 'url' || imageEncoding === 'multipart'
+      ? imageEncoding
+      : 'unknown',
+    videoSubmitPath: typeof value.videoSubmitPath === 'string' ? value.videoSubmitPath : '/v1/videos/generations',
+    videoQueryPath: typeof value.videoQueryPath === 'string' ? value.videoQueryPath : '/v1/videos/generations/{taskId}',
+    videoReferenceEncoding: videoEncoding === 'data_url' || videoEncoding === 'raw_base64' || videoEncoding === 'url' || videoEncoding === 'multipart'
+      ? videoEncoding
+      : 'unknown',
+    taskProtocol: taskProtocol === 'unknown' ? 'unknown' : 'generic',
+  };
+}
+
 function normalizeCustomApis(input: unknown): CustomApiProvider[] {
   if (!Array.isArray(input)) {
     return [];
@@ -239,10 +285,29 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         models,
         videoModels,
         createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
-        requestMode: item.requestMode === 'sync' ? ('sync' as const) : ('async' as const),
-        protocol: item.protocol === 'responses' ? ('responses' as const) : ('images' as const),
+        // Older builds silently assigned async to every custom platform even
+        // though the UI had no async selector. Migrate that legacy value to
+        // sync; async must be explicitly reintroduced with a known query URL.
+        requestMode: 'sync' as const,
+        protocol:
+          item.protocol === 'responses'
+            ? ('responses' as const)
+            : item.protocol === 'chat' || item.protocol === 'chat/completions' || item.protocol === 'chat_completions'
+              ? ('chat' as const)
+              : ('images' as const),
         referenceImageField:
           item.referenceImageField === 'input_image' ? ('input_image' as const) : ('image' as const),
+        referenceImageEncoding:
+          item.referenceImageEncoding === 'raw_base64' || item.referenceImageEncoding === 'url' || item.referenceImageEncoding === 'data_url'
+            ? (item.referenceImageEncoding as 'raw_base64' | 'url' | 'data_url')
+            : ('auto' as const),
+        imageTransport:
+          item.imageTransport === 'generations_json'
+          || item.imageTransport === 'edits_multipart'
+          || item.imageTransport === 'apimart_json'
+            ? (item.imageTransport as 'generations_json' | 'edits_multipart' | 'apimart_json')
+            : ('auto' as const),
+        capabilities: normalizeCustomApiCapabilities(item.capabilities),
       };
     })
     .filter((item) => item.id && item.name && item.baseUrl);

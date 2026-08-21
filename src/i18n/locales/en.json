@@ -34,6 +34,11 @@
     "generate": "Generate",
     "emptyHintTitle": "Double-click to add a node",
     "emptyHintSubtitle": "Double-click to add a node",
+    "groupDialog": {
+      "title": "Create Group",
+      "renameTitle": "Rename Group",
+      "placeholder": "Enter group name"
+    },
     "toolbar": {
       "zoomIn": "Zoom In",
       "zoomOut": "Zoom Out",
@@ -107,6 +112,9 @@
     "copyText": "Copy Text",
     "copyErrorReport": "Copy Error",
     "retryGeneration": "Retry Generation",
+    "retryWithEncoding": "Switch Encoding & Retry",
+    "rename": "Rename",
+    "confirmEncodingRetry": "This will submit a new generation request with another reference-image encoding. The provider may charge for it. Continue?",
     "copied": "Copied",
     "download": "Download",
     "ungroup": "Ungroup",
@@ -142,7 +150,8 @@
       "textAnnotation": "Text",
       "panorama": "360 Panorama",
       "directorDesk": "3D Director Desk",
-      "audio": "Media"
+      "audio": "Media",
+      "seamlessMosaic": "Seamless Mosaic"
     },
     "imageNode": {
       "title": "Image Node",
@@ -222,6 +231,9 @@
       "noInput": "Waiting for panorama input",
       "uploadHint": "Click to upload a panorama\nor connect from an upstream node",
       "replaceImage": "Replace"
+    },
+    "seamlessMosaic": {
+      "hint": "Connect images to auto-import · Double-click to edit"
     }
   },
   "viewer": {
@@ -417,7 +429,7 @@
     "customApiFetch": "Fetch Models",
     "customApiFetching": "Fetching…",
     "customApiTestNeedUrl": "Please fill in the Base URL first",
-    "customApiTestOk": "Protocol OK, {{count}} models detected (click \"Fetch Models\" to import)",
+    "customApiTestOk": "Probe complete: {{protocol}}, reference field {{field}}, encoding {{encoding}}, {{confidence}} confidence; {{count}} models detected. Values are in this form; click Save",
     "customApiTestFailed": "Connection failed:",
     "customApiFetched": "Fetched {{count}} models",
     "customApiFetchFailed": "Fetch failed:",
@@ -425,7 +437,12 @@
     "customApiVerifyProtocol": "Verify Protocol",
     "customApiUrlOk": "URL reachable (HTTP {{status}})",
     "customApiUrlFailed": "URL unreachable (HTTP {{status}})",
-    "customApiUrlFailed2": "URL check failed:"
+    "customApiUrlFailed2": "URL check failed:",
+    "customApiProtocol": "Image protocol",
+    "customApiReferenceField": "Reference field",
+    "customApiReferenceEncoding": "Reference encoding",
+    "customApiReferenceEncodingAuto": "Auto (by field)",
+    "customApiProbeHint": "Protocol verification uses only non-billable probes such as /v1/models and OPTIONS. It fills image protocol, reference field, and encoding; sync/async cannot be safely detected, so choose it manually."
   },
   "pricing": {
     "nativePrice": "Native: {{value}}",
@@ -464,7 +481,7 @@
     "moveTo": "Move to group",
     "uncategorized": "Uncategorized",
     "more": "More actions",
-    "noCategories": "No groups yet",
+    "noCategories": "No groups yet. Click \"New Group\" to create one",
     "count": "{{count}} assets",
     "clear": "Clear",
     "clearConfirm": "Clear all assets in this group?",
@@ -497,7 +514,6 @@
     "builtinCategoryHint": "Characters, scenes, and props are built-in groups and cannot be renamed or deleted.",
     "addSubCategory": "New Sub-group",
     "subCategoryPrompt": "Sub-group name:",
-    "noCategories": "No groups yet. Click \"New Group\" to create one",
     "backup": "Backup",
     "backupHint": "Export library & prompts as a zip backup",
     "importBackup": "Import",

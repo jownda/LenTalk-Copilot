@@ -6,6 +6,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use std::time::Duration;
 use tracing::info;
 
 use crate::ai::error::AIError;
@@ -28,7 +29,7 @@ struct ImageResponse {
 impl PPIOProvider {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder().no_proxy().timeout(Duration::from_secs(60)).build().unwrap_or_else(|_| Client::new()),
             api_key: Arc::new(RwLock::new(None)),
             base_url: "https://api.ppio.com".to_string(),
             model_registry: PPIOModelRegistry::new(),

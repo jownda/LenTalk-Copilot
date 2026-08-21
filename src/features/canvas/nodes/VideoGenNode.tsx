@@ -244,11 +244,8 @@ function renderPromptWithHighlights(
         </span>
       );
     } else if (imageUrl) {
-      // 保留 token 占位以保持光标位置一致，缩略图撑满整个 token 区域(左右零空隙)。
-      // 缩略图必须 pointer-events-none: 它在高亮层(z-20)覆盖在 textarea 上方,
-      // 若可点击会拦截鼠标, 导致光标不跟手、文字无法选中/删除。
-      // token 用普通 inline span(勿用 inline-block): 保证高亮层排版与 textarea
-      // 完全一致(基线/换行), 否则光标位置与显示文字错位。
+      // 保留 token 占位以保持光标位置一致(token 文字透明, 只显示缩略图)。
+      // 缩略图固定 20×20 正方形居中, 尺寸稳定不影响行高排版。
       segments.push(
         <span
           key={`ref-${matchStart}`}
@@ -780,6 +777,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         imageMode,
         referenceImages: videoReferenceImages,
         referenceAudio: inputAudio,
+        extraParams: {},
       },
     });
     updateNodeSize(outputId, compactSize.width, compactSize.height);
@@ -801,6 +799,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         imageMode,
         referenceImages: videoReferenceImages,
         referenceAudio: inputAudio,
+        extraParams: {},
       });
       recordGenerationOutcome({
         nodeId: outputId,

@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   BALANCE_INSUFFICIENT_MESSAGE,
+  IMAGE_EDITS_NETWORK_ERROR_MESSAGE,
   isBalanceInsufficientError,
+  isImageEditsNetworkError,
   resolveErrorContent,
 } from './errorDialog';
 
@@ -24,6 +26,27 @@ describe('isBalanceInsufficientError', () => {
     expect(isBalanceInsufficientError('HTTP 404 Not Found')).toBe(false);
     expect(isBalanceInsufficientError('Task failed: connection refused')).toBe(false);
     expect(isBalanceInsufficientError('')).toBe(false);
+  });
+});
+
+describe('isImageEditsNetworkError', () => {
+  it('recognizes network failures sent to the multipart image edits endpoint', () => {
+    expect(isImageEditsNetworkError(
+      'Network error: error sending request for url (https://sub-proxy-us.65535.space/v1/images/edits)'
+    )).toBe(true);
+  });
+
+  it('replaces the raw endpoint failure with a protocol configuration hint', () => {
+    const rawError = 'Network error: error sending request for url (https://sub-proxy-us.65535.space/v1/images/edits)';
+    const result = resolveErrorContent(rawError, '生成失败');
+
+    expect(result.message).toBe(IMAGE_EDITS_NETWORK_ERROR_MESSAGE);
+    expect(result.details).toContain('/v1/images/edits');
+  });
+
+  it('does not suggest a protocol change for other network failures', () => {
+    expect(isImageEditsNetworkError('Network error: connection refused')).toBe(false);
+    expect(isImageEditsNetworkError('HTTP 400 from /v1/images/edits')).toBe(false);
   });
 });
 

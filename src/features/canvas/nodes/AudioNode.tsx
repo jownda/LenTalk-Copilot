@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { isTauri } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 import { Handle, Position } from '@xyflow/react';
 import { AlertTriangle, AudioLines, Camera, LoaderCircle, Music2, Upload, Video, X } from 'lucide-react';
 
@@ -8,8 +9,13 @@ import { CANVAS_NODE_TYPES, type AudioNodeData } from '@/features/canvas/domain/
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
+import { canvasEventBus } from '@/features/canvas/application/canvasServices';
 import { prepareNodeImage, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
-import { extractVideoThumbnail, persistLibraryAssetBinary } from '@/commands/assetLibrary';
+import {
+  extractVideoThumbnail,
+  persistLibraryAssetBinary,
+  persistLibraryAssetFile,
+} from '@/commands/assetLibrary';
 import { useCanvasStore } from '@/stores/canvasStore';
 
 type AudioNodeProps = {
@@ -128,6 +134,16 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     return `生成中…（已等待 ${waitedMinutes} 分钟）`;
   }, [isGenerating, waitedMinutes]);
 
+  const applyMediaSource = useCallback((sourcePath: string, mediaType: 'audio' | 'video', fileName: string) => {
+    updateNodeData(id, {
+      sourcePath,
+      mediaType,
+      previewImageUrl: null,
+      aspectRatio: undefined,
+      displayName: fileName.replace(/\.[^.]+$/, '').trim() || fileName,
+    });
+  }, [id, updateNodeData]);
+
   /** 上传媒体文件(点击选择或拖拽), 持久化后写入节点 */
   const handleMediaFiles = useCallback(async (files: FileList | File[]) => {
     const file = Array.from(files)[0];
@@ -144,23 +160,55 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     }
     setIsUploading(true);
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
       const extension = file.name.split('.').pop()?.trim() || (mediaType === 'video' ? 'mp4' : 'mp3');
-      const sourcePath = await persistLibraryAssetBinary(bytes, extension);
-      updateNodeData(id, {
-        sourcePath,
-        mediaType,
-        previewImageUrl: null,
-        aspectRatio: undefined,
-        // 导入媒体时用文件原名作为节点标题, 避免显示默认的"媒体"导致分不清
-        displayName: file.name.replace(/\.[^.]+$/, '').trim() || file.name,
-      });
+      const nativePath = (file as File & { path?: unknown }).path;
+      const sourcePath = isTauri() && typeof nativePath === 'string' && nativePath.trim()
+        ? await persistLibraryAssetFile(nativePath, extension)
+        : await persistLibraryAssetBinary(new Uint8Array(await file.arrayBuffer()), extension);
+      applyMediaSource(sourcePath, mediaType, file.name);
     } catch (error) {
       console.warn('[mediaNode] upload failed', error);
     } finally {
       setIsUploading(false);
     }
-  }, [id, updateNodeData]);
+  }, [applyMediaSource]);
+
+  const handleUploadClick = useCallback(async () => {
+    if (!isTauri()) {
+      fileInputRef.current?.click();
+      return;
+    }
+
+    const selectedPath = await open({
+      multiple: false,
+      filters: [{ name: '媒体文件', extensions: ['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv', 'mp3', 'm4a', 'wav', 'aac', 'flac', 'ogg'] }],
+    });
+    if (!selectedPath || Array.isArray(selectedPath)) {
+      return;
+    }
+
+    const fileName = selectedPath.split(/[\\/]/).pop() || 'media';
+    const extension = fileName.split('.').pop()?.trim() || 'bin';
+    const videoExtensions = new Set(['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv']);
+    const mediaType = videoExtensions.has(extension.toLowerCase()) ? 'video' : 'audio';
+    setIsUploading(true);
+    try {
+      const sourcePath = await persistLibraryAssetFile(selectedPath, extension);
+      applyMediaSource(sourcePath, mediaType, fileName);
+    } catch (error) {
+      console.warn('[mediaNode] native upload failed', error);
+    } finally {
+      setIsUploading(false);
+    }
+  }, [applyMediaSource]);
+
+  useEffect(() => {
+    return canvasEventBus.subscribe('upload-node/reupload', ({ nodeId }) => {
+      if (nodeId === id) {
+        void handleUploadClick();
+      }
+    });
+  }, [handleUploadClick, id]);
 
   /** 视频截图: 当前帧绘制到 canvas → 生成图片节点到下游(右侧)并连线 */
   /** 视频加载后自动截首帧作为缩略图(存 previewImageUrl), 生成过则跳过。 */
@@ -359,7 +407,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
         <button
           type="button"
           className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border-dark text-text-muted transition-colors hover:border-accent/60 hover:bg-accent/5 hover:text-text-dark"
-          onClick={() => fileInputRef.current?.click()}
+          onClick={() => void handleUploadClick()}
         >
           {isVideo ? (
             <Video className="h-9 w-9 opacity-60" />

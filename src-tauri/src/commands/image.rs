@@ -1270,7 +1270,16 @@ async fn resolve_source_bytes(source: &str) -> Result<(Vec<u8>, String), String>
     }
 
     if source.starts_with("http://") || source.starts_with("https://") {
-        let response = reqwest::get(source)
+        // 远程下载加 20s 超时: 结果 URL 若挂起(慢 CDN / 失效签名), 快速失败
+        // 而非无限等待, 避免节点"一直生成中"无响应。
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| format!("Failed to build image download client: {}", e))?;
+        let response = client
+            .get(source)
+            .send()
             .await
             .map_err(|e| format!("Failed to download remote image: {}", e))?;
 

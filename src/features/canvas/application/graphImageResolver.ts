@@ -5,21 +5,20 @@ import {
   isGroupNode,
   isImageEditNode,
   isPanoramaNode,
+  isSeamlessMosaicNode,
   isStoryboardGenNode,
   isStoryboardSplitNode,
   isTextAnnotationNode,
   isUploadNode,
   type CanvasEdge,
   type CanvasNode,
-} from '../domain/canvasNodes';
-import type { GraphImageResolver } from './ports';
+} from "../domain/canvasNodes";
+import type { GraphImageResolver } from "./ports";
 
 export class DefaultGraphImageResolver implements GraphImageResolver {
   collectInputImages(nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]): string[] {
     const nodeById = new Map(nodes.map((node) => [node.id, node]));
-    const sourceNodeIds = edges
-      .filter((edge) => edge.target === nodeId)
-      .map((edge) => edge.source);
+    const sourceNodeIds = edges.filter((edge) => edge.target === nodeId).map((edge) => edge.source);
 
     const images = sourceNodeIds
       .map((sourceId) => nodeById.get(sourceId))
@@ -30,9 +29,7 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
 
   collectInputAudio(nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]): string[] {
     const nodeById = new Map(nodes.map((node) => [node.id, node]));
-    const sourceNodeIds = edges
-      .filter((edge) => edge.target === nodeId)
-      .map((edge) => edge.source);
+    const sourceNodeIds = edges.filter((edge) => edge.target === nodeId).map((edge) => edge.source);
 
     const audioSources = sourceNodeIds
       .map((sourceId) => nodeById.get(sourceId))
@@ -43,9 +40,7 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
 
   collectInputText(nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]): string[] {
     const nodeById = new Map(nodes.map((node) => [node.id, node]));
-    const sourceNodeIds = edges
-      .filter((edge) => edge.target === nodeId)
-      .map((edge) => edge.source);
+    const sourceNodeIds = edges.filter((edge) => edge.target === nodeId).map((edge) => edge.source);
 
     const textSources = sourceNodeIds
       .map((sourceId) => nodeById.get(sourceId))
@@ -54,10 +49,7 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
     return [...new Set(textSources)];
   }
 
-  private extractImages(
-    node: CanvasNode | undefined,
-    nodeById: Map<string, CanvasNode>
-  ): string[] {
+  private extractImages(node: CanvasNode | undefined, nodeById: Map<string, CanvasNode>): string[] {
     if (!node) {
       return [];
     }
@@ -74,6 +66,10 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
         return [node.data.outputImageUrl];
       }
       return node.data.inputImageUrl ? [node.data.inputImageUrl] : [];
+    }
+
+    if (isSeamlessMosaicNode(node)) {
+      return node.data.outputImageUrl ? [node.data.outputImageUrl] : [];
     }
 
     if (isStoryboardSplitNode(node)) {
@@ -98,10 +94,7 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
     return [];
   }
 
-  private extractAudio(
-    node: CanvasNode | undefined,
-    nodeById: Map<string, CanvasNode>
-  ): string[] {
+  private extractAudio(node: CanvasNode | undefined, nodeById: Map<string, CanvasNode>): string[] {
     if (!node) {
       return [];
     }
@@ -111,17 +104,14 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
       return children.flatMap((child) => this.extractAudio(child, nodeById));
     }
 
-    if (isAudioNode(node) && node.data.mediaType !== 'video' && node.data.sourcePath) {
+    if (isAudioNode(node) && node.data.mediaType !== "video" && node.data.sourcePath) {
       return [node.data.sourcePath];
     }
 
     return [];
   }
 
-  private extractText(
-    node: CanvasNode | undefined,
-    nodeById: Map<string, CanvasNode>
-  ): string[] {
+  private extractText(node: CanvasNode | undefined, nodeById: Map<string, CanvasNode>): string[] {
     if (!node) {
       return [];
     }

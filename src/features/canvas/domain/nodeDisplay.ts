@@ -17,6 +17,7 @@ export const DEFAULT_NODE_DISPLAY_NAME: Record<CanvasNodeType, string> = {
   [CANVAS_NODE_TYPES.panorama]: '360 全景',
   [CANVAS_NODE_TYPES.directorDesk]: '3D 导演台',
   [CANVAS_NODE_TYPES.audio]: '媒体',
+  [CANVAS_NODE_TYPES.seamlessMosaic]: '无缝拼图',
 };
 
 export const EXPORT_RESULT_DISPLAY_NAME: Record<ExportImageNodeResultKind, string> = {

@@ -2,7 +2,8 @@ import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Terminal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
-import { fetchProviderModels, testProviderConnection, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck } from '@/commands/ai';
+import type { CustomApiCapabilities } from '@/stores/settingsStore';
+import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck } from '@/commands/ai';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { recommendedApis } from '@/features/settings/recommendedApis';
 import { UiCheckbox, UiModal, UiSelect } from '@/components/ui';
@@ -191,6 +192,7 @@ export function SettingsDialog({
   const [jimengLoginMessage, setJimengLoginMessage] = useState('');
   const jimengLoginTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const jimengLoginCheckingRef = useRef(false);
+  const jimengLoginProbeRef = useRef(false);
   const customApiSectionRef = useRef<HTMLDivElement>(null);
   const [showAddCustomApi, setShowAddCustomApi] = useState(false);
   const [editingCustomApiId, setEditingCustomApiId] = useState<string | null>(null);
@@ -200,9 +202,12 @@ export function SettingsDialog({
     apiKey: '',
     modelsText: '',
     videoModelsText: '',
-    requestMode: 'async' as 'sync' | 'async',
-    protocol: 'images' as 'images' | 'responses',
+    requestMode: 'sync' as 'sync' | 'async',
+    protocol: 'images' as 'images' | 'responses' | 'chat',
     referenceImageField: 'image' as 'image' | 'input_image',
+    referenceImageEncoding: 'auto' as 'auto' | 'data_url' | 'raw_base64' | 'url',
+    imageTransport: 'auto' as 'auto' | 'generations_json' | 'edits_multipart' | 'apimart_json',
+    capabilities: undefined as CustomApiCapabilities | undefined,
   });
   const [customApiBusy, setCustomApiBusy] = useState<'idle' | 'testing' | 'fetching'>('idle');
   const [customApiStatus, setCustomApiStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
@@ -222,9 +227,12 @@ export function SettingsDialog({
       apiKey: '',
       modelsText: api.models.join('\n'),
       videoModelsText: (api.videoModels ?? []).join('\n'),
-      requestMode: 'async',
+      requestMode: 'sync',
       protocol: 'images',
       referenceImageField: 'image',
+      referenceImageEncoding: 'auto',
+      imageTransport: 'auto',
+      capabilities: undefined,
     });
     setShowAddCustomApi(true);
     setCustomApiStatus(null);
@@ -238,6 +246,38 @@ export function SettingsDialog({
     setLocalJimengCliExecutable(jimengCli.executable);
     setShowJimengCliSettings(true);
   }, [jimengCli.executable]);
+
+  // 打开设置时只探测本地登录态，不会发起新的授权或打开浏览器。
+  const probeJimengLoginStatus = useCallback(async (executable: string) => {
+    const value = executable.trim() || 'dreamina';
+    if (jimengLoginProbeRef.current) {
+      return;
+    }
+    jimengLoginProbeRef.current = true;
+    try {
+      const result = await jimengCliLoginStart(value);
+      if (!result.needAuth) {
+        setJimengLoginState('success');
+        setJimengLoginMessage(result.message || '已登录即梦账号');
+      } else {
+        setJimengLoginState('idle');
+        setJimengLoginMessage('');
+      }
+    } catch {
+      // CLI 未安装或当前不可用时不覆盖设置弹窗，用户点击登录后再显示具体错误。
+      setJimengLoginState('idle');
+      setJimengLoginMessage('');
+    } finally {
+      jimengLoginProbeRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!showJimengCliSettings) {
+      return;
+    }
+    void probeJimengLoginStatus(localJimengCliExecutable);
+  }, [showJimengCliSettings, probeJimengLoginStatus]);
 
   // 组件卸载/关闭时清理登录轮询
   useEffect(() => {
@@ -465,7 +505,7 @@ export function SettingsDialog({
     setCustomApiBusy('testing');
     setCustomApiStatus(null);
     try {
-      const result = await testProviderConnection(baseUrl, apiKey);
+      const result = await detectProviderCapabilities(baseUrl, apiKey);
       const models = result.models ?? [];
       const videoModelIds = new Set(
         customApiDraft.videoModelsText
@@ -474,18 +514,51 @@ export function SettingsDialog({
           .filter(Boolean)
       );
       const imageModels = models.filter((model) => !videoModelIds.has(model.trim().toLowerCase()));
-      const hasNativeGptImage = models.some((model) => /^gpt-image-1(?:$|[-_])/i.test(model));
-      setCustomApiDraft((previous) => ({
-        ...previous,
-        modelsText: imageModels.length > 0 ? imageModels.join('\n') : previous.modelsText,
-        // 异步提交同时兼容平台直接返回图片和返回任务 ID 两种行为。
-        requestMode: 'async',
-        protocol: 'images',
-        referenceImageField: hasNativeGptImage ? 'input_image' : 'image',
-      }));
+      setCustomApiDraft((previous) => {
+        // 探测结果优先; 但探测为低置信度 images 默认且用户已手动选择 chat/responses
+        // 时保留用户选择(OPTIONS 探测常被网关中间件统一响应, 不足以推翻手动配置)。
+        const detectedProtocol = result.capabilities.imageProtocol === 'responses'
+          ? 'responses'
+          : result.capabilities.imageProtocol === 'chat' ? 'chat' : 'images';
+        const keepManualProtocol =
+          detectedProtocol === 'images'
+          && (previous.protocol === 'chat' || previous.protocol === 'responses');
+        return {
+          ...previous,
+          modelsText: imageModels.length > 0 ? imageModels.join('\n') : previous.modelsText,
+          // 能力探测只确认协议和编码，不足以证明平台支持任务查询；保持同步默认。
+          protocol: keepManualProtocol ? previous.protocol : detectedProtocol,
+          referenceImageField: result.capabilities.imageReferenceField === 'input_image' ? 'input_image' : 'image',
+          referenceImageEncoding: result.capabilities.imageReferenceEncoding === 'raw_base64'
+            ? 'raw_base64'
+            : result.capabilities.imageReferenceEncoding === 'url' ? 'url' : 'data_url',
+          capabilities: result.capabilities,
+        };
+      });
+      const encodingLabel = result.capabilities.imageReferenceEncoding === 'raw_base64'
+        ? 'Base64'
+        : result.capabilities.imageReferenceEncoding === 'url'
+          ? 'URL'
+          : result.capabilities.imageReferenceEncoding === 'multipart'
+            ? 'Multipart'
+            : 'Data URL';
+      const protocolLabel = result.capabilities.imageProtocol === 'responses'
+        ? '/v1/responses'
+        : result.capabilities.imageProtocol === 'chat'
+          ? '/v1/chat/completions'
+          : result.capabilities.imageProtocol === 'images'
+            ? '/v1/images/generations'
+            : '未识别';
+      const confidenceLabel = result.capabilities.confidence === 'high' ? '高' : '低（仅非计费探测）';
       setCustomApiStatus({
         type: 'ok',
-        text: t('settings.customApiTestOk', { count: result.count ?? 0 }),
+        text: t('settings.customApiTestOk', {
+          count: models.length,
+          protocol: protocolLabel,
+          field: result.capabilities.imageReferenceField,
+          encoding: encodingLabel,
+          confidence: confidenceLabel,
+        }),
       });
     } catch (error) {
       setCustomApiStatus({
@@ -512,6 +585,9 @@ export function SettingsDialog({
       requestMode: api.requestMode,
       protocol: api.protocol,
       referenceImageField: api.referenceImageField ?? 'image',
+      referenceImageEncoding: api.referenceImageEncoding ?? 'auto',
+      imageTransport: api.imageTransport ?? 'auto',
+      capabilities: api.capabilities,
     });
     setShowAddCustomApi(true);
   }, []);
@@ -525,9 +601,12 @@ export function SettingsDialog({
       apiKey: '',
       modelsText: '',
       videoModelsText: '',
-      requestMode: 'async',
+      requestMode: 'sync',
       protocol: 'images',
       referenceImageField: 'image',
+      referenceImageEncoding: 'auto',
+      imageTransport: 'auto',
+      capabilities: undefined,
     });
   }, []);
 
@@ -559,6 +638,9 @@ export function SettingsDialog({
         requestMode: customApiDraft.requestMode,
         protocol: customApiDraft.protocol,
         referenceImageField: customApiDraft.referenceImageField,
+        referenceImageEncoding: customApiDraft.referenceImageEncoding,
+        imageTransport: customApiDraft.imageTransport,
+        capabilities: customApiDraft.capabilities,
       });
     } else {
       addCustomApi({
@@ -570,6 +652,9 @@ export function SettingsDialog({
         requestMode: customApiDraft.requestMode,
         protocol: customApiDraft.protocol,
         referenceImageField: customApiDraft.referenceImageField,
+        referenceImageEncoding: customApiDraft.referenceImageEncoding,
+        imageTransport: customApiDraft.imageTransport,
+        capabilities: customApiDraft.capabilities,
       });
     }
     resetCustomApiForm();
@@ -1139,7 +1224,106 @@ export function SettingsDialog({
                             className="ui-scrollbar w-full resize-none rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
                           />
                         </label>
-                        {/* 验证连接会自动匹配请求模式、接口协议和参考图字段。 */}
+                        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                          <label className="block">
+                            <span className="mb-1 block text-[11px] text-text-muted">请求模式</span>
+                            <select
+                              value={customApiDraft.requestMode}
+                              onChange={(event) =>
+                                setCustomApiDraft({
+                                  ...customApiDraft,
+                                  requestMode: event.target.value as 'sync' | 'async',
+                                })
+                              }
+                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
+                            >
+                              <option value="sync">同步返回</option>
+                              <option value="async">异步轮询</option>
+                            </select>
+                          </label>
+                          <label className="block">
+                            <span className="mb-1 block text-[11px] text-text-muted">
+                              {t('settings.customApiProtocol', '图片协议')}
+                            </span>
+                            <select
+                              value={customApiDraft.protocol}
+                              onChange={(event) =>
+                                setCustomApiDraft({
+                                  ...customApiDraft,
+                                  protocol: event.target.value as 'images' | 'responses' | 'chat',
+                                })
+                              }
+                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
+                            >
+                              <option value="images">/v1/images</option>
+                              <option value="responses">/v1/responses</option>
+                              <option value="chat">/v1/chat/completions</option>
+                            </select>
+                          </label>
+                          <label className="block">
+                            <span className="mb-1 block text-[11px] text-text-muted">
+                              {t('settings.customApiReferenceField', '参考图字段')}
+                            </span>
+                            <select
+                              value={customApiDraft.referenceImageField}
+                              onChange={(event) =>
+                                setCustomApiDraft({
+                                  ...customApiDraft,
+                                  referenceImageField: event.target.value as 'image' | 'input_image',
+                                })
+                              }
+                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
+                            >
+                              <option value="image">image / images</option>
+                              <option value="input_image">input_image</option>
+                            </select>
+                          </label>
+                          <label className="block">
+                            <span className="mb-1 block text-[11px] text-text-muted">
+                              {t('settings.customApiReferenceEncoding', '参考图编码')}
+                            </span>
+                            <select
+                              value={customApiDraft.referenceImageEncoding}
+                              onChange={(event) =>
+                                setCustomApiDraft({
+                                  ...customApiDraft,
+                                  referenceImageEncoding: event.target.value as 'auto' | 'data_url' | 'raw_base64' | 'url',
+                                })
+                              }
+                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
+                            >
+                              <option value="auto">{t('settings.customApiReferenceEncodingAuto', '自动')}</option>
+                              <option value="data_url">Data URL</option>
+                              <option value="raw_base64">Base64</option>
+                              <option value="url">URL</option>
+                            </select>
+                          </label>
+                          <label className="block">
+                            <span className="mb-1 block text-[11px] text-text-muted">图生图适配器</span>
+                            <select
+                              value={customApiDraft.imageTransport}
+                              onChange={(event) =>
+                                setCustomApiDraft({
+                                  ...customApiDraft,
+                                  imageTransport: event.target.value as 'auto' | 'generations_json' | 'edits_multipart' | 'apimart_json',
+                                })
+                              }
+                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
+                            >
+                              <option value="auto">自动（带参考图时用 edits）</option>
+                              <option value="generations_json">/v1/images JSON</option>
+                              <option value="edits_multipart">/v1/images/edits 上传图片</option>
+                              <option value="apimart_json">APIMart image_urls</option>
+                            </select>
+                          </label>
+                        </div>
+                        <p className="text-[10px] leading-4 text-text-muted">
+                          {t(
+                            'settings.customApiProbeHint',
+                            '验证协议只使用 /v1/models 和 OPTIONS 等非计费探测，会自动填写图片协议、参考图字段和编码；同步/异步无法安全探测，请手动选择。'
+                          )}
+                        </p>
+                        {/* 连接验证只检查服务可达性和模型列表; 请求协议与参考图编码按上方配置发送。 */}
                         <div className="flex flex-wrap items-center gap-2 pt-0.5">
                           <button
                             type="button"
@@ -1386,6 +1570,8 @@ export function SettingsDialog({
                         ? t('settings.jimengCliLogining', '获取授权中…')
                         : jimengLoginState === 'polling'
                           ? t('settings.jimengCliWaitingAuth', '等待授权…')
+                          : jimengLoginState === 'success'
+                            ? t('settings.jimengCliLoggedIn', '已登录')
                           : t('settings.jimengCliLoginBtn', '一键登录')}
                     </button>
                   </div>

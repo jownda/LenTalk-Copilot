@@ -3,15 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { resolveVideoModelProfile } from './videoProfiles';
 
 describe('resolveVideoModelProfile', () => {
-  it('marks MiniMax H3 as the verified profile', () => {
-    const profile = resolveVideoModelProfile('custom:wgspai/minimax-h3');
-    expect(profile.id).toBe('minimax-h3');
+  it('uses the generic profile for custom video models', () => {
+    const profile = resolveVideoModelProfile('custom:provider/minimax-h3');
+    expect(profile.id).toBe('openai-video');
     expect(profile.status).toBe('verified');
-    expect(profile.referenceImageTarget).toBe('platform-file');
   });
 
   it('maps Seedance 2 to the generic verified profile (no local block)', () => {
-    const profile = resolveVideoModelProfile('custom:wgspai/seedance-v2-1080p');
+    const profile = resolveVideoModelProfile('custom:provider/seedance-v2-1080p');
     expect(profile.id).toBe('seedance-v2');
     expect(profile.status).toBe('verified');
     expect(profile.unavailableReason).toBeUndefined();

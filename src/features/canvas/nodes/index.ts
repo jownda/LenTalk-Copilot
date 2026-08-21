@@ -6,6 +6,7 @@ import { GroupNode } from './GroupNode';
 import { ImageEditNode } from './ImageEditNode';
 import { ImageNode } from './ImageNode';
 import { PanoramaNode } from './PanoramaNode';
+import { SeamlessMosaicNode } from './SeamlessMosaicNode';
 import { StoryboardGenNode } from './StoryboardGenNode';
 import { StoryboardNode } from './StoryboardNode';
 import { TextAnnotationNode } from './TextAnnotationNode';
@@ -19,6 +20,7 @@ export const nodeTypes: NodeTypes = {
   groupNode: GroupNode,
   imageNode: ImageEditNode,
   panoramaNode: PanoramaNode,
+  seamlessMosaicNode: SeamlessMosaicNode,
   storyboardGenNode: StoryboardGenNode,
   storyboardNode: StoryboardNode,
   textAnnotationNode: TextAnnotationNode,
@@ -33,6 +35,7 @@ export {
   ImageEditNode,
   ImageNode,
   PanoramaNode,
+  SeamlessMosaicNode,
   StoryboardGenNode,
   StoryboardNode,
   TextAnnotationNode,

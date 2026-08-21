@@ -20,6 +20,17 @@ export async function persistLibraryAssetBinary(
   });
 }
 
+/** 直接复制本地媒体文件，避免视频内容经 Tauri IPC 传输。 */
+export async function persistLibraryAssetFile(
+  sourcePath: string,
+  extension: string
+): Promise<string> {
+  return await invoke<string>('persist_library_asset_file', {
+    sourcePath,
+    extension,
+  });
+}
+
 /** 用系统 QuickLook 为视频生成首帧缩略图, 返回缩略图路径(失败返回 null) */
 export async function extractVideoThumbnail(videoPath: string): Promise<string | null> {
   try {

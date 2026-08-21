@@ -267,7 +267,6 @@ export const PanoramaNode = memo(({ id, data, selected, width, height }: Panoram
     const canvas = canvasRef.current;
     if (!scene || !canvas) return;
     renderPanoramaView(scene, canvas, data.yaw, data.pitch, data.fov);
-    animationRef.current = requestAnimationFrame(renderLoop);
   }, [data.yaw, data.pitch, data.fov]);
 
   // 使用原生 wheel 监听(React 合成事件对 wheel 默认 passive,preventDefault 无效),
