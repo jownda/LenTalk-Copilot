@@ -685,7 +685,7 @@ fn common_locations(command: &str) -> Vec<String> {
             directories.push(PathBuf::from(app_data).join("npm"));
         }
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            directories.push(PathBuf::from(local_app_data).join("Programs"));
+            directories.push(PathBuf::from(local_app_data.clone()).join("Programs"));
             directories.push(PathBuf::from(local_app_data).join("dreamina"));
         }
         directories.push(home.join("AppData/Roaming/npm"));
