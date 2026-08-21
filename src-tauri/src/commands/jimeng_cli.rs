@@ -609,7 +609,10 @@ fn expand_windows_path(path: &str) -> String {
         return output;
     }
 
-    path.to_string()
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.to_string()
+    }
 }
 
 fn find_in_path(command: &str) -> Option<String> {
@@ -697,7 +700,7 @@ fn common_locations(command: &str) -> Vec<String> {
             windows_command_suffixes(command)
                 .into_iter()
                 .map(|suffix| format!("{}{}", path.display(), suffix))
-                .collect()
+                .collect::<Vec<_>>()
         }
         #[cfg(not(target_os = "windows"))]
         {
