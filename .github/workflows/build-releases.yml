@@ -21,6 +21,9 @@ jobs:
   build-windows:
     name: Windows (NSIS exe + MSI)
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
 
