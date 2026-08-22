@@ -107,6 +107,8 @@ interface SettingsState {
   enableUpdateDialog: boolean;
   /** 最近一次使用的图片生成模型 id(新建 AI 图片节点默认选中) */
   lastImageModelId: string | null;
+  /** 已实际成功生成过的模型，供拉取模型列表标记为可用。 */
+  usableModelIds: string[];
   setProviderApiKey: (providerId: string, key: string) => void;
   setJimengCliExecutable: (executable: string) => void;
   addCustomApi: (input: Omit<CustomApiProvider, 'id' | 'createdAt'>) => CustomApiProvider;
@@ -135,6 +137,7 @@ interface SettingsState {
   setAutoCheckAppUpdateOnLaunch: (enabled: boolean) => void;
   setEnableUpdateDialog: (enabled: boolean) => void;
   setLastImageModelId: (modelId: string | null) => void;
+  markModelAvailable: (modelId: string) => void;
 }
 
 const HEX_COLOR_PATTERN = /^#?[0-9a-fA-F]{6}$/;
@@ -215,6 +218,18 @@ function normalizeApiKeys(input: ProviderApiKeys | null | undefined): ProviderAp
     acc[normalizedProviderId] = normalizeApiKey(key);
     return acc;
   }, {});
+}
+
+function normalizeUsableModelIds(input: unknown): string[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+  return Array.from(new Set(
+    input
+      .filter((modelId): modelId is string => typeof modelId === 'string')
+      .map((modelId) => modelId.trim())
+      .filter(Boolean)
+  )).slice(-500);
 }
 
 function normalizeJimengCliSettings(input: unknown): JimengCliSettings {
@@ -375,6 +390,7 @@ export const useSettingsStore = create<SettingsState>()(
       autoCheckAppUpdateOnLaunch: true,
       enableUpdateDialog: true,
       lastImageModelId: null,
+      usableModelIds: [],
       setProviderApiKey: (providerId, key) =>
         set((state) => ({
           apiKeys: {
@@ -469,10 +485,17 @@ export const useSettingsStore = create<SettingsState>()(
       setAutoCheckAppUpdateOnLaunch: (enabled) => set({ autoCheckAppUpdateOnLaunch: enabled }),
       setEnableUpdateDialog: (enabled) => set({ enableUpdateDialog: enabled }),
       setLastImageModelId: (modelId) => set({ lastImageModelId: modelId }),
+      markModelAvailable: (modelId) => {
+        const normalizedModelId = modelId.trim();
+        if (!normalizedModelId) return;
+        set((state) => state.usableModelIds.includes(normalizedModelId)
+          ? state
+          : { usableModelIds: [...state.usableModelIds, normalizedModelId].slice(-500) });
+      },
     }),
     {
       name: 'settings-storage',
-      version: 15,
+      version: 16,
       onRehydrateStorage: () => {
         return (_state, error) => {
           if (error) {
@@ -496,6 +519,7 @@ export const useSettingsStore = create<SettingsState>()(
           autoCheckAppUpdateOnLaunch?: boolean;
           enableUpdateDialog?: boolean;
           lastImageModelId?: string | null;
+          usableModelIds?: unknown;
           enableStoryboardGenGridPreviewShortcut?: boolean;
           showStoryboardGenAdvancedRatioControls?: boolean;
           storyboardGenAutoInferEmptyFrame?: boolean;
@@ -529,6 +553,7 @@ export const useSettingsStore = create<SettingsState>()(
             autoCheckAppUpdateOnLaunch: state.autoCheckAppUpdateOnLaunch ?? true,
             enableUpdateDialog: state.enableUpdateDialog ?? true,
             lastImageModelId: typeof state.lastImageModelId === 'string' && state.lastImageModelId ? state.lastImageModelId : null,
+            usableModelIds: normalizeUsableModelIds(state.usableModelIds),
             enableStoryboardGenGridPreviewShortcut:
               state.enableStoryboardGenGridPreviewShortcut ?? false,
             showStoryboardGenAdvancedRatioControls:
@@ -559,6 +584,7 @@ export const useSettingsStore = create<SettingsState>()(
           autoCheckAppUpdateOnLaunch: state.autoCheckAppUpdateOnLaunch ?? true,
           enableUpdateDialog: state.enableUpdateDialog ?? true,
           lastImageModelId: typeof state.lastImageModelId === 'string' && state.lastImageModelId ? state.lastImageModelId : null,
+          usableModelIds: normalizeUsableModelIds(state.usableModelIds),
           enableStoryboardGenGridPreviewShortcut:
             state.enableStoryboardGenGridPreviewShortcut ?? false,
           showStoryboardGenAdvancedRatioControls:

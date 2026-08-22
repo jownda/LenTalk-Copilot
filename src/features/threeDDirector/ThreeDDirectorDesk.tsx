@@ -1,11 +1,9 @@
-import { useEffect, useState } from 'react';
-import { Camera, X } from 'lucide-react';
+import { useEffect } from 'react';
+import { X } from 'lucide-react';
 import './styles/index.css';
 import { DirectorDeskShell } from './app/layout/DirectorDeskShell';
 import { DirectorCanvas } from './editor/canvas/DirectorCanvas';
 import { initDirectorDeskHostBridge } from './editor/io/hostBridge';
-import { postDirectorDeskCapturesToHost } from './editor/io/hostBridge';
-import { requestViewportCapture } from './editor/io/captureBridge';
 import { useDirectorStore } from './editor/store/directorStore';
 
 interface ThreeDDirectorDeskProps {
@@ -23,38 +21,10 @@ function isEditableShortcutTarget(target: EventTarget | null): boolean {
 export function ThreeDDirectorDesk({ onClose }: ThreeDDirectorDeskProps) {
   const viewMode = useDirectorStore((state) => state.viewMode);
   const setViewMode = useDirectorStore((state) => state.setViewMode);
-  const [captureToCanvasState, setCaptureToCanvasState] = useState<
-    'idle' | 'capturing' | 'sent' | 'failed'
-  >('idle');
 
   useEffect(() => {
     initDirectorDeskHostBridge();
   }, []);
-
-  const handleCaptureToCanvas = async () => {
-    if (captureToCanvasState === 'capturing') {
-      return;
-    }
-    setCaptureToCanvasState('capturing');
-    try {
-      const results = await requestViewportCapture({
-        preset: 'current',
-        source: 'capture-panel',
-      });
-      postDirectorDeskCapturesToHost(
-        results.map((result, index) => ({
-          dataUrl: result.dataUrl,
-          fileName: `3D导演台截图-${index + 1}.png`,
-        }))
-      );
-      setCaptureToCanvasState('sent');
-      window.setTimeout(() => setCaptureToCanvasState('idle'), 1600);
-    } catch (error) {
-      console.warn('[director-desk] capture to canvas failed', error);
-      setCaptureToCanvasState('failed');
-      window.setTimeout(() => setCaptureToCanvasState('idle'), 1600);
-    }
-  };
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -89,7 +59,8 @@ export function ThreeDDirectorDesk({ onClose }: ThreeDDirectorDeskProps) {
 
   return (
     <div
-      className="director-desk-app fixed inset-0 z-[120] flex flex-col bg-[rgb(var(--bg-rgb))]"
+      className="director-desk-app fixed inset-x-0 bottom-0 top-10 z-[120] flex flex-col bg-[rgb(var(--bg-rgb))]"
+      data-director-desk
       onDoubleClick={(event) => {
         // 阻止双击冒泡到外层 ProjectManager 的「双击空白新建项目」处理
         event.stopPropagation();
@@ -120,27 +91,6 @@ export function ThreeDDirectorDesk({ onClose }: ThreeDDirectorDeskProps) {
           </div>
         </div>
         <div className="top-bar-actions">
-          <button
-            className="top-bar-action-button top-bar-action-button--label"
-            type="button"
-            aria-label="截图到画布"
-            title={captureToCanvasState === 'sent'
-              ? '已发送到画布'
-              : captureToCanvasState === 'failed'
-                ? '截图失败'
-                : '将当前视角截图发送到画布下游节点'}
-            disabled={captureToCanvasState === 'capturing'}
-            onClick={() => void handleCaptureToCanvas()}
-          >
-            <Camera aria-hidden="true" size={14} strokeWidth={1.8} />
-            <span className="top-bar-action-label">
-              {captureToCanvasState === 'sent'
-                ? '已发送'
-                : captureToCanvasState === 'failed'
-                  ? '失败'
-                  : '截图到画布'}
-            </span>
-          </button>
           <button
             className="top-bar-action-button"
             type="button"

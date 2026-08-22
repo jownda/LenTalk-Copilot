@@ -21,6 +21,7 @@ import {
   prepareNodeImage,
   resolveImageDisplayUrl,
 } from '@/features/canvas/application/imageData';
+import { persistLibraryAssetBinary } from '@/commands/assetLibrary';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { ThreeDDirectorDesk } from '@/features/threeDDirector/ThreeDDirectorDesk';
 import { registerHostCaptureSourceNode } from '@/features/threeDDirector/editor/io/hostBridge';
@@ -35,6 +36,7 @@ const DIRECTOR_DESK_NODE_MIN_WIDTH = 240;
 const DIRECTOR_DESK_NODE_MIN_HEIGHT = 180;
 
 const CAPTURES_SENT_MESSAGE_TYPE = 'storyai:director-desk-captures-sent';
+const REFERENCE_VIDEO_SENT_MESSAGE_TYPE = 'storyai:director-desk-reference-video-sent';
 const PANORAMA_MESSAGE_TYPE = 'storyai:director-desk-panorama';
 
 interface HostCaptureItem {
@@ -42,12 +44,25 @@ interface HostCaptureItem {
   fileName?: unknown;
 }
 
+interface HostReferenceVideo {
+  dataUrl?: unknown;
+  fileName?: unknown;
+  sourceNodeId?: unknown;
+}
+
+function getFileExtension(fileName: string) {
+  const extension = fileName.split('.').pop()?.trim().toLowerCase();
+  return extension && /^[a-z0-9]{1,10}$/.test(extension) ? extension : 'mp4';
+}
+
 export const DirectorDeskNode = memo(({ id, data, selected, width, height }: DirectorDeskNodeProps) => {
   const updateNodeInternals = useUpdateNodeInternals();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const addDerivedExportNode = useCanvasStore((state) => state.addDerivedExportNode);
+  const addNode = useCanvasStore((state) => state.addNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
+  const findNodePosition = useCanvasStore((state) => state.findNodePosition);
   const nodes = useCanvasStore((state) => state.nodes);
   const edges = useCanvasStore((state) => state.edges);
 
@@ -131,6 +146,37 @@ export const DirectorDeskNode = memo(({ id, data, selected, width, height }: Dir
     [addDerivedExportNode, addEdge, id, isHandlingCaptures, updateNodeData]
   );
 
+  const handleReferenceVideo = useCallback(async (video: HostReferenceVideo) => {
+    const dataUrl = typeof video.dataUrl === 'string' ? video.dataUrl : '';
+    if (!dataUrl) {
+      return;
+    }
+
+    const fileName = typeof video.fileName === 'string' && video.fileName.trim()
+      ? video.fileName.trim()
+      : '3D导演台运镜.mp4';
+    try {
+      const response = await fetch(dataUrl);
+      if (!response.ok) {
+        throw new Error(`视频数据读取失败 (${response.status})`);
+      }
+      const sourcePath = await persistLibraryAssetBinary(
+        new Uint8Array(await response.arrayBuffer()),
+        getFileExtension(fileName)
+      );
+      const placement = findNodePosition(id, 320, 250);
+      const mediaNodeId = addNode(CANVAS_NODE_TYPES.audio, placement, {
+        displayName: fileName.replace(/\.[^.]+$/, '').trim() || fileName,
+        mediaType: 'video',
+        previewImageUrl: null,
+        sourcePath,
+      });
+      addEdge(id, mediaNodeId);
+    } catch (error) {
+      console.warn('[directorDeskNode] handle reference video failed', error);
+    }
+  }, [addEdge, addNode, findNodePosition, id]);
+
   // 打开导演台期间:注册 sourceNodeId + 监听导演台发来的截图消息
   useEffect(() => {
     if (!isDeskOpen) {
@@ -140,20 +186,24 @@ export const DirectorDeskNode = memo(({ id, data, selected, width, height }: Dir
     registerHostCaptureSourceNode(id);
 
     const handleMessage = (event: MessageEvent) => {
-      if (event.data?.type !== CAPTURES_SENT_MESSAGE_TYPE) {
+      const messageType = event.data?.type;
+      if (messageType !== CAPTURES_SENT_MESSAGE_TYPE && messageType !== REFERENCE_VIDEO_SENT_MESSAGE_TYPE) {
         return;
       }
       const payload = event.data?.payload;
-      const captures = Array.isArray(payload?.captures) ? (payload.captures as HostCaptureItem[]) : [];
-      if (captures.length === 0) {
-        return;
-      }
       const sourceNodeId = typeof payload?.sourceNodeId === 'string' ? payload.sourceNodeId : null;
-      // 内嵌模式下截图应只属于当前节点;若带其他 sourceNodeId 则忽略
+      // 内嵌模式下产物应只属于当前节点;若带其他 sourceNodeId 则忽略
       if (sourceNodeId && sourceNodeId !== id) {
         return;
       }
-      void handleCaptures(captures);
+      if (messageType === CAPTURES_SENT_MESSAGE_TYPE) {
+        const captures = Array.isArray(payload?.captures) ? (payload.captures as HostCaptureItem[]) : [];
+        if (captures.length > 0) {
+          void handleCaptures(captures);
+        }
+        return;
+      }
+      void handleReferenceVideo(payload as HostReferenceVideo);
     };
 
     window.addEventListener('message', handleMessage);
@@ -161,7 +211,7 @@ export const DirectorDeskNode = memo(({ id, data, selected, width, height }: Dir
       window.removeEventListener('message', handleMessage);
       registerHostCaptureSourceNode(null);
     };
-  }, [handleCaptures, id, isDeskOpen]);
+  }, [handleCaptures, handleReferenceVideo, id, isDeskOpen]);
 
   // 打开导演台期间:上游图片变化时自动同步为全景图背景
   useEffect(() => {
@@ -175,7 +225,8 @@ export const DirectorDeskNode = memo(({ id, data, selected, width, height }: Dir
         {
           type: PANORAMA_MESSAGE_TYPE,
           payload: {
-            imageUrl: panoramaImageUrl,
+            // 画布图片在 Tauri 下可能保存为本地路径，导演台纹理需要可加载的 asset URL。
+            imageUrl: resolveImageDisplayUrl(panoramaImageUrl),
             fileName: '画布全景图.png',
             edgeId: panoramaEdge?.id,
             sourceNodeId: panoramaEdge?.source,

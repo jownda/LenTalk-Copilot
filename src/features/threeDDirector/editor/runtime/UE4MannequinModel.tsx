@@ -1,4 +1,4 @@
-import { useLoader } from "@react-three/fiber";
+import { useFrame, useLoader } from "@react-three/fiber";
 import { useLayoutEffect, useMemo } from "react";
 import {
   Box3,
@@ -13,7 +13,10 @@ import {
 } from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
-import type { CharacterRigState } from "../schema/directorProject";
+import type { CharacterRigState, DirectorObject } from "../schema/directorProject";
+import { sampleCharacterActionControls } from "../presets/characterActionPresets";
+import { getObjectMotionActionSample, getObjectMotionSpeed } from "../schema/objectMotion";
+import { getRuntimePlaybackProgress } from "./playbackRuntime";
 import { VIEWPORT_OBJECT_LABEL_VERTICAL_GAP } from "../schema/viewportLabels";
 import type { CharacterBodyType } from "./mannequin/bodyTypes";
 import {
@@ -27,6 +30,7 @@ interface UE4MannequinModelProps {
   color?: string;
   onLabelAnchorYChange?: (anchorY: number) => void;
   rigState?: CharacterRigState;
+  runtimeMotion?: { duration: number; object: DirectorObject };
 }
 
 interface LoadedGLTF {
@@ -129,6 +133,7 @@ export function UE4MannequinModel({
   color = "#F3F5F7",
   onLabelAnchorYChange,
   rigState,
+  runtimeMotion,
 }: UE4MannequinModelProps) {
   const gltf = useLoader(GLTFLoader, UE4_MANNEQUIN_MODEL_URL) as LoadedGLTF;
   const scene = useMemo(() => cloneSkeleton(gltf.scene) as Group, [gltf.scene]);
@@ -153,6 +158,20 @@ export function UE4MannequinModel({
       onLabelAnchorYChange?.(Number(labelAnchorY.toFixed(4)));
     }
   }, [bodyType, color, onLabelAnchorYChange, restPose, rigState?.controls, scene]);
+
+  useFrame(() => {
+    if (!runtimeMotion) return;
+    const progress = getRuntimePlaybackProgress();
+    const actionSample = getObjectMotionActionSample(runtimeMotion.object, progress, runtimeMotion.duration);
+    const routeAction = actionSample.actionPresetId;
+    const isMoving = getObjectMotionSpeed(runtimeMotion.object, progress, runtimeMotion.duration) > 0.05;
+    const actionPresetId = routeAction ?? (isMoving ? "walk-cycle" : runtimeMotion.object.characterRig?.actionPresetId);
+    const controls = actionPresetId
+      ? sampleCharacterActionControls(actionPresetId, actionSample.animationTimeSeconds, rigState?.controls ?? {})
+      : rigState?.controls ?? {};
+    applyUE4RestPoseAndRig(scene, { bodyType, controls, restPose });
+    scene.updateMatrixWorld(true);
+  });
 
   return (
     <group name={`ue-retopology-mannequin-${bodyType}`} scale={modelScale}>

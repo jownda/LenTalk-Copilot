@@ -418,11 +418,14 @@ fn run_cli(executable: &str, arguments: &[String]) -> Result<String, String> {
     let mut command = build_cli_command(&resolved);
     #[cfg(target_os = "windows")]
     if is_windows_script(&resolved) {
-        let command_line = std::iter::once(format!("\"{}\"", resolved.replace('"', "\\\"")))
+        // cmd.exe /S /C requires an extra pair of quotes around the complete
+        // command when the executable path itself is quoted. Without it,
+        // paths with spaces can be split before the .cmd/.bat file runs.
+        let command_line = std::iter::once(quote_windows_arg(&resolved))
             .chain(arguments.iter().map(|argument| quote_windows_arg(argument)))
             .collect::<Vec<_>>()
             .join(" ");
-        command.args(["/D", "/S", "/C"]).arg(command_line);
+        command.args(["/D", "/V:OFF", "/S", "/C"]).arg(format!("\"{command_line}\""));
     } else {
         command.args(arguments);
     }
@@ -508,7 +511,11 @@ fn build_cli_command(resolved: &str) -> Command {
 
 #[cfg(target_os = "windows")]
 fn quote_windows_arg(argument: &str) -> String {
-    if argument.is_empty() || argument.chars().any(char::is_whitespace) || argument.contains('"') {
+    if argument.is_empty()
+        || argument.chars().any(char::is_whitespace)
+        || argument.contains('"')
+        || argument.chars().any(|character| matches!(character, '&' | '|' | '<' | '>' | '^' | '(' | ')'))
+    {
         format!("\"{}\"", argument.replace('"', "\\\""))
     } else {
         argument.to_string()
@@ -681,6 +688,8 @@ fn common_locations(command: &str) -> Vec<String> {
     ];
     #[cfg(target_os = "windows")]
     {
+        // The official Windows installer defaults to %USERPROFILE%\\bin.
+        directories.push(home.join("bin"));
         if let Some(app_data) = std::env::var_os("APPDATA") {
             directories.push(PathBuf::from(app_data).join("npm"));
         }

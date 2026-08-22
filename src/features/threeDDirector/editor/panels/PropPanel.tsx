@@ -4,6 +4,7 @@ import {
   InspectorPanel,
   InspectorRangeNumberField,
   InspectorTextField,
+  TransformGizmoHeightControl,
 } from "./InspectorControls";
 import { useDirectorStore } from "../store/directorStore";
 
@@ -26,12 +27,13 @@ export function PropPanel() {
   });
   const updateObjectName = useDirectorStore((state) => state.updateObjectName);
   const updateObjectTransform = useDirectorStore((state) => state.updateObjectTransform);
+  const updateTransformGizmoHeight = useDirectorStore((state) => state.updateTransformGizmoHeight);
   const updateUniformScale = useDirectorStore((state) => state.updateUniformScale);
   const updateObjectColor = useDirectorStore((state) => state.updateObjectColor);
 
   if (!prop) return null;
 
-  const propColor = prop.color ?? "#d7e7ff";
+  const propColor = prop.color ?? "#ffffff";
 
   return (
     <InspectorPanel title="模型" ariaLabel="模型右侧属性面板" className="prop-inspector">
@@ -117,6 +119,11 @@ export function PropPanel() {
         step="0.01"
         value={prop.transform.scale[0]}
         onValueChange={(value) => updateUniformScale(prop.id, Number(value))}
+      />
+      <TransformGizmoHeightControl
+        ariaLabel="模型控制器高度"
+        value={prop.transformGizmoHeight}
+        onChange={(height) => updateTransformGizmoHeight(prop.id, height)}
       />
       <InspectorColorField
         label="颜色"

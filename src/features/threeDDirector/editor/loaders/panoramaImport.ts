@@ -1,3 +1,5 @@
+import { createStoredAssetUrl, localAssetBinaryStorage } from "./localAssetBinaryStorage";
+
 const PANORAMA_IMAGE_EXTENSION_RE = /\.(jpe?g|png|webp)$/i;
 const PANORAMA_RATIO = 2;
 const PANORAMA_RATIO_TOLERANCE = 0.02;
@@ -278,7 +280,7 @@ async function buildAdaptedPanoramaAsset(file: File) {
     if (isPanoramaRatio(source.width, source.height)) {
       return {
         projectionMode: "equirectangular" as const,
-        url: URL.createObjectURL(file),
+        blob: file as Blob,
       };
     }
 
@@ -300,13 +302,30 @@ async function buildAdaptedPanoramaAsset(file: File) {
 
     optimizeAdaptedPanoramaProjection(context, width, height);
 
-    return {
-      projectionMode: "backdrop" as const,
-      url: canvas.toDataURL("image/jpeg", 0.92),
-    };
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        (result) => result ? resolve(result) : reject(new Error("当前环境无法保存全景图，请稍后重试")),
+        "image/jpeg",
+        0.92
+      );
+    });
+
+    return { projectionMode: "backdrop" as const, blob };
   } finally {
     source.close?.();
   }
+}
+
+function readBlobAsDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      if (typeof reader.result === "string") resolve(reader.result);
+      else reject(new Error("全景图读取失败"));
+    });
+    reader.addEventListener("error", () => reject(reader.error ?? new Error("全景图读取失败")));
+    reader.readAsDataURL(blob);
+  });
 }
 
 export async function readPanoramaFile(file: File) {
@@ -315,11 +334,28 @@ export async function readPanoramaFile(file: File) {
   }
   const result = await buildAdaptedPanoramaAsset(file);
 
+  if (localAssetBinaryStorage.isAvailable) {
+    const storedFile = result.blob instanceof File
+      ? result.blob
+      : new File([result.blob], file.name.replace(/\.[^.]+$/, ".jpg"), { type: "image/jpeg" });
+    const stored = await localAssetBinaryStorage.save(storedFile);
+    return {
+      id: stored.key,
+      fileName: file.name,
+      name: file.name.replace(PANORAMA_IMAGE_EXTENSION_RE, ""),
+      projectionMode: result.projectionMode,
+      url: createStoredAssetUrl(stored.key),
+      storageKey: stored.key,
+      byteLength: stored.byteLength,
+    };
+  }
+
   return {
     id: crypto.randomUUID(),
     fileName: file.name,
-    name: file.name,
+    name: file.name.replace(PANORAMA_IMAGE_EXTENSION_RE, ""),
     projectionMode: result.projectionMode,
-    url: result.url,
+    url: await readBlobAsDataUrl(result.blob),
+    byteLength: result.blob.size,
   };
 }

@@ -12,6 +12,7 @@ import {
   TextureLoader,
 } from "three";
 import type { DirectorAssetRef, PanoramaProjectionMode } from "../schema/directorProject";
+import { useResolvedLocalAssetUrl } from "../loaders/useResolvedLocalAssetUrl";
 import { getPanoramaRotationRadians } from "./panoramaMath";
 
 type PanoramaTextureState =
@@ -90,21 +91,31 @@ function usePanoramaTexture(url: string | null, projectionMode: PanoramaProjecti
 
 export function ViewportBackground({
   backgroundColor,
+  backgroundBrightness = 1,
   panoramaAsset,
   panoramaRadius,
   panoramaYaw,
 }: {
   backgroundColor: string;
+  backgroundBrightness?: number;
   panoramaAsset?: DirectorAssetRef | null;
   panoramaRadius: number;
   panoramaYaw: number;
 }) {
   const { gl, scene } = useThree();
   const projectionMode = panoramaAsset?.projectionMode ?? "equirectangular";
-  const textureState = usePanoramaTexture(panoramaAsset?.url ?? null, projectionMode);
+  const resolvedPanoramaUrl = useResolvedLocalAssetUrl(panoramaAsset ?? undefined);
+  const textureState = usePanoramaTexture(resolvedPanoramaUrl ?? null, projectionMode);
   const safeRadius = Math.max(10, panoramaRadius);
   const rotationY = getPanoramaRotationRadians(panoramaYaw);
-  const fallbackColor = useMemo(() => new Color(backgroundColor), [backgroundColor]);
+  const fallbackColor = useMemo(
+    () => new Color(backgroundColor).multiplyScalar(Math.max(0, backgroundBrightness)),
+    [backgroundBrightness, backgroundColor]
+  );
+  const panoramaBrightness = useMemo(
+    () => new Color("#ffffff").multiplyScalar(Math.max(0, backgroundBrightness)),
+    [backgroundBrightness]
+  );
 
   useEffect(() => {
     const nextBackground =
@@ -112,10 +123,10 @@ export function ViewportBackground({
 
     scene.background = nextBackground;
     scene.backgroundBlurriness = 0;
-    scene.backgroundIntensity = 1;
+    scene.backgroundIntensity = Math.max(0, backgroundBrightness);
     scene.backgroundRotation.set(0, textureState.status === "ready" && projectionMode === "equirectangular" ? rotationY : 0, 0);
     gl.setClearColor(fallbackColor, 1);
-  }, [fallbackColor, gl, projectionMode, rotationY, scene, textureState]);
+  }, [backgroundBrightness, fallbackColor, gl, projectionMode, rotationY, scene, textureState]);
 
   return (
     <>
@@ -128,6 +139,7 @@ export function ViewportBackground({
         >
           <sphereGeometry args={[safeRadius, 96, 64]} />
           <meshBasicMaterial
+            color={panoramaBrightness}
             depthWrite={false}
             map={textureState.texture}
             side={BackSide}

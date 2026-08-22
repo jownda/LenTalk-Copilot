@@ -1,23 +1,27 @@
-import { useEffect, useState } from "react";
-import { ImageOff } from "lucide-react";
-import { Trash2 } from "lucide-react";
+import { ImagePlus, RotateCcw, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import {
   InspectorAxisGroup,
   InspectorColorField,
   InspectorPanel,
   InspectorRangeNumberField,
   InspectorSection,
+  InspectorSelectField,
 } from "./InspectorControls";
 import { useDirectorStore } from "../store/directorStore";
+import { readPanoramaFile } from "../loaders/panoramaImport";
+import { useResolvedLocalAssetUrl } from "../loaders/useResolvedLocalAssetUrl";
+import { GROUND_MATERIAL_PRESETS } from "../canvas/groundMaterialPresets";
+import type { GroundMaterialPresetId } from "../schema/directorProject";
 
-const PANORAMA_RADIUS_MIN = 10;
-const PANORAMA_RADIUS_MAX = 300;
-const PANORAMA_YAW_MIN = -180;
-const PANORAMA_YAW_MAX = 180;
 const SCENE_SCALE_MIN = 0.1;
 const SCENE_SCALE_MAX = 3;
 const GROUND_HEIGHT_MIN = -5;
 const GROUND_HEIGHT_MAX = 5;
+const GROUND_TEXTURE_SCALE_MIN = 0.25;
+const GROUND_TEXTURE_SCALE_MAX = 8;
+const SCENE_BRIGHTNESS_MIN = 0;
+const SCENE_BRIGHTNESS_MAX = 3;
 
 function replaceAxis(tuple: [number, number, number], axis: 0 | 1 | 2, value: number): [number, number, number] {
   return tuple.map((item, index) => (index === axis ? value : item)) as [number, number, number];
@@ -29,27 +33,27 @@ function clampNumber(value: number, min: number, max: number) {
 
 export function ScenePanel() {
   const scene = useDirectorStore((state) => state.project.scene);
-  const assets = useDirectorStore((state) => state.project.assets);
-  const panoramaAssetId = useDirectorStore((state) => state.project.panoramaAssetId);
+  const panoramaAsset = useDirectorStore((state) =>
+    state.project.assets.find((asset) => asset.id === state.project.panoramaAssetId)
+  );
   const updateScene = useDirectorStore((state) => state.updateScene);
+  const setPanoramaAsset = useDirectorStore((state) => state.setPanoramaAsset);
   const removePanoramaAsset = useDirectorStore((state) => state.removePanoramaAsset);
+  const resolvedPanoramaUrl = useResolvedLocalAssetUrl(panoramaAsset);
+  const panoramaInputRef = useRef<HTMLInputElement>(null);
   const [sceneScaleDraft, setSceneScaleDraft] = useState(String(scene.scale));
-  const [panoramaYawDraft, setPanoramaYawDraft] = useState(String(scene.panoramaYaw));
-  const [panoramaRadiusDraft, setPanoramaRadiusDraft] = useState(String(scene.panoramaRadius));
+  const [groundTextureScaleDraft, setGroundTextureScaleDraft] = useState(String(scene.groundTextureScale));
   const [groundHeightDraft, setGroundHeightDraft] = useState(String(scene.groundHeight));
-  const panoramaAsset = assets.find((item) => item.id === panoramaAssetId);
+  const [panoramaImporting, setPanoramaImporting] = useState(false);
+  const [panoramaError, setPanoramaError] = useState<string | null>(null);
 
   useEffect(() => {
     setSceneScaleDraft(String(scene.scale));
   }, [scene.scale]);
 
   useEffect(() => {
-    setPanoramaRadiusDraft(String(scene.panoramaRadius));
-  }, [scene.panoramaRadius]);
-
-  useEffect(() => {
-    setPanoramaYawDraft(String(scene.panoramaYaw));
-  }, [scene.panoramaYaw]);
+    setGroundTextureScaleDraft(String(scene.groundTextureScale));
+  }, [scene.groundTextureScale]);
 
   useEffect(() => {
     setGroundHeightDraft(String(scene.groundHeight));
@@ -62,27 +66,32 @@ export function ScenePanel() {
     setSceneScaleDraft(String(nextScale));
   }
 
-  function commitPanoramaYaw(value: string) {
-    const parsed = Number(value);
-    const nextYaw = Number.isFinite(parsed) ? clampNumber(parsed, PANORAMA_YAW_MIN, PANORAMA_YAW_MAX) : scene.panoramaYaw;
-    updateScene({ panoramaYaw: nextYaw });
-    setPanoramaYawDraft(String(nextYaw));
-  }
-
-  function commitPanoramaRadius(value: string) {
-    const parsed = Number(value);
-    const nextRadius = Number.isFinite(parsed)
-      ? clampNumber(parsed, PANORAMA_RADIUS_MIN, PANORAMA_RADIUS_MAX)
-      : scene.panoramaRadius;
-    updateScene({ panoramaRadius: nextRadius });
-    setPanoramaRadiusDraft(String(nextRadius));
-  }
-
   function commitGroundHeight(value: string) {
     const parsed = Number(value);
     const nextHeight = Number.isFinite(parsed) ? clampNumber(parsed, GROUND_HEIGHT_MIN, GROUND_HEIGHT_MAX) : scene.groundHeight;
     updateScene({ groundHeight: nextHeight });
     setGroundHeightDraft(String(nextHeight));
+  }
+
+  function commitGroundTextureScale(value: string) {
+    const parsed = Number(value);
+    const nextScale = Number.isFinite(parsed)
+      ? clampNumber(parsed, GROUND_TEXTURE_SCALE_MIN, GROUND_TEXTURE_SCALE_MAX)
+      : scene.groundTextureScale;
+    updateScene({ groundTextureScale: nextScale });
+    setGroundTextureScaleDraft(String(nextScale));
+  }
+
+  async function importPanorama(file: File) {
+    setPanoramaImporting(true);
+    setPanoramaError(null);
+    try {
+      setPanoramaAsset(await readPanoramaFile(file));
+    } catch (error) {
+      setPanoramaError(error instanceof Error ? error.message : "全景图导入失败，请重新选择图片");
+    } finally {
+      setPanoramaImporting(false);
+    }
   }
 
   return (
@@ -160,28 +169,73 @@ export function ScenePanel() {
           },
         ]}
       />
-      <InspectorSection title="全景背景">
-        {panoramaAsset ? (
-          <div className="panorama-thumbnail-card" aria-label="全景图缩略图卡片">
+      <InspectorSection title="背景">
+        <div className="panorama-control-card">
+          {panoramaAsset && resolvedPanoramaUrl ? (
+            <div className="panorama-thumbnail-card">
+              <img
+                alt="当前全景图"
+                className="panorama-thumbnail-image"
+                src={resolvedPanoramaUrl}
+              />
+              <span className="panorama-thumbnail-name">{panoramaAsset.fileName}</span>
+              <button
+                aria-label="删除全景图"
+                className="panorama-thumbnail-delete"
+                title="删除全景图"
+                type="button"
+                onClick={() => {
+                  removePanoramaAsset();
+                  setPanoramaError(null);
+                }}
+              >
+                <Trash2 aria-hidden="true" />
+              </button>
+            </div>
+          ) : (
+            <div className="panorama-empty-card">
+              <span className="panorama-empty-icon"><ImagePlus aria-hidden="true" size={16} /></span>
+              <span>可选：加入一张环境全景图</span>
+            </div>
+          )}
+          <div className="panorama-action-row">
             <button
-              aria-label="删除全景图"
-              className="panorama-thumbnail-delete"
+              className="inspector-action-button"
+              disabled={panoramaImporting}
               type="button"
-              onClick={() => removePanoramaAsset()}
+              onClick={() => panoramaInputRef.current?.click()}
             >
-              <Trash2 aria-hidden="true" size={14} strokeWidth={1.9} />
+              <ImagePlus aria-hidden="true" size={15} />
+              {panoramaImporting ? "正在处理..." : panoramaAsset ? "更换全景图" : "导入全景图"}
             </button>
-            <img className="panorama-thumbnail-image" alt={`${panoramaAsset.fileName} 全景图缩略图`} src={panoramaAsset.url} />
-            <span className="panorama-thumbnail-name">{panoramaAsset.fileName}</span>
+            {panoramaAsset ? (
+              <button
+                aria-label="恢复全景默认方向"
+                className="panorama-reset-button"
+                disabled={scene.panoramaYaw === 0}
+                title="恢复默认方向"
+                type="button"
+                onClick={() => updateScene({ panoramaYaw: 0 })}
+              >
+                <RotateCcw aria-hidden="true" size={15} />
+              </button>
+            ) : null}
           </div>
-        ) : (
-          <div className="panorama-empty-card" aria-label="全景图连接状态">
-            <span className="panorama-empty-icon" data-testid="panorama-empty-icon">
-              <ImageOff aria-hidden="true" size={16} strokeWidth={1.8} />
-            </span>
-            <span>未连接全景图</span>
-          </div>
-        )}
+          <input
+            ref={panoramaInputRef}
+            aria-label="选择全景图文件"
+            className="visually-hidden"
+            accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+            type="file"
+            onChange={(event) => {
+              const input = event.currentTarget;
+              const file = input.files?.[0];
+              if (file) void importPanorama(file);
+              input.value = "";
+            }}
+          />
+          {panoramaError ? <p className="panorama-import-error" role="alert">{panoramaError}</p> : null}
+        </div>
         <InspectorColorField
           label="天空颜色"
           colorAriaLabel="天空颜色"
@@ -190,50 +244,28 @@ export function ScenePanel() {
           onColorChange={(value) => updateScene({ backgroundColor: value })}
           onHexChange={(value) => updateScene({ backgroundColor: value })}
         />
-      </InspectorSection>
-      <InspectorSection title="全景球">
         <InspectorRangeNumberField
-          label="水平旋转"
-          rangeAriaLabel="全景球水平旋转滑杆"
-          numberAriaLabel="全景球水平旋转"
-          max={PANORAMA_YAW_MAX}
-          min={PANORAMA_YAW_MIN}
-          step="1"
-          value={panoramaYawDraft}
-          onValueChange={commitPanoramaYaw}
-          onRangeChange={commitPanoramaYaw}
-          onNumberBlur={commitPanoramaYaw}
-          onNumberChange={(value) => {
-            setPanoramaYawDraft(value);
-            if (value !== "") {
-              const parsed = Number(value);
-              if (Number.isFinite(parsed)) {
-                updateScene({ panoramaYaw: parsed });
-              }
-            }
-          }}
+          label={panoramaAsset ? "全景亮度" : "天空亮度"}
+          rangeAriaLabel={panoramaAsset ? "全景亮度滑杆" : "天空亮度滑杆"}
+          numberAriaLabel={panoramaAsset ? "全景亮度" : "天空亮度"}
+          max={SCENE_BRIGHTNESS_MAX}
+          min={SCENE_BRIGHTNESS_MIN}
+          step="0.05"
+          value={scene.backgroundBrightness}
+          onValueChange={(value) => updateScene({ backgroundBrightness: Number(value) })}
         />
-        <InspectorRangeNumberField
-          label="球形半径"
-          rangeAriaLabel="全景球半径滑杆"
-          numberAriaLabel="全景球半径"
-          max={PANORAMA_RADIUS_MAX}
-          min={PANORAMA_RADIUS_MIN}
-          step="1"
-          value={panoramaRadiusDraft}
-          onValueChange={commitPanoramaRadius}
-          onRangeChange={commitPanoramaRadius}
-          onNumberBlur={commitPanoramaRadius}
-          onNumberChange={(value) => {
-            setPanoramaRadiusDraft(value);
-            if (value !== "") {
-              const parsed = Number(value);
-              if (Number.isFinite(parsed)) {
-                updateScene({ panoramaRadius: parsed });
-              }
-            }
-          }}
-        />
+        {panoramaAsset ? (
+          <InspectorRangeNumberField
+            label="左右旋转"
+            rangeAriaLabel="全景左右旋转滑杆"
+            numberAriaLabel="全景左右旋转"
+            max="180"
+            min="-180"
+            step="1"
+            value={scene.panoramaYaw}
+            onValueChange={(value) => updateScene({ panoramaYaw: Number(value) })}
+          />
+        ) : null}
       </InspectorSection>
       <InspectorSection title="开关项">
         <div className="scene-switch-row" role="group" aria-label="开关项设置">
@@ -248,26 +280,88 @@ export function ScenePanel() {
           </div>
           <div className="inspector-toggle-row">
             <input
-              aria-label="网格吸附"
+              aria-label="显示编辑网格"
+              checked={scene.showGrid}
+              type="checkbox"
+              onChange={(event) => updateScene({ showGrid: event.target.checked })}
+            />
+            <span>编辑网格</span>
+          </div>
+          <div className="inspector-toggle-row">
+            <input
+              aria-label="移动时吸附网格"
               checked={scene.snapToGrid}
               type="checkbox"
               onChange={(event) => updateScene({ snapToGrid: event.target.checked })}
             />
-            <span>网格吸附</span>
+            <span>移动吸附</span>
           </div>
           <div className="inspector-toggle-row">
             <input
-              aria-label="地面"
+              aria-label="显示地面"
               checked={scene.showGround}
               type="checkbox"
               onChange={(event) => updateScene({ showGround: event.target.checked })}
             />
-            <span>地面</span>
+            <span>显示地面</span>
+          </div>
+          <div className="inspector-toggle-row">
+            <input
+              aria-label="启用地面和场景碰撞"
+              checked={scene.pathCollisionEnabled}
+              type="checkbox"
+              onChange={(event) => updateScene({ pathCollisionEnabled: event.target.checked })}
+            />
+            <span>路线防穿模</span>
           </div>
         </div>
       </InspectorSection>
       {scene.showGround ? (
         <InspectorSection title="地面">
+          <InspectorSelectField
+            ariaLabel="地面材质"
+            label="材质"
+            options={GROUND_MATERIAL_PRESETS.map((preset) => ({ value: preset.id, label: preset.label }))}
+            value={scene.groundMaterialPreset}
+            onChange={(value) => updateScene({ groundMaterialPreset: value as GroundMaterialPresetId })}
+          />
+          <InspectorColorField
+            label="地面颜色"
+            colorAriaLabel="地面颜色"
+            hexAriaLabel="地面颜色 HEX"
+            value={scene.groundColor}
+            onColorChange={(value) => updateScene({ groundColor: value })}
+            onHexChange={(value) => updateScene({ groundColor: value })}
+          />
+          <InspectorRangeNumberField
+            label="纹理大小"
+            rangeAriaLabel="地面纹理大小滑杆"
+            numberAriaLabel="地面纹理大小"
+            max={GROUND_TEXTURE_SCALE_MAX}
+            min={GROUND_TEXTURE_SCALE_MIN}
+            step="0.05"
+            value={groundTextureScaleDraft}
+            onValueChange={commitGroundTextureScale}
+            onRangeChange={commitGroundTextureScale}
+            onNumberBlur={commitGroundTextureScale}
+            onNumberChange={(value) => {
+              setGroundTextureScaleDraft(value);
+              if (value !== "") {
+                const parsed = Number(value);
+                if (Number.isFinite(parsed)) updateScene({ groundTextureScale: parsed });
+              }
+            }}
+          />
+          <InspectorRangeNumberField
+            label="地面亮度"
+            rangeAriaLabel="地面亮度滑杆"
+            numberAriaLabel="地面亮度"
+            max={SCENE_BRIGHTNESS_MAX}
+            min={SCENE_BRIGHTNESS_MIN}
+            step="0.05"
+            value={scene.groundBrightness}
+            onValueChange={(value) => updateScene({ groundBrightness: Number(value) })}
+          />
           <InspectorRangeNumberField
             label="透明度"
             rangeAriaLabel="地面透明度滑杆"

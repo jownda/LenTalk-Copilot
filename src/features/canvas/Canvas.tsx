@@ -297,6 +297,10 @@ function isTypingTarget(target: EventTarget | null): boolean {
   return tagName === "input" || tagName === "textarea" || element.isContentEditable;
 }
 
+function isDirectorDeskOpen(): boolean {
+  return typeof document !== "undefined" && document.querySelector("[data-director-desk]") !== null;
+}
+
 function resolveClipboardImageFile(event: ClipboardEvent): File | null {
   const clipboardItems = event.clipboardData?.items;
   if (!clipboardItems) {
@@ -1581,7 +1585,8 @@ export function Canvas() {
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (isTypingTarget(event.target)) {
+      // 导演台通过 portal 覆盖画布时，内部快捷键不能再作用于被选中的画布节点。
+      if (isTypingTarget(event.target) || isDirectorDeskOpen()) {
         return;
       }
 

@@ -20,6 +20,7 @@ import {
   Move3D,
   Plus,
   Ratio,
+  Route,
   Rotate3D,
   Scale3D,
   Trash2,
@@ -32,6 +33,15 @@ import { requestViewportCapture } from "../io/captureBridge";
 import { readLocalModelFile } from "../loaders/localModelImport";
 import { readPanoramaFile } from "../loaders/panoramaImport";
 import {
+  inspectCharacterModelFile,
+  type CharacterAssetInspection,
+} from "../loaders/characterAssetInspection";
+import {
+  getCharacterImportPreviewSteps,
+  type CharacterImportPreviewStep,
+} from "../loaders/characterImportPreview";
+import {
+  getModelLibraryCharacterStatus,
   getModelLibraryItems,
   MODEL_LIBRARY_CATEGORIES,
   type ModelLibraryCategoryId,
@@ -41,6 +51,9 @@ import {
   VIEWPORT_ASPECT_RATIO_OPTIONS,
   type ViewportAspectRatio,
 } from "../schema/viewportAspectRatio";
+import {
+  DIRECTOR_CHARACTER_BONE_PART_OPTIONS,
+} from "../schema/semanticBody";
 import { BODY_TYPE_OPTIONS, type CharacterBodyType } from "../runtime/mannequin/bodyTypes";
 import { GEOMETRY_PRIMITIVE_OPTIONS, type GeometryPrimitiveType } from "../schema/directorProject";
 import {
@@ -49,15 +62,27 @@ import {
   type CrowdCharactersInput,
   type TransformMode,
 } from "../store/directorStore";
+import { canImportCharacterFromInspection } from "./characterImportPolicy";
+
+export { canImportCharacterFromInspection } from "./characterImportPolicy";
 
 type ToolbarAction = {
   label: string;
   icon: LucideIcon;
   mode?: TransformMode;
+  pressed?: boolean;
+  buttonRef?: MutableRefObject<HTMLButtonElement | null>;
   onClick: () => void;
 };
 
-const DEFAULT_VIEWPORT_TOOLBAR_HEIGHT = 46;
+const FLOATING_PANEL_GAP = 8;
+const FLOATING_PANEL_MARGIN = 8;
+const MIN_FLOATING_PANEL_HEIGHT = 80;
+const CHARACTER_MENU_WIDTH = 132;
+const GEOMETRY_MENU_WIDTH = 112;
+const CROWD_PANEL_WIDTH = 260;
+const MODEL_LIBRARY_PANEL_WIDTH = 500;
+const ASPECT_RATIO_PANEL_WIDTH = 340;
 const DEFAULT_CROWD_ROWS = 3;
 const DEFAULT_CROWD_COLUMNS = 3;
 const DEFAULT_CROWD_SPACING = 1.2;
@@ -65,6 +90,14 @@ const MIN_CROWD_GRID_SIZE = 1;
 const MAX_CROWD_GRID_SIZE = 12;
 const MIN_CROWD_SPACING = 0.1;
 const MAX_CROWD_SPACING = 10;
+const CHARACTER_IMPORT_PREVIEW_STEP_MS = 1800;
+
+const CHARACTER_IMPORT_STATUS_LABELS = {
+  ready: "可直接使用",
+  "native-only": "仅自带动作",
+  "manual-mapping": "需要手动映射",
+  "static-only": "仅静态使用",
+} as const;
 
 function clampCrowdGridSize(value: number) {
   if (!Number.isFinite(value)) return MIN_CROWD_GRID_SIZE;
@@ -95,11 +128,13 @@ export function ViewportToolbar({
   const geometryTriggerRef = useRef<HTMLButtonElement | null>(null);
   const crowdTriggerRef = useRef<HTMLButtonElement | null>(null);
   const modelLibraryTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const aspectRatioTriggerRef = useRef<HTMLButtonElement | null>(null);
   const characterMenuRef = useRef<HTMLDivElement | null>(null);
   const geometryMenuRef = useRef<HTMLDivElement | null>(null);
   const crowdPanelRef = useRef<HTMLDivElement | null>(null);
   const modelLibraryPanelRef = useRef<HTMLDivElement | null>(null);
   const sceneLocalModelInputRef = useRef<HTMLInputElement | null>(null);
+  const characterLocalModelInputRef = useRef<HTMLInputElement | null>(null);
   const libraryLocalModelInputRef = useRef<HTMLInputElement | null>(null);
   const panoramaInputRef = useRef<HTMLInputElement | null>(null);
   const billboardInputRef = useRef<HTMLInputElement | null>(null);
@@ -109,11 +144,24 @@ export function ViewportToolbar({
   const [crowdPanelOpen, setCrowdPanelOpen] = useState(false);
   const [modelLibraryOpen, setModelLibraryOpen] = useState(false);
   const [aspectRatioPanelOpen, setAspectRatioPanelOpen] = useState(false);
-  const [toolbarHeight, setToolbarHeight] = useState(DEFAULT_VIEWPORT_TOOLBAR_HEIGHT);
+  const [pendingCharacterImport, setPendingCharacterImport] = useState<{
+    file: File;
+    report: CharacterAssetInspection;
+    boneMap: NonNullable<CharacterAssetInspection["boneMap"]>;
+  } | null>(null);
+  const [characterImportError, setCharacterImportError] = useState<string | null>(null);
+  const [characterImportBusy, setCharacterImportBusy] = useState(false);
+  const [characterImportPreview, setCharacterImportPreviewState] = useState<{
+    objectId: string;
+    steps: CharacterImportPreviewStep[];
+    stepIndex: number;
+  } | null>(null);
+  const characterImportPlaybackRestoreRef = useRef<{ playing: boolean; progress: number } | null>(null);
   const [characterMenuStyle, setCharacterMenuStyle] = useState<CSSProperties>({});
   const [geometryMenuStyle, setGeometryMenuStyle] = useState<CSSProperties>({});
   const [crowdPanelStyle, setCrowdPanelStyle] = useState<CSSProperties>({});
   const [modelLibraryPanelStyle, setModelLibraryPanelStyle] = useState<CSSProperties>({});
+  const [aspectRatioPanelStyle, setAspectRatioPanelStyle] = useState<CSSProperties>({});
   const [crowdBodyType] = useState<CharacterBodyType>(BODY_TYPE_OPTIONS[0]?.bodyType ?? "mannequin");
   const [crowdRows, setCrowdRows] = useState(String(DEFAULT_CROWD_ROWS));
   const [crowdColumns, setCrowdColumns] = useState(String(DEFAULT_CROWD_COLUMNS));
@@ -121,6 +169,12 @@ export function ViewportToolbar({
   const [activeModelLibraryCategoryId, setActiveModelLibraryCategoryId] =
     useState<ModelLibraryCategoryId>("convenience");
   const addImportedAsset = useDirectorStore((state) => state.addImportedAsset);
+  const addImportedAnimationAsset = useDirectorStore((state) => state.addImportedAnimationAsset);
+  const applyCharacterActionPreset = useDirectorStore((state) => state.applyCharacterActionPreset);
+  const restartCameraMotionPlayback = useDirectorStore((state) => state.restartCameraMotionPlayback);
+  const setCameraMotionPlaying = useDirectorStore((state) => state.setCameraMotionPlaying);
+  const setCameraMotionProgress = useDirectorStore((state) => state.setCameraMotionProgress);
+  const setCharacterActionPreview = useDirectorStore((state) => state.setCharacterActionPreview);
   const addObjectFromAsset = useDirectorStore((state) => state.addObjectFromAsset);
   const removeImportedAsset = useDirectorStore((state) => state.removeImportedAsset);
   const assets = useDirectorStore((state) => state.project.assets);
@@ -132,11 +186,63 @@ export function ViewportToolbar({
   const activeCameraId = useDirectorStore((state) => state.project.activeCameraId);
   const viewMode = useDirectorStore((state) => state.viewMode);
   const transformMode = useDirectorStore((state) => state.transformMode);
+  const showCharacterRoutes = useDirectorStore((state) => state.showCharacterRoutes);
   const viewportAspectRatio = useDirectorStore((state) => state.viewportAspectRatio);
   const setViewMode = useDirectorStore((state) => state.setViewMode);
   const setTransformMode = useDirectorStore((state) => state.setTransformMode);
+  const setShowCharacterRoutes = useDirectorStore((state) => state.setShowCharacterRoutes);
   const setViewportAspectRatio = useDirectorStore((state) => state.setViewportAspectRatio);
   const toggleViewportPanelsCollapsed = useDirectorStore((state) => state.toggleViewportPanelsCollapsed);
+
+  function stopCharacterImportPreview() {
+    setCharacterImportPreviewState(null);
+    setCharacterActionPreview(null);
+    const restore = characterImportPlaybackRestoreRef.current;
+    characterImportPlaybackRestoreRef.current = null;
+    if (restore) {
+      setCameraMotionPlaying(false);
+      setCameraMotionProgress(restore.progress);
+      setCameraMotionPlaying(restore.playing);
+    }
+  }
+
+  function startCharacterImportPreview(objectId: string, steps: CharacterImportPreviewStep[]) {
+    if (!steps.length) return;
+    const runtime = useDirectorStore.getState();
+    characterImportPlaybackRestoreRef.current = {
+      playing: runtime.cameraMotionPlaying,
+      progress: runtime.cameraMotionProgress,
+    };
+    setCharacterImportPreviewState({ objectId, steps, stepIndex: 0 });
+  }
+
+  useEffect(() => {
+    if (!characterImportPreview) return;
+    const step = characterImportPreview.steps[characterImportPreview.stepIndex];
+    if (!step) {
+      stopCharacterImportPreview();
+      return;
+    }
+    setCharacterActionPreview({
+      objectId: characterImportPreview.objectId,
+      actionPresetId: step.actionPresetId,
+    });
+    restartCameraMotionPlayback();
+    const timeout = window.setTimeout(() => {
+      if (characterImportPreview.stepIndex + 1 >= characterImportPreview.steps.length) {
+        stopCharacterImportPreview();
+        return;
+      }
+      setCharacterImportPreviewState((current) => current
+        ? { ...current, stepIndex: current.stepIndex + 1 }
+        : current);
+    }, CHARACTER_IMPORT_PREVIEW_STEP_MS);
+    return () => window.clearTimeout(timeout);
+  }, [characterImportPreview, restartCameraMotionPlayback, setCharacterActionPreview]);
+
+  useEffect(() => () => {
+    setCharacterActionPreview(null);
+  }, [setCharacterActionPreview]);
 
   useEffect(() => {
     if (!characterMenuOpen && !crowdPanelOpen && !modelLibraryOpen && !aspectRatioPanelOpen) return;
@@ -149,8 +255,10 @@ export function ViewportToolbar({
       if (event.target instanceof Node && modelLibraryPanelRef.current?.contains(event.target)) return;
       if (event.target instanceof Node && aspectRatioPanelRef.current?.contains(event.target)) return;
       if (event.target instanceof Node && sceneLocalModelInputRef.current?.contains(event.target)) return;
+      if (event.target instanceof Node && characterLocalModelInputRef.current?.contains(event.target)) return;
       if (event.target instanceof Node && libraryLocalModelInputRef.current?.contains(event.target)) return;
       if (event.target instanceof Node && panoramaInputRef.current?.contains(event.target)) return;
+      if (event.target instanceof Node && billboardInputRef.current?.contains(event.target)) return;
 
       setCharacterMenuOpen(false);
       setGeometryMenuOpen(false);
@@ -167,70 +275,133 @@ export function ViewportToolbar({
   }, [aspectRatioPanelOpen, characterMenuOpen, crowdPanelOpen, modelLibraryOpen]);
 
   useLayoutEffect(() => {
-    const element = toolbarRef.current;
-    if (!element) return;
-
-    const updateHeight = () => {
-      const nextHeight = Math.max(element.offsetHeight, DEFAULT_VIEWPORT_TOOLBAR_HEIGHT);
-      setToolbarHeight((currentHeight) => (currentHeight === nextHeight ? currentHeight : nextHeight));
-    };
-
-    updateHeight();
-
-    if (typeof ResizeObserver === "undefined") {
-      window.addEventListener("resize", updateHeight);
-      return () => {
-        window.removeEventListener("resize", updateHeight);
-      };
-    }
-
-    const resizeObserver = new ResizeObserver(updateHeight);
-    resizeObserver.observe(element);
-    window.addEventListener("resize", updateHeight);
-
-    return () => {
-      resizeObserver.disconnect();
-      window.removeEventListener("resize", updateHeight);
-    };
-  }, []);
-
-  useLayoutEffect(() => {
     const toolbarElement = toolbarRef.current;
     const frameElement = toolbarElement?.parentElement;
     if (!toolbarElement || !frameElement) return;
 
     const updateFloatingPositions = () => {
       const frameRect = frameElement.getBoundingClientRect();
+      const toolbarRect = toolbarElement.getBoundingClientRect();
+      const getCenteredPanelLeft = (
+        anchorCenter: number,
+        panel: HTMLElement | null,
+        fallbackWidth: number
+      ) => {
+        const panelWidth = Math.min(
+          panel?.offsetWidth || fallbackWidth,
+          Math.max(0, frameRect.width - FLOATING_PANEL_MARGIN * 2)
+        );
+        const halfWidth = panelWidth / 2;
+        const minimum = FLOATING_PANEL_MARGIN + halfWidth;
+        const maximum = Math.max(minimum, frameRect.width - FLOATING_PANEL_MARGIN - halfWidth);
+        return Math.min(maximum, Math.max(minimum, anchorCenter - frameRect.left));
+      };
+      const getSidePanelLeft = (
+        triggerRect: DOMRect,
+        panel: HTMLElement | null,
+        fallbackWidth: number
+      ) => {
+        const panelWidth = Math.min(
+          panel?.offsetWidth || fallbackWidth,
+          Math.max(0, frameRect.width - FLOATING_PANEL_MARGIN * 2)
+        );
+        const rightPosition = triggerRect.right - frameRect.left + FLOATING_PANEL_GAP;
+        const leftPosition = triggerRect.left - frameRect.left - panelWidth - FLOATING_PANEL_GAP;
+        const preferred = rightPosition + panelWidth <= frameRect.width - FLOATING_PANEL_MARGIN
+          ? rightPosition
+          : leftPosition;
+        return Math.min(
+          Math.max(FLOATING_PANEL_MARGIN, frameRect.width - panelWidth - FLOATING_PANEL_MARGIN),
+          Math.max(FLOATING_PANEL_MARGIN, preferred)
+        );
+      };
 
       if (characterMenuOpen && characterTriggerRef.current) {
         const triggerRect = characterTriggerRef.current.getBoundingClientRect();
+        const availableHeight = Math.max(
+          MIN_FLOATING_PANEL_HEIGHT,
+          frameRect.bottom - toolbarRect.bottom - FLOATING_PANEL_GAP - FLOATING_PANEL_MARGIN
+        );
         setCharacterMenuStyle({
-          left: `${triggerRect.left - frameRect.left + triggerRect.width / 2}px`,
-          bottom: `${frameRect.bottom - triggerRect.top + 8}px`,
+          left: `${getCenteredPanelLeft(
+            triggerRect.left + triggerRect.width / 2,
+            characterMenuRef.current,
+            CHARACTER_MENU_WIDTH
+          )}px`,
+          top: `${toolbarRect.bottom - frameRect.top + FLOATING_PANEL_GAP}px`,
+          bottom: "auto",
+          maxHeight: `${availableHeight}px`,
         });
       }
 
       if (geometryMenuOpen && geometryTriggerRef.current) {
         const triggerRect = geometryTriggerRef.current.getBoundingClientRect();
+        const availableHeight = Math.max(
+          MIN_FLOATING_PANEL_HEIGHT,
+          frameRect.bottom - triggerRect.top - FLOATING_PANEL_MARGIN
+        );
         setGeometryMenuStyle({
-          left: `${triggerRect.right - frameRect.left + 8}px`,
-          bottom: `${frameRect.bottom - triggerRect.bottom}px`,
+          left: `${getSidePanelLeft(
+            triggerRect,
+            geometryMenuRef.current,
+            GEOMETRY_MENU_WIDTH
+          )}px`,
+          top: `${triggerRect.top - frameRect.top}px`,
+          bottom: "auto",
+          maxHeight: `${availableHeight}px`,
         });
       }
 
       if (crowdPanelOpen && crowdTriggerRef.current) {
         const triggerRect = crowdTriggerRef.current.getBoundingClientRect();
+        const availableHeight = Math.max(
+          MIN_FLOATING_PANEL_HEIGHT,
+          frameRect.bottom - triggerRect.top - FLOATING_PANEL_MARGIN
+        );
         setCrowdPanelStyle({
-          left: `${triggerRect.right - frameRect.left + 8}px`,
-          bottom: `${frameRect.bottom - triggerRect.bottom}px`,
+          left: `${getSidePanelLeft(
+            triggerRect,
+            crowdPanelRef.current,
+            CROWD_PANEL_WIDTH
+          )}px`,
+          top: `${triggerRect.top - frameRect.top}px`,
+          bottom: "auto",
+          maxHeight: `${availableHeight}px`,
         });
       }
 
       if (modelLibraryOpen) {
-        const toolbarRect = toolbarElement.getBoundingClientRect();
+        const availableHeight = Math.max(
+          MIN_FLOATING_PANEL_HEIGHT,
+          frameRect.bottom - toolbarRect.bottom - 10 - FLOATING_PANEL_MARGIN
+        );
         setModelLibraryPanelStyle({
-          left: `${toolbarRect.left - frameRect.left + toolbarRect.width / 2}px`,
-          bottom: `${frameRect.bottom - toolbarRect.top + 10}px`,
+          left: `${getCenteredPanelLeft(
+            toolbarRect.left + toolbarRect.width / 2,
+            modelLibraryPanelRef.current,
+            MODEL_LIBRARY_PANEL_WIDTH
+          )}px`,
+          top: `${toolbarRect.bottom - frameRect.top + 10}px`,
+          bottom: "auto",
+          maxHeight: `${availableHeight}px`,
+        });
+      }
+
+      if (aspectRatioPanelOpen && aspectRatioTriggerRef.current) {
+        const triggerRect = aspectRatioTriggerRef.current.getBoundingClientRect();
+        const availableHeight = Math.max(
+          MIN_FLOATING_PANEL_HEIGHT,
+          frameRect.bottom - toolbarRect.bottom - FLOATING_PANEL_GAP - FLOATING_PANEL_MARGIN
+        );
+        setAspectRatioPanelStyle({
+          left: `${getCenteredPanelLeft(
+            triggerRect.left + triggerRect.width / 2,
+            aspectRatioPanelRef.current,
+            ASPECT_RATIO_PANEL_WIDTH
+          )}px`,
+          top: `${toolbarRect.bottom - frameRect.top + FLOATING_PANEL_GAP}px`,
+          bottom: "auto",
+          maxHeight: `${availableHeight}px`,
         });
       }
     };
@@ -259,13 +430,16 @@ export function ViewportToolbar({
     if (modelLibraryTriggerRef.current) {
       resizeObserver.observe(modelLibraryTriggerRef.current);
     }
+    if (aspectRatioTriggerRef.current) {
+      resizeObserver.observe(aspectRatioTriggerRef.current);
+    }
     window.addEventListener("resize", updateFloatingPositions);
 
     return () => {
       resizeObserver.disconnect();
       window.removeEventListener("resize", updateFloatingPositions);
     };
-  }, [characterMenuOpen, crowdPanelOpen, geometryMenuOpen, modelLibraryOpen]);
+  }, [aspectRatioPanelOpen, characterMenuOpen, crowdPanelOpen, geometryMenuOpen, modelLibraryOpen]);
 
   async function handleLocalModelChange(
     event: ChangeEvent<HTMLInputElement>,
@@ -292,6 +466,25 @@ export function ViewportToolbar({
     }
   }
 
+  async function handleCharacterModelChange(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+    setCharacterImportError(null);
+    setCharacterImportBusy(true);
+
+    try {
+      const report = await inspectCharacterModelFile(file);
+      setPendingCharacterImport({ file, report, boneMap: report.boneMap ?? {} });
+      setCharacterMenuOpen(false);
+    } catch (error) {
+      setCharacterImportError(error instanceof Error ? error.message : "人物模型体检失败");
+    } finally {
+      setCharacterImportBusy(false);
+      input.value = "";
+    }
+  }
+
   async function handlePanoramaChange(event: ChangeEvent<HTMLInputElement>) {
     const input = event.currentTarget;
     const file = input.files?.[0];
@@ -307,13 +500,12 @@ export function ViewportToolbar({
     }
   }
 
-  /** 导入参考图 → 2D 立绘卡 */
+  /** Import a reference image as a 2D billboard, preserving its native aspect ratio. */
   function handleBillboardChange(event: ChangeEvent<HTMLInputElement>) {
     const input = event.currentTarget;
     const file = input.files?.[0];
-    if (!file) {
-      return;
-    }
+    if (!file) return;
+
     const reader = new FileReader();
     reader.onload = () => {
       const dataUrl = typeof reader.result === "string" ? reader.result : "";
@@ -323,10 +515,9 @@ export function ViewportToolbar({
       }
       const image = new window.Image();
       image.onload = () => {
-        const ratio =
-          image.naturalWidth > 0 && image.naturalHeight > 0
-            ? image.naturalWidth / image.naturalHeight
-            : 1;
+        const ratio = image.naturalWidth > 0 && image.naturalHeight > 0
+          ? image.naturalWidth / image.naturalHeight
+          : 1;
         addImageBillboard(dataUrl, ratio);
         input.value = "";
       };
@@ -340,6 +531,85 @@ export function ViewportToolbar({
       input.value = "";
     };
     reader.readAsDataURL(file);
+  }
+
+  async function confirmCharacterImport(kind: "character" | "prop") {
+    if (!pendingCharacterImport) return;
+    setCharacterImportError(null);
+
+    if (kind === "character" && !canImportCharacterFromInspection(
+      pendingCharacterImport.report,
+      pendingCharacterImport.boneMap
+    )) {
+      setCharacterImportError(
+        pendingCharacterImport.report.readiness === "static-only"
+          ? "该文件没有可用蒙皮骨架，只能作为静态道具加入"
+          : "请先完成 15 个身体部位的骨骼映射"
+      );
+      return;
+    }
+
+    setCharacterImportBusy(true);
+
+    try {
+      const result = await readLocalModelFile(pendingCharacterImport.file);
+      addImportedAsset({
+        kind,
+        ...result,
+        assetSource: "local",
+        characterRigProfile: pendingCharacterImport.report.rigProfile,
+        characterImportReadiness: kind === "character" && pendingCharacterImport.report.readiness === "manual-mapping"
+          ? "ready"
+          : pendingCharacterImport.report.readiness,
+        characterOrientationCorrection: pendingCharacterImport.report.orientationCorrection,
+        characterBoneMap: pendingCharacterImport.boneMap,
+      });
+      const embeddedClips = pendingCharacterImport.report.animations.filter(
+        (clip) => clip.duration > 0.05 && clip.trackCount > 0
+      );
+      let embeddedAnimationAssetId: string | null = null;
+      if (kind === "character" && embeddedClips.length) {
+        const animationAssetId = addImportedAnimationAsset({
+          name: `${result.name} 自带动作`,
+          fileName: result.fileName,
+          url: result.url,
+          modelFormat: pendingCharacterImport.report.format,
+          storageKey: result.storageKey,
+          byteLength: result.byteLength,
+          rigProfile: pendingCharacterImport.report.rigProfile,
+          sourceCharacterAssetId: result.storageKey ? `local_asset_${result.storageKey}` : undefined,
+          clips: embeddedClips.map((clip, index) => ({
+            id: `clip_${index + 1}`,
+            name: clip.name,
+            duration: clip.duration,
+            trackCount: clip.trackCount,
+          })),
+        });
+        embeddedAnimationAssetId = animationAssetId;
+        const importedCharacterId = useDirectorStore.getState().selectedObjectId;
+        if (importedCharacterId && pendingCharacterImport.report.readiness === "native-only") {
+          applyCharacterActionPreset(importedCharacterId, null);
+        }
+      }
+      const importedCharacterId = useDirectorStore.getState().selectedObjectId;
+      if (kind === "character" && importedCharacterId) {
+        startCharacterImportPreview(importedCharacterId, getCharacterImportPreviewSteps({
+          animationAssetId: embeddedAnimationAssetId,
+          clips: embeddedClips.map((clip, index) => ({
+            id: `clip_${index + 1}`,
+            name: clip.name,
+            duration: clip.duration,
+            trackCount: clip.trackCount,
+          })),
+          readiness: pendingCharacterImport.report.readiness,
+        }));
+      }
+      setPendingCharacterImport(null);
+    } catch (error) {
+      setCharacterImportError(error instanceof Error ? error.message : "人物模型导入失败");
+    } finally {
+      setCharacterImportBusy(false);
+    }
   }
 
   async function handleCapture(preset: "current" | "four" | "twelve") {
@@ -430,11 +700,15 @@ export function ViewportToolbar({
 
   function addModelLibraryItem(item: ModelLibraryItem) {
     addImportedAsset({
-      kind: "prop",
+      kind: item.kind ?? "prop",
       assetSource: "library",
       fileName: item.fileName,
       name: item.name,
       url: item.url,
+      modelFormat: item.fileName.toLowerCase().endsWith(".glb") ? "glb" : item.fileName.toLowerCase().endsWith(".fbx") ? "fbx" : undefined,
+      characterRigProfile: item.characterRigProfile,
+      characterImportReadiness: item.characterImportReadiness,
+      characterOrientationCorrection: item.characterOrientationCorrection,
     });
     setModelLibraryOpen(false);
   }
@@ -451,7 +725,8 @@ export function ViewportToolbar({
           categoryId: "my-models",
           fileName: asset.fileName,
           id: asset.id,
-          name: asset.name ?? asset.fileName.replace(/\.(fbx|obj)$/i, ""),
+          kind: asset.kind === "character" ? "character" : "prop",
+          name: asset.name ?? asset.fileName.replace(/\.(fbx|obj|glb)$/i, ""),
           thumbUrl: undefined,
           url: asset.url,
         }) satisfies ModelLibraryItem
@@ -482,6 +757,12 @@ export function ViewportToolbar({
     { label: "导入全景图", icon: ImagePlus, onClick: () => panoramaInputRef.current?.click() },
     { label: "导入立绘图", icon: Image, onClick: () => billboardInputRef.current?.click() },
     {
+      label: "显示人物路线",
+      icon: Route,
+      pressed: showCharacterRoutes,
+      onClick: () => setShowCharacterRoutes(!showCharacterRoutes),
+    },
+    {
       label: "导入本地模型",
       icon: Box,
       onClick: () => {
@@ -490,7 +771,12 @@ export function ViewportToolbar({
     },
     { label: "模型库", icon: Boxes, onClick: toggleModelLibrary },
     { label: "添加机位", icon: Video, onClick: addCameraFromViewport },
-    { label: "选择画幅比例", icon: Ratio, onClick: toggleAspectRatioPanel },
+    {
+      label: "选择画幅比例",
+      icon: Ratio,
+      buttonRef: aspectRatioTriggerRef,
+      onClick: toggleAspectRatioPanel,
+    },
     { label: "当前视角截图", icon: Camera, onClick: () => void handleCapture("current") },
     { label: "四方位截图", icon: Grid2X2, onClick: () => void handleCapture("four") },
     { label: "十二方位截图", icon: Grid3X3, onClick: () => void handleCapture("twelve") },
@@ -499,14 +785,15 @@ export function ViewportToolbar({
 
   function renderActionButton(action: ToolbarAction) {
     const Icon = action.icon;
-    const active = action.mode ? transformMode === action.mode : false;
+    const active = action.mode ? transformMode === action.mode : action.pressed ?? false;
 
     return (
       <button
         key={action.label}
         aria-label={action.label}
-        aria-pressed={action.mode ? active : undefined}
+        aria-pressed={action.mode || action.pressed !== undefined ? active : undefined}
         className={`ui-icon-button viewport-toolbar-button${active ? " is-active" : ""}`}
+        ref={action.buttonRef}
         type="button"
         onClick={action.onClick}
       >
@@ -530,10 +817,6 @@ export function ViewportToolbar({
       toolbarContainerRef.current = element;
     }
   }
-
-  const aspectRatioPanelStyle = {
-    "--viewport-toolbar-height": `${toolbarHeight}px`,
-  } as CSSProperties;
 
   return (
     <>
@@ -596,6 +879,15 @@ export function ViewportToolbar({
               {option.label}
             </button>
           ))}
+          <button
+            className="viewport-toolbar-menu-item-inline"
+            role="menuitem"
+            type="button"
+            onClick={() => characterLocalModelInputRef.current?.click()}
+          >
+            <UserPlus aria-hidden="true" size={14} strokeWidth={1.8} />
+            <span>{characterImportBusy ? "正在体检..." : "导入绑骨人物"}</span>
+          </button>
           <div
             className="viewport-toolbar-submenu-wrap"
             onMouseEnter={openCrowdPanel}
@@ -806,6 +1098,9 @@ export function ViewportToolbar({
                         )}
                       </span>
                       <span className="model-library-name">{item.name}</span>
+                      {getModelLibraryCharacterStatus(item) ? (
+                        <small className="model-library-character-status">{getModelLibraryCharacterStatus(item)}</small>
+                      ) : null}
                     </button>
                     <button
                       aria-label={`删除模型 ${item.name}`}
@@ -842,6 +1137,9 @@ export function ViewportToolbar({
                       )}
                     </span>
                     <span className="model-library-name">{item.name}</span>
+                    {getModelLibraryCharacterStatus(item) ? (
+                      <small className="model-library-character-status">{getModelLibraryCharacterStatus(item)}</small>
+                    ) : null}
                   </button>
                 )
               ))}
@@ -892,6 +1190,127 @@ export function ViewportToolbar({
           </div>
         </div>
       ) : null}
+      {pendingCharacterImport ? (
+        <div className="character-import-dialog" role="dialog" aria-label="人物模型体检结果">
+          <div className="character-import-dialog-header">
+            <div>
+              <h2>人物模型体检</h2>
+              <p>{pendingCharacterImport.file.name}</p>
+            </div>
+            <button
+              aria-label="关闭人物模型体检"
+              className="top-bar-action-button"
+              type="button"
+              onClick={() => setPendingCharacterImport(null)}
+            >
+              <X aria-hidden="true" size={16} />
+            </button>
+          </div>
+          <div className={`character-import-status is-${pendingCharacterImport.report.readiness}`}>
+            {CHARACTER_IMPORT_STATUS_LABELS[pendingCharacterImport.report.readiness]}
+          </div>
+          {(() => {
+            const boneMap = pendingCharacterImport.boneMap ?? {};
+            const mappingCount = Object.keys(boneMap).length;
+            const canAddAsCharacter = canImportCharacterFromInspection(
+              pendingCharacterImport.report,
+              boneMap
+            );
+            const boneNames = pendingCharacterImport.report.boneNames ?? [];
+
+            return <>
+          <dl className="character-import-metrics">
+            <div><dt>骨架</dt><dd>{pendingCharacterImport.report.primaryBoneCount} 根骨骼</dd></div>
+            <div><dt>身体识别</dt><dd>{mappingCount + 1}/16</dd></div>
+            <div><dt>可播放动作</dt><dd>{pendingCharacterImport.report.playableAnimationCount} 个</dd></div>
+            <div><dt>站立方向</dt><dd>{pendingCharacterImport.report.uprightAxis.toUpperCase()} 轴</dd></div>
+          </dl>
+          {pendingCharacterImport.report.readiness === "manual-mapping" ? (
+            <section className="character-import-mapping" aria-label="手动骨架映射">
+              <div className="character-import-mapping-header">
+                <strong>补全骨架映射</strong>
+                <span>{mappingCount}/15</span>
+              </div>
+              <p>只需把下面主要部位对应到模型骨骼，完成后即可跟拍和使用外部动作。</p>
+              <div className="character-import-mapping-grid">
+                {DIRECTOR_CHARACTER_BONE_PART_OPTIONS.map((part) => (
+                  <label key={part.value}>
+                    <span>{part.label}</span>
+                    <select
+                      aria-label={`映射 ${part.label}`}
+                      value={boneMap[part.value] ?? ""}
+                      onChange={(event) => setPendingCharacterImport((current) => current
+                        ? {
+                            ...current,
+                            boneMap: {
+                              ...current.boneMap,
+                              [part.value]: event.target.value || undefined,
+                            },
+                          }
+                        : current)}
+                    >
+                      <option value="">未映射</option>
+                      {boneNames.map((boneName) => <option key={boneName} value={boneName}>{boneName}</option>)}
+                    </select>
+                  </label>
+                ))}
+              </div>
+            </section>
+          ) : null}
+          {pendingCharacterImport.report.warnings.length ? (
+            <ul className="character-import-warnings">
+              {pendingCharacterImport.report.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+            </ul>
+          ) : (
+            <p className="character-import-ready-copy">骨架和身体部位识别完整，可以直接加入场景。</p>
+          )}
+          {characterImportError ? <p className="character-import-error">{characterImportError}</p> : null}
+          <div className="character-import-actions">
+            <button type="button" onClick={() => setPendingCharacterImport(null)}>取消</button>
+            {canAddAsCharacter ? (
+              <button
+                className="is-primary"
+                disabled={characterImportBusy}
+                type="button"
+                onClick={() => void confirmCharacterImport("character")}
+              >
+                {characterImportBusy ? "正在导入..." : "作为人物加入"}
+              </button>
+            ) : (
+              <button
+                className="is-primary"
+                disabled={characterImportBusy || pendingCharacterImport.report.readiness === "manual-mapping"}
+                type="button"
+                onClick={() => void confirmCharacterImport("prop")}
+              >
+                {characterImportBusy ? "正在导入..." : pendingCharacterImport.report.readiness === "manual-mapping" ? "补全映射后作为人物加入" : "作为静态道具加入"}
+              </button>
+            )}
+          </div>
+            </>;
+          })()}
+        </div>
+      ) : null}
+      {characterImportError && !pendingCharacterImport ? (
+        <div className="character-import-toast" role="alert">{characterImportError}</div>
+      ) : null}
+      {characterImportPreview ? (
+        <div className="character-import-preview-bar" role="status" aria-label="人物动作自动自检">
+          <div>
+            <strong>人物动作自检</strong>
+            <span>
+              正在预览：{characterImportPreview.steps[characterImportPreview.stepIndex]?.label}
+              {` ${characterImportPreview.stepIndex + 1}/${characterImportPreview.steps.length}`}
+            </span>
+          </div>
+          <div className="character-import-preview-steps" aria-hidden="true">
+            {characterImportPreview.steps.map((step, index) => (
+              <i key={`${step.actionPresetId}-${index}`} className={index <= characterImportPreview.stepIndex ? "is-active" : undefined} />
+            ))}
+          </div>
+          <button type="button" onClick={stopCharacterImportPreview}>跳过</button>
+        </div>
+      ) : null}
       <input
         ref={panoramaInputRef}
         aria-hidden="true"
@@ -916,9 +1335,19 @@ export function ViewportToolbar({
         className="hidden-file-input"
         data-testid="scene-local-model-input"
         tabIndex={-1}
-        accept=".fbx,.obj"
+        accept=".fbx,.obj,.glb"
         type="file"
         onChange={(event) => void handleLocalModelChange(event, true)}
+      />
+      <input
+        ref={characterLocalModelInputRef}
+        aria-hidden="true"
+        className="hidden-file-input"
+        data-testid="character-local-model-input"
+        tabIndex={-1}
+        accept=".fbx,.glb"
+        type="file"
+        onChange={(event) => void handleCharacterModelChange(event)}
       />
       <input
         ref={libraryLocalModelInputRef}
@@ -926,7 +1355,7 @@ export function ViewportToolbar({
         className="hidden-file-input"
         data-testid="library-local-model-input"
         tabIndex={-1}
-        accept=".fbx,.obj"
+        accept=".fbx,.obj,.glb"
         multiple
         type="file"
         onChange={(event) => void handleLocalModelChange(event, false)}

@@ -1,4 +1,4 @@
-import { Camera, Download, Eye, Images, Send, Trash2, X, ZoomIn, ZoomOut } from "lucide-react";
+import { Camera, Download, Eye, Images, Pause, Play, Plus, Route, Send, Trash2, Waypoints, X, ZoomIn, ZoomOut } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   InspectorAxisGroup,
@@ -10,27 +10,41 @@ import {
 } from "./InspectorControls";
 import { requestViewportCapture } from "../io/captureBridge";
 import { downloadDataUrl } from "../io/screenshotExport";
-import { postDirectorDeskCapturesToHost } from "../io/hostBridge";
+import { postDirectorDeskCapturesToHost, postDirectorDeskReferenceVideoDataUrlToHost } from "../io/hostBridge";
 import { getDirectorObjectFocusTarget, isCameraFocusableObject } from "../schema/cameraTarget";
 import type { DirectorCameraCapture } from "../schema/directorProject";
+import { getCameraMotionPath, getCameraMotionTimingPlan } from "../schema/cameraMotion";
 import { useDirectorStore } from "../store/directorStore";
+import { MotionStudio } from "../motion/MotionStudio";
+import { useMotionViewportBridge } from "../motion/motionViewportBridge";
 
 const VIEWER_ZOOM_MIN = 0.25;
 const VIEWER_ZOOM_MAX = 5;
 const VIEWER_ZOOM_STEP = 0.25;
+const CAMERA_MOTION_DURATION_MIN = 0.5;
+const CAMERA_MOTION_DURATION_MAX = 30;
+const CAMERA_MOTION_FOV_MIN = 10;
+const CAMERA_MOTION_FOV_MAX = 120;
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
 
 function replaceAxis(tuple: [number, number, number], axis: 0 | 1 | 2, value: number): [number, number, number] {
   return tuple.map((item, index) => (index === axis ? value : item)) as [number, number, number];
 }
 
 export function CameraPanel() {
-  const [activeTab, setActiveTab] = useState<"properties" | "captures">("properties");
+  const [activeTab, setActiveTab] = useState<"properties" | "motion" | "captures">("properties");
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [hoveredCaptureId, setHoveredCaptureId] = useState<string | null>(null);
+  const [sentCaptureId, setSentCaptureId] = useState<string | null>(null);
   const [viewerCapture, setViewerCapture] = useState<DirectorCameraCapture | null>(null);
   const [viewerScale, setViewerScale] = useState(1);
   const [viewerOffset, setViewerOffset] = useState({ x: 0, y: 0 });
   const [viewerDragging, setViewerDragging] = useState(false);
+  const [motionDurationDraft, setMotionDurationDraft] = useState("6");
+  const [motionFovDraft, setMotionFovDraft] = useState("50");
   const viewerDragStateRef = useRef<{
     startX: number;
     startY: number;
@@ -40,11 +54,24 @@ export function CameraPanel() {
   const camera = useDirectorStore((state) =>
     state.project.cameras.find((item) => item.id === state.project.activeCameraId)
   );
-  const cameras = useDirectorStore((state) => state.project.cameras);
+  const allCameras = useDirectorStore((state) => state.project.cameras);
+  const cameras = useMemo(() => allCameras.filter((item) => !item.isVirtual), [allCameras]);
   const objects = useDirectorStore((state) => state.project.objects);
   const setActiveCamera = useDirectorStore((state) => state.setActiveCamera);
   const addCameraCaptures = useDirectorStore((state) => state.addCameraCaptures);
   const updateCamera = useDirectorStore((state) => state.updateCamera);
+  const selectedCameraKeyframeId = useDirectorStore((state) => state.selectedCameraKeyframeId);
+  const cameraMotionProgress = useDirectorStore((state) => state.cameraMotionProgress);
+  const cameraMotionPlaying = useDirectorStore((state) => state.cameraMotionPlaying);
+  const selectCameraMotionKeyframe = useDirectorStore((state) => state.selectCameraMotionKeyframe);
+  const addCameraMotionKeyframe = useDirectorStore((state) => state.addCameraMotionKeyframe);
+  const updateCameraMotionKeyframe = useDirectorStore((state) => state.updateCameraMotionKeyframe);
+  const deleteCameraMotionKeyframe = useDirectorStore((state) => state.deleteCameraMotionKeyframe);
+  const updateCameraMotionPath = useDirectorStore((state) => state.updateCameraMotionPath);
+  const setCameraMotionProgress = useDirectorStore((state) => state.setCameraMotionProgress);
+  const setCameraMotionPlaying = useDirectorStore((state) => state.setCameraMotionPlaying);
+  const setViewMode = useDirectorStore((state) => state.setViewMode);
+  const viewportBridge = useMotionViewportBridge();
 
   if (!camera) return null;
   const currentCamera = camera;
@@ -63,6 +90,24 @@ export function CameraPanel() {
     currentCamera.targetMode === "object" && currentCamera.targetObjectId
       ? `object:${currentCamera.targetObjectId}`
       : "manual";
+  const motionPath = useMemo(() => getCameraMotionPath(currentCamera), [currentCamera]);
+  const motionTimingPlan = useMemo(() => getCameraMotionTimingPlan(currentCamera), [currentCamera]);
+  const selectedMotionKeyframe =
+    motionPath.keyframes.find((item) => item.id === selectedCameraKeyframeId) ?? motionPath.keyframes[0] ?? null;
+  const propertyKeyframe = selectedCameraKeyframeId
+    ? motionPath.keyframes.find((item) => item.id === selectedCameraKeyframeId) ?? null
+    : null;
+  const propertyPosition = propertyKeyframe?.position ?? currentCamera.transform.position;
+  const propertyTarget = propertyKeyframe?.target ?? currentCamera.target;
+  const propertyFov = propertyKeyframe?.fov ?? currentCamera.fov;
+
+  useEffect(() => {
+    setMotionDurationDraft(String(motionPath.duration));
+  }, [currentCamera.id, motionPath.duration]);
+
+  useEffect(() => {
+    setMotionFovDraft(selectedMotionKeyframe ? String(selectedMotionKeyframe.fov) : "");
+  }, [selectedMotionKeyframe?.fov, selectedMotionKeyframe?.id]);
 
   useEffect(() => {
     if (!viewerCapture) {
@@ -131,12 +176,24 @@ export function CameraPanel() {
   }, [clampViewerScale]);
 
   const sendCaptureToCanvas = useCallback((capture: DirectorCameraCapture) => {
+    if (capture.mediaType === "video") {
+      postDirectorDeskReferenceVideoDataUrlToHost({
+        dataUrl: capture.dataUrl,
+        fileName: `${capture.name}.mp4`,
+        mimeType: "video/mp4",
+      });
+      return;
+    }
     postDirectorDeskCapturesToHost([
       {
         dataUrl: capture.dataUrl,
         fileName: `${capture.name}.png`,
       },
     ]);
+  }, []);
+
+  const markCaptureSent = useCallback((captureId: string) => {
+    setSentCaptureId(captureId);
   }, []);
 
   const sendAllCapturesToCanvas = useCallback(() => {
@@ -172,9 +229,10 @@ export function CameraPanel() {
     if (!captureCamera) return;
 
     const nextCaptures = (captureCamera.captures ?? []).filter((item) => item.id !== captureId);
+    const latestImage = [...nextCaptures].reverse().find((item) => item.mediaType !== "video");
     updateCamera(captureCamera.id, {
       captures: nextCaptures,
-      lastCaptureUrl: nextCaptures[nextCaptures.length - 1]?.dataUrl ?? null,
+      lastCaptureUrl: latestImage?.dataUrl ?? null,
     });
     setHoveredCaptureId((current) => (current === captureId ? null : current));
     setViewerCapture((current) => (current?.id === captureId ? null : current));
@@ -197,13 +255,13 @@ export function CameraPanel() {
     updateViewerScale((current) => current + (direction === "in" ? VIEWER_ZOOM_STEP : -VIEWER_ZOOM_STEP));
   }
 
-  function handleViewerWheel(event: React.WheelEvent<HTMLImageElement>) {
+  function handleViewerWheel(event: React.WheelEvent<HTMLElement>) {
     event.preventDefault();
     event.stopPropagation();
     updateViewerScale((current) => current + (event.deltaY < 0 ? VIEWER_ZOOM_STEP : -VIEWER_ZOOM_STEP));
   }
 
-  function handleViewerMouseDown(event: React.MouseEvent<HTMLImageElement>) {
+  function handleViewerMouseDown(event: React.MouseEvent<HTMLElement>) {
     event.preventDefault();
     event.stopPropagation();
 
@@ -244,26 +302,159 @@ export function CameraPanel() {
       return;
     }
 
+    const nextMotionPath = motionPath.keyframes.length > 0
+      ? {
+          ...motionPath,
+          keyframes: motionPath.keyframes.map((keyframe) => ({
+            ...keyframe,
+            targetMode: "object" as const,
+            targetObjectId: targetObject.id,
+            target: getDirectorObjectFocusTarget(targetObject),
+          })),
+        }
+      : undefined;
+
     updateCamera(currentCamera.id, {
       targetMode: "object",
       targetObjectId: targetObject.id,
       target: getDirectorObjectFocusTarget(targetObject),
+      ...(nextMotionPath ? { motionPath: nextMotionPath } : {}),
     });
   }
 
   function updateManualTarget(axis: 0 | 1 | 2, value: string) {
+    const target = replaceAxis(propertyTarget, axis, Number(value));
+    const nextMotionPath = motionPath.keyframes.length > 0
+      ? {
+          ...motionPath,
+          keyframes: motionPath.keyframes.map((keyframe) =>
+            propertyKeyframe && keyframe.id !== propertyKeyframe.id
+              ? keyframe
+              : { ...keyframe, targetMode: "manual" as const, targetObjectId: null, target }
+          ),
+        }
+      : undefined;
+
     updateCamera(currentCamera.id, {
       targetMode: "manual",
       targetObjectId: null,
-      target: replaceAxis(currentCamera.target, axis, Number(value)),
+      target,
+      ...(nextMotionPath ? { motionPath: nextMotionPath } : {}),
     });
+  }
+
+  function updateCameraPosition(axis: 0 | 1 | 2, value: string) {
+    const parsedValue = Number(value);
+    if (!Number.isFinite(parsedValue)) return;
+
+    if (motionPath.keyframes.length > 0 && !propertyKeyframe) return;
+
+    if (propertyKeyframe) {
+      updateCameraMotionKeyframe(currentCamera.id, propertyKeyframe.id, {
+        position: replaceAxis(propertyKeyframe.position, axis, parsedValue),
+      });
+      return;
+    }
+
+    updateCamera(currentCamera.id, {
+      transform: {
+        ...currentCamera.transform,
+        position: replaceAxis(currentCamera.transform.position, axis, parsedValue),
+      },
+    });
+  }
+
+  function updateCameraFov(value: string) {
+    const fov = Number(value);
+    if (!Number.isFinite(fov)) return;
+
+    const nextMotionPath = motionPath.keyframes.length > 0
+      ? {
+          ...motionPath,
+          keyframes: motionPath.keyframes.map((keyframe) =>
+            propertyKeyframe && keyframe.id !== propertyKeyframe.id ? keyframe : { ...keyframe, fov }
+          ),
+        }
+      : undefined;
+
+    updateCamera(currentCamera.id, {
+      fov,
+      ...(nextMotionPath ? { motionPath: nextMotionPath } : {}),
+    });
+  }
+
+  function handleAddMotionKeyframe() {
+    const keyframeId = addCameraMotionKeyframe(currentCamera.id);
+    if (!keyframeId) return;
+    setActiveTab("motion");
+    setViewMode("director");
+  }
+
+  function handleOpenMotionTab() {
+    setActiveTab("motion");
+    setViewMode("director");
+
+    if (selectedCameraKeyframeId && motionPath.keyframes.some((item) => item.id === selectedCameraKeyframeId)) {
+      return;
+    }
+
+    const firstKeyframe = motionPath.keyframes[0];
+    if (!firstKeyframe) return;
+    selectCameraMotionKeyframe(firstKeyframe.id);
+    setCameraMotionProgress(firstKeyframe.time);
+  }
+
+  function handleSelectMotionKeyframe(keyframeId: string, time: number) {
+    selectCameraMotionKeyframe(keyframeId);
+    setCameraMotionProgress(time);
+    setCameraMotionPlaying(false);
+    setViewMode("director");
+  }
+
+  function handleToggleMotionPlayback() {
+    if (motionPath.keyframes.length < 2) return;
+    if (cameraMotionProgress >= 0.999) setCameraMotionProgress(0);
+    setViewMode("camera");
+    setCameraMotionPlaying(!cameraMotionPlaying);
+  }
+
+  function updateSelectedMotionPosition(axis: 0 | 1 | 2, value: string) {
+    if (!selectedMotionKeyframe) return;
+    updateCameraMotionKeyframe(currentCamera.id, selectedMotionKeyframe.id, {
+      position: replaceAxis(selectedMotionKeyframe.position, axis, Number(value)),
+    });
+  }
+
+  function commitMotionDuration(value: string) {
+    const parsed = Number(value);
+    const nextDuration = Number.isFinite(parsed)
+      ? clampNumber(parsed, CAMERA_MOTION_DURATION_MIN, CAMERA_MOTION_DURATION_MAX)
+      : motionPath.duration;
+    updateCameraMotionPath(currentCamera.id, { duration: nextDuration });
+    setMotionDurationDraft(String(nextDuration));
+  }
+
+  function commitSelectedMotionFov(value: string) {
+    if (!selectedMotionKeyframe) return;
+    const parsed = Number(value);
+    const nextFov = Number.isFinite(parsed)
+      ? clampNumber(parsed, CAMERA_MOTION_FOV_MIN, CAMERA_MOTION_FOV_MAX)
+      : selectedMotionKeyframe.fov;
+    updateCameraMotionKeyframe(currentCamera.id, selectedMotionKeyframe.id, { fov: nextFov });
+    setMotionFovDraft(String(nextFov));
+  }
+
+  function formatMotionTime(time: number) {
+    return `${(time * motionPath.duration).toFixed(1)}s`;
   }
 
   function renderCaptureCards(captureList: DirectorCameraCapture[]) {
     return (
-      <div className="camera-capture-grid" aria-label="相机截图列表">
+      <div className="camera-capture-grid" aria-label="截图和视频列表">
         {captureList.map((capture) => {
           const captureActive = hoveredCaptureId === capture.id;
+          const isVideo = capture.mediaType === "video";
+          const isSent = sentCaptureId === capture.id;
 
           return (
             <div key={capture.id} className="camera-capture-card">
@@ -273,7 +464,11 @@ export function CameraPanel() {
                 onMouseEnter={() => setHoveredCaptureId(capture.id)}
                 onMouseLeave={() => setHoveredCaptureId((current) => (current === capture.id ? null : current))}
               >
-                <img className="camera-capture-thumb" alt={`${capture.name} 缩略图`} src={capture.dataUrl} />
+                {isVideo ? (
+                  <video className="camera-capture-thumb" aria-label={`${capture.name} 视频缩略图`} src={capture.dataUrl} muted preload="metadata" />
+                ) : (
+                  <img className="camera-capture-thumb" alt={`${capture.name} 缩略图`} src={capture.dataUrl} />
+                )}
                 <div
                   aria-label={`${capture.name} 缩略图操作`}
                   className={`camera-capture-actions${captureActive ? " is-visible" : ""}`}
@@ -291,13 +486,15 @@ export function CameraPanel() {
                     <Trash2 aria-hidden="true" size={14} strokeWidth={1.9} />
                   </button>
                   <button
-                    aria-label={`发送到画布 ${capture.name}`}
+                    aria-label={isSent ? "已添加到画布" : `发送到画布 ${capture.name}`}
                     className="camera-capture-action"
                     type="button"
                     onClick={(event) => {
                       event.stopPropagation();
                       sendCaptureToCanvas(capture);
+                      markCaptureSent(capture.id);
                     }}
+                    title={isSent ? "已添加到画布" : "添加到画布"}
                   >
                     <Send aria-hidden="true" size={14} strokeWidth={1.9} />
                   </button>
@@ -313,6 +510,7 @@ export function CameraPanel() {
                     <Eye aria-hidden="true" size={14} strokeWidth={1.9} />
                   </button>
                 </div>
+                {isSent ? <span className="camera-capture-send-notice" role="status">已添加到画布</span> : null}
               </div>
               <span className="camera-capture-name">{capture.name}</span>
             </div>
@@ -332,11 +530,11 @@ export function CameraPanel() {
 
   function renderCaptureEmptyState() {
     return (
-      <div className="camera-capture-empty object-search-empty-state" role="status" aria-label="暂无摄像机截图">
+      <div className="camera-capture-empty object-search-empty-state" role="status" aria-label="暂无截图或视频">
         <span className="object-search-empty-icon" data-testid="camera-capture-empty-icon">
           <Images aria-hidden="true" size={16} strokeWidth={1.8} />
         </span>
-        <span>暂无摄像机截图</span>
+        <span>暂无截图或视频</span>
       </div>
     );
   }
@@ -351,10 +549,10 @@ export function CameraPanel() {
               .map((group) => (
                 <section
                   key={group.camera.id}
-                  aria-label={`${group.camera.name}截图`}
+                  aria-label={`${group.camera.name}截图/视频`}
                   className="camera-capture-group"
                 >
-                  <h3>{group.camera.name}截图</h3>
+                  <h3>{group.camera.name}截图/视频</h3>
                   {renderCaptureCards(group.captures)}
                 </section>
               ))
@@ -432,10 +630,10 @@ export function CameraPanel() {
             <ZoomOut aria-hidden="true" size={18} strokeWidth={2} />
           </button>
           <button
-            aria-label="下载图片"
+            aria-label={viewerCapture.mediaType === "video" ? "下载视频" : "下载图片"}
             className="camera-capture-viewer-tool"
             type="button"
-            onClick={() => downloadDataUrl(viewerCapture.dataUrl, `${viewerCapture.name}.png`)}
+            onClick={() => downloadDataUrl(viewerCapture.dataUrl, `${viewerCapture.name}.${viewerCapture.mediaType === "video" ? "mp4" : "png"}`)}
           >
             <Download aria-hidden="true" size={18} strokeWidth={2} />
           </button>
@@ -449,17 +647,182 @@ export function CameraPanel() {
           </button>
         </div>
         <div className="camera-capture-viewer-stage">
-          <img
-            className={viewerImageClassName}
-            alt={`${viewerCapture.name} 查看大图`}
-            src={viewerCapture.dataUrl}
-            style={{ transform: `translate(${viewerOffset.x}px, ${viewerOffset.y}px) scale(${viewerScale})` }}
-            onClick={(event) => event.stopPropagation()}
-            onWheel={handleViewerWheel}
-            onMouseDown={handleViewerMouseDown}
-            draggable={false}
-          />
+          {viewerCapture.mediaType === "video" ? (
+            <video
+              className={viewerImageClassName}
+              aria-label={`${viewerCapture.name} 视频预览`}
+              src={viewerCapture.dataUrl}
+              controls
+              autoPlay
+              style={{ transform: `translate(${viewerOffset.x}px, ${viewerOffset.y}px) scale(${viewerScale})` }}
+              onClick={(event) => event.stopPropagation()}
+              onWheel={handleViewerWheel}
+              onMouseDown={handleViewerMouseDown}
+            />
+          ) : (
+            <img
+              className={viewerImageClassName}
+              alt={`${viewerCapture.name} 查看大图`}
+              src={viewerCapture.dataUrl}
+              style={{ transform: `translate(${viewerOffset.x}px, ${viewerOffset.y}px) scale(${viewerScale})` }}
+              onClick={(event) => event.stopPropagation()}
+              onWheel={handleViewerWheel}
+              onMouseDown={handleViewerMouseDown}
+              draggable={false}
+            />
+          )}
         </div>
+      </div>
+    );
+  }
+
+  function renderMotionEditor() {
+    if (viewportBridge) {
+      return (
+        <MotionStudio
+          embedded
+          getViewportCameraSnapshot={viewportBridge.getSnapshot}
+          onLoadCameraSnapshot={viewportBridge.loadSnapshot}
+          onStartPilot={viewportBridge.startPilot}
+        />
+      );
+    }
+
+    return (
+      <div className="camera-motion-tab">
+        <div className="camera-motion-intro">
+          <span className="camera-motion-intro-icon"><Route aria-hidden="true" size={18} /></span>
+          <div>
+            <h3>自由摄影机轨迹</h3>
+            <p>先移动当前机位，再添加轨迹点；橙色轨迹点可直接在 3D 视口中拖动。</p>
+          </div>
+        </div>
+
+        <button className="camera-motion-add-button" type="button" onClick={handleAddMotionKeyframe}>
+          <Plus aria-hidden="true" size={15} />
+          将当前机位添加为轨迹点
+        </button>
+
+        {motionPath.keyframes.length === 0 ? (
+          <div className="camera-motion-empty" role="status">
+            <Waypoints aria-hidden="true" size={22} />
+            <strong>还没有摄影机轨迹</strong>
+            <span>添加两个或更多轨迹点后，即可预演任意推、拉、摇、移和环绕路线。</span>
+          </div>
+        ) : (
+          <>
+            <InspectorRangeNumberField
+              label="镜头时长"
+              rangeAriaLabel="摄影机轨迹时长滑杆"
+              numberAriaLabel="摄影机轨迹时长"
+              min="0.5"
+              max="30"
+              step="0.1"
+              value={motionDurationDraft}
+              onValueChange={commitMotionDuration}
+              onRangeChange={commitMotionDuration}
+              onNumberBlur={commitMotionDuration}
+              onNumberChange={setMotionDurationDraft}
+            />
+            <InspectorSelectField
+              label="路径插值"
+              ariaLabel="摄影机路径插值"
+              value={motionPath.interpolation}
+              onChange={(value) => updateCameraMotionPath(currentCamera.id, { interpolation: value === "linear" ? "linear" : "smooth" })}
+            >
+              <option value="smooth">平滑曲线</option>
+              <option value="linear">直线分段</option>
+            </InspectorSelectField>
+
+            <div className="camera-motion-playback">
+              <button
+                className="camera-motion-play-button"
+                type="button"
+                disabled={motionPath.keyframes.length < 2}
+                aria-label={cameraMotionPlaying ? "暂停轨迹预演" : "播放轨迹预演"}
+                onClick={handleToggleMotionPlayback}
+              >
+                {cameraMotionPlaying ? <Pause aria-hidden="true" size={15} /> : <Play aria-hidden="true" size={15} />}
+              </button>
+              <input
+                aria-label="摄影机轨迹播放位置"
+                max="1"
+                min="0"
+                step="0.001"
+                type="range"
+                value={cameraMotionProgress}
+                onChange={(event) => {
+                  setCameraMotionPlaying(false);
+                  setCameraMotionProgress(Number(event.currentTarget.value));
+                  setViewMode("camera");
+                }}
+              />
+              <span>{formatMotionTime(cameraMotionProgress)} / {motionPath.duration.toFixed(1)}s</span>
+            </div>
+
+            <button
+              className={`camera-motion-loop-button${motionPath.loop ? " is-active" : ""}`}
+              type="button"
+              aria-pressed={motionPath.loop}
+              onClick={() => updateCameraMotionPath(currentCamera.id, { loop: !motionPath.loop })}
+            >
+              循环播放
+            </button>
+
+            <div className="camera-motion-keyframes" role="list" aria-label="摄影机轨迹点">
+              {motionPath.keyframes.map((keyframe, index) => (
+                <div key={keyframe.id} role="listitem">
+                  <button
+                    className={selectedMotionKeyframe?.id === keyframe.id ? "is-active" : ""}
+                    type="button"
+                    aria-label={`选择轨迹点 K${index + 1}`}
+                    aria-pressed={selectedMotionKeyframe?.id === keyframe.id}
+                    onClick={() => handleSelectMotionKeyframe(
+                      keyframe.id,
+                      motionTimingPlan?.arrivals[index] ?? keyframe.time
+                    )}
+                  >
+                    <span>K{index + 1}</span>
+                    <small>{formatMotionTime(motionTimingPlan?.arrivals[index] ?? keyframe.time)}</small>
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {selectedMotionKeyframe ? (
+              <InspectorSection title={`轨迹点 K${motionPath.keyframes.indexOf(selectedMotionKeyframe) + 1}`} className="camera-motion-keyframe-editor">
+                <InspectorAxisGroup
+                  label="位置"
+                  axes={[
+                    { axis: "X", ariaLabel: "轨迹点位置 X", value: selectedMotionKeyframe.position[0], onChange: (value) => updateSelectedMotionPosition(0, value) },
+                    { axis: "Y", ariaLabel: "轨迹点位置 Y", value: selectedMotionKeyframe.position[1], onChange: (value) => updateSelectedMotionPosition(1, value) },
+                    { axis: "Z", ariaLabel: "轨迹点位置 Z", value: selectedMotionKeyframe.position[2], onChange: (value) => updateSelectedMotionPosition(2, value) },
+                  ]}
+                />
+                <InspectorRangeNumberField
+                  label="此点焦段 (mm)"
+                  rangeAriaLabel="轨迹点焦段滑杆"
+                  numberAriaLabel="轨迹点焦段"
+                  min="10"
+                  max="120"
+                  step="0.1"
+                  value={motionFovDraft}
+                  onValueChange={commitSelectedMotionFov}
+                  onRangeChange={commitSelectedMotionFov}
+                  onNumberBlur={commitSelectedMotionFov}
+                  onNumberChange={setMotionFovDraft}
+                />
+                <button
+                  className="camera-motion-delete-button"
+                  type="button"
+                  onClick={() => deleteCameraMotionKeyframe(currentCamera.id, selectedMotionKeyframe.id)}
+                >
+                  <Trash2 aria-hidden="true" size={14} /> 删除当前轨迹点
+                </button>
+              </InspectorSection>
+            ) : null}
+          </>
+        )}
       </div>
     );
   }
@@ -472,7 +835,8 @@ export function CameraPanel() {
       footer={renderCaptureOverviewFooter()}
       tabs={[
         { label: "属性", active: activeTab === "properties", onClick: () => setActiveTab("properties") },
-        { label: "摄像机截图", active: activeTab === "captures", onClick: () => setActiveTab("captures") },
+        { label: "轨迹", active: activeTab === "motion", onClick: handleOpenMotionTab },
+        { label: "截图/视频", active: activeTab === "captures", onClick: () => setActiveTab("captures") },
       ]}
     >
       {activeTab === "properties" ? (
@@ -501,38 +865,23 @@ export function CameraPanel() {
               {
                 axis: "X",
                 ariaLabel: "机位位置 X",
-                value: currentCamera.transform.position[0],
-                onChange: (value) =>
-                  updateCamera(currentCamera.id, {
-                    transform: {
-                      ...currentCamera.transform,
-                      position: replaceAxis(currentCamera.transform.position, 0, Number(value)),
-                    },
-                  }),
+                value: propertyPosition[0],
+                disabled: motionPath.keyframes.length > 0 && !propertyKeyframe,
+                onChange: (value) => updateCameraPosition(0, value),
               },
               {
                 axis: "Y",
                 ariaLabel: "机位位置 Y",
-                value: currentCamera.transform.position[1],
-                onChange: (value) =>
-                  updateCamera(currentCamera.id, {
-                    transform: {
-                      ...currentCamera.transform,
-                      position: replaceAxis(currentCamera.transform.position, 1, Number(value)),
-                    },
-                  }),
+                value: propertyPosition[1],
+                disabled: motionPath.keyframes.length > 0 && !propertyKeyframe,
+                onChange: (value) => updateCameraPosition(1, value),
               },
               {
                 axis: "Z",
                 ariaLabel: "机位位置 Z",
-                value: currentCamera.transform.position[2],
-                onChange: (value) =>
-                  updateCamera(currentCamera.id, {
-                    transform: {
-                      ...currentCamera.transform,
-                      position: replaceAxis(currentCamera.transform.position, 2, Number(value)),
-                    },
-                  }),
+                value: propertyPosition[2],
+                disabled: motionPath.keyframes.length > 0 && !propertyKeyframe,
+                onChange: (value) => updateCameraPosition(2, value),
               },
             ]}
           />
@@ -555,32 +904,32 @@ export function CameraPanel() {
               {
                 axis: "X",
                 ariaLabel: "注视坐标 X",
-                value: currentCamera.target[0],
+                value: propertyTarget[0],
                 onChange: (value) => updateManualTarget(0, value),
               },
               {
                 axis: "Y",
                 ariaLabel: "注视坐标 Y",
-                value: currentCamera.target[1],
+                value: propertyTarget[1],
                 onChange: (value) => updateManualTarget(1, value),
               },
               {
                 axis: "Z",
                 ariaLabel: "注视坐标 Z",
-                value: currentCamera.target[2],
+                value: propertyTarget[2],
                 onChange: (value) => updateManualTarget(2, value),
               },
             ]}
           />
           <InspectorRangeNumberField
-            label="视野角度 (FOV)"
-            rangeAriaLabel="机位 FOV 滑杆"
-            numberAriaLabel="机位 FOV"
+            label="焦段 (mm)"
+            rangeAriaLabel="机位焦段滑杆"
+            numberAriaLabel="机位焦段"
             max="120"
             min="10"
             step="0.1"
-            value={currentCamera.fov}
-            onValueChange={(value) => updateCamera(currentCamera.id, { fov: Number(value) })}
+            value={propertyFov}
+            onValueChange={updateCameraFov}
           />
           <InspectorSection title="相机截图" className="camera-capture-section">
             <button
@@ -595,8 +944,10 @@ export function CameraPanel() {
             {renderCurrentCameraCaptureGrid()}
           </InspectorSection>
         </>
+      ) : activeTab === "motion" ? (
+        renderMotionEditor()
       ) : (
-        <div className="camera-capture-tab">
+        <div className="camera-capture-tab" aria-label="截图/视频页面">
           {captureError ? <p>{captureError}</p> : null}
           {renderAllCameraCaptures()}
         </div>

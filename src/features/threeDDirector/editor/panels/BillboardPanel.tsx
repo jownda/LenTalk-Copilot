@@ -3,6 +3,7 @@ import {
   InspectorPanel,
   InspectorSection,
   InspectorTextField,
+  TransformGizmoHeightControl,
 } from "./InspectorControls";
 import { useDirectorStore } from "../store/directorStore";
 
@@ -18,6 +19,7 @@ export function BillboardPanel() {
   });
   const updateObjectName = useDirectorStore((state) => state.updateObjectName);
   const updateObjectTransform = useDirectorStore((state) => state.updateObjectTransform);
+  const updateTransformGizmoHeight = useDirectorStore((state) => state.updateTransformGizmoHeight);
   const updateBillboardFaceCamera = useDirectorStore((state) => state.updateBillboardFaceCamera);
 
   if (!billboard) return null;
@@ -112,6 +114,11 @@ export function BillboardPanel() {
             onChange: (value) => updateObjectTransform(billboard.id, { scale: replaceAxis(billboard.transform.scale, 2, Number(value)) }),
           },
         ]}
+      />
+      <TransformGizmoHeightControl
+        ariaLabel="立绘卡控制器高度"
+        value={billboard.transformGizmoHeight}
+        onChange={(height) => updateTransformGizmoHeight(billboard.id, height)}
       />
       <label className="inspector-field inspector-checkbox-field">
         <input

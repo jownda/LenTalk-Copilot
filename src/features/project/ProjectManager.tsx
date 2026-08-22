@@ -17,7 +17,7 @@ export function ProjectManager() {
   const [showRenameDialog, setShowRenameDialog] = useState(false);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [editingProjectName, setEditingProjectName] = useState('');
-  const [sortField, setSortField] = useState<ProjectSortField>('createdAt');
+  const [sortField, setSortField] = useState<ProjectSortField>('updatedAt');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   /** 项目卡片宽度(px, 由顶部滑杆调节, 网格固定宽度线性跟随) */
   const [thumbSize, setThumbSize] = useState(240);

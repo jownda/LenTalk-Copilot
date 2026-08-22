@@ -1,4 +1,4 @@
-import { Euler, Quaternion, type Object3D, type SkinnedMesh } from "three";
+import { Euler, Quaternion, type Object3D } from "three";
 import type { CharacterBodyType } from "../mannequin/bodyTypes";
 import {
   getUE4BodyBoneScales,
@@ -25,26 +25,6 @@ function isBone(object: Object3D): object is Object3D & { isBone: true } {
   return "isBone" in object && object.isBone === true;
 }
 
-/**
- * 收集场景中蒙皮网格实际使用的骨骼(通过 skeleton.bones)。
- * 部分 glb(如 Mixamo Michelle)的 joints 节点不在场景树内,scene.traverse 遍历不到,
- * 必须从 SkinnedMesh.skeleton.bones 取,否则姿势/rest pose 应用会静默失效。
- */
-function collectSkeletonBones(root: Object3D): Object3D[] {
-  const bones = new Set<Object3D>();
-
-  root.traverse((object) => {
-    if ((object as SkinnedMesh).isSkinnedMesh) {
-      const skeleton = (object as SkinnedMesh).skeleton;
-      if (skeleton?.bones) {
-        skeleton.bones.forEach((bone) => bones.add(bone));
-      }
-    }
-  });
-
-  return Array.from(bones);
-}
-
 function applyRotationOffset(object: Object3D, rotation: [number, number, number]) {
   object.quaternion.multiply(new Quaternion().setFromEuler(new Euler(rotation[0], rotation[1], rotation[2])));
 }
@@ -52,7 +32,7 @@ function applyRotationOffset(object: Object3D, rotation: [number, number, number
 export function captureUE4RestPose(scene: Object3D): UE4RestPose {
   const restPose: UE4RestPose = {};
 
-  collectSkeletonBones(scene).forEach((object) => {
+  scene.traverse((object) => {
     if (!isBone(object)) return;
 
     restPose[object.name] = {
@@ -74,7 +54,7 @@ export function applyUE4RestPoseAndRig(
   const neutralRotations = getUE4NeutralPoseBoneRotations();
   const poseRotations = getUE4PoseBoneRotations(controls, bodyType);
 
-  collectSkeletonBones(scene).forEach((object) => {
+  scene.traverse((object) => {
     if (!isBone(object)) return;
 
     const rest = restPose[object.name];

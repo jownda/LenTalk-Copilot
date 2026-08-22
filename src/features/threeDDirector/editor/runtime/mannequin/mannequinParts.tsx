@@ -1,3 +1,6 @@
+import { forwardRef } from "react";
+import type { Group } from "three";
+
 interface HumanoidMaterialProps {
   color: string;
 }
@@ -196,7 +199,7 @@ export function Torso({
   );
 }
 
-export function Head({
+export const Head = forwardRef<Group, HeadProps>(function Head({
   color,
   eyeRadius,
   faceOffsetZ,
@@ -209,7 +212,7 @@ export function Head({
   noseScale,
   position,
   rotation,
-}: HeadProps) {
+}, ref) {
   const eyeY = headRadius * 0.16;
   const eyeX = headRadius * 0.26;
   const faceZ = faceOffsetZ + headRadius * 0.08;
@@ -220,7 +223,7 @@ export function Head({
         <cylinderGeometry args={[neckRadius * 0.9, neckRadius, neckHeight, 18]} />
         <HumanoidMaterial color={color} />
       </mesh>
-      <group position={position} rotation={rotation}>
+      <group ref={ref} position={position} rotation={rotation}>
         <mesh name="humanoid-head" scale={headScale}>
           <sphereGeometry args={[headRadius, 28, 24]} />
           <HumanoidMaterial color={color} />
@@ -248,4 +251,4 @@ export function Head({
       </group>
     </>
   );
-}
+});

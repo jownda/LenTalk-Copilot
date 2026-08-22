@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Terminal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
+import { buildCustomModelId, isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
 import type { CustomApiCapabilities } from '@/stores/settingsStore';
 import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck } from '@/commands/ai';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -216,6 +216,7 @@ export function SettingsDialog({
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [pickedModels, setPickedModels] = useState<string[]>([]);
   const [modelPickerSearch, setModelPickerSearch] = useState('');
+  const usableModelIds = useSettingsStore((state) => state.usableModelIds);
   const { shouldRender, isVisible } = useDialogTransition(isOpen, UI_DIALOG_TRANSITION_MS);
 
   /** 一键添加推荐平台(预填到新增表单) */
@@ -1442,7 +1443,12 @@ export function SettingsDialog({
                                 onChange={() => togglePickedModel(model)}
                                 className="accent-accent"
                               />
-                              <span className="truncate">{model}</span>
+                              <span className="min-w-0 truncate">{model}</span>
+                              {editingCustomApiId && usableModelIds.includes(buildCustomModelId(editingCustomApiId, model)) && (
+                                <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-300">
+                                  可用
+                                </span>
+                              )}
                             </label>
                           ))}
                           {filteredFetchedModels.length === 0 && (

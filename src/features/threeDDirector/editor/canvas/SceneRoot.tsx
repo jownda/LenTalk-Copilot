@@ -1,61 +1,124 @@
 import { Html, Line, TransformControls, type TransformControlsProps } from "@react-three/drei";
 import { useLoader, type ThreeEvent } from "@react-three/fiber";
-import { Suspense, useCallback, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Box3, Matrix4, Quaternion, Vector3, type Group, type Object3D } from "three";
+import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from "react";
+import { Box3, Color, Euler, Vector3, type Group, type Object3D } from "three";
 import type { TransformControls as TransformControlsImpl } from "three-stdlib";
+import type { Line2 } from "three-stdlib";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
 import type {
   DirectorAssetRef,
   DirectorCameraShot,
+  DirectorCameraMotionKeyframe,
   DirectorObject,
+  DirectorObjectMotionKeyframe,
   GeometryPrimitiveType,
+  SceneSettings,
 } from "../schema/directorProject";
+import {
+  getCameraMotionActiveKeyframeIndex,
+  getCameraMotionKeyframeArrivalProgress,
+  getCameraMotionPath,
+  getCameraMotionSnapshot,
+  sampleCameraMotionPath,
+} from "../schema/cameraMotion";
+import {
+  getObjectMotionActionPresetId,
+  getObjectMotionSnapshot,
+  getObjectMotionSpeed,
+  getObjectMotionTimingSample,
+  normalizeObjectMotionPath,
+  sampleObjectMotionPath,
+} from "../schema/objectMotion";
+import { getAnimatedCameraFocusTarget } from "../schema/cameraTarget";
+import { BuiltInLifeModel } from "../modelLibrary/BuiltInLifeModel";
 import {
   VIEWPORT_CAMERA_ASPECT,
   VIEWPORT_CAMERA_FRUSTUM_DEPTH,
-  VIEWPORT_CAMERA_FRUSTUM_FRAME_WIDTH,
-  VIEWPORT_CAMERA_VISUAL_SCALE,
+  getVerticalFovFromFocalLength,
 } from "../schema/cameraGeometry";
-import { VIEWPORT_OBJECT_LABEL_VERTICAL_GAP } from "../schema/viewportLabels";
 import type { TransformMode } from "../store/directorStore";
 import { useDirectorStore } from "../store/directorStore";
 import { CharacterModel } from "../runtime/CharacterModel";
 import { BillboardModel } from "../runtime/BillboardModel";
+import { sampleCharacterActionControls } from "../presets/characterActionPresets";
 import { getGroundedLabelY } from "../runtime/mannequin/bodyTypes";
+import { constrainCameraPosition, constrainObjectMotionTransform } from "../schema/pathCollision";
 import { getUE4GroundedLabelY } from "../runtime/ue4Mannequin/ue4MannequinRig";
 import { getEffectiveGroundOpacity } from "./panoramaMath";
+import {
+  VIEWPORT_CAMERA_FORWARD,
+  VIEWPORT_CAMERA_LENS_TIP,
+  getImportedModelNormalization,
+  getViewportCameraBodyWireframeLines,
+  getViewportCameraHitArea,
+  getViewportCameraLabelY,
+  getViewportCameraQuaternion,
+} from "./viewportCameraGeometry";
 import { getCrowdAnchorTransform } from "../store/directorStore";
+import {
+  DIRECTOR_CHARACTER_BONE_MAP_USER_DATA_KEY,
+  getDirectorObjectSceneNodeName,
+} from "../runtime/semanticBodyTracking";
+import { useResolvedLocalAssetUrl } from "../loaders/useResolvedLocalAssetUrl";
+import { parseImportedCharacterActionId } from "../schema/importedCharacterAction";
+import { GROUND_PLANE_SIZE, createGroundMaterialTexture, getGroundMaterialPreset } from "./groundMaterialPresets";
+import { getRuntimePlaybackProgress, subscribeRuntimePlayback } from "../runtime/playbackRuntime";
+import { disposeIsolatedModelMaterials, isolateAndTintModelMaterials } from "../runtime/modelMaterialTint";
+import {
+  createCameraTrackingSmoothingState,
+  getRuntimeCameraPlaybackSnapshot,
+} from "../runtime/cameraBodyTracking";
 
 export { getEffectiveGroundOpacity, getPanoramaRotationRadians } from "./panoramaMath";
+export {
+  getImportedModelNormalization,
+  getViewportCameraBodyWireframeLines,
+  getViewportCameraHitArea,
+  getViewportCameraLabelY,
+  getViewportCameraOpaqueDepthRange,
+  getViewportCameraQuaternion,
+} from "./viewportCameraGeometry";
 
 const VIEWPORT_CAMERA_LINE = "#A9D8FF";
 const VIEWPORT_CAMERA_LINE_OPACITY = 0.92;
-const VIEWPORT_CAMERA_HIT_PADDING = 0.06;
-const VIEWPORT_CAMERA_FORWARD = new Vector3(0, 0, 1);
-const VIEWPORT_CAMERA_WORLD_UP = new Vector3(0, 1, 0);
 const HIDE_FROM_VIEWPORT_CAPTURE_KEY = "hideFromViewportCapture";
-const VIEWPORT_CAMERA_BODY_CENTER: CameraWirePoint = [0, 0, -0.52 * VIEWPORT_CAMERA_VISUAL_SCALE];
-const VIEWPORT_CAMERA_BODY_SIZE: CameraWirePoint = [
-  0.4 * VIEWPORT_CAMERA_VISUAL_SCALE,
-  0.4 * VIEWPORT_CAMERA_VISUAL_SCALE,
-  1 * VIEWPORT_CAMERA_VISUAL_SCALE,
-];
-const VIEWPORT_CAMERA_BODY_FRONT_Z = VIEWPORT_CAMERA_BODY_CENTER[2] + VIEWPORT_CAMERA_BODY_SIZE[2] / 2;
-const VIEWPORT_CAMERA_LENS_TIP: CameraWirePoint = [0, 0, 0.2 * VIEWPORT_CAMERA_VISUAL_SCALE];
+const AXIS_ONLY_GIZMO_MARKER = "axisOnlyGizmo";
+const TRANSLATE_PLANE_NAMES = new Set(["XY", "YZ", "XZ"]);
+type TransformControlsGizmoInternals = {
+  gizmo: Record<string, Object3D>;
+  picker: Record<string, Object3D>;
+  updateMatrixWorld: () => void;
+  userData: Record<string, unknown>;
+};
+type AxisOnlyTransformControls = {
+  gizmo?: TransformControlsGizmoInternals;
+};
 const ROLE_LABEL_DISTANCE_FACTOR = 3;
-const IMPORTED_MODEL_TARGET_MAX_SIZE = 2;
-type CameraWirePoint = [number, number, number];
-type CameraWirePointLine = CameraWirePoint[];
-type CameraWirePart = "body" | "lens" | "reel";
-type CameraWireLine = {
-  part: CameraWirePart;
-  points: CameraWirePointLine;
-};
-type CameraHitArea = {
-  args: CameraWirePoint;
-  position: CameraWirePoint;
-};
+
+function getTransformGizmoHeight(item: DirectorObject) {
+  const height = item.transformGizmoHeight;
+  return typeof height === "number" && Number.isFinite(height) ? height : 0;
+}
+
+function getTransformGizmoOffset(height: number, rotation: Euler, scale: Vector3) {
+  return new Vector3(0, height, 0).multiply(scale).applyEuler(rotation);
+}
+
+function getTransformGizmoAnchorTransform(item: DirectorObject) {
+  const height = getTransformGizmoHeight(item);
+  const rotation = new Euler(...item.transform.rotation);
+  const scale = new Vector3(...item.transform.scale);
+  const position = new Vector3(...item.transform.position).add(getTransformGizmoOffset(height, rotation, scale));
+
+  return {
+    position: position.toArray() as [number, number, number],
+    rotation: item.transform.rotation,
+    scale: item.transform.scale,
+  };
+}
 
 function ViewportObjectLabel({
   children,
@@ -95,6 +158,24 @@ function ViewportTransformControls({
     controlsRef.current = controls;
     if (controls) {
       controls.userData[HIDE_FROM_VIEWPORT_CAPTURE_KEY] = true;
+      const axisOnlyControls = controls as unknown as AxisOnlyTransformControls;
+      const gizmo = axisOnlyControls.gizmo;
+      if (!gizmo || gizmo.userData[AXIS_ONLY_GIZMO_MARKER]) return;
+
+      const hideTranslatePlanes = () => {
+        [gizmo.gizmo.translate, gizmo.picker.translate].forEach((group) => {
+          group?.traverse((child: Object3D) => {
+            if (TRANSLATE_PLANE_NAMES.has(child.name)) child.visible = false;
+          });
+        });
+      };
+      const updateGizmo = gizmo.updateMatrixWorld;
+      gizmo.updateMatrixWorld = () => {
+        updateGizmo();
+        hideTranslatePlanes();
+      };
+      gizmo.userData[AXIS_ONLY_GIZMO_MARKER] = true;
+      hideTranslatePlanes();
     }
   }, []);
   const beginUndoBatch = useDirectorStore((state) => state.beginUndoBatch);
@@ -114,232 +195,9 @@ function ViewportTransformControls({
   );
 }
 
-export function getViewportCameraQuaternion(
-  position: [number, number, number],
-  target: [number, number, number]
-) {
-  const origin = new Vector3(...position);
-  const direction = new Vector3(...target).sub(origin);
-  if (direction.lengthSq() === 0) return new Quaternion();
-
-  const forward = direction.normalize();
-  const up =
-    Math.abs(forward.dot(VIEWPORT_CAMERA_WORLD_UP)) > 0.999
-      ? new Vector3(0, 0, 1)
-      : VIEWPORT_CAMERA_WORLD_UP;
-  const matrix = new Matrix4().lookAt(origin, origin.clone().sub(forward), up);
-
-  return new Quaternion().setFromRotationMatrix(matrix);
-}
-
-export function getViewportCameraOpaqueDepthRange() {
-  const zValues = getViewportCameraBodyWireframeLines()
-    .filter((line) => line.part !== "lens")
-    .flatMap((line) => line.points)
-    .map((point) => point[2]);
-
-  return {
-    minZ: Math.min(...zValues),
-    maxZ: Math.max(...zValues),
-  };
-}
-
-export function getViewportCameraLabelY() {
-  const points = getViewportCameraBodyWireframeLines().flatMap((line) => line.points);
-  const modelTopY = Math.max(...points.map((point) => point[1]));
-
-  return modelTopY + VIEWPORT_OBJECT_LABEL_VERTICAL_GAP;
-}
-
-export function getImportedModelNormalization(bounds: Box3, targetMaxSize = IMPORTED_MODEL_TARGET_MAX_SIZE) {
-  if (bounds.isEmpty()) {
-    return {
-      position: [0, 0, 0] as [number, number, number],
-      scale: 1,
-    };
-  }
-
-  const size = new Vector3();
-  const center = new Vector3();
-  bounds.getSize(size);
-  bounds.getCenter(center);
-
-  const maxSize = Math.max(size.x, size.y, size.z);
-  const scale = Number.isFinite(maxSize) && maxSize > 0 ? targetMaxSize / maxSize : 1;
-
-  return {
-    position: [-center.x * scale, -bounds.min.y * scale, -center.z * scale] as [number, number, number],
-    scale,
-  };
-}
-
-function createBoxWireframeLines({
-  center,
-  size,
-}: {
-  center: CameraWirePoint;
-  size: CameraWirePoint;
-}): CameraWirePointLine[] {
-  const [cx, cy, cz] = center;
-  const [width, height, depth] = size;
-  const x0 = cx - width / 2;
-  const x1 = cx + width / 2;
-  const y0 = cy - height / 2;
-  const y1 = cy + height / 2;
-  const z0 = cz - depth / 2;
-  const z1 = cz + depth / 2;
-  const corners: Record<string, CameraWirePoint> = {
-    bbl: [x0, y0, z0],
-    bbr: [x1, y0, z0],
-    btl: [x0, y1, z0],
-    btr: [x1, y1, z0],
-    fbl: [x0, y0, z1],
-    fbr: [x1, y0, z1],
-    ftl: [x0, y1, z1],
-    ftr: [x1, y1, z1],
-  };
-
-  return [
-    [corners.bbl, corners.bbr],
-    [corners.bbr, corners.btr],
-    [corners.btr, corners.btl],
-    [corners.btl, corners.bbl],
-    [corners.fbl, corners.fbr],
-    [corners.fbr, corners.ftr],
-    [corners.ftr, corners.ftl],
-    [corners.ftl, corners.fbl],
-    [corners.bbl, corners.fbl],
-    [corners.bbr, corners.fbr],
-    [corners.btr, corners.ftr],
-    [corners.btl, corners.ftl],
-  ];
-}
-
-function createCircleWireframeLine({
-  center,
-  radius,
-  segments = 32,
-  plane = "xy",
-}: {
-  center: CameraWirePoint;
-  radius: number;
-  segments?: number;
-  plane?: "xy" | "xz" | "yz";
-}): CameraWirePointLine {
-  const [cx, cy, cz] = center;
-  return Array.from({ length: segments + 1 }, (_, index) => {
-    const angle = (Math.PI * 2 * index) / segments;
-    const a = Math.cos(angle) * radius;
-    const b = Math.sin(angle) * radius;
-
-    if (plane === "xz") return [cx + a, cy, cz + b];
-    if (plane === "yz") return [cx, cy + a, cz + b];
-
-    return [cx + a, cy + b, cz];
-  });
-}
-
-function createInvertedTetrahedronLensWireframeLines(): CameraWirePointLine[] {
-  const backTopLeft: CameraWirePoint = [
-    -0.10 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    0.10 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    VIEWPORT_CAMERA_BODY_FRONT_Z,
-  ];
-  const backTopRight: CameraWirePoint = [
-    0.10 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    0.10 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    VIEWPORT_CAMERA_BODY_FRONT_Z,
-  ];
-  const backBottomRight: CameraWirePoint = [
-    0.10 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    -0.10 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    VIEWPORT_CAMERA_BODY_FRONT_Z,
-  ];
-  const backBottomLeft: CameraWirePoint = [
-    -0.10 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    -0.10 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    VIEWPORT_CAMERA_BODY_FRONT_Z,
-  ];
-
-  const frontTopLeft: CameraWirePoint = [
-    -0.25 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    0.2 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    VIEWPORT_CAMERA_LENS_TIP[2],
-  ];
-  const frontTopRight: CameraWirePoint = [
-    0.25 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    0.2 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    VIEWPORT_CAMERA_LENS_TIP[2],
-  ];
-  const frontBottomRight: CameraWirePoint = [
-    0.25 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    -0.2 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    VIEWPORT_CAMERA_LENS_TIP[2],
-  ];
-  const frontBottomLeft: CameraWirePoint = [
-    -0.25 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    -0.2 * VIEWPORT_CAMERA_VISUAL_SCALE,
-    VIEWPORT_CAMERA_LENS_TIP[2],
-  ];
-
-  return [
-    [backTopLeft, backTopRight, backBottomRight, backBottomLeft, backTopLeft],
-    [frontTopLeft, frontTopRight, frontBottomRight, frontBottomLeft, frontTopLeft],
-
-    [backTopLeft, frontTopLeft],
-    [backTopRight, frontTopRight],
-    [backBottomRight, frontBottomRight],
-    [backBottomLeft, frontBottomLeft],
-
-  ];
-}
-function withCameraPart(part: CameraWirePart, lines: CameraWirePointLine[]): CameraWireLine[] {
-  return lines.map((points) => ({ part, points }));
-}
-
-export function getViewportCameraBodyWireframeLines(): CameraWireLine[] {
-  return [
-    ...withCameraPart("body", [
-      ...createBoxWireframeLines({ center: VIEWPORT_CAMERA_BODY_CENTER, size: VIEWPORT_CAMERA_BODY_SIZE }),
-    ]),
-    ...withCameraPart("lens", createInvertedTetrahedronLensWireframeLines()),
-    ...withCameraPart("reel", [
-      createCircleWireframeLine({
-        center: [0, 0.44 * VIEWPORT_CAMERA_VISUAL_SCALE, -0.78 * VIEWPORT_CAMERA_VISUAL_SCALE],
-        radius: 0.21 * VIEWPORT_CAMERA_VISUAL_SCALE,
-        plane: "yz",
-      }),
-      createCircleWireframeLine({
-        center: [0, 0.44 * VIEWPORT_CAMERA_VISUAL_SCALE, -0.34 * VIEWPORT_CAMERA_VISUAL_SCALE],
-        radius: 0.21 * VIEWPORT_CAMERA_VISUAL_SCALE,
-        plane: "yz",
-      }),
-    ]),
-  ];
-}
-
-export function getViewportCameraHitArea(): CameraHitArea {
-  const points = getViewportCameraBodyWireframeLines().flatMap((line) => line.points);
-  const minX = Math.min(...points.map((point) => point[0]));
-  const maxX = Math.max(...points.map((point) => point[0]));
-  const minY = Math.min(...points.map((point) => point[1]));
-  const maxY = Math.max(...points.map((point) => point[1]));
-  const minZ = Math.min(...points.map((point) => point[2]));
-  const maxZ = Math.max(...points.map((point) => point[2]));
-
-  return {
-    args: [
-      maxX - minX + VIEWPORT_CAMERA_HIT_PADDING * 2,
-      maxY - minY + VIEWPORT_CAMERA_HIT_PADDING * 2,
-      maxZ - minZ + VIEWPORT_CAMERA_HIT_PADDING * 2,
-    ],
-    position: [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2],
-  };
-}
-
-function NormalizedImportedObject({ object }: { object: Object3D }) {
+function NormalizedImportedObject({ color, object }: { color?: string; object: Object3D }) {
   const { clone, normalization } = useMemo(() => {
-    const clonedObject = object.clone(true);
+    const clonedObject = cloneSkeleton(object) as Object3D;
     clonedObject.updateMatrixWorld(true);
 
     return {
@@ -347,6 +205,9 @@ function NormalizedImportedObject({ object }: { object: Object3D }) {
       normalization: getImportedModelNormalization(new Box3().setFromObject(clonedObject)),
     };
   }, [object]);
+
+  useLayoutEffect(() => isolateAndTintModelMaterials(clone, color), [clone, color]);
+  useEffect(() => () => disposeIsolatedModelMaterials(clone), [clone]);
 
   return (
     <group
@@ -358,27 +219,37 @@ function NormalizedImportedObject({ object }: { object: Object3D }) {
   );
 }
 
-function FbxModel({ url }: { url: string }) {
+function FbxModel({ color, url }: { color?: string; url: string }) {
   const object = useLoader(FBXLoader, url);
 
-  return <NormalizedImportedObject object={object} />;
+  return <NormalizedImportedObject color={color} object={object} />;
 }
 
-function ObjModel({ url }: { url: string }) {
+function ObjModel({ color, url }: { color?: string; url: string }) {
   const object = useLoader(OBJLoader, url);
 
-  return <NormalizedImportedObject object={object} />;
+  return <NormalizedImportedObject color={color} object={object} />;
+}
+
+function GlbModel({ color, url }: { color?: string; url: string }) {
+  const loaded = useLoader(GLTFLoader, url);
+
+  return <NormalizedImportedObject color={color} object={loaded.scene} />;
 }
 
 function ImportedModel({
+  color,
   fileName,
   url,
 }: {
+  color?: string;
   fileName: string;
   url: string;
 }) {
-  if (/\.fbx$/i.test(fileName)) return <FbxModel url={url} />;
-  if (/\.obj$/i.test(fileName)) return <ObjModel url={url} />;
+  if (url.startsWith("builtin://life/")) return <BuiltInLifeModel color={color} modelId={fileName} />;
+  if (/\.fbx$/i.test(fileName)) return <FbxModel color={color} url={url} />;
+  if (/\.obj$/i.test(fileName)) return <ObjModel color={color} url={url} />;
+  if (/\.glb$/i.test(fileName)) return <GlbModel color={color} url={url} />;
   return null;
 }
 
@@ -447,29 +318,52 @@ function GeometryPrimitiveModel({
 function ObjectSceneNode({
   asset,
   item,
+  motionObjects,
+  motionScene,
   selected,
   showLabels,
   transformMode,
   transformable,
   translationSnap,
   onSelect,
+  motionPhase = 0,
+  motionWalking = false,
+  motionTimeSeconds = 0,
+  motionDurationSeconds = 6,
+  motionProgress = 0,
 }: {
   asset?: DirectorAssetRef;
   item: DirectorObject;
+  motionObjects: DirectorObject[];
+  motionScene: SceneSettings;
   selected: boolean;
   showLabels: boolean;
   transformMode: TransformMode;
   transformable: boolean;
   translationSnap: number | null;
   onSelect?: (item: DirectorObject) => void;
+  motionPhase?: number;
+  motionWalking?: boolean;
+  motionTimeSeconds?: number;
+  motionDurationSeconds?: number;
+  motionProgress?: number;
 }) {
   const groupRef = useRef<Group>(null!);
+  const gizmoAnchorRef = useRef<Group>(null!);
   const [measuredCharacterLabel, setMeasuredCharacterLabel] = useState<{
     key: string;
     y: number;
   } | null>(null);
   const updateObjectTransform = useDirectorStore((state) => state.updateObjectTransform);
-  const isImportedModel = asset?.sourceType === "model";  const characterLabelKey = `${item.id}:${item.bodyType ?? ""}:${item.characterRig?.rigType ?? ""}`;
+  const pilotHoveredTargetId = useDirectorStore((state) => state.cameraPilotHoveredTargetId);
+  const pilotLockedTargetId = useDirectorStore((state) => state.cameraPilotLockedTargetId);
+  const animationAssets = useDirectorStore((state) => state.project.animationAssets);
+  const characterActionPreview = useDirectorStore((state) => state.characterActionPreview);
+  const initialRouteActionPresetId = getObjectMotionActionPresetId(item, motionProgress, motionDurationSeconds);
+  const [runtimeActionPresetId, setRuntimeActionPresetId] = useState(initialRouteActionPresetId);
+  const isImportedModel = asset?.sourceType === "model";
+  const resolvedAssetUrl = useResolvedLocalAssetUrl(isImportedModel ? asset : undefined);
+  const characterLabelKey = `${item.id}:${item.bodyType ?? ""}:${item.characterRig?.rigType ?? ""}`;
   const fallbackCharacterLabelY =
     item.kind === "character"
       ? item.characterRig?.rigType === "ue4-mannequin"
@@ -478,6 +372,54 @@ function ObjectSceneNode({
       : 1.25;
   const characterLabelY =
     measuredCharacterLabel?.key === characterLabelKey ? measuredCharacterLabel.y : fallbackCharacterLabelY;
+  const focusOffsetY = item.kind === "character" ? Math.max(0.8, characterLabelY * 0.58) : 0.75;
+  const pilotTargetState = pilotLockedTargetId === item.id ? "locked" : pilotHoveredTargetId === item.id ? "hovered" : null;
+  const routeActionPresetId = characterActionPreview?.objectId === item.id
+    ? characterActionPreview.actionPresetId
+    : runtimeActionPresetId;
+  const resolvedActionPresetId = routeActionPresetId ?? (motionWalking ? "walk-cycle" : null);
+  const importedActionRef = parseImportedCharacterActionId(resolvedActionPresetId);
+  const importedAnimationAsset = importedActionRef
+    ? (animationAssets ?? []).find(
+        (animationAsset) => animationAsset.id === importedActionRef.animationAssetId
+      )
+    : undefined;
+  const importedAnimationClip = importedAnimationAsset?.clips.find((clip) => clip.id === importedActionRef?.clipId);
+  const resolvedAnimationUrl = useResolvedLocalAssetUrl(importedAnimationAsset);
+  const gizmoHeight = getTransformGizmoHeight(item);
+  const gizmoAnchorTransform = useMemo(() => getTransformGizmoAnchorTransform(item), [item]);
+  const animatedCharacterRig = useMemo(() => {
+    if (!item.characterRig) return item.characterRig;
+    const actionPresetId = routeActionPresetId;
+    if (actionPresetId) {
+      return {
+        ...item.characterRig,
+        controls: sampleCharacterActionControls(
+          actionPresetId,
+          motionTimeSeconds,
+          item.characterRig.controls
+        ),
+      };
+    }
+    if (!motionWalking) return item.characterRig;
+    const stride = Math.sin(motionPhase) * 28;
+    const leftKnee = Math.max(0, Math.sin(motionPhase + Math.PI / 2)) * 24;
+    const rightKnee = Math.max(0, Math.sin(motionPhase - Math.PI / 2)) * 24;
+    return {
+      ...item.characterRig,
+      controls: {
+        ...item.characterRig.controls,
+        "body.offsetY": (item.characterRig.controls["body.offsetY"] ?? 0) + Math.abs(Math.cos(motionPhase)) * 0.025,
+        "body.pitch": (item.characterRig.controls["body.pitch"] ?? 0) - 3,
+        "leftShoulder.pitch": -stride * 0.72,
+        "rightShoulder.pitch": stride * 0.72,
+        "leftHip.pitch": stride,
+        "rightHip.pitch": -stride,
+        "leftKnee.bend": leftKnee,
+        "rightKnee.bend": rightKnee,
+      },
+    };
+  }, [item, motionPhase, motionTimeSeconds, motionWalking, routeActionPresetId]);
   const handleCharacterLabelAnchorYChange = useCallback(
     (anchorY: number) => {
       setMeasuredCharacterLabel((current) => {
@@ -496,9 +438,35 @@ function ObjectSceneNode({
     [characterLabelKey]
   );
 
+  useEffect(() => subscribeRuntimePlayback((progress) => {
+    const group = groupRef.current;
+    if (!group?.position?.set || !group.rotation?.set || !group.scale?.set) return;
+    if (item.motionPath?.keyframes.length) {
+      const nextTransform = constrainObjectMotionTransform(
+        item,
+        getObjectMotionSnapshot(item, progress, motionDurationSeconds),
+        motionScene,
+        motionObjects
+      );
+      group.position.set(...nextTransform.position);
+      group.rotation.set(...nextTransform.rotation);
+      group.scale.set(...nextTransform.scale);
+      group.updateMatrixWorld(true);
+    }
+    const nextAction = getObjectMotionActionPresetId(item, progress, motionDurationSeconds);
+    setRuntimeActionPresetId((current) => current === nextAction ? current : nextAction);
+  }), [item, motionDurationSeconds, motionObjects, motionScene]);
+
   function commitTransformFromViewport() {
     const group = groupRef.current;
-    if (!group) return;
+    const gizmoAnchor = gizmoAnchorRef.current;
+    if (!group || !gizmoAnchor) return;
+
+    const gizmoOffset = getTransformGizmoOffset(gizmoHeight, gizmoAnchor.rotation, gizmoAnchor.scale);
+    group.position.copy(gizmoAnchor.position).sub(gizmoOffset);
+    group.rotation.copy(gizmoAnchor.rotation);
+    group.scale.copy(gizmoAnchor.scale);
+    group.updateMatrixWorld(true);
 
     updateObjectTransform(item.id, {
       position: [group.position.x, group.position.y, group.position.z],
@@ -510,6 +478,7 @@ function ObjectSceneNode({
   const node = (
     <group
       ref={groupRef}
+      name={getDirectorObjectSceneNodeName(item.id)}
       position={item.transform.position}
       rotation={item.transform.rotation}
       scale={item.transform.scale}
@@ -517,25 +486,57 @@ function ObjectSceneNode({
         event.stopPropagation();
         onSelect?.(item);
       }}
+      userData={{
+        directorObjectId: item.id,
+        directorObjectName: item.name,
+        directorFocusOffset: [0, focusOffsetY, 0],
+        [DIRECTOR_CHARACTER_BONE_MAP_USER_DATA_KEY]: asset?.characterBoneMap,
+      }}
     >
-      {isImportedModel && asset ? (
-        <Suspense fallback={null}>
-          <ImportedModel fileName={asset.fileName} url={asset.url} />
-        </Suspense>
-      ) : item.kind === "character" ? (
+      {pilotTargetState ? (
+        <group position={[0, focusOffsetY, 0]} userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}>
+          <mesh rotation={[Math.PI / 2, 0, 0]}>
+            <ringGeometry args={[0.62, 0.68, 40]} />
+            <meshBasicMaterial color={pilotTargetState === "locked" ? "#4ADE80" : "#F7B955"} depthTest={false} transparent opacity={0.95} />
+          </mesh>
+          <ViewportObjectLabel position={[0, 0.42, 0]}>
+            {pilotTargetState === "locked" ? `已锁定 · ${item.name}` : `${item.name} · F 锁定`}
+          </ViewportObjectLabel>
+        </group>
+      ) : null}
+      {item.kind === "character" ? (
         <>
           <Suspense fallback={null}>
             <CharacterModel
+              actionPresetId={resolvedActionPresetId}
+              animationTimeSeconds={motionTimeSeconds}
+              assetUrl={isImportedModel ? resolvedAssetUrl : undefined}
+              assetFormat={asset?.modelFormat}
+              externalAnimation={resolvedAnimationUrl && importedAnimationAsset && importedAnimationClip
+                ? {
+                    url: resolvedAnimationUrl,
+                    format: importedAnimationAsset.modelFormat,
+                    clipName: importedAnimationClip.name,
+                  }
+                : null}
+              orientationCorrection={asset?.characterOrientationCorrection}
+              boneMap={asset?.characterBoneMap}
               bodyType={item.bodyType}
               color={item.color}
+              motionWalking={motionWalking}
               onLabelAnchorYChange={handleCharacterLabelAnchorYChange}
-              rigState={item.characterRig}
+              rigState={animatedCharacterRig}
+              runtimeMotion={{ duration: motionDurationSeconds, object: item }}
             />
           </Suspense>
           {showLabels ? (
             <ViewportObjectLabel position={[0, characterLabelY, 0]}>{item.name}</ViewportObjectLabel>
           ) : null}
         </>
+      ) : isImportedModel && asset && resolvedAssetUrl ? (
+        <Suspense fallback={null}>
+          <ImportedModel color={item.color} fileName={asset.fileName} url={resolvedAssetUrl} />
+        </Suspense>
       ) : item.kind === "prop" && item.geometryType ? (
         <GeometryPrimitiveModel color={item.color} geometryType={item.geometryType} />
       ) : item.kind === "billboard" && item.imageUrl ? (
@@ -555,9 +556,16 @@ function ObjectSceneNode({
   return (
     <>
       {node}
+      <group
+        ref={gizmoAnchorRef}
+        position={gizmoAnchorTransform.position}
+        rotation={gizmoAnchorTransform.rotation}
+        scale={gizmoAnchorTransform.scale}
+        userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}
+      />
       <ViewportTransformControls
         mode={transformMode}
-        object={groupRef}
+        object={gizmoAnchorRef}
         onObjectChange={commitTransformFromViewport}
         translationSnap={transformMode === "translate" ? translationSnap : null}
       />
@@ -616,11 +624,13 @@ function CrowdTransformRig({
 }
 
 export function getViewportCameraFrustumLines(
-  _camera: DirectorCameraShot
+  camera: DirectorCameraShot,
+  fov = camera.fov,
 ): Array<[[number, number, number], [number, number, number]]> {
   const frameDepth = VIEWPORT_CAMERA_FRUSTUM_DEPTH;
-  const halfWidth = VIEWPORT_CAMERA_FRUSTUM_FRAME_WIDTH / 2;
-  const halfHeight = VIEWPORT_CAMERA_FRUSTUM_FRAME_WIDTH / VIEWPORT_CAMERA_ASPECT / 2;
+  const safeFov = getVerticalFovFromFocalLength(fov);
+  const halfHeight = frameDepth * Math.tan((safeFov * Math.PI) / 360);
+  const halfWidth = halfHeight * VIEWPORT_CAMERA_ASPECT;
   const topLeft: [number, number, number] = [-halfWidth, halfHeight, frameDepth];
   const topRight: [number, number, number] = [halfWidth, halfHeight, frameDepth];
   const bottomRight: [number, number, number] = [halfWidth, -halfHeight, frameDepth];
@@ -636,6 +646,66 @@ export function getViewportCameraFrustumLines(
     [bottomRight, bottomLeft],
     [bottomLeft, topLeft],
   ];
+}
+
+function ViewportCameraTargetRig({
+  cameraId,
+  position,
+  selected,
+  transformable,
+  translationSnap,
+}: {
+  cameraId: string;
+  position: [number, number, number];
+  selected: boolean;
+  transformable: boolean;
+  translationSnap: number | null;
+}) {
+  const groupRef = useRef<Group>(null!);
+  const updateCamera = useDirectorStore((state) => state.updateCamera);
+
+  useLayoutEffect(() => {
+    groupRef.current?.position.set(...position);
+  }, [position]);
+
+  function commitTargetFromViewport() {
+    const group = groupRef.current;
+    if (!group) return;
+
+    updateCamera(cameraId, {
+      targetMode: "manual",
+      targetObjectId: null,
+      target: [group.position.x, group.position.y, group.position.z],
+    });
+  }
+
+  const node = (
+    <group
+      ref={groupRef}
+      name={`${cameraId}-target-control`}
+      position={position}
+      userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}
+    >
+      <mesh>
+        <sphereGeometry args={[0.12, 16, 12]} />
+        <meshBasicMaterial color={selected ? "#FFD166" : "#9FE3FF"} depthTest={false} opacity={0.95} transparent />
+      </mesh>
+    </group>
+  );
+
+  if (!selected || !transformable) return node;
+
+  return (
+    <>
+      {node}
+      <ViewportTransformControls
+        mode="translate"
+        object={groupRef}
+        onObjectChange={commitTargetFromViewport}
+        translationSnap={translationSnap}
+      />
+    </>
+  );
 }
 
 function ViewportCameraRig({
@@ -658,18 +728,53 @@ function ViewportCameraRig({
   const groupRef = useRef<Group>(null!);
   const selectObject = useDirectorStore((state) => state.selectObject);
   const updateCamera = useDirectorStore((state) => state.updateCamera);
+  const objects = useDirectorStore((state) => state.project.objects);
   const bodyWireframeLines = useMemo(() => getViewportCameraBodyWireframeLines(), []);
   const cameraHitArea = useMemo(() => getViewportCameraHitArea(), []);
   const cameraLabelY = useMemo(() => getViewportCameraLabelY(), []);
-  const frustumLines = useMemo(() => getViewportCameraFrustumLines(camera), [camera]);
+  const motionPath = useMemo(() => getCameraMotionPath(camera), [camera]);
+  const followsMotionPath = motionPath.keyframes.length >= 2;
+  const displayedSnapshot = useMemo(
+    () => {
+      const progress = getRuntimePlaybackProgress();
+      const snapshot = followsMotionPath
+        ? getCameraMotionSnapshot(camera, progress)
+        : {
+            position: camera.transform.position,
+            target: camera.target,
+            fov: camera.fov,
+          };
+      const trackingTarget = getAnimatedCameraFocusTarget(camera, objects, progress);
+      return trackingTarget ? { ...snapshot, target: trackingTarget } : snapshot;
+    },
+    [camera, followsMotionPath, objects]
+  );
+  const frustumLines = useMemo(
+    () => getViewportCameraFrustumLines(camera, displayedSnapshot.fov),
+    [camera, displayedSnapshot.fov]
+  );
   const cameraQuaternion = useMemo(
-    () => getViewportCameraQuaternion(camera.transform.position, camera.target),
-    [camera.target, camera.transform.position]
+    () => getViewportCameraQuaternion(displayedSnapshot.position, displayedSnapshot.target),
+    [displayedSnapshot.position, displayedSnapshot.target]
   );
 
   useLayoutEffect(() => {
+    groupRef.current?.position?.set?.(...displayedSnapshot.position);
     groupRef.current?.quaternion?.copy?.(cameraQuaternion);
-  }, [cameraQuaternion]);
+  }, [cameraQuaternion, displayedSnapshot.position]);
+
+  useEffect(() => {
+    if (!followsMotionPath) return;
+
+    return subscribeRuntimePlayback((progress) => {
+      const group = groupRef.current;
+      if (!group) return;
+      const snapshot = getCameraMotionSnapshot(camera, progress);
+      group.position.set(...snapshot.position);
+      group.quaternion.copy(getViewportCameraQuaternion(snapshot.position, snapshot.target));
+      group.updateMatrixWorld();
+    });
+  }, [camera, followsMotionPath]);
 
   function commitCameraTransformFromViewport() {
     const group = groupRef.current;
@@ -677,7 +782,7 @@ function ViewportCameraRig({
 
     const position: [number, number, number] = [group.position.x, group.position.y, group.position.z];
     const forward = VIEWPORT_CAMERA_FORWARD.clone().applyQuaternion(group.quaternion).normalize();
-    const currentDistance = new Vector3(...camera.target).distanceTo(group.position);
+    const currentDistance = new Vector3(...displayedSnapshot.target).distanceTo(group.position);
     const nextTarget = group.position.clone().add(forward.multiplyScalar(Math.max(currentDistance, 0.1)));
 
     updateCamera(camera.id, {
@@ -698,7 +803,7 @@ function ViewportCameraRig({
   const node = (
     <group
       ref={groupRef}
-      position={camera.transform.position}
+      position={displayedSnapshot.position}
       quaternion={cameraQuaternion}
       scale={object?.transform.scale ?? [1, 1, 1]}
       userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}
@@ -741,11 +846,18 @@ function ViewportCameraRig({
     </group>
   );
 
-  if (!selected || !transformable) return node;
+  if (!selected || !transformable || followsMotionPath) return node;
 
   return (
     <>
       {node}
+      <ViewportCameraTargetRig
+        cameraId={camera.id}
+        position={displayedSnapshot.target}
+        selected={selected}
+        transformable={transformable}
+        translationSnap={translationSnap}
+      />
       <ViewportTransformControls
         mode={transformMode}
         object={groupRef}
@@ -756,20 +868,700 @@ function ViewportCameraRig({
   );
 }
 
-export function SceneRoot() {
+function CameraMotionKeyframeHandle({
+  cameraId,
+  keyframe,
+  arrivalProgress,
+  index,
+  selected,
+  showTransformControls,
+  simpleLabel,
+  playbackState,
+  translationSnap,
+}: {
+  cameraId: string;
+  keyframe: DirectorCameraMotionKeyframe;
+  arrivalProgress: number;
+  index: number;
+  selected: boolean;
+  showTransformControls: boolean;
+  simpleLabel: boolean;
+  playbackState: "idle" | "reached" | "approaching";
+  translationSnap: number | null;
+}) {
+  const groupRef = useRef<Group>(null!);
+  const selectCameraMotionKeyframe = useDirectorStore((state) => state.selectCameraMotionKeyframe);
+  const updateCameraMotionKeyframe = useDirectorStore((state) => state.updateCameraMotionKeyframe);
+  const setCameraMotionProgress = useDirectorStore((state) => state.setCameraMotionProgress);
+
+  function selectKeyframe(event: ThreeEvent<MouseEvent>) {
+    event.stopPropagation();
+    selectCameraMotionKeyframe(keyframe.id);
+    setCameraMotionProgress(arrivalProgress);
+  }
+
+  function commitKeyframePosition() {
+    const group = groupRef.current;
+    if (!group) return;
+    updateCameraMotionKeyframe(cameraId, keyframe.id, {
+      position: [group.position.x, group.position.y, group.position.z],
+    });
+  }
+
+  const node = (
+    <group
+      ref={groupRef}
+      position={keyframe.position}
+      onClick={selectKeyframe}
+      userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}
+    >
+      <mesh name={`${keyframe.id}-motion-handle`} onClick={selectKeyframe}>
+        <sphereGeometry args={[selected || playbackState !== "idle" ? 0.17 : 0.13, 20, 14]} />
+        <meshBasicMaterial
+          color={playbackState === "reached" ? "#FFD08A" : playbackState === "approaching" ? "#FFF1C7" : selected ? "#FFD09A" : "#F5A65B"}
+          depthTest={false}
+          visible={!showTransformControls}
+        />
+      </mesh>
+      {playbackState === "approaching" ? (
+        <mesh name={`${keyframe.id}-approaching-pulse`}>
+          <sphereGeometry args={[0.26, 20, 14]} />
+          <meshBasicMaterial color="#FFD08A" depthTest={false} opacity={0.22} transparent />
+        </mesh>
+      ) : null}
+      <ViewportObjectLabel position={[0, 0.34, 0]}>
+        <span className={`camera-motion-point-label is-${playbackState}`}>{simpleLabel ? index + 1 : `K${index + 1}`}</span>
+      </ViewportObjectLabel>
+    </group>
+  );
+
+  if (!showTransformControls) return node;
+
+  return (
+    <>
+      {node}
+      <ViewportTransformControls
+        mode="translate"
+        object={groupRef}
+        onObjectChange={commitKeyframePosition}
+        translationSnap={translationSnap}
+      />
+    </>
+  );
+}
+
+function CameraMotionSelectionTransform({
+  cameraId,
+  keyframes,
+  translationSnap,
+}: {
+  cameraId: string;
+  keyframes: DirectorCameraMotionKeyframe[];
+  translationSnap: number | null;
+}) {
+  const groupRef = useRef<Group>(null!);
+  const translateSelectedCameraMotionKeyframes = useDirectorStore(
+    (state) => state.translateSelectedCameraMotionKeyframes
+  );
+  const center = useMemo<[number, number, number]>(() => {
+    if (keyframes.length === 0) return [0, 0, 0];
+    const sum = keyframes.reduce(
+      (result, keyframe) => [
+        result[0] + keyframe.position[0],
+        result[1] + keyframe.position[1],
+        result[2] + keyframe.position[2],
+      ] as [number, number, number],
+      [0, 0, 0] as [number, number, number]
+    );
+    return [sum[0] / keyframes.length, sum[1] / keyframes.length, sum[2] / keyframes.length];
+  }, [keyframes]);
+  const lastCommittedPositionRef = useRef(new Vector3(...center));
+
+  useLayoutEffect(() => {
+    const nextCenter = new Vector3(...center);
+    groupRef.current?.position?.copy?.(nextCenter);
+    lastCommittedPositionRef.current.copy(nextCenter);
+  }, [center]);
+
+  function commitSelectionPosition() {
+    const group = groupRef.current;
+    if (!group) return;
+    const lastPosition = lastCommittedPositionRef.current;
+    const offset: [number, number, number] = [
+      group.position.x - lastPosition.x,
+      group.position.y - lastPosition.y,
+      group.position.z - lastPosition.z,
+    ];
+    if (offset.every((value) => Math.abs(value) <= 0.000001)) return;
+    lastPosition.copy(group.position);
+    translateSelectedCameraMotionKeyframes(cameraId, offset);
+  }
+
+  if (keyframes.length < 2) return null;
+
+  return (
+    <>
+      <group
+        ref={groupRef}
+        name="camera-motion-multi-selection"
+        position={center}
+        userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}
+      >
+        <ViewportObjectLabel position={[0, 0.48, 0]}>已选 {keyframes.length} 个轨迹点</ViewportObjectLabel>
+      </group>
+      <ViewportTransformControls
+        mode="translate"
+        object={groupRef}
+        onObjectChange={commitSelectionPosition}
+        translationSnap={translationSnap}
+      />
+    </>
+  );
+}
+
+function RuntimeCameraMotionPlayhead({
+  camera,
+  objects,
+  sceneRootRef,
+  sceneSettings,
+}: {
+  camera: DirectorCameraShot;
+  objects: DirectorObject[];
+  sceneRootRef: MutableRefObject<Group | null>;
+  sceneSettings: SceneSettings;
+}) {
+  const groupRef = useRef<Group>(null);
+  const directionRef = useRef<Line2>(null);
+  const smoothingStateRef = useRef(createCameraTrackingSmoothingState());
+  const initialSnapshot = useMemo(() => {
+    const snapshot = getCameraMotionSnapshot(camera, getRuntimePlaybackProgress());
+    const trackingTarget = getAnimatedCameraFocusTarget(camera, objects, getRuntimePlaybackProgress());
+    return trackingTarget ? { ...snapshot, target: trackingTarget } : snapshot;
+  }, [camera, objects]);
+
+  const updatePlayhead = useCallback((progress: number) => {
+    const group = groupRef.current;
+    const sceneRoot = sceneRootRef.current;
+    if (!group || !sceneRoot) return;
+    const snapshot = getRuntimeCameraPlaybackSnapshot({
+      camera,
+      objects,
+      progress,
+      scene: sceneRoot,
+      sceneSettings,
+      smoothingState: smoothingStateRef.current,
+    });
+    group.position.set(...snapshot.position);
+    group.updateMatrixWorld(true);
+    directionRef.current?.geometry.setPositions([
+      0, 0, 0,
+      snapshot.target[0] - snapshot.position[0],
+      snapshot.target[1] - snapshot.position[1],
+      snapshot.target[2] - snapshot.position[2],
+    ]);
+    directionRef.current?.computeLineDistances();
+  }, [camera, objects, sceneRootRef, sceneSettings]);
+
+  useLayoutEffect(() => updatePlayhead(getRuntimePlaybackProgress()), [updatePlayhead]);
+  useEffect(() => subscribeRuntimePlayback(updatePlayhead), [updatePlayhead]);
+
+  return (
+    <group
+      ref={groupRef}
+      name="camera-motion-playhead"
+      position={initialSnapshot.position}
+      userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}
+    >
+      <mesh>
+        <sphereGeometry args={[0.12, 20, 14]} />
+        <meshBasicMaterial color="#FFFFFF" depthTest={false} />
+      </mesh>
+      <Line
+        ref={directionRef}
+        color="#FFFFFF"
+        lineWidth={2}
+        name="camera-motion-playhead-direction"
+        opacity={0.72}
+        points={[
+          [0, 0, 0],
+          [
+            initialSnapshot.target[0] - initialSnapshot.position[0],
+            initialSnapshot.target[1] - initialSnapshot.position[1],
+            initialSnapshot.target[2] - initialSnapshot.position[2],
+          ],
+        ]}
+        transparent
+      />
+    </group>
+  );
+}
+
+function CameraMotionPathRig({
+  camera,
+  scene,
+  sceneRootRef,
+  translationSnap,
+}: {
+  camera: DirectorCameraShot;
+  scene: SceneSettings;
+  sceneRootRef: MutableRefObject<Group | null>;
+  translationSnap: number | null;
+}) {
+  const selectedCameraKeyframeId = useDirectorStore((state) => state.selectedCameraKeyframeId);
+  const selectedCameraKeyframeIds = useDirectorStore((state) => state.selectedCameraKeyframeIds);
+  const cameraMotionProgress = getRuntimePlaybackProgress();
+  const cameraMotionPlaying = useDirectorStore((state) => state.cameraMotionPlaying);
+  const motionStudioOpen = useDirectorStore((state) => state.motionStudioOpen);
+  const objects = useDirectorStore((state) => state.project.objects);
+  const motionPath = useMemo(() => getCameraMotionPath(camera), [camera]);
+  const effectiveSelectedIds = selectedCameraKeyframeIds.length > 0
+    ? selectedCameraKeyframeIds
+    : selectedCameraKeyframeId
+      ? [selectedCameraKeyframeId]
+      : [];
+  const selectedIdSet = useMemo(() => new Set(effectiveSelectedIds), [effectiveSelectedIds]);
+  const selectedKeyframes = useMemo(
+    () => motionPath.keyframes.filter((keyframe) => selectedIdSet.has(keyframe.id)),
+    [motionPath.keyframes, selectedIdSet]
+  );
+  const points = useMemo(
+    () => sampleCameraMotionPath(camera, 80).map((position) => constrainCameraPosition(position, scene, objects)),
+    [camera, objects, scene]
+  );
+  const timelinePreviewActive = cameraMotionPlaying || cameraMotionProgress > 0.0001;
+  const activeIndex = useMemo(
+    () => getCameraMotionActiveKeyframeIndex(camera, cameraMotionProgress),
+    [camera, cameraMotionProgress]
+  );
+  const activeSegmentPoints = useMemo(() => {
+    const pathStart = motionPath.keyframes[0]?.time ?? 0;
+    const pathEnd = Math.max(pathStart, cameraMotionProgress);
+    if (!timelinePreviewActive || activeIndex < 0 || pathEnd - pathStart <= 0.0001) return [];
+    const sampleCount = Math.max(2, Math.ceil((pathEnd - pathStart) * 80));
+    return Array.from({ length: sampleCount }, (_, index) => {
+      const progress = pathStart + (pathEnd - pathStart) * (index / (sampleCount - 1));
+      return constrainCameraPosition(getCameraMotionSnapshot(camera, progress).position, scene, objects);
+    });
+  }, [activeIndex, camera, cameraMotionProgress, motionPath.keyframes, objects, scene, timelinePreviewActive]);
+  if (motionPath.keyframes.length === 0) return null;
+
+  return (
+    <group userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}>
+      {points.length >= 2 ? (
+        <Line
+          color="#F5A65B"
+          lineWidth={2}
+          opacity={0.92}
+          points={points}
+          transparent
+          userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}
+        />
+      ) : null}
+      {activeSegmentPoints.length >= 2 ? (
+        <Line
+          color="#FFD08A"
+          lineWidth={5}
+          name="camera-motion-active-segment"
+          opacity={0.96}
+          points={activeSegmentPoints}
+          transparent
+          userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}
+        />
+      ) : null}
+      {motionPath.keyframes.map((keyframe, index) => (
+        <CameraMotionKeyframeHandle
+          key={keyframe.id}
+          cameraId={camera.id}
+          arrivalProgress={getCameraMotionKeyframeArrivalProgress(camera, index)}
+          index={index}
+          keyframe={keyframe}
+          playbackState={
+            timelinePreviewActive
+              ? index <= activeIndex
+                ? "reached"
+                : index === activeIndex + 1
+                  ? "approaching"
+                  : "idle"
+              : "idle"
+          }
+          selected={selectedIdSet.has(keyframe.id)}
+          showTransformControls={selectedKeyframes.length === 1 && selectedCameraKeyframeId === keyframe.id}
+          simpleLabel={motionStudioOpen}
+          translationSnap={translationSnap}
+        />
+      ))}
+      <CameraMotionSelectionTransform
+        cameraId={camera.id}
+        keyframes={selectedKeyframes}
+        translationSnap={translationSnap}
+      />
+      {timelinePreviewActive ? (
+        <RuntimeCameraMotionPlayhead
+          camera={camera}
+          objects={objects}
+          sceneRootRef={sceneRootRef}
+          sceneSettings={scene}
+        />
+      ) : null}
+    </group>
+  );
+}
+
+function CharacterRoutePointHandle({
+  characterId,
+  keyframe,
+  index,
+  active,
+  selected,
+  translationSnap,
+  transformMode,
+}: {
+  characterId: string;
+  keyframe: DirectorObjectMotionKeyframe;
+  index: number;
+  active: boolean;
+  selected: boolean;
+  translationSnap: number | null;
+  transformMode: TransformMode;
+}) {
+  const groupRef = useRef<Group>(null!);
+  const selectObject = useDirectorStore((state) => state.selectObject);
+  const selectObjectMotionKeyframe = useDirectorStore((state) => state.selectObjectMotionKeyframe);
+  const updateObjectMotionKeyframe = useDirectorStore((state) => state.updateObjectMotionKeyframe);
+
+  function selectPoint(event: ThreeEvent<MouseEvent>) {
+    event.stopPropagation();
+    selectObject(characterId);
+    selectObjectMotionKeyframe(keyframe.id);
+  }
+
+  function commitTransform() {
+    const group = groupRef.current;
+    if (!group) return;
+    updateObjectMotionKeyframe(characterId, keyframe.id, {
+      transform: {
+        position: [group.position.x, group.position.y, group.position.z],
+        rotation: [group.rotation.x, group.rotation.y, group.rotation.z],
+        scale: keyframe.transform.scale,
+      },
+    });
+  }
+
+  const node = (
+    <group
+      ref={groupRef}
+      position={keyframe.transform.position}
+      rotation={keyframe.transform.rotation}
+      onClick={selectPoint}
+      userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}
+    >
+      <mesh name={`${keyframe.id}-character-route-handle`} onClick={selectPoint}>
+        <sphereGeometry args={[selected ? 0.2 : 0.15, 20, 14]} />
+        <meshBasicMaterial color={selected ? "#B9F7D0" : "#4ADE80"} depthTest={false} />
+      </mesh>
+      <mesh
+        name={`${keyframe.id}-character-route-ring`}
+        rotation={[-Math.PI / 2, 0, 0]}
+        position={[0, 0.018, 0]}
+        renderOrder={20}
+      >
+        <ringGeometry args={[
+          selected ? 0.3 : 0.27,
+          selected ? 0.43 : 0.37,
+          36,
+        ]} />
+        <meshBasicMaterial
+          color={active ? "#F4FFF7" : selected ? "#B9F7D0" : "#4ADE80"}
+          depthTest={false}
+          depthWrite={false}
+          transparent
+          opacity={1}
+        />
+      </mesh>
+      <mesh
+        name={`${keyframe.id}-character-route-ring-glow`}
+        rotation={[-Math.PI / 2, 0, 0]}
+        position={[0, 0.016, 0]}
+        renderOrder={19}
+      >
+        <ringGeometry args={[selected ? 0.44 : 0.38, selected ? 0.5 : 0.44, 36]} />
+        <meshBasicMaterial
+          color={active ? "#FFFFFF" : "#166534"}
+          depthTest={false}
+          depthWrite={false}
+          transparent
+          opacity={active || selected ? 0.95 : 0.72}
+        />
+      </mesh>
+      <ViewportObjectLabel position={[0, 0.38, 0]}>
+        <span className="camera-motion-point-label">{index + 1}</span>
+      </ViewportObjectLabel>
+    </group>
+  );
+
+  if (!selected) return node;
+  return (
+    <>
+      {node}
+      <ViewportTransformControls
+        mode={transformMode}
+        object={groupRef}
+        onObjectChange={commitTransform}
+        translationSnap={translationSnap}
+      />
+    </>
+  );
+}
+
+function CharacterRouteRig({
+  character,
+  duration,
+  progress,
+  playing,
+  showHandles = true,
+  scene,
+  objects,
+  transformMode,
+  translationSnap,
+}: {
+  character: DirectorObject;
+  duration: number;
+  progress: number;
+  playing: boolean;
+  showHandles?: boolean;
+  scene: SceneSettings;
+  objects: DirectorObject[];
+  transformMode: TransformMode;
+  translationSnap: number | null;
+}) {
+  const selectedObjectMotionKeyframeId = useDirectorStore((state) => state.selectedObjectMotionKeyframeId);
+  const path = useMemo(
+    () => normalizeObjectMotionPath(character.motionPath, character.transform),
+    [character.motionPath, character.transform]
+  );
+  const activeIndex = useMemo(() => {
+    const timing = getObjectMotionTimingSample(character, progress, duration);
+    return timing?.holdingPointIndex ?? timing?.segment ?? 0;
+  }, [character, duration, progress]);
+  const activePoints = useMemo(() => {
+    if (!playing || path.keyframes.length < 2) return [];
+    const end = Math.max(path.keyframes[0].time, progress);
+    const count = Math.max(2, Math.ceil(end * 60));
+    return Array.from({ length: count }, (_, index) =>
+      constrainObjectMotionTransform(
+        character,
+        getObjectMotionSnapshot(character, (end * index) / (count - 1), duration),
+        scene,
+        objects
+      ).position
+    );
+  }, [character, duration, objects, path.keyframes, playing, progress, scene]);
+  const routePoints = useMemo(
+    () => sampleObjectMotionPath(character, 96, duration).map((position) =>
+      constrainObjectMotionTransform(character, { ...character.transform, position }, scene, objects).position
+    ),
+    [character, duration, objects, scene]
+  );
+
+  if (path.keyframes.length === 0) return null;
+  return (
+    <group userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}>
+      {routePoints.length >= 2 ? (
+        <Line color="#4ADE80" lineWidth={2} opacity={0.9} points={routePoints} transparent />
+      ) : null}
+      {activePoints.length >= 2 ? (
+        <Line color="#D4FFE0" lineWidth={5} opacity={0.96} points={activePoints} transparent />
+      ) : null}
+      {showHandles ? path.keyframes.map((keyframe, index) => (
+        <CharacterRoutePointHandle
+          key={keyframe.id}
+          characterId={character.id}
+          index={index}
+          keyframe={keyframe}
+          active={index === activeIndex}
+          selected={selectedObjectMotionKeyframeId === keyframe.id}
+          transformMode={transformMode}
+          translationSnap={translationSnap}
+        />
+      )) : null}
+      {playing && path.keyframes.length >= 2 ? (
+        <group position={getObjectMotionSnapshot(character, progress, duration).position}>
+          <mesh>
+            <sphereGeometry args={[0.11, 18, 12]} />
+            <meshBasicMaterial color="#FFFFFF" depthTest={false} />
+          </mesh>
+          <ViewportObjectLabel position={[0, 0.31, 0]}>进行中：{activeIndex + 1}</ViewportObjectLabel>
+        </group>
+      ) : null}
+    </group>
+  );
+}
+
+function PropMotionPointHandle({
+  objectId,
+  keyframe,
+  index,
+  selected,
+  transformMode,
+  translationSnap,
+}: {
+  objectId: string;
+  keyframe: DirectorObjectMotionKeyframe;
+  index: number;
+  selected: boolean;
+  transformMode: TransformMode;
+  translationSnap: number | null;
+}) {
+  const groupRef = useRef<Group>(null!);
+  const selectObject = useDirectorStore((state) => state.selectObject);
+  const selectObjectMotionKeyframe = useDirectorStore((state) => state.selectObjectMotionKeyframe);
+  const updateObjectMotionKeyframe = useDirectorStore((state) => state.updateObjectMotionKeyframe);
+
+  function selectPoint(event: ThreeEvent<MouseEvent>) {
+    event.stopPropagation();
+    selectObject(objectId);
+    selectObjectMotionKeyframe(keyframe.id);
+  }
+
+  function commitTransform() {
+    const group = groupRef.current;
+    if (!group) return;
+    updateObjectMotionKeyframe(objectId, keyframe.id, {
+      transform: {
+        position: [group.position.x, group.position.y, group.position.z],
+        rotation: [group.rotation.x, group.rotation.y, group.rotation.z],
+        scale: [group.scale.x, group.scale.y, group.scale.z],
+      },
+    });
+  }
+
+  const node = (
+    <group
+      ref={groupRef}
+      position={keyframe.transform.position}
+      rotation={keyframe.transform.rotation}
+      scale={keyframe.transform.scale}
+      onClick={selectPoint}
+      userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}
+    >
+      <mesh name={`${keyframe.id}-prop-motion-handle`} onClick={selectPoint}>
+        <sphereGeometry args={[selected ? 0.18 : 0.14, 18, 12]} />
+        <meshBasicMaterial color={selected ? "#E2E8F0" : "#94A3B8"} depthTest={false} />
+      </mesh>
+      <ViewportObjectLabel position={[0, 0.3, 0]}>
+        <span className="camera-motion-point-label is-prop-motion-point">{index + 1}</span>
+      </ViewportObjectLabel>
+    </group>
+  );
+
+  if (!selected) return node;
+  return (
+    <>
+      {node}
+      <ViewportTransformControls
+        mode={transformMode}
+        object={groupRef}
+        onObjectChange={commitTransform}
+        translationSnap={translationSnap}
+      />
+    </>
+  );
+}
+
+function PropMotionRig({
+  object,
+  duration,
+  scene,
+  objects,
+  transformMode,
+  translationSnap,
+}: {
+  object: DirectorObject;
+  duration: number;
+  scene: SceneSettings;
+  objects: DirectorObject[];
+  transformMode: TransformMode;
+  translationSnap: number | null;
+}) {
+  const selectedObjectMotionKeyframeId = useDirectorStore((state) => state.selectedObjectMotionKeyframeId);
+  const path = useMemo(
+    () => normalizeObjectMotionPath(object.motionPath, object.transform),
+    [object.motionPath, object.transform]
+  );
+  const routePoints = useMemo(
+    () => sampleObjectMotionPath(object, 96, duration).map((position) =>
+      constrainObjectMotionTransform(object, { ...object.transform, position }, scene, objects).position
+    ),
+    [duration, object, objects, scene]
+  );
+
+  if (path.keyframes.length === 0) return null;
+
+  return (
+    <group userData={{ [HIDE_FROM_VIEWPORT_CAPTURE_KEY]: true }}>
+      {routePoints.length >= 2 ? (
+        <Line color="#94A3B8" lineWidth={1} opacity={0.7} points={routePoints} transparent />
+      ) : null}
+      {path.keyframes.map((keyframe, index) => (
+        <PropMotionPointHandle
+          key={keyframe.id}
+          objectId={object.id}
+          keyframe={keyframe}
+          index={index}
+          selected={selectedObjectMotionKeyframeId === keyframe.id}
+          transformMode={transformMode}
+          translationSnap={translationSnap}
+        />
+      ))}
+    </group>
+  );
+}
+
+export type SceneRootRenderMode = "interactive" | "director-monitor" | "clean-camera";
+
+export function SceneRoot({ renderMode = "interactive" }: { renderMode?: SceneRootRenderMode }) {
+  const sceneRootRef = useRef<Group>(null);
   const scene = useDirectorStore((state) => state.project.scene);
   const assets = useDirectorStore((state) => state.project.assets);
   const objects = useDirectorStore((state) => state.project.objects);
   const cameras = useDirectorStore((state) => state.project.cameras);
-  const panoramaAssetId = useDirectorStore((state) => state.project.panoramaAssetId);
   const viewMode = useDirectorStore((state) => state.viewMode);
   const selectedObjectId = useDirectorStore((state) => state.selectedObjectId);
+  const selectedCameraKeyframeId = useDirectorStore((state) => state.selectedCameraKeyframeId);
+  const selectedObjectMotionKeyframeId = useDirectorStore((state) => state.selectedObjectMotionKeyframeId);
+  const motionStudioOpen = useDirectorStore((state) => state.motionStudioOpen);
+  const cameraPilotMode = useDirectorStore((state) => state.cameraPilotMode);
+  const activeCameraId = useDirectorStore((state) => state.project.activeCameraId);
+  const cameraMotionProgress = getRuntimePlaybackProgress();
+  const cameraMotionPlaying = useDirectorStore((state) => state.cameraMotionPlaying);
   const selectedCrowdId = useDirectorStore((state) => state.selectedCrowdId);
   const transformMode = useDirectorStore((state) => state.transformMode);
+  const showCharacterRoutes = useDirectorStore((state) => state.showCharacterRoutes);
   const selectObject = useDirectorStore((state) => state.selectObject);
   const selectCrowd = useDirectorStore((state) => state.selectCrowd);
-  const panoramaAsset = assets.find((item) => item.id === panoramaAssetId);
+  const interactive = renderMode === "interactive";
+  const effectiveViewMode = renderMode === "clean-camera" ? "camera" : renderMode === "director-monitor" ? "director" : viewMode;
   const translationSnap = scene.snapToGrid ? 1 : null;
+  const groundMaterialPreset = useMemo(
+    () => getGroundMaterialPreset(scene.groundMaterialPreset),
+    [scene.groundMaterialPreset]
+  );
+  const groundTexture = useMemo(
+    () => scene.showGround
+      ? createGroundMaterialTexture(scene.groundMaterialPreset, GROUND_PLANE_SIZE, scene.groundTextureScale)
+      : null,
+    [scene.groundMaterialPreset, scene.groundTextureScale, scene.showGround]
+  );
+  const groundColor = useMemo(
+    () => {
+      const selectedColor = scene.groundColor.toLowerCase() === "#303640"
+        ? groundMaterialPreset.baseColor
+        : scene.groundColor;
+      return `#${new Color(selectedColor).multiplyScalar(Math.max(0, scene.groundBrightness)).getHexString()}`;
+    },
+    [groundMaterialPreset.baseColor, scene.groundBrightness, scene.groundColor]
+  );
+  useEffect(() => () => groundTexture?.dispose(), [groundTexture]);
   const assetsById = useMemo(() => new Map(assets.map((item) => [item.id, item])), [assets]);
   const cameraObjectsByCameraId = useMemo(() => {
     return new Map(
@@ -778,6 +1570,10 @@ export function SceneRoot() {
         .map((item) => [item.linkedCameraId as string, item])
     );
   }, [objects]);
+  const activeMotionDuration = useMemo(() => {
+    const camera = cameras.find((item) => item.id === activeCameraId) ?? cameras[0];
+    return camera ? getCameraMotionPath(camera).duration : 6;
+  }, [activeCameraId, cameras]);
   const crowdLocksById = useMemo(() => {
     const result = new Map<string, boolean>();
     const crowdMembers = objects.filter((item) => item.kind === "character" && item.crowdId);
@@ -801,19 +1597,23 @@ export function SceneRoot() {
 
   return (
     <group
+      ref={sceneRootRef}
       position={scene.position}
       rotation={scene.rotation}
       scale={[scene.scale, scene.scale, scene.scale]}
     >
       {scene.showGround ? (
         <mesh position={[0, scene.groundHeight, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-          <planeGeometry args={[200, 200]} />
-          <meshBasicMaterial
-            color="#303640"
-            opacity={getEffectiveGroundOpacity(scene.groundOpacity, Boolean(panoramaAsset))}
+          <planeGeometry args={[GROUND_PLANE_SIZE, GROUND_PLANE_SIZE]} />
+          <meshStandardMaterial
+            color={groundColor}
+            map={groundTexture}
+            metalness={groundMaterialPreset.metalness}
+            opacity={getEffectiveGroundOpacity(scene.groundOpacity, false)}
             polygonOffset
             polygonOffsetFactor={1}
             polygonOffsetUnits={1}
+            roughness={groundMaterialPreset.roughness}
             transparent
           />
         </mesh>
@@ -822,22 +1622,47 @@ export function SceneRoot() {
         .filter((item) => item.visible && item.kind !== "camera")
         .map((item) => {
           const asset = item.assetRefId ? assetsById.get(item.assetRefId) : undefined;
+          const hasMotion = Boolean(item.motionPath?.keyframes?.length);
+          const motionWalking = cameraMotionPlaying
+            && item.kind === "character"
+            && hasMotion
+            && getObjectMotionSpeed(item, cameraMotionProgress, activeMotionDuration) > 0.05;
+          const motionTransform = hasMotion
+            ? getObjectMotionSnapshot(item, cameraMotionProgress, activeMotionDuration)
+            : item.transform;
+          const renderedItem = {
+            ...item,
+            transform: constrainObjectMotionTransform(item, motionTransform, scene, objects),
+          };
 
           return (
             <ObjectSceneNode
               key={item.id}
               asset={asset}
-              item={item}
-              selected={item.crowdId ? false : item.id === selectedObjectId}
-              showLabels={scene.showLabels}
+              item={renderedItem}
+              motionObjects={objects}
+              motionScene={scene}
+              motionPhase={cameraMotionProgress * activeMotionDuration * 7.2}
+              motionDurationSeconds={activeMotionDuration}
+              motionTimeSeconds={cameraMotionProgress * activeMotionDuration}
+              motionProgress={cameraMotionProgress}
+              motionWalking={motionWalking}
+              selected={interactive && !item.crowdId && item.id === selectedObjectId}
+              showLabels={interactive && scene.showLabels && cameraPilotMode === "idle"}
               transformMode={transformMode}
-              transformable={!item.locked}
+              transformable={
+                interactive
+                && !motionStudioOpen
+                && !item.locked
+                && cameraPilotMode === "idle"
+                && !selectedObjectMotionKeyframeId
+              }
               translationSnap={translationSnap}
               onSelect={handleObjectSelect}
             />
           );
         })}
-      {Array.from(new Set(objects.map((item) => item.crowdId).filter((item): item is string => typeof item === "string"))).map(
+      {interactive ? Array.from(new Set(objects.map((item) => item.crowdId).filter((item): item is string => typeof item === "string"))).map(
         (crowdId) => (
           <CrowdTransformRig
             key={crowdId}
@@ -845,28 +1670,96 @@ export function SceneRoot() {
             objects={objects}
             selected={selectedCrowdId === crowdId}
             transformMode={transformMode}
-            transformable={!(crowdLocksById.get(crowdId) ?? false)}
+            transformable={cameraPilotMode === "idle" && !(crowdLocksById.get(crowdId) ?? false)}
             translationSnap={translationSnap}
           />
         )
-      )}
-      {viewMode === "director"
-        ? cameras
-            .map((camera) => ({ camera, object: cameraObjectsByCameraId.get(camera.id) }))
-            .filter(({ object }) => object?.visible ?? true)
-            .map(({ camera, object }) => (
-              <ViewportCameraRig
-                key={camera.id}
-                camera={camera}
+      ) : null}
+      {(interactive || renderMode === "director-monitor") && cameraPilotMode === "idle"
+        ? objects
+            .filter((item) =>
+              item.visible
+              && item.kind === "prop"
+              && item.id === selectedObjectId
+              && (item.motionPath?.keyframes.length ?? 0) > 0
+            )
+            .map((object) => (
+              <PropMotionRig
+                key={`${object.id}-motion-route`}
                 object={object}
-                selected={object?.id === selectedObjectId}
-                showLabel={scene.showLabels}
+                duration={activeMotionDuration}
+                scene={scene}
+                objects={objects}
                 transformMode={transformMode}
-                transformable={Boolean(object && !object.locked)}
                 translationSnap={translationSnap}
               />
             ))
         : null}
+      {(interactive || renderMode === "director-monitor") && showCharacterRoutes && cameraPilotMode === "idle" ? objects
+        .filter((item) => item.visible && item.kind === "character" && (item.motionPath?.keyframes.length ?? 0) > 0)
+        .map((character) => (
+          <CharacterRouteRig
+            key={`${character.id}-route`}
+            character={character}
+            duration={activeMotionDuration}
+            progress={cameraMotionProgress}
+            playing={cameraMotionPlaying}
+            showHandles={interactive}
+            scene={scene}
+            objects={objects}
+            transformMode={transformMode}
+            translationSnap={translationSnap}
+          />
+        )) : null}
+      {effectiveViewMode === "director"
+        ? cameras
+            .map((camera) => ({ camera, object: cameraObjectsByCameraId.get(camera.id) }))
+            .filter(({ object }) => object?.visible ?? true)
+            .map(({ camera, object }) => (
+              <group key={camera.id}>
+                {interactive && !motionStudioOpen && !camera.isVirtual ? (
+                  <ViewportCameraRig
+                    camera={camera}
+                    object={object}
+                    selected={object?.id === selectedObjectId}
+                    showLabel={scene.showLabels}
+                    transformMode={transformMode}
+                    transformable={Boolean(
+                      object
+                      && !object.locked
+                      && !selectedCameraKeyframeId
+                      && getCameraMotionPath(camera).keyframes.length < 2
+                    )}
+                    translationSnap={translationSnap}
+                  />
+                ) : null}
+                {interactive && cameraPilotMode === "idle" && (object?.id === selectedObjectId || (motionStudioOpen && camera.id === activeCameraId)) ? (
+                  <CameraMotionPathRig
+                    camera={camera}
+                    scene={scene}
+                    sceneRootRef={sceneRootRef}
+                    translationSnap={translationSnap}
+                  />
+                ) : null}
+              </group>
+            ))
+        : null}
+      {renderMode === "director-monitor" && activeCameraId ? cameras
+        .filter((camera) => camera.id === activeCameraId)
+        .map((camera) => {
+          const points = sampleCameraMotionPath(camera, 80).map((position) => constrainCameraPosition(position, scene, objects));
+          const rawPlayhead = getCameraMotionSnapshot(camera, cameraMotionProgress);
+          const playhead = { ...rawPlayhead, position: constrainCameraPosition(rawPlayhead.position, scene, objects) };
+          return (
+            <group key={`${camera.id}-monitor-route`}>
+              {points.length >= 2 ? <Line color="#F5A65B" lineWidth={2} points={points} /> : null}
+              <mesh position={playhead.position}>
+                <sphereGeometry args={[0.14, 16, 12]} />
+                <meshBasicMaterial color="#FFFFFF" depthTest={false} />
+              </mesh>
+            </group>
+          );
+        }) : null}
     </group>
   );
 }

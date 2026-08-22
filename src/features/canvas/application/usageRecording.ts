@@ -9,6 +9,7 @@ import {
 } from '@/commands/usageLog';
 import { getImageModel, getVideoModel } from '@/features/canvas/models';
 import { useProjectStore } from '@/stores/projectStore';
+import { useSettingsStore } from '@/stores/settingsStore';
 import { CURRENT_RUNTIME_SESSION_ID } from './generationErrorReport';
 
 export interface RecordGenerationOutcomeParams {
@@ -28,6 +29,10 @@ export interface RecordGenerationOutcomeParams {
 
 /** 生成进入终态时调用(成功/失败各一次, 由调用方保证每个任务只记一次)。 */
 export function recordGenerationOutcome(params: RecordGenerationOutcomeParams): void {
+  if (params.status === 'succeeded') {
+    useSettingsStore.getState().markModelAvailable(params.modelId);
+  }
+
   const model = params.kind === 'video'
     ? getVideoModel(params.modelId)
     : getImageModel(params.modelId);

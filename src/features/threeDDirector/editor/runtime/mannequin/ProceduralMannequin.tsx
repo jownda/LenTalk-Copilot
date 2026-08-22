@@ -1,4 +1,9 @@
-import type { CharacterRigState } from "../../schema/directorProject";
+import { useEffect, useRef } from "react";
+import type { Group } from "three";
+import { sampleCharacterActionControls } from "../../presets/characterActionPresets";
+import type { CharacterRigState, DirectorObject } from "../../schema/directorProject";
+import { getObjectMotionActionSample, getObjectMotionSpeed } from "../../schema/objectMotion";
+import { subscribeRuntimePlayback } from "../playbackRuntime";
 import { getBodyPreset, type CharacterBodyType } from "./bodyTypes";
 import { degreesToRadians, getBodyTypePoseLimit, getRotationFromControls, getSingleAxisRotation } from "./mannequinPose";
 import { Foot, Hand, Head, Joint, Segment, Torso } from "./mannequinParts";
@@ -7,6 +12,7 @@ interface ProceduralMannequinProps {
   bodyType?: CharacterBodyType;
   color?: string;
   rigState?: CharacterRigState;
+  runtimeMotion?: { duration: number; object: DirectorObject };
 }
 
 function clampDegrees(value: number, bodyType?: CharacterBodyType) {
@@ -26,10 +32,21 @@ function getLimbRotation(
   ];
 }
 
-export function ProceduralMannequin({ bodyType, color = "#4F8EF7", rigState }: ProceduralMannequinProps) {
+export function ProceduralMannequin({ bodyType, color = "#4F8EF7", rigState, runtimeMotion }: ProceduralMannequinProps) {
   const preset = getBodyPreset(bodyType);
   const controls = rigState?.controls ?? {};
   const p = preset.proportions;
+  const bodyRef = useRef<Group>(null!);
+  const torsoRef = useRef<Group>(null!);
+  const headRef = useRef<Group>(null!);
+  const leftShoulderRef = useRef<Group>(null!);
+  const rightShoulderRef = useRef<Group>(null!);
+  const leftElbowRef = useRef<Group>(null!);
+  const rightElbowRef = useRef<Group>(null!);
+  const leftHipRef = useRef<Group>(null!);
+  const rightHipRef = useRef<Group>(null!);
+  const leftKneeRef = useRef<Group>(null!);
+  const rightKneeRef = useRef<Group>(null!);
 
   const bodyRotation = getRotationFromControls(controls, "body", preset.bodyType);
   const torsoRotation = getRotationFromControls(controls, "torso", preset.bodyType);
@@ -61,9 +78,34 @@ export function ProceduralMannequin({ bodyType, color = "#4F8EF7", rigState }: P
   const footY = ankleY - p.footRadius - 0.045;
   const jointScale: [number, number, number] = [p.jointRadiusScale, p.jointRadiusScale, p.jointRadiusScale];
 
+  useEffect(() => subscribeRuntimePlayback((progress) => {
+    if (!runtimeMotion || !bodyRef.current) return;
+    const actionSample = getObjectMotionActionSample(runtimeMotion.object, progress, runtimeMotion.duration);
+    const routeAction = actionSample.actionPresetId;
+    const isMoving = getObjectMotionSpeed(runtimeMotion.object, progress, runtimeMotion.duration) > 0.05;
+    const actionPresetId = routeAction ?? (isMoving ? "walk-cycle" : runtimeMotion.object.characterRig?.actionPresetId);
+    const animatedControls = actionPresetId
+      ? sampleCharacterActionControls(actionPresetId, actionSample.animationTimeSeconds, controls)
+      : controls;
+    const rotations: Array<[Group | null, [number, number, number]]> = [
+      [bodyRef.current, getRotationFromControls(animatedControls, "body", preset.bodyType)],
+      [torsoRef.current, getRotationFromControls(animatedControls, "torso", preset.bodyType)],
+      [headRef.current, getRotationFromControls(animatedControls, "head", preset.bodyType)],
+      [leftShoulderRef.current, getLimbRotation(animatedControls, "leftShoulder", preset.bodyType)],
+      [rightShoulderRef.current, getLimbRotation(animatedControls, "rightShoulder", preset.bodyType)],
+      [leftElbowRef.current, getSingleAxisRotation(animatedControls, "leftElbow.bend", preset.bodyType)],
+      [rightElbowRef.current, getSingleAxisRotation(animatedControls, "rightElbow.bend", preset.bodyType)],
+      [leftHipRef.current, getLimbRotation(animatedControls, "leftHip", preset.bodyType)],
+      [rightHipRef.current, getLimbRotation(animatedControls, "rightHip", preset.bodyType)],
+      [leftKneeRef.current, getSingleAxisRotation(animatedControls, "leftKnee.bend", preset.bodyType)],
+      [rightKneeRef.current, getSingleAxisRotation(animatedControls, "rightKnee.bend", preset.bodyType)],
+    ];
+    rotations.forEach(([group, rotation]) => group?.rotation.set(...rotation));
+  }), [controls, preset.bodyType, runtimeMotion]);
+
   return (
-    <group name={`procedural-${preset.bodyType}`} rotation={bodyRotation} scale={preset.defaultScale}>
-      <group rotation={torsoRotation}>
+    <group ref={bodyRef} name={`procedural-${preset.bodyType}`} rotation={bodyRotation} scale={preset.defaultScale}>
+      <group ref={torsoRef} rotation={torsoRotation}>
         <Torso
           abdomenPosition={[0, abdomenY, 0]}
           abdomenScale={p.torsoLowerScale}
@@ -90,24 +132,27 @@ export function ProceduralMannequin({ bodyType, color = "#4F8EF7", rigState }: P
           neckRadius={p.neckRadius}
           noseScale={p.noseScale}
           position={[0, headY, 0]}
+          ref={headRef}
           rotation={headRotation}
         />
 
         <Joint color={color} position={[-p.shoulderWidth * 0.86, shoulderY, 0]} radius={p.shoulderRadius} scale={jointScale} />
         <Joint color={color} position={[p.shoulderWidth * 0.86, shoulderY, 0]} radius={p.shoulderRadius} scale={jointScale} />
 
-        <group position={[-p.shoulderWidth, armOriginY, 0]} rotation={leftShoulderRotation}>
+        <group ref={leftShoulderRef} position={[-p.shoulderWidth, armOriginY, 0]} rotation={leftShoulderRotation}>
           <Segment
             color={color}
             length={p.upperArmLength}
+            name="humanoid-left-upper-arm"
             position={[0, -(p.upperArmLength * 0.5 + p.upperArmRadius), 0]}
             radius={p.upperArmRadius}
           />
-          <group position={[0, elbowY, 0]} rotation={leftElbowRotation}>
+          <group ref={leftElbowRef} position={[0, elbowY, 0]} rotation={leftElbowRotation}>
             <Joint color={color} position={[0, 0, 0]} radius={p.elbowRadius} scale={jointScale} />
             <Segment
               color={color}
               length={p.forearmLength}
+              name="humanoid-left-forearm"
               position={[0, -(p.forearmLength * 0.5 + p.forearmRadius), 0]}
               radius={p.forearmRadius}
             />
@@ -116,18 +161,20 @@ export function ProceduralMannequin({ bodyType, color = "#4F8EF7", rigState }: P
           </group>
         </group>
 
-        <group position={[p.shoulderWidth, armOriginY, 0]} rotation={rightShoulderRotation}>
+        <group ref={rightShoulderRef} position={[p.shoulderWidth, armOriginY, 0]} rotation={rightShoulderRotation}>
           <Segment
             color={color}
             length={p.upperArmLength}
+            name="humanoid-right-upper-arm"
             position={[0, -(p.upperArmLength * 0.5 + p.upperArmRadius), 0]}
             radius={p.upperArmRadius}
           />
-          <group position={[0, elbowY, 0]} rotation={rightElbowRotation}>
+          <group ref={rightElbowRef} position={[0, elbowY, 0]} rotation={rightElbowRotation}>
             <Joint color={color} position={[0, 0, 0]} radius={p.elbowRadius} scale={jointScale} />
             <Segment
               color={color}
               length={p.forearmLength}
+              name="humanoid-right-forearm"
               position={[0, -(p.forearmLength * 0.5 + p.forearmRadius), 0]}
               radius={p.forearmRadius}
             />
@@ -140,18 +187,20 @@ export function ProceduralMannequin({ bodyType, color = "#4F8EF7", rigState }: P
       <Joint color={color} position={[-p.legSpread, hipJointY, 0]} radius={p.thighRadius * 1.08} scale={jointScale} />
       <Joint color={color} position={[p.legSpread, hipJointY, 0]} radius={p.thighRadius * 1.08} scale={jointScale} />
 
-      <group position={[-p.legSpread, legOriginY, 0]} rotation={leftHipRotation}>
+      <group ref={leftHipRef} position={[-p.legSpread, legOriginY, 0]} rotation={leftHipRotation}>
         <Segment
           color={color}
           length={p.thighLength}
+          name="humanoid-left-thigh"
           position={[0, -(p.thighLength * 0.5 + p.thighRadius), 0]}
           radius={p.thighRadius}
         />
-        <group position={[0, kneeY, 0]} rotation={leftKneeRotation}>
+        <group ref={leftKneeRef} position={[0, kneeY, 0]} rotation={leftKneeRotation}>
           <Joint color={color} position={[0, 0, 0]} radius={p.kneeRadius} scale={jointScale} />
           <Segment
             color={color}
             length={p.calfLength}
+            name="humanoid-left-calf"
             position={[0, -(p.calfLength * 0.5 + p.calfRadius), 0]}
             radius={p.calfRadius}
           />
@@ -160,18 +209,20 @@ export function ProceduralMannequin({ bodyType, color = "#4F8EF7", rigState }: P
         </group>
       </group>
 
-      <group position={[p.legSpread, legOriginY, 0]} rotation={rightHipRotation}>
+      <group ref={rightHipRef} position={[p.legSpread, legOriginY, 0]} rotation={rightHipRotation}>
         <Segment
           color={color}
           length={p.thighLength}
+          name="humanoid-right-thigh"
           position={[0, -(p.thighLength * 0.5 + p.thighRadius), 0]}
           radius={p.thighRadius}
         />
-        <group position={[0, kneeY, 0]} rotation={rightKneeRotation}>
+        <group ref={rightKneeRef} position={[0, kneeY, 0]} rotation={rightKneeRotation}>
           <Joint color={color} position={[0, 0, 0]} radius={p.kneeRadius} scale={jointScale} />
           <Segment
             color={color}
             length={p.calfLength}
+            name="humanoid-right-calf"
             position={[0, -(p.calfLength * 0.5 + p.calfRadius), 0]}
             radius={p.calfRadius}
           />

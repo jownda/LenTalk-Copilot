@@ -104,14 +104,14 @@ export function NodeSelectionMenu({
         return (
           <button
             key={item.type}
-            className="flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-bg-dark"
+            className="flex w-full items-center gap-3 px-4 py-1 text-left transition-colors hover:bg-bg-dark"
             style={{ transitionDelay: isVisible ? `${index * 30}ms` : '0ms' }}
             onClick={() => {
               handleClose();
               setTimeout(() => onSelect(item.type), UI_POPOVER_TRANSITION_MS + 10);
             }}
           >
-            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-bg-dark">
+            <div className="flex h-6 w-6 items-center justify-center rounded-md bg-bg-dark">
               <Icon className="h-4 w-4 text-accent" />
             </div>
             <span className="text-sm text-text-dark">{t(item.menuLabelKey)}</span>

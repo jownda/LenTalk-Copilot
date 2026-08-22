@@ -18,6 +18,20 @@ export const DEFAULT_DIRECTOR_CAMERA_VIEW_SNAPSHOT: CameraViewSnapshot = {
   target: [0, 1.05, 0],
 };
 
+const FULL_FRAME_SENSOR_HEIGHT_MM = 24;
+
+/** Converts the stored full-frame-equivalent focal length into Three.js vertical FOV degrees. */
+export function getVerticalFovFromFocalLength(focalLength: number) {
+  const safeFocalLength = Math.min(120, Math.max(10, Number.isFinite(focalLength) ? focalLength : 50));
+  return (2 * Math.atan(FULL_FRAME_SENSOR_HEIGHT_MM / (2 * safeFocalLength)) * 180) / Math.PI;
+}
+
+/** Converts a Three.js vertical FOV angle back into the stored focal length in millimeters. */
+export function getFocalLengthFromVerticalFov(verticalFov: number) {
+  const safeVerticalFov = Math.min(179, Math.max(1, Number.isFinite(verticalFov) ? verticalFov : getVerticalFovFromFocalLength(50)));
+  return FULL_FRAME_SENSOR_HEIGHT_MM / (2 * Math.tan((safeVerticalFov * Math.PI) / 360));
+}
+
 function getForwardDirection(position: [number, number, number], target: [number, number, number]) {
   const direction = new Vector3(...target).sub(new Vector3(...position));
   return direction.lengthSq() === 0 ? new Vector3(0, 0, -1) : direction.normalize();

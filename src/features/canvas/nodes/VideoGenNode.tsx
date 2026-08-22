@@ -726,7 +726,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       return;
     }
     const prompt = [
-      promptDraftRef.current.replace(/@(?=(?:图|音频)\d+)/g, '').trim(),
+      promptDraftRef.current.trim(),
       ...inputText,
     ].filter(Boolean).join('\n\n').trim();
     if (!prompt) return;

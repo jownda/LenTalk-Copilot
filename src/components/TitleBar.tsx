@@ -12,6 +12,7 @@ import minimizeNormalIcon from '@/assets/macos-traffic-lights/2-minimize-1-norma
 import minimizeHoverIcon from '@/assets/macos-traffic-lights/2-minimize-2-hover.svg';
 import maximizeNormalIcon from '@/assets/macos-traffic-lights/3-maximize-1-normal.svg';
 import maximizeHoverIcon from '@/assets/macos-traffic-lights/3-maximize-2-hover.svg';
+import appPackage from '../../package.json';
 
 interface TitleBarProps {
   onSettingsClick: () => void;
@@ -28,6 +29,8 @@ const noopWindow = {
   close: async () => {},
   startDragging: async () => {},
 };
+
+const APP_VERSION = appPackage.version;
 
 export function TitleBar({ onSettingsClick, onBillingClick, showBackButton, onBackClick }: TitleBarProps) {
   const { t, i18n } = useTranslation();
@@ -149,6 +152,7 @@ export function TitleBar({ onSettingsClick, onBillingClick, showBackButton, onBa
         <span className="text-sm font-semibold text-text-dark">
           {titleText}
         </span>
+        <span className="ml-2 text-xs text-text-muted">v{APP_VERSION}</span>
         {!isZh && !currentProjectName ? (
           <span className="text-xs text-text-muted ml-2">{t('app.subtitle')}</span>
         ) : null}

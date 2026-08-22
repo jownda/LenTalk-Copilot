@@ -1,4 +1,22 @@
 import { useDirectorStore } from "../store/directorStore";
+import {
+  DIRECTOR_EXTENSION_PROTOCOL_VERSION,
+  DIRECTOR_EXTENSION_REQUEST_TYPE,
+  DIRECTOR_EXTENSION_RESPONSE_TYPE,
+  createDirectorExtensionResponse,
+  isDirectorExtensionAction,
+  parseDirectorExtensionRequest,
+  type DirectorExtensionResponsePayload,
+} from "./extensionProtocol";
+import { requestCleanFrameExport } from "./cleanFrameExport";
+import { requestReferenceVideoExport, type ReferenceVideoExportResult } from "./referenceVideoExport";
+import { getDirectorProjectFingerprint } from "./projectDocument";
+import { listDirectorPluginResults, submitDirectorPluginResult } from "./pluginResultRegistry";
+import {
+  initTauriDirectorHostTransport,
+  postTauriDirectorHostMessage,
+  type DirectorDeskTransportMessage,
+} from "./tauriHostTransport";
 
 interface HostPanoramaPayload {
   edgeId?: unknown;
@@ -19,22 +37,16 @@ export interface HostCaptureItemPayload {
 
 export interface HostCaptureBatchPayload {
   captures?: HostCaptureItemPayload[];
-  /** 发起截图的画布节点 id(内嵌模式由 DirectorDeskNode 注册) */
+  /** The canvas node that opened the embedded director desk. */
   sourceNodeId?: unknown;
 }
 
-interface HostConnectedPanorama {
-  edgeId: string;
-  sourceNodeId: string;
-}
-
 let initialized = false;
-let hostConnectedPanorama: HostConnectedPanorama | null = null;
-let removeUnsubscribe: (() => void) | null = null;
-let suppressNextPanoramaRemovalNotice = false;
+let activeExtensionExportRequestId: string | null = null;
+let clearTauriTransport: (() => void) | null = null;
 let hostCaptureSourceNodeId: string | null = null;
+export const DIRECTOR_DESK_SESSION_OPENED_EVENT = "storyai:director-desk-session-opened";
 
-/** 注册当前打开导演台的画布节点 id,截图发送到宿主时随消息透传 */
 export function registerHostCaptureSourceNode(nodeId: string | null) {
   hostCaptureSourceNodeId = nodeId;
 }
@@ -43,8 +55,32 @@ function normalizeString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function getHostOrigin() {
-  return window.location.origin;
+const HOST_ORIGIN_QUERY_KEY = "hostOrigin";
+
+function normalizeOrigin(value: unknown) {
+  const text = normalizeString(value);
+  if (!text) return null;
+
+  try {
+    return new URL(text).origin;
+  } catch {
+    return null;
+  }
+}
+
+export function getDirectorDeskHostOrigin() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return normalizeOrigin(params.get(HOST_ORIGIN_QUERY_KEY)) ?? window.location.origin;
+  } catch {
+    return window.location.origin;
+  }
+}
+
+function isAllowedHostEvent(event: MessageEvent) {
+  const fromExpectedOrigin = event.origin === getDirectorDeskHostOrigin();
+  const fromParentWindow = window.parent === window || event.source === window.parent;
+  return fromExpectedOrigin && fromParentWindow;
 }
 
 function normalizeTheme(value: unknown): "dark" | "light" | null {
@@ -64,60 +100,34 @@ function getInitialHostTheme() {
   }
 }
 
-function notifyPanoramaRemoved() {
-  if (!hostConnectedPanorama) {
-    return;
+function isSupportedHostImageUrl(value: string) {
+  if (value.startsWith("data:image/")) {
+    return true;
   }
 
-  window.parent?.postMessage(
-    {
-      type: "storyai:director-desk-panorama-removed",
-      payload: hostConnectedPanorama,
-    },
-    getHostOrigin()
-  );
-  hostConnectedPanorama = null;
-}
-
-function subscribeToPanoramaRemoval() {
-  if (removeUnsubscribe) {
-    return;
+  try {
+    const url = new URL(value, window.location.href);
+    return url.protocol === "http:" || url.protocol === "https:" || url.protocol === "blob:" || url.protocol === "asset:";
+  } catch {
+    return false;
   }
-
-  let previousPanoramaAssetId = useDirectorStore.getState().project.panoramaAssetId;
-  removeUnsubscribe = useDirectorStore.subscribe((state) => {
-    const nextPanoramaAssetId = state.project.panoramaAssetId;
-
-    if (previousPanoramaAssetId && !nextPanoramaAssetId) {
-      if (suppressNextPanoramaRemovalNotice) {
-        suppressNextPanoramaRemovalNotice = false;
-        hostConnectedPanorama = null;
-      } else {
-        notifyPanoramaRemoved();
-      }
-    }
-
-    previousPanoramaAssetId = nextPanoramaAssetId;
-  });
 }
 
 function importHostPanorama(payload: HostPanoramaPayload) {
+  const edgeId = normalizeString(payload.edgeId);
+  const sourceNodeId = normalizeString(payload.sourceNodeId);
   const imageUrl = normalizeString(payload.imageUrl);
-  if (!imageUrl) {
+  const fileName = normalizeString(payload.fileName);
+
+  if (!edgeId || !sourceNodeId || !fileName || !imageUrl || !isSupportedHostImageUrl(imageUrl)) {
     return;
   }
 
-  const fileName = normalizeString(payload.fileName) || "画布全景图.png";
-  const edgeId = normalizeString(payload.edgeId);
-  const sourceNodeId = normalizeString(payload.sourceNodeId);
-
-  hostConnectedPanorama = edgeId && sourceNodeId ? { edgeId, sourceNodeId } : null;
-  useDirectorStore.getState().addImportedAsset({
-    kind: "panorama",
+  useDirectorStore.getState().setPanoramaAsset({
     name: fileName,
     fileName,
     url: imageUrl,
-    projectionMode: "backdrop",
+    projectionMode: "equirectangular",
   });
 }
 
@@ -127,10 +137,130 @@ function openHostSession(payload: HostSessionPayload) {
   if (theme) {
     applyDirectorDeskTheme(theme);
   }
-  suppressNextPanoramaRemovalNotice = Boolean(useDirectorStore.getState().project.panoramaAssetId);
-  useDirectorStore.getState().openScopedScene(instanceId || null);
-  suppressNextPanoramaRemovalNotice = false;
-  hostConnectedPanorama = null;
+  if (instanceId) {
+    useDirectorStore.getState().openScopedScene(instanceId);
+    window.dispatchEvent(new CustomEvent(DIRECTOR_DESK_SESSION_OPENED_EVENT, { detail: { instanceId } }));
+    postDirectorDeskMessageToHost({ type: "storyai:director-desk-ready" });
+  }
+}
+
+export function postDirectorDeskMessageToHost(message: DirectorDeskTransportMessage) {
+  if (postTauriDirectorHostMessage(message)) return;
+  window.parent?.postMessage(message, getDirectorDeskHostOrigin());
+}
+
+function postDirectorExtensionResponse(payload: DirectorExtensionResponsePayload) {
+  postDirectorDeskMessageToHost({ type: DIRECTOR_EXTENSION_RESPONSE_TYPE, payload });
+}
+
+async function handleDirectorExtensionRequest(payload: unknown) {
+  const request = parseDirectorExtensionRequest(payload);
+  if (request) {
+    if (request.action === "plugin.results.list") {
+      const projectFingerprint = getDirectorProjectFingerprint(useDirectorStore.getState().project);
+      postDirectorExtensionResponse({
+        protocolVersion: DIRECTOR_EXTENSION_PROTOCOL_VERSION,
+        requestId: request.requestId,
+        action: request.action,
+        ok: true,
+        data: listDirectorPluginResults(projectFingerprint),
+      });
+      return;
+    }
+    if (request.action === "plugin.result.submit") {
+      try {
+        const project = useDirectorStore.getState().project;
+        const result = submitDirectorPluginResult(
+          request.options?.result,
+          getDirectorProjectFingerprint(project)
+        );
+        postDirectorExtensionResponse({
+          protocolVersion: DIRECTOR_EXTENSION_PROTOCOL_VERSION,
+          requestId: request.requestId,
+          action: request.action,
+          ok: true,
+          data: result,
+        });
+      } catch (error) {
+        postDirectorExtensionResponse({
+          protocolVersion: DIRECTOR_EXTENSION_PROTOCOL_VERSION,
+          requestId: request.requestId,
+          action: request.action,
+          ok: false,
+          error: {
+            code: "invalid-plugin-result",
+            message: error instanceof Error ? error.message : "插件结果无效",
+          },
+        });
+      }
+      return;
+    }
+    if (request.action === "export.frame" || request.action === "export.video") {
+      if (activeExtensionExportRequestId) {
+        postDirectorExtensionResponse({
+          protocolVersion: DIRECTOR_EXTENSION_PROTOCOL_VERSION,
+          requestId: request.requestId,
+          action: request.action,
+          ok: false,
+          error: { code: "export-busy", message: "已有导出任务正在进行，请稍后再试" },
+        });
+        return;
+      }
+      activeExtensionExportRequestId = request.requestId;
+      try {
+        const result = request.action === "export.frame"
+          ? await requestCleanFrameExport({
+              fileName: request.options?.fileName ?? "current-frame.png",
+              position: request.options?.position ?? "current",
+              quality: request.options?.quality ?? "720p",
+            })
+          : await requestReferenceVideoExport({
+              fileName: request.options?.fileName ?? "director-reference.mp4",
+              fps: request.options?.fps ?? 30,
+              quality: request.options?.quality ?? "720p",
+            });
+        postDirectorExtensionResponse({
+          protocolVersion: DIRECTOR_EXTENSION_PROTOCOL_VERSION,
+          requestId: request.requestId,
+          action: request.action,
+          ok: true,
+          data: result,
+        });
+      } catch (error) {
+        postDirectorExtensionResponse({
+          protocolVersion: DIRECTOR_EXTENSION_PROTOCOL_VERSION,
+          requestId: request.requestId,
+          action: request.action,
+          ok: false,
+          error: {
+            code: "export-failed",
+            message: error instanceof Error ? error.message : "导出失败",
+          },
+        });
+      } finally {
+        activeExtensionExportRequestId = null;
+      }
+      return;
+    }
+    const state = useDirectorStore.getState();
+    postDirectorExtensionResponse(createDirectorExtensionResponse(request, state));
+    return;
+  }
+
+  const value = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+  const requestId = normalizeString(value.requestId).slice(0, 128) || "unknown";
+  const action = normalizeString(value.action);
+  const unsupportedAction = Boolean(action) && !isDirectorExtensionAction(action);
+  postDirectorExtensionResponse({
+    protocolVersion: DIRECTOR_EXTENSION_PROTOCOL_VERSION,
+    requestId,
+    action: "unknown",
+    ok: false,
+    error: {
+      code: unsupportedAction ? "unsupported-action" : "invalid-request",
+      message: unsupportedAction ? `不支持的二创接口操作：${action}` : "二创接口请求缺少有效的 requestId 或 action",
+    },
+  });
 }
 
 export function postDirectorDeskCapturesToHost(
@@ -157,31 +287,94 @@ export function postDirectorDeskCapturesToHost(
     return;
   }
 
-  window.parent?.postMessage(
-    {
-      type: "storyai:director-desk-captures-sent",
-      payload: {
-        captures: normalizedCaptures,
-        sourceNodeId: hostCaptureSourceNodeId ?? undefined,
-      },
+  postDirectorDeskMessageToHost({
+    type: "storyai:director-desk-captures-sent",
+    payload: {
+      captures: normalizedCaptures,
+      sourceNodeId: hostCaptureSourceNodeId ?? undefined,
     },
-    getHostOrigin()
-  );
+  });
+}
+
+async function blobToDataUrl(blob: Blob) {
+  return await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+        return;
+      }
+      reject(new Error("导出视频读取失败"));
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("导出视频读取失败"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+export async function postDirectorDeskReferenceVideoToHost(result: ReferenceVideoExportResult) {
+  if (!hostCaptureSourceNodeId) {
+    throw new Error("请从画布中的 3D导演台节点进入后再导出视频");
+  }
+
+  const dataUrl = await blobToDataUrl(result.blob);
+  postDirectorDeskReferenceVideoDataUrlToHost({
+    dataUrl,
+    durationSeconds: result.durationSeconds,
+    fileName: result.fileName,
+    height: result.height,
+    mimeType: result.mimeType,
+    width: result.width,
+  });
+
+  return dataUrl;
+}
+
+export function postDirectorDeskReferenceVideoDataUrlToHost(payload: {
+  dataUrl: string;
+  fileName: string;
+  durationSeconds?: number;
+  height?: number;
+  mimeType?: string;
+  width?: number;
+}) {
+  if (!hostCaptureSourceNodeId) {
+    throw new Error("请从画布中的 3D导演台节点进入后再添加视频");
+  }
+
+  postDirectorDeskMessageToHost({
+    type: "storyai:director-desk-reference-video-sent",
+    payload: {
+      dataUrl: payload.dataUrl,
+      durationSeconds: payload.durationSeconds,
+      fileName: payload.fileName,
+      height: payload.height,
+      mimeType: payload.mimeType,
+      sourceNodeId: hostCaptureSourceNodeId,
+      width: payload.width,
+    },
+  });
+}
+
+function handleHostProtocolMessage(message: DirectorDeskTransportMessage) {
+  if (message.type === "storyai:director-desk-session") {
+    openHostSession((message.payload || {}) as HostSessionPayload);
+    return;
+  }
+
+  if (message.type === "storyai:director-desk-panorama") {
+    importHostPanorama((message.payload || {}) as HostPanoramaPayload);
+    return;
+  }
+
+  if (message.type === DIRECTOR_EXTENSION_REQUEST_TYPE) {
+    void handleDirectorExtensionRequest(message.payload);
+  }
 }
 
 function handleHostMessage(event: MessageEvent) {
-  if (event.origin !== getHostOrigin()) {
-    return;
-  }
-
-  if (event.data?.type === "storyai:director-desk-session") {
-    openHostSession((event.data.payload || {}) as HostSessionPayload);
-    return;
-  }
-
-  if (event.data?.type === "storyai:director-desk-panorama") {
-    importHostPanorama((event.data.payload || {}) as HostPanoramaPayload);
-  }
+  if (!isAllowedHostEvent(event)) return;
+  if (!event.data || typeof event.data !== "object" || typeof event.data.type !== "string") return;
+  handleHostProtocolMessage(event.data as DirectorDeskTransportMessage);
 }
 
 export function initDirectorDeskHostBridge() {
@@ -192,7 +385,14 @@ export function initDirectorDeskHostBridge() {
   initialized = true;
   applyDirectorDeskTheme(getInitialHostTheme() ?? "dark");
   window.addEventListener("message", handleHostMessage);
-  subscribeToPanoramaRemoval();
+  void initTauriDirectorHostTransport(handleHostProtocolMessage).then((cleanup) => {
+    if (!cleanup) return;
+    if (!initialized) {
+      cleanup();
+      return;
+    }
+    clearTauriTransport = cleanup;
+  });
 }
 
 export function clearDirectorDeskHostBridge() {
@@ -201,9 +401,9 @@ export function clearDirectorDeskHostBridge() {
   }
 
   initialized = false;
-  hostConnectedPanorama = null;
-  suppressNextPanoramaRemovalNotice = false;
+  activeExtensionExportRequestId = null;
+  hostCaptureSourceNodeId = null;
   window.removeEventListener("message", handleHostMessage);
-  removeUnsubscribe?.();
-  removeUnsubscribe = null;
+  clearTauriTransport?.();
+  clearTauriTransport = null;
 }

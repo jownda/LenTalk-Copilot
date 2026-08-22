@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NodeToolbar as ReactFlowNodeToolbar } from '@xyflow/react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Copy, Crop, Download, FolderOpen, Library, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Trash2, Unlink2 } from 'lucide-react';
 import { save } from '@tauri-apps/plugin-dialog';
 import { useTranslation } from 'react-i18next';
@@ -24,6 +25,7 @@ import {
   saveImageSourceToDirectory,
   saveImageSourceToPath,
 } from '@/commands/image';
+import { isWindowsDesktopRuntime } from '@/platform/runtime';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { UI_POPOVER_TRANSITION_MS } from '@/components/ui/motion';
@@ -336,9 +338,21 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     }
 
     try {
-      const selectedPath = await save({
-        defaultPath: `node-${node.id}.${videoSource ? 'mp4' : 'png'}`,
-      });
+      const extension = videoSource ? 'mp4' : 'png';
+      const defaultPath = `node-${node.id}.${extension}`;
+      const isWindows = isWindowsDesktopRuntime();
+      // Windows 原生文件框会以当前聚焦窗口作为父窗口，从而稳定显示在主窗口前。
+      if (isWindows) {
+        await getCurrentWindow().setFocus();
+      }
+
+      const selectedPath = await save(isWindows
+        ? {
+          title: videoSource ? '保存视频' : '保存图片',
+          defaultPath,
+          filters: [{ name: videoSource ? 'MP4 视频' : 'PNG 图片', extensions: [extension] }],
+        }
+        : { defaultPath });
       if (!selectedPath || Array.isArray(selectedPath)) {
         return;
       }

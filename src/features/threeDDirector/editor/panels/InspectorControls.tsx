@@ -25,6 +25,7 @@ type AxisControl = {
   ariaLabel: string;
   value: FieldValue;
   onChange: (value: string) => void;
+  disabled?: boolean;
   step?: string;
   min?: string;
   max?: string;
@@ -53,6 +54,7 @@ type RangeNumberFieldProps = {
   min: string | number;
   max: string | number;
   step: string | number;
+  disabled?: boolean;
 };
 
 type InspectorSelectOption = {
@@ -338,6 +340,7 @@ function InspectorAxisInput({ control }: { control: AxisControl }) {
   useEffect(() => () => cleanupDragRef.current?.(), []);
 
   function applyDeltaFromValue(deltaSteps: number, value: FieldValue) {
+    if (control.disabled) return;
     const step = parseStep(control.step);
     const startValue = parseFiniteNumber(value) ?? 0;
     const precision = Math.max(decimalPlaces(control.step), decimalPlaces(value));
@@ -346,7 +349,7 @@ function InspectorAxisInput({ control }: { control: AxisControl }) {
   }
 
   function handlePrefixMouseDown(event: MouseEvent<HTMLButtonElement>) {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || control.disabled) return;
 
     event.currentTarget.focus();
     event.preventDefault();
@@ -399,11 +402,12 @@ function InspectorAxisInput({ control }: { control: AxisControl }) {
   }
 
   return (
-    <div className={`inspector-axis-input${isDragging ? " is-dragging" : ""}`}>
+    <div className={`inspector-axis-input${isDragging ? " is-dragging" : ""}${control.disabled ? " is-disabled" : ""}`}>
       <button
         aria-label={`${control.ariaLabel} 拖动调整`}
         className="inspector-axis-prefix"
         type="button"
+        disabled={control.disabled}
         onKeyDown={handlePrefixKeyDown}
         onMouseDown={handlePrefixMouseDown}
       >
@@ -416,6 +420,7 @@ function InspectorAxisInput({ control }: { control: AxisControl }) {
         min={control.min}
         step={control.step}
         type="number"
+        disabled={control.disabled}
         value={control.value}
         onChange={(event) => control.onChange(event.currentTarget.value)}
         onBlur={endInteraction}
@@ -437,6 +442,7 @@ export function InspectorRangeNumberField({
   min,
   max,
   step,
+  disabled = false,
 }: RangeNumberFieldProps) {
   const rangeDragCleanupRef = useRef<(() => void) | null>(null);
   const { beginInteraction, endInteraction } = useUndoBatchInteraction();
@@ -469,6 +475,7 @@ export function InspectorRangeNumberField({
           min={min}
           step={step}
           type="range"
+          disabled={disabled}
           value={value}
           onChange={(event) => (onRangeChange ?? onValueChange)(event.currentTarget.value)}
           onPointerCancel={stopRangeDrag}
@@ -482,6 +489,7 @@ export function InspectorRangeNumberField({
           min={min}
           step={step}
           type="number"
+          disabled={disabled}
           value={value}
           onBlur={(event) => {
             onNumberBlur?.(event.currentTarget.value);
@@ -492,6 +500,42 @@ export function InspectorRangeNumberField({
         />
       </div>
     </div>
+  );
+}
+
+export function TransformGizmoHeightControl({
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  value?: number;
+  onChange: (value: number) => void;
+  ariaLabel: string;
+}) {
+  const height = Number.isFinite(value) ? value as number : 0;
+
+  return (
+    <>
+      <InspectorRangeNumberField
+        label="控制器高度"
+        rangeAriaLabel={`${ariaLabel}滑杆`}
+        numberAriaLabel={ariaLabel}
+        min="-20"
+        max="20"
+        step="0.01"
+        value={height}
+        onValueChange={(nextValue) => onChange(Number(nextValue))}
+      />
+      <button
+        aria-label="还原控制器至落地点"
+        className="inspector-action-button"
+        disabled={height === 0}
+        type="button"
+        onClick={() => onChange(0)}
+      >
+        还原至落地点
+      </button>
+    </>
   );
 }
 
