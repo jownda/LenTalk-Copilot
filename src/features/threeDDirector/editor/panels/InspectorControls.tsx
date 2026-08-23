@@ -69,7 +69,10 @@ type OptionElementProps = {
   children?: ReactNode;
 };
 
+// Axis dragging is a continuous interaction. Keep the existing sensitivity,
+// but do not quantize pointer movement to whole steps.
 const AXIS_DRAG_PIXELS_PER_STEP = 10;
+const AXIS_DRAG_MIN_PRECISION = 3;
 
 function parseFiniteNumber(value: FieldValue | undefined) {
   const parsed = Number(value);
@@ -343,7 +346,7 @@ function InspectorAxisInput({ control }: { control: AxisControl }) {
     if (control.disabled) return;
     const step = parseStep(control.step);
     const startValue = parseFiniteNumber(value) ?? 0;
-    const precision = Math.max(decimalPlaces(control.step), decimalPlaces(value));
+    const precision = Math.max(decimalPlaces(control.step), decimalPlaces(value), AXIS_DRAG_MIN_PRECISION);
     const nextValue = clampValue(startValue + deltaSteps * step, control.min, control.max);
     control.onChange(formatDraggedValue(nextValue, precision));
   }
@@ -361,12 +364,16 @@ function InspectorAxisInput({ control }: { control: AxisControl }) {
     const startX = event.clientX;
     const startValue = parseFiniteNumber(control.value) ?? 0;
     const step = parseStep(control.step);
-    const precision = Math.max(decimalPlaces(control.step), decimalPlaces(control.value));
+    const precision = Math.max(
+      decimalPlaces(control.step),
+      decimalPlaces(control.value),
+      AXIS_DRAG_MIN_PRECISION,
+    );
     let previousValue = formatDraggedValue(startValue, precision);
 
     const handleMouseMove = (moveEvent: globalThis.MouseEvent) => {
       moveEvent.preventDefault();
-      const deltaSteps = Math.round((moveEvent.clientX - startX) / AXIS_DRAG_PIXELS_PER_STEP);
+      const deltaSteps = (moveEvent.clientX - startX) / AXIS_DRAG_PIXELS_PER_STEP;
       const nextValue = clampValue(startValue + deltaSteps * step, control.min, control.max);
       const formattedValue = formatDraggedValue(nextValue, precision);
 

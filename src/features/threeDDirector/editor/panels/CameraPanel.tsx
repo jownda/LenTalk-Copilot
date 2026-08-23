@@ -13,7 +13,7 @@ import { downloadDataUrl } from "../io/screenshotExport";
 import { postDirectorDeskCapturesToHost, postDirectorDeskReferenceVideoDataUrlToHost } from "../io/hostBridge";
 import { getDirectorObjectFocusTarget, isCameraFocusableObject } from "../schema/cameraTarget";
 import type { DirectorCameraCapture } from "../schema/directorProject";
-import { getCameraMotionPath, getCameraMotionTimingPlan } from "../schema/cameraMotion";
+import { DEFAULT_CAMERA_MOTION_PATH, getCameraMotionPath, getCameraMotionTimingPlan } from "../schema/cameraMotion";
 import { useDirectorStore } from "../store/directorStore";
 import { MotionStudio } from "../motion/MotionStudio";
 import { useMotionViewportBridge } from "../motion/motionViewportBridge";
@@ -73,9 +73,11 @@ export function CameraPanel() {
   const setViewMode = useDirectorStore((state) => state.setViewMode);
   const viewportBridge = useMotionViewportBridge();
 
-  if (!camera) return null;
-  const currentCamera = camera;
-  const captures = useMemo(() => currentCamera.captures ?? [], [currentCamera.captures]);
+  // 注意: 本组件禁止在 hooks 中间提前 return——删除机位后 camera 变 null 时,
+  // 提前 return 会跳过后续 hooks, 触发 React "Rendered fewer hooks than expected"
+  // 崩溃(整页黑屏)。early return 已统一移到组件末尾(所有 hooks 之后)。
+  // hooks 区一律用 camera?. 可选链, 在 early return 之后重新定义非空 currentCamera。
+  const captures = useMemo(() => camera?.captures ?? [], [camera?.captures]);
   const cameraCaptureGroups = useMemo(
     () =>
       cameras.map((item) => ({
@@ -87,23 +89,30 @@ export function CameraPanel() {
   const hasAnyCameraCapture = cameraCaptureGroups.some((group) => group.captures.length > 0);
   const focusableObjects = useMemo(() => objects.filter(isCameraFocusableObject), [objects]);
   const targetSelectValue =
-    currentCamera.targetMode === "object" && currentCamera.targetObjectId
-      ? `object:${currentCamera.targetObjectId}`
+    camera?.targetMode === "object" && camera?.targetObjectId
+      ? `object:${camera.targetObjectId}`
       : "manual";
-  const motionPath = useMemo(() => getCameraMotionPath(currentCamera), [currentCamera]);
-  const motionTimingPlan = useMemo(() => getCameraMotionTimingPlan(currentCamera), [currentCamera]);
+  // camera 为空时用默认空路径占位, 保证类型非 undefined(hooks 区不允许提前 return)。
+  const motionPath = useMemo(
+    () => (camera ? getCameraMotionPath(camera) : { ...DEFAULT_CAMERA_MOTION_PATH }),
+    [camera]
+  );
+  const motionTimingPlan = useMemo(
+    () => (camera ? getCameraMotionTimingPlan(camera) : undefined),
+    [camera]
+  );
   const selectedMotionKeyframe =
-    motionPath.keyframes.find((item) => item.id === selectedCameraKeyframeId) ?? motionPath.keyframes[0] ?? null;
+    motionPath?.keyframes.find((item) => item.id === selectedCameraKeyframeId) ?? motionPath?.keyframes[0] ?? null;
   const propertyKeyframe = selectedCameraKeyframeId
-    ? motionPath.keyframes.find((item) => item.id === selectedCameraKeyframeId) ?? null
+    ? motionPath?.keyframes.find((item) => item.id === selectedCameraKeyframeId) ?? null
     : null;
-  const propertyPosition = propertyKeyframe?.position ?? currentCamera.transform.position;
-  const propertyTarget = propertyKeyframe?.target ?? currentCamera.target;
-  const propertyFov = propertyKeyframe?.fov ?? currentCamera.fov;
+  // propertyPosition/propertyTarget/propertyFov 在 early return 之后重新定义(非可选),
+  // 这里不再提前声明, 避免 camera 为 null 时类型含 undefined。
 
   useEffect(() => {
+    if (!camera || !motionPath) return;
     setMotionDurationDraft(String(motionPath.duration));
-  }, [currentCamera.id, motionPath.duration]);
+  }, [camera?.id, motionPath?.duration]);
 
   useEffect(() => {
     setMotionFovDraft(selectedMotionKeyframe ? String(selectedMotionKeyframe.fov) : "");
@@ -206,6 +215,17 @@ export function CameraPanel() {
       )
     );
   }, [cameraCaptureGroups]);
+
+  // 所有 hooks 已执行完毕(useMemo/useEffect/useCallback 等), 现在才允许 early
+  // return——绝不能提前到 hooks 中间, 否则删除机位后 camera 变 null 提前 return
+  // 会跳过后续 hooks, 触发 React "Rendered fewer hooks than expected" 崩溃(整页黑屏)。
+  if (!camera) return null;
+  // early return 之后 camera 已收窄为非空, 重新定义 currentCamera 供后续 JSX 使用。
+  const currentCamera = camera;
+  const propertyPosition: [number, number, number] =
+    propertyKeyframe?.position ?? currentCamera.transform.position;
+  const propertyTarget: [number, number, number] = propertyKeyframe?.target ?? currentCamera.target;
+  const propertyFov: number = propertyKeyframe?.fov ?? currentCamera.fov;
 
   async function handleCameraCapture() {
     try {
@@ -717,7 +737,7 @@ export function CameraPanel() {
               numberAriaLabel="摄影机轨迹时长"
               min="0.5"
               max="30"
-              step="0.1"
+              step="any"
               value={motionDurationDraft}
               onValueChange={commitMotionDuration}
               onRangeChange={commitMotionDuration}
@@ -805,7 +825,7 @@ export function CameraPanel() {
                   numberAriaLabel="轨迹点焦段"
                   min="10"
                   max="120"
-                  step="0.1"
+                  step="any"
                   value={motionFovDraft}
                   onValueChange={commitSelectedMotionFov}
                   onRangeChange={commitSelectedMotionFov}
@@ -927,7 +947,7 @@ export function CameraPanel() {
             numberAriaLabel="机位焦段"
             max="120"
             min="10"
-            step="0.1"
+            step="any"
             value={propertyFov}
             onValueChange={updateCameraFov}
           />
