@@ -406,9 +406,10 @@
   top: calc(100% + 8px);
   z-index: 30;
   display: grid;
-  gap: 4px;
-  width: 132px;
-  padding: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px;
+  width: 220px;
+  padding: 5px;
   border: 1px solid rgb(var(--border-rgb) / 0.35);
   border-radius: 14px;
   background: rgb(var(--panel-rgb) / 0.9);
@@ -423,7 +424,7 @@
 .viewport-toolbar-menu button,
 .viewport-toolbar-submenu button {
   width: 100%;
-  height: 30px;
+  height: 28px;
   border: 0;
   border-radius: 10px;
   padding: 0 9px;
@@ -433,6 +434,12 @@
   font-weight: 600;
   line-height: 17px;
   text-align: left;
+}
+
+/* 「添加角色」菜单里整行功能项(导入绑骨人物/群众/几何模型)占满两列 */
+.viewport-toolbar-menu .viewport-toolbar-menu-item-inline,
+.viewport-toolbar-menu .viewport-toolbar-submenu-wrap {
+  grid-column: 1 / -1;
 }
 
 .viewport-toolbar-menu-item-inline {

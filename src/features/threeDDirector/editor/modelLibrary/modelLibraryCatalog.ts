@@ -1,13 +1,10 @@
-import guoCharactersManifest from "./guoCharactersManifest.json";
-import guoPropsManifest from "./guoPropsManifest.json";
 import type { CharacterImportReadiness, CharacterRigProfile } from "../schema/directorProject";
-import { getGuoCharacterCompatibility } from "./guoCharacterCompatibility";
+import { GEOMETRY_PRIMITIVE_OPTIONS, type GeometryPrimitiveType } from "../schema/directorProject";
 
-export const LOCAL_GUO_ASSETS_AVAILABLE = __LOCAL_GUO_ASSETS_AVAILABLE__;
 export const LOCAL_MIXAMO_CHARACTER_AVAILABLE = __LOCAL_MIXAMO_CHARACTER_AVAILABLE__;
 export const LOCAL_ROBOT_CHARACTER_AVAILABLE = __LOCAL_ROBOT_CHARACTER_AVAILABLE__;
 
-export type ModelLibraryCategoryId = "characters" | "convenience" | "home" | "outdoor" | "tools" | "weapons" | "my-models";
+export type ModelLibraryCategoryId = "characters" | "geometry" | "convenience" | "home" | "outdoor" | "tools" | "my-models";
 
 export type ModelLibraryCategory = {
   directoryName: string;
@@ -23,6 +20,7 @@ export type ModelLibraryItem = {
   thumbUrl?: string;
   url: string;
   kind?: "character" | "prop";
+  geometryType?: GeometryPrimitiveType;
   characterRigProfile?: CharacterRigProfile;
   characterImportReadiness?: CharacterImportReadiness;
   characterOrientationCorrection?: [number, number, number];
@@ -38,16 +36,27 @@ export function getModelLibraryCharacterStatus(item: ModelLibraryItem) {
 }
 
 export const MODEL_LIBRARY_CATEGORIES: ModelLibraryCategory[] = [
-  ...(LOCAL_GUO_ASSETS_AVAILABLE || LOCAL_MIXAMO_CHARACTER_AVAILABLE || LOCAL_ROBOT_CHARACTER_AVAILABLE
+  ...(LOCAL_MIXAMO_CHARACTER_AVAILABLE || LOCAL_ROBOT_CHARACTER_AVAILABLE
     ? [{ id: "characters" as const, label: "人物", directoryName: "人物" }]
     : []),
+  { id: "geometry", label: "几何模型", directoryName: "" },
   { id: "convenience", label: "便利生活", directoryName: "便利生活" },
   { id: "home", label: "居家生活", directoryName: "生活家居" },
   { id: "outdoor", label: "户外出行", directoryName: "户外出行" },
   { id: "tools", label: "工具配件", directoryName: "工具配件" },
-  ...(LOCAL_GUO_ASSETS_AVAILABLE ? [{ id: "weapons" as const, label: "武器", directoryName: "武器" }] : []),
   { id: "my-models", label: "我的模型", directoryName: "" },
 ];
+
+/** 程序化几何体(立方体/球体/圆柱体等), 从「添加角色」菜单移到「模型库」的「几何模型」分类。 */
+export const GEOMETRY_MODELS: ModelLibraryItem[] = GEOMETRY_PRIMITIVE_OPTIONS.map((option) => ({
+  id: `geometry:${option.type}`,
+  kind: "prop",
+  categoryId: "geometry",
+  fileName: `${option.type}.geom`,
+  name: option.label,
+  url: `geometry://${option.type}`,
+  geometryType: option.type,
+}));
 
 const BUILTIN_LIFE_MODEL_INPUTS: Array<Omit<ModelLibraryItem, "id" | "thumbUrl" | "url">> = [
   { categoryId: "convenience", fileName: "ATM_low.fbx", name: "自动取款机" },
@@ -80,33 +89,18 @@ export const BUILTIN_LIFE_MODELS: ModelLibraryItem[] = BUILTIN_LIFE_MODEL_INPUTS
   thumbUrl: localBuiltinThumbnailUrl(item.fileName),
 }));
 
-type GuoCharacterManifestItem = {
-  id: string;
-  label: string;
-  localModelPath: string;
-  localThumbnailPath: string;
-};
-
-type GuoPropManifestItem = {
-  id: string;
-  label: string;
-  categoryId: string;
-  localModelPath: string;
-  localThumbnailPath: string;
-};
-
-const localAssetUrl = (path: string) => `${import.meta.env.BASE_URL}local-assets/guo-3d-assets/${path}`;
 const localMixamoAssetUrl = (path: string) => `${import.meta.env.BASE_URL}local-assets/mixamo/${path}`;
 
 // Keep one canonical entry for each robot. The old robot-* filenames were
 // aliases of these same 0029/0030 models.
+// 这两个角色(动态男性/动态女性)只在「添加角色」菜单快捷添加, 不列入模型库。
 export const ROBOT_CHARACTER_MODELS: ModelLibraryItem[] = LOCAL_ROBOT_CHARACTER_AVAILABLE
   ? [{
       id: "guo-character:guo-skeleton-0029-male-bot-a",
       kind: "character",
       categoryId: "characters",
       fileName: "0029_male-bot-a.fbx",
-      name: "机器人男性",
+      name: "动态男性",
       thumbUrl: localMixamoAssetUrl("thumbnails/0029_male-bot-a.png"),
       url: localMixamoAssetUrl("characters/0029_male-bot-a.fbx"),
       characterRigProfile: "mixamo",
@@ -117,7 +111,7 @@ export const ROBOT_CHARACTER_MODELS: ModelLibraryItem[] = LOCAL_ROBOT_CHARACTER_
       kind: "character",
       categoryId: "characters",
       fileName: "0030_female-bot-a.fbx",
-      name: "机器人女性",
+      name: "动态女性",
       thumbUrl: localMixamoAssetUrl("thumbnails/0030_female-bot-a.png"),
       url: localMixamoAssetUrl("characters/0030_female-bot-a.fbx"),
       characterRigProfile: "mixamo",
@@ -138,57 +132,21 @@ export const MIXAMO_CHARACTER_MODELS: ModelLibraryItem[] = LOCAL_MIXAMO_CHARACTE
       characterImportReadiness: "ready",
       characterOrientationCorrection: [0, 0, 0],
     }, {
-      id: "rigged-character:robot-expressive",
+      id: "rigged-character:soldier",
       kind: "character",
       categoryId: "characters",
-      fileName: "robot-expressive.glb",
-      name: "表情机器人（自带动作）",
-      url: localMixamoAssetUrl("characters/robot-expressive.glb"),
+      fileName: "soldier.glb",
+      name: "士兵（自带动作）",
+      url: localMixamoAssetUrl("characters/soldier.glb"),
       characterRigProfile: "mixamo",
       characterImportReadiness: "ready",
       characterOrientationCorrection: [0, 0, 0],
     }]
   : [];
 
-export const GUO_CHARACTER_MODELS: ModelLibraryItem[] = (guoCharactersManifest.items as GuoCharacterManifestItem[])
-  .filter((item) => item.id !== "guo-skeleton-0029-male-bot-a" && item.id !== "guo-skeleton-0030-female-bot-a")
-  .map((item) => {
-  const compatibility = getGuoCharacterCompatibility(item.id);
-  return {
-    id: `guo-character:${item.id}`,
-    kind: "character",
-    categoryId: "characters",
-    fileName: item.localModelPath.split("/").pop() ?? `${item.id}.fbx`,
-    name: item.label,
-    url: localAssetUrl(`guo-skeleton-models/${item.localModelPath}`),
-    thumbUrl: localAssetUrl(`guo-skeleton-models/${item.localThumbnailPath}`),
-    characterRigProfile: compatibility.rigProfile,
-    characterImportReadiness: compatibility.readiness,
-    characterOrientationCorrection: compatibility.orientationCorrection,
-  };
-  });
-
-function mapGuoPropCategory(categoryId: string): ModelLibraryCategoryId {
-  if (categoryId === "furniture") return "home";
-  if (categoryId === "vehicle" || categoryId === "environment") return "outdoor";
-  if (categoryId === "firearms" || categoryId === "melee") return "weapons";
-  if (categoryId === "accessory") return "convenience";
-  return "tools";
-}
-
-export const GUO_PROP_MODELS: ModelLibraryItem[] = (guoPropsManifest.items as GuoPropManifestItem[]).map((item) => ({
-  id: `guo-prop:${item.id}`,
-  kind: "prop",
-  categoryId: mapGuoPropCategory(item.categoryId),
-  fileName: item.localModelPath.split("/").pop() ?? `${item.id}.fbx`,
-  name: item.label,
-  url: localAssetUrl(`guo-mounted-props-200/${item.localModelPath}`),
-  thumbUrl: localAssetUrl(`guo-mounted-props-200/${item.localThumbnailPath}`),
-}));
-
 export function getModelLibraryItems() {
-  const localModels = LOCAL_GUO_ASSETS_AVAILABLE ? [...GUO_CHARACTER_MODELS, ...GUO_PROP_MODELS] : [];
-  return [...ROBOT_CHARACTER_MODELS, ...MIXAMO_CHARACTER_MODELS, ...localModels, ...BUILTIN_LIFE_MODELS].sort((a, b) => {
+  // ROBOT_CHARACTER_MODELS(动态男性/动态女性) 只在「添加角色」菜单快捷添加, 不列入模型库。
+  return [...MIXAMO_CHARACTER_MODELS, ...GEOMETRY_MODELS, ...BUILTIN_LIFE_MODELS].sort((a, b) => {
     const categoryIndexA = MODEL_LIBRARY_CATEGORIES.findIndex((category) => category.id === a.categoryId);
     const categoryIndexB = MODEL_LIBRARY_CATEGORIES.findIndex((category) => category.id === b.categoryId);
 

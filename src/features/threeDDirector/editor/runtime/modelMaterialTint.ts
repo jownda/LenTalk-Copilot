@@ -33,7 +33,7 @@ export function getModelTintColor(original: Color, tint: Color) {
   );
 }
 
-export function isolateAndTintModelMaterials(root: Object3D, color?: string) {
+export function isolateAndTintModelMaterials(root: Object3D, color?: string, disableTextures = false) {
   const tint = color ? new Color(color) : null;
   root.traverse((object) => {
     if (!hasMaterial(object)) return;
@@ -45,6 +45,15 @@ export function isolateAndTintModelMaterials(root: Object3D, color?: string) {
     }
     const materials = Array.isArray(object.material) ? object.material : [object.material];
     materials.forEach((material) => {
+      // 去掉模型贴图(仅纯色显示): 清掉 map 但 dispose 原贴图(克隆材质与原材质共享纹理,
+      // dispose 会破坏原始资源)。
+      if (disableTextures) {
+        const mapMaterial = material as Material & { map: unknown };
+        if (mapMaterial.map) {
+          mapMaterial.map = null;
+          material.needsUpdate = true;
+        }
+      }
       if (!hasColor(material)) return;
       const originalHex = typeof material.userData[ORIGINAL_COLOR_KEY] === "string"
         ? material.userData[ORIGINAL_COLOR_KEY]

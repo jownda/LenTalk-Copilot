@@ -114,8 +114,8 @@ function preset(
 }
 
 export const CHARACTER_BODY_PRESETS: CharacterBodyPreset[] = [
-  preset("mannequin", "男性素体", 2.62),
-  preset("female", "女性素体", 2.52, {
+  preset("mannequin", "静态男性", 2.62),
+  preset("female", "静态女性", 2.52, {
     pelvisScale: [1.42, 0.56, 0.78],
     torsoLowerRadius: 0.16,
     torsoUpperRadius: 0.2,

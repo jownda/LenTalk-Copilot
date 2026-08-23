@@ -16,6 +16,7 @@ import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { clone as cloneSkeleton, retargetClip } from "three/examples/jsm/utils/SkeletonUtils.js";
 import { getCharacterActionPreset } from "../presets/characterActionPresets";
+import { resolveNativeClipNameFromPresetId } from "../presets/nativeActionClipCatalog";
 import { getObjectMotionActionSample } from "../schema/objectMotion";
 import type { CharacterRigState, DirectorModelFormat, DirectorObject } from "../schema/directorProject";
 import type { DirectorCharacterBoneMap } from "../schema/semanticBody";
@@ -61,30 +62,21 @@ export function getCanonicalHumanoidBoneName(name: string) {
   return name.replace(/:/g, "").replace(/^mixamorig1/i, "mixamorig");
 }
 
-const XBOT_NATIVE_ACTION_CLIPS: NativeActionClipNames = {
-  "run-cycle": "run",
-  "walk-cycle": "walk",
-  "wave-cycle": "agree",
-};
-
 export const SOLDIER_NATIVE_ACTION_CLIPS: NativeActionClipNames = {
   "run-cycle": "run",
   "walk-cycle": "walk",
   "wave-cycle": "idle",
 };
 
-export const ROBOT_EXPRESSIVE_ACTION_CLIPS: NativeActionClipNames = {
-  "run-cycle": "running",
-  "walk-cycle": "walking",
-  "wave-cycle": "wave",
-};
-
 export function getNativeMixamoActionClip(
   actionPresetId: string | null | undefined,
   clips: AnimationClip[],
-  clipNames: NativeActionClipNames = XBOT_NATIVE_ACTION_CLIPS
+  clipNames: NativeActionClipNames = SOLDIER_NATIVE_ACTION_CLIPS
 ) {
-  const clipName = actionPresetId ? clipNames[actionPresetId] : undefined;
+  // 自带动画面板选择: preset id 形如 "native:<clipName>"(如 native:Run),
+  // 直接按动画名匹配; 否则按内置预设 id 的映射表查找。
+  const clipName = resolveNativeClipNameFromPresetId(actionPresetId)
+    ?? (actionPresetId ? clipNames[actionPresetId] : undefined);
   return clipName ? clips.find((clip) => clip.name.toLowerCase() === clipName) ?? null : null;
 }
 
@@ -241,7 +233,8 @@ export function prepareMixamoAnimationClip(
   retargetMode: MixamoRetargetMode = "direct",
   targetRestPose?: CharacterRestPose,
   sourceRestPose?: CharacterRestPose,
-  targetBoneMap?: DirectorCharacterBoneMap
+  targetBoneMap?: DirectorCharacterBoneMap,
+  stripHipsPosition = false,
 ) {
   if (sourceScene && retargetMode === "skeleton") {
     const skinnedClip = prepareSkinnedMixamoAnimationClip(sourceClip, scene, sourceScene, targetRestPose);
@@ -300,6 +293,21 @@ export function prepareMixamoAnimationClip(
       track.name = `${targetNode.name}${track.name.slice(propertySeparator)}`;
     }
   });
+  // 剥离全部骨骼的 position track: 角色位置由场景 rest transform 控制, 动画不做位移。
+  // 用于骨骼 rest 单位与动画单位不一致的模型(如 soldier.glb 骨骼 position 是 cm、
+  // 根节点 -90°+scale 0.01, 而 walk.fbx 动画 position 是米)——mixer 把米值直接
+  // 写到 cm 骨骼会压扁骨架(Hips z=106 也因 worldHeightScale 巨大被抛飞)。只保留
+  // 旋转 track(无量纲, 与 rest 无关, direct 模式直接应用)。
+  if (stripHipsPosition) {
+    clip.tracks = clip.tracks.filter((track) => {
+      const separator = track.name.lastIndexOf(".");
+      if (separator < 0) return true;
+      const trackPropertyName = track.name.slice(separator + 1);
+      return trackPropertyName !== "position";
+    });
+    return clip;
+  }
+
   const hipsTrack = clip.tracks.find((track) => {
     const [nodeName, propertyName] = track.name.split(".");
     return propertyName === "position" && getCanonicalHumanoidBoneName(nodeName).endsWith("mixamorigHips");
@@ -536,6 +544,7 @@ function PreparedExternalAnimationClip({
   sourceScene,
   runtimeMotion,
   targetBoneMap,
+  stripHipsPosition = false,
 }: {
   animationTimeSeconds: number;
   retargetMode: MixamoRetargetMode;
@@ -545,6 +554,7 @@ function PreparedExternalAnimationClip({
   sourceScene: Object3D;
   runtimeMotion?: { duration: number; object: DirectorObject };
   targetBoneMap?: DirectorCharacterBoneMap;
+  stripHipsPosition?: boolean;
 }) {
   const sourceRestPose = useMemo(() => captureCharacterRestPose(sourceScene), [sourceScene]);
   const clip = useMemo(
@@ -556,10 +566,11 @@ function PreparedExternalAnimationClip({
           retargetMode,
           restPose,
           sourceRestPose,
-          targetBoneMap
+          targetBoneMap,
+          stripHipsPosition
         )
       : null,
-    [restPose, retargetMode, scene, sourceClip, sourceRestPose, sourceScene, targetBoneMap]
+    [restPose, retargetMode, scene, sourceClip, sourceRestPose, sourceScene, stripHipsPosition, targetBoneMap]
   );
   return clip
     ? <MixamoAnimationPlayer animationTimeSeconds={animationTimeSeconds} clip={clip} restPose={restPose} runtimeMotion={runtimeMotion} scene={scene} />
@@ -573,6 +584,7 @@ function ExternalFbxAnimationClip({ animation, ...props }: {
   restPose: CharacterRestPose;
   runtimeMotion?: { duration: number; object: DirectorObject };
   targetBoneMap?: DirectorCharacterBoneMap;
+  stripHipsPosition?: boolean;
   scene: Object3D;
 }) {
   const source = useLoader(FBXLoader, animation.url);
@@ -587,6 +599,7 @@ function ExternalGlbAnimationClip({ animation, ...props }: {
   restPose: CharacterRestPose;
   runtimeMotion?: { duration: number; object: DirectorObject };
   targetBoneMap?: DirectorCharacterBoneMap;
+  stripHipsPosition?: boolean;
   scene: Object3D;
 }) {
   const source = useLoader(GLTFLoader, animation.url);
@@ -601,6 +614,7 @@ function ExternalCharacterAnimationClip(props: {
   restPose: CharacterRestPose;
   runtimeMotion?: { duration: number; object: DirectorObject };
   targetBoneMap?: DirectorCharacterBoneMap;
+  stripHipsPosition?: boolean;
   scene: Object3D;
 }) {
   return props.animation.format === "glb"
@@ -616,9 +630,11 @@ function LoadedMixamoCharacter({
   allowExternalAnimations = true,
   externalAnimation,
   orientationCorrection = DEFAULT_ORIENTATION_CORRECTION,
-  nativeActionClipNames = XBOT_NATIVE_ACTION_CLIPS,
+  nativeActionClipNames = SOLDIER_NATIVE_ACTION_CLIPS,
   nativeAnimations = [],
   robotNeutralTPose = false,
+  disableModelTextures = false,
+  stripHipsPosition = false,
   source,
   retargetMode,
   rigState,
@@ -629,6 +645,8 @@ function LoadedMixamoCharacter({
   nativeActionClipNames?: NativeActionClipNames;
   nativeAnimations?: AnimationClip[];
   robotNeutralTPose?: boolean;
+  disableModelTextures?: boolean;
+  stripHipsPosition?: boolean;
   source: Object3D;
   retargetMode: MixamoRetargetMode;
 }) {
@@ -656,8 +674,8 @@ function LoadedMixamoCharacter({
   }, [orientationCorrection, source]);
 
   useLayoutEffect(() => {
-    isolateAndTintModelMaterials(scene, color);
-  }, [color, scene]);
+    isolateAndTintModelMaterials(scene, color, disableModelTextures);
+  }, [color, disableModelTextures, scene]);
   useLayoutEffect(() => () => disposeIsolatedModelMaterials(scene), [scene]);
 
   useLayoutEffect(() => {
@@ -688,10 +706,26 @@ function LoadedMixamoCharacter({
     scene,
   ]);
 
-  const preparedNativeClip = useMemo(
-    () => nativeClip?.clone() ?? null,
-    [nativeClip, scene]
-  );
+  // GLB 动画的 Hips position track 常含根骨骼位移(root motion):
+  // soldier 的 Run 等也有位移。角色位置由场景 transform 控制, 直接应用
+  // 该 track 会把角色放倒/抬飞, 故播放前剥离 Hips 的 position track,
+  // 仅保留旋转(外部 FBX 动画已由 prepareMixamoAnimationClip 做过根位移
+  // 处理, 不走这里)。
+  const preparedNativeClip = useMemo(() => {
+    if (!nativeClip) return null;
+    const clip = nativeClip.clone();
+    clip.tracks = clip.tracks.filter((track) => {
+      const separator = track.name.lastIndexOf(".");
+      if (separator < 0) return true;
+      const nodeName = track.name.slice(0, separator);
+      const propertyName = track.name.slice(separator + 1);
+      if (propertyName === "position" && getCanonicalHumanoidBoneName(nodeName).endsWith("Hips")) {
+        return false;
+      }
+      return true;
+    });
+    return clip;
+  }, [nativeClip]);
 
   const bodyOffsetY = rigState?.controls["body.offsetY"] ?? 0;
   return (
@@ -704,6 +738,7 @@ function LoadedMixamoCharacter({
           retargetMode={retargetMode}
           restPose={restPose}
           runtimeMotion={runtimeMotion}
+          stripHipsPosition={stripHipsPosition}
           targetBoneMap={boneMap}
           scene={scene}
         />
@@ -722,6 +757,7 @@ function LoadedMixamoCharacter({
           retargetMode={retargetMode}
           restPose={restPose}
           runtimeMotion={runtimeMotion}
+          stripHipsPosition={stripHipsPosition}
           targetBoneMap={boneMap}
           scene={scene}
         />
@@ -744,20 +780,33 @@ function MixamoFbxCharacter(props: MixamoCharacterModelProps) {
 
 function MixamoGlbCharacter(props: MixamoCharacterModelProps) {
   const loaded = useLoader(GLTFLoader, props.url);
-  const isRobotExpressive = /robot-expressive\.glb(?:$|[?#])/i.test(props.url);
   const isSoldier = /soldier\.glb(?:$|[?#])/i.test(props.url);
-  const retargetMode: MixamoRetargetMode = isRobotExpressive || isSoldier ? "direct" : "local-rest";
-  const nativeActionClipNames = isRobotExpressive
-    ? ROBOT_EXPRESSIVE_ACTION_CLIPS
-    : isSoldier
-      ? SOLDIER_NATIVE_ACTION_CLIPS
-      : XBOT_NATIVE_ACTION_CLIPS;
+
+  // 士兵: 去掉贴图(纯色显示) + 禁用 GLB 内嵌动画(自带动作有绝对坐标根位移,
+  // 易畸形/躺倒) + 外部系统动画。soldier.glb 骨骼 rest 变换非常规(Hips z=106
+  // 大偏移、LeftUpLeg 等骨骼 rest 旋转非单位), local-rest 的 rest 校正会畸形、
+  // Hips position 重写会因 worldHeightScale 巨大把角色抛飞, 故走 direct(动画
+  // 旋转直接应用, 骨骼名与 Mixamo 一致) + 剥离 Hips position(位置由场景控制)。
+  if (isSoldier) {
+    return (
+      <LoadedMixamoCharacter
+        {...props}
+        disableModelTextures
+        nativeActionClipNames={{}}
+        nativeAnimations={[]}
+        retargetMode="direct"
+        stripHipsPosition
+        source={loaded.scene}
+      />
+    );
+  }
+
+  // 其他 GLB: 保留内嵌动画(用户导入模型), 外部动画回退也走 local-rest 校正。
   return (
     <LoadedMixamoCharacter
       {...props}
-      nativeActionClipNames={nativeActionClipNames}
       nativeAnimations={loaded.animations}
-      retargetMode={retargetMode}
+      retargetMode="local-rest"
       source={loaded.scene}
     />
   );

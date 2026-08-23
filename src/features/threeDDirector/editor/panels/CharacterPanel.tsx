@@ -11,6 +11,7 @@ import {
 } from "./InspectorControls";
 import { MANNEQUIN_POSE_PRESETS } from "../presets/mannequinPosePresets";
 import { CHARACTER_ACTION_PRESETS } from "../presets/characterActionPresets";
+import { getModelNativeActionOptions } from "../presets/nativeActionClipCatalog";
 import { getCameraMotionPath } from "../schema/cameraMotion";
 import { getObjectMotionTimingPlan, normalizeObjectMotionPath } from "../schema/objectMotion";
 import { getCrowdAnchorTransform, useDirectorStore } from "../store/directorStore";
@@ -113,9 +114,9 @@ export function CharacterPanel() {
     ?? (role.characterRig?.rigType === "mixamo" ? "mixamo" : role.characterRig?.rigType === "ue4-mannequin" ? "bip" : "unknown");
   const roleImportReadiness = roleAsset?.characterImportReadiness ?? "ready";
   const allowsHumanoidActions = roleImportReadiness === "ready";
-  const hidesPosePresets = /(?:0029_male-bot-a|0030_female-bot-a)\.fbx(?:$|[?#])/i.test(
-    roleAsset?.url ?? roleAsset?.fileName ?? ""
-  );
+  // Mixamo 动态模型(动态男/女、士兵、Camille 及所有 mixamo 骨架模型)不使用
+  // 姿势预设/姿势调节, 直接隐藏「姿势」tab 面板。
+  const hidesPosePresets = roleRigProfile === "mixamo";
   const visibleCharacterActionPresets = CHARACTER_ACTION_PRESETS.filter(
     (preset) => !preset.mixamoOnly || role.characterRig?.rigType === "mixamo"
   );
@@ -178,7 +179,9 @@ export function CharacterPanel() {
     }
   }
   const roleColor = role.color ?? (roleAsset ? "#ffffff" : selection.color);
-  const isRobotExpressive = /robot-expressive\.glb(?:$|[?#])/i.test(roleAsset?.url ?? "");
+  // 模型自带动作(如士兵的 Idle/Run/Walk/TPose): 仅当前角色匹配的模型可见,
+  // 其他模型返回空数组自动隐藏。
+  const nativeActionOptions = getModelNativeActionOptions(roleAsset?.url);
   const transform = selection.crowdAnchor;
   const isCrowd = selection.mode === "crowd";
   const routePath = normalizeObjectMotionPath(role.motionPath, role.transform);
@@ -297,7 +300,9 @@ export function CharacterPanel() {
       className="character-inspector"
       tabs={[
         { label: "属性", active: activeTab === "properties", onClick: () => setActiveTab("properties") },
-        { label: "姿势", active: activeTab === "pose", onClick: () => setActiveTab("pose") },
+        ...(!hidesPosePresets
+          ? [{ label: "姿势", active: activeTab === "pose", onClick: () => setActiveTab("pose") }]
+          : []),
         { label: "动作", active: activeTab === "action", onClick: () => setActiveTab("action") },
         { label: "路线", active: activeTab === "route", onClick: () => setActiveTab("route") },
       ]}
@@ -486,6 +491,10 @@ export function CharacterPanel() {
             }
           />
         </>
+      ) : activeTab === "pose" && hidesPosePresets ? (
+        <InspectorSection title="姿势预设" className="pose-preset-section">
+          <p className="character-action-compatibility" role="status">Mixamo 动态模型不支持姿势编辑，请切换至「动作」使用动作预设。</p>
+        </InspectorSection>
       ) : activeTab === "pose" ? (
         <InspectorSection title="姿势预设" className="pose-preset-section">
           {role.characterRig && allowsHumanoidActions ? (
@@ -576,9 +585,7 @@ export function CharacterPanel() {
               >
                 <span>{preset.label}</span>
                   <small>{(
-                  isRobotExpressive
-                    ? preset.robotExpressiveDuration ?? preset.duration
-                    : role.characterRig?.rigType === "mixamo"
+                  role.characterRig?.rigType === "mixamo"
                     ? preset.mixamoDuration ?? preset.duration
                     : preset.duration
                 ).toFixed(2)} 秒</small>
@@ -600,6 +607,32 @@ export function CharacterPanel() {
               </button>
             )) : null}
           </div>
+          {nativeActionOptions.length > 0 ? (
+            <div className="native-action-section">
+              <div className="native-action-header">
+                <strong>自带动作</strong>
+                <span>仅当前模型可用</span>
+              </div>
+              <div className="native-action-grid">
+                {nativeActionOptions.map((option) => (
+                  <button
+                    key={option.id}
+                    className={`native-action-preset${role.characterRig?.actionPresetId === option.id ? " is-active" : ""}`}
+                    type="button"
+                    aria-label={`播放自带动作 ${option.label}`}
+                    onClick={() => {
+                      if (isCrowd && selection.crowdId) applyCrowdActionPreset(selection.crowdId, option.id);
+                      else applyCharacterActionPreset(role.id, option.id);
+                      restartCameraMotionPlayback();
+                    }}
+                  >
+                    <span>{option.label}</span>
+                    <small>{option.duration.toFixed(2)} 秒</small>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
           {!isCrowd ? (
             <div className="imported-action-section">
               <div className="imported-action-header">

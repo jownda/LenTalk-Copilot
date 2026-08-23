@@ -44,6 +44,7 @@ import {
   getModelLibraryCharacterStatus,
   getModelLibraryItems,
   MODEL_LIBRARY_CATEGORIES,
+  ROBOT_CHARACTER_MODELS,
   type ModelLibraryCategoryId,
   type ModelLibraryItem,
 } from "../modelLibrary/modelLibraryCatalog";
@@ -54,9 +55,7 @@ import {
 import {
   DIRECTOR_CHARACTER_BONE_PART_OPTIONS,
 } from "../schema/semanticBody";
-import { BODY_TYPE_OPTIONS, type CharacterBodyType } from "../runtime/mannequin/bodyTypes";
-import { GEOMETRY_PRIMITIVE_OPTIONS, type GeometryPrimitiveType } from "../schema/directorProject";
-import {
+import { BODY_TYPE_OPTIONS, type CharacterBodyType } from "../runtime/mannequin/bodyTypes";import {
   useDirectorStore,
   type CameraShotSnapshot,
   type CrowdCharactersInput,
@@ -78,8 +77,7 @@ type ToolbarAction = {
 const FLOATING_PANEL_GAP = 8;
 const FLOATING_PANEL_MARGIN = 8;
 const MIN_FLOATING_PANEL_HEIGHT = 80;
-const CHARACTER_MENU_WIDTH = 132;
-const GEOMETRY_MENU_WIDTH = 112;
+const CHARACTER_MENU_WIDTH = 220;
 const CROWD_PANEL_WIDTH = 260;
 const MODEL_LIBRARY_PANEL_WIDTH = 500;
 const ASPECT_RATIO_PANEL_WIDTH = 340;
@@ -125,12 +123,10 @@ export function ViewportToolbar({
   const toolbarRef = useRef<HTMLDivElement | null>(null);
   const aspectRatioPanelRef = useRef<HTMLDivElement | null>(null);
   const characterTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const geometryTriggerRef = useRef<HTMLButtonElement | null>(null);
   const crowdTriggerRef = useRef<HTMLButtonElement | null>(null);
   const modelLibraryTriggerRef = useRef<HTMLButtonElement | null>(null);
   const aspectRatioTriggerRef = useRef<HTMLButtonElement | null>(null);
   const characterMenuRef = useRef<HTMLDivElement | null>(null);
-  const geometryMenuRef = useRef<HTMLDivElement | null>(null);
   const crowdPanelRef = useRef<HTMLDivElement | null>(null);
   const modelLibraryPanelRef = useRef<HTMLDivElement | null>(null);
   const sceneLocalModelInputRef = useRef<HTMLInputElement | null>(null);
@@ -140,7 +136,6 @@ export function ViewportToolbar({
   const billboardInputRef = useRef<HTMLInputElement | null>(null);
   const addImageBillboard = useDirectorStore((state) => state.addImageBillboard);
   const [characterMenuOpen, setCharacterMenuOpen] = useState(false);
-  const [geometryMenuOpen, setGeometryMenuOpen] = useState(false);
   const [crowdPanelOpen, setCrowdPanelOpen] = useState(false);
   const [modelLibraryOpen, setModelLibraryOpen] = useState(false);
   const [aspectRatioPanelOpen, setAspectRatioPanelOpen] = useState(false);
@@ -158,7 +153,6 @@ export function ViewportToolbar({
   } | null>(null);
   const characterImportPlaybackRestoreRef = useRef<{ playing: boolean; progress: number } | null>(null);
   const [characterMenuStyle, setCharacterMenuStyle] = useState<CSSProperties>({});
-  const [geometryMenuStyle, setGeometryMenuStyle] = useState<CSSProperties>({});
   const [crowdPanelStyle, setCrowdPanelStyle] = useState<CSSProperties>({});
   const [modelLibraryPanelStyle, setModelLibraryPanelStyle] = useState<CSSProperties>({});
   const [aspectRatioPanelStyle, setAspectRatioPanelStyle] = useState<CSSProperties>({});
@@ -250,7 +244,6 @@ export function ViewportToolbar({
     function closeMenusOnOutsidePointerDown(event: PointerEvent) {
       if (event.target instanceof Node && toolbarRef.current?.contains(event.target)) return;
       if (event.target instanceof Node && characterMenuRef.current?.contains(event.target)) return;
-      if (event.target instanceof Node && geometryMenuRef.current?.contains(event.target)) return;
       if (event.target instanceof Node && crowdPanelRef.current?.contains(event.target)) return;
       if (event.target instanceof Node && modelLibraryPanelRef.current?.contains(event.target)) return;
       if (event.target instanceof Node && aspectRatioPanelRef.current?.contains(event.target)) return;
@@ -261,7 +254,6 @@ export function ViewportToolbar({
       if (event.target instanceof Node && billboardInputRef.current?.contains(event.target)) return;
 
       setCharacterMenuOpen(false);
-      setGeometryMenuOpen(false);
       setCrowdPanelOpen(false);
       setModelLibraryOpen(false);
       setAspectRatioPanelOpen(false);
@@ -329,24 +321,6 @@ export function ViewportToolbar({
             CHARACTER_MENU_WIDTH
           )}px`,
           top: `${toolbarRect.bottom - frameRect.top + FLOATING_PANEL_GAP}px`,
-          bottom: "auto",
-          maxHeight: `${availableHeight}px`,
-        });
-      }
-
-      if (geometryMenuOpen && geometryTriggerRef.current) {
-        const triggerRect = geometryTriggerRef.current.getBoundingClientRect();
-        const availableHeight = Math.max(
-          MIN_FLOATING_PANEL_HEIGHT,
-          frameRect.bottom - triggerRect.top - FLOATING_PANEL_MARGIN
-        );
-        setGeometryMenuStyle({
-          left: `${getSidePanelLeft(
-            triggerRect,
-            geometryMenuRef.current,
-            GEOMETRY_MENU_WIDTH
-          )}px`,
-          top: `${triggerRect.top - frameRect.top}px`,
           bottom: "auto",
           maxHeight: `${availableHeight}px`,
         });
@@ -421,9 +395,6 @@ export function ViewportToolbar({
     if (characterTriggerRef.current) {
       resizeObserver.observe(characterTriggerRef.current);
     }
-    if (geometryTriggerRef.current) {
-      resizeObserver.observe(geometryTriggerRef.current);
-    }
     if (crowdTriggerRef.current) {
       resizeObserver.observe(crowdTriggerRef.current);
     }
@@ -439,7 +410,7 @@ export function ViewportToolbar({
       resizeObserver.disconnect();
       window.removeEventListener("resize", updateFloatingPositions);
     };
-  }, [aspectRatioPanelOpen, characterMenuOpen, crowdPanelOpen, geometryMenuOpen, modelLibraryOpen]);
+  }, [aspectRatioPanelOpen, characterMenuOpen, crowdPanelOpen, modelLibraryOpen]);
 
   async function handleLocalModelChange(
     event: ChangeEvent<HTMLInputElement>,
@@ -637,7 +608,6 @@ export function ViewportToolbar({
 
   function toggleCharacterMenu() {
     setCharacterMenuOpen((isOpen) => !isOpen);
-    setGeometryMenuOpen(false);
     setCrowdPanelOpen(false);
     setModelLibraryOpen(false);
     setAspectRatioPanelOpen(false);
@@ -646,20 +616,27 @@ export function ViewportToolbar({
   function addCharacterWithBodyType(bodyType: CharacterBodyType) {
     addPresetCharacter(bodyType);
     setCharacterMenuOpen(false);
-    setGeometryMenuOpen(false);
     setCrowdPanelOpen(false);
   }
 
-  function addGeometryWithType(geometryType: GeometryPrimitiveType) {
-    addGeometryPrimitive(geometryType);
+  function addDynamicCharacter(item: ModelLibraryItem) {
+    addImportedAsset({
+      kind: item.kind ?? "prop",
+      assetSource: "library",
+      fileName: item.fileName,
+      name: item.name,
+      url: item.url,
+      modelFormat: item.fileName.toLowerCase().endsWith(".glb") ? "glb" : item.fileName.toLowerCase().endsWith(".fbx") ? "fbx" : undefined,
+      characterRigProfile: item.characterRigProfile,
+      characterImportReadiness: item.characterImportReadiness,
+      characterOrientationCorrection: item.characterOrientationCorrection,
+    });
     setCharacterMenuOpen(false);
-    setGeometryMenuOpen(false);
     setCrowdPanelOpen(false);
   }
 
   function openCrowdPanel() {
     setCrowdPanelOpen(true);
-    setGeometryMenuOpen(false);
   }
 
   function closeCrowdPanel() {
@@ -686,19 +663,22 @@ export function ViewportToolbar({
     applyCrowdValueDrafts(nextInput);
     addCrowdCharacters(nextInput);
     setCharacterMenuOpen(false);
-    setGeometryMenuOpen(false);
     setCrowdPanelOpen(false);
   }
 
   function toggleModelLibrary() {
     setModelLibraryOpen((isOpen) => !isOpen);
     setCharacterMenuOpen(false);
-    setGeometryMenuOpen(false);
     setCrowdPanelOpen(false);
     setAspectRatioPanelOpen(false);
   }
 
   function addModelLibraryItem(item: ModelLibraryItem) {
+    if (item.geometryType) {
+      addGeometryPrimitive(item.geometryType);
+      setModelLibraryOpen(false);
+      return;
+    }
     addImportedAsset({
       kind: item.kind ?? "prop",
       assetSource: "library",
@@ -740,7 +720,6 @@ export function ViewportToolbar({
   function toggleAspectRatioPanel() {
     setAspectRatioPanelOpen((isOpen) => !isOpen);
     setCharacterMenuOpen(false);
-    setGeometryMenuOpen(false);
     setCrowdPanelOpen(false);
     setModelLibraryOpen(false);
   }
@@ -865,20 +844,43 @@ export function ViewportToolbar({
           aria-label="选择角色体型"
           style={characterMenuStyle}
         >
-          {BODY_TYPE_OPTIONS.map((option) => (
-            <button
-              key={option.bodyType}
-              role="menuitem"
-              type="button"
-              onClick={() => addCharacterWithBodyType(option.bodyType)}
-              onMouseEnter={() => {
-                setGeometryMenuOpen(false);
-                setCrowdPanelOpen(false);
-              }}
-            >
-              {option.label}
-            </button>
-          ))}
+          {BODY_TYPE_OPTIONS.flatMap((option) => {
+            // 「静态男性」后跟「动态男性」, 「静态女性」后跟「动态女性」。
+            const dynamicItem = option.bodyType === "mannequin"
+              ? ROBOT_CHARACTER_MODELS.find((item) => item.fileName.includes("male"))
+              : option.bodyType === "female"
+                ? ROBOT_CHARACTER_MODELS.find((item) => item.fileName.includes("female"))
+                : undefined;
+            const buttons = [
+              <button
+                key={option.bodyType}
+                role="menuitem"
+                type="button"
+                onClick={() => addCharacterWithBodyType(option.bodyType)}
+                onMouseEnter={() => {
+                                setCrowdPanelOpen(false);
+                }}
+              >
+                {option.label}
+              </button>,
+            ];
+            if (dynamicItem) {
+              buttons.push(
+                <button
+                  key={dynamicItem.id}
+                  role="menuitem"
+                  type="button"
+                  onClick={() => addDynamicCharacter(dynamicItem)}
+                  onMouseEnter={() => {
+                                    setCrowdPanelOpen(false);
+                  }}
+                >
+                  {dynamicItem.name}
+                </button>
+              );
+            }
+            return buttons;
+          })}
           <button
             className="viewport-toolbar-menu-item-inline"
             role="menuitem"
@@ -903,29 +905,6 @@ export function ViewportToolbar({
               onMouseEnter={openCrowdPanel}
             >
               <span>群众 (3x3)</span>
-              <ChevronRight aria-hidden="true" size={14} strokeWidth={1.8} />
-            </button>
-          </div>
-          <div
-            className="viewport-toolbar-submenu-wrap"
-            onMouseEnter={() => {
-              setGeometryMenuOpen(true);
-              setCrowdPanelOpen(false);
-            }}
-          >
-            <button
-              ref={geometryTriggerRef}
-              aria-expanded={geometryMenuOpen}
-              aria-haspopup="menu"
-              className="viewport-toolbar-menu-subtrigger"
-              role="menuitem"
-              type="button"
-              onMouseEnter={() => {
-                setGeometryMenuOpen(true);
-                setCrowdPanelOpen(false);
-              }}
-            >
-              <span>几何模型</span>
               <ChevronRight aria-hidden="true" size={14} strokeWidth={1.8} />
             </button>
           </div>
@@ -1001,26 +980,6 @@ export function ViewportToolbar({
               添加
             </button>
           </div>
-        </div>
-      ) : null}
-      {geometryMenuOpen ? (
-        <div
-          ref={geometryMenuRef}
-          className="viewport-toolbar-submenu"
-          role="menu"
-          aria-label="选择几何模型"
-          style={geometryMenuStyle}
-        >
-          {GEOMETRY_PRIMITIVE_OPTIONS.map((option) => (
-            <button
-              key={option.type}
-              role="menuitem"
-              type="button"
-              onClick={() => addGeometryWithType(option.type)}
-            >
-              {option.label}
-            </button>
-          ))}
         </div>
       ) : null}
       {modelLibraryOpen ? (

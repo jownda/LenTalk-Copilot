@@ -6,8 +6,7 @@ import path from "path";
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 const appVersion = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version ?? "0.0.0";
-const localGuoAssetsAvailable = existsSync(new URL("./public/local-assets/guo-3d-assets", import.meta.url));
-const requiredMixamoCharacters = ["camille.fbx", "xbot.glb", "soldier.glb"];
+const requiredMixamoCharacters = ["camille.fbx", "soldier.glb"];
 const localMixamoCharacterAvailable = requiredMixamoCharacters.every((fileName) =>
   existsSync(new URL(`./public/local-assets/mixamo/characters/${fileName}`, import.meta.url))
 );
@@ -36,7 +35,6 @@ export default defineConfig(async () => ({
 
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
-    __LOCAL_GUO_ASSETS_AVAILABLE__: JSON.stringify(localGuoAssetsAvailable),
     __LOCAL_MIXAMO_CHARACTER_AVAILABLE__: JSON.stringify(localMixamoCharacterAvailable),
     __LOCAL_ROBOT_CHARACTER_AVAILABLE__: JSON.stringify(localRobotCharacterAvailable),
     __LOCAL_MIXAMO_ANIMATIONS_AVAILABLE__: JSON.stringify(localMixamoAnimationsAvailable),
