@@ -258,3 +258,153 @@ npm run build       # tsc 类型 + vite 打包，确认前端无破坏
 - 引擎层：单测覆盖全部 V2 校验规则（zh/en fixture 各一组）。
 - 集成层：中文界面全中文输出（仅特定英文名称），英文界面按 locale 输出；两条语言路径各跑一次回归走查。
 - 用户体验：AI 编译出错时按钮旁保留原始错误详情 + 一键复制；校验 warning 只在左侧面板提示，不污染导出文本。
+
+---
+
+## 5. V2-P3 用户反馈问题清单（2026-08-25 集成实测）
+
+> 本轮 7 项全部为用户真实操作反馈，先记录问题与方案，按 V2.8 → V2.15 逐步实施、独立提交。
+> 依据：`表演技巧ACTING SKILL.md`（表演五支柱、表演母版、声音锁）、`视频提示脚本CINEDANCE HIGGSFIELD SKILL.md`（逐镜密封文档、FOV 角度语言银行）。
+> 约束沿用：中文界面全中文输出（仅特定英文名称），英文界面按 locale 全英文输出。
+
+### V2-P3-1 页面无法上下滚动，下方内容不可见（布局级）
+
+**证据**：打开工作室后左侧卡片较长（导演简报 → 导演文档 → 镜头列表 → 检查器 → 连续性），页面整体无法滚动，底部分区看不到。
+
+**根因（代码核查）**
+1. 顶层容器 `.cinematic-studio-app` 是 `fixed top-10 bottom-0 overflow-hidden`，实际高度 = 视口 − 40px；
+2. 内部 `.cinematic-studio-body { min-height: 100vh }` 与 `.app-shell { height: 100vh; overflow: hidden }` 仍按整屏高度计算，底部 40px 被容器裁切，唯一滚动区 `.content`（`overflow-y: auto`）的底端和滚动条尾部也被裁掉；
+3. `styles.css` 存在一批坏选择器：`.inspector-`、`.checklist-`、`.tech-`、`.settings-`、`.recipe-edit-` 后直接拼接 `.cinematic-studio-app`（约 1313 / 2846 / 2896 / 3060 / 3175 行），本意应是给 `.cinematic-studio-body` 设列布局，从未生效，属死代码。
+
+**改动**
+1. 高度链改为 `100%`：`.cinematic-studio-body { height: 100% }`（去掉 `min-height: 100vh`）、`.app-shell { height: 100% }`；
+2. `.content` 保持唯一纵向滚动区（`min-height: 0; overflow-y: auto`），左列能滚动到底看到全部卡片；
+3. `.content-side` 维持自身内部滚动（sticky + max-height），右侧资产库 / 提示词编辑器各自可滚；
+4. 修复/清理上述坏选择器（按 DOM 结构核对作用域后改，避免样式回归）。
+
+**文件**：`src/features/cinematicStudio/CinematicStudioWorkbench.tsx`、`src/features/cinematicStudio/app/styles.css`
+
+---
+
+### V2-P3-2 模型切换放到「AI编译提示词」左边，去掉右上角设置
+
+**证据**：当前选 AI 模型要进右上角设置弹窗，路径长；右上角齿轮与 LenTalk 全局设置入口混淆。
+
+**改动**
+1. `DirectorBriefCard` 场景操作区（scene-actions）「AI编译提示词」左侧新增「模型」下拉：
+   - 数据源 = LenTalk 自定义平台的 Chat 模型列表（与 `aiSettings.ts` 一致）；
+   - 切换即写 `saveAISettings({ provider, model })`，未配置平台时置灰并显示「未配置」；
+2. 移除顶栏 `Settings2` 设置按钮；设置入口迁到模型下拉右侧的小齿轮图标（仍打开居中设置弹窗，保证 API 可维护）；
+3. 两个「模型」职责分开：新下拉只决定调用哪个 Chat 模型；旧的「目标模型」下拉继续只控制编译模板语法（Kling / Seedance 等输出规范），UI 加 tooltip 区分。
+
+**文件**：`src/features/cinematicStudio/app/App.tsx`、`src/features/cinematicStudio/app/components/DirectorBriefCard.tsx`、`src/features/cinematicStudio/app/providers/aiSettings.ts`、`src/features/cinematicStudio/app/i18n.ts`
+
+---
+
+### V2-P3-3 资产编辑新增「用户备注（仅 AI 参考）」，AI 填写补充到角色信息栏
+
+**证据**：AI 填写详细目前只依赖参考图，用户已有的「性格 / 声音 / 来历」等主观信息没有入口；希望先写一句人设，AI 再结合图片补全「表演母版 + 声音锁」。
+UI 位置：名称输入框下方；其他资产类型同逻辑。
+
+**依据（ACTING SKILL）**：表演母版 = 身体传记 + 心理引擎 + 声线 + 习惯/抽动（带触发条件）+ 命名步态 + 压力裂缝 + 软化目标；声音锁在角色开口时逐字粘贴。用户备注只作 AI 理解素材，不是最终提示词字段。
+
+**改动**
+1. `Asset` 增加 `notes?` / `notesZh?`：用户手写简要备注（角色 = 性格 / 动机 / 说话习惯；地点 = 氛围 / 用途；道具 = 用法 / 质感；风格参考 = 意向描述），中英分栏，**强制不入编译输出**；
+2. 编辑页在「名称」下方放备注输入框，占位文案写明「仅 AI 参考，不输出到最终提示词」；角色类型提示可写性格与声音；
+3. `fillAssetDetails` 的 prompt 注入 `notes` / `notesZh`，规则改为「参考图 + 用户备注共同依据」：角色把备注性格/声音吸收进 `masterProfile` 与 `voicePrompt`（声音锁），地点/道具吸收进 `description` 与标记；
+4. 编译白名单 + 校验器加规则：「资产备注禁入导出」。
+
+**文件**：`src/features/cinematicStudio/shared-types/index.ts`、`src/features/cinematicStudio/app/components/AssetLibrary.tsx`、`src/features/cinematicStudio/app/providers/ai.ts`、`src/features/cinematicStudio/app/i18n.ts`、编译白名单
+
+---
+
+### V2-P3-4 风格倾向与一句风格话深度结合
+
+**证据**：风格配方目前平铺 12 个可折叠模块字段，选中风格后「一句风格话」仍为空或手填，两者割裂。
+
+**改动**
+1. 风格倾向卡的一级展示改为「一段详细风格描述」（zh/en 各一段），不默认分栏；12 字段折叠为「高级编辑」；
+2. 选中某个风格倾向时，把该风格的详细描述直接写入 `project.styleBrief`（当前界面语言对应语种），用户可手改，改动即视为脱离自动派生；
+3. 风格预设数据补 `descriptionZh` / `description` 长文本字段（一段话囊括光线 / 色彩 / 构图 / 质感本意）；
+4. AI 编译规则：`styleBrief` 是唯一风格语义来源；手改过则以手改内容优先，风格倾向仅作标签参考。
+
+**文件**：`src/features/cinematicStudio/app/components/TechnicalProfileCard.tsx`、`src/features/cinematicStudio/engine/presets/`（风格预设）、`src/features/cinematicStudio/app/i18n.ts`
+
+---
+
+### V2-P3-5 「AI编译提示词」是分水岭：以上用户填写（仅 AI 参考），以下 AI 填写（进入最终提示词）
+
+**证据（代码核查）**：`aiCompileScene` 把 `draft.audioPlan` 直接合并进 project，覆盖用户在音频计划卡里填的内容；`fillSceneDraft` 的 schema 也要求 AI 输出 `audioPlan`。用户明确：音频计划是用户信息，AI 不要填。
+
+**产品语义（写入 AI 规则与 UI 帮助）**
+- 按钮以上（导演简报：剧情 / 站位 / 风格 / 硬约束 / 对白 / 表演目标 / 音频计划）= 用户输入，仅作为 AI 编译参考上下文，**不整块直拼进最终提示词**；
+- 按钮以下（导演文档各层、镜头列表、检查器）= AI 产出，进入最终提示词；
+- 本地编译例外：不依赖 AI，把用户已填内容直接按结构编译输出（保留现有功能）。
+
+**改动**
+1. `fillSceneDraft` schema 删除 `audioPlan` 输出；AI prompt 把用户现有 `audioPlan` 作为必读输入，只在 directorLayers 的 `audio` 层转述/细化，禁止回写音频计划卡；
+2. `aiCompileScene` 不再合并 `draft.audioPlan`；
+3. 音频计划区加刘海提示「用户填写 · 仅作 AI 参考」，用户区 / AI 区做视觉分隔（分水岭标签）；
+4. 编译规则明确：场景字段（logline、priorContext、staging、styleBrief、audioPlan、actingObjectives…）由 AI 消化后重组进分层文档，不逐字拼接；本地编译保留结构化直拼兜底。
+
+**文件**：`src/features/cinematicStudio/app/providers/ai.ts`、`src/features/cinematicStudio/app/App.tsx`、`src/features/cinematicStudio/app/components/DirectorBriefCard.tsx`、`src/features/cinematicStudio/app/i18n.ts`
+
+---
+
+### V2-P3-6 镜头焦段（mm）与视场角（°）双轨冲突
+
+**证据（代码核查）**：检查器「镜头」下拉写 `shot.lens`（24mm…135mm），光学卡写 `shot.optics.fieldOfViewDegrees`（8°–135°）；AI 生成 schema 同时要求 `lens` 字符串与 `optics.fieldOfViewDegrees`，两套标称并存会互相矛盾或重复。
+
+**依据（CINEDANCE）**：FOV 角度是镜头语言核心度量，品牌 / mm 只是实现细节。
+
+**改动**
+1. 以**度数 `fieldOfViewDegrees` 为唯一权威字段**；`lens`（mm）降级为兼容层：旧数据缺失 optics 时按 lens-bank 换算补 FOV，UI 一律显示度数；
+2. 检查器删除 mm 下拉，并入光学卡的「视场角」选择 / 决策树（`OpticsCameraEditor` 已有 8° / 18° / 29° / 47° / 84° / 107° / 135° + 内容类别决策，直接复用）；
+3. `lensModel`（品牌镜头）保留为可选实现细节，不再承担焦段语义；
+4. `fillSceneDraft` schema 去掉顶层 `lens`，只保留 `optics.fieldOfViewDegrees` + `lensModel`；continuity 的 `OPTICS.FOV_OVERRIDDEN` / `OPTICS.BRAND_AS_PRIMARY` 升级为「双轨并存 error」。
+
+**文件**：`src/features/cinematicStudio/app/components/OpticsCameraEditor.tsx`、`src/features/cinematicStudio/app/App.tsx`（检查器）、`src/features/cinematicStudio/app/providers/ai.ts`、`src/features/cinematicStudio/engine/continuity.ts`、`src/features/cinematicStudio/shared-types/index.ts`
+
+---
+
+### V2-P3-7 镜头列表以下（检查器）内容未进最终提示词
+
+**证据**：AI 编译后检查器已填（节拍 / 站位 / 表演 / 眼部生活 / 声音锁），但最终提示词没有对应输出；实测输出只有 AI 分层文本，检查器数据缺失。
+
+**根因（代码核查）**：`compileDirectorSequence` 里 `scene.directorLayers` 存在时直接拼接分层文本并 return，结构化镜头渲染（`renderShotSection`：节拍、站位、表演、眼动、对白 + 声音锁）被整段跳过；AI 分层文本本身没有逐镜密封结构，导致检查器数据丢失。
+
+**依据（CINEDANCE + ACTING）**：每镜是一份密封文档，必须包含本镜活动引用、节拍 / 动作时序、站位、表演（行为而非情绪）、声音锁；这些是最终提示词的必要部分，不是可删元数据。真正问题不是「检查器没用」，而是透传路径把它丢了。
+
+**改动**
+1. 分层透传不再裸 `return`：`directorLayers` 存在时逐层校验，并与结构化镜头数据合并——`actionTiming` 层之后补上每镜结构段（活动引用 / 节拍 / 站位 / 表演 / 声音锁，来自检查器数据，去重呈现）；
+2. AI 规则：directorLayers 的 `actionTiming` 必须逐镜分块，每镜内容与检查器字段一一对应；校验器按镜头数检查「每镜至少 1 节拍、有站位、有表演、开口角色有声音锁」，缺失 → warning 并自动用结构化渲染补齐该镜；
+3. AI 分层文本与结构化数据冲突时（同镜两个版本），以检查器结构化数据为准，AI 文本作参考描述；
+4. 不删除检查器：它是 AI 填写 + 用户修正的结构化入口，与最终输出强绑定。
+
+**文件**：`src/features/cinematicStudio/engine/compiler/director.ts`、`src/features/cinematicStudio/engine/compiler/sections.ts`、`src/features/cinematicStudio/app/providers/ai.ts`、新校验模块（复用 V2-P2-1）
+
+---
+
+## 6. 实施顺序追加（V2-P3）
+
+| 步骤 | 内容 | 层 | 风险 | 提交点 |
+|---|---|---|---|---|
+| V2.8 | 布局滚动修复（高度链 100% + 清理坏选择器） | UI | 低 | `fix:` |
+| V2.9 | 模型下拉迁移 + 移除右上角设置（入口移模型旁） | UI | 低 | `feat:` |
+| V2.10 | 资产备注字段 + AI 填写纳入备注（角色信息栏） | 数据+AI+UI | 中 | `feat:` |
+| V2.11 | 风格倾向 → 一句风格话自动派生（一段式描述） | 预设+UI | 低 | `feat:` |
+| V2.12 | AI 编译分水岭：删 audioPlan 输出，AI 只读不回写；用户区/AI区视觉分隔 | AI+UI | 中 | `feat:` |
+| V2.13 | 焦段统一为视场角（mm 兼容层删除 UI） | 引擎+AI+UI | 中 | `refactor:` |
+| V2.14 | 检查器内容进最终提示词（分层 + 结构化合并输出） | 引擎+AI | 高 | `feat:` |
+| V2.15 | P3 回归走查（下节断言）+ 提交 | 验收 | — | `fix:` |
+
+## 7. 回归走查断言追加（V2-P3）
+
+1. 全屏工作室左列可完整滚动到底，滚动条可见，底部按钮不被裁切；
+2. 右上角无设置齿轮；「AI编译提示词」左侧有模型下拉，切换后下轮 AI 调用使用新模型；
+3. 资产编辑名称下出现「用户备注（仅 AI 参考）」；AI 填写后角色「表演母版 + 声音锁」被补全，最终提示词不含用户备注原文；
+4. 选中风格倾向后「一句风格话」自动出现该风格的一段中文描述，可手改；
+5. AI 编译后音频计划卡内容保持用户填写不变；导演文档 audio 层参考它但不再回写；
+6. 检查器不再出现 mm 焦段下拉，只保留视场角；导出文本无 mm/度数并存冲突；
+7. 最终提示词中每个镜头都有完整的节拍 / 站位 / 表演 / 声音锁段落；「动作时序」与检查器内容不重复冲突；
+8. 中文界面全程中文输出（固定名词除外），英文界面全英文（沿用既有 locale 验收）。
