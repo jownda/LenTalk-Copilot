@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use commands::ai as ai_commands;
 use commands::asset_library;
+use commands::cinematic_studio;
 use commands::image;
 use commands::jimeng_cli;
 use commands::project_state;
@@ -187,6 +188,14 @@ pub fn run() {
             asset_library::persist_library_asset_binary,
             asset_library::persist_library_asset_file,
             asset_library::extract_video_thumbnail,
+            cinematic_studio::project_save,
+            cinematic_studio::project_load,
+            cinematic_studio::prompt_save,
+            cinematic_studio::prompt_load,
+            cinematic_studio::version_record,
+            cinematic_studio::version_list,
+            cinematic_studio::keychain_set,
+            cinematic_studio::keychain_get,
             ai_commands::set_api_key,
             ai_commands::verify_provider_url,
             ai_commands::test_provider_connection,
@@ -199,6 +208,8 @@ pub fn run() {
             jimeng_cli::generate_jimeng_cli_video,
             jimeng_cli::jimeng_cli_login_start,
             jimeng_cli::jimeng_cli_login_check,
+            jimeng_cli::jimeng_cli_logout,
+            ai_commands::chat_completion,
             ai_commands::list_models,
             project_state::list_project_summaries,
             project_state::get_project_record,

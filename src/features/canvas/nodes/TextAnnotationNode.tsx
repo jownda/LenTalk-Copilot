@@ -98,6 +98,12 @@ export const TextAnnotationNode = memo(({
         maxHeight={MAX_HEIGHT}
       />
       <Handle
+        id="target"
+        type="target"
+        position={Position.Left}
+        className="!h-2 !w-2 !border-surface-dark !bg-accent"
+      />
+      <Handle
         id="source"
         type="source"
         position={Position.Right}

@@ -578,7 +578,7 @@ fn resolve_executable(requested: &str) -> Result<String, String> {
         }
     }
     Err(format!(
-        "未找到即梦 CLI（{trimmed}）。请先在终端运行 `dreamina -h` 验证安装，或在设置中填写完整路径（Windows 示例：%USERPROFILE%\\.dreamina_cli\\dreamina.exe）"
+        "未找到即梦 CLI（{trimmed}）。请先在终端运行 `dreamina -h` 验证安装，或在设置中填写完整路径（Windows 示例：%USERPROFILE%\\bin\\dreamina.exe）"
     ))
 }
 
@@ -784,6 +784,7 @@ fn output_summary(output: &str) -> String {
 }
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JimengCliLoginStartResult {
     /// true = 需要用户在浏览器完成授权; false = 已复用本地登录态
     pub need_auth: bool,
@@ -933,6 +934,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn login_start_result_serializes_camel_case() {
+        let result = JimengCliLoginStartResult {
+            need_auth: true,
+            verification_uri: Some("https://example.com/auth".to_string()),
+            user_code: Some("ABC-123".to_string()),
+            device_code: Some("def456".to_string()),
+            message: "ok".to_string(),
+        };
+        let value = serde_json::to_value(&result).expect("result serializes");
+        let object = value.as_object().expect("result is an object");
+        assert!(object.contains_key("needAuth"));
+        assert!(object.contains_key("verificationUri"));
+        assert!(object.contains_key("userCode"));
+        assert!(object.contains_key("deviceCode"));
+        assert!(object.contains_key("message"));
+        assert!(!object.contains_key("need_auth"));
+    }
+
+    #[test]
+    fn parses_current_headless_login_output() {
+        let output = "✓ 请使用浏览器完成 OAuth Device Flow 登录。 verification_uri: https://jimeng.jianying.com/ai-tool/cli-auth?verification_uri=https%3A%2F%2Fjimeng.jianying.com%2Fpassport%2Fopen%2Fscan_user_code%2F%3Fuser_code%3De1c08104fb4102e12ffb67d73c8efa0e user_code: e1c08104fb4102e12ffb67d73c8efa0e device_code: fa27cecdb576a27dc37cad8c812928a0 poll_interval: 1s expires_at: 2026-08-24T09:38:56+08:00";
+        assert_eq!(
+            extract_url_field(output).as_deref(),
+            Some("https://jimeng.jianying.com/ai-tool/cli-auth?verification_uri=https%3A%2F%2Fjimeng.jianying.com%2Fpassport%2Fopen%2Fscan_user_code%2F%3Fuser_code%3De1c08104fb4102e12ffb67d73c8efa0e")
+        );
+        assert_eq!(extract_field(output, &["user_code"]).as_deref(), Some("e1c08104fb4102e12ffb67d73c8efa0e"));
+        assert_eq!(extract_field(output, &["device_code"]).as_deref(), Some("fa27cecdb576a27dc37cad8c812928a0"));
+    }
+
+    #[test]
     fn extracts_verification_url_and_codes() {
         let output = r#"
 verification_uri: https://jimeng.jianying.com/oauth/device/activate
@@ -998,8 +1029,27 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
 
     #[test]
     fn common_locations_include_home_dirs() {
-        let locations = common_locations("dreamina");
-        assert!(locations.iter().any(|p| p.ends_with(".local/bin/dreamina")));
-        assert!(locations.iter().any(|p| p.ends_with(".cargo/bin/dreamina")));
+        let locations = common_locations("dreamina").into_iter().map(|p| p.replace('\\', "/")).collect::<Vec<_>>();
+        assert!(locations.iter().any(|p| p.ends_with(".local/bin/dreamina") || p.ends_with(".local/bin/dreamina.exe")));
+        assert!(locations.iter().any(|p| p.ends_with(".cargo/bin/dreamina") || p.ends_with(".cargo/bin/dreamina.exe")));
     }
+}
+
+/// Clear the local Dreamina CLI OAuth login state.
+#[tauri::command]
+pub async fn jimeng_cli_logout(executable: String) -> Result<JimengCliLoginCheckResult, String> {
+    let executable = executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先在「设置 - 密钥 - 即梦 CLI」中填写 CLI 可执行命令".to_string());
+    }
+    let value = executable.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli(&value, &["logout".to_string()])
+    })
+    .await
+    .map_err(|error| format!("即梦 CLI 退出登录失败: {error}"))??;
+    Ok(JimengCliLoginCheckResult {
+        success: true,
+        message: output.trim().to_string(),
+    })
 }

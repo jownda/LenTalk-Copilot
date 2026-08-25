@@ -16,6 +16,8 @@ export const DEFAULT_NODE_DISPLAY_NAME: Record<CanvasNodeType, string> = {
   [CANVAS_NODE_TYPES.storyboardGen]: '分镜生成',
   [CANVAS_NODE_TYPES.panorama]: '360 全景',
   [CANVAS_NODE_TYPES.directorDesk]: '3D 导演台',
+  [CANVAS_NODE_TYPES.cinematicStudio]: '电影提示词工作室',
+  [CANVAS_NODE_TYPES.promptOptimizer]: '提示词优化',
   [CANVAS_NODE_TYPES.audio]: '媒体',
   [CANVAS_NODE_TYPES.seamlessMosaic]: '无缝拼图',
 };

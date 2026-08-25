@@ -3,6 +3,7 @@ import {
   CANVAS_NODE_TYPES,
   DEFAULT_ASPECT_RATIO,
   type AudioNodeData,
+  type CinematicStudioNodeData,
   type DirectorDeskNodeData,
   type ImageSize,
   type CanvasNodeData,
@@ -12,6 +13,7 @@ import {
   type ImageEditNodeData,
   type VideoGenNodeData,
   type PanoramaNodeData,
+  type PromptOptimizerNodeData,
   type StoryboardSplitNodeData,
   type StoryboardGenNodeData,
   type TextAnnotationNodeData,
@@ -22,7 +24,7 @@ import { DEFAULT_NODE_DISPLAY_NAME } from './nodeDisplay';
 import { getDefaultImageModelId, getImageModel } from '../models';
 import { useSettingsStore } from '@/stores/settingsStore';
 
-export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music' | 'video' | 'mosaic';
+export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music' | 'video' | 'mosaic' | 'clapperboard';
 
 export interface CanvasNodeCapabilities {
   toolbar: boolean;
@@ -225,10 +227,10 @@ const textAnnotationNodeDefinition: CanvasNodeDefinition<TextAnnotationNodeData>
   },
   connectivity: {
     sourceHandle: true,
-    targetHandle: false,
+    targetHandle: true,
     connectMenu: {
       fromSource: true,
-      fromTarget: false,
+      fromTarget: true,
     },
   },
   createDefaultData: () => ({
@@ -371,6 +373,61 @@ const directorDeskNodeDefinition: CanvasNodeDefinition<DirectorDeskNodeData> = {
   }),
 };
 
+const cinematicStudioNodeDefinition: CanvasNodeDefinition<CinematicStudioNodeData> = {
+  type: CANVAS_NODE_TYPES.cinematicStudio,
+  menuLabelKey: 'node.menu.cinematicStudio',
+  menuIcon: 'clapperboard',
+  visibleInMenu: true,
+  capabilities: {
+    toolbar: true,
+    promptInput: false,
+  },
+  connectivity: {
+    sourceHandle: true,
+    targetHandle: true,
+    connectMenu: {
+      fromSource: true,
+      fromTarget: false,
+    },
+  },
+  createDefaultData: () => ({
+    displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.cinematicStudio],
+    lastProjectTitle: null,
+    lastPromptPreview: null,
+  }),
+  defaultSize: { width: 280, height: 200 },
+};
+
+const promptOptimizerNodeDefinition: CanvasNodeDefinition<PromptOptimizerNodeData> = {
+  type: CANVAS_NODE_TYPES.promptOptimizer,
+  menuLabelKey: 'node.menu.promptOptimizer',
+  menuIcon: 'sparkles',
+  visibleInMenu: true,
+  capabilities: {
+    toolbar: true,
+    promptInput: true,
+  },
+  connectivity: {
+    sourceHandle: true,
+    targetHandle: true,
+    connectMenu: {
+      fromSource: true,
+      fromTarget: true,
+    },
+  },
+  createDefaultData: () => ({
+    displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.promptOptimizer],
+    purpose: '',
+    taskType: 'auto',
+    targetModel: '',
+    referencePalette: '',
+    optimizedPrompt: '',
+    routeSummary: '',
+    notes: [],
+  }),
+  defaultSize: { width: 400, height: 360 },
+};
+
 const seamlessMosaicNodeDefinition: CanvasNodeDefinition<SeamlessMosaicNodeData> = {
   type: CANVAS_NODE_TYPES.seamlessMosaic,
   menuLabelKey: 'node.menu.seamlessMosaic',
@@ -420,7 +477,9 @@ export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition>
   [CANVAS_NODE_TYPES.storyboardGen]: storyboardGenNodeDefinition,
   [CANVAS_NODE_TYPES.panorama]: panoramaNodeDefinition,
   [CANVAS_NODE_TYPES.directorDesk]: directorDeskNodeDefinition,
+  [CANVAS_NODE_TYPES.cinematicStudio]: cinematicStudioNodeDefinition,
   [CANVAS_NODE_TYPES.audio]: audioNodeDefinition,
+  [CANVAS_NODE_TYPES.promptOptimizer]: promptOptimizerNodeDefinition,
   [CANVAS_NODE_TYPES.seamlessMosaic]: seamlessMosaicNodeDefinition,
 };
 

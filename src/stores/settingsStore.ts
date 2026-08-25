@@ -40,6 +40,22 @@ export function isVideoGenerationModelName(model: string): boolean {
 }
 
 /** 自定义 AI 平台(OpenAI 兼容),参考 Infinite Canvas 的 API 设置写法 */
+/** Classify a model id as a chat-completion LLM (excludes image/video generators). */
+export function isChatCompletionModelName(model: string): boolean {
+  const value = model.trim().toLowerCase();
+  if (!value || isVideoGenerationModelName(value)) {
+    return false;
+  }
+  const imageMarker =
+    /gpt-image|dall-?e|imagen|midjourney|stable[- ]?diffusion|sdxl|\bflux\b|nano[- ]?banana|\bbanana\b|seedream|z-image|qwen-image|tongyi[- ]image|image[- ]?(gen|edit|generation)|\bimage\b/i;
+  if (imageMarker.test(value)) {
+    return false;
+  }
+  const llmMarker =
+    /(?:^|[-_/])(gpt|o[1-4]|claude|codex|gemini|deepseek|glm|chatglm|llama|mistral|mixtral|qwen[23]?|kimi|moonshot|doubao|hunyuan|ernie|spark|baichuan|abab|phi|falcon|vicuna|wizard|openchat|hermes|nemotron|granite|olmo|jamba|command|nova|titan|minimax|groq|grok)(?=[-_.0-9]|$)|gpt-|claude-|codex-|gemini-|deepseek-|glm-|llama-|kimi|moonshot|doubao/i;
+  return llmMarker.test(value);
+}
+
 export interface CustomApiProvider {
   id: string;
   name: string;
@@ -48,6 +64,8 @@ export interface CustomApiProvider {
   models: string[];
   /** 视频生成模型：与图像模型分开，避免在图片节点中误选。 */
   videoModels: string[];
+  /** Chat LLM models for text tasks. */
+  chatModels: string[];
   createdAt: number;
   /** 请求模式: sync=同步等待平台返回图片; async=提交后轮询任务状态 */
   requestMode: 'sync' | 'async';
@@ -287,6 +305,9 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         ...explicitVideoModels,
         ...configuredModels.filter(isVideoGenerationModelName),
       ]));
+      const chatModels = Array.isArray(item.chatModels)
+        ? item.chatModels.map((model) => String(model).trim()).filter(Boolean)
+        : [];
       const videoModelIds = new Set(videoModels.map((model) => model.toLowerCase()));
       const models = configuredModels.filter(
         (model) => !videoModelIds.has(model.toLowerCase()) && !isVideoGenerationModelName(model)
@@ -299,6 +320,7 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         apiKey: normalizeApiKey(String(item.apiKey ?? '')),
         models,
         videoModels,
+        chatModels,
         createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
         // Older builds silently assigned async to every custom platform even
         // though the UI had no async selector. Migrate that legacy value to

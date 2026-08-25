@@ -5,6 +5,7 @@ import {
   isGroupNode,
   isImageEditNode,
   isPanoramaNode,
+  isPromptOptimizerNode,
   isSeamlessMosaicNode,
   isStoryboardGenNode,
   isStoryboardSplitNode,
@@ -124,6 +125,15 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
     if (isTextAnnotationNode(node)) {
       const content = node.data.content.trim();
       return content ? [content] : [];
+    }
+
+    if (isPromptOptimizerNode(node)) {
+      const optimized = typeof node.data.optimizedPrompt === 'string' ? node.data.optimizedPrompt.trim() : '';
+      if (optimized) {
+        return [optimized];
+      }
+      const purpose = typeof node.data.purpose === 'string' ? node.data.purpose.trim() : '';
+      return purpose ? [purpose] : [];
     }
 
     return [];

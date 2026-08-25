@@ -171,6 +171,69 @@ impl OpenAICompatibleProvider {
         Ok(models)
     }
 
+    /// 纯文本 Chat Completion: 供提示词优化等纯文本任务使用。
+    pub async fn chat_completion(
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        messages: &[(String, serde_json::Value)],
+    ) -> Result<String, AIError> {
+        let client = Self::build_client();
+        let normalized_base = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches('/');
+        let endpoint = format!("{}/v1/chat/completions", normalized_base);
+        let message_payload: Vec<Value> = messages
+            .iter()
+            .map(|(role, content)| json!({ "role": role, "content": content }))
+            .collect();
+        let body = json!({
+            "model": model,
+            "messages": message_payload,
+            "temperature": 0.4,
+        });
+
+        let response = client
+            .post(&endpoint)
+            .bearer_auth(api_key)
+            .header("Accept-Encoding", "identity")
+            .json(&body)
+            .send()
+            .await?;
+        let (status, body_text) =
+            Self::read_response_text(response, "/v1/chat/completions").await?;
+        let payload: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+
+        if !status.is_success() {
+            let message = payload
+                .get("error")
+                .and_then(|value| value.get("message"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if body_text.trim().is_empty() {
+                        format!("HTTP {} 空响应体", status)
+                    } else {
+                        body_text.chars().take(400).collect()
+                    }
+                });
+            return Err(AIError::TaskFailed(format!("HTTP {}: {}", status, message)));
+        }
+
+        payload
+            .get("choices")
+            .and_then(|value| value.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                AIError::TaskFailed("chat completion 响应缺少 choices[0].message.content".into())
+            })
+    }
+
     /// 仅检查 Base URL 是否可达(不依赖 API Key,供「验证链接」使用)
     pub async fn check_url_reachable(base_url: &str) -> Result<u16, AIError> {
         let client = Self::build_short_timeout_client();
@@ -206,6 +269,81 @@ impl OpenAICompatibleProvider {
         }
     }
 
+    /// Native GPT Image parameter mode rejects a standalone aspect_ratio field.
+    fn uses_native_image_parameters(api_model: &str) -> bool {
+        let normalized = api_model.trim().to_ascii_lowercase();
+        normalized.ends_with("-native")
+            || normalized.ends_with("-n")
+            || normalized.contains("gpt-image-1")
+            || normalized.contains("dall-e")
+    }
+
+    fn parse_aspect_ratio(aspect_ratio: &str) -> Option<(u32, u32)> {
+        let (width, height) = aspect_ratio.trim().split_once(':')?;
+        let width = width.trim().parse::<u32>().ok()?;
+        let height = height.trim().parse::<u32>().ok()?;
+        (width > 0 && height > 0).then_some((width, height))
+    }
+
+    fn round_to_multiple_of_16(value: f64) -> u32 {
+        (((value / 16.0).round() as u32).max(1)) * 16
+    }
+
+    /// Map the UI resolution tier to an upstream pixel size.
+    fn map_requested_image_size(api_model: &str, resolution: &str, aspect_ratio: &str) -> String {
+        let trimmed_resolution = resolution.trim();
+        if trimmed_resolution.contains('x')
+            && trimmed_resolution
+                .split_once('x')
+                .map(|(width, height)| {
+                    width.parse::<u32>().is_ok() && height.parse::<u32>().is_ok()
+                })
+                .unwrap_or(false)
+        {
+            return trimmed_resolution.to_string();
+        }
+
+        if trimmed_resolution.eq_ignore_ascii_case("1K") {
+            return Self::map_gpt_image_size(aspect_ratio).to_string();
+        }
+
+        let target_long_edge = if trimmed_resolution.eq_ignore_ascii_case("4K") {
+            3840u32
+        } else if trimmed_resolution.eq_ignore_ascii_case("2K") {
+            2048u32
+        } else {
+            return Self::map_gpt_image_size(aspect_ratio).to_string();
+        };
+        let (ratio_width, ratio_height) = Self::parse_aspect_ratio(aspect_ratio).unwrap_or((1, 1));
+        let (mut width, mut height) = if ratio_width >= ratio_height {
+            (
+                target_long_edge,
+                Self::round_to_multiple_of_16(
+                    target_long_edge as f64 * ratio_height as f64 / ratio_width as f64,
+                ),
+            )
+        } else {
+            (
+                Self::round_to_multiple_of_16(
+                    target_long_edge as f64 * ratio_width as f64 / ratio_height as f64,
+                ),
+                target_long_edge,
+            )
+        };
+
+        if Self::uses_native_image_parameters(api_model) {
+            const MAX_NATIVE_PIXELS: f64 = 8_294_400.0;
+            let pixels = width as f64 * height as f64;
+            if pixels > MAX_NATIVE_PIXELS {
+                let scale = (MAX_NATIVE_PIXELS / pixels).sqrt();
+                width = (((width as f64 * scale) / 16.0).floor() as u32).max(1) * 16;
+                height = (((height as f64 * scale) / 16.0).floor() as u32).max(1) * 16;
+            }
+        }
+
+        format!("{}x{}", width, height)
+    }
+
     /// 解析自定义平台 base_url 与 API Key(优先该平台, 其次 default)。
     async fn resolve_base_url_and_key(
         &self,
@@ -234,6 +372,7 @@ impl OpenAICompatibleProvider {
     fn build_request_body(
         api_model: &str,
         prompt: &str,
+        resolution: &str,
         aspect_ratio: &str,
         reference_images: Option<&Vec<String>>,
         reference_image_field: &str,
@@ -245,17 +384,20 @@ impl OpenAICompatibleProvider {
             "prompt": prompt,
             "n": 1,
         });
+        body["size"] = json!(Self::map_requested_image_size(
+            api_model,
+            resolution,
+            aspect_ratio,
+        ));
         if is_gpt_image {
-            body["size"] = json!(Self::map_gpt_image_size(aspect_ratio));
             body["output_format"] = json!("png");
             // gpt-image-2-* 中转模型会读取该字段；仅传 OpenAI 的 size 时会回退为服务端默认横幅。
-            if api_model.to_ascii_lowercase().contains("gpt-image-2") {
+            if api_model.to_ascii_lowercase().contains("gpt-image-2")
+                && !Self::uses_native_image_parameters(api_model)
+            {
                 body["aspect_ratio"] = json!(aspect_ratio);
             }
         } else {
-            // 即使平台只读取 size,也要反映用户选择的横竖方向；再同时传
-            // aspect_ratio,供支持精确画幅的 OpenAI 兼容中转使用。
-            body["size"] = json!(Self::map_gpt_image_size(aspect_ratio));
             // Generic OpenAI-compatible image relays commonly expose arbitrary
             // canvas framing through aspect_ratio rather than size alone.
             body["aspect_ratio"] = json!(aspect_ratio);
@@ -301,6 +443,7 @@ impl OpenAICompatibleProvider {
     fn build_apimart_request_body(
         api_model: &str,
         prompt: &str,
+        resolution: &str,
         aspect_ratio: &str,
         reference_images: Option<&Vec<String>>,
     ) -> Result<Value, AIError> {
@@ -317,7 +460,7 @@ impl OpenAICompatibleProvider {
             "model": api_model,
             "prompt": prompt,
             "n": 1,
-            "size": Self::map_gpt_image_size(aspect_ratio),
+            "size": Self::map_requested_image_size(api_model, resolution, aspect_ratio),
             "aspect_ratio": aspect_ratio,
             "official_fallback": false,
         });
@@ -351,15 +494,21 @@ impl OpenAICompatibleProvider {
     async fn build_edits_form(
         api_model: &str,
         prompt: &str,
+        resolution: &str,
         aspect_ratio: &str,
         reference_images: Option<&Vec<String>>,
     ) -> Result<Form, AIError> {
         let mut form = Form::new()
             .text("model", api_model.to_string())
             .text("prompt", prompt.to_string())
-            .text("size", Self::map_gpt_image_size(aspect_ratio).to_string())
-            .text("aspect_ratio", aspect_ratio.to_string())
+            .text(
+                "size",
+                Self::map_requested_image_size(api_model, resolution, aspect_ratio),
+            )
             .text("n", "1");
+        if !Self::uses_native_image_parameters(api_model) {
+            form = form.text("aspect_ratio", aspect_ratio.to_string());
+        }
 
         if let Some(images) = reference_images {
             for (index, reference) in images.iter().enumerate() {
@@ -496,6 +645,7 @@ impl OpenAICompatibleProvider {
     async fn build_responses_body(
         api_model: &str,
         prompt: &str,
+        resolution: &str,
         aspect_ratio: &str,
         reference_images: Option<&Vec<String>>,
     ) -> Result<Value, AIError> {
@@ -514,7 +664,11 @@ impl OpenAICompatibleProvider {
             "generate"
         };
         let mut tool = json!({ "type": "image_generation", "action": action });
-        tool["size"] = json!(Self::map_gpt_image_size(aspect_ratio));
+        tool["size"] = json!(Self::map_requested_image_size(
+            api_model,
+            resolution,
+            aspect_ratio,
+        ));
         Ok(json!({
             "model": api_model,
             "input": [{ "role": "user", "content": content }],
@@ -1017,6 +1171,7 @@ impl AIProvider for OpenAICompatibleProvider {
             let body = Self::build_responses_body(
                     api_model,
                     &request.prompt,
+                    &request.size,
                     &request.aspect_ratio,
                     request.reference_images.as_ref(),
                 )
@@ -1043,6 +1198,7 @@ impl AIProvider for OpenAICompatibleProvider {
             let form = Self::build_edits_form(
                 api_model,
                 &request.prompt,
+                &request.size,
                 &request.aspect_ratio,
                 request.reference_images.as_ref(),
             )
@@ -1058,6 +1214,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 Self::build_apimart_request_body(
                     api_model,
                     &request.prompt,
+                    &request.size,
                     &request.aspect_ratio,
                     request.reference_images.as_ref(),
                 )?
@@ -1065,6 +1222,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 Self::build_request_body(
                     api_model,
                     &request.prompt,
+                    &request.size,
                     &request.aspect_ratio,
                     request.reference_images.as_ref(),
                     reference_image_field,
@@ -1101,6 +1259,7 @@ impl AIProvider for OpenAICompatibleProvider {
             let fallback_body = Self::build_request_body(
                 api_model,
                 &request.prompt,
+                &request.size,
                 &request.aspect_ratio,
                 request.reference_images.as_ref(),
                 "input_image",
@@ -1129,6 +1288,7 @@ impl AIProvider for OpenAICompatibleProvider {
             let alternate_body = Self::build_request_body(
                 api_model,
                 &request.prompt,
+                &request.size,
                 &request.aspect_ratio,
                 request.reference_images.as_ref(),
                 alternate_field,
@@ -1259,6 +1419,7 @@ impl AIProvider for OpenAICompatibleProvider {
             let body = Self::build_responses_body(
                     api_model,
                     &request.prompt,
+                    &request.size,
                     &request.aspect_ratio,
                     request.reference_images.as_ref(),
                 )
@@ -1285,6 +1446,7 @@ impl AIProvider for OpenAICompatibleProvider {
             let form = Self::build_edits_form(
                 api_model,
                 &request.prompt,
+                &request.size,
                 &request.aspect_ratio,
                 request.reference_images.as_ref(),
             )
@@ -1300,6 +1462,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 Self::build_apimart_request_body(
                     api_model,
                     &request.prompt,
+                    &request.size,
                     &request.aspect_ratio,
                     request.reference_images.as_ref(),
                 )?
@@ -1307,6 +1470,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 Self::build_request_body(
                     api_model,
                     &request.prompt,
+                    &request.size,
                     &request.aspect_ratio,
                     request.reference_images.as_ref(),
                     reference_image_field,
@@ -1330,6 +1494,7 @@ impl AIProvider for OpenAICompatibleProvider {
             let fallback_body = Self::build_request_body(
                 api_model,
                 &request.prompt,
+                &request.size,
                 &request.aspect_ratio,
                 request.reference_images.as_ref(),
                 "input_image",
@@ -1358,6 +1523,7 @@ impl AIProvider for OpenAICompatibleProvider {
             let alternate_body = Self::build_request_body(
                 api_model,
                 &request.prompt,
+                &request.size,
                 &request.aspect_ratio,
                 request.reference_images.as_ref(),
                 alternate_field,
@@ -1613,6 +1779,7 @@ mod tests {
         let body = OpenAICompatibleProvider::build_request_body(
             "gpt-image-2",
             "edit the image",
+            "1K",
             "1:1",
             Some(&references),
             "image",
@@ -1630,6 +1797,7 @@ mod tests {
         let body = OpenAICompatibleProvider::build_request_body(
             "gpt-image-2",
             "edit the image",
+            "1K",
             "1:1",
             Some(&references),
             "input_image",
@@ -1647,6 +1815,7 @@ mod tests {
         let body = OpenAICompatibleProvider::build_request_body(
             "gpt-image-2",
             "edit the image",
+            "1K",
             "1:1",
             Some(&references),
             "image",
@@ -1662,6 +1831,7 @@ mod tests {
         let body = OpenAICompatibleProvider::build_request_body(
             "gpt-image-2-auto",
             "generate a square image",
+            "1K",
             "1:1",
             None,
             "image",
@@ -1682,6 +1852,7 @@ mod tests {
         let body = OpenAICompatibleProvider::build_request_body(
             "gpt-image-2",
             "combine both images",
+            "1K",
             "1:1",
             Some(&references),
             "image",
@@ -1702,6 +1873,7 @@ mod tests {
         let body = OpenAICompatibleProvider::build_request_body(
             "gpt-image-1",
             "combine both images",
+            "1K",
             "1:1",
             Some(&references),
             "input_image",
@@ -1737,6 +1909,7 @@ mod tests {
         let body = OpenAICompatibleProvider::build_apimart_request_body(
             "gpt-image-2",
             "combine both images",
+            "1K",
             "16:9",
             Some(&references),
         )
@@ -1746,5 +1919,37 @@ mod tests {
         assert_eq!(body["aspect_ratio"], "16:9");
         assert_eq!(body["image_urls"], serde_json::json!(references));
     }
+    #[test]
+    fn maps_resolution_tiers_to_real_pixel_sizes() {
+        assert_eq!(
+            OpenAICompatibleProvider::map_requested_image_size("gpt-image-2-auto", "2K", "16:9"),
+            "2048x1152",
+        );
+        assert_eq!(
+            OpenAICompatibleProvider::map_requested_image_size("gpt-image-2-auto", "4K", "16:9"),
+            "3840x2160",
+        );
+        assert_eq!(
+            OpenAICompatibleProvider::map_requested_image_size("gpt-image-2-auto", "4K", "9:16"),
+            "2160x3840",
+        );
+    }
 
+    #[test]
+    fn native_model_omits_aspect_ratio_and_stays_within_pixel_limit() {
+        let body = OpenAICompatibleProvider::build_request_body(
+            "gpt-image-2-native",
+            "generate a square image",
+            "4K",
+            "1:1",
+            None,
+            "input_image",
+            "raw_base64",
+        )
+        .expect("request body should be built");
+
+        assert_eq!(body["size"], "2880x2880");
+        assert!(body.get("aspect_ratio").is_none());
+    }
 }
+

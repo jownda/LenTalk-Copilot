@@ -1,6 +1,6 @@
 import { useMemo, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Image, Upload, Sparkles, LayoutGrid, Type, Orbit, Box, Music2, Video, Grid3x3 } from 'lucide-react';
+import { Clapperboard, Image, Upload, Sparkles, LayoutGrid, Type, Orbit, Box, Music2, Video, Grid3x3 } from 'lucide-react';
 import { UI_POPOVER_TRANSITION_MS } from '@/components/ui/motion';
 
 import type { CanvasNodeType } from '@/features/canvas/domain/canvasNodes';
@@ -24,6 +24,7 @@ export const nodeMenuIconMap: Record<MenuIconKey, typeof Upload> = {
   music: Music2,
   video: Video,
   mosaic: Grid3x3,
+  clapperboard: Clapperboard,
 };
 
 export function NodeSelectionMenu({

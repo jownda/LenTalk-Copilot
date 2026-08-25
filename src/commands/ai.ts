@@ -163,6 +163,62 @@ function mapGptImageSize(aspectRatio: string): string {
   return '1024x1024';
 }
 
+function usesNativeImageParameters(apiModel: string): boolean {
+  const normalized = apiModel.trim().toLowerCase();
+  return normalized.endsWith('-native')
+    || normalized.endsWith('-n')
+    || normalized.includes('gpt-image-1')
+    || normalized.includes('dall-e');
+}
+
+function mapRequestedImageSize(
+  apiModel: string,
+  resolution: string,
+  aspectRatio: string
+): string {
+  const normalizedResolution = resolution.trim();
+  if (/^\d+x\d+$/i.test(normalizedResolution)) {
+    return normalizedResolution;
+  }
+  if (normalizedResolution.toUpperCase() === '1K') {
+    return mapGptImageSize(aspectRatio);
+  }
+  const targetLongEdge = normalizedResolution.toUpperCase() === '4K'
+    ? 3840
+    : normalizedResolution.toUpperCase() === '2K'
+      ? 2048
+      : 0;
+  const match = aspectRatio.trim().match(/^(\d+)\s*:\s*(\d+)$/);
+  if (!targetLongEdge || !match) {
+    return mapGptImageSize(aspectRatio);
+  }
+  const ratioWidth = Number(match[1]);
+  const ratioHeight = Number(match[2]);
+  if (!ratioWidth || !ratioHeight) {
+    return mapGptImageSize(aspectRatio);
+  }
+  const roundTo16 = (value: number) => Math.max(16, Math.round(value / 16) * 16);
+  let width: number;
+  let height: number;
+  if (ratioWidth >= ratioHeight) {
+    width = targetLongEdge;
+    height = roundTo16(targetLongEdge * ratioHeight / ratioWidth);
+  } else {
+    width = roundTo16(targetLongEdge * ratioWidth / ratioHeight);
+    height = targetLongEdge;
+  }
+  if (usesNativeImageParameters(apiModel)) {
+    const maxNativePixels = 8_294_400;
+    const pixels = width * height;
+    if (pixels > maxNativePixels) {
+      const scale = Math.sqrt(maxNativePixels / pixels);
+      width = Math.max(16, Math.floor(width * scale / 16) * 16);
+      height = Math.max(16, Math.floor(height * scale / 16) * 16);
+    }
+  }
+  return `${width}x${height}`;
+}
+
 /** 浏览器降级任务存储:jobId → 状态(与 Rust 异步任务语义一致) */
 const browserGenerationJobs = new Map<string, GenerationJobStatus>();
 
@@ -651,7 +707,15 @@ export async function jimengCliLoginCheck(
   if (!isTauri()) {
     throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。');
   }
-  return await invoke<JimengCliLoginCheckResult>('jimeng_cli_login_check', { executable, device_code: deviceCode });
+  return await invoke<JimengCliLoginCheckResult>('jimeng_cli_login_check', { executable, deviceCode });
+}
+
+/** Clear the local Dreamina CLI OAuth login state. */
+export async function jimengCliLogout(executable: string): Promise<JimengCliLoginCheckResult> {
+  if (!isTauri()) {
+    throw new Error('Dreamina CLI is desktop-only.');
+  }
+  return await invoke<JimengCliLoginCheckResult>('jimeng_cli_logout', { executable });
 }
 
 function isCustomModel(model: string): boolean {
@@ -752,7 +816,7 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
           tools: [{
             type: 'image_generation',
             action: referenceImages.length > 0 ? 'edit' : 'generate',
-            size: mapGptImageSize(request.aspect_ratio),
+            size: mapRequestedImageSize(apiModel, request.size, request.aspect_ratio),
           }],
           tool_choice: { type: 'image_generation' },
         }
@@ -876,12 +940,12 @@ function buildBrowserImagesRequestBody(
   const body: Record<string, unknown> = {
     model: apiModel,
     prompt: request.prompt,
-    size: isGptImage ? mapGptImageSize(request.aspect_ratio) : '1024x1024',
+    size: mapRequestedImageSize(apiModel, request.size, request.aspect_ratio),
     n: 1,
   };
   if (isGptImage) {
     body.output_format = 'png';
-    if (apiModel.toLowerCase().includes('gpt-image-2')) {
+    if (apiModel.toLowerCase().includes('gpt-image-2') && !usesNativeImageParameters(apiModel)) {
       body.aspect_ratio = request.aspect_ratio;
     }
   } else {
@@ -1340,4 +1404,57 @@ export async function fetchProviderModels(
     baseUrl,
     apiKey,
   });
+}
+
+export type ChatCompletionContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
+export interface ChatCompletionMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string | ChatCompletionContentPart[];
+}
+
+/** 调用自定义平台(OpenAI 兼容)的纯文本 Chat Completion，用于提示词增强。 */
+export async function chatCompletion(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  messages: ChatCompletionMessage[],
+): Promise<string> {
+  if (shouldUseWebviewProviderRequests()) {
+    const url = `${normalizeBaseUrl(baseUrl)}/v1/chat/completions`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+    let response: Response;
+    try {
+      response = await httpFetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ model, messages, temperature: 0.4 }),
+        },
+        30000,
+      );
+    } catch (error) {
+      const hint = error instanceof Error ? error.message : String(error);
+      throw new Error(`浏览器跨域(CORS)或网络错误:${hint}。请使用桌面版 LenTalk 配置自定义平台。`);
+    }
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`HTTP ${response.status} ${response.statusText}${body ? `: ${body.slice(0, 200)}` : ''}`);
+    }
+    const payload = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const content = payload.choices?.[0]?.message?.content;
+    if (typeof content !== 'string' || !content) {
+      throw new Error('chat completion 响应缺少 choices[0].message.content');
+    }
+    return content;
+  }
+  return await invoke<string>('chat_completion', { baseUrl, apiKey, model, messages });
 }

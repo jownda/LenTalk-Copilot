@@ -61,6 +61,12 @@ pub struct ProviderHttpResponseDto {
     pub body: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ChatMessageDto {
+    pub role: String,
+    pub content: serde_json::Value,
+}
+
 #[derive(Debug)]
 struct GenerationJobRecord {
     job_id: String,
@@ -336,6 +342,22 @@ pub async fn fetch_provider_models(
         "models": models,
         "count": models.len(),
     }))
+}
+
+#[tauri::command]
+pub async fn chat_completion(
+    base_url: String,
+    api_key: String,
+    model: String,
+    messages: Vec<ChatMessageDto>,
+) -> Result<String, String> {
+    let mapped: Vec<(String, serde_json::Value)> = messages
+        .into_iter()
+        .map(|message| (message.role, message.content))
+        .collect();
+    OpenAICompatibleProvider::chat_completion(&base_url, &api_key, &model, &mapped)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Probe only metadata/capability endpoints. This command never submits a

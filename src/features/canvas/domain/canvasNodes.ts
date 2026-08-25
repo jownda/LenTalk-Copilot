@@ -11,7 +11,9 @@ export const CANVAS_NODE_TYPES = {
   storyboardGen: "storyboardGenNode",
   panorama: "panoramaNode",
   directorDesk: "directorDeskNode",
+  cinematicStudio: "cinematicStudioNode",
   audio: "audioNode",
+  promptOptimizer: "promptOptimizerNode",
   seamlessMosaic: "seamlessMosaicNode",
 } as const;
 
@@ -90,6 +92,33 @@ export interface GroupNodeData extends NodeDisplayData {
 
 export interface TextAnnotationNodeData extends NodeDisplayData {
   content: string;
+  [key: string]: unknown;
+}
+
+export type PromptOptimizerTaskType =
+  | "auto"
+  | "character"
+  | "location"
+  | "prop"
+  | "edit"
+  | "texture"
+  | "viewChange";
+
+export interface PromptOptimizerNodeData extends NodeDisplayData {
+  purpose: string;
+  taskType?: PromptOptimizerTaskType;
+  targetModel?: string;
+  referencePalette?: string;
+  optimizedPrompt?: string;
+  routeSummary?: string;
+  notes?: string[];
+  /** 最近一次优化的执行模式：local=本地规则, ai=AI 增强, ai-fallback=AI 失败已回退。 */
+  enhanceMode?: 'local' | 'ai' | 'ai-fallback';
+  /** Chat 模型选择(来自设置中 providers 的 chatModels)。 */
+  chatProviderId?: string;
+  chatModel?: string;
+  /** 输出语言：zh=中文, en=English。 */
+  outputLang?: 'zh' | 'en';
   [key: string]: unknown;
 }
 
@@ -202,6 +231,15 @@ export interface DirectorDeskNodeData extends NodeDisplayData {
   [key: string]: unknown;
 }
 
+/** Cinematic Prompt Studio 节点:双击进入独立提示词工作台 */
+export interface CinematicStudioNodeData extends NodeDisplayData {
+  /** 最近一次保存的工程标题(仅用于节点预览) */
+  lastProjectTitle?: string | null;
+  /** 最近一次编译的提示词摘要(仅用于节点预览) */
+  lastPromptPreview?: string | null;
+  [key: string]: unknown;
+}
+
 /** 无缝拼图:画布坐标系内的单个图层(裁剪/位移/缩放后叠加) */
 export interface MosaicLayerItem {
   id: string;
@@ -273,6 +311,7 @@ export type CanvasNodeData =
   | UploadImageNodeData
   | ExportImageNodeData
   | TextAnnotationNodeData
+  | PromptOptimizerNodeData
   | GroupNodeData
   | ImageEditNodeData
   | VideoGenNodeData
@@ -280,6 +319,7 @@ export type CanvasNodeData =
   | StoryboardGenNodeData
   | PanoramaNodeData
   | DirectorDeskNodeData
+  | CinematicStudioNodeData
   | AudioNodeData
   | SeamlessMosaicNodeData;
 
@@ -342,6 +382,12 @@ export function isTextAnnotationNode(
   node: CanvasNode | null | undefined,
 ): node is Node<TextAnnotationNodeData, typeof CANVAS_NODE_TYPES.textAnnotation> {
   return node?.type === CANVAS_NODE_TYPES.textAnnotation;
+}
+
+export function isPromptOptimizerNode(
+  node: CanvasNode | null | undefined,
+): node is Node<PromptOptimizerNodeData, typeof CANVAS_NODE_TYPES.promptOptimizer> {
+  return node?.type === CANVAS_NODE_TYPES.promptOptimizer;
 }
 
 export function isStoryboardSplitNode(

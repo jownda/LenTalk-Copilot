@@ -1,9 +1,9 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Terminal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { buildCustomModelId, isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
+import { buildCustomModelId, isChatCompletionModelName, isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
 import type { CustomApiCapabilities } from '@/stores/settingsStore';
-import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck } from '@/commands/ai';
+import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck, jimengCliLogout } from '@/commands/ai';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { recommendedApis } from '@/features/settings/recommendedApis';
 import { UiCheckbox, UiModal, UiSelect } from '@/components/ui';
@@ -11,6 +11,11 @@ import { UI_CONTENT_OVERLAY_INSET_CLASS, UI_DIALOG_TRANSITION_MS } from '@/compo
 import { useDialogTransition } from '@/components/ui/useDialogTransition';
 import { listModelProviders } from '@/features/canvas/models';
 import type { SettingsCategory } from '@/features/settings/settingsEvents';
+
+const JIMENG_LOGIN_POLL_INTERVAL_MS = 3000;
+const JIMENG_LOGIN_MAX_ATTEMPTS = 200;
+
+const JIMENG_LOGIN_NO_PERMISSION_MESSAGE = 'OAuth 授权成功，但当前账号没有 dreamina_cli 使用权限（仅限高级或高级以上的会员等级）。请升级会员后重试。';
 
 interface SettingsDialogProps {
   isOpen: boolean;
@@ -188,7 +193,7 @@ export function SettingsDialog({
   const [showJimengCliSettings, setShowJimengCliSettings] = useState(false);
   const [localJimengCliExecutable, setLocalJimengCliExecutable] = useState(jimengCli.executable);
   const [jimengLoginState, setJimengLoginState] = useState<'idle' | 'opening' | 'polling' | 'success' | 'error'>('idle');
-  const [jimengLoginInfo, setJimengLoginInfo] = useState<{ verificationUri: string; userCode: string; deviceCode: string } | null>(null);
+  const [, setJimengLoginInfo] = useState<{ verificationUri: string; userCode: string; deviceCode: string } | null>(null);
   const [jimengLoginMessage, setJimengLoginMessage] = useState('');
   const jimengLoginTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const jimengLoginCheckingRef = useRef(false);
@@ -202,6 +207,7 @@ export function SettingsDialog({
     apiKey: '',
     modelsText: '',
     videoModelsText: '',
+    chatModelsText: '',
     requestMode: 'sync' as 'sync' | 'async',
     protocol: 'images' as 'images' | 'responses' | 'chat',
     referenceImageField: 'image' as 'image' | 'input_image',
@@ -212,7 +218,7 @@ export function SettingsDialog({
   const [customApiBusy, setCustomApiBusy] = useState<'idle' | 'testing' | 'fetching'>('idle');
   const [customApiStatus, setCustomApiStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
-  const [modelPickerMediaType, setModelPickerMediaType] = useState<'image' | 'video'>('image');
+  const [modelPickerMediaType, setModelPickerMediaType] = useState<'image' | 'video' | 'chat'>('image');
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [pickedModels, setPickedModels] = useState<string[]>([]);
   const [modelPickerSearch, setModelPickerSearch] = useState('');
@@ -228,6 +234,7 @@ export function SettingsDialog({
       apiKey: '',
       modelsText: api.models.join('\n'),
       videoModelsText: (api.videoModels ?? []).join('\n'),
+      chatModelsText: '',
       requestMode: 'sync',
       protocol: 'images',
       referenceImageField: 'image',
@@ -295,7 +302,7 @@ export function SettingsDialog({
   const startJimengLogin = useCallback(async () => {
     const executable = localJimengCliExecutable.trim() || 'dreamina';
     setJimengLoginState('opening');
-    setJimengLoginMessage('');
+    setJimengLoginMessage('正在获取授权链接，稍后会自动打开浏览器，通常需要几秒钟，请稍候…');
     setJimengLoginInfo(null);
     if (jimengLoginTimerRef.current) {
       clearInterval(jimengLoginTimerRef.current);
@@ -340,6 +347,12 @@ export function SettingsDialog({
         };
         try {
           const check = await jimengCliLoginCheck(executable, deviceCode);
+          if (check.message.includes('使用权限') || check.message.includes('没有权限')) {
+            stopPolling();
+            setJimengLoginState('error');
+            setJimengLoginMessage(JIMENG_LOGIN_NO_PERMISSION_MESSAGE);
+            return;
+          }
           if (check.success) {
             stopPolling();
             setJimengLoginState('success');
@@ -353,27 +366,54 @@ export function SettingsDialog({
             setJimengLoginMessage(check.message || '登录失败，请重试');
             return;
           }
-          if (attempts >= 60) {
+          if (attempts >= JIMENG_LOGIN_MAX_ATTEMPTS) {
             stopPolling();
             setJimengLoginState('error');
             setJimengLoginMessage('等待授权超时。若已在浏览器完成授权，可在终端手动执行: dreamina login checklogin --device_code=<设备码>');
             return;
           }
-          setJimengLoginMessage(`等待浏览器授权完成…（已等待 ${attempts * 3} 秒）`);
+          setJimengLoginMessage(`等待浏览器授权完成…（已等待 ${attempts * (JIMENG_LOGIN_POLL_INTERVAL_MS / 1000)} 秒）`);
         } catch (error) {
-          if (attempts >= 60) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          const errorLower = errorMessage.toLowerCase();
+          const pendingError = errorLower.includes('not logged in') || errorLower.includes('pending') || errorLower.includes('waiting') || errorMessage.includes('未登录') || errorMessage.includes('等待') || errorMessage.includes('尚未');
+          const permissionDenied = errorMessage.includes('使用权限') || errorMessage.includes('没有权限');
+          if (permissionDenied) {
             stopPolling();
             setJimengLoginState('error');
-            setJimengLoginMessage(error instanceof Error ? error.message : String(error));
+            setJimengLoginMessage(JIMENG_LOGIN_NO_PERMISSION_MESSAGE);
+            return;
+          }
+          const terminalError = !pendingError && (errorLower.includes('expired') || errorLower.includes('invalid') || errorLower.includes('fail') || errorMessage.includes('过期') || errorMessage.includes('失效') || errorMessage.includes('失败') || errorMessage.includes('未找到') || errorMessage.includes('无法启动'));
+          if (attempts >= JIMENG_LOGIN_MAX_ATTEMPTS) {
+            stopPolling();
+            setJimengLoginState('error');
+            setJimengLoginMessage('等待授权超时。若已在浏览器完成授权，可在终端手动执行: dreamina login checklogin --device_code=<设备码>');
+          } else if (terminalError) {
+            stopPolling();
+            setJimengLoginState('error');
+            setJimengLoginMessage(errorMessage);
+          } else {
+            setJimengLoginMessage('等待浏览器授权完成…（已等待 ' + (attempts * (JIMENG_LOGIN_POLL_INTERVAL_MS / 1000)) + ' 秒）');
           }
         } finally {
           jimengLoginCheckingRef.current = false;
         }
-      }, 3000);
+      }, JIMENG_LOGIN_POLL_INTERVAL_MS);
     } catch (error) {
       setJimengLoginState('error');
       setJimengLoginMessage(error instanceof Error ? error.message : String(error));
     }
+  }, [localJimengCliExecutable]);
+
+    const handleJimengLogout = useCallback(() => {
+    setJimengLoginState('idle');
+    setJimengLoginInfo(null);
+    setJimengLoginMessage('已退出登录');
+    void jimengCliLogout(localJimengCliExecutable).catch((error) => {
+      setJimengLoginState('error');
+      setJimengLoginMessage(error instanceof Error ? error.message : String(error));
+    });
   }, [localJimengCliExecutable]);
 
   const saveJimengCliSettings = useCallback(() => {
@@ -409,7 +449,7 @@ export function SettingsDialog({
 
   /** 验证协议:带 Key 调 /v1/models,检测 OpenAI 兼容 */
   /** 拉取平台模型列表并打开对应媒体类型的模型选择弹窗。 */
-  const handleFetchModels = useCallback(async (mediaType: 'image' | 'video') => {
+  const handleFetchModels = useCallback(async (mediaType: 'image' | 'video' | 'chat') => {
     const baseUrl = customApiDraft.baseUrl.trim().replace(/\/+$/, '');
     if (!baseUrl) {
       setCustomApiStatus({ type: 'err', text: t('settings.customApiTestNeedUrl') });
@@ -432,11 +472,17 @@ export function SettingsDialog({
       const targetModels = models.filter(
         (model) => mediaType === 'video'
           ? isVideoGenerationModelName(model)
-          : !videoModelIds.has(model.trim().toLowerCase()) && !isVideoGenerationModelName(model)
+          : mediaType === 'chat'
+            ? isChatCompletionModelName(model)
+            : !videoModelIds.has(model.trim().toLowerCase()) && !isVideoGenerationModelName(model) && !isChatCompletionModelName(model)
       );
       setFetchedModels(targetModels);
       const existing = new Set(
-        (mediaType === 'video' ? customApiDraft.videoModelsText : customApiDraft.modelsText)
+        (mediaType === 'video'
+          ? customApiDraft.videoModelsText
+          : mediaType === 'chat'
+            ? customApiDraft.chatModelsText
+            : customApiDraft.modelsText)
           .split(/[\n,]/)
           .map((model) => model.trim())
           .filter(Boolean)
@@ -474,7 +520,9 @@ export function SettingsDialog({
       ...customApiDraft,
       ...(modelPickerMediaType === 'video'
         ? { videoModelsText: pickedModels.join('\n') }
-        : { modelsText: pickedModels.join('\n') }),
+        : modelPickerMediaType === 'chat'
+          ? { chatModelsText: pickedModels.join('\n') }
+          : { modelsText: pickedModels.join('\n') }),
     });
     setIsModelPickerOpen(false);
     setCustomApiStatus({ type: 'ok', text: t('settings.customApiModelsApplied', '已应用所选模型') });
@@ -514,7 +562,7 @@ export function SettingsDialog({
           .map((model) => model.trim().toLowerCase())
           .filter(Boolean)
       );
-      const imageModels = models.filter((model) => !videoModelIds.has(model.trim().toLowerCase()));
+      const imageModels = models.filter((model) => !videoModelIds.has(model.trim().toLowerCase()) && !isChatCompletionModelName(model));
       setCustomApiDraft((previous) => {
         // 探测结果优先; 但探测为低置信度 images 默认且用户已手动选择 chat/responses
         // 时保留用户选择(OPTIONS 探测常被网关中间件统一响应, 不足以推翻手动配置)。
@@ -583,6 +631,7 @@ export function SettingsDialog({
       apiKey: api.apiKey,
       modelsText: api.models.join('\n'),
       videoModelsText: api.videoModels.join('\n'),
+      chatModelsText: (api.chatModels ?? []).join('\n'),
       requestMode: api.requestMode,
       protocol: api.protocol,
       referenceImageField: api.referenceImageField ?? 'image',
@@ -602,6 +651,7 @@ export function SettingsDialog({
       apiKey: '',
       modelsText: '',
       videoModelsText: '',
+      chatModelsText: '',
       requestMode: 'sync',
       protocol: 'images',
       referenceImageField: 'image',
@@ -622,11 +672,21 @@ export function SettingsDialog({
       .split(/[\n,]/)
       .map((model) => model.trim())
       .filter(Boolean);
+    const chatModels = customApiDraft.chatModelsText
+      .split(/[\n,]/)
+      .map((model) => model.trim())
+      .filter(Boolean)
+      .filter((model) => isChatCompletionModelName(model));
     const videoModelIds = new Set(videoModels.map((model) => model.toLowerCase()));
+    const chatModelIds = new Set(chatModels.map((model) => model.toLowerCase()));
     const imageModels = models.filter(
-      (model) => !videoModelIds.has(model.toLowerCase()) && !isVideoGenerationModelName(model)
+      (model) =>
+        !videoModelIds.has(model.toLowerCase()) &&
+        !chatModelIds.has(model.toLowerCase()) &&
+        !isVideoGenerationModelName(model) &&
+        !isChatCompletionModelName(model)
     );
-    if (!name || !baseUrl || (models.length === 0 && videoModels.length === 0)) {
+    if (!name || !baseUrl || (models.length === 0 && videoModels.length === 0 && chatModels.length === 0)) {
       return;
     }
     if (editingCustomApiId) {
@@ -636,6 +696,7 @@ export function SettingsDialog({
         apiKey: customApiDraft.apiKey.trim(),
         models: imageModels,
         videoModels,
+        chatModels,
         requestMode: customApiDraft.requestMode,
         protocol: customApiDraft.protocol,
         referenceImageField: customApiDraft.referenceImageField,
@@ -650,6 +711,7 @@ export function SettingsDialog({
         apiKey: customApiDraft.apiKey.trim(),
         models: imageModels,
         videoModels,
+        chatModels,
         requestMode: customApiDraft.requestMode,
         protocol: customApiDraft.protocol,
         referenceImageField: customApiDraft.referenceImageField,
@@ -1225,6 +1287,30 @@ export function SettingsDialog({
                             className="ui-scrollbar w-full resize-none rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
                           />
                         </label>
+                        <label className="block">
+                          <span className="mb-1 flex items-center justify-between text-[11px] text-text-muted">
+                            <span>{t('settings.customApiChatModels')}</span>
+                            <button
+                              type="button"
+                              onClick={() => void handleFetchModels('chat')}
+                              disabled={customApiBusy !== 'idle'}
+                              className="rounded-md border border-border-dark px-2 py-0.5 text-[11px] text-text-muted transition-colors hover:border-accent/50 hover:text-text-dark disabled:opacity-50"
+                            >
+                              {customApiBusy === 'fetching'
+                                ? t('settings.customApiFetching', '拉取中…')
+                                : t('settings.customApiFetchModels', '拉取模型')}
+                            </button>
+                          </span>
+                          <textarea
+                            value={customApiDraft.chatModelsText}
+                            onChange={(event) =>
+                              setCustomApiDraft({ ...customApiDraft, chatModelsText: event.target.value })
+                            }
+                            rows={2}
+                            placeholder={t('settings.customApiChatModelsPlaceholder')}
+                            className="ui-scrollbar w-full resize-none rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
+                          />
+                        </label>
                         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                           <label className="block">
                             <span className="mb-1 block text-[11px] text-text-muted">请求模式</span>
@@ -1379,7 +1465,11 @@ export function SettingsDialog({
                       isOpen={isModelPickerOpen}
                       title={t(
                         'settings.customApiPickModels',
-                        modelPickerMediaType === 'video' ? '选择视频模型' : '选择图片模型'
+                        modelPickerMediaType === 'video'
+                          ? '选择视频模型'
+                          : modelPickerMediaType === 'chat'
+                            ? '选择 Chat 模型'
+                            : '选择图片模型'
                       )}
                       onClose={() => setIsModelPickerOpen(false)}
                       widthClassName="w-[480px]"
@@ -1566,32 +1656,30 @@ export function SettingsDialog({
                         {t('settings.jimengCliLoginDesc', '点击后自动打开浏览器完成授权，无需手动执行命令')}
                       </p>
                     </div>
-                    <button
+                    <div className="flex shrink-0 items-center gap-2">
+<button
                       type="button"
                       onClick={startJimengLogin}
                       disabled={jimengLoginState === 'opening' || jimengLoginState === 'polling'}
                       className="shrink-0 rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      {jimengLoginState === 'opening'
+                      {jimengLoginState === 'opening' || jimengLoginState === 'polling'
                         ? t('settings.jimengCliLogining', '获取授权中…')
-                        : jimengLoginState === 'polling'
-                          ? t('settings.jimengCliWaitingAuth', '等待授权…')
-                          : jimengLoginState === 'success'
-                            ? t('settings.jimengCliLoggedIn', '已登录')
+                        : jimengLoginState === 'success'
+                          ? t('settings.jimengCliLoggedIn', '已登录')
                           : t('settings.jimengCliLoginBtn', '一键登录')}
                     </button>
+{jimengLoginState === 'success' && (
+<button
+  type="button"
+  onClick={handleJimengLogout}
+  className="shrink-0 rounded-md border border-border-dark bg-surface-dark px-3 py-1.5 text-xs font-medium text-text-dark transition-colors hover:bg-surface-dark/70 disabled:cursor-not-allowed disabled:opacity-50"
+>
+  {t('settings.jimengCliLogout', '退出登录')}
+</button>
+)}
+</div>
                   </div>
-
-                  {jimengLoginInfo && (
-                    <div className="mt-3 rounded-md bg-bg-dark p-3 text-center">
-                      <p className="text-[11px] text-text-muted">
-                        {t('settings.jimengCliUserCodeHint', '请在浏览器打开的页面中输入以下代码')}
-                      </p>
-                      <p className="mt-1 font-mono text-2xl font-bold tracking-[0.3em] text-accent">
-                        {jimengLoginInfo.userCode}
-                      </p>
-                    </div>
-                  )}
 
                   {jimengLoginMessage && (
                     <p className={`mt-2 break-all text-[11px] leading-4 ${
@@ -1604,16 +1692,28 @@ export function SettingsDialog({
                   )}
                 </div>
 
-                <div className="space-y-2 rounded-md border border-border-dark bg-surface-dark/50 p-3 text-xs text-text-muted">
-                  <p>{t('settings.jimengCliInstallStep')}</p>
-                  <code className="block overflow-x-auto rounded bg-bg-dark px-2 py-1.5 text-[11px] text-text-dark">
-                    curl -fsSL https://jimeng.jianying.com/cli | bash
-                  </code>
-                  <p>{t('settings.jimengCliLoginStep')}</p>
-                  <code className="block rounded bg-bg-dark px-2 py-1.5 text-[11px] text-text-dark">
-                    dreamina login
-                  </code>
-                  <p>{t('settings.jimengCliVideoNote')}</p>
+                <div className="space-y-3 rounded-md border border-border-dark bg-surface-dark/50 p-3 text-xs text-text-muted">
+                  <p className="font-medium text-text-dark">{t('settings.jimengCliManualTitle')}</p>
+                  <ol className="list-decimal space-y-2 pl-4">
+                    <li className="space-y-1">
+                      <p>{t('settings.jimengCliManualInstall')}</p>
+                      <code className="block overflow-x-auto rounded bg-bg-dark px-2 py-1.5 text-[11px] text-text-dark">curl -fsSL https://jimeng.jianying.com/cli | bash</code>
+                    </li>
+                    <li className="space-y-1">
+                      <p>{t('settings.jimengCliManualVerify')}</p>
+                      <code className="block overflow-x-auto rounded bg-bg-dark px-2 py-1.5 text-[11px] text-text-dark">dreamina -h</code>
+                    </li>
+                    <li className="space-y-1">
+                      <p>{t('settings.jimengCliManualLogin')}</p>
+                      <code className="block overflow-x-auto rounded bg-bg-dark px-2 py-1.5 text-[11px] text-text-dark">dreamina login</code>
+                    </li>
+                    <li className="space-y-1">
+                      <p>{t('settings.jimengCliManualOpenLink')}</p>
+                    </li>
+                    <li className="space-y-1">
+                      <p>{t('settings.jimengCliManualFirstVideo')}</p>
+                    </li>
+                  </ol>
                 </div>
               </div>
             </UiModal>
