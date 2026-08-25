@@ -293,11 +293,11 @@ npm run build       # tsc 类型 + vite 打包，确认前端无破坏
 **改动**
 1. `DirectorBriefCard` 场景操作区（scene-actions）「AI编译提示词」左侧新增「模型」下拉：
    - 数据源 = LenTalk 自定义平台的 Chat 模型列表（与 `aiSettings.ts` 一致）；
-   - 切换即写 `saveAISettings({ provider, model })`，未配置平台时置灰并显示「未配置」；
-2. 移除顶栏 `Settings2` 设置按钮；设置入口迁到模型下拉右侧的小齿轮图标（仍打开居中设置弹窗，保证 API 可维护）；
+   - 切换即写 `saveAISettings({ provider, model })`；未配置平台时下拉显示「未配置，前往 LenTalk 设置 → 密钥」并提示跳转；
+2. 移除顶栏 `Settings2` 设置按钮，**工作室内部不再放任何设置入口**；全软件 API 设置统一收口到 LenTalk「设置 → 密钥」（即 settingsStore 的 customApis 与 chatModels），工作室不再有第二份 API 弹窗；
 3. 两个「模型」职责分开：新下拉只决定调用哪个 Chat 模型；旧的「目标模型」下拉继续只控制编译模板语法（Kling / Seedance 等输出规范），UI 加 tooltip 区分。
 
-**文件**：`src/features/cinematicStudio/app/App.tsx`、`src/features/cinematicStudio/app/components/DirectorBriefCard.tsx`、`src/features/cinematicStudio/app/providers/aiSettings.ts`、`src/features/cinematicStudio/app/i18n.ts`
+**文件**：`src/features/cinematicStudio/app/App.tsx`（移除 settingsOpen / SettingsModal 使用）、`src/features/cinematicStudio/app/components/DirectorBriefCard.tsx`、`src/features/cinematicStudio/app/providers/aiSettings.ts`、`src/features/cinematicStudio/app/i18n.ts`
 
 ---
 
@@ -390,7 +390,7 @@ UI 位置：名称输入框下方；其他资产类型同逻辑。
 | 步骤 | 内容 | 层 | 风险 | 提交点 |
 |---|---|---|---|---|
 | V2.8 | 布局滚动修复（高度链 100% + 清理坏选择器） | UI | 低 | `fix:` |
-| V2.9 | 模型下拉迁移 + 移除右上角设置（入口移模型旁） | UI | 低 | `feat:` |
+| V2.9 | 模型下拉迁移 + 移除工作室全部设置入口（API 统一 LenTalk 设置 → 密钥） | UI | 低 | `feat:` |
 | V2.10 | 资产备注字段 + AI 填写纳入备注（角色信息栏） | 数据+AI+UI | 中 | `feat:` |
 | V2.11 | 风格倾向 → 一句风格话自动派生（一段式描述） | 预设+UI | 低 | `feat:` |
 | V2.12 | AI 编译分水岭：删 audioPlan 输出，AI 只读不回写；用户区/AI区视觉分隔 | AI+UI | 中 | `feat:` |
@@ -401,7 +401,7 @@ UI 位置：名称输入框下方；其他资产类型同逻辑。
 ## 7. 回归走查断言追加（V2-P3）
 
 1. 全屏工作室左列可完整滚动到底，滚动条可见，底部按钮不被裁切；
-2. 右上角无设置齿轮；「AI编译提示词」左侧有模型下拉，切换后下轮 AI 调用使用新模型；
+2. 工作室内无任何设置按钮/弹窗，API 配置只能在 LenTalk「设置 → 密钥」完成；「AI编译提示词」左侧有模型下拉（列出 LenTalk 已配置平台的 Chat 模型），切换后下轮 AI 调用使用新模型；
 3. 资产编辑名称下出现「用户备注（仅 AI 参考）」；AI 填写后角色「表演母版 + 声音锁」被补全，最终提示词不含用户备注原文；
 4. 选中风格倾向后「一句风格话」自动出现该风格的一段中文描述，可手改；
 5. AI 编译后音频计划卡内容保持用户填写不变；导演文档 audio 层参考它但不再回写；
