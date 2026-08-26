@@ -287,8 +287,7 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, on
       </div>
 
       <div className="asset-modal-grid">
-        <div className="asset-section-title">{t.identityAppearance}</div>
-        {/* 左列：参考图 + 名称 + 锁定级别 */}
+        {/* 左列：基础信息 → 状态 → 锁定 */}
         <div className="asset-modal-left">
           <div className="asset-refs">
             {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={src} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
@@ -298,29 +297,9 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, on
             </label>
           </div>
           <label className="field-label">{t.assetName}<input className="modal-input" value={asset.name} placeholder={t.assetNamePlaceholder} onChange={(event) => update({ name: event.target.value })} /></label>
-          <label className="field-label">{t.assetReferenceTag}<input className="modal-input" value={`@${asset.referenceTag ?? asset.name}`} readOnly /></label>
-          <div className="asset-state-grid">
-            <label className="field-label">{t.assetStateName}<input className="modal-input" value={asset.stateName ?? "base"} placeholder={t.assetStateNamePlaceholder} onChange={(event) => update({ stateName: event.target.value })} /></label>
-            <label className="field-label">{t.assetVersion}<input className="modal-input" type="number" min="1" value={asset.version ?? 1} onChange={(event) => update({ version: Math.max(1, Number(event.target.value) || 1) })} /></label>
-          </div>
-          <label className="field-label">{t.assetChangeLog}<textarea className="modal-textarea asset-notes-input" value={asset.changeLog ?? ""} placeholder={t.assetChangeLogPlaceholder} onChange={(event) => update({ changeLog: event.target.value })} /></label>
-          <div className="field-label">{t.stressTest}<div className="lock-options">
-            {(["untested", "passed", "failed"] as const).map((status) => <button key={status} className={`lock-option ${asset.stressTestStatus === status ? "active" : ""}`} onClick={() => update({ stressTestStatus: status })}>{t[status === "untested" ? "stressUntested" : status === "passed" ? "stressPassed" : "stressFailed"]}</button>)}
-          </div></div>
-          {isVehicleInterior && <button className="outline-button" onClick={() => update({ kind: "prop" })}>{t.moveVehicleToProp}</button>}
-          <div className="asset-variant-actions">
-            <button className="outline-button" onClick={() => setVariantComposerOpen((open) => !open)}><Plus size={13} /> {t.createVariant}</button>
-            {variantComposerOpen && <div className="asset-variant-composer">
-              <label className="field-label">{t.variantStatePrompt}<input className="modal-input" autoFocus value={variantStateName} placeholder={t.assetStateNamePlaceholder} onChange={(event) => setVariantStateName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); createVariant(); } }} /></label>
-              <p className="hint-text">{t.variantCreateHint}</p>
-              <div className="asset-variant-composer-actions">
-                <button className="outline-button" onClick={() => { setVariantComposerOpen(false); setVariantStateName(""); }}>{t.cancel}</button>
-                <button className="primary-button" onClick={createVariant}>{t.createVariantConfirm}</button>
-              </div>
-            </div>}
-          </div>
           <label className="field-label">{t.assetNotes}<span className="field-help">{t.assetNotesHelp}</span><textarea className="modal-textarea asset-notes-input" value={locale === "zh" ? (asset.notesZh ?? "") : (asset.notes ?? "")} placeholder={locale === "zh" ? t.assetNotesZhPlaceholder : t.assetNotesPlaceholder} onChange={(event) => update(locale === "zh" ? { notesZh: event.target.value } : { notes: event.target.value })} /></label>
-          {/* 声音音色（角色）：点击上传音频，可试听/删除 */}
+          <label className="field-label">{t.assetReferenceTag}<input className="modal-input" value={`@${asset.referenceTag ?? asset.name}`} readOnly /></label>
+          {/* 角色声音参考：不参与最终提示词，只用于音色和配音参考 */}
           {asset.kind === "character" && <div className="field-label">{t.voiceClip}
             {asset.voiceClip ? (
               <div className="voice-clip">
@@ -335,13 +314,38 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, on
               </label>
             )}
           </div>}
+          <div className="field-label">{t.stressTest}<div className="lock-options">
+            {(["untested", "passed", "failed"] as const).map((status) => <button key={status} className={`lock-option ${asset.stressTestStatus === status ? "active" : ""}`} onClick={() => update({ stressTestStatus: status })}>{t[status === "untested" ? "stressUntested" : status === "passed" ? "stressPassed" : "stressFailed"]}</button>)}
+          </div></div>
+          {isVehicleInterior && <button className="outline-button" onClick={() => update({ kind: "prop" })}>{t.moveVehicleToProp}</button>}
+          <div className="asset-state-section">
+            <div className="asset-section-title">{t.assetStateArea}</div>
+            <div className="asset-state-grid">
+              <label className="field-label">{t.assetStateName}<input className="modal-input" value={asset.stateName ?? "base"} placeholder={t.assetStateNamePlaceholder} onChange={(event) => update({ stateName: event.target.value })} /></label>
+              <label className="field-label">{t.assetVersion}<input className="modal-input" type="number" min="1" value={asset.version ?? 1} onChange={(event) => update({ version: Math.max(1, Number(event.target.value) || 1) })} /></label>
+            </div>
+            <div className="asset-change-row">
+              <label className="field-label">{t.assetChangeLog}<textarea className="modal-textarea asset-notes-input" value={asset.changeLog ?? ""} placeholder={t.assetChangeLogPlaceholder} onChange={(event) => update({ changeLog: event.target.value })} /></label>
+              <div className="asset-variant-actions">
+                <button className="outline-button" onClick={() => setVariantComposerOpen((open) => !open)}><Plus size={13} /> {t.createVariant}</button>
+                {variantComposerOpen && <div className="asset-variant-composer">
+                  <label className="field-label">{t.variantStatePrompt}<input className="modal-input" autoFocus value={variantStateName} placeholder={t.assetStateNamePlaceholder} onChange={(event) => setVariantStateName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); createVariant(); } }} /></label>
+                  <p className="hint-text">{t.variantCreateHint}</p>
+                  <div className="asset-variant-composer-actions">
+                    <button className="outline-button" onClick={() => { setVariantComposerOpen(false); setVariantStateName(""); }}>{t.cancel}</button>
+                    <button className="primary-button" onClick={createVariant}>{t.createVariantConfirm}</button>
+                  </div>
+                </div>}
+              </div>
+            </div>
+          </div>
           <div className="field-label">{t.lockLevel}<div className="lock-options">
             {lockLevels.map(([level, key]) => <button key={level} className={`lock-option ${asset.lockLevel === level ? "active" : ""}`} onClick={() => update({ lockLevel: level })}>{t[key]}</button>)}
           </div></div>
           {asset.lockLevel === "strict" && <p className="hint-text">{t.strictIdentityHint}</p>}
         </div>
 
-        {/* 右列：描述 + 用途 + 忽略 + 标记 */}
+        {/* 右列：描述 → AI → 表演字段 → 其他约束 */}
         <div className="asset-modal-right">
           <div className="asset-desc-row">
             {locale === "zh" ? (
@@ -351,6 +355,21 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, on
             )}
             <button className="outline-button translate-btn" disabled={aiBusy} onClick={() => void aiFillDetails()}>{aiBusy ? <span className="spin-dot" /> : <Sparkles size={13} />} {t.aiFillDetails}</button>
           </div>
+
+          {asset.kind === "character" && <div className="asset-acting-section">
+            <div className="asset-section-title">{t.actingMasterProfile}</div>
+            <div className="hint-text"><strong>{t.characterSheetGuide}</strong><br />{t.characterSheetHint}</div>
+            <textarea className="modal-textarea profile-textarea" value={locale === "zh" ? (acting.masterProfileZh ?? "") : (acting.masterProfile ?? "")} placeholder={t.actingMasterPlaceholder} spellCheck={false} aria-label={t.actingMasterProfile} onChange={(event) => updateActing(locale === "zh" ? { masterProfileZh: event.target.value } : { masterProfile: event.target.value })} />
+            <div className="field-label">{t.voicePromptLabel}
+              <textarea className="modal-textarea" value={locale === "zh" ? (acting.voicePromptZh ?? "") : (acting.voicePrompt ?? "")} placeholder={t.voicePromptPlaceholder} spellCheck={false} onChange={(event) => updateActing(locale === "zh" ? { voicePromptZh: event.target.value } : { voicePrompt: event.target.value })} />
+            </div>
+            <div className="field-label">{t.performanceTarget}
+              <div className="perf-options">
+                {[0, 1, 2, 3, 4, 5].map((n) => <button key={n} className={`perf-option ${acting.performanceTarget === n ? "active" : ""}`} title={t[perfTipKeys[n]]} onClick={() => updateActing({ performanceTarget: n })}>{t[perfKeys[n]]}</button>)}
+              </div>
+              <p className="hint-text">{t.performanceTargetHint}</p>
+            </div>
+          </div>}
 
           <div className="field-label">{t.useFor}<div className="check-chips">
             {useForOptions.map(([value, key]) => <button key={value} className={`check-chip ${(asset.useFor ?? []).includes(value) ? "active" : ""}`} onClick={() => toggleUseFor(value)}>{t[key]}</button>)}
@@ -365,20 +384,6 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, on
           </>}
         </div>
 
-        {asset.kind === "character" && <div className="asset-modal-full">
-          <div className="asset-section-title">{t.actingMasterProfile}</div>
-          <div className="hint-text"><strong>{t.characterSheetGuide}</strong><br />{t.characterSheetHint}</div>
-          <textarea className="modal-textarea profile-textarea" value={locale === "zh" ? (acting.masterProfileZh ?? "") : (acting.masterProfile ?? "")} placeholder={t.actingMasterPlaceholder} spellCheck={false} aria-label={t.actingMasterProfile} onChange={(event) => updateActing(locale === "zh" ? { masterProfileZh: event.target.value } : { masterProfile: event.target.value })} />
-          <div className="field-label">{t.voicePromptLabel}
-            <textarea className="modal-textarea" value={locale === "zh" ? (acting.voicePromptZh ?? "") : (acting.voicePrompt ?? "")} placeholder={t.voicePromptPlaceholder} spellCheck={false} onChange={(event) => updateActing(locale === "zh" ? { voicePromptZh: event.target.value } : { voicePrompt: event.target.value })} />
-          </div>
-          <div className="field-label">{t.performanceTarget}
-            <div className="perf-options">
-              {[0, 1, 2, 3, 4, 5].map((n) => <button key={n} className={`perf-option ${acting.performanceTarget === n ? "active" : ""}`} title={t[perfTipKeys[n]]} onClick={() => updateActing({ performanceTarget: n })}>{t[perfKeys[n]]}</button>)}
-            </div>
-            <p className="hint-text">{t.performanceTargetHint}</p>
-          </div>
-        </div>}
       </div>
 
       <div className="modal-actions">

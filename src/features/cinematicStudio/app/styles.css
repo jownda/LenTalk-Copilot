@@ -2554,6 +2554,12 @@
 .asset-variant-composer { display: flex; flex-direction: column; gap: 7px; padding: var(--space-3); border: 1px solid var(--accent-ring); border-radius: var(--r-md); background: var(--accent-softer); }
 .asset-variant-composer-actions { display: flex; justify-content: flex-end; gap: var(--space-2); }
 .field-help { display: block; margin-top: 3px; color: var(--text-faint); font-size: 10px; font-weight: 400; line-height: 1.45; }
+.asset-state-section { display: flex; flex-direction: column; gap: var(--space-2); }
+.asset-change-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(150px, .6fr); gap: var(--space-2); align-items: end; }
+.asset-change-row .field-label { min-width: 0; }
+.asset-change-row .asset-variant-actions { min-width: 0; }
+.asset-change-row .asset-variant-actions > .outline-button { width: 100%; justify-content: center; }
+.asset-acting-section { display: flex; flex-direction: column; gap: var(--space-3); }
 
 /* Staging 与 Participants：收紧边距 */
 .staging-editor, .participants-editor {
