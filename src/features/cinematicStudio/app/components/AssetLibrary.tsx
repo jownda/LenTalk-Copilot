@@ -8,7 +8,7 @@
 import { createPortal } from "react-dom";
 import { useState } from "react";
 import type { Asset, AssetActingProfile, AssetKind, LockLevel, ProjectV2, SceneV2 } from "../../shared-types";
-import { ImagePlus, Lock, LockKeyhole, Mic, Plus, SlidersHorizontal, Sparkles, Trash2, X } from "lucide-react";
+import { ImagePlus, Lock, LockKeyhole, Mic, Plus, Sparkles, Trash2, X } from "lucide-react";
 import type { ProjectAction } from "../store/projectReducer";
 import type { Locale } from "../i18n";
 import { classifyError, fillAssetDetails } from "../providers/ai";
@@ -20,24 +20,6 @@ const TABS: { kind: AssetKind; labelKey: "assetTabCharacter" | "assetTabLocation
   { kind: "prop", labelKey: "assetTabProp" },
   { kind: "style-reference", labelKey: "assetTabReference" },
 ];
-
-/** 按资产类型显示用途选项（value → i18n key） */
-const USE_FOR_OPTIONS: Record<AssetKind, [string, keyof import("../i18n").CopyZh][]> = {
-  character: [["face", "useForFace"], ["body", "useForBody"], ["wardrobe", "useForWardrobe"], ["appearance", "useForAppearanceOnly"]],
-  location: [["environment", "useForEnvironment"], ["appearance", "useForAppearanceOnly"]],
-  prop: [["appearance", "useForPropAppearance"]],
-  "style-reference": [["appearance", "useForAppearanceOnly"]],
-  "audio-reference": [["appearance", "useForAppearanceOnly"]],
-};
-
-/** 按资产类型只展示有意义的「忽略」选项（地点/道具不再出现表情、姿势等无关项） */
-const IGNORE_OPTIONS: Record<AssetKind, [string, keyof import("../i18n").CopyZh][]> = {
-  character: [["pose", "ignorePose"], ["background", "ignoreBackground"], ["lighting", "ignoreLighting"], ["composition", "ignoreComposition"], ["expression", "ignoreExpression"]],
-  location: [["lighting", "ignoreLighting"], ["composition", "ignoreComposition"]],
-  prop: [["pose", "ignorePose"], ["background", "ignoreBackground"], ["lighting", "ignoreLighting"], ["composition", "ignoreComposition"]],
-  "style-reference": [["lighting", "ignoreLighting"], ["composition", "ignoreComposition"]],
-  "audio-reference": [["lighting", "ignoreLighting"], ["composition", "ignoreComposition"]],
-};
 
 /** 压缩上传图片到最长边 maxEdge，返回 JPEG data URL */
 function compressImage(file: File, maxEdge = 720, quality = 0.82): Promise<string> {
@@ -164,11 +146,8 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
   const [imageBusy, setImageBusy] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
-  const [markerDraft, setMarkerDraft] = useState("");
-  const [alwaysDraft, setAlwaysDraft] = useState("");
   const [variantComposerOpen, setVariantComposerOpen] = useState(false);
   const [variantStateName, setVariantStateName] = useState("");
-  const [exportConstraintsOpen, setExportConstraintsOpen] = useState(false);
   const update = (patch: Partial<Asset>) => dispatch({ type: "UPDATE_ASSET", id: asset.id, patch });
   const acting = asset.actingProfile ?? {};
   const updateActing = (patch: Partial<AssetActingProfile>) => update({ actingProfile: { ...acting, ...patch } });
@@ -200,29 +179,6 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
     reader.readAsDataURL(file);
   };
 
-  const toggleUseFor = (value: string) => {
-    const current = asset.useFor ?? [];
-    update({ useFor: current.includes(value) ? current.filter((item) => item !== value) : [...current, value] });
-  };
-  const toggleIgnore = (value: string) => {
-    const current = asset.ignore ?? [];
-    update({ ignore: current.includes(value) ? current.filter((item) => item !== value) : [...current, value] });
-  };
-
-  const commitMarker = () => {
-    const value = markerDraft.trim();
-    if (!value) return;
-    update({ uniqueMarkers: [...(asset.uniqueMarkers ?? []), value] });
-    setMarkerDraft("");
-  };
-  const commitAlways = () => {
-    const value = alwaysDraft.trim();
-    if (!value) return;
-    update({ alwaysVisible: [...(asset.alwaysVisible ?? []), value] });
-    setAlwaysDraft("");
-  };
-  const onMarkerKey = (event: React.KeyboardEvent) => { if (event.key === "Enter" || event.key === ",") { event.preventDefault(); commitMarker(); } };
-  const onAlwaysKey = (event: React.KeyboardEvent) => { if (event.key === "Enter" || event.key === ",") { event.preventDefault(); commitAlways(); } };
   const isBaseCard = (asset.baseAssetId ?? asset.id) === asset.id;
   const activeInCurrentScene = sceneUsesAsset(scene, asset.id);
   const createVariant = () => {
@@ -263,9 +219,6 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
   };
 
   const lockLevels: [LockLevel, keyof Copy][] = [["none", "lockNone"], ["soft", "lockSoft"], ["strict", "lockStrict"]];
-  const useForOptions = USE_FOR_OPTIONS[asset.kind];
-  const ignoreOptions = IGNORE_OPTIONS[asset.kind];
-
   return <div className="modal-overlay" onClick={onClose}>
     <div className="modal asset-modal" onClick={(event) => event.stopPropagation()}>
       <div className="modal-head">
@@ -279,7 +232,7 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
       </div>
 
       <div className="asset-modal-grid">
-        {/* 左列：基础信息 → 状态 → 锁定 */}
+        {/* 左列：用户填写的基础信息 */}
         <div className="asset-modal-left">
           <div className="asset-refs">
             {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={src} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
@@ -310,31 +263,17 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
             {(["untested", "passed", "failed"] as const).map((status) => <button key={status} className={`lock-option ${asset.stressTestStatus === status ? "active" : ""}`} onClick={() => update({ stressTestStatus: status })}>{t[status === "untested" ? "stressUntested" : status === "passed" ? "stressPassed" : "stressFailed"]}</button>)}
           </div></div>
           {isVehicleInterior && <button className="outline-button" onClick={() => update({ kind: "prop" })}>{t.moveVehicleToProp}</button>}
-          <div className="asset-state-section">
-            <div className="asset-section-title">{t.assetStateArea}</div>
-            <div className="asset-state-grid">
-              <label className="field-label">{t.assetStateName}<input className="modal-input" value={asset.stateName ?? "base"} placeholder={t.assetStateNamePlaceholder} onChange={(event) => update({ stateName: event.target.value })} /></label>
-              <label className="field-label">{t.assetVersion}<input className="modal-input" type="number" min="1" value={asset.version ?? 1} onChange={(event) => update({ version: Math.max(1, Number(event.target.value) || 1) })} /></label>
-            </div>
-          </div>
-          <div className="field-label">{t.lockLevel}<div className="lock-options">
-            {lockLevels.map(([level, key]) => <button key={level} className={`lock-option ${asset.lockLevel === level ? "active" : ""}`} onClick={() => update({ lockLevel: level })}>{t[key]}</button>)}
-          </div></div>
         </div>
 
-        {/* 右列：描述 → AI → 表演字段 → 其他约束 */}
+        {/* 右列：描述 → AI 填写结果 */}
         <div className="asset-modal-right">
-          <div className="asset-desc-row">
-            {locale === "zh" ? (
-              <label className="field-label">{t.assetDescriptionZh}<textarea className="modal-textarea" value={asset.descriptionZh ?? ""} placeholder={t.assetDescriptionZhPlaceholder} onChange={(event) => update({ descriptionZh: event.target.value })} /></label>
-            ) : (
-              <label className="field-label">{t.assetDescription}<textarea className="modal-textarea" value={asset.description} placeholder={t.assetDescriptionPlaceholder} spellCheck={false} onChange={(event) => update({ description: event.target.value })} /></label>
-            )}
-            <div className="asset-desc-actions">
-              <button className="outline-button translate-btn" disabled={aiBusy} onClick={() => void aiFillDetails()}>{aiBusy ? <span className="spin-dot" /> : <Sparkles size={13} />} {t.aiFillDetails}</button>
-              <button className={`icon-button ${exportConstraintsOpen ? "active" : ""}`} title={t.assetExportConstraintsHint} aria-label={t.assetExportConstraints} aria-expanded={exportConstraintsOpen} onClick={() => setExportConstraintsOpen((open) => !open)}><SlidersHorizontal size={14} /></button>
-            </div>
-          </div>
+          <button className="outline-button asset-ai-fill-button" disabled={aiBusy} onClick={() => void aiFillDetails()}>{aiBusy ? <span className="spin-dot" /> : <Sparkles size={14} />} {t.aiFillDetails}</button>
+          <div className="asset-ai-output-label">{t.assetAiOutput}</div>
+          {locale === "zh" ? (
+            <label className="field-label">{t.assetDescriptionZh}<textarea className="modal-textarea" value={asset.descriptionZh ?? ""} placeholder={t.assetDescriptionZhPlaceholder} onChange={(event) => update({ descriptionZh: event.target.value })} /></label>
+          ) : (
+            <label className="field-label">{t.assetDescription}<textarea className="modal-textarea" value={asset.description} placeholder={t.assetDescriptionPlaceholder} spellCheck={false} onChange={(event) => update({ description: event.target.value })} /></label>
+          )}
 
           {asset.kind === "character" && <div className="asset-acting-section">
             <div className="asset-section-title">{t.actingMasterProfile}</div>
@@ -349,35 +288,31 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
             </div>
           </div>}
 
-          {exportConstraintsOpen && <div className="asset-export-constraints">
-            <div className="field-label">{t.useFor}<div className="check-chips">
-              {useForOptions.map(([value, key]) => <button key={value} className={`check-chip ${(asset.useFor ?? []).includes(value) ? "active" : ""}`} onClick={() => toggleUseFor(value)}>{t[key]}</button>)}
-            </div></div>
-            <div className="field-label">{t.ignoreLabel}<div className="check-chips">
-              {ignoreOptions.map(([value, key]) => <button key={value} className={`check-chip ${(asset.ignore ?? []).includes(value) ? "active" : ""}`} onClick={() => toggleIgnore(value)}>{t[key]}</button>)}
-            </div></div>
+        </div>
+      </div>
 
-            {asset.lockLevel === "strict" && <>
-              <TokenEditor label={t.uniqueMarkers} placeholder={t.uniqueMarkerPlaceholder} tokens={asset.uniqueMarkers ?? []} draft={markerDraft} setDraft={setMarkerDraft} onCommit={commitMarker} onKey={onMarkerKey} onRemove={(token) => update({ uniqueMarkers: (asset.uniqueMarkers ?? []).filter((item) => item !== token) })} />
-              <TokenEditor label={t.alwaysVisible} placeholder={t.alwaysVisiblePlaceholder} tokens={asset.alwaysVisible ?? []} draft={alwaysDraft} setDraft={setAlwaysDraft} onCommit={commitAlways} onKey={onAlwaysKey} onRemove={(token) => update({ alwaysVisible: (asset.alwaysVisible ?? []).filter((item) => item !== token) })} />
-            </>}
-          </div>}
-
-          <div className="asset-change-row">
-            <label className="field-label">{t.assetChangeLog}<textarea className="modal-textarea asset-notes-input" value={asset.changeLog ?? ""} placeholder={t.assetChangeLogPlaceholder} onChange={(event) => update({ changeLog: event.target.value })} /></label>
-            <div className="asset-variant-actions">
-              <button className="outline-button" onClick={() => setVariantComposerOpen((open) => !open)}><Plus size={13} /> {t.createVariant}</button>
-              {variantComposerOpen && <div className="asset-variant-composer">
-                <label className="field-label">{t.variantStatePrompt}<input className="modal-input" autoFocus value={variantStateName} placeholder={t.assetStateNamePlaceholder} onChange={(event) => setVariantStateName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); createVariant(); } }} /></label>
-                <div className="asset-variant-composer-actions">
-                  <button className="outline-button" onClick={() => { setVariantComposerOpen(false); setVariantStateName(""); }}>{t.cancel}</button>
-                  <button className="primary-button" onClick={createVariant}>{t.createVariantConfirm}</button>
-                </div>
-              </div>}
-            </div>
+      <div className="asset-state-section asset-state-full">
+        <div className="asset-section-title">{t.assetStateArea}</div>
+        <div className="asset-state-grid">
+          <label className="field-label">{t.assetStateName}<input className="modal-input" value={asset.stateName ?? "base"} placeholder={t.assetStateNamePlaceholder} onChange={(event) => update({ stateName: event.target.value })} /></label>
+          <label className="field-label">{t.assetVersion}<input className="modal-input" type="number" min="1" value={asset.version ?? 1} onChange={(event) => update({ version: Math.max(1, Number(event.target.value) || 1) })} /></label>
+          <div className="field-label">{t.lockLevel}<div className="lock-options">
+            {lockLevels.map(([level, key]) => <button key={level} className={`lock-option ${asset.lockLevel === level ? "active" : ""}`} onClick={() => update({ lockLevel: level })}>{t[key]}</button>)}
+          </div></div>
+        </div>
+        <div className="asset-change-row">
+          <label className="field-label">{t.assetChangeLog}<textarea className="modal-textarea asset-notes-input" value={asset.changeLog ?? ""} placeholder={t.assetChangeLogPlaceholder} onChange={(event) => update({ changeLog: event.target.value })} /></label>
+          <div className="asset-variant-actions">
+            <button className="outline-button" onClick={() => setVariantComposerOpen((open) => !open)}><Plus size={13} /> {t.createVariant}</button>
+            {variantComposerOpen && <div className="asset-variant-composer">
+              <label className="field-label">{t.variantStatePrompt}<input className="modal-input" autoFocus value={variantStateName} placeholder={t.assetStateNamePlaceholder} onChange={(event) => setVariantStateName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); createVariant(); } }} /></label>
+              <div className="asset-variant-composer-actions">
+                <button className="outline-button" onClick={() => { setVariantComposerOpen(false); setVariantStateName(""); }}>{t.cancel}</button>
+                <button className="primary-button" onClick={createVariant}>{t.createVariantConfirm}</button>
+              </div>
+            </div>}
           </div>
         </div>
-
       </div>
 
       <div className="modal-actions">
@@ -386,17 +321,6 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
         <button className="outline-button" onClick={onClose}>{t.cancel}</button>
         <button className="primary-button" onClick={onClose}>{t.save}</button>
       </div>
-    </div>
-  </div>;
-}
-
-function TokenEditor({ label, placeholder, tokens, draft, setDraft, onCommit, onKey, onRemove }: {
-  label: string; placeholder: string; tokens: string[]; draft: string; setDraft(value: string): void; onCommit(): void; onKey(event: React.KeyboardEvent): void; onRemove(token: string): void;
-}) {
-  return <div className="field-label">{label}
-    <div className="token-editor">
-      {tokens.map((token) => <span className="token-chip" key={token}>{token}<button onClick={() => onRemove(token)}><X size={10} /></button></span>)}
-      <input value={draft} placeholder={placeholder} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKey} onBlur={onCommit} />
     </div>
   </div>;
 }
