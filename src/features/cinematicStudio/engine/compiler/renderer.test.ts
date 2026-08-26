@@ -1,0 +1,23 @@
+import { describe, expect, it } from "vitest";
+
+import type { Asset } from "../../shared-types";
+import { renderAssetLine } from "./renderer";
+
+const asset: Asset = {
+  id: "hero", kind: "character", name: "HERO", description: "A man in a navy suit.",
+  descriptionZh: "穿海军蓝西装的男人。", notes: "性格内敛，声音低沉沙哑。", notesZh: "性格内敛，声音低沉沙哑。",
+  referencePaths: [], lockLevel: "strict", tags: [],
+};
+
+describe("renderAssetLine user notes isolation", () => {
+  it("does not export user notes in either locale", () => {
+    const zh = renderAssetLine(asset, 1, "at-mention", "zh");
+    const en = renderAssetLine(asset, 1, "at-mention", "en");
+    expect(zh).toContain("穿海军蓝西装的男人。");
+    expect(en).toContain("A man in a navy suit.");
+    expect(zh).not.toContain("性格内敛");
+    expect(en).not.toContain("性格内敛");
+    expect(zh).not.toContain("声音低沉");
+    expect(en).not.toContain("声音低沉");
+  });
+});

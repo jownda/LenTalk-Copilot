@@ -490,7 +490,7 @@ const LOCK_LEVEL_VALUES: LockLevel[] = ["none", "soft", "strict"];
 export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Partial<Asset>> {
   const settings = loadAISettings();
   if (!isRemoteConfigured(settings)) {
-    throw new Error("AI 未配置，请先在右上角「设置 → API 设置」中填写服务商、模型与 API Key。");
+    throw new Error("AI 未配置，请先在 LenTalk「设置 → 密钥」中配置 Chat 模型与 API Key。");
   }
   const images = (asset.referencePaths ?? []).slice(0, 4);
   if (images.length === 0) {
@@ -508,6 +508,8 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
     name: asset.name?.trim() || "",
     description: asset.description?.trim() || "",
     descriptionZh: asset.descriptionZh?.trim() || "",
+    notes: asset.notes?.trim() || "",
+    notesZh: asset.notesZh?.trim() || "",
     useFor: asset.useFor ?? [],
     ignore: asset.ignore ?? [],
     uniqueMarkers: asset.uniqueMarkers ?? [],
@@ -534,6 +536,7 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
     "Analyze the attached reference image(s) carefully. Every field must be grounded in what you can see (or, for style refs, derive consistently) — no invented details.",
     "",
     FILL_ASSET_KIND_HINTS[asset.kind],
+    `User notes (${language}, AI reference only; never copy this field into the final prompt): ${isZh ? (asset.notesZh?.trim() || "(none)") : (asset.notes?.trim() || "(none)")}`,
     "",
     "Return ONLY a JSON object with this exact schema:",
     `{ "name": string, "${descriptionField}": string, "useFor": string[], "ignore": string[], "uniqueMarkers": string[], "alwaysVisible": string[], "forbiddenConfusions": string[], "tags": string[], "lockLevel": "none" | "soft" | "strict"${actingSchema} }`,
@@ -549,6 +552,9 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
     `- tags: 2-5 short production tags in ${language}.`,
     "- lockLevel: \"strict\" only for a character whose identity must be exact, \"soft\" for suggested lock, else \"none\".",
     ...characterRules,
+    ...(isCharacter
+      ? ["For a character, absorb the user's personality, motivation, speaking habits, and voice notes into actingProfile.masterProfile and actingProfile.voicePrompt; do not output the notes field itself."]
+      : ["For this asset, use the user notes only to disambiguate the image and improve the canonical description; do not output the notes field itself."]),
     "",
     `Asset kind: ${asset.kind}`,
     "Current values already filled by the user (keep them unless the image clearly contradicts them): " + JSON.stringify(existing),

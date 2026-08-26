@@ -231,6 +231,7 @@ function AssetEditor({ asset, locale, t, dispatch, setNotice, onClose }: { asset
             </label>
           </div>
           <label className="field-label">{t.assetName}<input className="modal-input" value={asset.name} placeholder={t.assetNamePlaceholder} onChange={(event) => update({ name: event.target.value })} /></label>
+          <label className="field-label">{t.assetNotes}<textarea className="modal-textarea asset-notes-input" value={locale === "zh" ? (asset.notesZh ?? "") : (asset.notes ?? "")} placeholder={locale === "zh" ? t.assetNotesZhPlaceholder : t.assetNotesPlaceholder} onChange={(event) => update(locale === "zh" ? { notesZh: event.target.value } : { notes: event.target.value })} /></label>
           {/* 声音音色（角色）：点击上传音频，可试听/删除 */}
           {asset.kind === "character" && <div className="field-label">{t.voiceClip}
             {asset.voiceClip ? (

@@ -120,6 +120,10 @@ export interface Asset {
   description: string;
   /** UI 辅助阅读 */
   descriptionZh?: string;
+  /** 用户备注：仅供 AI 填写时参考，不参与任何提示词编译 */
+  notes?: string;
+  /** 同上（中文界面） */
+  notesZh?: string;
   referencePaths: string[];
   /** 用途：face, body, wardrobe, appearance, environment… */
   useFor?: string[];
