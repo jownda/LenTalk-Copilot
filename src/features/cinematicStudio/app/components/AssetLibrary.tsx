@@ -105,7 +105,7 @@ export default function AssetLibrary({ project, dispatch, locale, t, setNotice }
     {assets.length === 0 ? <div className="empty assets-empty">{t.emptyAssets}</div> : <div className="asset-grid">
       {assets.map((asset) => <AssetTile key={asset.id} asset={asset} locale={locale} t={t} onClick={() => setEditingId(asset.id)} onDelete={() => { dispatch({ type: "DELETE_ASSET", id: asset.id }); setNotice(t.assetDeleted); }} />)}
     </div>}
-    {editing && <AssetEditor asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onClose={() => setEditingId(null)} />}
+    {editing && <AssetEditor asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />}
   </section>;
 }
 
@@ -128,7 +128,7 @@ function AssetTile({ asset, locale, t, onClick, onDelete }: { asset: Asset; loca
   </div>;
 }
 
-function AssetEditor({ asset, locale, t, dispatch, setNotice, onClose }: { asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; onClose(): void }) {
+function AssetEditor({ asset, locale, t, dispatch, setNotice, onCreateVariant, onClose }: { asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; onCreateVariant(id: string): void; onClose(): void }) {
   const [imageBusy, setImageBusy] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
@@ -188,6 +188,14 @@ function AssetEditor({ asset, locale, t, dispatch, setNotice, onClose }: { asset
   };
   const onMarkerKey = (event: React.KeyboardEvent) => { if (event.key === "Enter" || event.key === ",") { event.preventDefault(); commitMarker(); } };
   const onAlwaysKey = (event: React.KeyboardEvent) => { if (event.key === "Enter" || event.key === ",") { event.preventDefault(); commitAlways(); } };
+  const createVariant = () => {
+    const stateName = window.prompt(t.variantStatePrompt)?.trim();
+    if (!stateName) return;
+    const id = crypto.randomUUID();
+    dispatch({ type: "CREATE_ASSET_VARIANT", sourceId: asset.id, id, stateName });
+    onCreateVariant(id);
+  };
+  const isVehicleInterior = asset.kind === "location" && /(?:车辆|车厢|汽车|巴士|车内|vehicle|car|bus|train).*?(?:内部|内景|interior|inside)?/i.test(asset.name);
 
   /** AI 填写详细：按接入的参考图把描述类字段一次填完整 */
   const aiFillDetails = async () => {
@@ -240,6 +248,11 @@ function AssetEditor({ asset, locale, t, dispatch, setNotice, onClose }: { asset
             <label className="field-label">{t.assetVersion}<input className="modal-input" type="number" min="1" value={asset.version ?? 1} onChange={(event) => update({ version: Math.max(1, Number(event.target.value) || 1) })} /></label>
           </div>
           <label className="field-label">{t.assetChangeLog}<textarea className="modal-textarea asset-notes-input" value={asset.changeLog ?? ""} placeholder={t.assetChangeLogPlaceholder} onChange={(event) => update({ changeLog: event.target.value })} /></label>
+          <div className="field-label">{t.stressTest}<div className="lock-options">
+            {(["untested", "passed", "failed"] as const).map((status) => <button key={status} className={`lock-option ${asset.stressTestStatus === status ? "active" : ""}`} onClick={() => update({ stressTestStatus: status })}>{t[status === "untested" ? "stressUntested" : status === "passed" ? "stressPassed" : "stressFailed"]}</button>)}
+          </div></div>
+          {isVehicleInterior && <button className="outline-button" onClick={() => update({ kind: "prop" })}>{t.moveVehicleToProp}</button>}
+          <button className="outline-button" onClick={createVariant}><Plus size={13} /> {t.createVariant}</button>
           <label className="field-label">{t.assetNotes}<textarea className="modal-textarea asset-notes-input" value={locale === "zh" ? (asset.notesZh ?? "") : (asset.notes ?? "")} placeholder={locale === "zh" ? t.assetNotesZhPlaceholder : t.assetNotesPlaceholder} onChange={(event) => update(locale === "zh" ? { notesZh: event.target.value } : { notes: event.target.value })} /></label>
           {/* 声音音色（角色）：点击上传音频，可试听/删除 */}
           {asset.kind === "character" && <div className="field-label">{t.voiceClip}
@@ -288,6 +301,7 @@ function AssetEditor({ asset, locale, t, dispatch, setNotice, onClose }: { asset
 
         {asset.kind === "character" && <div className="asset-modal-full">
           <div className="asset-section-title">{t.actingMasterProfile}</div>
+          <div className="hint-text"><strong>{t.characterSheetGuide}</strong><br />{t.characterSheetHint}</div>
           <textarea className="modal-textarea profile-textarea" value={locale === "zh" ? (acting.masterProfileZh ?? "") : (acting.masterProfile ?? "")} placeholder={t.actingMasterPlaceholder} spellCheck={false} aria-label={t.actingMasterProfile} onChange={(event) => updateActing(locale === "zh" ? { masterProfileZh: event.target.value } : { masterProfile: event.target.value })} />
           <div className="field-label">{t.voicePromptLabel}
             <textarea className="modal-textarea" value={locale === "zh" ? (acting.voicePromptZh ?? "") : (acting.voicePrompt ?? "")} placeholder={t.voicePromptPlaceholder} spellCheck={false} onChange={(event) => updateActing(locale === "zh" ? { voicePromptZh: event.target.value } : { voicePrompt: event.target.value })} />

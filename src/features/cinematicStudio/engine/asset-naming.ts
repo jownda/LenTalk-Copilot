@@ -46,3 +46,12 @@ export function withAssetReferenceTag(asset: Asset, projectCode: string): Asset 
     referenceTag: buildAssetReferenceTag({ ...asset, stateName, version }, projectCode),
   };
 }
+
+/** 变体输出完整基卡描述加上本卡变化，基卡本身仍只输出自己的完整描述。 */
+export function assetCanonicalDescription(asset: Asset, locale: "zh" | "en"): string {
+  const base = locale === "zh" ? asset.baseDescriptionZh?.trim() : asset.baseDescription?.trim();
+  const current = locale === "zh"
+    ? (asset.descriptionZh?.trim() || asset.description.trim())
+    : (asset.description.trim() || asset.descriptionZh?.trim());
+  return [base, current].filter(Boolean).join(locale === "zh" ? "；" : "; ");
+}

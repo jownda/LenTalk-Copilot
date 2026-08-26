@@ -5,6 +5,7 @@
  * 原则：空值不输出；强约束与风格分离；编号在一个 Prompt 内稳定。
  */
 import type { Asset, IdentityRule, PropState, ProjectV2, SceneV2, ShotV2 } from "../../shared-types";
+import { assetCanonicalDescription } from "../asset-naming";
 import { fillTemplate, localizePromptValue, promptLexicon, type PromptLocale } from "../i18n/lexicon";
 
 /** appearance-only 资产：用途仅「仅外观参考」且非锁定 */
@@ -38,9 +39,7 @@ export type ReferenceSyntax = "asset-id" | "at-mention" | "plain-text";
 /** 单条资产 canonical 行（Asset-ID 模板；P2.1 支持三种引用语法，P0.2 双语） */
 export function renderAssetLine(asset: Asset, imageIndex: number, syntax: ReferenceSyntax = "asset-id", locale: PromptLocale = "zh"): string {
   const lex = promptLexicon(locale);
-  const desc = locale === "zh"
-    ? (asset.descriptionZh?.trim() || asset.description.trim() || asset.name.trim())
-    : (asset.description.trim() || asset.descriptionZh?.trim() || asset.name.trim());
+  const desc = assetCanonicalDescription(asset, locale) || asset.name.trim();
   const namePart = asset.referenceTag?.trim() || asset.name.trim() || desc;
   const n = String(imageIndex);
   const head = syntax === "at-mention"

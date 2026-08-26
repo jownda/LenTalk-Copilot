@@ -34,4 +34,9 @@ describe("asset reference naming", () => {
     expect(tagged.referenceTag).toBe("char_cb_hero_rain-soaked_v2");
     expect(output).toContain("@char_cb_hero_rain-soaked_v2");
   });
+
+  it("merges a variant's inherited base description with its change-only description", () => {
+    const output = renderAssetLine({ ...asset, baseDescriptionZh: "中年男性，深蓝西装", descriptionZh: "西装被雨水浸透，领口沾有血迹" }, 1, "at-mention", "zh");
+    expect(output).toContain("中年男性，深蓝西装；西装被雨水浸透，领口沾有血迹");
+  });
 });

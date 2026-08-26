@@ -12,6 +12,7 @@ export type ProjectAction =
   | { type: "SET_PROJECT"; project: ProjectV2 }
   | { type: "PATCH_PROJECT"; patch: Partial<ProjectV2> }
   | { type: "ADD_ASSET"; kind: AssetKind; name?: string }
+  | { type: "CREATE_ASSET_VARIANT"; sourceId: string; id: string; stateName: string }
   | { type: "UPDATE_ASSET"; id: string; patch: Partial<Asset> }
   | { type: "DELETE_ASSET"; id: string }
   | { type: "SET_CHARACTER_COUNT_LOCK"; count?: number }
@@ -50,6 +51,28 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
         changeLog: "",
       }, state.projectCode?.trim() || deriveProjectCode(state.title));
       return { ...state, assets: [...(state.assets ?? []), created] };
+    }
+    case "CREATE_ASSET_VARIANT": {
+      const source = (state.assets ?? []).find((asset) => asset.id === action.sourceId);
+      if (!source) return state;
+      const groupId = source.variantGroupId || source.baseAssetId || source.id;
+      const nextVersion = Math.max(0, ...(state.assets ?? []).filter((asset) => asset.variantGroupId === groupId).map((asset) => asset.version ?? 1)) + 1;
+      const variant = withAssetReferenceTag({
+        ...source,
+        id: action.id,
+        variantGroupId: groupId,
+        baseAssetId: source.baseAssetId || source.id,
+        stateName: action.stateName.trim() || "variant",
+        version: nextVersion,
+        description: "",
+        descriptionZh: "",
+        baseDescription: source.baseDescription || source.description,
+        baseDescriptionZh: source.baseDescriptionZh || source.descriptionZh,
+        changeLog: "",
+        stressTestStatus: "untested",
+        stressTestNotes: "",
+      }, state.projectCode?.trim() || deriveProjectCode(state.title));
+      return { ...state, assets: [...(state.assets ?? []), variant] };
     }
     case "UPDATE_ASSET":
       return {

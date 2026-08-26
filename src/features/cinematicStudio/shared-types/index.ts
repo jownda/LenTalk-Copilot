@@ -151,6 +151,12 @@ export interface Asset {
   version?: number;
   /** 新状态相对基卡的变化记录。 */
   changeLog?: string;
+  /** 变体创建时冻结的基卡完整描述，导出时与当前变化描述合并。 */
+  baseDescription?: string;
+  baseDescriptionZh?: string;
+  /** 资产在多动作、多景别试拍中的验收状态。 */
+  stressTestStatus?: "untested" | "passed" | "failed";
+  stressTestNotes?: string;
   /** 已持久化的稳定引用名：char_project_name_state_v1。 */
   referenceTag?: string;
 }

@@ -37,4 +37,13 @@ describe("projectReducer asset naming", () => {
     const next = projectReducer(project, { type: "PATCH_PROJECT", patch: { projectCode: "CHB" } });
     expect(next.assets?.[0].referenceTag).toBe("char_chb_kel_base_v1");
   });
+
+  it("creates an independent state card with inherited base description and a new version", () => {
+    const next = projectReducer(project, { type: "CREATE_ASSET_VARIANT", sourceId: "kel", id: "kel-wet", stateName: "wet" });
+    expect(next.assets?.[1]).toMatchObject({
+      id: "kel-wet", variantGroupId: "kel", baseAssetId: "kel", stateName: "wet", version: 2,
+      baseDescription: "teenage boy", description: "", stressTestStatus: "untested",
+      referenceTag: "char_cb_kel_wet_v2",
+    });
+  });
 });
