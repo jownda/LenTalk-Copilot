@@ -14,6 +14,7 @@ import {
   renderActingSection, renderAudioSection, renderLocalLocks, renderShotSection, type PromptLocale, type ReferenceSyntax, unifiedCameraForScene,
 } from "./sections";
 import { lensById, lensByFov, physicsAnchorById, renderLightingLayer, renderPhysicsLayer, renderTechnicalProfile } from "../presets";
+import { validateDirectorLayers } from "../quality";
 
 export interface DirectorOptions {
   syntax?: ReferenceSyntax;
@@ -202,12 +203,19 @@ export function compileDirectorSequence(project: ProjectV2, scene: SceneV2, opti
   // 这样用户编辑/锁定过的层文本能原样进入最终提示词（P0.6 锁定语义的落点）。
   const storedLayers = scene.directorLayers;
   if (storedLayers) {
-    const joined = DIRECTOR_LAYER_ORDER
-      .map((key) => (storedLayers[key] ?? "").trim())
-      .filter(Boolean)
-      .join("\n\n");
-    if (joined) return joined;
+    // V2.2：AI 分层文本在进入最终提示词前必须过质量门；
+    // error 级结构冲突 → 丢弃整份分层文档，回退结构化编译（每镜一卡，天然分块）。
+    const issues = validateDirectorLayers(storedLayers, project, scene);
+    const hasBlockingErrors = issues.some((issue) => issue.severity === "error");
+    if (!hasBlockingErrors) {
+      const joined = DIRECTOR_LAYER_ORDER
+        .map((key) => (storedLayers[key] ?? "").trim())
+        .filter(Boolean)
+        .join("\n\n");
+      if (joined) return joined;
+    }
   }
+  /* 结构化编译路径（V2.2 起作为 AI 分层文档的校验回退兜底） */
   const registry = buildSceneAssetRegistry(project, scene);
   const locks = renderLocalLocks(project, locale);
   const sections: string[] = [];

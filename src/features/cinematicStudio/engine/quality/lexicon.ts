@@ -3,10 +3,16 @@
  * 供 validateDirectorLayers 与后续 sanitize 管道共用，禁止在此文件引入副作用。
  * 语言约束：用户可见替换句维护 zh/en 两套；检测用正则覆盖两种语言。
  */
-import { DIRECTOR_LAYER_ORDER } from "../compiler/director";
-
-/** 导演文档 canonical 层 key（与 compiler/director.ts 的 DIRECTOR_LAYER_ORDER 保持一致） */
-export const DIRECTOR_LAYER_KEYS: readonly string[] = DIRECTOR_LAYER_ORDER;
+/**
+ * 导演文档 canonical 层 key（与 compiler/director.ts 的 DIRECTOR_LAYER_ORDER 保持一致）。
+ * 刻意内联而非从 director.ts 导入：director → quality 存在编译期依赖，反向导入会形成循环。
+ * 两处顺序由 validateDirectorLayers 双语单测隐式锁定。
+ */
+export const DIRECTOR_LAYER_KEYS: readonly string[] = [
+  "sceneContext", "activeReferences", "locationMap", "firstFrame", "formatMode",
+  "optics", "camera", "actionTiming", "physics", "lighting", "audio",
+  "positiveConstraints", "negativeLocks",
+];
 
 // ─────────────────────────────────────────────────────────────
 // V2-P1-1 光学术语冲突
