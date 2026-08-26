@@ -316,19 +316,6 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
               <label className="field-label">{t.assetStateName}<input className="modal-input" value={asset.stateName ?? "base"} placeholder={t.assetStateNamePlaceholder} onChange={(event) => update({ stateName: event.target.value })} /></label>
               <label className="field-label">{t.assetVersion}<input className="modal-input" type="number" min="1" value={asset.version ?? 1} onChange={(event) => update({ version: Math.max(1, Number(event.target.value) || 1) })} /></label>
             </div>
-            <div className="asset-change-row">
-              <label className="field-label">{t.assetChangeLog}<textarea className="modal-textarea asset-notes-input" value={asset.changeLog ?? ""} placeholder={t.assetChangeLogPlaceholder} onChange={(event) => update({ changeLog: event.target.value })} /></label>
-              <div className="asset-variant-actions">
-                <button className="outline-button" onClick={() => setVariantComposerOpen((open) => !open)}><Plus size={13} /> {t.createVariant}</button>
-                {variantComposerOpen && <div className="asset-variant-composer">
-                  <label className="field-label">{t.variantStatePrompt}<input className="modal-input" autoFocus value={variantStateName} placeholder={t.assetStateNamePlaceholder} onChange={(event) => setVariantStateName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); createVariant(); } }} /></label>
-                  <div className="asset-variant-composer-actions">
-                    <button className="outline-button" onClick={() => { setVariantComposerOpen(false); setVariantStateName(""); }}>{t.cancel}</button>
-                    <button className="primary-button" onClick={createVariant}>{t.createVariantConfirm}</button>
-                  </div>
-                </div>}
-              </div>
-            </div>
           </div>
           <div className="field-label">{t.lockLevel}<div className="lock-options">
             {lockLevels.map(([level, key]) => <button key={level} className={`lock-option ${asset.lockLevel === level ? "active" : ""}`} onClick={() => update({ lockLevel: level })}>{t[key]}</button>)}
@@ -375,6 +362,20 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
               <TokenEditor label={t.alwaysVisible} placeholder={t.alwaysVisiblePlaceholder} tokens={asset.alwaysVisible ?? []} draft={alwaysDraft} setDraft={setAlwaysDraft} onCommit={commitAlways} onKey={onAlwaysKey} onRemove={(token) => update({ alwaysVisible: (asset.alwaysVisible ?? []).filter((item) => item !== token) })} />
             </>}
           </div>}
+
+          <div className="asset-change-row">
+            <label className="field-label">{t.assetChangeLog}<textarea className="modal-textarea asset-notes-input" value={asset.changeLog ?? ""} placeholder={t.assetChangeLogPlaceholder} onChange={(event) => update({ changeLog: event.target.value })} /></label>
+            <div className="asset-variant-actions">
+              <button className="outline-button" onClick={() => setVariantComposerOpen((open) => !open)}><Plus size={13} /> {t.createVariant}</button>
+              {variantComposerOpen && <div className="asset-variant-composer">
+                <label className="field-label">{t.variantStatePrompt}<input className="modal-input" autoFocus value={variantStateName} placeholder={t.assetStateNamePlaceholder} onChange={(event) => setVariantStateName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); createVariant(); } }} /></label>
+                <div className="asset-variant-composer-actions">
+                  <button className="outline-button" onClick={() => { setVariantComposerOpen(false); setVariantStateName(""); }}>{t.cancel}</button>
+                  <button className="primary-button" onClick={createVariant}>{t.createVariantConfirm}</button>
+                </div>
+              </div>}
+            </div>
+          </div>
         </div>
 
       </div>
