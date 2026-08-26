@@ -3,6 +3,7 @@
  * 12 模块预设 + 9 种风格配方 + 编译渲染（renderTechnicalProfile）。
  */
 import type { ProjectV2 } from "../../shared-types";
+import { localizedStyleBrief } from "../styles";
 import { FILM_PRESETS, FORMAT_PRESETS, FRAME_PRESETS, PHYSICS_PRESETS, presetById } from "./technical-modules";
 import { recipeById } from "./style-recipes";
 
@@ -20,11 +21,11 @@ export * from "./physics-anchors";
  */
 const TECH_LABELS: Record<"zh" | "en", Record<string, string>> = {
   zh: {
-    Cinematography: "摄影语言", Lighting: "光线", Color: "色彩", Acting: "表演", Skin: "皮肤",
+    "Style direction": "风格倾向", Cinematography: "摄影语言", Lighting: "光线", Color: "色彩", Acting: "表演", Skin: "皮肤",
     Physics: "物理", Composition: "构图", Sharpness: "锐化", "Camera angles": "机位角度", Avoid: "禁止",
   },
   en: {
-    Cinematography: "Cinematography", Lighting: "Lighting", Color: "Color", Acting: "Acting", Skin: "Skin",
+    "Style direction": "Style direction", Cinematography: "Cinematography", Lighting: "Lighting", Color: "Color", Acting: "Acting", Skin: "Skin",
     Physics: "Physics", Composition: "Composition", Sharpness: "Sharpness", "Camera angles": "Camera angles", Avoid: "Avoid",
   },
 };
@@ -41,6 +42,9 @@ export function renderTechnicalProfile(
   const join = (list: string[]) => list.join(locale === "zh" ? "、" : ", ");
   const line = (label: string, value: string) => `${L[label]}${sep}${value}.`;
   const lines: string[] = [];
+
+  const styleBrief = localizedStyleBrief(project, locale);
+  if (styleBrief) lines.push(line("Style direction", styleBrief));
 
   // 影像格式
   const format = profile?.format ? (presetById(FORMAT_PRESETS, profile.format)?.compile ?? profile.format) : "";

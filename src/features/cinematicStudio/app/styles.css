@@ -3232,6 +3232,7 @@
 .recipe-tile-swatch.empty i { background: var(--border); }
 .recipe-tile-card .tile-name { font-size: 12px; font-weight: 700; color: var(--text); }
 .recipe-tile-desc { font-size: 10px; color: var(--text-faint); }
+.recipe-tile-detail { display: block; max-width: 680px; margin-top: 3px; color: var(--text-muted); font-size: 10px; line-height: 1.45; }
 .recipe-tile-name.muted { color: var(--text-muted); font-size: 12px; font-weight: 600; }
 .recipe-grid.modal {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));

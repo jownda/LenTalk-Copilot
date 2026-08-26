@@ -298,6 +298,10 @@ export interface ProjectV02 {
   audioPlan?: AudioPlan;
   /** 一句风格话（导演简报·风格倾向：与配方二选一或叠加的自由描述） */
   styleBrief?: string;
+  /** 一句风格话（中文界面；与英文分开保存） */
+  styleBriefZh?: string;
+  /** One-line style brief (English UI; stored separately from Chinese) */
+  styleBriefEn?: string;
   /** 正向强约束（不可被风格预设覆盖） */
   positiveConstraints?: string[];
   /** 角色数量锁：EXACTLY N */

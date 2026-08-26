@@ -9,7 +9,7 @@ import type { ProjectV2, TechnicalProfile } from "../../shared-types";
 import {
   ACTING_PRESETS, CINEMATOGRAPHY_PRESETS, COLOR_PRESETS, COMPOSITION_PRESETS, FILM_PRESETS, FORMAT_PRESETS,
   LIGHTING_PRESETS, MASTER_STYLES, PHYSICS_PRESETS, SHARPNESS_PRESETS, SKIN_PRESETS, STYLE_RECIPES,
-  recipeById, localizeRecipeTerm, type StyleRecipe,
+  recipeById, localizeRecipeTerm, styleBriefDescription, type MasterStyle, type StyleRecipe,
 } from "../../engine";
 import { ChevronDown, Lock, LockOpen, Pencil, X } from "lucide-react";
 import type { CopyZh, Locale } from "../i18n";
@@ -40,6 +40,7 @@ export default function TechnicalProfileCard({ project, t, locale, onChange, onS
   const [editorOpen, setEditorOpen] = useState(false);
   const profile = project.technicalProfile ?? {};
   const recipe = recipeById(profile.recipeId);
+  const masterStyle = MASTER_STYLES.find((style) => style.recipeId === profile.recipeId);
 
   const modules: ModuleConfig[] = useMemo(() => [
     { key: "format", labelKey: "moduleFormat", presets: FORMAT_PRESETS, kind: "single" },
@@ -97,12 +98,14 @@ export default function TechnicalProfileCard({ project, t, locale, onChange, onS
   /** 编辑模态保存：接收完整 patch（11 模块 + 锁定） */
   const saveEditorPatch = (patch: Partial<TechnicalProfile>) => {
     onChange({ ...profile, ...patch });
-    const master = MASTER_STYLES.find((s) => s.recipeId === (patch.recipeId ?? profile.recipeId));
-    onStyleChange?.(master?.id);
+    if (patch.recipeId !== profile.recipeId) {
+      const master = MASTER_STYLES.find((s) => s.recipeId === patch.recipeId);
+      onStyleChange?.(master?.id);
+    }
   };
 
   return <div className="tech-card">
-    <RecipeTile recipe={recipe} locale={locale} t={t} onClick={() => setPickerOpen(true)} onEdit={() => setEditorOpen(true)} />
+    <RecipeTile recipe={recipe} style={masterStyle} locale={locale} t={t} onClick={() => setPickerOpen(true)} onEdit={() => setEditorOpen(true)} />
 
     {pickerOpen && (
       <RecipePickerModal
@@ -128,8 +131,9 @@ export default function TechnicalProfileCard({ project, t, locale, onChange, onS
 }
 
 /** 配方缩略图 tile（仿资产库 asset-tile）：单击选配方 / 双击或编辑按钮进编辑页 */
-function RecipeTile({ recipe, locale, t, onClick, onEdit }: {
+function RecipeTile({ recipe, style, locale, t, onClick, onEdit }: {
   recipe: StyleRecipe | undefined;
+  style?: MasterStyle;
   locale: Locale;
   t: CopyZh;
   onClick(): void;
@@ -157,6 +161,7 @@ function RecipeTile({ recipe, locale, t, onClick, onEdit }: {
     <div className="tile-info">
       <div className="tile-name">{locale === "zh" ? recipe.name : recipe.nameEn}</div>
       <span className="recipe-tile-desc">{swatches.join(locale === "zh" ? "、" : ", ")}</span>
+      {style && <span className="recipe-tile-detail">{styleBriefDescription(style, locale)}</span>}
     </div>
     <button className="recipe-edit-btn" title={t.editRecipe} onClick={(event) => { event.stopPropagation(); onEdit(); }}><Pencil size={12} /></button>
   </div>;

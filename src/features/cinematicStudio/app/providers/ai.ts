@@ -3,7 +3,7 @@
  * 配置了 API Key 时使用远程 OpenAI 兼容 Chat Completions（OpenAI / DeepSeek / Kimi / 通义 / 智谱 / 自定义），
  * 未配置或请求失败时自动回退本地模板建议。
  */
-import { DIRECTOR_LAYER_ORDER, LocalSuggestionProvider, SHOT_TEMPLATES } from "../../engine";
+import { DIRECTOR_LAYER_ORDER, LocalSuggestionProvider, SHOT_TEMPLATES, localizedStyleBrief } from "../../engine";
 import type { AIAssistant, AssetSuggestion, BeatSuggestion, FixSuggestion, SceneSuggestion } from "../../engine";
 import { buildSceneAssetRegistry } from "../../engine/compiler/renderer";
 import { validateDirectorLayers, type DirectorLayerIssue } from "../../engine/quality";
@@ -637,7 +637,7 @@ export function collectSceneAssetIds(project: ProjectV2, scene: SceneV2): string
  * 生成完整的剧情分镜（镜头列表 + 各镜头检查器内容 + 音频计划），并返回可直接写入 Project 的结果。
  * @throws 未配置远程模型 / 请求失败
  */
-export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { seconds?: string }): Promise<{
+export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { seconds?: string; locale?: Locale }): Promise<{
   scene: SceneV2;
   audioPlan?: AudioPlan;
   negativePrompt?: string;
@@ -659,6 +659,8 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
   const locationAsset = scene.staging?.locationAssetId ? byId.get(scene.staging.locationAssetId) : undefined;
   const orderIds = [...(scene.staging?.characterOrder ?? [])].filter((id) => byId.has(id) && byId.get(id)?.kind === "character");
   const seconds = t?.seconds ?? "s";
+  const locale = t?.locale ?? "zh";
+  const styleBrief = localizedStyleBrief(project, locale);
 
   const assetSummary = (ids: string[]): string => ids
     .map((id) => {
@@ -691,7 +693,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
 
   const data = await chatJSON(settings, JSON_SYSTEM, [
     "You are the AI storyboard planner of a cinematic AI video prompt studio.",
-    "Read the scene card content below and plan a complete, professional storyboard for this scene: shot list, every shot's camera/performance/participants/beats/prop states, and the audio plan.",
+    "Read the scene card content below and plan a complete, professional storyboard for this scene: shot list, every shot's camera/performance/participants/beats/prop states, and the audio plan. Treat the style direction as one coherent visual system; do not scatter it into contradictory style labels.",
     "",
     "SCENE CARD CONTENT:",
     `Logline (故事梗概): ${scene.logline?.trim() || "(empty)"}`,
@@ -701,6 +703,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     `Performance objectives (表演目标, per character): ${JSON.stringify(scene.actingObjectives ?? [])}`,
     `Axis direction: ${scene.staging?.axisDirection ?? "left-to-right"}; Spacing: ${scene.staging?.spacing?.trim() || "(default)"}`,
     `Scene emotion arc: ${scene.emotionArc?.trim() || "(not set)"}; Scene name: ${scene.name}`,
+    `Style direction: ${styleBrief || "(not set)"}`,
     "",
     `LOCATION ASSET: ${locationAsset ? `${locationAsset.name}(${locationAsset.id}) — ${locationAsset.description?.trim() || locationAsset.descriptionZh?.trim() || ""}` : "(none)"}`,
     `CHARACTER ASSETS (scene references only): ${assetSummary(characterIds) || "(none)"}`,

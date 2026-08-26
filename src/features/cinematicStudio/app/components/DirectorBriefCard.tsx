@@ -17,6 +17,7 @@ import type { LenTalkChatModelOption } from "../providers/aiSettings";
 import AudioPlanEditor from "./AudioPlanEditor";
 import StagingEditor from "./StagingEditor";
 import TechnicalProfileCard from "./TechnicalProfileCard";
+import { getStyle, localizedStyleBrief, styleBriefDescription } from "../../engine";
 
 interface DirectorBriefCardProps {
   project: ProjectV2;
@@ -67,6 +68,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
   const characterCandidates = characterAssets.filter((asset) => !order.includes(asset.id));
   const nameOf = (id: string) => (project.assets ?? []).find((asset) => asset.id === id)?.name ?? id;
   const audio = project.audioPlan ?? { score: "none" as const, subtitles: false };
+  const styleBrief = localizedStyleBrief(project, locale);
   const audioSummary = `${t.score} ${audio.score === "original-score" ? t.scoreOriginal : t.scoreNone} · ${t.subtitles} ${audio.subtitles ? t.subtitlesBurned : t.subtitlesNone} · ${t.diegeticMusic} ${(audio.diegeticMusic ?? []).length} · ${t.sfx} ${(audio.sfx ?? []).length}`;
 
   const addCharacter = (id: string) => {
@@ -145,9 +147,23 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
         t={t}
         locale={locale}
         onChange={(profile) => onUpdateProject({ technicalProfile: profile })}
-        onStyleChange={(styleId) => onUpdateProject({ styleId })}
+        onStyleChange={(styleId) => {
+          if (!styleId) {
+            onUpdateProject({ styleId: undefined });
+            return;
+          }
+          const generated = styleBriefDescription(getStyle(styleId), locale);
+          onUpdateProject({
+            styleId,
+            styleBrief: generated,
+            ...(locale === "zh" ? { styleBriefZh: generated } : { styleBriefEn: generated }),
+          });
+        }}
       />
-      <label className="field-label">{t.styleBrief}<textarea className="modal-textarea" value={project.styleBrief ?? ""} placeholder={t.styleBriefPlaceholder} onChange={(event) => onUpdateProject({ styleBrief: event.target.value || undefined })} /></label>
+      <label className="field-label">{t.styleBrief}<textarea className="modal-textarea" value={styleBrief} placeholder={t.styleBriefPlaceholder} onChange={(event) => {
+        const value = event.target.value || undefined;
+        onUpdateProject({ styleBrief: value, ...(locale === "zh" ? { styleBriefZh: value } : { styleBriefEn: value }) });
+      }} /></label>
     </div>
 
     {/* 硬约束 */}

@@ -262,7 +262,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
     setSceneCompileBusy(true);
     setAiCompileError("");
     try {
-      const draft = await fillSceneDraft(project, scene, { seconds: t.seconds });
+      const draft = await fillSceneDraft(project, scene, { seconds: t.seconds, locale });
       const targetScene = draft.scene;
       // P0.6：用户锁定的导演文档层在再次 AI 编译时保留，不被新生成覆盖。
       const lockedKeys = (scene.lockedDirectorLayers ?? []).filter((key) => (scene.directorLayers?.[key] ?? "").trim());

@@ -324,11 +324,13 @@ UI 位置：名称输入框下方；其他资产类型同逻辑。
 
 **改动**
 1. 风格倾向卡的一级展示改为「一段详细风格描述」（zh/en 各一段），不默认分栏；12 字段折叠为「高级编辑」；
-2. 选中某个风格倾向时，把该风格的详细描述直接写入 `project.styleBrief`（当前界面语言对应语种），用户可手改，改动即视为脱离自动派生；
+2. 选中某个风格倾向时，把该风格的详细描述写入当前语言字段：中文写 `project.styleBriefZh`，英文写 `project.styleBriefEn`，同时更新旧 `project.styleBrief` 作为兼容快照；用户可手改，改动即视为脱离自动派生；
 3. 风格预设数据补 `descriptionZh` / `description` 长文本字段（一段话囊括光线 / 色彩 / 构图 / 质感本意）；
-4. AI 编译规则：`styleBrief` 是唯一风格语义来源；手改过则以手改内容优先，风格倾向仅作标签参考。
+4. AI 编译规则：当前语言的 `styleBriefZh` / `styleBriefEn` 是唯一风格语义来源；手改过则以手改内容优先，风格倾向仅作标签参考。旧项目只有 `styleBrief` 时，仅在文字语种与当前界面一致时兼容读取，防止中英串出。
 
-**文件**：`src/features/cinematicStudio/app/components/TechnicalProfileCard.tsx`、`src/features/cinematicStudio/engine/presets/`（风格预设）、`src/features/cinematicStudio/app/i18n.ts`
+**文件**：`src/features/cinematicStudio/app/components/TechnicalProfileCard.tsx`、`src/features/cinematicStudio/app/components/DirectorBriefCard.tsx`、`src/features/cinematicStudio/engine/styles.ts`、`src/features/cinematicStudio/engine/presets/`（风格预设）、`src/features/cinematicStudio/app/providers/ai.ts`、`src/features/cinematicStudio/app/i18n.ts`、`src/features/cinematicStudio/shared-types/index.ts`
+
+**V2.11 验收结果**：已完成。13 个大师风格均补充中英文段落；选择风格自动填当前语言描述；普通编辑器保存不会覆盖手改描述；AI 编译和本地编译读取当前语言字段；新增语言隔离与旧字段兼容测试。
 
 ---
 
@@ -392,7 +394,7 @@ UI 位置：名称输入框下方；其他资产类型同逻辑。
 | V2.8 | 布局滚动修复（高度链 100% + 清理坏选择器） | UI | 低 | `fix:` |
 | V2.9 | 模型下拉迁移 + 移除工作室全部设置入口（API 统一 LenTalk 设置 → 密钥） | UI | 低 | `feat:` |
 | V2.10 | 资产备注字段 + AI 填写纳入备注（角色信息栏） | 数据+AI+UI | 中 | `feat:` |
-| V2.11 | 风格倾向 → 一句风格话自动派生（一段式描述） | 预设+UI | 低 | `feat:` |
+| V2.11 | 风格倾向 → 风格描述自动派生（一段式中英分离描述） | 预设+UI+编译 | 低 | `feat:` 已完成 |
 | V2.12 | AI 编译分水岭：删 audioPlan 输出，AI 只读不回写；用户区/AI区视觉分隔 | AI+UI | 中 | `feat:` |
 | V2.13 | 焦段统一为视场角（mm 兼容层删除 UI） | 引擎+AI+UI | 中 | `refactor:` |
 | V2.14 | 检查器内容进最终提示词（分层 + 结构化合并输出） | 引擎+AI | 高 | `feat:` |
