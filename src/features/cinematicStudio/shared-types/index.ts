@@ -308,6 +308,8 @@ export interface PromptVersion {
 // ── V0.2 扩展：Project / Scene / Shot ──
 
 export interface ProjectV02 {
+  /** 提示词编辑器当前内容；随工程持久化，关闭工作室后不丢失。 */
+  compiledPrompt?: string;
   /** 资产库（角色/地点/道具/参考） */
   assets?: Asset[];
   /** 角色身份规则表 */

@@ -5,13 +5,14 @@ import './app/styles.css';
 export interface CinematicStudioWorkbenchProps {
   onClose: () => void;
   onStateChange?: (snapshot: CinematicStudioAppStateSnapshot) => void;
+  onSendToVideo?: (prompt: string) => void;
 }
 
 /**
  * 电影提示词工作室全屏嵌入层。顶层留有 LenTalk 标题栏高度(top-10),
  * 与 3D 导演台保持一致;样式通过 .cinematic-studio-app 作用域隔离。
  */
-export function CinematicStudioWorkbench({ onClose, onStateChange }: CinematicStudioWorkbenchProps) {
+export function CinematicStudioWorkbench({ onClose, onStateChange, onSendToVideo }: CinematicStudioWorkbenchProps) {
   const latestSnapshot = useRef<CinematicStudioAppStateSnapshot>({});
 
   const handleStateChange = useCallback(
@@ -49,7 +50,7 @@ export function CinematicStudioWorkbench({ onClose, onStateChange }: CinematicSt
       }}
     >
       <main className="cinematic-studio-body">
-        <StudioApp onClose={handleClose} onStateChange={handleStateChange} />
+        <StudioApp onClose={handleClose} onStateChange={handleStateChange} onSendToVideo={onSendToVideo} />
       </main>
     </div>
   );

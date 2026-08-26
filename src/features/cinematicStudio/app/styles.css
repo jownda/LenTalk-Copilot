@@ -2597,6 +2597,8 @@
 
 /* Prompt card：textarea 与 negative 区紧凑 */
 .prompt-editor, .negative-editor { min-height: 180px; padding: 10px 12px; line-height: 1.55; }
+.prompt-send-row { display: flex; justify-content: flex-start; padding: 8px 0 6px; }
+.prompt-send-video-button { min-height: 32px; }
 
 /* Shot row：等高 */
 .shots-row { display: flex; gap: var(--space-2); overflow-x: auto; padding-bottom: var(--space-1); }

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
-import { ChevronDown, Clapperboard, Copy, Download, FileJson, FileText, FolderOpen, History, PenLine, Plus, Save, Sparkles, X } from "lucide-react";
+import { ChevronDown, Clapperboard, Copy, Download, FileJson, FileText, FolderOpen, History, PenLine, Plus, Save, Send, Sparkles, X } from "lucide-react";
 import { classifyError, fillSceneDraft, getAssistant } from "./providers/ai";
 import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type AISettings } from "./providers/aiSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -36,14 +36,15 @@ export interface CinematicStudioAppStateSnapshot {
 export interface CinematicStudioAppProps {
   onClose?: () => void;
   onStateChange?: (snapshot: CinematicStudioAppStateSnapshot) => void;
+  onSendToVideo?: (prompt: string) => void;
 }
 
-export default function App({ onClose, onStateChange }: CinematicStudioAppProps = {}) {
+export default function App({ onClose, onStateChange, onSendToVideo }: CinematicStudioAppProps = {}) {
   const [project, setProject] = useState<ProjectV2>(loadProject);
   const [locale, setLocale] = useState<Locale>(() => localStorage.getItem("cineprompt-locale") === "en" ? "en" : "zh");
   const [sceneId, setSceneId] = useState(project.scenes[0].id);
   const [shotId, setShotId] = useState(project.scenes[0].shots[0].id);
-  const [prompt, setPrompt] = useState("");
+  const [prompt, setPrompt] = useState(() => project.compiledPrompt ?? "");
   const [notice, setNotice] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [exampleOpen, setExampleOpen] = useState(false);
@@ -93,6 +94,10 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
     }, 400);
     return () => window.clearTimeout(timer);
   }, [onStateChange, project.title, prompt]);
+  useEffect(() => {
+    if ((project.compiledPrompt ?? "") === prompt) return;
+    dispatch({ type: "PATCH_PROJECT", patch: { compiledPrompt: prompt } });
+  }, [project.compiledPrompt, prompt]);
   /** P2.2/P0/P1.4：编译入口（生成 + 存档版本历史；locale 决定输出语言；项目包内落盘） */
   const runCompile = (noticeKey: "promptCompiled" | "promptRebuilt" | "promptLocalCompiled", targetScene: SceneV2 = scene) => {
     const result = compilePrompt(project, targetScene, shot, { template, profile: modelProfileById(modelProfileId), locale, director: true });
@@ -559,6 +564,22 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
           ))}
         </div>}
         <span className="output-language">{locale === "zh" ? "输出语言：中文" : "Output language: English"}</span>
+        <div className="prompt-send-row">
+          <button
+            type="button"
+            className="primary-button prompt-send-video-button"
+            disabled={!onSendToVideo || !prompt.trim()}
+            title={!onSendToVideo ? (locale === "zh" ? "请从画布中的电影提示词工作室节点打开" : "Open this from a Cinematic Prompt Studio node on the canvas") : undefined}
+            onClick={() => {
+              const nextPrompt = prompt.trim();
+              if (!nextPrompt || !onSendToVideo) return;
+              onSendToVideo(nextPrompt);
+              setNotice(t.sentToVideoNode);
+            }}
+          >
+            <Send size={14} /> {t.sendToVideoNode}
+          </button>
+        </div>
         <textarea className="prompt-editor" value={prompt} onChange={(event) => { setPrompt(event.target.value); if (manualOverride === null && event.target.value.trim()) setManualOverride(event.target.value); }} spellCheck={false} />
         {manualOverride !== null && <div className="manual-override-bar">
           <span><PenLine size={13} /> {t.manualOverride}</span>

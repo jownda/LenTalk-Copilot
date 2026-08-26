@@ -25,6 +25,9 @@ const CINEMATIC_STUDIO_NODE_MIN_HEIGHT = 160;
 export const CinematicStudioNode = memo(({ id, data, selected, width, height }: CinematicStudioNodeProps) => {
   const updateNodeInternals = useUpdateNodeInternals();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
+  const addEdge = useCanvasStore((state) => state.addEdge);
+  const addNode = useCanvasStore((state) => state.addNode);
+  const findNodePosition = useCanvasStore((state) => state.findNodePosition);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const [isOpen, setIsOpen] = useState(false);
 
@@ -66,6 +69,22 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     },
     [id, updateNodeData]
   );
+
+  const handleSendToVideo = useCallback((prompt: string) => {
+    const nextPrompt = prompt.trim();
+    if (!nextPrompt) return;
+    const placement = findNodePosition(id, 420, 360);
+    const videoNodeId = addNode(CANVAS_NODE_TYPES.videoGen, placement, {
+      prompt: nextPrompt,
+      model: '',
+      duration: 5,
+      aspectRatio: '16:9',
+      resolution: '720p',
+      imageMode: 'reference',
+    });
+    addEdge(id, videoNodeId);
+    setSelectedNode(videoNodeId);
+  }, [addEdge, addNode, findNodePosition, id, setSelectedNode]);
 
   const projectTitle = typeof data.lastProjectTitle === 'string' && data.lastProjectTitle.trim()
     ? data.lastProjectTitle.trim()
@@ -136,7 +155,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
 
       {isOpen && typeof document !== 'undefined'
         ? createPortal(
-          <CinematicStudioWorkbench onClose={handleClose} onStateChange={handleStateChange} />,
+          <CinematicStudioWorkbench onClose={handleClose} onStateChange={handleStateChange} onSendToVideo={handleSendToVideo} />,
           document.body
         )
         : null}
