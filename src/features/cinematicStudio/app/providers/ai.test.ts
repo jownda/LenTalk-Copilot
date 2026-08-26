@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Asset, ProjectV2, SceneV2 } from "../../shared-types";
-import { collectSceneAssetIds } from "./ai";
+import { collectSceneAssetIds, normalizeSceneDraft } from "./ai";
 
 const assets: Asset[] = [
   { id: "location", kind: "location", name: "车厢", description: "carriage", referencePaths: [], lockLevel: "none", tags: [] },
@@ -38,5 +38,31 @@ describe("collectSceneAssetIds", () => {
   it("去重并忽略不存在的站位 id", () => {
     const nextScene = { ...scene, staging: { ...scene.staging, characterOrder: ["hero", "missing", "hero"] } };
     expect(collectSceneAssetIds(project, nextScene)).toEqual(["location", "hero", "prop"]);
+  });
+
+  it("写回前丢弃 error 级 directorLayers，并返回质量问题供面板使用", () => {
+    const invalidScene = { ...scene, shootingMode: "multi-shot" as const };
+    const result = normalizeSceneDraft(project, invalidScene, {
+      directorLayers: {
+        formatMode: "FORMAT MODE:\nCONTROLLED MULTI-SHOT SEQUENCE.",
+        actionTiming: "ACTION TIMING:\n0:00-0:05: continuous timeline without shot blocks.",
+      },
+      shots: [],
+    }, "秒");
+
+    expect(result.scene.directorLayers).toBeUndefined();
+    expect(result.directorLayers).toBeUndefined();
+    expect(result.directorLayerIssues?.map((issue) => issue.code)).toContain("DIRECTOR.MULTI_SHOT_TIMELINE");
+  });
+
+  it("没有 error 时保留 AI directorLayers", () => {
+    const layers = {
+      sceneContext: "SCENE CONTEXT:\nA quiet carriage.",
+      formatMode: "FORMAT MODE:\nSINGLE CONTINUOUS TAKE.",
+    };
+    const result = normalizeSceneDraft(project, scene, { directorLayers: layers, shots: [] }, "秒");
+    expect(result.directorLayers).toEqual(layers);
+    expect(result.scene.directorLayers).toEqual(layers);
+    expect(result.directorLayerIssues).toBeUndefined();
   });
 });

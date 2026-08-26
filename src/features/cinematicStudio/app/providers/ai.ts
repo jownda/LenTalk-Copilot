@@ -6,6 +6,7 @@
 import { DIRECTOR_LAYER_ORDER, LocalSuggestionProvider, SHOT_TEMPLATES } from "../../engine";
 import type { AIAssistant, AssetSuggestion, BeatSuggestion, FixSuggestion, SceneSuggestion } from "../../engine";
 import { buildSceneAssetRegistry } from "../../engine/compiler/renderer";
+import { validateDirectorLayers, type DirectorLayerIssue } from "../../engine/quality";
 import type {
   ActionBeat, Asset, AssetActingProfile, AssetKind, AudioPlan, CameraBehavior, CameraMovement, ContinuityIssueV2, CutStyle,
   FirstFrameLock, LightingDirection, LockLevel, Optics, PhysicsAnchor, ProjectV2, PropState, SceneV2, ShotParticipant, ShotV2,
@@ -630,7 +631,13 @@ export function collectSceneAssetIds(project: ProjectV2, scene: SceneV2): string
  * 生成完整的剧情分镜（镜头列表 + 各镜头检查器内容 + 音频计划），并返回可直接写入 Project 的结果。
  * @throws 未配置远程模型 / 请求失败
  */
-export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { seconds?: string }): Promise<{ scene: SceneV2; audioPlan?: AudioPlan; negativePrompt?: string; directorLayers?: Record<string, string> }> {
+export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { seconds?: string }): Promise<{
+  scene: SceneV2;
+  audioPlan?: AudioPlan;
+  negativePrompt?: string;
+  directorLayers?: Record<string, string>;
+  directorLayerIssues?: DirectorLayerIssue[];
+}> {
   const settings = loadAISettings();
   if (!isRemoteConfigured(settings)) {
     throw new Error("AI 未配置，请先在右上角「设置 → API 设置」中填写服务商、模型与 API Key。");
@@ -748,13 +755,29 @@ function normalizeDirectorLayers(value: unknown): Record<string, string> | undef
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
-export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: unknown, seconds: string): { scene: SceneV2; audioPlan?: AudioPlan; negativePrompt?: string; directorLayers?: Record<string, string> } {
+export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: unknown, seconds: string): {
+  scene: SceneV2;
+  audioPlan?: AudioPlan;
+  negativePrompt?: string;
+  directorLayers?: Record<string, string>;
+  directorLayerIssues?: DirectorLayerIssue[];
+} {
   const obj = (data ?? {}) as Record<string, unknown>;
   const assets = project.assets ?? [];
   const characterIds = new Set(assets.filter((asset) => asset.kind === "character").map((asset) => asset.id));
   const propIds = new Set(assets.filter((asset) => asset.kind === "prop").map((asset) => asset.id));
   const orderIds = [...(scene.staging?.characterOrder ?? [])].filter((id) => characterIds.has(id));
-  const directorLayers = normalizeDirectorLayers(obj.directorLayers);
+  const candidateDirectorLayers = normalizeDirectorLayers(obj.directorLayers);
+  // V2.4：AI 写回前复用同一质量门；error 级分层整体丢弃，交给结构化镜头数据兜底。
+  // 显式覆盖为 undefined，避免展开旧 scene 时把上一版坏文本带回工程。
+  const directorLayerIssues = candidateDirectorLayers
+    ? validateDirectorLayers(candidateDirectorLayers, project, scene)
+    : [];
+  const directorLayers = candidateDirectorLayers && !directorLayerIssues.some((issue) => issue.severity === "error")
+    ? candidateDirectorLayers
+    : candidateDirectorLayers
+      ? undefined
+      : scene.directorLayers;
 
   const LENS_CHARACTERS = new Set(["47-standard", "84-wide", "107-ultrawide", "29-short-tele", "18-tele", "8-supertele", "135-immersive"]);
   const PHYSICS_ANCHOR_KINDS = new Set(["walk", "run", "weapon", "liquid", "particle"]);
@@ -986,10 +1009,11 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
       ...(firstFrameLock ? { firstFrameLock } : {}),
       ...(lightingDirection ? { lightingDirection } : {}),
       shots,
-      ...(directorLayers ? { directorLayers } : {}),
+      directorLayers,
     },
     audioPlan,
     negativePrompt: asString(obj.negativePrompt, undefined),
     directorLayers,
+    ...(directorLayerIssues.length > 0 ? { directorLayerIssues } : {}),
   };
 }
