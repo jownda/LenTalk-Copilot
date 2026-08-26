@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, modelProfileById, sanitizeDirectorText, shotTemplateById } from "../engine";
+import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
 import { ChevronDown, Clapperboard, Copy, Download, FileJson, FileText, FolderOpen, History, PenLine, Plus, Save, Settings2, Sparkles, X } from "lucide-react";
 import { classifyError, fillSceneDraft, getAssistant } from "./providers/ai";
@@ -66,6 +66,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
   const scene = project.scenes.find((item) => item.id === sceneId) ?? project.scenes[0];
   const shot = scene.shots.find((item) => item.id === shotId) ?? scene.shots[0];
   const issues = useMemo(() => checkContinuityV2(project, scene), [project, scene]);
+  const directorLayerIssues = useMemo(() => scene.directorLayers ? validateDirectorLayers(scene.directorLayers, project, scene) : [], [project, scene]);
   const hasExportErrors = issues.some((i) => i.severity === "error");
   const t: CopyZh = copy[locale] as CopyZh;
 
@@ -494,7 +495,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
         <div className="card-head">
           <div className="card-head-title"><span className="eyebrow">{t.continuity}</span><strong>{issues.length}</strong></div>
         </div>
-        <ContinuityPanel project={project} scene={scene} issues={issues} t={t} locale={locale} onFix={fixIssue} onAiAdvice={aiAdvice} />
+        <ContinuityPanel project={project} scene={scene} issues={issues} directorIssues={directorLayerIssues} t={t} locale={locale} onFix={fixIssue} onAiAdvice={aiAdvice} />
       </section>
       </div>
 

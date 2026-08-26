@@ -5,6 +5,7 @@
  */
 import { useMemo } from "react";
 import type { ContinuityIssueV2, ProjectV2, SceneV2 } from "../../shared-types";
+import type { DirectorLayerIssue } from "../../engine/quality";
 import { computeRiskScores } from "../../engine";
 import { CheckCircle2, ChevronDown, CircleAlert, Info, ShieldAlert, Sparkles, Wrench, XCircle } from "lucide-react";
 import { useState } from "react";
@@ -54,12 +55,13 @@ interface ContinuityPanelProps {
   issues: ContinuityIssueV2[];
   t: CopyZh;
   locale: Locale;
+  directorIssues?: DirectorLayerIssue[];
   onFix(issue: ContinuityIssueV2): void;
   /** P3：AI 结构化修复建议（只建议，不直接改数据） */
   onAiAdvice?(issue: ContinuityIssueV2): void;
 }
 
-export default function ContinuityPanel({ project, scene, issues, t, locale, onFix, onAiAdvice }: ContinuityPanelProps) {
+export default function ContinuityPanel({ project, scene, issues, t, locale, directorIssues = [], onFix, onAiAdvice }: ContinuityPanelProps) {
   const risks = useMemo(() => computeRiskScores(project, scene), [project, scene]);
   const groups = useMemo(() => {
     const map = new Map<GroupKey, ContinuityIssueV2[]>();
@@ -83,6 +85,7 @@ export default function ContinuityPanel({ project, scene, issues, t, locale, onF
   const blockedCount = checklist.filter((item) => item.errors.length > 0).length;
   const passedCount = checklist.filter((item) => item.total === 0).length;
   const levelLabel = (level: "low" | "medium" | "high") => ({ low: t.riskLevelLow, medium: t.riskLevelMedium, high: t.riskLevelHigh })[level];
+  const qualityIssues = directorIssues;
 
   return <div className="continuity-panel">
     {/* 风险评分条 */}
@@ -108,6 +111,13 @@ export default function ContinuityPanel({ project, scene, issues, t, locale, onF
 
     {/* 分组问题列表 */}
     <div className="issue-groups">
+      {qualityIssues.length > 0 && <div className="issue-group director-quality-group">
+        <div className="issue-group-head">
+          <span>{t.directorQuality}</span>
+          <em>{qualityIssues.length}</em>
+        </div>
+        {qualityIssues.map((issue, issueIndex) => <DirectorIssueRow key={`${issue.code}-${issue.layerKey ?? ""}-${issueIndex}`} issue={issue} locale={locale} />)}
+      </div>}
       {GROUP_ORDER.map((key) => {
         const list = groups.get(key)!;
         if (list.length === 0) return null;
@@ -120,7 +130,7 @@ export default function ContinuityPanel({ project, scene, issues, t, locale, onF
           {list.map((issue, issueIndex) => <IssueRow key={`${issue.code}-${issue.entityId ?? ""}-${issueIndex}`} issue={issue} t={t} locale={locale} onFix={onFix} onAiAdvice={onAiAdvice} />)}
         </div>;
       })}
-      {issues.length === 0 && <div className="issue-all-clear"><CheckCircle2 size={14} /> {t.continuityOk}</div>}
+      {issues.length === 0 && qualityIssues.length === 0 && <div className="issue-all-clear"><CheckCircle2 size={14} /> {t.continuityOk}</div>}
     </div>
 
     {/* P3 导出前清单：按检查族逐项打勾/报错；error 未清零时导出按钮在提示词卡片置灰 */}
@@ -153,6 +163,22 @@ export default function ContinuityPanel({ project, scene, issues, t, locale, onF
         {blockedCount > 0 && <p className="checklist-hint"><XCircle size={12} /> {t.exportBlockedHint}</p>}
       </div>}
     </div>
+  </div>;
+}
+
+function DirectorIssueRow({ issue, locale }: { issue: DirectorLayerIssue; locale: Locale }) {
+  const Icon = issue.severity === "error" ? CircleAlert : CircleAlert;
+  const label = locale === "zh" ? issue.detailZh.split("；")[0] || issue.label : issue.label;
+  const detail = locale === "zh" ? issue.detailZh : issue.detail;
+  const suggestion = locale === "zh" ? issue.suggestionZh : issue.suggestion;
+  return <div className={`issue-row ${issue.severity}`}>
+    <Icon size={13} className="issue-icon" />
+    <div className="issue-main">
+      <span className="issue-label">{label}</span>
+      <span className="issue-detail">{detail}{issue.layerKey ? ` · ${issue.layerKey}${issue.line ? `:${issue.line}` : ""}` : ""}</span>
+      {suggestion && <span className="issue-detail">{suggestion}</span>}
+    </div>
+    <span className="issue-quality-code">{issue.code}</span>
   </div>;
 }
 
