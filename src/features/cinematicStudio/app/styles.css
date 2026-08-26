@@ -1223,13 +1223,22 @@
   letter-spacing: 0.01em;
   transition: background-color .15s, border-color .15s, color .15s, box-shadow .15s;
 }
-.primary-button {
+.cinematic-studio-app .primary-button {
   padding: 0 14px;
   color: #ffffff;
-  background: var(--accent);
+  background: rgb(var(--accent-rgb));
   box-shadow: 0 1px 0 rgba(255, 255, 255, 0.1) inset, var(--shadow-sm);
 }
-.primary-button:hover { background: var(--accent-hover); }
+.cinematic-studio-app .primary-button:hover { background: rgb(var(--accent-rgb) / 0.85); }
+.cinematic-studio-app .primary-button:active {
+  background: rgb(var(--accent-rgb) / 0.72);
+  transform: translateY(1px);
+  box-shadow: none;
+}
+.cinematic-studio-app .primary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
 .outline-button {
   padding: 0 12px;
   color: var(--text);
