@@ -233,7 +233,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
         <ChevronDown size={13} />
       </label>
       <button className="primary-button" disabled={compileBusy} onClick={onAiCompile}>{compileBusy ? <span className="spin-dot" /> : <Sparkles size={16} />} {compileBusy ? `${t.aiCompiling} ${busySeconds}s` : t.aiCompilePrompt}</button>
-      <button className="outline-button" onClick={onLocalCompile}>{t.localCompile}</button>
+      <button className="primary-button" onClick={onLocalCompile}>{t.localCompile}</button>
       {aiCompileError && (
         <span className="ai-error-wrap">
           <span className="ai-error-badge" title={aiCompileErrorDetail || aiCompileError}><span className="ai-error-dot" /> {aiCompileError}</span>
