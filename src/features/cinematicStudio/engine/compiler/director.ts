@@ -14,7 +14,7 @@ import {
   renderActingSection, renderAudioSection, renderLocalLocks, renderShotSection, type PromptLocale, type ReferenceSyntax, unifiedCameraForScene,
 } from "./sections";
 import { lensById, lensByFov, physicsAnchorById, renderLightingLayer, renderPhysicsLayer, renderTechnicalProfile } from "../presets";
-import { validateDirectorLayers } from "../quality";
+import { sanitizeDirectorText, validateDirectorLayers } from "../quality";
 
 export interface DirectorOptions {
   syntax?: ReferenceSyntax;
@@ -212,7 +212,7 @@ export function compileDirectorSequence(project: ProjectV2, scene: SceneV2, opti
         .map((key) => (storedLayers[key] ?? "").trim())
         .filter(Boolean)
         .join("\n\n");
-      if (joined) return joined;
+      if (joined) return sanitizeDirectorText(joined);
     }
   }
   /* 结构化编译路径（V2.2 起作为 AI 分层文档的校验回退兜底） */
@@ -275,5 +275,5 @@ export function compileDirectorSequence(project: ProjectV2, scene: SceneV2, opti
     push(sections, "NEGATIVE LOCKS (GLOBAL ONLY)", globalLocks.join(locale === "zh" ? "；" : "; "));
   }
 
-  return sections.filter(Boolean).join("\n\n");
+  return sanitizeDirectorText(sections.filter(Boolean).join("\n\n"));
 }

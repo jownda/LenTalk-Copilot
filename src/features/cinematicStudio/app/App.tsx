@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, modelProfileById, shotTemplateById } from "../engine";
+import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, modelProfileById, sanitizeDirectorText, shotTemplateById } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
 import { ChevronDown, Clapperboard, Copy, Download, FileJson, FileText, FolderOpen, History, PenLine, Plus, Save, Settings2, Sparkles, X } from "lucide-react";
 import { classifyError, fillSceneDraft, getAssistant } from "./providers/ai";
@@ -331,7 +331,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
     setProject((current) => ({ ...current, scenes: remaining }));
     if (sceneId === id) { setSceneId(remaining[0].id); setShotId(remaining[0].shots[0]?.id ?? ""); }
   };
-  const copyPrompt = async () => { await navigator.clipboard.writeText(prompt); setNotice(t.promptCopied); };
+  const copyPrompt = async () => { await navigator.clipboard.writeText(sanitizeDirectorText(prompt)); setNotice(t.promptCopied); };
   const exportProject = (format: "txt" | "md" | "json") => {
     if (format !== "json") {
       const exportErrors = issues.filter((i) => i.severity === "error");
@@ -339,7 +339,8 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
     }
     const scopeLabel = template === "pro-sequence" ? (locale === "zh" ? "当前场景全部镜头" : "all scene shots") : template === "shot-cards" ? (locale === "zh" ? "当前场景逐镜" : "one card per shot") : (locale === "zh" ? "当前选中镜头" : "current shot");
     const header = format === "json" ? "" : `${locale === "zh" ? "# Cinematic Prompt Studio 导出" : "# Cinematic Prompt Studio export"}\n模板/Template: ${template}\n语言/Language: ${locale}\n范围/Scope: ${scopeLabel}\n\n`;
-    const content = format === "json" ? JSON.stringify(project, null, 2) : format === "md" ? `${header}# ${project.title}\n\n${project.description}\n\n## ${scene.name}\n\n\`\`\`text\n${prompt}\n\`\`\`` : `${header}${prompt}`;
+    const exportText = sanitizeDirectorText(prompt);
+    const content = format === "json" ? JSON.stringify(project, null, 2) : format === "md" ? `${header}# ${project.title}\n\n${project.description}\n\n## ${scene.name}\n\n\`\`\`text\n${exportText}\n\`\`\`` : `${header}${exportText}`;
     download(`${project.title.replace(/ /g, "-").toLowerCase()}.${format}`, content, format === "json" ? "application/json" : "text/plain"); setNotice(`${format.toUpperCase()} ${locale === "zh" ? "导出已下载。" : "export downloaded."}`);
   };
   const importProject = (file?: File) => { if (!file) return; const reader = new FileReader(); reader.onload = () => { try { const imported = migrateProject(JSON.parse(String(reader.result))); setProject(imported); setSceneId(imported.scenes[0]?.id || ""); setShotId(imported.scenes[0]?.shots[0]?.id || ""); setNotice(t.projectImported); } catch { setNotice(t.invalidProject); } }; reader.readAsText(file); };
