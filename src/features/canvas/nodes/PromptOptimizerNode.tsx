@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
-import { Handle, Position, type NodeProps } from '@xyflow/react';
+import { Handle, Position, useUpdateNodeInternals, type NodeProps } from '@xyflow/react';
 import { Check, Copy, ScanSearch, Sparkles, Wand2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { createPortal } from 'react-dom';
@@ -359,6 +359,7 @@ export const PromptOptimizerNode = memo(({
   height,
 }: PromptOptimizerNodeProps) => {
   const { t } = useTranslation();
+  const updateNodeInternals = useUpdateNodeInternals();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const addNode = useCanvasStore((state) => state.addNode);
@@ -392,6 +393,20 @@ export const PromptOptimizerNode = memo(({
   const enhanceMode = data.enhanceMode;
   const customApis = useSettingsStore((state) => state.customApis);
   const outputLang: 'zh' | 'en' = data.outputLang ?? 'en';
+
+  useEffect(() => {
+    const element = rootRef.current;
+    if (!element) {
+      return;
+    }
+
+    // Handles are vertically centered, so React Flow must remeasure them whenever this node changes size.
+    const observer = new ResizeObserver(() => updateNodeInternals(id));
+    observer.observe(element);
+    updateNodeInternals(id);
+
+    return () => observer.disconnect();
+  }, [id, updateNodeInternals]);
 
   useEffect(() => {
     if (!isPurposeComposingRef.current) {
