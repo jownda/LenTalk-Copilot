@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { ProjectV2, SceneV2 } from "../../shared-types";
+import type { Asset, ProjectV2, SceneV2 } from "../../shared-types";
 import { compileDirectorSequence } from "./director";
 
 function makeScene(overrides: Partial<SceneV2> = {}): SceneV2 {
@@ -53,11 +53,65 @@ describe("compileDirectorSequence stored layer quality gate", () => {
     const scene = makeScene({ directorLayers: storedLayers });
     const output = compileDirectorSequence(makeProject(scene), scene, { locale: "en" });
 
-    expect(output).toBe([
-      storedLayers.sceneContext,
-      storedLayers.formatMode,
-      storedLayers.negativeLocks,
-    ].join("\n\n"));
+    expect(output).toContain(storedLayers.sceneContext);
+    expect(output).toContain(storedLayers.formatMode);
+    expect(output).toContain(storedLayers.negativeLocks);
+    expect(output).toContain("STRUCTURED SHOT INSPECTOR:");
+    expect(output).toContain("SHOT 镜头 1");
+    expect(output.indexOf(storedLayers.formatMode)).toBeLessThan(output.indexOf("STRUCTURED SHOT INSPECTOR:"));
+    expect(output.indexOf("STRUCTURED SHOT INSPECTOR:")).toBeLessThan(output.indexOf(storedLayers.negativeLocks));
+  });
+
+  it("无 error 时把检查器的活动引用、节拍、表演与声音锁追加到最终提示词", () => {
+    const actor: Asset = {
+      id: "actor-1",
+      kind: "character",
+      name: "林警官",
+      description: "middle-aged man",
+      descriptionZh: "中年男性",
+      referencePaths: [],
+      lockLevel: "none",
+      tags: [],
+      actingProfile: { voicePromptZh: "低沉克制，压力下呼吸加重。" },
+    };
+    const scene = makeScene({
+      directorLayers: {
+        sceneContext: "SCENE CONTEXT:\nAI scene prose.",
+        formatMode: "FORMAT MODE:\nSINGLE CONTINUOUS TAKE.",
+        actionTiming: "ACTION TIMING:\nAI timing reference.",
+      },
+      shots: [{
+        ...makeScene().shots[0],
+        participants: [{ characterId: actor.id, role: "primary", position: "center" }],
+        optics: { fieldOfViewDegrees: 84 },
+        beats: [{
+          id: "beat-1",
+          order: 1,
+          duration: 2,
+          verb: "speak",
+          actorId: actor.id,
+          actionText: "抬眼并压低声音",
+          dialogue: "我听见了。",
+          required: true,
+        }],
+        acting: "先压住怒意，再让恐惧从眼神里露出来。",
+        eyeLife: "眼睛先于头部转向声源，眨眼变慢。",
+        performanceLevel: 4,
+      }],
+    });
+    const project = makeProject(scene);
+    project.assets = [actor];
+    const output = compileDirectorSequence(project, scene, { locale: "zh", syntax: "at-mention" });
+
+    expect(output).toContain("镜头结构化检查器：");
+    expect(output).toContain("镜头活动引用：");
+    expect(output).toContain("@林警官");
+    expect(output).toContain("视场角 84°");
+    expect(output).toContain("抬眼并压低声音");
+    expect(output).toContain("表演评分：4");
+    expect(output).toContain("对白：\"我听见了。\"");
+    expect(output).toContain("声音锁（林警官）：低沉克制，压力下呼吸加重。");
+    expect(output.indexOf("AI timing reference.")).toBeLessThan(output.indexOf("抬眼并压低声音"));
   });
 
   it("error 级分层冲突时回退结构化编译，不透传错误 storedLayers", () => {

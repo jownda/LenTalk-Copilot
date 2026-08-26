@@ -252,9 +252,17 @@ function renderVoiceLockLines(project: ProjectV2, scene: SceneV2, locale: Prompt
       : (prof?.voicePrompt?.trim() || prof?.voicePromptZh?.trim());
     if (!voice) continue;
     const name = asset.name.trim() || asset.id;
-    lines.push(locale === "zh" ? `声音锁（${name}）：${voice}。` : `Voice lock (${name}): ${voice}.`);
+    const punctuation = /[。．.!！?？]$/.test(voice) ? "" : (locale === "zh" ? "。" : ".");
+    lines.push(locale === "zh" ? `声音锁（${name}）：${voice}${punctuation}` : `Voice lock (${name}): ${voice}${punctuation}`);
   }
   return lines;
+}
+
+/** 仅渲染声音锁，供导演分层与结构化检查器合并输出时复用。 */
+export function renderVoiceLockSection(project: ProjectV2, scene: SceneV2, locale: PromptLocale = "zh"): string {
+  const lines = renderVoiceLockLines(project, scene, locale);
+  if (lines.length === 0) return "";
+  return `${locale === "zh" ? "声音锁：" : "VOICE LOCKS:"}\n${lines.join("\n")}`;
 }
 
 /** 负面段（P0.3 双语 renderNegativeItems） */

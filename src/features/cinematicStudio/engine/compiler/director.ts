@@ -11,7 +11,8 @@ import {
   assetRefName, buildSceneAssetRegistry, renderAssetLine, renderCharacterCountLock, renderStrictIdentityLock,
 } from "./renderer";
 import {
-  renderActingSection, renderAudioSection, renderLocalLocks, renderShotSection, type PromptLocale, type ReferenceSyntax, unifiedCameraForScene,
+  renderActingSection, renderAudioSection, renderLocalLocks, renderShotSection, renderVoiceLockSection,
+  type PromptLocale, type ReferenceSyntax, unifiedCameraForScene,
 } from "./sections";
 import { lensById, lensByFov, physicsAnchorById, renderLightingLayer, renderPhysicsLayer, renderTechnicalProfile } from "../presets";
 import { sanitizeDirectorText, validateDirectorLayers } from "../quality";
@@ -196,6 +197,42 @@ function renderPhysicsAnchors(scene: SceneV2, locale: PromptLocale): string[] {
   return lines;
 }
 
+/**
+ * V2.14：把检查器的结构化镜头字段追加到 AI 导演分层之后。
+ * 分层文本保留叙事与导演意图，检查器字段负责逐镜的可执行细节；两者冲突时，
+ * 该附录放在后面并明确声明以结构化字段为准，避免检查器内容只停留在 UI。
+ */
+function renderStructuredShotAppendix(
+  project: ProjectV2,
+  scene: SceneV2,
+  locale: PromptLocale,
+  syntax: ReferenceSyntax,
+): string {
+  const zh = locale === "zh";
+  const blocks: string[] = [
+    zh
+      ? "镜头结构化检查器：\n以下逐镜内容来自检查器字段；如与前文导演描述冲突，以本段为准。"
+      : "STRUCTURED SHOT INSPECTOR:\nThe following per-shot blocks come from the structured inspector fields; when they conflict with earlier director prose, follow this section.",
+  ];
+  const cameraOverride = unifiedCameraForScene(scene);
+
+  for (const shot of scene.shots ?? []) {
+    const shotBlocks: string[] = [];
+    const shotRegistry = buildSceneAssetRegistry(project, scene, "shot", shot);
+    if (shotRegistry.orderedAssets.length > 0) {
+      const lines = shotRegistry.orderedAssets.map((asset, index) => renderAssetLine(asset, index + 1, syntax, locale));
+      shotBlocks.push(`${zh ? "镜头活动引用：" : "SHOT ACTIVE REFERENCES:"}\n${lines.join("\n")}`);
+    }
+    const shotText = renderShotSection(project, scene, shot, locale, syntax, cameraOverride).trim();
+    if (shotText) shotBlocks.push(shotText);
+    if (shotBlocks.length > 0) blocks.push(shotBlocks.join("\n\n"));
+  }
+
+  const voiceLocks = renderVoiceLockSection(project, scene, locale);
+  if (voiceLocks) blocks.push(voiceLocks);
+  return blocks.length > 1 ? blocks.join("\n\n") : "";
+}
+
 export function compileDirectorSequence(project: ProjectV2, scene: SceneV2, options: DirectorOptions = {}): string {
   const syntax = options.syntax ?? "asset-id";
   const locale: PromptLocale = options.locale ?? "zh";
@@ -212,7 +249,21 @@ export function compileDirectorSequence(project: ProjectV2, scene: SceneV2, opti
         .map((key) => (storedLayers[key] ?? "").trim())
         .filter(Boolean)
         .join("\n\n");
-      if (joined) return sanitizeDirectorText(joined);
+      if (joined) {
+        const appendix = renderStructuredShotAppendix(project, scene, locale, syntax);
+        const layerBlocks: string[] = [];
+        let appendixInserted = false;
+        for (const key of DIRECTOR_LAYER_ORDER) {
+          const layer = (storedLayers[key] ?? "").trim();
+          if (layer) layerBlocks.push(layer);
+          if (key === "actionTiming" && appendix) {
+            layerBlocks.push(appendix);
+            appendixInserted = true;
+          }
+        }
+        if (appendix && !appendixInserted) layerBlocks.push(appendix);
+        return sanitizeDirectorText(layerBlocks.join("\n\n"));
+      }
     }
   }
   /* 结构化编译路径（V2.2 起作为 AI 分层文档的校验回退兜底） */

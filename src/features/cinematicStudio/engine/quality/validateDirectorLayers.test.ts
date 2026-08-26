@@ -56,6 +56,7 @@ function makeShot(characterId: string, propIds: string[] = []): ShotV2 {
     movement: "Steadicam", action: "快步走", acting: "克制克制", direction: "left-to-right",
     characterId,
     participants: [{ characterId, role: "primary", position: "center" }],
+    beats: [{ id: "beat-1", order: 1, verb: "wait", actorId: characterId, actionText: "保持坐姿" }],
     propStatesAtStart: propIds.map((propId) => ({ propId, state: "on-ground", position: "地面" })),
   };
 }
@@ -104,6 +105,16 @@ describe("validateDirectorLayers（中文 fixture）", () => {
   it("干净样例：无任何 issue", () => {
     const project = makeProject(ZH_ASSETS, makeScene(cleanZhLayers));
     expect(validateDirectorLayers(cleanZhLayers, project, project.scenes[0])).toEqual([]);
+  });
+
+  it("检查器字段缺失 → warning，但不升级为 error", () => {
+    const scene = makeScene(cleanZhLayers);
+    scene.shots[0] = { ...scene.shots[0], beats: [], acting: "" };
+    const issues = validateDirectorLayers(cleanZhLayers, makeProject(ZH_ASSETS, scene), scene);
+    const hit = issues.find((issue) => issue.code === "DIRECTOR.INSPECTOR_COVERAGE");
+    expect(hit).toBeDefined();
+    expect(hit?.severity).toBe("warning");
+    expect(hit?.detailZh).toContain("节拍");
   });
 
   it("多镜头声明 + 单一连续时间轴 → error", () => {
@@ -212,6 +223,7 @@ describe("validateDirectorLayers（英文 fixture）", () => {
         movement: "Steadicam", action: "Walks fast", acting: "Restrained", direction: "left-to-right",
         characterId: "hero",
         participants: [{ characterId: "hero", role: "primary", position: "center" }],
+        beats: [{ id: "beat-en-1", order: 1, verb: "wait", actorId: "hero", actionText: "holds position" }],
       }],
     };
   }

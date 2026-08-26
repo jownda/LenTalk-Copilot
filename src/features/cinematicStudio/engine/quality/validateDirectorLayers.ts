@@ -100,6 +100,55 @@ function checkMultiShotBlocks(layers: Record<string, string>, scene: SceneV2): D
   }];
 }
 
+/** V2-P3-7：检查器字段缺失时给出 warning，编译器仍会用结构化字段补齐最终提示词。 */
+function checkInspectorCoverage(project: ProjectV2, scene: SceneV2): DirectorLayerIssue[] {
+  const assets = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
+  const out: DirectorLayerIssue[] = [];
+  for (const shot of scene.shots ?? []) {
+    const missing: string[] = [];
+    if ((shot.beats ?? []).length === 0) missing.push("beats / 节拍");
+
+    const hasParticipantPosition = (shot.participants ?? []).some((participant) => participant.position?.trim());
+    const hasShotLayout = Boolean(
+      shot.layout?.anchorDescription?.trim() ||
+      (shot.layout?.characterOrder ?? []).length > 0,
+    );
+    const hasSceneLayout = Boolean(
+      scene.staging?.anchorDescription?.trim() ||
+      (scene.staging?.characterOrder ?? []).length > 0,
+    );
+    if (!hasParticipantPosition && !hasShotLayout && !hasSceneLayout) missing.push("staging / 站位");
+    if (!shot.acting?.trim()) missing.push("acting / 表演");
+
+    const speakers = new Set(
+      (shot.beats ?? [])
+        .filter((beat) => beat.dialogue?.trim() && beat.actorId)
+        .map((beat) => beat.actorId as string),
+    );
+    const missingVoices = [...speakers].filter((id) => {
+      const profile = assets.get(id)?.actingProfile;
+      return !profile?.voicePrompt?.trim() && !profile?.voicePromptZh?.trim();
+    });
+    if (missingVoices.length > 0) {
+      missing.push(`voice lock / 声音锁（${missingVoices.map((id) => assets.get(id)?.name ?? id).join(", ")}）`);
+    }
+
+    if (missing.length > 0) {
+      out.push({
+        code: "DIRECTOR.INSPECTOR_COVERAGE",
+        severity: "warning",
+        layerKey: "actionTiming",
+        label: "Structured shot inspector fields are incomplete",
+        detail: `Shot ${shot.label} is missing ${missing.join(", ")}. The compiler will append the available structured fields, but the shot should be completed before export.`,
+        detailZh: `镜头「${shot.label}」缺少：${missing.join("、")}。编译器会追加已有结构化字段，但导出前应补全该镜头。`,
+        suggestion: "Fill the missing inspector fields; the structured shot appendix remains authoritative over conflicting prose.",
+        suggestionZh: "补全检查器字段；若与前文导演描述冲突，以最终提示词中的结构化镜头附录为准。",
+      });
+    }
+  }
+  return out;
+}
+
 /** V2-P0-2：正文提到未被本场景引用的资产 */
 function checkUnreferencedAssets(
   layers: Record<string, string>, project: ProjectV2, scene: SceneV2,
@@ -295,6 +344,7 @@ export function validateDirectorLayers(
 ): DirectorLayerIssue[] {
   return [
     ...checkMultiShotBlocks(layers, scene),
+    ...checkInspectorCoverage(project, scene),
     ...checkUnreferencedAssets(layers, project, scene),
     ...checkMetadataStatements(layers),
     ...checkFirstFramePropsConflict(layers, project, scene),

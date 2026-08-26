@@ -389,6 +389,8 @@ UI 位置：名称输入框下方；其他资产类型同逻辑。
 
 **文件**：`src/features/cinematicStudio/engine/compiler/director.ts`、`src/features/cinematicStudio/engine/compiler/sections.ts`、`src/features/cinematicStudio/app/providers/ai.ts`、新校验模块（复用 V2-P2-1）
 
+**V2.14 验收结果**：已完成。`directorLayers` 通过质量门时保留原有 AI 分层文本，并在其后追加「镜头结构化检查器 / STRUCTURED SHOT INSPECTOR」段；该段逐镜输出活动资产引用、FOV / 相机、参与角色、站位、状态链、节拍、动作、表演、眼部生活、表演评分、对白和声音锁。附录明确以检查器字段为冲突时的权威来源，声音锁单独渲染，避免重复整张音频计划。质量门新增每镜节拍、站位、表演、对白角色声音锁的完整性 warning；warning 不阻断写回，error 仍回退完整结构化编译。AI 规则同步要求 `actionTiming` 按镜头分块，结构化检查器字段优先。新增编译器与质量门回归测试。
+
 ---
 
 ## 6. 实施顺序追加（V2-P3）
@@ -401,7 +403,7 @@ UI 位置：名称输入框下方；其他资产类型同逻辑。
 | V2.11 | 风格倾向 → 风格描述自动派生（一段式中英分离描述） | 预设+UI+编译 | 低 | `feat:` 已完成 |
 | V2.12 | AI 编译分水岭：删 audioPlan 输出，AI 只读不回写；用户区/AI区视觉分隔 | AI+UI | 中 | `feat:` 已完成 |
 | V2.13 | 焦段统一为视场角（mm 兼容层删除 UI） | 引擎+AI+UI | 中 | `refactor:` 已完成 |
-| V2.14 | 检查器内容进最终提示词（分层 + 结构化合并输出） | 引擎+AI | 高 | `feat:` |
+| V2.14 | 检查器内容进最终提示词（分层 + 结构化合并输出） | 引擎+AI | 高 | `feat:` 已完成 |
 | V2.15 | P3 回归走查（下节断言）+ 提交 | 验收 | — | `fix:` |
 
 ## 7. 回归走查断言追加（V2-P3）

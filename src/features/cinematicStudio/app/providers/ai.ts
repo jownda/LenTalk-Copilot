@@ -734,7 +734,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     "formatMode: SINGLE CONTINUOUS TAKE or CONTROLLED MULTI-SHOT SEQUENCE (long-take vs multi-shot).",
     "optics: diagonal field-of-view + observable lens outcome + anti-drift lock.",
     "camera: physical operator behavior (height, distance, angle, side, screen placement, focus, depth of field, handheld quality).",
-    "actionTiming: wall-clock time blocks (0:00-0:03 …) each carrying position/action/camera/prop/physics/audio.",
+    "actionTiming: wall-clock time blocks (0:00-0:03 …), grouped and labeled per shot; each block carries position/action/camera/prop/physics/audio. The structured shot inspector fields remain authoritative when this prose conflicts with them.",
     "physics: physics anchors + walk/run/weapon/liquid/particle locks per shot.",
     "lighting: structured light-direction lock (key light, direction, exposure priority, highlights, forbids).",
     "audio: audio + dialogue rules + per-character voice lock.",
