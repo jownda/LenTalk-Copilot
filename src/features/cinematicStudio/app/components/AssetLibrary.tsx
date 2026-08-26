@@ -7,7 +7,7 @@
  */
 import { createPortal } from "react-dom";
 import { useState } from "react";
-import type { Asset, AssetActingProfile, AssetKind, LockLevel, ProjectV2 } from "../../shared-types";
+import type { Asset, AssetActingProfile, AssetKind, LockLevel, ProjectV2, SceneV2 } from "../../shared-types";
 import { ImagePlus, Lock, LockKeyhole, Mic, Plus, Sparkles, Trash2, X } from "lucide-react";
 import type { ProjectAction } from "../store/projectReducer";
 import type { Locale } from "../i18n";
@@ -72,13 +72,32 @@ type Copy = import("../i18n").CopyZh;
 
 interface AssetLibraryProps {
   project: ProjectV2;
+  scene: SceneV2;
   dispatch: (action: ProjectAction) => void;
   locale: Locale;
   t: Copy;
   setNotice: (message: string) => void;
 }
 
-export default function AssetLibrary({ project, dispatch, locale, t, setNotice }: AssetLibraryProps) {
+function sceneUsesAsset(scene: SceneV2, assetId: string): boolean {
+  if (scene.staging?.locationAssetId === assetId || (scene.staging?.characterOrder ?? []).includes(assetId)) return true;
+  return scene.shots.some((shot) => (
+    shot.characterId === assetId ||
+    (shot.participants ?? []).some((participant) => participant.characterId === assetId) ||
+    (shot.layout?.characterOrder ?? []).includes(assetId) ||
+    [...(shot.propStatesAtStart ?? []), ...(shot.propStatesAtEnd ?? [])].some((state) => state.propId === assetId) ||
+    (shot.beats ?? []).some((beat) => (
+      beat.actorId === assetId || beat.targetCharacterId === assetId || beat.targetPropId === assetId ||
+      [...(beat.stateBefore ?? []), ...(beat.stateAfter ?? [])].some((state) => state.propId === assetId)
+    ))
+  ));
+}
+
+function projectUsageCount(project: ProjectV2, assetId: string): number {
+  return project.scenes.filter((scene) => sceneUsesAsset(scene, assetId)).length;
+}
+
+export default function AssetLibrary({ project, scene, dispatch, locale, t, setNotice }: AssetLibraryProps) {
   const [tab, setTab] = useState<AssetKind>("character");
   const [editingId, setEditingId] = useState<string | null>(null);
   const assets = (project.assets ?? []).filter((asset) => asset.kind === tab || (tab === "style-reference" && (asset.kind === "style-reference" || asset.kind === "audio-reference")));
@@ -104,19 +123,19 @@ export default function AssetLibrary({ project, dispatch, locale, t, setNotice }
       <input value={project.projectCode ?? ""} placeholder={t.projectCodePlaceholder} onChange={(event) => dispatch({ type: "PATCH_PROJECT", patch: { projectCode: event.target.value } })} />
     </label>
     {assets.length === 0 ? <div className="empty assets-empty">{t.emptyAssets}</div> : <div className="asset-grid">
-      {assets.map((asset) => <AssetTile key={asset.id} asset={asset} locale={locale} t={t} onClick={() => setEditingId(asset.id)} onDelete={() => { dispatch({ type: "DELETE_ASSET", id: asset.id }); setNotice(t.assetDeleted); }} />)}
+      {assets.map((asset) => <AssetTile key={asset.id} asset={asset} locale={locale} t={t} activeInCurrentScene={sceneUsesAsset(scene, asset.id)} projectUsageCount={projectUsageCount(project, asset.id)} onClick={() => setEditingId(asset.id)} onDelete={() => { dispatch({ type: "DELETE_ASSET", id: asset.id }); setNotice(t.assetDeleted); }} />)}
     </div>}
     {editing && typeof document !== "undefined" && (() => {
       const host = document.querySelector<HTMLElement>("[data-cinematic-studio]");
       return host ? createPortal(
-        <AssetEditor project={project} asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />,
+        <AssetEditor project={project} scene={scene} asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />,
         host,
       ) : null;
     })()}
   </section>;
 }
 
-function AssetTile({ asset, locale, t, onClick, onDelete }: { asset: Asset; locale: Locale; t: Copy; onClick(): void; onDelete(): void }) {
+function AssetTile({ asset, locale, t, activeInCurrentScene, projectUsageCount, onClick, onDelete }: { asset: Asset; locale: Locale; t: Copy; activeInCurrentScene: boolean; projectUsageCount: number; onClick(): void; onDelete(): void }) {
   const thumb = asset.referencePaths?.[0];
   const desc = locale === "zh" ? (asset.descriptionZh?.trim() || asset.description.trim()) : (asset.description.trim() || asset.descriptionZh?.trim());
   const lockBadge = asset.lockLevel === "strict" ? <span className="lock-badge strict" title={t.lockStrict}><LockKeyhole size={9} /></span>
@@ -133,12 +152,15 @@ function AssetTile({ asset, locale, t, onClick, onDelete }: { asset: Asset; loca
       <span className={`asset-state-badge ${asset.stateName === "base" ? "base" : "variant"}`}>
         {asset.stateName === "base" ? t.assetBaseCard : `${t.assetStateLabel} · ${asset.stateName || t.assetVariantFallback}`}
       </span>
+      <span className={`asset-usage-badge ${activeInCurrentScene ? "active" : ""}`}>
+        {activeInCurrentScene ? t.assetActiveInCurrentScene : projectUsageCount > 0 ? t.assetActiveElsewhere.replace("{count}", String(projectUsageCount)) : t.assetInactive}
+      </span>
       <span className="asset-tile-desc">{desc || t.noDesc}</span>
     </div>
   </div>;
 }
 
-function AssetEditor({ project, asset, locale, t, dispatch, setNotice, onCreateVariant, onClose }: { project: ProjectV2; asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; onCreateVariant(id: string): void; onClose(): void }) {
+function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, onCreateVariant, onClose }: { project: ProjectV2; scene: SceneV2; asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; onCreateVariant(id: string): void; onClose(): void }) {
   const [imageBusy, setImageBusy] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
@@ -204,6 +226,8 @@ function AssetEditor({ project, asset, locale, t, dispatch, setNotice, onCreateV
   const baseCard = (project.assets ?? []).find((candidate) => candidate.id === (asset.baseAssetId ?? asset.id));
   const variantGroupId = asset.variantGroupId ?? asset.baseAssetId ?? asset.id;
   const variantCount = (project.assets ?? []).filter((candidate) => (candidate.variantGroupId ?? candidate.baseAssetId ?? candidate.id) === variantGroupId).length;
+  const activeInCurrentScene = sceneUsesAsset(scene, asset.id);
+  const usageCount = projectUsageCount(project, asset.id);
   const createVariant = () => {
     const stateName = variantStateName.trim();
     if (!stateName) {
@@ -256,6 +280,10 @@ function AssetEditor({ project, asset, locale, t, dispatch, setNotice, onCreateV
         <span className={`asset-state-badge ${isBaseCard ? "base" : "variant"}`}>{isBaseCard ? t.assetBaseCard : t.assetVariantCard}</span>
         <span>{isBaseCard ? t.assetBaseCardHint : t.assetVariantCardHint.replace("{name}", baseCard?.name || t.assetBaseCard)}</span>
         <span className="asset-variant-count">{t.assetStateCount.replace("{count}", String(variantCount))}</span>
+      </div>
+      <div className={`asset-effective-context ${activeInCurrentScene ? "active" : ""}`}>
+        <strong>{activeInCurrentScene ? t.assetActiveInCurrentScene : t.assetInactive}</strong>
+        <span>{activeInCurrentScene ? t.assetActiveInCurrentSceneHint : usageCount > 0 ? t.assetActiveElsewhere.replace("{count}", String(usageCount)) : t.assetInactiveHint}</span>
       </div>
 
       <div className="asset-modal-grid">

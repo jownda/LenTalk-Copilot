@@ -2517,6 +2517,8 @@
 }
 .asset-state-badge.base { color: var(--accent); border-color: var(--accent-ring); background: var(--accent-softer); }
 .asset-state-badge.variant { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.asset-usage-badge { width: fit-content; color: var(--text-faint); font-size: 9px; font-weight: 600; line-height: 1.2; }
+.asset-usage-badge.active { color: var(--success); }
 
 /* Token editor：chip + input 真正并排，input 自适应 */
 .token-editor { flex-wrap: wrap; gap: var(--space-1); }
@@ -2544,6 +2546,10 @@
   line-height: 1.5;
 }
 .asset-variant-count { margin-left: auto; color: var(--text-faint); white-space: nowrap; }
+.asset-effective-context { display: flex; align-items: baseline; gap: var(--space-2); margin-top: var(--space-2); padding: 8px 10px; border: 1px dashed var(--border); border-radius: var(--r-md); color: var(--text-faint); background: var(--surface-input); font-size: 10.5px; line-height: 1.5; }
+.asset-effective-context strong { color: var(--text-muted); white-space: nowrap; }
+.asset-effective-context.active { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); background: color-mix(in srgb, var(--success) 7%, var(--surface-input)); }
+.asset-effective-context.active strong { color: var(--success); }
 .asset-variant-actions { display: flex; flex-direction: column; gap: var(--space-2); }
 .asset-variant-composer { display: flex; flex-direction: column; gap: 7px; padding: var(--space-3); border: 1px solid var(--accent-ring); border-radius: var(--r-md); background: var(--accent-softer); }
 .asset-variant-composer-actions { display: flex; justify-content: flex-end; gap: var(--space-2); }

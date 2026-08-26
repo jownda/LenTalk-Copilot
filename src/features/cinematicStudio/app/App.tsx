@@ -503,7 +503,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
       <aside className="content-side">
       {/* ── 资产库（右侧固定栏）── */}
       <div id="asset-library-card">
-        <AssetLibrary project={project} dispatch={dispatch} locale={locale} t={t} setNotice={setNotice} />
+        <AssetLibrary project={project} scene={scene} dispatch={dispatch} locale={locale} t={t} setNotice={setNotice} />
       </div>
       <section className="card prompt-card">
         <div className="card-head">
