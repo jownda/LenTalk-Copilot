@@ -7,14 +7,14 @@
   /* 直接读取 LenTalk 全局主题变量，保证明暗、色调和强调色同步。 */
   --bg: rgb(var(--bg-rgb));
   --surface: rgb(var(--surface-rgb));
-  --surface-elevated: color-mix(in srgb, var(--surface) 82%, var(--text) 18%);
-  --surface-input: color-mix(in srgb, var(--bg) 76%, var(--surface) 24%);
-  --surface-overlay: rgb(var(--surface-rgb) / 0.96);
+  --surface-elevated: var(--ui-surface-panel);
+  --surface-input: var(--ui-surface-field);
+  --surface-overlay: var(--ui-surface-panel);
 
   /* Border */
-  --border: rgb(var(--border-rgb));
-  --border-strong: color-mix(in srgb, var(--border) 68%, var(--text) 32%);
-  --border-soft: color-mix(in srgb, var(--border) 72%, transparent);
+  --border: var(--ui-border-soft);
+  --border-strong: var(--ui-border-strong);
+  --border-soft: var(--ui-border-soft);
 
   /* Text */
   --text: rgb(var(--text-rgb));
@@ -2533,27 +2533,23 @@
 .asset-modal { width: min(920px, 94vw); }
 .asset-modal-grid { grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); gap: var(--space-4); }
 .asset-refs { min-height: 92px; }
-.asset-variant-context {
+.asset-state-status {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: 9px 10px;
+  min-height: 34px;
+  padding: 6px 10px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   color: var(--text-muted);
   background: var(--surface-input);
   font-size: 11px;
-  line-height: 1.5;
 }
-.asset-variant-count { margin-left: auto; color: var(--text-faint); white-space: nowrap; }
-.asset-effective-context { display: flex; align-items: baseline; gap: var(--space-2); margin-top: var(--space-2); padding: 8px 10px; border: 1px dashed var(--border); border-radius: var(--r-md); color: var(--text-faint); background: var(--surface-input); font-size: 10.5px; line-height: 1.5; }
-.asset-effective-context strong { color: var(--text-muted); white-space: nowrap; }
-.asset-effective-context.active { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); background: color-mix(in srgb, var(--success) 7%, var(--surface-input)); }
-.asset-effective-context.active strong { color: var(--success); }
+.asset-state-status strong { color: var(--text-muted); white-space: nowrap; }
+.asset-state-status.active strong { color: var(--success); }
 .asset-variant-actions { display: flex; flex-direction: column; gap: var(--space-2); }
 .asset-variant-composer { display: flex; flex-direction: column; gap: 7px; padding: var(--space-3); border: 1px solid var(--accent-ring); border-radius: var(--r-md); background: var(--accent-softer); }
 .asset-variant-composer-actions { display: flex; justify-content: flex-end; gap: var(--space-2); }
-.field-help { display: block; margin-top: 3px; color: var(--text-faint); font-size: 10px; font-weight: 400; line-height: 1.45; }
 .asset-state-section { display: flex; flex-direction: column; gap: var(--space-2); }
 .asset-change-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(150px, .6fr); gap: var(--space-2); align-items: end; }
 .asset-change-row .field-label { min-width: 0; }
