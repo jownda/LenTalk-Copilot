@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
-import { ChevronDown, Clapperboard, Copy, Download, FileJson, FileText, FolderOpen, PenLine, Plus, Save, Send, Sparkles, X } from "lucide-react";
+import { ChevronDown, Copy, Download, FileJson, FileText, FolderOpen, PenLine, Plus, Save, Send, X } from "lucide-react";
 import { classifyError, fillSceneDraft, getAssistant } from "./providers/ai";
 import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type AISettings } from "./providers/aiSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { loadProjectFromDisk, recordVersionToSqlite, savePromptToDisk, saveProjectToDisk } from "./providers/projectStorage";
-import { loadProject, migrateProject, bakeryRescueProject, museumRedDoorsProject, persistProject } from "./model";
+import { loadProject, migrateProject, persistProject } from "./model";
 import { cameraLabels, copy, framingLabels, type CopyZh, type Locale } from "./i18n";
 import AssetLibrary from "./components/AssetLibrary";
 import BeatEditor from "./components/BeatEditor";
@@ -39,7 +39,7 @@ export interface CinematicStudioAppProps {
   onSendToVideo?: (prompt: string) => void;
 }
 
-export default function App({ onClose, onStateChange, onSendToVideo }: CinematicStudioAppProps = {}) {
+export default function App({ onStateChange, onSendToVideo }: CinematicStudioAppProps = {}) {
   const [project, setProject] = useState<ProjectV2>(loadProject);
   const [locale, setLocale] = useState<Locale>(() => localStorage.getItem("cineprompt-locale") === "en" ? "en" : "zh");
   const [sceneId, setSceneId] = useState(project.scenes[0].id);
@@ -47,7 +47,6 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
   const [prompt, setPrompt] = useState(() => project.compiledPrompt ?? "");
   const [notice, setNotice] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(true);
-  const [exampleOpen, setExampleOpen] = useState(false);
   const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
   const [sceneCompileBusy, setSceneCompileBusy] = useState(false);
   const [aiCompileError, setAiCompileError] = useState("");
@@ -62,6 +61,7 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
   /** 手动覆写文本：编辑器内容与最近编译输出不一致时记录（P2.2） */
   const [manualOverride, setManualOverride] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const [projectCodeDraft, setProjectCodeDraft] = useState(() => project.projectCode ?? "");
   const scene = project.scenes.find((item) => item.id === sceneId) ?? project.scenes[0];
   const shot = scene.shots.find((item) => item.id === shotId) ?? scene.shots[0];
   const issues = useMemo(() => checkContinuityV2(project, scene), [project, scene]);
@@ -75,6 +75,7 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
 
   useEffect(() => { persistProject(project); }, [project]);
   useEffect(() => { localStorage.setItem("cineprompt-locale", locale); }, [locale]);
+  useEffect(() => { setProjectCodeDraft(project.projectCode ?? ""); }, [project.projectCode]);
   /** LenTalk Chat 配置变更时同步刷新工作室选中的模型（地址/Key 同源） */
   useEffect(() => { setAiSettings(loadAISettings()); }, [customApis]);
   const selectChatModel = (value: string) => {
@@ -85,6 +86,16 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
     if (!option) return;
     setAiSettings(saveAISettings(resolveLenTalkChatModel(option.providerId, option.model)));
     setNotice(t.settingsSaved);
+  };
+  const commitProjectCode = () => {
+    const nextCode = projectCodeDraft.trim();
+    if (!nextCode) {
+      setProjectCodeDraft(project.projectCode ?? "");
+      return;
+    }
+    if (nextCode !== project.projectCode) {
+      dispatch({ type: "PATCH_PROJECT", patch: { projectCode: nextCode } });
+    }
   };
   /** 节点嵌入：把工程标题与提示词摘要回传给宿主节点（防抖 400ms，避免逐键同步） */
   useEffect(() => {
@@ -350,12 +361,7 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
     download(`${project.title.replace(/ /g, "-").toLowerCase()}.${format}`, content, format === "json" ? "application/json" : "text/plain"); setNotice(`${format.toUpperCase()} ${locale === "zh" ? "导出已下载。" : "export downloaded."}`);
   };
   const importProject = (file?: File) => { if (!file) return; const reader = new FileReader(); reader.onload = () => { try { const imported = migrateProject(JSON.parse(String(reader.result))); setProject(imported); setSceneId(imported.scenes[0]?.id || ""); setShotId(imported.scenes[0]?.shots[0]?.id || ""); setNotice(t.projectImported); } catch { setNotice(t.invalidProject); } }; reader.readAsText(file); };
-  const loadExample = (example: ProjectV2) => {
-    const copy = structuredClone(example);
-    setProject(copy); setSceneId(copy.scenes[0].id); setShotId(copy.scenes[0].shots[0]?.id ?? ""); setNotice(t.exampleLoaded); setExampleOpen(false);
-  };
   return <main className="app-shell">
-    <header className="topbar"><div className="brand"><span className="brand-mark"><Clapperboard size={17} /></span><span>CINEMATIC PROMPT STUDIO</span><span className="version">V0.2</span></div><div className="top-actions"><div className="example-menu"><button className="example-button" onClick={() => setExampleOpen((v) => !v)}><Sparkles size={14} /> {t.openExample} <ChevronDown size={12} /></button>{exampleOpen && <div className="example-options"><button onClick={() => loadExample(museumRedDoorsProject)}>{t.exampleMuseum}</button><button onClick={() => loadExample(bakeryRescueProject)}>{t.exampleBakery}</button></div>}</div><div className="locale-switch" aria-label="Language"><button className={locale === "zh" ? "active" : ""} onClick={() => setLocale("zh")}>中</button><button className={locale === "en" ? "active" : ""} onClick={() => setLocale("en")}>EN</button></div><button className="icon-button" title={t.saveProject} onClick={handleSaveProject}><Save size={17} /></button><button className="icon-button" title={t.openProject} onClick={handleOpenProject}><FolderOpen size={17} /></button>{onClose && <button className="icon-button" title={locale === "zh" ? "退出" : "Exit"} onClick={onClose}><X size={17} /></button>}<input ref={fileInput} className="hidden" type="file" accept="application/json" onChange={(event) => importProject(event.target.files?.[0])} /></div></header>
     <section className="content">
       <div className="content-main">
       {/* ── 1. 导演简报卡（P0.4：合并风格配方 / 场景 / 音频计划）── */}
@@ -498,6 +504,28 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
       </div>
 
       <aside className="content-side">
+      <section className="side-project-toolbar" aria-label={locale === "zh" ? "工程设置" : "Project controls"}>
+        <label className="asset-project-code">{t.projectCode}
+          <input
+            value={projectCodeDraft}
+            placeholder={t.projectCodePlaceholder}
+            onChange={(event) => setProjectCodeDraft(event.target.value)}
+            onBlur={commitProjectCode}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
+          />
+        </label>
+        <div className="locale-switch" aria-label="Language">
+          <button className={locale === "zh" ? "active" : ""} onClick={() => setLocale("zh")}>中</button>
+          <button className={locale === "en" ? "active" : ""} onClick={() => setLocale("en")}>EN</button>
+        </div>
+        <div className="side-project-actions">
+          <button className="icon-button" title={t.openProject} onClick={handleOpenProject}><FolderOpen size={16} /></button>
+          <button className="icon-button" title={t.saveProject} onClick={handleSaveProject}><Save size={16} /></button>
+        </div>
+        <input ref={fileInput} className="hidden" type="file" accept="application/json" onChange={(event) => importProject(event.target.files?.[0])} />
+      </section>
       {/* ── 资产库（右侧固定栏）── */}
       <div id="asset-library-card">
         <AssetLibrary project={project} scene={scene} dispatch={dispatch} locale={locale} t={t} setNotice={setNotice} />

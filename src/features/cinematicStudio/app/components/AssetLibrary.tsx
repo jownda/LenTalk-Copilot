@@ -1,6 +1,6 @@
 /**
  * 资产库卡片（P0.1）
- * 角色 / 地点 / 道具 / 风格·声音参考 四个 Tab。
+ * 角色 / 地点 / 道具三个分类 Tab。
  * 每条资产：名称、英文 canonical 描述（可从中文一键翻译草稿）、用途/忽略复选框、
  * 锁定级别（未锁定/建议锁定/强锁定）、独特标记与始终可见 token。
  * 参考图压缩后存入 Asset.referencePaths（P3 SQLite 前暂存 localStorage）。
@@ -14,11 +14,10 @@ import type { Locale } from "../i18n";
 import { classifyError, fillAssetDetails } from "../providers/ai";
 import { isRemoteConfigured } from "../providers/aiSettings";
 
-const TABS: { kind: AssetKind; labelKey: "assetTabCharacter" | "assetTabLocation" | "assetTabProp" | "assetTabReference" }[] = [
+const TABS: { kind: AssetKind; labelKey: "assetTabCharacter" | "assetTabLocation" | "assetTabProp" }[] = [
   { kind: "character", labelKey: "assetTabCharacter" },
   { kind: "location", labelKey: "assetTabLocation" },
   { kind: "prop", labelKey: "assetTabProp" },
-  { kind: "style-reference", labelKey: "assetTabReference" },
 ];
 
 /** 压缩上传图片到最长边 maxEdge，返回 JPEG data URL */
@@ -82,7 +81,7 @@ function projectUsageCount(project: ProjectV2, assetId: string): number {
 export default function AssetLibrary({ project, scene, dispatch, locale, t, setNotice }: AssetLibraryProps) {
   const [tab, setTab] = useState<AssetKind>("character");
   const [editingId, setEditingId] = useState<string | null>(null);
-  const assets = (project.assets ?? []).filter((asset) => asset.kind === tab || (tab === "style-reference" && (asset.kind === "style-reference" || asset.kind === "audio-reference")));
+  const assets = (project.assets ?? []).filter((asset) => asset.kind === tab);
   const editing = (project.assets ?? []).find((asset) => asset.id === editingId);
 
   const addAsset = (kind: AssetKind) => {
@@ -91,19 +90,16 @@ export default function AssetLibrary({ project, scene, dispatch, locale, t, setN
   };
 
   return <section className="card asset-card">
-    <div className="card-head">
+    <div className="asset-card-heading">
       <div className="card-head-title">
         <span className="eyebrow">{t.assetLibrary}</span>
         <strong>{assets.length}</strong>
       </div>
-      <div className="asset-tabs">
-        {TABS.map((item) => <button key={item.kind} className={`asset-tab ${tab === item.kind ? "active" : ""}`} onClick={() => setTab(item.kind)}>{t[item.labelKey]}</button>)}
-      </div>
       <button className="outline-button" onClick={() => addAsset(tab)}><Plus size={15} /> {t.addAsset}</button>
     </div>
-    <label className="asset-project-code">{t.projectCode}
-      <input value={project.projectCode ?? ""} placeholder={t.projectCodePlaceholder} onChange={(event) => dispatch({ type: "PATCH_PROJECT", patch: { projectCode: event.target.value } })} />
-    </label>
+    <div className="asset-tabs" role="tablist" aria-label={t.assetLibrary}>
+      {TABS.map((item) => <button key={item.kind} role="tab" aria-selected={tab === item.kind} className={`asset-tab ${tab === item.kind ? "active" : ""}`} onClick={() => setTab(item.kind)}>{t[item.labelKey]}</button>)}
+    </div>
     {assets.length === 0 ? <div className="empty assets-empty">{t.emptyAssets}</div> : <div className="asset-grid">
       {assets.map((asset) => <AssetTile key={asset.id} asset={asset} locale={locale} t={t} activeInCurrentScene={sceneUsesAsset(scene, asset.id)} projectUsageCount={projectUsageCount(project, asset.id)} onClick={() => setEditingId(asset.id)} onDelete={() => { dispatch({ type: "DELETE_ASSET", id: asset.id }); setNotice(t.assetDeleted); }} />)}
     </div>}

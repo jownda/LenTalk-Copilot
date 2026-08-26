@@ -92,7 +92,7 @@
 .app-shell {
   flex: 1 1 auto;
   display: grid;
-  grid-template-rows: 56px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
   min-height: 0;
   overflow: hidden;
@@ -194,13 +194,22 @@
   display: flex;
   flex-direction: column;
   gap: 16px;
-  overflow-y: auto;
+  overflow-y: scroll;
   overscroll-behavior: contain;
-  padding-right: 8px;
+  scrollbar-gutter: stable;
+  padding: 0 12px 48px 0;
 }
 
-.asset-project-code { display: inline-flex; align-items: center; gap: 8px; margin: 0 0 12px; color: var(--text-muted); font-size: 11px; }
+.side-project-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+  padding: 0 1px;
+}
+.asset-project-code { display: inline-flex; align-items: center; gap: 8px; margin: 0; color: var(--text-muted); font-size: 11px; white-space: nowrap; }
 .asset-project-code input { width: 100px; padding: 5px 7px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-input); color: var(--text); font: inherit; }
+.side-project-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .asset-state-grid { display: grid; grid-template-columns: minmax(0, 1fr) 92px; gap: 8px; }
 
 @media (max-width: 1080px) {
@@ -1696,15 +1705,17 @@
  * ═══════════════════════════════════════════════════════════ */
 .asset-card { display: flex; flex-direction: column; gap: 12px; }
 .asset-tabs {
-  display: flex;
-  gap: 4px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
   padding: 3px;
   background: var(--surface-input);
   border: 1px solid var(--border-soft);
   border-radius: var(--r-lg);
-  width: fit-content;
+  width: 100%;
 }
 .asset-tab {
+  width: 100%;
   padding: 6px 14px;
   border-radius: var(--r-md);
   font-size: 12px;
@@ -1716,6 +1727,12 @@
 .asset-tab.active {
   background: var(--accent-soft);
   color: var(--accent);
+}
+.asset-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
 }
 .asset-grid {
   display: grid;
