@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { Check, Copy, ScanSearch, Sparkles, Wand2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -366,6 +366,7 @@ export const PromptOptimizerNode = memo(({
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
   const nodes = useCanvasStore((state) => state.nodes);
   const edges = useCanvasStore((state) => state.edges);
+  const purpose = typeof data.purpose === 'string' ? data.purpose : '';
 
   const [isEditingResult, setIsEditingResult] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -377,12 +378,13 @@ export const PromptOptimizerNode = memo(({
   const [pickerAnchor, setPickerAnchor] = useState<PickerAnchor>(PICKER_FALLBACK_ANCHOR);
   const [previewState, setPreviewState] = useState<ReferencePreviewState | null>(null);
   const [previewSize, setPreviewSize] = useState<{ width: number; height: number } | null>(null);
+  const [purposeDraft, setPurposeDraft] = useState(purpose);
 
   const rootRef = useRef<HTMLDivElement>(null);
   const purposeTextareaRef = useRef<HTMLTextAreaElement>(null);
   const purposeHighlightRef = useRef<HTMLDivElement>(null);
+  const isPurposeComposingRef = useRef(false);
 
-  const purpose = typeof data.purpose === 'string' ? data.purpose : '';
   const taskType: PromptOptimizerTaskType = data.taskType ?? 'auto';
   const resolvedTitle = resolveNodeDisplayName(CANVAS_NODE_TYPES.promptOptimizer, data);
   const resolvedWidth = Math.max(MIN_WIDTH, Math.round(width ?? DEFAULT_WIDTH));
@@ -390,6 +392,12 @@ export const PromptOptimizerNode = memo(({
   const enhanceMode = data.enhanceMode;
   const customApis = useSettingsStore((state) => state.customApis);
   const outputLang: 'zh' | 'en' = data.outputLang ?? 'en';
+
+  useEffect(() => {
+    if (!isPurposeComposingRef.current) {
+      setPurposeDraft(purpose);
+    }
+  }, [purpose]);
 
   const chatModelOptions = useMemo(() => {
     const options: Array<{ providerId: string; model: string; label: string }> = [];
@@ -698,7 +706,7 @@ export const PromptOptimizerNode = memo(({
 
   const insertImageReference = useCallback((imageIndex: number) => {
     const marker = `@图${imageIndex + 1}`;
-    let basePurpose = purpose;
+    let basePurpose = purposeDraft;
     let baseCursor = pickerCursor ?? basePurpose.length;
     const trimmedBefore = basePurpose.slice(0, baseCursor).replace(/\s+$/, '');
     if (trimmedBefore.endsWith('@')) {
@@ -707,6 +715,7 @@ export const PromptOptimizerNode = memo(({
       baseCursor = atIndex;
     }
     const { nextText, nextCursor } = insertReferenceToken(basePurpose, baseCursor, marker);
+    setPurposeDraft(nextText);
     updateNodeData(id, { purpose: nextText });
     setShowImagePicker(false);
     setPickerCursor(null);
@@ -715,7 +724,7 @@ export const PromptOptimizerNode = memo(({
       purposeTextareaRef.current?.focus();
       purposeTextareaRef.current?.setSelectionRange(nextCursor, nextCursor);
     });
-  }, [id, pickerCursor, purpose, updateNodeData]);
+  }, [id, pickerCursor, purposeDraft, updateNodeData]);
 
   const handlePurposeKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     if (showImagePicker && incomingImages.length > 0) {
@@ -748,12 +757,29 @@ export const PromptOptimizerNode = memo(({
     const isAtKey = event.key === '@' || (event.shiftKey && event.code === 'Digit2');
     if (isAtKey && !event.ctrlKey && !event.metaKey && !event.altKey && incomingImages.length > 0) {
       event.preventDefault();
-      const cursor = event.currentTarget.selectionStart ?? purpose.length;
+      const cursor = event.currentTarget.selectionStart ?? purposeDraft.length;
       setPickerAnchor(resolvePickerAnchor(rootRef.current, event.currentTarget, cursor));
       setPickerCursor(cursor);
       setShowImagePicker(true);
       setPickerActiveIndex(0);
     }
+  };
+
+  const handlePurposeChange = (value: string) => {
+    setPurposeDraft(value);
+    if (!isPurposeComposingRef.current) {
+      updateNodeData(id, { purpose: value });
+    }
+  };
+
+  const handlePurposeCompositionStart = () => {
+    isPurposeComposingRef.current = true;
+  };
+
+  const handlePurposeCompositionEnd = (value: string) => {
+    isPurposeComposingRef.current = false;
+    setPurposeDraft(value);
+    updateNodeData(id, { purpose: value });
   };
 
   const syncPurposeHighlightScroll = () => {
@@ -840,7 +866,7 @@ export const PromptOptimizerNode = memo(({
           >
             <div className="min-h-full whitespace-pre-wrap break-words px-2 py-1.5">
               {renderPromptWithHighlights(
-                purpose,
+                purposeDraft,
                 incomingImages.length,
                 incomingImageItems.map((item) => item.displayUrl),
                 handleReferenceThumbnailClick
@@ -849,8 +875,10 @@ export const PromptOptimizerNode = memo(({
           </div>
           <textarea
             ref={purposeTextareaRef}
-            value={purpose}
-            onChange={(event) => updateNodeData(id, { purpose: event.target.value })}
+            value={purposeDraft}
+            onChange={(event) => handlePurposeChange(event.target.value)}
+            onCompositionStart={handlePurposeCompositionStart}
+            onCompositionEnd={(event) => handlePurposeCompositionEnd(event.currentTarget.value)}
             onKeyDown={handlePurposeKeyDown}
             onScroll={syncPurposeHighlightScroll}
             onMouseDown={(event) => event.stopPropagation()}
