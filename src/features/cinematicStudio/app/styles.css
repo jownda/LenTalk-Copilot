@@ -66,9 +66,13 @@
 * { box-sizing: border-box; }
 
 .cinematic-studio-app .cinematic-studio-body {
+  display: flex;
+  flex-direction: column;
   margin: 0;
   min-width: 720px;
-  min-height: 100vh;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
   background: var(--bg);
   color: var(--text);
   font-size: 13px;
@@ -86,9 +90,11 @@
 
 /* ────────── Layout shell ────────── */
 .app-shell {
+  flex: 1 1 auto;
   display: grid;
   grid-template-rows: 56px minmax(0, 1fr);
-  height: 100vh;
+  height: 100%;
+  min-height: 0;
   overflow: hidden;
   background: var(--bg);
 }
@@ -155,6 +161,8 @@
 
 /* ────────── 竖向流式内容区 ────────── */
 .content {
+  height: 100%;
+  max-height: 100%;
   min-height: 0;
   overflow-y: auto;
   padding: 24px 28px 40px;
