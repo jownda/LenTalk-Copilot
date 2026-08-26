@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Asset } from "../../shared-types";
-import { renderAssetLine } from "./renderer";
+import { buildAssetReferenceTag, renderAssetLine } from "../../engine";
 
 const asset: Asset = {
   id: "hero", kind: "character", name: "HERO", description: "A man in a navy suit.",
@@ -19,5 +19,19 @@ describe("renderAssetLine user notes isolation", () => {
     expect(en).not.toContain("性格内敛");
     expect(zh).not.toContain("声音低沉");
     expect(en).not.toContain("声音低沉");
+  });
+});
+
+describe("asset reference naming", () => {
+  it("uses the stable project / state / version tag in @ references", () => {
+    const tagged = {
+      ...asset,
+      stateName: "rain soaked",
+      version: 2,
+      referenceTag: buildAssetReferenceTag({ ...asset, stateName: "rain soaked", version: 2 }, "CB"),
+    };
+    const output = renderAssetLine(tagged, 1, "at-mention", "en");
+    expect(tagged.referenceTag).toBe("char_cb_hero_rain-soaked_v2");
+    expect(output).toContain("@char_cb_hero_rain-soaked_v2");
   });
 });

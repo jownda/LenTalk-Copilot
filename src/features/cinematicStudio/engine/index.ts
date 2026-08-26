@@ -18,6 +18,7 @@ export * from "./compiler";
 export * from "./continuity";
 export * from "./quality";
 export * from "./golden";
+export * from "./asset-naming";
 export interface ContinuityIssue { status: "ok" | "warning"; label: string; detail: string; }
 
 /** V0.1 遗留编译器（单角色拼接；P2.1 起请用 compilePrompt 新入口，此函数仅保留兼容旧测试） */

@@ -3,6 +3,7 @@
  * P0.1 覆盖：资产库（增删改、参考图）、角色（增删改、绑定资产）、身份规则、角色数量锁。
  * 场景/镜头/节拍操作在 P0.2-P0.4 分批迁入。
  */
+import { deriveProjectCode, withAssetReferenceTag } from "../../engine";
 import type { Asset, AssetKind, ProjectV2 } from "../../shared-types";
 
 export const newId = () => crypto.randomUUID();
@@ -21,19 +22,20 @@ export function assetKindLabel(kind: AssetKind): string {
   return { character: "character", location: "location", prop: "prop", "style-reference": "style-reference", "audio-reference": "audio-reference" }[kind];
 }
 
-function patchAssets(project: ProjectV2, id: string, patch: Partial<Asset>): Asset[] {
-  return (project.assets ?? []).map((asset) => asset.id === id ? { ...asset, ...patch } : asset);
-}
-
 export function projectReducer(state: ProjectV2, action: ProjectAction): ProjectV2 {
   switch (action.type) {
     case "SET_PROJECT":
       return action.project;
-    case "PATCH_PROJECT":
-      return { ...state, ...action.patch };
+    case "PATCH_PROJECT": {
+      const next = { ...state, ...action.patch };
+      if (action.patch.projectCode === undefined) return next;
+      const projectCode = action.patch.projectCode.trim() || deriveProjectCode(next.title);
+      return { ...next, projectCode, assets: (next.assets ?? []).map((asset) => withAssetReferenceTag(asset, projectCode)) };
+    }
     case "ADD_ASSET": {
-      const created: Asset = {
-        id: newId(),
+      const id = newId();
+      const created: Asset = withAssetReferenceTag({
+        id,
         kind: action.kind,
         name: action.name ?? `NEW ${assetKindLabel(action.kind).toUpperCase()}`,
         description: "",
@@ -41,11 +43,21 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
         referencePaths: [],
         lockLevel: "none",
         tags: [],
-      };
+        variantGroupId: id,
+        baseAssetId: id,
+        stateName: "base",
+        version: 1,
+        changeLog: "",
+      }, state.projectCode?.trim() || deriveProjectCode(state.title));
       return { ...state, assets: [...(state.assets ?? []), created] };
     }
     case "UPDATE_ASSET":
-      return { ...state, assets: patchAssets(state, action.id, action.patch) };
+      return {
+        ...state,
+        assets: (state.assets ?? []).map((asset) => asset.id === action.id
+          ? withAssetReferenceTag({ ...asset, ...action.patch }, state.projectCode?.trim() || deriveProjectCode(state.title))
+          : asset),
+      };
     case "DELETE_ASSET":
       return {
         ...state,

@@ -193,6 +193,10 @@
   overflow-y: auto;
 }
 
+.asset-project-code { display: inline-flex; align-items: center; gap: 8px; margin: 0 0 12px; color: var(--text-muted); font-size: 11px; }
+.asset-project-code input { width: 100px; padding: 5px 7px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-input); color: var(--text); font: inherit; }
+.asset-state-grid { display: grid; grid-template-columns: minmax(0, 1fr) 92px; gap: 8px; }
+
 @media (max-width: 1080px) {
   .content { grid-template-columns: 1fr; }
   .content-side { position: static; max-height: none; }

@@ -41,7 +41,7 @@ export function renderAssetLine(asset: Asset, imageIndex: number, syntax: Refere
   const desc = locale === "zh"
     ? (asset.descriptionZh?.trim() || asset.description.trim() || asset.name.trim())
     : (asset.description.trim() || asset.descriptionZh?.trim() || asset.name.trim());
-  const namePart = asset.name.trim() || desc;
+  const namePart = asset.referenceTag?.trim() || asset.name.trim() || desc;
   const n = String(imageIndex);
   const head = syntax === "at-mention"
     ? fillTemplate(lex.templates.assetHeadAtMention, { name: namePart, n, desc })
@@ -305,7 +305,7 @@ export function totalSceneDuration(scene: SceneV2): number {
 
 /** 从 Project 取资产名 */
 export function assetNameById(project: ProjectV2): (id: string) => string {
-  const byId = new Map((project.assets ?? []).map((asset) => [asset.id, asset.name]));
+  const byId = new Map((project.assets ?? []).map((asset) => [asset.id, asset.referenceTag?.trim() || asset.name]));
   return (id: string) => byId.get(id) ?? id;
 }
 

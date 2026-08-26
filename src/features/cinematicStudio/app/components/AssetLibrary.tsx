@@ -99,6 +99,9 @@ export default function AssetLibrary({ project, dispatch, locale, t, setNotice }
       </div>
       <button className="outline-button" onClick={() => addAsset(tab)}><Plus size={15} /> {t.addAsset}</button>
     </div>
+    <label className="asset-project-code">{t.projectCode}
+      <input value={project.projectCode ?? ""} placeholder={t.projectCodePlaceholder} onChange={(event) => dispatch({ type: "PATCH_PROJECT", patch: { projectCode: event.target.value } })} />
+    </label>
     {assets.length === 0 ? <div className="empty assets-empty">{t.emptyAssets}</div> : <div className="asset-grid">
       {assets.map((asset) => <AssetTile key={asset.id} asset={asset} locale={locale} t={t} onClick={() => setEditingId(asset.id)} onDelete={() => { dispatch({ type: "DELETE_ASSET", id: asset.id }); setNotice(t.assetDeleted); }} />)}
     </div>}
@@ -231,6 +234,12 @@ function AssetEditor({ asset, locale, t, dispatch, setNotice, onClose }: { asset
             </label>
           </div>
           <label className="field-label">{t.assetName}<input className="modal-input" value={asset.name} placeholder={t.assetNamePlaceholder} onChange={(event) => update({ name: event.target.value })} /></label>
+          <label className="field-label">{t.assetReferenceTag}<input className="modal-input" value={`@${asset.referenceTag ?? asset.name}`} readOnly /></label>
+          <div className="asset-state-grid">
+            <label className="field-label">{t.assetStateName}<input className="modal-input" value={asset.stateName ?? "base"} placeholder={t.assetStateNamePlaceholder} onChange={(event) => update({ stateName: event.target.value })} /></label>
+            <label className="field-label">{t.assetVersion}<input className="modal-input" type="number" min="1" value={asset.version ?? 1} onChange={(event) => update({ version: Math.max(1, Number(event.target.value) || 1) })} /></label>
+          </div>
+          <label className="field-label">{t.assetChangeLog}<textarea className="modal-textarea asset-notes-input" value={asset.changeLog ?? ""} placeholder={t.assetChangeLogPlaceholder} onChange={(event) => update({ changeLog: event.target.value })} /></label>
           <label className="field-label">{t.assetNotes}<textarea className="modal-textarea asset-notes-input" value={locale === "zh" ? (asset.notesZh ?? "") : (asset.notes ?? "")} placeholder={locale === "zh" ? t.assetNotesZhPlaceholder : t.assetNotesPlaceholder} onChange={(event) => update(locale === "zh" ? { notesZh: event.target.value } : { notes: event.target.value })} /></label>
           {/* 声音音色（角色）：点击上传音频，可试听/删除 */}
           {asset.kind === "character" && <div className="field-label">{t.voiceClip}

@@ -1,7 +1,7 @@
 import type { Asset, Project, ProjectV2 } from "../shared-types";
-import { DEFAULT_NEGATIVE, fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, withNegativePrefix, bakeryRescueProject, museumRedDoorsProject } from "../engine";
+import { DEFAULT_NEGATIVE, deriveProjectCode, fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, withAssetReferenceTag, withNegativePrefix, bakeryRescueProject, museumRedDoorsProject } from "../engine";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const rainPreview = "./assets/rain-night-reference.jpg";
 
@@ -39,10 +39,12 @@ export function migrateProject(raw: unknown): ProjectV2 {
         shot.lens = fovToLegacyFocalLength(fov);
       }
     }
-    return project;
+    const projectCode = project.projectCode?.trim() || deriveProjectCode(project.title || project.id);
+    return { ...project, projectCode, assets: project.assets.map((asset) => withAssetReferenceTag(asset, projectCode)) };
   }
 
-  const migrated: ProjectV2 = { ...project, schemaVersion: SCHEMA_VERSION };
+  const projectCode = project.projectCode?.trim() || deriveProjectCode(project.title || project.id);
+  const migrated: ProjectV2 = { ...project, schemaVersion: SCHEMA_VERSION, projectCode };
   const legacy = project as Project;
   const charAssetIds = new Map<string, string>();
 
@@ -105,6 +107,8 @@ export function migrateProject(raw: unknown): ProjectV2 {
       }
     }
   }
+
+  migrated.assets = migrated.assets.map((asset) => withAssetReferenceTag(asset, projectCode));
 
   return migrated;
 }

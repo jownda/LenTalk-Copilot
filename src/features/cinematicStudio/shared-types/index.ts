@@ -141,6 +141,18 @@ export interface Asset {
   voiceClip?: string;
   /** 角色表演母版 + 声音锁（仅角色；P2/P5） */
   actingProfile?: AssetActingProfile;
+  /** 资产状态组；同一角色/地点/道具的状态变体共享该 id。 */
+  variantGroupId?: string;
+  /** 变体的基卡资产 id；基卡指向自身。 */
+  baseAssetId?: string;
+  /** 当前卡片的可见状态，如 base / wet / injured / night-rain。 */
+  stateName?: string;
+  /** 版本号只增不覆盖，作为提示词引用的一部分。 */
+  version?: number;
+  /** 新状态相对基卡的变化记录。 */
+  changeLog?: string;
+  /** 已持久化的稳定引用名：char_project_name_state_v1。 */
+  referenceTag?: string;
 }
 
 /** 身份强锁规则（绑定 Character Asset） */
@@ -308,6 +320,8 @@ export interface ProjectV02 {
   characterCountLock?: number;
   /** 数据 schema 版本 */
   schemaVersion?: number;
+  /** 资产 @ 引用使用的项目码。 */
+  projectCode?: string;
 }
 
 export interface SceneV02 {
