@@ -1,5 +1,5 @@
 import type { Asset, Project, ProjectV2 } from "../shared-types";
-import { DEFAULT_NEGATIVE, withNegativePrefix, bakeryRescueProject, museumRedDoorsProject } from "../engine";
+import { DEFAULT_NEGATIVE, fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, withNegativePrefix, bakeryRescueProject, museumRedDoorsProject } from "../engine";
 
 export const SCHEMA_VERSION = 2;
 
@@ -29,7 +29,18 @@ export const seedProject: ProjectV2 = {
  */
 export function migrateProject(raw: unknown): ProjectV2 {
   const project = (raw ?? {}) as ProjectV2;
-  if (project.schemaVersion === SCHEMA_VERSION && Array.isArray(project.assets)) return project;
+  if (project.schemaVersion === SCHEMA_VERSION && Array.isArray(project.assets)) {
+    for (const scene of project.scenes ?? []) {
+      for (const shot of scene.shots ?? []) {
+        if (shot.optics || !shot.lens) continue;
+        const fov = legacyFocalLengthToFov(shot.lens);
+        if (fov == null) continue;
+        shot.optics = { fieldOfViewDegrees: fov, lensCharacter: lensByFov(fov)?.id };
+        shot.lens = fovToLegacyFocalLength(fov);
+      }
+    }
+    return project;
+  }
 
   const migrated: ProjectV2 = { ...project, schemaVersion: SCHEMA_VERSION };
   const legacy = project as Project;
@@ -84,6 +95,13 @@ export function migrateProject(raw: unknown): ProjectV2 {
       }
       if (shot.action?.trim() && !Array.isArray(shot.beats)) {
         shot.beats = [{ id: `${shot.id}-beat-1`, order: 1, actorId: assetId, verb: "performs", actionText: shot.action.trim() }];
+      }
+      if (!shot.optics && shot.lens) {
+        const fov = legacyFocalLengthToFov(shot.lens);
+        if (fov != null) {
+          shot.optics = { fieldOfViewDegrees: fov, lensCharacter: lensByFov(fov)?.id };
+          shot.lens = fovToLegacyFocalLength(fov);
+        }
       }
     }
   }

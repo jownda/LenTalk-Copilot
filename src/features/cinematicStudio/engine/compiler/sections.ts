@@ -5,7 +5,7 @@
  */
 import type { ProjectV2, SceneV2, ShotV2 } from "../../shared-types";
 import { getCamera, getLens } from "../gear";
-import { renderTechnicalProfile } from "../presets";
+import { legacyFocalLengthToFov, lensByFov, renderTechnicalProfile } from "../presets";
 import { beatVerbZh } from "../beats";
 import {
   canonicalNegativeId, classifyNegative, renderDefaultNegative, renderNegativeItems, DEFAULT_NEGATIVE_IDS,
@@ -70,13 +70,13 @@ export function renderTechnicalSection(project: ProjectV2, locale: PromptLocale 
 }
 
 /** 相机参数覆写（长镜头模式用于全镜统一） */
-export type ShotCameraOverride = Partial<Pick<ShotV2, "framing" | "lens" | "movement" | "camera" | "lensModel">>;
+export type ShotCameraOverride = Partial<Pick<ShotV2, "framing" | "movement" | "camera" | "lensModel">>;
 
 export function unifiedCameraForScene(scene: SceneV2): ShotCameraOverride | undefined {
   if (scene.shootingMode !== "long-take") return undefined;
   const first = scene.shots[0];
   if (!first) return undefined;
-  return { framing: first.framing, lens: first.lens, movement: first.movement, camera: first.camera, lensModel: first.lensModel };
+  return { framing: first.framing, movement: first.movement, camera: first.camera, lensModel: first.lensModel };
 }
 
 /** 单镜头段（时间、相机、参与者、站位、状态链、Beats、NOTE；P2.1 引用语法） */
@@ -85,12 +85,12 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
   const shotLines = [renderShotTime(shot, locale)];
   const shotBit: string[] = [];
   const framing = cameraOverride && cameraOverride.framing !== undefined ? cameraOverride.framing : shot.framing;
-  const lensText = cameraOverride && cameraOverride.lens !== undefined ? cameraOverride.lens : shot.lens;
   const movement = cameraOverride && cameraOverride.movement !== undefined ? cameraOverride.movement : shot.movement;
   const cameraId = cameraOverride && cameraOverride.camera !== undefined ? cameraOverride.camera : shot.camera;
   const lensModelId = cameraOverride && cameraOverride.lensModel !== undefined ? cameraOverride.lensModel : shot.lensModel;
   if (framing?.trim()) shotBit.push(localizePromptValue(framing.trim(), locale));
-  if (lensText?.trim()) shotBit.push(lensText.trim());
+  const fov = shot.optics?.fieldOfViewDegrees ?? lensByFov(legacyFocalLengthToFov(shot.lens))?.fov;
+  if (fov != null) shotBit.push(locale === "zh" ? `视场角 ${fov}°` : `FOV ${fov}°`);
   if (movement) shotBit.push(`${localizePromptValue(movement, locale)}${locale === "zh" ? "" : " movement"}`);
   const camera = getCamera(cameraId);
   if (camera) shotBit.push(`${locale === "zh" ? "相机" : "Camera"}: ${camera.brand} ${camera.model}`);

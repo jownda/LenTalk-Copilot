@@ -15,7 +15,7 @@ import type { Asset, ContinuityIssueV2, ProjectV2, SceneV2, ShotRisk } from "../
 import { resolveCharacterOrder } from "./compiler/renderer";
 import { TERMINAL_STATES, TRIGGER_VERBS } from "./states";
 import { ATTACK_VERBS } from "./beats";
-import { FILM_PRESETS, LENS_BANK, lensById, presetById, type LensContentClass } from "./presets";
+import { FILM_PRESETS, LENS_BANK, legacyFocalLengthToFov, lensById, presetById, type LensContentClass } from "./presets";
 
 /** 画面方向值的中文映射（连续性详情在 zh 界面使用） */
 const DIR_ZH: Record<string, string> = {
@@ -637,18 +637,19 @@ export function checkTechnical(project: ProjectV2, scene: SceneV2, _options: Con
     }
   }
 
-  // P3 光学：只写了品牌/焦距，没给镜头语言（FOV）→ info，引导用可观测结果表达
+  // P3 光学：只写了品牌/焦距，没给镜头语言（FOV）→ error，阻止两套语义并存
   for (const shot of scene.shots) {
-    const hasFov = Boolean(shot.optics?.lensCharacter || shot.optics?.fieldOfViewDegrees);
-    const brandText = shot.lensModel?.trim() || shot.lens?.trim();
+    const hasFov = Boolean(shot.optics?.lensCharacter || shot.optics?.fieldOfViewDegrees || legacyFocalLengthToFov(shot.lens));
+    const brandText = shot.lensModel?.trim();
     if (brandText && !hasFov) {
       issues.push({
-        code: "OPTICS.BRAND_AS_PRIMARY",
-        severity: "info",
+        code: "OPTICS.DUAL_TRACK_CONFLICT",
+        severity: "error",
         entityId: shot.id,
-        label: "Brand / focal length without FOV",
-        detail: `Shot ${shot.label} declares gear ("${brandText}") but no lens character / FOV; give an observable lens language (47°/84°/107°/29°/18°/8°/135°) instead.`,
-        detailZh: `镜头「${shot.label}」只写了器材（“${brandText}”），没有给出镜头语言/视场角；请改用可观测的镜头语言（47°/84°/107°/29°/18°/8°/135°）。`,
+        label: "FOV missing",
+        detail: `Shot ${shot.label} declares gear ("${brandText}") but no FOV; choose an observable lens language (47°/84°/107°/29°/18°/8°/135°) before export.`,
+        detailZh: `镜头「${shot.label}」只写了器材（“${brandText}”），没有视场角；导出前请补充可观测的镜头语言（47°/84°/107°/29°/18°/8°/135°）。`,
+        fixLabel: "Choose FOV",
       });
     }
   }

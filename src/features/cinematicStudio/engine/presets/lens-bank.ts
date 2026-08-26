@@ -165,3 +165,27 @@ export function lensByFov(degrees?: number): LensPreset | undefined {
     return Math.abs(preset.fov - degrees) < Math.abs(best.fov - degrees) ? preset : best;
   }, undefined);
 }
+
+/** 旧工程的 mm 焦段只用于迁移兼容，不作为新的提示词字段。 */
+export function legacyFocalLengthToFov(value?: string): number | undefined {
+  const match = value?.match(/(\d+(?:\.\d+)?)\s*mm/i);
+  if (!match) return undefined;
+  const focal = Number(match[1]);
+  if (!Number.isFinite(focal)) return undefined;
+  if (focal <= 28) return 84;
+  if (focal <= 50) return 47;
+  if (focal <= 65) return 29;
+  if (focal <= 85) return 18;
+  return 8;
+}
+
+/** 为仍要求旧 Shot.lens 的兼容结构生成稳定的 mm 值。 */
+export function fovToLegacyFocalLength(degrees?: number): string {
+  if (degrees == null) return "50mm";
+  if (degrees >= 107) return "24mm";
+  if (degrees >= 84) return "28mm";
+  if (degrees >= 47) return "50mm";
+  if (degrees >= 29) return "65mm";
+  if (degrees >= 18) return "85mm";
+  return "135mm";
+}

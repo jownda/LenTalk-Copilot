@@ -75,6 +75,8 @@ describe("compileDirectorSequence stored layer quality gate", () => {
     expect(output).toContain("SCENE CONTEXT");
     expect(output).toContain("FORMAT MODE");
     expect(output).toContain("SHOT 镜头 1");
+    expect(output).toContain("FOV 47°");
+    expect(output).not.toContain("35mm");
     expect(output).not.toContain("AI generated scene.");
     expect(output).not.toContain("continuous action without shot blocks.");
   });

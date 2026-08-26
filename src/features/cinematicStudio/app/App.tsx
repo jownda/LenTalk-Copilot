@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers } from "../engine";
+import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
 import { ChevronDown, Clapperboard, Copy, Download, FileJson, FileText, FolderOpen, History, PenLine, Plus, Save, Sparkles, X } from "lucide-react";
 import { classifyError, fillSceneDraft, getAssistant } from "./providers/ai";
@@ -252,7 +252,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
     const last = scene.shots[scene.shots.length - 1];
     const end = last?.time?.endSeconds ?? (() => { const m = last?.duration.match(/(\d+)\s*-\s*(\d+)/); return m ? Number(m[2]) : 0; })();
     const step = 8; // 每个镜头默认 8 秒
-    const created: ShotV2 = { id: newId(), label: String(scene.shots.length + 1).padStart(2, "0"), duration: `${end}-${end + step}${t.seconds}`, time: { startSeconds: end, endSeconds: end + step }, framing: "Medium close-up", lens: "50mm", movement: "Static", action: t.defineAction, acting: t.naturalPerformance, direction: scene.shots[scene.shots.length - 1]?.direction ?? "left-to-right", cutStyle: scene.cutStyleDefault ?? "hard-cut" };
+    const created: ShotV2 = { id: newId(), label: String(scene.shots.length + 1).padStart(2, "0"), duration: `${end}-${end + step}${t.seconds}`, time: { startSeconds: end, endSeconds: end + step }, framing: "Medium close-up", lens: "50mm", optics: { lensCharacter: "47-standard", fieldOfViewDegrees: 47 }, movement: "Static", action: t.defineAction, acting: t.naturalPerformance, direction: scene.shots[scene.shots.length - 1]?.direction ?? "left-to-right", cutStyle: scene.cutStyleDefault ?? "hard-cut" };
     setProject((current) => ({ ...current, scenes: current.scenes.map((item) => item.id === scene.id ? { ...item, shots: [...item.shots, created] } : item) })); setShotId(created.id);
   };
   /** AI 智能分镜：读取用户音频计划作为参考，生成镜头列表/检查器/导演文档，最后编译到提示词编辑器 */
@@ -421,7 +421,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
                   <option value="match-cut">{t.cutMatch}</option>
                 </select><ChevronDown size={10} /></span>
               </span>
-              <span className="shot-camera">{item.lens}<small>{cameraLabels[locale][item.movement]}</small></span>
+              <span className="shot-camera">{(() => { const fov = item.optics?.fieldOfViewDegrees ?? lensById(item.optics?.lensCharacter)?.fov ?? lensByFov(legacyFocalLengthToFov(item.lens))?.fov; return fov == null ? "—" : `${fov}°`; })()}<small>{cameraLabels[locale][item.movement]}</small></span>
               <button className="shot-delete" title={t.deleteShot} onClick={(event) => { event.stopPropagation(); deleteShot(item.id); }}><X size={13} /></button>
             </div>;
           })}
@@ -448,7 +448,6 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
             </div>
             <div className="fields-grid">
               <LabeledSelect label={t.framing} value={shot.framing} values={["Wide", "3/4 medium, behind subject", "Medium close-up", "Extreme close-up, profile"]} displayValue={(value) => framingLabels[locale][value]} onChange={(value) => updateShot({ framing: value })} />
-              <LabeledSelect label={t.lens} value={shot.lens} values={["24mm", "28mm", "35mm", "50mm", "65mm", "85mm", "100mm", "135mm"]} onChange={(value) => updateShot({ lens: value })} />
               <LabeledSelect label={t.movement} value={shot.movement} values={movements} displayValue={(value) => cameraLabels[locale][value]} onChange={(value) => updateShot({ movement: value as CameraMovement })} />
             </div>
           </InspectorSection>

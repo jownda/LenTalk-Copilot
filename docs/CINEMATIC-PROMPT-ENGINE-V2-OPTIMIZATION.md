@@ -369,6 +369,8 @@ UI 位置：名称输入框下方；其他资产类型同逻辑。
 
 **文件**：`src/features/cinematicStudio/app/components/OpticsCameraEditor.tsx`、`src/features/cinematicStudio/app/App.tsx`（检查器）、`src/features/cinematicStudio/app/providers/ai.ts`、`src/features/cinematicStudio/engine/continuity.ts`、`src/features/cinematicStudio/shared-types/index.ts`
 
+**V2.13 验收结果**：已完成。旧 `Shot.lens` 仍保留为兼容字段，项目加载时会映射到 `optics.fieldOfViewDegrees`；检查器和镜头列表只显示 FOV，结构化编译输出 FOV 而不输出 mm；新建镜头和 AI 镜头默认建立 FOV。AI 请求侧移除顶层 `lens` 与 `audioPlan` schema 字段，连续性检查将无法识别的品牌/焦段而无 FOV 的情况升级为 error。新增迁移、FOV 兼容与连续性测试。
+
 ---
 
 ### V2-P3-7 镜头列表以下（检查器）内容未进最终提示词
@@ -398,7 +400,7 @@ UI 位置：名称输入框下方；其他资产类型同逻辑。
 | V2.10 | 资产备注字段 + AI 填写纳入备注（角色信息栏） | 数据+AI+UI | 中 | `feat:` |
 | V2.11 | 风格倾向 → 风格描述自动派生（一段式中英分离描述） | 预设+UI+编译 | 低 | `feat:` 已完成 |
 | V2.12 | AI 编译分水岭：删 audioPlan 输出，AI 只读不回写；用户区/AI区视觉分隔 | AI+UI | 中 | `feat:` 已完成 |
-| V2.13 | 焦段统一为视场角（mm 兼容层删除 UI） | 引擎+AI+UI | 中 | `refactor:` |
+| V2.13 | 焦段统一为视场角（mm 兼容层删除 UI） | 引擎+AI+UI | 中 | `refactor:` 已完成 |
 | V2.14 | 检查器内容进最终提示词（分层 + 结构化合并输出） | 引擎+AI | 高 | `feat:` |
 | V2.15 | P3 回归走查（下节断言）+ 提交 | 验收 | — | `fix:` |
 

@@ -20,6 +20,10 @@ export interface ShotTemplate {
 }
 
 const newId = () => crypto.randomUUID();
+const opticsStandard = { lensCharacter: "47-standard" as const, fieldOfViewDegrees: 47 };
+const opticsWide = { lensCharacter: "84-wide" as const, fieldOfViewDegrees: 84 };
+const opticsPortrait = { lensCharacter: "29-short-tele" as const, fieldOfViewDegrees: 29 };
+const opticsTele = { lensCharacter: "18-tele" as const, fieldOfViewDegrees: 18 };
 
 function nextLabel(scene: SceneV2): string {
   return String(scene.shots.length + 1).padStart(2, "0");
@@ -32,7 +36,7 @@ const resolveReaction: ShotTemplate = {
   create: (project, scene) => {
     const firstCharacter = (project.assets ?? []).find((a) => a.kind === "character")?.id;
     const shot: ShotV2 = {
-      id: newId(), label: nextLabel(scene), duration: "0-5s", framing: "Extreme close-up", lens: "85mm", movement: "Static",
+      id: newId(), label: nextLabel(scene), duration: "0-5s", framing: "Extreme close-up", lens: "85mm", optics: opticsTele, movement: "Static",
       participants: firstCharacter ? [{ characterId: firstCharacter, role: "primary", position: "center", entrance: "already-in-frame" }] : [],
       beats: [
         { id: newId(), order: 1, duration: 1.5, actorId: firstCharacter, verb: "pauses", actionText: "eye darts toward the target, decision forming" },
@@ -62,7 +66,7 @@ const groupStaging: ShotTemplate = {
       })
       .filter((p): p is { characterId: string; role: "primary" | "supporting" | "target" | "background" } => Boolean(p));
     const shot: ShotV2 = {
-      id: newId(), label: nextLabel(scene), duration: "0-3s", framing: "Wide", lens: "24mm", movement: "Static",
+      id: newId(), label: nextLabel(scene), duration: "0-3s", framing: "Wide", lens: "24mm", optics: opticsWide, movement: "Static",
       participants,
       layout: { useSceneStaging: true },
       beats: [{ id: newId(), order: 1, duration: 3, verb: "pauses", actionText: "full group visible, static hold" }],
@@ -84,7 +88,7 @@ const propTrigger: ShotTemplate = {
     const firstCharacter = (project.assets ?? []).find((a) => a.kind === "character")?.id;
     const firstProp = (project.assets ?? []).find((a) => a.kind === "prop")?.id;
     const shot: ShotV2 = {
-      id: newId(), label: nextLabel(scene), duration: "0-6s", framing: "Close-up", lens: "50mm", movement: "Static",
+      id: newId(), label: nextLabel(scene), duration: "0-6s", framing: "Close-up", lens: "50mm", optics: opticsPortrait, movement: "Static",
       participants: firstCharacter ? [{ characterId: firstCharacter, role: "primary", position: "center", entrance: "already-in-frame" }] : [],
       beats: [
         { id: newId(), order: 1, duration: 1.5, actorId: firstCharacter, verb: "grabs", targetPropId: firstProp, targetBodyPart: "hand close-up" },
@@ -110,7 +114,7 @@ const rescueChain: ShotTemplate = {
     const attacker = characters[0]?.id;
     const victim = characters[1]?.id;
     const shot: ShotV2 = {
-      id: newId(), label: nextLabel(scene), duration: "0-8s", framing: "Medium", lens: "35mm", movement: "Handheld",
+      id: newId(), label: nextLabel(scene), duration: "0-8s", framing: "Medium", lens: "35mm", optics: opticsStandard, movement: "Handheld",
       participants: [attacker, victim].filter(Boolean).map((characterId) => ({ characterId: characterId!, role: "primary" as const, entrance: "already-in-frame" as const })),
       beats: [
         { id: newId(), order: 1, duration: 2, actorId: attacker, verb: "grabs", targetCharacterId: victim, targetBodyPart: "collar", required: true, forbiddenTargets: [] },
@@ -137,7 +141,7 @@ const blastEnter: ShotTemplate = {
     const firstProp = (project.assets ?? []).find((a) => a.kind === "prop")?.id;
     const location = scene.staging?.locationAssetId ?? (project.assets ?? []).find((a) => a.kind === "location")?.id;
     const shot: ShotV2 = {
-      id: newId(), label: nextLabel(scene), duration: "0-10s", framing: "Wide", lens: "24mm", movement: "Dolly",
+      id: newId(), label: nextLabel(scene), duration: "0-10s", framing: "Wide", lens: "24mm", optics: opticsWide, movement: "Dolly",
       participants: firstCharacter ? [{ characterId: firstCharacter, role: "primary", position: "center", entrance: "enters-left" }] : [],
       propStatesAtStart: firstProp ? [{ propId: firstProp, state: "armed" }] : [],
       beats: [

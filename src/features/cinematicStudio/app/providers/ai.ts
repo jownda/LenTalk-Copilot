@@ -6,6 +6,7 @@
 import { DIRECTOR_LAYER_ORDER, LocalSuggestionProvider, SHOT_TEMPLATES, localizedStyleBrief } from "../../engine";
 import type { AIAssistant, AssetSuggestion, BeatSuggestion, FixSuggestion, SceneSuggestion } from "../../engine";
 import { buildSceneAssetRegistry } from "../../engine/compiler/renderer";
+import { fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov } from "../../engine/presets";
 import { validateDirectorLayers, type DirectorLayerIssue } from "../../engine/quality";
 import type {
   ActionBeat, Asset, AssetActingProfile, AssetKind, CameraBehavior, CameraMovement, ContinuityIssueV2, CutStyle,
@@ -675,7 +676,6 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
   const vocabLines = [
     "Available camera IDs: arri-alexa-35, arri-alexa-mini-lf, red-v-raptor, sony-venice-2, bmd-ursa-cine, canon-c300-iii, panasonic-s1h, kinefinity-mavo-edge",
     "Available lensModel IDs: arri-master-prime, zeiss-supreme-prime, zeiss-cp4, cooke-s7i, leica-summicron-c, angenieux-optimo, canon-cne, sigma-cine-ff, cooke-panchro, helios-44-2",
-    "lens: pick from 24mm, 28mm, 35mm, 50mm, 65mm, 85mm, 100mm, 135mm",
     "framing: pick from Wide, Medium close-up, or Extreme close-up, profile (free English framing phrases also allowed)",
     "movement: pick from Static, Handheld, Steadicam, Dolly, Tracking, Crane, POV, OTS",
     "direction: \"left-to-right\" or \"right-to-left\"; cutStyle: \"hard-cut\" | \"overlap\" | \"match-cut\"",
@@ -712,9 +712,9 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     `Technical profile: ${JSON.stringify(project.technicalProfile ?? {})}`,
     "",
     "STORYBOARD RULES:",
-    "Plan 1-8 shots covering the whole scene: establish, medium, close-up/detail, reaction, and any beat-driven shots. Use more shots for longer/more complex scenes and fewer for simple ones. Vary framing, lens, camera and movement meaningfully. Keep shots in chronological order; each shot's duration 3-12s.",
+    "Plan 1-8 shots covering the whole scene: establish, medium, close-up/detail, reaction, and any beat-driven shots. Use more shots for longer/more complex scenes and fewer for simple ones. Vary framing, FOV, camera and movement meaningfully. Keep shots in chronological order; each shot's duration 3-12s.",
     `Timeline: all shots are sequential; shot 1 starts at 0; shot N starts where shot N-1 ends; pass startSeconds/endSeconds. Duration label uses "${seconds}" suffix.`,
-    "Every shot needs action, acting, framing, lens, movement, direction, and participants (only existing character IDs). Assign camera / lensModel from the available IDs when the scene benefits from a specific look, otherwise omit.",
+    "Every shot needs action, acting, framing, optics.fieldOfViewDegrees, movement, direction, and participants (only existing character IDs). Assign camera / lensModel from the available IDs when the scene benefits from a specific look, otherwise omit.",
     "Performance (P2): per shot, set performanceLevel (0-5, 4 default whenever the acting master profile is strong) and eyeLife (micro glances / blink quality / eye glint / eyes leading the turn). Fill the beats' P2 fields: tactic (press / charm / provoke...), subtext (true intent opposite to the line), beatChange (visible shift: pause / posture / tempo / eye-line cut), reactionBeforeLine (reaction starting before the other speaker finishes).",
     "Photography (P1): prefer observable lens character over focal-length-only strings. Per shot set optics.lensCharacter from the 7 presets (47-standard / 84-wide / 107-ultrawide / 29-short-tele / 18-tele / 8-supertele / 135-immersive) with optics.fieldOfViewDegrees 8-135 matching the preset, and add lensOutcome + antiDriftLock when the look must stay locked. Set cameraBehavior as physical operator behavior (height / distance / angle / side / subjectSize / screenPlacement / focusBehavior / depthOfField / handheldQuality). Add physicsAnchors for walk / run / weapon / liquid / particle. Per participant set torsoFacing when the body turns away from the eyeline, and anchorDistance when a landmark anchors the scene. At scene level return firstFrameLock.requiredSubjectIds (only existing asset ids that MUST be on screen in frame one) and lightingDirection (primarySource / direction / exposurePriority / allowHighlights / forbid).",
     "State, not transition: write mid-action states (jaw clenched, strides lengthening), never transition chains (starts to... / begins to...). Groups react in staggered waves with different intensities, never in unison.",
@@ -747,7 +747,9 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     `{ "sceneName": string, "emotionArc": string, "actingObjectives": [ { "characterId": string, "objective": string, "superObjective": string | null, "obstacle": string | null, "stakes": string | null } ], "firstFrameLock": { "requiredSubjectIds": string[], "occupancyStatement": string | null }, "lightingDirection": { "primarySource": string | null, "direction": string | null, "exposurePriority": string | null, "allowHighlights": string[], "forbid": string[] }, "negativePrompt": string, "directorLayers": { "sceneContext": string, "activeReferences": string, "locationMap": string, "firstFrame": string, "formatMode": string, "optics": string, "camera": string, "actionTiming": string, "physics": string, "lighting": string, "audio": string, "positiveConstraints": string, "negativeLocks": string }, "audioPlan": { "diegeticMusic": string[], "musicSourcePropId": string | null, "sfx": string[], "score": "none" | "original-score", "subtitles": boolean }, "shots": [ { "time": { "startSeconds": number, "endSeconds": number }, "label": string, "framing": string, "lens": string, "lensModel": string | null, "camera": string | null, "optics": { "lensCharacter": "47-standard" | "84-wide" | "107-ultrawide" | "29-short-tele" | "18-tele" | "8-supertele" | "135-immersive" | null, "fieldOfViewDegrees": number | null, "lensOutcome": string[] | null, "antiDriftLock": string | null }, "cameraBehavior": { "height": string | null, "distance": string | null, "angle": string | null, "side": string | null, "subjectSize": string | null, "screenPlacement": string | null, "focusBehavior": string | null, "depthOfField": string | null, "handheldQuality": string | null }, "physicsAnchors": [ { "kind": "walk" | "run" | "weapon" | "liquid" | "particle", "detail": string | null } ], "movement": string, "action": string, "acting": string, "performanceLevel": number, "eyeLife": string, "direction": "left-to-right" | "right-to-left", "cutStyle": "hard-cut" | "overlap" | "match-cut", "participants": [ { "characterId": string, "role": "primary" | "supporting" | "target" | "background", "position": string | null, "entrance": "already-in-frame" | "enters-left" | "enters-right" | null, "facing": string | null, "eyeline": string | null, "torsoFacing": string | null, "anchorDistance": string | null } ], "beats": [ { "order": number, "duration": number, "verb": string, "actorId": string | null, "targetCharacterId": string | null, "targetPropId": string | null, "targetBodyPart": string | null, "actionText": string | null, "dialogue": string | null, "tactic": string | null, "subtext": string | null, "beatChange": string | null, "reactionBeforeLine": string | null, "required": boolean, "forbiddenTargets": string[], "stateBefore": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "stateAfter": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "cutRule": string | null, "note": string | null } ], "propStatesAtStart": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "propStatesAtEnd": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "note": string | null } ] }`,
     ...vocabLines,
     "Do NOT invent character/prop IDs. Do NOT add prose or keys outside the schema (the only exceptions are the top-level negativePrompt and directorLayers fields).",
-  ].join("\n").replace(/, "audioPlan": \{[^}]*\}, "shots"/, ', "shots"'));
+  ].join("\n")
+    .replace(', "audioPlan": { "diegeticMusic": string[], "musicSourcePropId": string | null, "sfx": string[], "score": "none" | "original-score", "subtitles": boolean }, "shots"', ', "shots"')
+    .replace(/, "lens": string,/, ''));
 
   return normalizeSceneDraft(project, scene, data, seconds);
 }
@@ -935,10 +937,13 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     const movement = asString(raw.movement, "Static") as CameraMovement;
     const cutStyle = asString(raw.cutStyle, scene.cutStyleDefault ?? "hard-cut") as CutStyle;
     const framing = asString(raw.framing, "Medium close-up");
-    const lens = asString(raw.lens, "50mm");
+    const legacyLens = asString(raw.lens, undefined);
     const lensModel = asString(raw.lensModel, undefined);
     const camera = asString(raw.camera, undefined);
     const shotOptics = normalizeOptics(raw.optics);
+    const legacyFov = shotOptics?.fieldOfViewDegrees ?? legacyFocalLengthToFov(legacyLens) ?? 47;
+    const normalizedOptics = shotOptics ?? { fieldOfViewDegrees: legacyFov, lensCharacter: lensByFov(legacyFov)?.id };
+    const lens = legacyLens || fovToLegacyFocalLength(legacyFov);
     const shotCameraBehavior = normalizeCameraBehavior(raw.cameraBehavior);
     const shotPhysicsAnchors = normalizePhysicsAnchors(raw.physicsAnchors);
     const direction = asString(raw.direction, "left-to-right") as ShotV2["direction"];
@@ -953,7 +958,7 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
       lens,
       ...(lensModel ? { lensModel } : {}),
       ...(camera ? { camera } : {}),
-      ...(shotOptics ? { optics: shotOptics } : {}),
+      ...(normalizedOptics ? { optics: normalizedOptics } : {}),
       ...(shotCameraBehavior ? { cameraBehavior: shotCameraBehavior } : {}),
       ...(shotPhysicsAnchors ? { physicsAnchors: shotPhysicsAnchors } : {}),
       movement,
