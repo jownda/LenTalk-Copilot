@@ -2589,7 +2589,7 @@
   right: var(--space-4);
   bottom: var(--space-4);
   transform: none;
-  z-index: 50;
+  z-index: 130;
   padding: 10px 14px;
   border-radius: var(--r-md);
   box-shadow: var(--shadow-md);

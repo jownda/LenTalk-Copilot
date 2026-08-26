@@ -202,6 +202,7 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
     if (!isRemoteConfigured()) { setNotice(t.aiNotConfigured); return; }
     if (!(asset.referencePaths ?? []).length) { setNotice(t.aiFillNeedsImage); return; }
     setAiBusy(true);
+    setNotice(t.aiFillStarted);
     try {
       const patch = await fillAssetDetails(asset, locale);
       update(patch);
@@ -267,7 +268,7 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
 
         {/* 右列：描述 → AI 填写结果 */}
         <div className="asset-modal-right">
-          <button className="outline-button asset-ai-fill-button" disabled={aiBusy} onClick={() => void aiFillDetails()}>{aiBusy ? <span className="spin-dot" /> : <Sparkles size={14} />} {t.aiFillDetails}</button>
+          <button type="button" className="primary-button asset-ai-fill-button" disabled={aiBusy} aria-busy={aiBusy} onClick={() => void aiFillDetails()}>{aiBusy ? <span className="spin-dot" /> : <Sparkles size={14} />} {aiBusy ? t.aiFillStarted : t.aiFillDetails}</button>
           <div className="asset-ai-output-label">{t.assetAiOutput}</div>
           {locale === "zh" ? (
             <label className="field-label">{t.assetDescriptionZh}<textarea className="modal-textarea" value={asset.descriptionZh ?? ""} placeholder={t.assetDescriptionZhPlaceholder} onChange={(event) => update({ descriptionZh: event.target.value })} /></label>
