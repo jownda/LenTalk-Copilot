@@ -5,6 +5,7 @@
  */
 import { DIRECTOR_LAYER_ORDER, LocalSuggestionProvider, SHOT_TEMPLATES } from "../../engine";
 import type { AIAssistant, AssetSuggestion, BeatSuggestion, FixSuggestion, SceneSuggestion } from "../../engine";
+import { buildSceneAssetRegistry } from "../../engine/compiler/renderer";
 import type {
   ActionBeat, Asset, AssetActingProfile, AssetKind, AudioPlan, CameraBehavior, CameraMovement, ContinuityIssueV2, CutStyle,
   FirstFrameLock, LightingDirection, LockLevel, Optics, PhysicsAnchor, ProjectV2, PropState, SceneV2, ShotParticipant, ShotV2,
@@ -615,6 +616,15 @@ interface GeneratedShotResult {
   cutStyle?: unknown;
 }
 
+/** V2.3：收集本场景明确引用的资产，供 AI 输入侧和后续审计共用。 */
+export function collectSceneAssetIds(project: ProjectV2, scene: SceneV2): string[] {
+  const byId = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
+  const shotIds = buildSceneAssetRegistry(project, scene).orderedAssets.map((asset) => asset.id);
+  const stagingCharacterIds = (scene.staging?.characterOrder ?? [])
+    .filter((id) => byId.get(id)?.kind === "character");
+  return Array.from(new Set([...shotIds, ...stagingCharacterIds]));
+}
+
 /**
  * AI 智能分镜：读取场景卡片的内容（地点站位、前情续接、故事梗概、角色/道具资产），
  * 生成完整的剧情分镜（镜头列表 + 各镜头检查器内容 + 音频计划），并返回可直接写入 Project 的结果。
@@ -628,8 +638,11 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
 
   const assets = project.assets ?? [];
   const byId = new Map(assets.map((asset) => [asset.id, asset]));
-  const characterIds = assets.filter((asset) => asset.kind === "character").map((asset) => asset.id);
-  const propIds = assets.filter((asset) => asset.kind === "prop").map((asset) => asset.id);
+  // V2.3：AI 只接收本场景已有引用，不把项目资产库全集暴露给模型。
+  // 场景站位角色即使尚未进入某个镜头，也属于用户明确指定的场景资产。
+  const sceneAssetIds = collectSceneAssetIds(project, scene);
+  const characterIds = sceneAssetIds.filter((id) => byId.get(id)?.kind === "character");
+  const propIds = sceneAssetIds.filter((id) => byId.get(id)?.kind === "prop");
   const locationAsset = scene.staging?.locationAssetId ? byId.get(scene.staging.locationAssetId) : undefined;
   const orderIds = [...(scene.staging?.characterOrder ?? [])].filter((id) => byId.has(id) && byId.get(id)?.kind === "character");
   const seconds = t?.seconds ?? "s";
@@ -677,8 +690,8 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     `Scene emotion arc: ${scene.emotionArc?.trim() || "(not set)"}; Scene name: ${scene.name}`,
     "",
     `LOCATION ASSET: ${locationAsset ? `${locationAsset.name}(${locationAsset.id}) — ${locationAsset.description?.trim() || locationAsset.descriptionZh?.trim() || ""}` : "(none)"}`,
-    `CHARACTER ASSETS: ${assetSummary(characterIds) || "(none)"}`,
-    `PROP ASSETS: ${assetSummary(propIds) || "(none)"}`,
+    `CHARACTER ASSETS (scene references only): ${assetSummary(characterIds) || "(none)"}`,
+    `PROP ASSETS (scene references only): ${assetSummary(propIds) || "(none)"}`,
     `Existing beats may reference: ${allowedBeats.join(", ") || "(none)"}`,
     `Technical profile: ${JSON.stringify(project.technicalProfile ?? {})}`,
     "",
@@ -696,8 +709,10 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     "Audio plan: diegeticMusic/sfx as short concrete cues; score only \"none\" or \"original-score\"; subtitles true when dialogue needs burned-in subtitles. musicSourcePropId must be an existing prop or null.",
     "DIRECTOR LAYERS: also produce \"directorLayers\", an object that lays out this scene as a director-level document in this exact order. Each key maps to one full text block whose FIRST line is its own section header (Chinese header when the scene is Chinese, English uppercase otherwise).",
     `Layer keys in order: ${DIRECTOR_LAYER_ORDER.join(", ")}.`,
+    "Use only these canonical section headers; never invent, translate, rename, or omit a header. Choose the Chinese header for a Chinese scene and the English uppercase header for an English scene:",
+    "sceneContext=场景上下文 / SCENE CONTEXT; activeReferences=活动引用 / ACTIVE REFERENCES; locationMap=位置图 / LOCATION MAP; firstFrame=首帧与站位 / FIRST FRAME AND SPATIAL BLOCKING; formatMode=格式模式 / FORMAT MODE; optics=光学 / OPTICS; camera=相机 / CAMERA; actionTiming=动作时间 / ACTION TIMING; physics=物理 / PHYSICS; lighting=光线 / LIGHTING; audio=音频 / AUDIO; positiveConstraints=正向约束 / POSITIVE CONSTRAINTS; negativeLocks=负面局部锁 / NEGATIVE LOCKS.",
     "sceneContext: one or two sentences for this scene only (no scene number, no prior-context summary).",
-    "activeReferences: list ONLY the @tag assets actually used in this scene's shots (context isolation).",
+    "activeReferences: list ONLY the @tag assets provided in the scene-reference asset lists; never mention assets absent from those lists.",
     "locationMap: camera position/orientation, foreground-midground-background, landmarks, movement paths, light direction.",
     "firstFrame: first-frame occupancy lock + spatial blocking (who/where at frame one).",
     "formatMode: SINGLE CONTINUOUS TAKE or CONTROLLED MULTI-SHOT SEQUENCE (long-take vs multi-shot).",
@@ -709,6 +724,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     "audio: audio + dialogue rules + per-character voice lock.",
     "positiveConstraints: positive hard constraints (character count lock, strict identity, user hard constraints).",
     "negativeLocks: only global failure modes (identity drift, floating motion, text/watermark); local locks go inline in their own section instead.",
+    "Never output project-management metadata such as enabled assets, disabled assets, unused assets, or project-only assets. Never mention an asset by name unless it is in the scene-reference asset lists.",
     "",
     "Return ONLY a JSON object matching this schema:",
     "The top-level object MUST also include \"negativePrompt\": string (see Negative prompt rule) and \"directorLayers\": object (see DIRECTOR LAYERS rule).",
