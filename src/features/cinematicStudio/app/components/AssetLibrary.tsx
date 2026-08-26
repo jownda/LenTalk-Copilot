@@ -8,7 +8,7 @@
 import { createPortal } from "react-dom";
 import { useState } from "react";
 import type { Asset, AssetActingProfile, AssetKind, LockLevel, ProjectV2, SceneV2 } from "../../shared-types";
-import { ImagePlus, Lock, LockKeyhole, Mic, Plus, Sparkles, Trash2, X } from "lucide-react";
+import { ImagePlus, Lock, LockKeyhole, Mic, Plus, SlidersHorizontal, Sparkles, Trash2, X } from "lucide-react";
 import type { ProjectAction } from "../store/projectReducer";
 import type { Locale } from "../i18n";
 import { classifyError, fillAssetDetails } from "../providers/ai";
@@ -168,6 +168,7 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
   const [alwaysDraft, setAlwaysDraft] = useState("");
   const [variantComposerOpen, setVariantComposerOpen] = useState(false);
   const [variantStateName, setVariantStateName] = useState("");
+  const [exportConstraintsOpen, setExportConstraintsOpen] = useState(false);
   const update = (patch: Partial<Asset>) => dispatch({ type: "UPDATE_ASSET", id: asset.id, patch });
   const acting = asset.actingProfile ?? {};
   const updateActing = (patch: Partial<AssetActingProfile>) => update({ actingProfile: { ...acting, ...patch } });
@@ -332,7 +333,6 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
           <div className="field-label">{t.lockLevel}<div className="lock-options">
             {lockLevels.map(([level, key]) => <button key={level} className={`lock-option ${asset.lockLevel === level ? "active" : ""}`} onClick={() => update({ lockLevel: level })}>{t[key]}</button>)}
           </div></div>
-          {asset.lockLevel === "strict" && <p className="hint-text">{t.strictIdentityHint}</p>}
         </div>
 
         {/* 右列：描述 → AI → 表演字段 → 其他约束 */}
@@ -343,7 +343,10 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
             ) : (
               <label className="field-label">{t.assetDescription}<textarea className="modal-textarea" value={asset.description} placeholder={t.assetDescriptionPlaceholder} spellCheck={false} onChange={(event) => update({ description: event.target.value })} /></label>
             )}
-            <button className="outline-button translate-btn" disabled={aiBusy} onClick={() => void aiFillDetails()}>{aiBusy ? <span className="spin-dot" /> : <Sparkles size={13} />} {t.aiFillDetails}</button>
+            <div className="asset-desc-actions">
+              <button className="outline-button translate-btn" disabled={aiBusy} onClick={() => void aiFillDetails()}>{aiBusy ? <span className="spin-dot" /> : <Sparkles size={13} />} {t.aiFillDetails}</button>
+              <button className={`icon-button ${exportConstraintsOpen ? "active" : ""}`} title={t.assetExportConstraintsHint} aria-label={t.assetExportConstraints} aria-expanded={exportConstraintsOpen} onClick={() => setExportConstraintsOpen((open) => !open)}><SlidersHorizontal size={14} /></button>
+            </div>
           </div>
 
           {asset.kind === "character" && <div className="asset-acting-section">
@@ -359,17 +362,19 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
             </div>
           </div>}
 
-          <div className="field-label">{t.useFor}<div className="check-chips">
-            {useForOptions.map(([value, key]) => <button key={value} className={`check-chip ${(asset.useFor ?? []).includes(value) ? "active" : ""}`} onClick={() => toggleUseFor(value)}>{t[key]}</button>)}
-          </div></div>
-          <div className="field-label">{t.ignoreLabel}<div className="check-chips">
-            {ignoreOptions.map(([value, key]) => <button key={value} className={`check-chip ${(asset.ignore ?? []).includes(value) ? "active" : ""}`} onClick={() => toggleIgnore(value)}>{t[key]}</button>)}
-          </div></div>
+          {exportConstraintsOpen && <div className="asset-export-constraints">
+            <div className="field-label">{t.useFor}<div className="check-chips">
+              {useForOptions.map(([value, key]) => <button key={value} className={`check-chip ${(asset.useFor ?? []).includes(value) ? "active" : ""}`} onClick={() => toggleUseFor(value)}>{t[key]}</button>)}
+            </div></div>
+            <div className="field-label">{t.ignoreLabel}<div className="check-chips">
+              {ignoreOptions.map(([value, key]) => <button key={value} className={`check-chip ${(asset.ignore ?? []).includes(value) ? "active" : ""}`} onClick={() => toggleIgnore(value)}>{t[key]}</button>)}
+            </div></div>
 
-          {asset.lockLevel === "strict" && <>
-            <TokenEditor label={t.uniqueMarkers} placeholder={t.uniqueMarkerPlaceholder} tokens={asset.uniqueMarkers ?? []} draft={markerDraft} setDraft={setMarkerDraft} onCommit={commitMarker} onKey={onMarkerKey} onRemove={(token) => update({ uniqueMarkers: (asset.uniqueMarkers ?? []).filter((item) => item !== token) })} />
-            <TokenEditor label={t.alwaysVisible} placeholder={t.alwaysVisiblePlaceholder} tokens={asset.alwaysVisible ?? []} draft={alwaysDraft} setDraft={setAlwaysDraft} onCommit={commitAlways} onKey={onAlwaysKey} onRemove={(token) => update({ alwaysVisible: (asset.alwaysVisible ?? []).filter((item) => item !== token) })} />
-          </>}
+            {asset.lockLevel === "strict" && <>
+              <TokenEditor label={t.uniqueMarkers} placeholder={t.uniqueMarkerPlaceholder} tokens={asset.uniqueMarkers ?? []} draft={markerDraft} setDraft={setMarkerDraft} onCommit={commitMarker} onKey={onMarkerKey} onRemove={(token) => update({ uniqueMarkers: (asset.uniqueMarkers ?? []).filter((item) => item !== token) })} />
+              <TokenEditor label={t.alwaysVisible} placeholder={t.alwaysVisiblePlaceholder} tokens={asset.alwaysVisible ?? []} draft={alwaysDraft} setDraft={setAlwaysDraft} onCommit={commitAlways} onKey={onAlwaysKey} onRemove={(token) => update({ alwaysVisible: (asset.alwaysVisible ?? []).filter((item) => item !== token) })} />
+            </>}
+          </div>}
         </div>
 
       </div>
