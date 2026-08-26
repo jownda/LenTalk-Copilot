@@ -213,6 +213,45 @@ function normalizeEdgesWithNodes(rawEdges: CanvasEdge[], nodes: CanvasNode[]): C
     }));
 }
 
+function applyCinematicStudioPromptToTarget(
+  nodes: CanvasNode[],
+  sourceId: string | null | undefined,
+  targetId: string | null | undefined
+): CanvasNode[] {
+  if (!sourceId || !targetId) {
+    return nodes;
+  }
+
+  const source = nodes.find((node) => node.id === sourceId);
+  const target = nodes.find((node) => node.id === targetId);
+  if (
+    source?.type !== CANVAS_NODE_TYPES.cinematicStudio
+    || !target
+    || (target.type !== CANVAS_NODE_TYPES.videoGen && target.type !== CANVAS_NODE_TYPES.textAnnotation)
+  ) {
+    return nodes;
+  }
+
+  const prompt = typeof (source.data as { lastPromptPreview?: unknown }).lastPromptPreview === 'string'
+    ? (source.data as { lastPromptPreview: string }).lastPromptPreview.trim()
+    : '';
+  if (!prompt) {
+    return nodes;
+  }
+
+  return nodes.map((node) => {
+    if (node.id !== targetId) {
+      return node;
+    }
+
+    if (node.type === CANVAS_NODE_TYPES.videoGen) {
+      return { ...node, data: { ...node.data, prompt } } as CanvasNode;
+    }
+
+    return { ...node, data: { ...node.data, content: prompt } } as CanvasNode;
+  });
+}
+
 function normalizeNodes(rawNodes: CanvasNode[]): CanvasNode[] {
   return rawNodes
     .map((node) => {
@@ -900,17 +939,21 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   onConnect: (connection) => {
     const sourceHandle = normalizeHandleId(connection.sourceHandle) ?? 'source';
     const targetHandle = normalizeHandleId(connection.targetHandle) ?? 'target';
-    set((state) => ({
-      edges: addEdge<CanvasEdge>(
-        { ...connection, sourceHandle, targetHandle, type: 'disconnectableEdge' },
-        state.edges
-      ),
-      history: {
-        past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
-        future: [],
-      },
-      dragHistorySnapshot: null,
-    }));
+    set((state) => {
+      const nextNodes = applyCinematicStudioPromptToTarget(state.nodes, connection.source, connection.target);
+      return {
+        nodes: nextNodes,
+        edges: addEdge<CanvasEdge>(
+          { ...connection, sourceHandle, targetHandle, type: 'disconnectableEdge' },
+          state.edges
+        ),
+        history: {
+          past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
+          future: [],
+        },
+        dragHistorySnapshot: null,
+      };
+    });
   },
 
   setCanvasData: (nodes, edges, history) => {
@@ -1048,6 +1091,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     };
 
     set({
+      nodes: applyCinematicStudioPromptToTarget(state.nodes, source, target),
       edges: [...state.edges, newEdge],
     });
 

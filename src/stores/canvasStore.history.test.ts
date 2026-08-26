@@ -103,6 +103,22 @@ describe('canvasStore history (undo/redo)', () => {
     expect(useCanvasStore.getState().nodes.some((node) => node.id === id)).toBe(true);
   });
 
+  it('电影提示词工作室连接到视频或文本节点时写入当前提示词', () => {
+    const store = useCanvasStore.getState();
+    const studioId = store.addNode('cinematicStudioNode', { x: 0, y: 0 }, {
+      lastPromptPreview: '完整电影提示词',
+    });
+    const videoId = store.addNode('videoGenNode', { x: 400, y: 0 });
+    const textId = store.addNode('textAnnotationNode', { x: 400, y: 280 });
+
+    store.onConnect({ source: studioId, target: videoId, sourceHandle: 'source', targetHandle: 'target' });
+    store.addEdge(studioId, textId);
+
+    const nodes = useCanvasStore.getState().nodes;
+    expect(nodes.find((node) => node.id === videoId)?.data.prompt).toBe('完整电影提示词');
+    expect(nodes.find((node) => node.id === textId)?.data.content).toBe('完整电影提示词');
+  });
+
   it('setCanvasData 对持久化历史做相邻内容去重', () => {
     const id = addTextNode(50, 60);
     const node = useCanvasStore.getState().nodes.find((item) => item.id === id) as CanvasNode;

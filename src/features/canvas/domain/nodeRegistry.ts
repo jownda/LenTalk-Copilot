@@ -393,6 +393,7 @@ const cinematicStudioNodeDefinition: CanvasNodeDefinition<CinematicStudioNodeDat
   createDefaultData: () => ({
     displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.cinematicStudio],
     lastProjectTitle: null,
+    lastProjectDescription: null,
     lastPromptPreview: null,
   }),
   defaultSize: { width: 280, height: 200 },

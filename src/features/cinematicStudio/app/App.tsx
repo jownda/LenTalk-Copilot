@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
-import { ChevronDown, Copy, Download, FileJson, FileText, FolderOpen, PenLine, Plus, Save, Send, X } from "lucide-react";
+import { ArrowLeft, ChevronDown, Copy, Download, FileJson, FileText, FolderOpen, PenLine, Plus, Save, Send, X } from "lucide-react";
 import { classifyError, fillSceneDraft, getAssistant } from "./providers/ai";
 import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type AISettings } from "./providers/aiSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -30,6 +30,7 @@ function download(name: string, contents: string, type: string) {
 
 export interface CinematicStudioAppStateSnapshot {
   projectTitle?: string;
+  projectDescription?: string;
   promptPreview?: string;
 }
 
@@ -39,7 +40,7 @@ export interface CinematicStudioAppProps {
   onSendToVideo?: (prompt: string) => void;
 }
 
-export default function App({ onStateChange, onSendToVideo }: CinematicStudioAppProps = {}) {
+export default function App({ onClose, onStateChange, onSendToVideo }: CinematicStudioAppProps = {}) {
   const [project, setProject] = useState<ProjectV2>(loadProject);
   const [locale, setLocale] = useState<Locale>(() => localStorage.getItem("cineprompt-locale") === "en" ? "en" : "zh");
   const [sceneId, setSceneId] = useState(project.scenes[0].id);
@@ -100,10 +101,14 @@ export default function App({ onStateChange, onSendToVideo }: CinematicStudioApp
   /** 节点嵌入：把工程标题与提示词摘要回传给宿主节点（防抖 400ms，避免逐键同步） */
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      onStateChange?.({ projectTitle: project.title, promptPreview: prompt });
+      onStateChange?.({
+        projectTitle: project.title,
+        projectDescription: project.description,
+        promptPreview: prompt,
+      });
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [onStateChange, project.title, prompt]);
+  }, [onStateChange, project.description, project.title, prompt]);
   useEffect(() => {
     if ((project.compiledPrompt ?? "") === prompt) return;
     dispatch({ type: "PATCH_PROJECT", patch: { compiledPrompt: prompt } });
@@ -505,6 +510,7 @@ export default function App({ onStateChange, onSendToVideo }: CinematicStudioApp
 
       <aside className="content-side">
       <section className="side-project-toolbar" aria-label={locale === "zh" ? "工程设置" : "Project controls"}>
+        {onClose && <button className="outline-button studio-back-button" onClick={onClose}><ArrowLeft size={15} /> {locale === "zh" ? "返回画布" : "Back to canvas"}</button>}
         <label className="asset-project-code">{t.projectCode}
           <input
             value={projectCodeDraft}

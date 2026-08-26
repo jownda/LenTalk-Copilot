@@ -231,10 +231,12 @@ export interface DirectorDeskNodeData extends NodeDisplayData {
   [key: string]: unknown;
 }
 
-/** Cinematic Prompt Studio 节点:双击进入独立提示词工作台 */
+/** Cinematic Prompt Studio 节点：单击进入独立提示词工作台。 */
 export interface CinematicStudioNodeData extends NodeDisplayData {
   /** 最近一次保存的工程标题(仅用于节点预览) */
   lastProjectTitle?: string | null;
+  /** 最近一次保存的工程简介(仅用于节点预览) */
+  lastProjectDescription?: string | null;
   /** 最近一次编译的提示词摘要(仅用于节点预览) */
   lastPromptPreview?: string | null;
   [key: string]: unknown;

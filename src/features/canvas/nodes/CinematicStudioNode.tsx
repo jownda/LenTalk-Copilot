@@ -61,9 +61,10 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   }, []);
 
   const handleStateChange = useCallback(
-    (snapshot: { projectTitle?: string; promptPreview?: string }) => {
+    (snapshot: { projectTitle?: string; projectDescription?: string; promptPreview?: string }) => {
       updateNodeData(id, {
         lastProjectTitle: typeof snapshot.projectTitle === 'string' ? snapshot.projectTitle : null,
+        lastProjectDescription: typeof snapshot.projectDescription === 'string' ? snapshot.projectDescription : null,
         lastPromptPreview: typeof snapshot.promptPreview === 'string' ? snapshot.promptPreview : null,
       });
     },
@@ -92,6 +93,10 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const promptPreview = typeof data.lastPromptPreview === 'string' && data.lastPromptPreview.trim()
     ? data.lastPromptPreview.trim()
     : null;
+  const projectDescription = typeof data.lastProjectDescription === 'string' && data.lastProjectDescription.trim()
+    ? data.lastProjectDescription.trim()
+    : null;
+  const nodeSummary = projectDescription ?? promptPreview;
 
   return (
     <div
@@ -102,8 +107,13 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           : 'border-[rgba(15,23,42,0.22)] hover:border-[rgba(15,23,42,0.34)] dark:border-[rgba(255,255,255,0.22)] dark:hover:border-[rgba(255,255,255,0.34)]'}
       `}
       style={{ width: resolvedWidth, height: resolvedHeight }}
-      onClick={() => setSelectedNode(id)}
-      onDoubleClick={handleOpen}
+      onClick={(event) => {
+        const target = event.target as HTMLElement | null;
+        if (target?.closest('button, input, textarea, select, .react-flow__handle')) {
+          return;
+        }
+        handleOpen(event);
+      }}
     >
       <NodeHeader
         className={NODE_HEADER_FLOATING_POSITION_CLASS}
@@ -117,7 +127,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         type="button"
         className="nodrag relative flex min-h-0 flex-1 flex-col items-center justify-center gap-2 overflow-hidden rounded-lg border border-[rgba(255,255,255,0.12)] bg-bg-dark/70 transition-colors hover:border-[rgba(255,255,255,0.24)]"
         onClick={handleOpen}
-        title="双击进入电影提示词工作室"
+        title="进入电影提示词工作室"
       >
         <Clapperboard className="h-10 w-10 text-text-muted/60" />
 
@@ -127,15 +137,15 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           </span>
         )}
 
-        {promptPreview && (
+        {nodeSummary && (
           <span className="line-clamp-2 max-w-[calc(100%-16px)] px-2 text-center text-[11px] leading-snug text-text-muted">
-            {promptPreview}
+            {nodeSummary}
           </span>
         )}
 
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-center gap-1.5 bg-gradient-to-t from-black/70 to-transparent px-2 pb-2 pt-6">
           <MousePointer2 className="h-3.5 w-3.5 text-white/85" />
-          <span className="text-[11px] text-white/90">双击进入</span>
+          <span className="text-[11px] text-white/90">单击进入</span>
         </div>
       </button>
 
