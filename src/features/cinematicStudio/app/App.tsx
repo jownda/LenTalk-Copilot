@@ -586,9 +586,6 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
           <button className="outline-button" onClick={() => { setManualOverride(null); setPrompt(compilePrompt(project, scene, shot, { template, profile: modelProfileById(modelProfileId), locale, director: true }).text); }}>{t.rebuild}</button>
           <button className="outline-button" onClick={() => setManualOverride(null)}>{t.keepOverride}</button>
         </div>}
-        <div className="prompt-footer">
-          <button className="primary-button" onClick={() => runCompile("promptRebuilt")}><Sparkles size={15} /> {t.generate}</button>
-        </div>
       </section>
       </aside>
     </section>
