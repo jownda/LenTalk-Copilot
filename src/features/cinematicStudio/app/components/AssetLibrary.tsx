@@ -109,7 +109,7 @@ export default function AssetLibrary({ project, dispatch, locale, t, setNotice }
     {editing && typeof document !== "undefined" && (() => {
       const host = document.querySelector<HTMLElement>("[data-cinematic-studio]");
       return host ? createPortal(
-        <AssetEditor asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />,
+        <AssetEditor project={project} asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />,
         host,
       ) : null;
     })()}
@@ -130,17 +130,22 @@ function AssetTile({ asset, locale, t, onClick, onDelete }: { asset: Asset; loca
         <div className="tile-name">{asset.name || "…"}</div>
         {lockBadge}
       </div>
+      <span className={`asset-state-badge ${asset.stateName === "base" ? "base" : "variant"}`}>
+        {asset.stateName === "base" ? t.assetBaseCard : `${t.assetStateLabel} · ${asset.stateName || t.assetVariantFallback}`}
+      </span>
       <span className="asset-tile-desc">{desc || t.noDesc}</span>
     </div>
   </div>;
 }
 
-function AssetEditor({ asset, locale, t, dispatch, setNotice, onCreateVariant, onClose }: { asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; onCreateVariant(id: string): void; onClose(): void }) {
+function AssetEditor({ project, asset, locale, t, dispatch, setNotice, onCreateVariant, onClose }: { project: ProjectV2; asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; onCreateVariant(id: string): void; onClose(): void }) {
   const [imageBusy, setImageBusy] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [markerDraft, setMarkerDraft] = useState("");
   const [alwaysDraft, setAlwaysDraft] = useState("");
+  const [variantComposerOpen, setVariantComposerOpen] = useState(false);
+  const [variantStateName, setVariantStateName] = useState("");
   const update = (patch: Partial<Asset>) => dispatch({ type: "UPDATE_ASSET", id: asset.id, patch });
   const acting = asset.actingProfile ?? {};
   const updateActing = (patch: Partial<AssetActingProfile>) => update({ actingProfile: { ...acting, ...patch } });
@@ -195,11 +200,21 @@ function AssetEditor({ asset, locale, t, dispatch, setNotice, onCreateVariant, o
   };
   const onMarkerKey = (event: React.KeyboardEvent) => { if (event.key === "Enter" || event.key === ",") { event.preventDefault(); commitMarker(); } };
   const onAlwaysKey = (event: React.KeyboardEvent) => { if (event.key === "Enter" || event.key === ",") { event.preventDefault(); commitAlways(); } };
+  const isBaseCard = (asset.baseAssetId ?? asset.id) === asset.id;
+  const baseCard = (project.assets ?? []).find((candidate) => candidate.id === (asset.baseAssetId ?? asset.id));
+  const variantGroupId = asset.variantGroupId ?? asset.baseAssetId ?? asset.id;
+  const variantCount = (project.assets ?? []).filter((candidate) => (candidate.variantGroupId ?? candidate.baseAssetId ?? candidate.id) === variantGroupId).length;
   const createVariant = () => {
-    const stateName = window.prompt(t.variantStatePrompt)?.trim();
-    if (!stateName) return;
+    const stateName = variantStateName.trim();
+    if (!stateName) {
+      setNotice(t.variantStateRequired);
+      return;
+    }
     const id = crypto.randomUUID();
     dispatch({ type: "CREATE_ASSET_VARIANT", sourceId: asset.id, id, stateName });
+    setVariantComposerOpen(false);
+    setVariantStateName("");
+    setNotice(t.variantCreated.replace("{state}", stateName));
     onCreateVariant(id);
   };
   const isVehicleInterior = asset.kind === "location" && /(?:车辆|车厢|汽车|巴士|车内|vehicle|car|bus|train).*?(?:内部|内景|interior|inside)?/i.test(asset.name);
@@ -237,6 +252,12 @@ function AssetEditor({ asset, locale, t, dispatch, setNotice, onCreateVariant, o
         <button className="modal-close" onClick={onClose}><X size={14} /></button>
       </div>
 
+      <div className="asset-variant-context">
+        <span className={`asset-state-badge ${isBaseCard ? "base" : "variant"}`}>{isBaseCard ? t.assetBaseCard : t.assetVariantCard}</span>
+        <span>{isBaseCard ? t.assetBaseCardHint : t.assetVariantCardHint.replace("{name}", baseCard?.name || t.assetBaseCard)}</span>
+        <span className="asset-variant-count">{t.assetStateCount.replace("{count}", String(variantCount))}</span>
+      </div>
+
       <div className="asset-modal-grid">
         <div className="asset-section-title">{t.identityAppearance}</div>
         {/* 左列：参考图 + 名称 + 锁定级别 */}
@@ -259,8 +280,18 @@ function AssetEditor({ asset, locale, t, dispatch, setNotice, onCreateVariant, o
             {(["untested", "passed", "failed"] as const).map((status) => <button key={status} className={`lock-option ${asset.stressTestStatus === status ? "active" : ""}`} onClick={() => update({ stressTestStatus: status })}>{t[status === "untested" ? "stressUntested" : status === "passed" ? "stressPassed" : "stressFailed"]}</button>)}
           </div></div>
           {isVehicleInterior && <button className="outline-button" onClick={() => update({ kind: "prop" })}>{t.moveVehicleToProp}</button>}
-          <button className="outline-button" onClick={createVariant}><Plus size={13} /> {t.createVariant}</button>
-          <label className="field-label">{t.assetNotes}<textarea className="modal-textarea asset-notes-input" value={locale === "zh" ? (asset.notesZh ?? "") : (asset.notes ?? "")} placeholder={locale === "zh" ? t.assetNotesZhPlaceholder : t.assetNotesPlaceholder} onChange={(event) => update(locale === "zh" ? { notesZh: event.target.value } : { notes: event.target.value })} /></label>
+          <div className="asset-variant-actions">
+            <button className="outline-button" onClick={() => setVariantComposerOpen((open) => !open)}><Plus size={13} /> {t.createVariant}</button>
+            {variantComposerOpen && <div className="asset-variant-composer">
+              <label className="field-label">{t.variantStatePrompt}<input className="modal-input" autoFocus value={variantStateName} placeholder={t.assetStateNamePlaceholder} onChange={(event) => setVariantStateName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); createVariant(); } }} /></label>
+              <p className="hint-text">{t.variantCreateHint}</p>
+              <div className="asset-variant-composer-actions">
+                <button className="outline-button" onClick={() => { setVariantComposerOpen(false); setVariantStateName(""); }}>{t.cancel}</button>
+                <button className="primary-button" onClick={createVariant}>{t.createVariantConfirm}</button>
+              </div>
+            </div>}
+          </div>
+          <label className="field-label">{t.assetNotes}<span className="field-help">{t.assetNotesHelp}</span><textarea className="modal-textarea asset-notes-input" value={locale === "zh" ? (asset.notesZh ?? "") : (asset.notes ?? "")} placeholder={locale === "zh" ? t.assetNotesZhPlaceholder : t.assetNotesPlaceholder} onChange={(event) => update(locale === "zh" ? { notesZh: event.target.value } : { notes: event.target.value })} /></label>
           {/* 声音音色（角色）：点击上传音频，可试听/删除 */}
           {asset.kind === "character" && <div className="field-label">{t.voiceClip}
             {asset.voiceClip ? (
