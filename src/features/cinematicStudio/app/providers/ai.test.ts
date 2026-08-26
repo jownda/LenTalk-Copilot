@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Asset, ProjectV2, SceneV2 } from "../../shared-types";
-import { collectSceneAssetIds, normalizeSceneDraft } from "./ai";
+import { collectSceneAssetIds, normalizeSceneDraft, SCENE_DRAFT_JSON_SCHEMA } from "./ai";
 
 const assets: Asset[] = [
   { id: "location", kind: "location", name: "车厢", description: "carriage", referencePaths: [], lockLevel: "none", tags: [] },
@@ -73,5 +73,11 @@ describe("collectSceneAssetIds", () => {
     }, "秒");
     expect(result).not.toHaveProperty("audioPlan");
     expect(result.scene).not.toHaveProperty("audioPlan");
+  });
+
+  it("AI 分镜 schema 不再要求 AI 返回音频计划或旧 mm 焦段", () => {
+    expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"audioPlan"');
+    expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"lens": string');
+    expect(SCENE_DRAFT_JSON_SCHEMA).toContain('"fieldOfViewDegrees": number');
   });
 });
