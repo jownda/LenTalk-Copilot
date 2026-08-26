@@ -16,6 +16,7 @@ export * from "./i18n/preset-localize";
 export * from "./ai/assistant";
 export * from "./compiler";
 export * from "./continuity";
+export * from "./quality";
 export * from "./golden";
 export interface ContinuityIssue { status: "ok" | "warning"; label: string; detail: string; }
 
