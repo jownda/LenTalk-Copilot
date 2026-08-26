@@ -4,29 +4,29 @@
  * ───────────────────────────────────────────────────────────── */
 
 .cinematic-studio-app {
-  /* Surface scale — 由底到顶 */
-  --bg: #0f0f0f;
-  --surface: #1a1a1a;
-  --surface-elevated: #222222;
-  --surface-input: #161618;
-  --surface-overlay: rgba(244, 246, 252, 0.96);
+  /* 直接读取 LenTalk 全局主题变量，保证明暗、色调和强调色同步。 */
+  --bg: rgb(var(--bg-rgb));
+  --surface: rgb(var(--surface-rgb));
+  --surface-elevated: color-mix(in srgb, var(--surface) 82%, var(--text) 18%);
+  --surface-input: color-mix(in srgb, var(--bg) 76%, var(--surface) 24%);
+  --surface-overlay: rgb(var(--surface-rgb) / 0.96);
 
   /* Border */
-  --border: #2a2a2a;
-  --border-strong: #353535;
-  --border-soft: #1f1f1f;
+  --border: rgb(var(--border-rgb));
+  --border-strong: color-mix(in srgb, var(--border) 68%, var(--text) 32%);
+  --border-soft: color-mix(in srgb, var(--border) 72%, transparent);
 
   /* Text */
-  --text: #ffffff;
-  --text-muted: #888888;
-  --text-faint: #5a5a5a;
+  --text: rgb(var(--text-rgb));
+  --text-muted: rgb(var(--text-muted-rgb));
+  --text-faint: color-mix(in srgb, var(--text-muted) 72%, var(--bg) 28%);
 
-  /* Accent — LenTalk blue */
-  --accent: #3B82F6;
-  --accent-hover: #2563EB;
-  --accent-soft: rgba(59, 130, 246, 0.16);
-  --accent-softer: rgba(59, 130, 246, 0.08);
-  --accent-ring: rgba(59, 130, 246, 0.35);
+  /* Accent — 跟随 LenTalk 的自定义强调色 */
+  --accent: rgb(var(--accent-rgb));
+  --accent-hover: color-mix(in srgb, var(--accent) 82%, var(--text) 18%);
+  --accent-soft: rgb(var(--accent-rgb) / 0.16);
+  --accent-softer: rgb(var(--accent-rgb) / 0.08);
+  --accent-ring: rgb(var(--accent-rgb) / 0.35);
 
   /* Semantic */
   --success: #4ADE80;
@@ -34,9 +34,9 @@
   --danger: #F87171;
 
   /* Shadow */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.35);
-  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.18);
+  --shadow-md: 0 4px 12px rgb(0 0 0 / 0.24);
+  --shadow-lg: 0 12px 32px rgb(0 0 0 / 0.32);
 
   /* Radius */
   --r-sm: 4px;

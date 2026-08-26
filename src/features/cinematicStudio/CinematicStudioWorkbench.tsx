@@ -41,7 +41,7 @@ export function CinematicStudioWorkbench({ onClose, onStateChange }: CinematicSt
 
   return (
     <div
-      className="cinematic-studio-app fixed inset-x-0 bottom-0 top-10 z-[120] overflow-hidden bg-[#0f0f0f]"
+      className="cinematic-studio-app fixed inset-x-0 bottom-0 top-10 z-[120] overflow-hidden"
       data-cinematic-studio
       onDoubleClick={(event) => {
         // 阻止双击冒泡到外层 ProjectManager 的「双击空白新建项目」处理

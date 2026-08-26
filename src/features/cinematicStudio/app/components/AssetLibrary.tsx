@@ -5,6 +5,7 @@
  * 锁定级别（未锁定/建议锁定/强锁定）、独特标记与始终可见 token。
  * 参考图压缩后存入 Asset.referencePaths（P3 SQLite 前暂存 localStorage）。
  */
+import { createPortal } from "react-dom";
 import { useState } from "react";
 import type { Asset, AssetActingProfile, AssetKind, LockLevel, ProjectV2 } from "../../shared-types";
 import { ImagePlus, Lock, LockKeyhole, Mic, Plus, Sparkles, Trash2, X } from "lucide-react";
@@ -105,7 +106,13 @@ export default function AssetLibrary({ project, dispatch, locale, t, setNotice }
     {assets.length === 0 ? <div className="empty assets-empty">{t.emptyAssets}</div> : <div className="asset-grid">
       {assets.map((asset) => <AssetTile key={asset.id} asset={asset} locale={locale} t={t} onClick={() => setEditingId(asset.id)} onDelete={() => { dispatch({ type: "DELETE_ASSET", id: asset.id }); setNotice(t.assetDeleted); }} />)}
     </div>}
-    {editing && <AssetEditor asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />}
+    {editing && typeof document !== "undefined" && (() => {
+      const host = document.querySelector<HTMLElement>("[data-cinematic-studio]");
+      return host ? createPortal(
+        <AssetEditor asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />,
+        host,
+      ) : null;
+    })()}
   </section>;
 }
 
