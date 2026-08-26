@@ -1,15 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
-import { ChevronDown, Clapperboard, Copy, Download, FileJson, FileText, FolderOpen, History, PenLine, Plus, Save, Settings2, Sparkles, X } from "lucide-react";
+import { ChevronDown, Clapperboard, Copy, Download, FileJson, FileText, FolderOpen, History, PenLine, Plus, Save, Sparkles, X } from "lucide-react";
 import { classifyError, fillSceneDraft, getAssistant } from "./providers/ai";
-import { isRemoteConfigured, loadAISettings, type AISettings } from "./providers/aiSettings";
+import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type AISettings } from "./providers/aiSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { loadProjectFromDisk, recordVersionToSqlite, savePromptToDisk, saveProjectToDisk } from "./providers/projectStorage";
 import { loadProject, migrateProject, bakeryRescueProject, museumRedDoorsProject, persistProject } from "./model";
 import { cameraLabels, copy, framingLabels, type CopyZh, type Locale } from "./i18n";
 import AssetLibrary from "./components/AssetLibrary";
-import SettingsModal from "./components/SettingsModal";
 import BeatEditor from "./components/BeatEditor";
 import ContinuityPanel from "./components/ContinuityPanel";
 import DirectorBriefCard from "./components/DirectorBriefCard";
@@ -57,9 +56,9 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
   const [modelProfileId, setModelProfileId] = useState<string>(() => localStorage.getItem("cineprompt-model") ?? "");
   const [history, setHistory] = useState<PromptVersion[]>(loadHistory);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [aiSettings, setAiSettings] = useState<AISettings>(() => loadAISettings());
   const customApis = useSettingsStore((state) => state.customApis);
+  const chatModels = useMemo(() => listLenTalkChatModels(), [customApis]);
   /** 手动覆写文本：编辑器内容与最近编译输出不一致时记录（P2.2） */
   const [manualOverride, setManualOverride] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -69,6 +68,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
   const directorLayerIssues = useMemo(() => scene.directorLayers ? validateDirectorLayers(scene.directorLayers, project, scene) : [], [project, scene]);
   const hasExportErrors = issues.some((i) => i.severity === "error");
   const t: CopyZh = copy[locale] as CopyZh;
+  const selectedChatModel = aiSettings.provider && aiSettings.model ? `${aiSettings.provider}:${aiSettings.model}` : "";
 
   /** 结构更新统一走 reducer（Compiler/Continuity 只读不可变快照） */
   const dispatch = (action: ProjectAction) => setProject((prev) => projectReducer(prev, action));
@@ -77,6 +77,15 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
   useEffect(() => { localStorage.setItem("cineprompt-locale", locale); }, [locale]);
   /** LenTalk Chat 配置变更时同步刷新工作室选中的模型（地址/Key 同源） */
   useEffect(() => { setAiSettings(loadAISettings()); }, [customApis]);
+  const selectChatModel = (value: string) => {
+    const separator = value.indexOf(":");
+    const providerId = separator >= 0 ? value.slice(0, separator) : "";
+    const model = separator >= 0 ? value.slice(separator + 1) : "";
+    const option = chatModels.find((item) => item.providerId === providerId && item.model === model);
+    if (!option) return;
+    setAiSettings(saveAISettings(resolveLenTalkChatModel(option.providerId, option.model)));
+    setNotice(t.settingsSaved);
+  };
   /** 节点嵌入：把工程标题与提示词摘要回传给宿主节点（防抖 400ms，避免逐键同步） */
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -350,16 +359,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
     setProject(copy); setSceneId(copy.scenes[0].id); setShotId(copy.scenes[0].shots[0]?.id ?? ""); setNotice(t.exampleLoaded); setExampleOpen(false);
   };
   return <main className="app-shell">
-    <header className="topbar"><div className="brand"><span className="brand-mark"><Clapperboard size={17} /></span><span>CINEMATIC PROMPT STUDIO</span><span className="version">V0.2</span></div><div className="top-actions"><div className="example-menu"><button className="example-button" onClick={() => setExampleOpen((v) => !v)}><Sparkles size={14} /> {t.openExample} <ChevronDown size={12} /></button>{exampleOpen && <div className="example-options"><button onClick={() => loadExample(museumRedDoorsProject)}>{t.exampleMuseum}</button><button onClick={() => loadExample(bakeryRescueProject)}>{t.exampleBakery}</button></div>}</div><div className="locale-switch" aria-label="Language"><button className={locale === "zh" ? "active" : ""} onClick={() => setLocale("zh")}>中</button><button className={locale === "en" ? "active" : ""} onClick={() => setLocale("en")}>EN</button></div><button className="icon-button" title={t.saveProject} onClick={handleSaveProject}><Save size={17} /></button><button className="icon-button" title={t.openProject} onClick={handleOpenProject}><FolderOpen size={17} /></button><button className="icon-button" title={t.settings} onClick={() => setSettingsOpen(true)}><Settings2 size={17} /></button>{onClose && <button className="icon-button" title={locale === "zh" ? "退出" : "Exit"} onClick={onClose}><X size={17} /></button>}<input ref={fileInput} className="hidden" type="file" accept="application/json" onChange={(event) => importProject(event.target.files?.[0])} /></div></header>
-    {settingsOpen && <SettingsModal
-      t={t}
-      onClose={() => setSettingsOpen(false)}
-      onSaved={(settings) => {
-        setAiSettings(settings);
-        setNotice(!settings.provider ? t.settingsCleared : t.settingsSaved);
-      }}
-    />}
-
+    <header className="topbar"><div className="brand"><span className="brand-mark"><Clapperboard size={17} /></span><span>CINEMATIC PROMPT STUDIO</span><span className="version">V0.2</span></div><div className="top-actions"><div className="example-menu"><button className="example-button" onClick={() => setExampleOpen((v) => !v)}><Sparkles size={14} /> {t.openExample} <ChevronDown size={12} /></button>{exampleOpen && <div className="example-options"><button onClick={() => loadExample(museumRedDoorsProject)}>{t.exampleMuseum}</button><button onClick={() => loadExample(bakeryRescueProject)}>{t.exampleBakery}</button></div>}</div><div className="locale-switch" aria-label="Language"><button className={locale === "zh" ? "active" : ""} onClick={() => setLocale("zh")}>中</button><button className={locale === "en" ? "active" : ""} onClick={() => setLocale("en")}>EN</button></div><button className="icon-button" title={t.saveProject} onClick={handleSaveProject}><Save size={17} /></button><button className="icon-button" title={t.openProject} onClick={handleOpenProject}><FolderOpen size={17} /></button>{onClose && <button className="icon-button" title={locale === "zh" ? "退出" : "Exit"} onClick={onClose}><X size={17} /></button>}<input ref={fileInput} className="hidden" type="file" accept="application/json" onChange={(event) => importProject(event.target.files?.[0])} /></div></header>
     <section className="content">
       <div className="content-main">
       {/* ── 1. 导演简报卡（P0.4：合并风格配方 / 场景 / 音频计划）── */}
@@ -382,6 +382,9 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
         onAiCompile={() => void aiCompileScene()}
         onLocalCompile={localCompileScene}
         onCopyAiError={() => void copyAiError()}
+        chatModels={chatModels}
+        selectedChatModel={selectedChatModel}
+        onSelectChatModel={selectChatModel}
       />
 
       {/* ── 2. 分层导演文档卡（P0.6：AI 编译产出各层，可展开编辑 + 锁定）── */}
@@ -526,7 +529,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
             </select>
             <ChevronDown size={14} />
           </span>
-          <span className="template-select model-select">
+          <span className="template-select model-select" title={t.targetModelHint}>
             <select value={modelProfileId} aria-label={t.targetModel} onChange={(event) => {
               const id = event.target.value;
               setModelProfileId(id);

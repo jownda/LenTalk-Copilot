@@ -1100,7 +1100,33 @@
   justify-content: flex-end;
   gap: 8px;
   margin-top: 14px;
+  flex-wrap: wrap;
 }
+.brief-model-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: var(--ctrl-h);
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-input);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.brief-model-select span { white-space: nowrap; }
+.brief-model-select select {
+  max-width: 220px;
+  min-width: 120px;
+  padding: 4px 18px 4px 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.brief-model-select select:disabled { color: var(--text-faint); cursor: not-allowed; }
+.brief-model-select svg { pointer-events: none; flex: none; }
 .ai-error-badge {
   display: inline-flex;
   align-items: center;

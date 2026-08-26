@@ -13,6 +13,7 @@ import { useEffect, useState } from "react";
 import type { ActingObjective, ProjectV2, SceneStaging, SceneV2 } from "../../shared-types";
 import { Check, ChevronDown, Clapperboard, Copy, Film, Plus, Sparkles, X } from "lucide-react";
 import type { CopyZh, Locale } from "../i18n";
+import type { LenTalkChatModelOption } from "../providers/aiSettings";
 import AudioPlanEditor from "./AudioPlanEditor";
 import StagingEditor from "./StagingEditor";
 import TechnicalProfileCard from "./TechnicalProfileCard";
@@ -36,6 +37,9 @@ interface DirectorBriefCardProps {
   onAiCompile(): void;
   onLocalCompile(): void;
   onCopyAiError(): void;
+  chatModels: LenTalkChatModelOption[];
+  selectedChatModel: string;
+  onSelectChatModel(value: string): void;
 }
 
 /** 多行文本 → string[]（按行拆分，过滤空行） */
@@ -46,6 +50,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
     project, scene, t, locale, compileBusy, aiCompileError, aiCompileErrorDetail, aiErrorCopied,
     onSelectScene, onAddScene, onDeleteScene, onRenameScene, onUpdateScene,
     onUpdateStaging, onUpdateProject, onAiCompile, onLocalCompile, onCopyAiError,
+    chatModels, selectedChatModel, onSelectChatModel,
   } = props;
   const [pickingCharacter, setPickingCharacter] = useState(false);
   const [audioOpen, setAudioOpen] = useState(false);
@@ -200,6 +205,15 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
 
     {/* 编译动作 */}
     <div className="scene-actions">
+      <label className="brief-model-select">
+        <span>{t.chatModel}</span>
+        <select value={selectedChatModel} aria-label={t.chatModel} disabled={chatModels.length === 0} onChange={(event) => onSelectChatModel(event.target.value)}>
+          {chatModels.length === 0
+            ? <option value="">{t.noChatModels}</option>
+            : chatModels.map((option) => <option key={`${option.providerId}:${option.model}`} value={`${option.providerId}:${option.model}`}>{option.providerName} · {option.model}</option>)}
+        </select>
+        <ChevronDown size={13} />
+      </label>
       <button className="primary-button" disabled={compileBusy} onClick={onAiCompile}>{compileBusy ? <span className="spin-dot" /> : <Sparkles size={16} />} {compileBusy ? `${t.aiCompiling} ${busySeconds}s` : t.aiCompilePrompt}</button>
       <button className="outline-button" onClick={onLocalCompile}>{t.localCompile}</button>
       {aiCompileError && (
