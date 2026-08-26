@@ -164,12 +164,12 @@
   height: 100%;
   max-height: 100%;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 24px 28px 40px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(380px, 460px);
   gap: 20px;
-  align-items: start;
+  align-items: stretch;
   max-width: 1600px;
   width: 100%;
   margin: 0 auto;
@@ -177,20 +177,26 @@
 
 .content-main {
   min-width: 0;
+  min-height: 0;
+  height: 100%;
   display: flex;
   flex-direction: column;
   gap: 16px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 8px;
 }
 
 .content-side {
-  position: sticky;
-  top: 16px;
   min-width: 0;
+  min-height: 0;
+  height: 100%;
   display: flex;
   flex-direction: column;
   gap: 16px;
-  max-height: calc(100vh - 96px);
   overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 8px;
 }
 
 .asset-project-code { display: inline-flex; align-items: center; gap: 8px; margin: 0 0 12px; color: var(--text-muted); font-size: 11px; }
@@ -198,8 +204,8 @@
 .asset-state-grid { display: grid; grid-template-columns: minmax(0, 1fr) 92px; gap: 8px; }
 
 @media (max-width: 1080px) {
-  .content { grid-template-columns: 1fr; }
-  .content-side { position: static; max-height: none; }
+  .content { grid-template-columns: 1fr; overflow-y: auto; }
+  .content-main, .content-side { height: auto; overflow: visible; padding-right: 0; }
 }
 
 /* ────────── 通用卡片 ────────── */
@@ -2630,6 +2636,14 @@
 
 /* 角色资产横条：移除独立显示，只显示简短摘要（避免重复资产库角色 Tab） */
 .role-assets { display: none; }
+
+/* 提示词输出优先占用右栏可用空间，避免生成内容被折叠。 */
+.prompt-editor-toolbar { justify-content: flex-end; }
+.prompt-editor-toolbar .output-language { display: none; }
+.cinematic-studio-app .prompt-editor {
+  min-height: clamp(360px, 56vh, 620px);
+  height: clamp(360px, 56vh, 620px);
+}
 
 /* ═══════════════════════════════════════════════════════════
  *  V0.2 · P0.3 状态编辑器（PropStateEditor）

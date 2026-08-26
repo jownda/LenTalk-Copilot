@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
-import { ChevronDown, Clapperboard, Copy, Download, FileJson, FileText, FolderOpen, History, PenLine, Plus, Save, Send, Sparkles, X } from "lucide-react";
+import { ChevronDown, Clapperboard, Copy, Download, FileJson, FileText, FolderOpen, PenLine, Plus, Save, Send, Sparkles, X } from "lucide-react";
 import { classifyError, fillSceneDraft, getAssistant } from "./providers/ai";
 import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type AISettings } from "./providers/aiSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -17,7 +17,7 @@ import ParticipantsEditor from "./components/ParticipantsEditor";
 import PropStateEditor from "./components/PropStateEditor";
 import OpticsCameraEditor from "./components/OpticsCameraEditor";
 import { projectReducer, type ProjectAction } from "./store/projectReducer";
-import { addVersion, deleteVersion, loadHistory } from "./store/promptHistory";
+import { addVersion, loadHistory } from "./store/promptHistory";
 
 const movements: CameraMovement[] = ["Static", "Handheld", "Steadicam", "Dolly", "Tracking", "Crane", "POV", "OTS"];
 const newId = () => crypto.randomUUID();
@@ -55,8 +55,7 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
   const [aiErrorCopied, setAiErrorCopied] = useState(false);
   const [template, setTemplate] = useState<"pro-sequence" | "shot-cards" | "asset-id-tagged">("pro-sequence");
   const [modelProfileId, setModelProfileId] = useState<string>(() => localStorage.getItem("cineprompt-model") ?? "");
-  const [history, setHistory] = useState<PromptVersion[]>(loadHistory);
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [, setHistory] = useState<PromptVersion[]>(loadHistory);
   const [aiSettings, setAiSettings] = useState<AISettings>(() => loadAISettings());
   const customApis = useSettingsStore((state) => state.customApis);
   const chatModels = useMemo(() => listLenTalkChatModels(), [customApis]);
@@ -122,13 +121,6 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
       }
     }
     setNotice(t[noticeKey]);
-  };
-  /** 从历史版本恢复结构（而非纯文本） */
-  const restoreVersion = (version: PromptVersion) => {
-    setProject(version.projectSnapshot as ProjectV2);
-    setPrompt(version.outputText);
-    setManualOverride(version.manualOverride ?? null);
-    setNotice(t.versionRestored);
   };
   /** P1：当前打开的项目包目录（成功保存后记录，用于版本落盘） */
   const [projectPackageDir, setProjectPackageDir] = useState<string | null>(() => sessionStorage.getItem("cineprompt-package-dir"));
@@ -545,24 +537,7 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
             </select>
             <ChevronDown size={14} />
           </span>
-          <button className="outline-button history-toggle" onClick={() => setHistoryOpen((v) => !v)}><History size={14} /> {t.promptHistory} <em>{history.length}</em></button>
         </div>
-        <span className="template-scope">{template === "pro-sequence" ? (locale === "zh" ? "输出范围：当前场景全部镜头" : "Scope: all scene shots") : template === "shot-cards" ? (locale === "zh" ? "输出范围：当前场景逐镜分卡" : "Scope: one card per shot") : (locale === "zh" ? "输出范围：仅当前选中镜头" : "Scope: current shot only")}</span>
-        {historyOpen && <div className="history-panel">
-          {history.length === 0 ? <span className="history-empty">{t.historyEmpty}</span> : history.map((version) => (
-            <div className="history-row" key={version.id}>
-              <span className="history-time">{new Date(version.createdAt).toLocaleTimeString()}</span>
-              <span className="history-meta">
-                <b>{version.template === "pro-sequence" ? t.proSequenceTemplate : version.template === "shot-cards" ? t.shotCardsTemplate : t.assetIdTemplate}</b>
-                <em className={`history-severity ${version.continuitySummary.errors > 0 ? "bad" : ""}`}>{version.continuitySummary.total} · {version.continuitySummary.errors} {t.issueError}</em>
-              </span>
-              <span className="history-actions">
-                <button className="history-restore" onClick={() => restoreVersion(version)}>{t.restore}</button>
-                <button className="history-delete" title={t.deleteVersion} onClick={() => setHistory(deleteVersion(version.id))}><X size={12} /></button>
-              </span>
-            </div>
-          ))}
-        </div>}
         <span className="output-language">{locale === "zh" ? "输出语言：中文" : "Output language: English"}</span>
         <div className="prompt-send-row">
           <button
