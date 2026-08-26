@@ -8,7 +8,7 @@ import type { AIAssistant, AssetSuggestion, BeatSuggestion, FixSuggestion, Scene
 import { buildSceneAssetRegistry } from "../../engine/compiler/renderer";
 import { validateDirectorLayers, type DirectorLayerIssue } from "../../engine/quality";
 import type {
-  ActionBeat, Asset, AssetActingProfile, AssetKind, AudioPlan, CameraBehavior, CameraMovement, ContinuityIssueV2, CutStyle,
+  ActionBeat, Asset, AssetActingProfile, AssetKind, CameraBehavior, CameraMovement, ContinuityIssueV2, CutStyle,
   FirstFrameLock, LightingDirection, LockLevel, Optics, PhysicsAnchor, ProjectV2, PropState, SceneV2, ShotParticipant, ShotV2,
 } from "../../shared-types";
 import { isRemoteConfigured, loadAISettings, normalizeBaseUrl, openAICompatibleBaseUrl, type AISettings } from "./aiSettings";
@@ -634,12 +634,11 @@ export function collectSceneAssetIds(project: ProjectV2, scene: SceneV2): string
 
 /**
  * AI 智能分镜：读取场景卡片的内容（地点站位、前情续接、故事梗概、角色/道具资产），
- * 生成完整的剧情分镜（镜头列表 + 各镜头检查器内容 + 音频计划），并返回可直接写入 Project 的结果。
+ * 生成完整的剧情分镜（镜头列表 + 各镜头检查器内容 + 导演文档），音频计划只作为用户输入读取，不回写。
  * @throws 未配置远程模型 / 请求失败
  */
 export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { seconds?: string; locale?: Locale }): Promise<{
   scene: SceneV2;
-  audioPlan?: AudioPlan;
   negativePrompt?: string;
   directorLayers?: Record<string, string>;
   directorLayerIssues?: DirectorLayerIssue[];
@@ -704,6 +703,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     `Axis direction: ${scene.staging?.axisDirection ?? "left-to-right"}; Spacing: ${scene.staging?.spacing?.trim() || "(default)"}`,
     `Scene emotion arc: ${scene.emotionArc?.trim() || "(not set)"}; Scene name: ${scene.name}`,
     `Style direction: ${styleBrief || "(not set)"}`,
+    `User audio plan (read-only; do not return or overwrite the audio plan card): ${JSON.stringify(project.audioPlan ?? { score: "none", subtitles: false })}`,
     "",
     `LOCATION ASSET: ${locationAsset ? `${locationAsset.name}(${locationAsset.id}) — ${locationAsset.description?.trim() || locationAsset.descriptionZh?.trim() || ""}` : "(none)"}`,
     `CHARACTER ASSETS (scene references only): ${assetSummary(characterIds) || "(none)"}`,
@@ -722,7 +722,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     "Beats: each shot gets 1-4 ordered beats (start order at 1). Each beat has verb + actorId + targetCharacterId/targetPropId (only existing IDs) when applicable, actionText in the scene language, optional dialogue (include dialogue text in the same language as the scene), optional stateBefore/stateAfter (propId must be an existing prop), optional required flag, and optional cutRule.",
     "propStatesAtStart / propStatesAtEnd: use only existing prop IDs; the state chain must be consistent across shots.",
     "Negative prompt: produce one comma-separated string of concrete negative constraints for this scene in the language of the scene (Chinese if the scene is Chinese), covering character/wardrobe drift, extra limbs, physics, floating props, water/dust on lens where relevant, and scene-specific artifacts to avoid.",
-    "Audio plan: diegeticMusic/sfx as short concrete cues; score only \"none\" or \"original-score\"; subtitles true when dialogue needs burned-in subtitles. musicSourcePropId must be an existing prop or null.",
+    "Audio: use the user audio plan above as the source of truth. Rephrase or clarify it only inside the AUDIO director layer when needed; do not invent a replacement plan, do not return a top-level audioPlan key, and do not change the user's audio settings.",
     "DIRECTOR LAYERS: also produce \"directorLayers\", an object that lays out this scene as a director-level document in this exact order. Each key maps to one full text block whose FIRST line is its own section header (Chinese header when the scene is Chinese, English uppercase otherwise).",
     `Layer keys in order: ${DIRECTOR_LAYER_ORDER.join(", ")}.`,
     "Use only these canonical section headers; never invent, translate, rename, or omit a header. Choose the Chinese header for a Chinese scene and the English uppercase header for an English scene:",
@@ -747,7 +747,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     `{ "sceneName": string, "emotionArc": string, "actingObjectives": [ { "characterId": string, "objective": string, "superObjective": string | null, "obstacle": string | null, "stakes": string | null } ], "firstFrameLock": { "requiredSubjectIds": string[], "occupancyStatement": string | null }, "lightingDirection": { "primarySource": string | null, "direction": string | null, "exposurePriority": string | null, "allowHighlights": string[], "forbid": string[] }, "negativePrompt": string, "directorLayers": { "sceneContext": string, "activeReferences": string, "locationMap": string, "firstFrame": string, "formatMode": string, "optics": string, "camera": string, "actionTiming": string, "physics": string, "lighting": string, "audio": string, "positiveConstraints": string, "negativeLocks": string }, "audioPlan": { "diegeticMusic": string[], "musicSourcePropId": string | null, "sfx": string[], "score": "none" | "original-score", "subtitles": boolean }, "shots": [ { "time": { "startSeconds": number, "endSeconds": number }, "label": string, "framing": string, "lens": string, "lensModel": string | null, "camera": string | null, "optics": { "lensCharacter": "47-standard" | "84-wide" | "107-ultrawide" | "29-short-tele" | "18-tele" | "8-supertele" | "135-immersive" | null, "fieldOfViewDegrees": number | null, "lensOutcome": string[] | null, "antiDriftLock": string | null }, "cameraBehavior": { "height": string | null, "distance": string | null, "angle": string | null, "side": string | null, "subjectSize": string | null, "screenPlacement": string | null, "focusBehavior": string | null, "depthOfField": string | null, "handheldQuality": string | null }, "physicsAnchors": [ { "kind": "walk" | "run" | "weapon" | "liquid" | "particle", "detail": string | null } ], "movement": string, "action": string, "acting": string, "performanceLevel": number, "eyeLife": string, "direction": "left-to-right" | "right-to-left", "cutStyle": "hard-cut" | "overlap" | "match-cut", "participants": [ { "characterId": string, "role": "primary" | "supporting" | "target" | "background", "position": string | null, "entrance": "already-in-frame" | "enters-left" | "enters-right" | null, "facing": string | null, "eyeline": string | null, "torsoFacing": string | null, "anchorDistance": string | null } ], "beats": [ { "order": number, "duration": number, "verb": string, "actorId": string | null, "targetCharacterId": string | null, "targetPropId": string | null, "targetBodyPart": string | null, "actionText": string | null, "dialogue": string | null, "tactic": string | null, "subtext": string | null, "beatChange": string | null, "reactionBeforeLine": string | null, "required": boolean, "forbiddenTargets": string[], "stateBefore": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "stateAfter": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "cutRule": string | null, "note": string | null } ], "propStatesAtStart": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "propStatesAtEnd": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "note": string | null } ] }`,
     ...vocabLines,
     "Do NOT invent character/prop IDs. Do NOT add prose or keys outside the schema (the only exceptions are the top-level negativePrompt and directorLayers fields).",
-  ].join("\n"));
+  ].join("\n").replace(/, "audioPlan": \{[^}]*\}, "shots"/, ', "shots"'));
 
   return normalizeSceneDraft(project, scene, data, seconds);
 }
@@ -766,7 +766,6 @@ function normalizeDirectorLayers(value: unknown): Record<string, string> | undef
 
 export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: unknown, seconds: string): {
   scene: SceneV2;
-  audioPlan?: AudioPlan;
   negativePrompt?: string;
   directorLayers?: Record<string, string>;
   directorLayerIssues?: DirectorLayerIssue[];
@@ -978,17 +977,6 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     } as ShotV2);
   }
 
-  const audioObj = (obj.audioPlan ?? {}) as Record<string, unknown>;
-  const score = asString(audioObj.score, "none");
-  const musicSourcePropId = asString(audioObj.musicSourcePropId, undefined);
-  const audioPlan: AudioPlan | undefined = {
-    diegeticMusic: asStringArray(audioObj.diegeticMusic).slice(0, 10),
-    ...(musicSourcePropId && propIds.has(musicSourcePropId) ? { musicSourcePropId } : {}),
-    sfx: asStringArray(audioObj.sfx).slice(0, 12),
-    score: score === "original-score" ? "original-score" : "none",
-    subtitles: audioObj.subtitles === true,
-  };
-
   const actingObjectives = (Array.isArray(obj.actingObjectives) ? obj.actingObjectives : [])
     .map((rawItem) => {
       const item = (rawItem ?? {}) as Record<string, unknown>;
@@ -1020,7 +1008,6 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
       shots,
       directorLayers,
     },
-    audioPlan,
     negativePrompt: asString(obj.negativePrompt, undefined),
     directorLayers,
     ...(directorLayerIssues.length > 0 ? { directorLayerIssues } : {}),

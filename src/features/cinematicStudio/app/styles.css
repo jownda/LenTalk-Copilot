@@ -1102,6 +1102,15 @@
   margin-top: 14px;
   flex-wrap: wrap;
 }
+.compile-boundary {
+  flex: 1 1 100%;
+  padding: 6px 0 0;
+  border-top: 1px solid var(--accent);
+  color: var(--accent);
+  font-size: 10px;
+  line-height: 1.4;
+  text-align: left;
+}
 .brief-model-select {
   display: inline-flex;
   align-items: center;
@@ -3291,7 +3300,7 @@
   border-top: 1px dashed var(--border);
 }
 .brief-group:first-of-type { border-top: none; padding-top: 0; }
-.brief-group-head { display: flex; align-items: center; justify-content: space-between; }
+.brief-group-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .brief-group .staging-editor { padding: 0; }
 .brief-group .stage-row { margin-bottom: 4px; }
 .brief-group .staging-location-picker { margin-top: 6px; }
@@ -3307,6 +3316,7 @@
   letter-spacing: 0;
 }
 .brief-audio-toggle:hover { color: var(--text); background: var(--surface-elevated); }
+.brief-user-badge { margin-left: auto; color: var(--text-faint); font-size: 10px; white-space: nowrap; }
 .audio-summary { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: min(440px, 58vw); }
 .brief-audio-toggle svg { transition: transform .2s; flex: none; }
 .brief-audio-toggle svg.collapsed { transform: rotate(-90deg); }

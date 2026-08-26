@@ -65,4 +65,13 @@ describe("collectSceneAssetIds", () => {
     expect(result.scene.directorLayers).toEqual(layers);
     expect(result.directorLayerIssues).toBeUndefined();
   });
+
+  it("忽略 AI 返回的 audioPlan，避免覆盖用户填写的音频计划", () => {
+    const result = normalizeSceneDraft(project, scene, {
+      audioPlan: { diegeticMusic: ["AI 自拟音乐"], sfx: ["AI 自拟音效"], score: "original-score", subtitles: true },
+      shots: [],
+    }, "秒");
+    expect(result).not.toHaveProperty("audioPlan");
+    expect(result.scene).not.toHaveProperty("audioPlan");
+  });
 });

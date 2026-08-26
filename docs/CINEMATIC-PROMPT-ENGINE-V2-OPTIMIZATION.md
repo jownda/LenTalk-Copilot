@@ -351,6 +351,8 @@ UI 位置：名称输入框下方；其他资产类型同逻辑。
 
 **文件**：`src/features/cinematicStudio/app/providers/ai.ts`、`src/features/cinematicStudio/app/App.tsx`、`src/features/cinematicStudio/app/components/DirectorBriefCard.tsx`、`src/features/cinematicStudio/app/i18n.ts`
 
+**V2.12 验收结果**：已完成。AI 解析与应用逻辑已删除 `audioPlan` 写回；AI 请求只读取现有音频计划，并要求在 `AUDIO` 导演层中参考，不得生成或覆盖音频卡。界面已增加“用户填写 · 仅作 AI 参考”和“以下由 AI 自动生成并进入提示词”的分界提示。
+
 ---
 
 ### V2-P3-6 镜头焦段（mm）与视场角（°）双轨冲突
@@ -395,7 +397,7 @@ UI 位置：名称输入框下方；其他资产类型同逻辑。
 | V2.9 | 模型下拉迁移 + 移除工作室全部设置入口（API 统一 LenTalk 设置 → 密钥） | UI | 低 | `feat:` |
 | V2.10 | 资产备注字段 + AI 填写纳入备注（角色信息栏） | 数据+AI+UI | 中 | `feat:` |
 | V2.11 | 风格倾向 → 风格描述自动派生（一段式中英分离描述） | 预设+UI+编译 | 低 | `feat:` 已完成 |
-| V2.12 | AI 编译分水岭：删 audioPlan 输出，AI 只读不回写；用户区/AI区视觉分隔 | AI+UI | 中 | `feat:` |
+| V2.12 | AI 编译分水岭：删 audioPlan 输出，AI 只读不回写；用户区/AI区视觉分隔 | AI+UI | 中 | `feat:` 已完成 |
 | V2.13 | 焦段统一为视场角（mm 兼容层删除 UI） | 引擎+AI+UI | 中 | `refactor:` |
 | V2.14 | 检查器内容进最终提示词（分层 + 结构化合并输出） | 引擎+AI | 高 | `feat:` |
 | V2.15 | P3 回归走查（下节断言）+ 提交 | 验收 | — | `fix:` |

@@ -255,7 +255,7 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
     const created: ShotV2 = { id: newId(), label: String(scene.shots.length + 1).padStart(2, "0"), duration: `${end}-${end + step}${t.seconds}`, time: { startSeconds: end, endSeconds: end + step }, framing: "Medium close-up", lens: "50mm", movement: "Static", action: t.defineAction, acting: t.naturalPerformance, direction: scene.shots[scene.shots.length - 1]?.direction ?? "left-to-right", cutStyle: scene.cutStyleDefault ?? "hard-cut" };
     setProject((current) => ({ ...current, scenes: current.scenes.map((item) => item.id === scene.id ? { ...item, shots: [...item.shots, created] } : item) })); setShotId(created.id);
   };
-  /** AI 智能分镜：根据场景卡片内容生成剧情分镜并填入音频计划/镜头列表/检查器，最后编译到提示词编辑器 */
+  /** AI 智能分镜：读取用户音频计划作为参考，生成镜头列表/检查器/导演文档，最后编译到提示词编辑器 */
   const aiCompileScene = async () => {
     if (sceneCompileBusy) return;
     if (!isRemoteConfigured()) { setNotice(t.aiNotConfigured); return; }
@@ -280,7 +280,6 @@ export default function App({ onClose, onStateChange }: CinematicStudioAppProps 
       const nextProject: ProjectV2 = {
         ...project,
         scenes: project.scenes.map((item) => item.id === mergedScene.id ? mergedScene : item),
-        ...(draft.audioPlan ? { audioPlan: draft.audioPlan } : {}),
         ...(draft.negativePrompt !== undefined ? { negativePrompt: draft.negativePrompt } : {}),
       };
       setProject(nextProject);

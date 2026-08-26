@@ -211,6 +211,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
     <div className="brief-group">
       <div className="brief-group-head">
         <span className="eyebrow">{t.audioPlan}</span>
+        <span className="brief-user-badge">{t.userInputAiReference}</span>
         <button className="brief-audio-toggle" onClick={() => setAudioOpen((open) => !open)} title={audioOpen ? t.audioCollapse : t.audioExpand}>
           <span className="audio-summary">{audioSummary}</span>
           <ChevronDown size={14} className={audioOpen ? "" : "collapsed"} />
@@ -221,6 +222,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
 
     {/* 编译动作 */}
     <div className="scene-actions">
+      <span className="compile-boundary">{t.aiOutputBoundary}</span>
       <label className="brief-model-select">
         <span>{t.chatModel}</span>
         <select value={selectedChatModel} aria-label={t.chatModel} disabled={chatModels.length === 0} onChange={(event) => onSelectChatModel(event.target.value)}>
