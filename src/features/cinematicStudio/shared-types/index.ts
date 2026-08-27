@@ -141,6 +141,22 @@ export interface Asset {
   voiceClip?: string;
   /** 角色表演母版 + 声音锁（仅角色；P2/P5） */
   actingProfile?: AssetActingProfile;
+  /** 角色随身/关联道具；角色进入场景引用时，这些道具会一并进入活动引用。 */
+  attachedPropIds?: string[];
+  /** 道具默认用途（英文界面）；仅道具资产使用。 */
+  propUsage?: string;
+  /** 道具默认用途（中文界面）；仅道具资产使用。 */
+  propUsageZh?: string;
+  /** 道具默认持有角色资产 id；镜头状态可覆盖。 */
+  propHolderCharacterId?: string;
+  /** 道具默认位置（英文界面），如 "in his right hand"。 */
+  propPosition?: string;
+  /** 道具默认位置（中文界面），如「右手握持」。 */
+  propPositionZh?: string;
+  /** 道具默认可见状态（英文界面），如 "unlit"。 */
+  propDefaultState?: string;
+  /** 道具默认可见状态（中文界面），如「未点燃」。 */
+  propDefaultStateZh?: string;
   /** 资产状态组；同一角色/地点/道具的状态变体共享该 id。 */
   variantGroupId?: string;
   /** 变体的基卡资产 id；基卡指向自身。 */
@@ -305,6 +321,16 @@ export interface PromptVersion {
   manualOverride?: string;
 }
 
+/** Final-audit record kept with the project rather than leaking into the delivered prompt. */
+export interface FinalAuditLogEntry {
+  id: string;
+  createdAt: string;
+  sceneId: string;
+  status: "passed" | "blocked";
+  automaticFixes: { code: string; detail: string; detailZh?: string; shotId?: string }[];
+  issues: { code: string; severity: "error" | "warning" | "info"; detail: string; detailZh?: string; shotId?: string }[];
+}
+
 // ── V0.2 扩展：Project / Scene / Shot ──
 
 export interface ProjectV02 {
@@ -330,6 +356,8 @@ export interface ProjectV02 {
   schemaVersion?: number;
   /** 资产 @ 引用使用的项目码。 */
   projectCode?: string;
+  /** 最近的最终审计记录；供排查自动修正与阻断原因，不参与提示词编译。 */
+  finalAuditLog?: FinalAuditLogEntry[];
 }
 
 export interface SceneV02 {

@@ -106,7 +106,7 @@ export default function AssetLibrary({ project, scene, dispatch, locale, t, setN
     {editing && typeof document !== "undefined" && (() => {
       const host = document.querySelector<HTMLElement>("[data-cinematic-studio]");
       return host ? createPortal(
-        <AssetEditor scene={scene} asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />,
+        <AssetEditor project={project} scene={scene} asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />,
         host,
       ) : null;
     })()}
@@ -138,13 +138,22 @@ function AssetTile({ asset, locale, t, activeInCurrentScene, projectUsageCount, 
   </div>;
 }
 
-function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVariant, onClose }: { scene: SceneV2; asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; onCreateVariant(id: string): void; onClose(): void }) {
+function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, onCreateVariant, onClose }: { project: ProjectV2; scene: SceneV2; asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; onCreateVariant(id: string): void; onClose(): void }) {
   const [imageBusy, setImageBusy] = useState(false);
+  const [propImageBusy, setPropImageBusy] = useState(false);
+  const [propPickerOpen, setPropPickerOpen] = useState(false);
+  const [propPickerMode, setPropPickerMode] = useState<"choices" | "library" | "create">("choices");
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [variantComposerOpen, setVariantComposerOpen] = useState(false);
   const [variantStateName, setVariantStateName] = useState("");
   const update = (patch: Partial<Asset>) => dispatch({ type: "UPDATE_ASSET", id: asset.id, patch });
+  const attachedPropIds = asset.attachedPropIds ?? [];
+  const attachedProps = attachedPropIds.map((id) => (project.assets ?? []).find((candidate) => candidate.id === id && candidate.kind === "prop")).filter((candidate): candidate is Asset => Boolean(candidate));
+  const attachableProps = (project.assets ?? []).filter((candidate) => candidate.kind === "prop" && !attachedPropIds.includes(candidate.id));
+  const characterAssets = (project.assets ?? []).filter((candidate) => candidate.kind === "character");
+  const linkedCharacters = characterAssets.filter((character) => (character.attachedPropIds ?? []).includes(asset.id));
+  const linkableCharacters = characterAssets.filter((character) => !linkedCharacters.some((linked) => linked.id === character.id));
   const acting = asset.actingProfile ?? {};
   const updateActing = (patch: Partial<AssetActingProfile>) => update({ actingProfile: { ...acting, ...patch } });
   const perfKeys = ["perf0", "perf1", "perf2", "perf3", "perf4", "perf5"] as const;
@@ -160,6 +169,42 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
     } catch { setNotice(t.uploadFailed); } finally { setImageBusy(false); }
   };
   const removeReference = (index: number) => update({ referencePaths: (asset.referencePaths ?? []).filter((_, i) => i !== index) });
+  const attachProp = (id: string) => {
+    if (attachedPropIds.includes(id)) return;
+    update({ attachedPropIds: [...attachedPropIds, id] });
+    setPropPickerOpen(false);
+  };
+  const detachProp = (id: string) => update({ attachedPropIds: attachedPropIds.filter((propId) => propId !== id) });
+  const linkCharacter = (characterId: string) => {
+    if (!characterId) return;
+    dispatch({ type: "SET_PROP_CHARACTER_LINK", propId: asset.id, characterId, linked: true });
+  };
+  const unlinkCharacter = (characterId: string) => {
+    dispatch({ type: "SET_PROP_CHARACTER_LINK", propId: asset.id, characterId, linked: false });
+    if (asset.propHolderCharacterId === characterId) update({ propHolderCharacterId: undefined });
+  };
+
+  /** 角色编辑中添加道具：上传后创建独立道具资产，避免混入角色身份参考图。 */
+  const uploadPropImage = async (file?: File) => {
+    if (!file) return;
+    setPropImageBusy(true);
+    try {
+      const dataUrl = await compressImage(file);
+      const id = crypto.randomUUID();
+      dispatch({
+        type: "ADD_ASSET",
+        id,
+        kind: "prop",
+        name: `${asset.name || t.assetKindCharacter} ${t.assetKindProp}`,
+        referencePaths: [dataUrl],
+        propHolderCharacterId: asset.id,
+      });
+      update({ attachedPropIds: [...attachedPropIds, id] });
+      setPropPickerOpen(false);
+      setPropPickerMode("choices");
+      setNotice(t.propImageAdded);
+    } catch { setNotice(t.uploadFailed); } finally { setPropImageBusy(false); }
+  };
 
   /** 声音音色上传：音频文件 → dataURL（角色配音/音色参考） */
   const uploadVoice = (file?: File) => {
@@ -231,16 +276,74 @@ function AssetEditor({ scene, asset, locale, t, dispatch, setNotice, onCreateVar
       <div className="asset-modal-grid">
         {/* 左列：用户填写的基础信息 */}
         <div className="asset-modal-left">
-          <div className="asset-refs">
+          {asset.kind === "character" ? <div className="asset-media-split">
+            <div className="asset-refs">
+              {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={src} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
+              <label className="asset-ref-add" title={t.uploadCharacterImages}>
+                {imageBusy ? <span className="spin-dot" /> : <ImagePlus size={18} />}
+                <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
+              </label>
+            </div>
+            <div className="asset-prop-panel">
+              {attachedProps.length > 0 && <div className="asset-prop-linked-list">
+                {attachedProps.map((prop) => <span className="asset-ref" key={prop.id} title={prop.name}>
+                  {prop.referencePaths?.[0] ? <img src={prop.referencePaths[0]} alt={prop.name} /> : <span className="asset-prop-fallback">{prop.name.slice(0, 1)}</span>}
+                  <button title={t.detachProp} onClick={() => detachProp(prop.id)}><X size={10} /></button>
+                </span>)}
+              </div>}
+              <button type="button" className="asset-prop-add" onClick={() => { setPropPickerOpen((open) => !open); setPropPickerMode("choices"); }}>
+                <Plus size={18} /> <span>{t.addProp}</span>
+              </button>
+              {propPickerOpen && <div className="asset-prop-picker">
+                {propPickerMode === "choices" && <>
+                  <button type="button" onClick={() => setPropPickerMode("library")}>{t.attachPropFromLibrary}</button>
+                  <button type="button" onClick={() => setPropPickerMode("create")}>{t.createNewProp}</button>
+                </>}
+                {propPickerMode === "library" && <>
+                  <button type="button" className="asset-prop-picker-back" onClick={() => setPropPickerMode("choices")}>{t.cancel}</button>
+                  {attachableProps.length === 0 ? <span className="hint-text">{t.noPropsToAttach}</span> : <div className="asset-prop-picker-grid">
+                    {attachableProps.map((prop) => <button type="button" key={prop.id} onClick={() => attachProp(prop.id)}>
+                      {prop.referencePaths?.[0] ? <img src={prop.referencePaths[0]} alt={prop.name} /> : <span>{prop.name.slice(0, 1)}</span>}
+                      <b>{prop.name}</b>
+                    </button>)}
+                  </div>}
+                </>}
+                {propPickerMode === "create" && <>
+                  <button type="button" className="asset-prop-picker-back" onClick={() => setPropPickerMode("choices")}>{t.cancel}</button>
+                  <label className="asset-prop-upload">
+                    {propImageBusy ? <span className="spin-dot" /> : <ImagePlus size={16} />}
+                    <span>{t.uploadImage}</span>
+                    <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadPropImage(event.target.files?.[0])} />
+                  </label>
+                </>}
+              </div>}
+            </div>
+          </div> : <div className="asset-refs">
             {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={src} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
             <label className="asset-ref-add" title={t.referenceImage}>
               {imageBusy ? <span className="spin-dot" /> : <ImagePlus size={18} />}
               <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
             </label>
-          </div>
+          </div>}
           <label className="field-label">{t.assetName}<input className="modal-input" value={asset.name} placeholder={t.assetNamePlaceholder} onChange={(event) => update({ name: event.target.value })} /></label>
           <label className="field-label">{t.assetNotes}<textarea className="modal-textarea asset-notes-input" value={locale === "zh" ? (asset.notesZh ?? "") : (asset.notes ?? "")} placeholder={locale === "zh" ? t.assetNotesZhPlaceholder : t.assetNotesPlaceholder} onChange={(event) => update(locale === "zh" ? { notesZh: event.target.value } : { notes: event.target.value })} /></label>
           <label className="field-label">{t.assetReferenceTag}<input className="modal-input" value={`@${asset.referenceTag ?? asset.name}`} readOnly /></label>
+          {asset.kind === "prop" && <div className="asset-prop-details">
+            <div className="asset-section-title">{t.propDetails}</div>
+            <div className="field-label">{t.linkedCharacters}
+              <div className="asset-prop-character-links">
+                {linkedCharacters.map((character) => <span key={character.id} className="stage-chip order-chip"><span className="avatar small">{character.name.slice(0, 1)}</span><b>{character.name}</b><button title={t.detachProp} onClick={() => unlinkCharacter(character.id)}><X size={11} /></button></span>)}
+                {linkableCharacters.length > 0 && <span className="select-wrap small asset-prop-character-select"><select value="" aria-label={t.linkedCharacters} onChange={(event) => linkCharacter(event.target.value)}><option value="">{t.linkCharacter}</option>{linkableCharacters.map((character) => <option key={character.id} value={character.id}>{character.name}</option>)}</select></span>}
+              </div>
+            </div>
+            <div className="fields-grid two">
+              <label className="field-label">{t.propHolder}<span className="select-wrap"><select value={asset.propHolderCharacterId ?? ""} onChange={(event) => { const id = event.target.value || undefined; update({ propHolderCharacterId: id }); if (id) linkCharacter(id); }}><option value="">{t.none}</option>{characterAssets.map((character) => <option key={character.id} value={character.id}>{character.name}</option>)}</select></span></label>
+              <label className="field-label">{t.propPosition}<input className="modal-input" value={locale === "zh" ? (asset.propPositionZh ?? "") : (asset.propPosition ?? "")} placeholder={t.propPositionPlaceholder} onChange={(event) => update(locale === "zh" ? { propPositionZh: event.target.value } : { propPosition: event.target.value })} /></label>
+            </div>
+            <label className="field-label">{t.propUsage}<textarea className="modal-textarea asset-notes-input" value={locale === "zh" ? (asset.propUsageZh ?? "") : (asset.propUsage ?? "")} placeholder={t.propUsagePlaceholder} onChange={(event) => update(locale === "zh" ? { propUsageZh: event.target.value } : { propUsage: event.target.value })} /></label>
+            <label className="field-label">{t.propDefaultState}<input className="modal-input" value={locale === "zh" ? (asset.propDefaultStateZh ?? "") : (asset.propDefaultState ?? "")} placeholder={t.propDefaultStatePlaceholder} onChange={(event) => update(locale === "zh" ? { propDefaultStateZh: event.target.value } : { propDefaultState: event.target.value })} /></label>
+            <span className="hint-text">{t.propDefaultsHint}</span>
+          </div>}
           {/* 角色声音参考：不参与最终提示词，只用于音色和配音参考 */}
           {asset.kind === "character" && <div className="field-label">{t.voiceClip}
             {asset.voiceClip ? (

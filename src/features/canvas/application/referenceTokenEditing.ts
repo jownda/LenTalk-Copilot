@@ -40,26 +40,26 @@ export function findReferenceTokens(
   const tokens: ReferenceTokenMatch[] = [];
 
   for (let index = 0; index < text.length; index += 1) {
-    if (text[index] !== '@') {
-      continue;
-    }
-
-    const kind = text.startsWith('@图', index)
-      ? 'image'
+    const tokenShape = text.startsWith('@图', index)
+      ? { kind: 'image' as const, prefixLength: 2, closesWithBracket: false }
       : text.startsWith('@音频', index)
-        ? 'audio'
-        : null;
-    if (!kind) {
+        ? { kind: 'audio' as const, prefixLength: 3, closesWithBracket: false }
+        : text.startsWith('[image', index)
+          ? { kind: 'image' as const, prefixLength: 6, closesWithBracket: true }
+          : text.startsWith('[audio', index)
+            ? { kind: 'audio' as const, prefixLength: 6, closesWithBracket: true }
+            : null;
+    if (!tokenShape) {
       continue;
     }
 
-    const digitsStart = index + (kind === 'image' ? 2 : 3);
+    const digitsStart = index + tokenShape.prefixLength;
     if (!isAsciiDigit(text[digitsStart] ?? '')) {
       continue;
     }
 
     const maxReferenceNumber = resolveMaxReferenceNumber(
-      kind === 'image' ? maxImageCount : maxAudioCount
+      tokenShape.kind === 'image' ? maxImageCount : maxAudioCount
     );
 
     let digitsEnd = digitsStart;
@@ -67,46 +67,20 @@ export function findReferenceTokens(
       digitsEnd += 1;
     }
 
-    if (maxReferenceNumber === Number.POSITIVE_INFINITY) {
-      const fullValue = Number(text.slice(digitsStart, digitsEnd));
-      if (Number.isFinite(fullValue) && fullValue >= 1) {
-        tokens.push({
-          start: index,
-          end: digitsEnd,
-          token: text.slice(index, digitsEnd),
-          value: fullValue,
-          kind,
-        });
-        index = digitsEnd - 1;
-      }
+    const end = tokenShape.closesWithBracket ? digitsEnd + 1 : digitsEnd;
+    if (tokenShape.closesWithBracket && text[digitsEnd] !== ']') {
       continue;
     }
-
-    let bestEnd = -1;
-    let bestValue = 0;
-    let rollingValue = 0;
-    for (let cursor = digitsStart; cursor < digitsEnd; cursor += 1) {
-      rollingValue = rollingValue * 10 + Number(text[cursor]);
-
-      if (rollingValue >= 1 && rollingValue <= maxReferenceNumber) {
-        bestEnd = cursor + 1;
-        bestValue = rollingValue;
-      }
-
-      if (rollingValue > maxReferenceNumber) {
-        break;
-      }
-    }
-
-    if (bestEnd > 0) {
+    const value = Number(text.slice(digitsStart, digitsEnd));
+    if (Number.isFinite(value) && value >= 1 && value <= maxReferenceNumber) {
       tokens.push({
         start: index,
-        end: bestEnd,
-        token: text.slice(index, bestEnd),
-        value: bestValue,
-        kind,
+        end,
+        token: text.slice(index, end),
+        value,
+        kind: tokenShape.kind,
       });
-      index = bestEnd - 1;
+      index = end - 1;
     }
   }
 

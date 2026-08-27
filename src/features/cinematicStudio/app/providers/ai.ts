@@ -7,9 +7,9 @@ import { DIRECTOR_LAYER_ORDER, LocalSuggestionProvider, SHOT_TEMPLATES, localize
 import type { AIAssistant, AssetSuggestion, BeatSuggestion, FixSuggestion, SceneSuggestion } from "../../engine";
 import { buildSceneAssetRegistry } from "../../engine/compiler/renderer";
 import { fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov } from "../../engine/presets";
-import { validateDirectorLayers, type DirectorLayerIssue } from "../../engine/quality";
+import { auditFinalPrompt, validateDirectorLayers, type DirectorLayerIssue } from "../../engine/quality";
 import type {
-  ActionBeat, Asset, AssetActingProfile, AssetKind, CameraBehavior, CameraMovement, ContinuityIssueV2, CutStyle,
+  ActingObjective, ActionBeat, Asset, AssetActingProfile, AssetKind, AudioPlan, CameraBehavior, CameraMovement, ContinuityIssueV2, CutStyle,
   FirstFrameLock, LightingDirection, LockLevel, Optics, PhysicsAnchor, ProjectV2, PropState, SceneV2, ShotParticipant, ShotV2,
 } from "../../shared-types";
 import { isRemoteConfigured, loadAISettings, normalizeBaseUrl, openAICompatibleBaseUrl, type AISettings } from "./aiSettings";
@@ -18,7 +18,9 @@ import type { Locale } from "../i18n";
 const localProvider = new LocalSuggestionProvider();
 
 /** AI 分镜返回结构：FOV 为唯一镜头语言，音频计划只读且不在 AI 返回范围内。 */
-export const SCENE_DRAFT_JSON_SCHEMA = `{ "sceneName": string, "emotionArc": string, "actingObjectives": [ { "characterId": string, "objective": string, "superObjective": string | null, "obstacle": string | null, "stakes": string | null } ], "firstFrameLock": { "requiredSubjectIds": string[], "occupancyStatement": string | null }, "lightingDirection": { "primarySource": string | null, "direction": string | null, "exposurePriority": string | null, "allowHighlights": string[], "forbid": string[] }, "negativePrompt": string, "directorLayers": { "sceneContext": string, "activeReferences": string, "locationMap": string, "firstFrame": string, "formatMode": string, "optics": string, "camera": string, "actionTiming": string, "physics": string, "lighting": string, "audio": string, "positiveConstraints": string, "negativeLocks": string }, "shots": [ { "time": { "startSeconds": number, "endSeconds": number }, "label": string, "framing": string, "lensModel": string | null, "camera": string | null, "optics": { "lensCharacter": "47-standard" | "84-wide" | "107-ultrawide" | "29-short-tele" | "18-tele" | "8-supertele" | "135-immersive" | null, "fieldOfViewDegrees": number | null, "lensOutcome": string[] | null, "antiDriftLock": string | null }, "cameraBehavior": { "height": string | null, "distance": string | null, "angle": string | null, "side": string | null, "subjectSize": string | null, "screenPlacement": string | null, "focusBehavior": string | null, "depthOfField": string | null, "handheldQuality": string | null }, "physicsAnchors": [ { "kind": "walk" | "run" | "weapon" | "liquid" | "particle", "detail": string | null } ], "movement": string, "action": string, "acting": string, "performanceLevel": number, "eyeLife": string, "direction": "left-to-right" | "right-to-left", "cutStyle": "hard-cut" | "overlap" | "match-cut", "participants": [ { "characterId": string, "role": "primary" | "supporting" | "target" | "background", "position": string | null, "entrance": "already-in-frame" | "enters-left" | "enters-right" | null, "facing": string | null, "eyeline": string | null, "torsoFacing": string | null, "anchorDistance": string | null } ], "beats": [ { "order": number, "duration": number, "verb": string, "actorId": string | null, "targetCharacterId": string | null, "targetPropId": string | null, "targetBodyPart": string | null, "actionText": string | null, "dialogue": string | null, "tactic": string | null, "subtext": string | null, "beatChange": string | null, "reactionBeforeLine": string | null, "required": boolean, "forbiddenTargets": string[], "stateBefore": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "stateAfter": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "cutRule": string | null, "note": string | null } ], "propStatesAtStart": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "propStatesAtEnd": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "note": string | null } ] }`;
+export const SCENE_DRAFT_JSON_SCHEMA = `{ "sceneName": string, "emotionArc": string, "actingObjectives": [ { "characterId": string, "objective": string, "superObjective": string | null, "obstacle": string | null, "stakes": string | null } ], "firstFrameLock": { "requiredSubjectIds": string[], "occupancyStatement": string | null }, "lightingDirection": { "primarySource": string | null, "direction": string | null, "exposurePriority": string | null, "allowHighlights": string[], "forbid": string[] }, "negativePrompt": string, "shots": [ { "time": { "startSeconds": number, "endSeconds": number }, "label": string, "framing": string, "lensModel": string | null, "camera": string | null, "optics": { "lensCharacter": "47-standard" | "84-wide" | "107-ultrawide" | "29-short-tele" | "18-tele" | "8-supertele" | "135-immersive" | null, "fieldOfViewDegrees": number | null, "lensOutcome": string[] | null, "antiDriftLock": string | null }, "cameraBehavior": { "height": string | null, "distance": string | null, "angle": string | null, "side": string | null, "subjectSize": string | null, "screenPlacement": string | null, "focusBehavior": string | null, "depthOfField": string | null, "handheldQuality": string | null }, "physicsAnchors": [ { "kind": "walk" | "run" | "weapon" | "liquid" | "particle", "detail": string | null } ], "movement": string, "action": string, "acting": string, "performanceLevel": number, "eyeLife": string, "direction": "left-to-right" | "right-to-left", "cutStyle": "hard-cut" | "overlap" | "match-cut", "participants": [ { "characterId": string, "role": "primary" | "supporting" | "target" | "background", "position": string | null, "entrance": "already-in-frame" | "enters-left" | "enters-right" | null, "facing": string | null, "eyeline": string | null, "torsoFacing": string | null, "anchorDistance": string | null } ], "beats": [ { "order": number, "duration": number, "verb": string, "actorId": string | null, "targetCharacterId": string | null, "targetPropId": string | null, "targetBodyPart": string | null, "actionText": string | null, "dialogue": string | null, "tactic": string | null, "subtext": string | null, "beatChange": string | null, "reactionBeforeLine": string | null, "required": boolean, "forbiddenTargets": string[], "stateBefore": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "stateAfter": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "cutRule": string | null, "note": string | null } ], "propStatesAtStart": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "propStatesAtEnd": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "note": string | null } ] }`;
+
+export type SceneCompileProgress = "idle" | "preparing" | "waiting" | "parsing" | "validating";
 
 interface AIModelProxyPayload {
   url: string;
@@ -138,7 +140,13 @@ function extractJSON<T>(text: string): T {
 }
 
 
-async function chatCompletionsJSON(settings: AISettings, system: string, user: string, imageUrls: string[] = []): Promise<unknown> {
+async function chatCompletionsJSON(
+  settings: AISettings,
+  system: string,
+  user: string,
+  imageUrls: string[] = [],
+  onProgress?: (stage: SceneCompileProgress) => void,
+): Promise<unknown> {
   const endpoint = `${openAICompatibleBaseUrl(settings.baseUrl)}/chat/completions`;
   const messages = [
     { role: "system", content: system },
@@ -166,6 +174,7 @@ async function chatCompletionsJSON(settings: AISettings, system: string, user: s
     },
     body: JSON.stringify(buildBody(withJsonMode)),
   });
+  onProgress?.("waiting");
   let response = await request(true);
   // 部分 OpenAI 兼容服务/中转站不支持 response_format：
   // 有的直接返回 400，有的会把内层 400 包装成 502（Bad Gateway）。
@@ -173,6 +182,7 @@ async function chatCompletionsJSON(settings: AISettings, system: string, user: s
   if (response.status === 400 || response.status === 502) {
     const raw = await response.clone().text();
     if (response.status === 502 || /response_format|json_object/i.test(raw)) {
+      onProgress?.("waiting");
       response = await request(false);
     }
   }
@@ -180,14 +190,15 @@ async function chatCompletionsJSON(settings: AISettings, system: string, user: s
     const raw = await response.text().catch(() => "");
     throw new Error(`HTTP ${response.status}${raw ? `：${raw.slice(0, 260)}` : ""}`);
   }
+  onProgress?.("parsing");
   const data = await response.json() as { choices?: { message?: { content?: string } }[] };
   const content = data.choices?.[0]?.message?.content;
   if (!content) throw new Error("响应中没有文本内容");
   return extractJSON(content);
 }
 
-async function chatJSON(settings: AISettings, system: string, user: string): Promise<unknown> {
-  return chatCompletionsJSON(settings, system, user);
+async function chatJSON(settings: AISettings, system: string, user: string, onProgress?: (stage: SceneCompileProgress) => void): Promise<unknown> {
+  return chatCompletionsJSON(settings, system, user, [], onProgress);
 }
 
 const JSON_SYSTEM = "You are the structured planning engine for a cinematic AI video prompt studio. "
@@ -603,6 +614,87 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
   return patch;
 }
 
+/** User-facing brief fields are AI planning reference only and never compile directly into the final prompt. */
+export interface SceneBriefOptimization {
+  mustHappen: string[];
+  forbid: string[];
+  dialogue?: string;
+  emotionArc?: string;
+  actingObjectives: ActingObjective[];
+  audioPlan: AudioPlan;
+}
+
+export async function optimizeSceneBrief(project: ProjectV2, scene: SceneV2, locale: Locale): Promise<SceneBriefOptimization> {
+  const settings = loadAISettings();
+  if (!isRemoteConfigured(settings)) {
+    throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key，再在「AI编译提示词」左侧选择模型。");
+  }
+  const language = locale === "zh" ? "Simplified Chinese (中文)" : "English";
+  const assets = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
+  const characterIds = new Set(collectSceneAssetIds(project, scene).filter((id) => assets.get(id)?.kind === "character"));
+  const propIds = new Set(collectSceneAssetIds(project, scene).filter((id) => assets.get(id)?.kind === "prop"));
+  const existing = {
+    mustHappen: scene.mustHappen ?? [],
+    forbid: scene.forbid ?? [],
+    dialogue: scene.dialogue ?? "",
+    emotionArc: scene.emotionArc ?? "",
+    actingObjectives: scene.actingObjectives ?? [],
+    audioPlan: project.audioPlan ?? { score: "none", subtitles: false },
+  };
+  const data = await chatJSON(settings, JSON_SYSTEM, [
+    "You optimize the user-reference fields of a cinematic scene brief. Do NOT create a shot list, director layers, final prompt, negative prompt, camera plan, or asset descriptions.",
+    `Return ONLY ${language}. These fields help the later storyboard AI understand intent; none of them is copied directly into the final prompt.`,
+    "Preserve useful user input, fill missing information, and keep every suggestion concrete, concise, and consistent with the current story.",
+    "",
+    `Scene logline: ${scene.logline?.trim() || "(empty)"}`,
+    `Prior context: ${scene.staging?.priorContext?.trim() || "(empty)"}`,
+    `Location and staging: ${scene.location}; ${scene.staging?.anchorDescription?.trim() || "(none)"}`,
+    `Duration / shooting mode: ${scene.duration}; ${scene.shootingMode === "multi-shot" ? "multi-shot" : "one continuous long take"}`,
+    `Available characters: ${[...characterIds].map((id) => `${assets.get(id)?.name ?? id}(${id})`).join(", ") || "(none)"}`,
+    `Available props: ${[...propIds].map((id) => `${assets.get(id)?.name ?? id}(${id})`).join(", ") || "(none)"}`,
+    `Current user-reference values: ${JSON.stringify(existing)}`,
+    "",
+    "Return exactly this JSON schema:",
+    '{ "mustHappen": string[], "forbid": string[], "dialogue": string, "emotionArc": string, "actingObjectives": [{ "characterId": string, "objective": string, "superObjective": string | null, "obstacle": string | null, "stakes": string | null }], "audioPlan": { "diegeticMusic": string[], "sfx": string[], "score": "none" | "original-score", "subtitles": boolean, "musicSourcePropId": string | null } }',
+    "Rules: mustHappen and forbid each contain at most 6 visible, story-relevant items. dialogue contains only lines intended for this scene. emotionArc describes a concise, camera-readable progression. actingObjectives use only available character IDs and give each active character a playable objective; omit inactive characters. Audio is planning reference only: use score none when no music is justified, and musicSourcePropId only when it is one of the available prop IDs.",
+  ].join("\n"));
+  const value = (data ?? {}) as Record<string, unknown>;
+  const objectives: ActingObjective[] = [];
+  for (const raw of Array.isArray(value.actingObjectives) ? value.actingObjectives : []) {
+    const item = (raw ?? {}) as Record<string, unknown>;
+    const characterId = asString(item.characterId);
+    const objective = asString(item.objective);
+    if (!characterIds.has(characterId) || !objective) continue;
+    const superObjective = asString(item.superObjective, undefined);
+    const obstacle = asString(item.obstacle, undefined);
+    const stakes = asString(item.stakes, undefined);
+    objectives.push({
+      characterId,
+      objective,
+      ...(superObjective ? { superObjective } : {}),
+      ...(obstacle ? { obstacle } : {}),
+      ...(stakes ? { stakes } : {}),
+    });
+  }
+  const audioRaw = (value.audioPlan ?? {}) as Record<string, unknown>;
+  const sourcePropId = asString(audioRaw.musicSourcePropId, undefined);
+  const score = asString(audioRaw.score, "none");
+  return {
+    mustHappen: asStringArray(value.mustHappen).slice(0, 6),
+    forbid: asStringArray(value.forbid).slice(0, 6),
+    dialogue: asString(value.dialogue, undefined),
+    emotionArc: asString(value.emotionArc, undefined),
+    actingObjectives: objectives,
+    audioPlan: {
+      diegeticMusic: asStringArray(audioRaw.diegeticMusic).slice(0, 6),
+      sfx: asStringArray(audioRaw.sfx).slice(0, 8),
+      score: score === "original-score" ? "original-score" : "none",
+      subtitles: audioRaw.subtitles === true,
+      ...(sourcePropId && propIds.has(sourcePropId) ? { musicSourcePropId: sourcePropId } : {}),
+    },
+  };
+}
+
 interface GeneratedShotResult {
   label?: unknown;
   time?: { startSeconds?: unknown; endSeconds?: unknown };
@@ -638,10 +730,10 @@ export function collectSceneAssetIds(project: ProjectV2, scene: SceneV2): string
 
 /**
  * AI 智能分镜：读取场景卡片的内容（地点站位、前情续接、故事梗概、角色/道具资产），
- * 生成完整的剧情分镜（镜头列表 + 各镜头检查器内容 + 导演文档），音频计划只作为用户输入读取，不回写。
+ * 生成完整的剧情分镜（镜头列表 + 各镜头检查器内容）。最终导演文档由本地编译器从这些结构化数据生成，避免模型重复输出同一份长文档。
  * @throws 未配置远程模型 / 请求失败
  */
-export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { seconds?: string; locale?: Locale }): Promise<{
+export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { seconds?: string; locale?: Locale; onProgress?: (stage: SceneCompileProgress) => void }): Promise<{
   scene: SceneV2;
   negativePrompt?: string;
   directorLayers?: Record<string, string>;
@@ -651,6 +743,8 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
   if (!isRemoteConfigured(settings)) {
     throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key，再在「AI编译提示词」左侧选择模型。");
   }
+
+  t?.onProgress?.("preparing");
 
   const assets = project.assets ?? [];
   const byId = new Map(assets.map((asset) => [asset.id, asset]));
@@ -664,6 +758,8 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
   const seconds = t?.seconds ?? "s";
   const locale = t?.locale ?? "zh";
   const styleBrief = localizedStyleBrief(project, locale);
+  const durationLimit = Number(scene.duration.match(/(\d+(?:\.\d+)?)/)?.[1]) || 15;
+  const isLongTake = scene.shootingMode !== "multi-shot";
 
   const assetSummary = (ids: string[]): string => ids
     .map((id) => {
@@ -695,18 +791,21 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
 
   const data = await chatJSON(settings, JSON_SYSTEM, [
     "You are the AI storyboard planner of a cinematic AI video prompt studio.",
-    "Read the scene card content below and plan a complete, professional storyboard for this scene: shot list, every shot's camera/performance/participants/beats/prop states, and the audio plan. Treat the style direction as one coherent visual system; do not scatter it into contradictory style labels.",
+    "Read the scene card content below and plan a complete, professional storyboard for this scene: shot list, every shot's camera/performance/participants/beats/prop states. Treat the style direction as one coherent visual system; do not scatter it into contradictory style labels.",
     "",
     "SCENE CARD CONTENT:",
     `Logline (故事梗概): ${scene.logline?.trim() || "(empty)"}`,
     `Prior context (前情续接): ${scene.staging?.priorContext?.trim() || "(empty)"}`,
+    `Must happen (user reference only): ${JSON.stringify(scene.mustHappen ?? [])}`,
+    `Forbid (user reference only): ${JSON.stringify(scene.forbid ?? [])}`,
+    `Scene dialogue (user reference only): ${scene.dialogue?.trim() || "(empty)"}`,
     `Spatial anchor (空间锚点): ${scene.staging?.anchorDescription?.trim() || "(empty)"}`,
     `Character order (左到右站位, left-to-right): ${orderIds.length > 0 ? assetSummary(orderIds) : "(none/empty)"}`,
     `Performance objectives (表演目标, per character): ${JSON.stringify(scene.actingObjectives ?? [])}`,
     `Axis direction: ${scene.staging?.axisDirection ?? "left-to-right"}; Spacing: ${scene.staging?.spacing?.trim() || "(default)"}`,
     `Scene emotion arc: ${scene.emotionArc?.trim() || "(not set)"}; Scene name: ${scene.name}`,
     `Style direction: ${styleBrief || "(not set)"}`,
-    `User audio plan (read-only; do not return or overwrite the audio plan card): ${JSON.stringify(project.audioPlan ?? { score: "none", subtitles: false })}`,
+    `User audio plan (AI reference only; do not return or overwrite the audio plan card, and do not copy it directly into the final prompt): ${JSON.stringify(project.audioPlan ?? { score: "none", subtitles: false })}`,
     "",
     `LOCATION ASSET: ${locationAsset ? `${locationAsset.name}(${locationAsset.id}) — ${locationAsset.description?.trim() || locationAsset.descriptionZh?.trim() || ""}` : "(none)"}`,
     `CHARACTER ASSETS (scene references only): ${assetSummary(characterIds) || "(none)"}`,
@@ -715,44 +814,36 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     `Technical profile: ${JSON.stringify(project.technicalProfile ?? {})}`,
     "",
     "STORYBOARD RULES:",
-    "Plan 1-8 shots covering the whole scene: establish, medium, close-up/detail, reaction, and any beat-driven shots. Use more shots for longer/more complex scenes and fewer for simple ones. Vary framing, FOV, camera and movement meaningfully. Keep shots in chronological order; each shot's duration 3-12s.",
-    `Timeline: all shots are sequential; shot 1 starts at 0; shot N starts where shot N-1 ends; pass startSeconds/endSeconds. Duration label uses "${seconds}" suffix.`,
+    isLongTake
+      ? `Shooting mode is LONG TAKE. Return EXACTLY ONE shot, starting at 0 and ending no later than ${durationLimit}s. Put the complete story progression into 1-8 continuous beats inside that one shot. Do not create cut points, alternate camera setups, or additional shot entries.`
+      : `Shooting mode is MULTI-SHOT. Select 1-8 shots only when the story rhythm needs a new viewpoint. Slow, observational, or dialogue-led scenes normally use 1-3 shots; do not add coverage just to fill a template. Use more shots only for a clear change of information, action, or emotional beat.`,
+    `Timeline hard limit: all shots are sequential; shot 1 starts at 0; shot N starts where shot N-1 ends; the final endSeconds MUST be less than or equal to ${durationLimit}s. Never exceed the user's ${durationLimit}${seconds} limit. Duration label uses "${seconds}" suffix.`,
     "Every shot needs action, acting, framing, optics.fieldOfViewDegrees, movement, direction, and participants (only existing character IDs). Assign camera / lensModel from the available IDs when the scene benefits from a specific look, otherwise omit.",
-    "Performance (P2): per shot, set performanceLevel (0-5, 4 default whenever the acting master profile is strong) and eyeLife (micro glances / blink quality / eye glint / eyes leading the turn). Fill the beats' P2 fields: tactic (press / charm / provoke...), subtext (true intent opposite to the line), beatChange (visible shift: pause / posture / tempo / eye-line cut), reactionBeforeLine (reaction starting before the other speaker finishes).",
+    "Performance (P2): per shot, set performanceLevel (0-5, 4 default whenever the acting master profile is strong) and eyeLife (micro glances / blink quality / eye glint / eyes leading the turn). Fill the beats' P2 fields: tactic (press / charm / provoke...), subtext (true intent opposite to the line), beatChange (visible shift: pause / posture / tempo / eye-line cut), reactionBeforeLine (reaction starting before the other speaker finishes). Every visible action must have its real performer in actorId; a listener or reacting character must get a separate beat with that character's actorId. Use targetCharacterId only for the person being watched, addressed, or reacted to. Never assign a listener's prop action, eye movement, hand movement, or body reaction to the speaker.",
     "Photography (P1): prefer observable lens character over focal-length-only strings. Per shot set optics.lensCharacter from the 7 presets (47-standard / 84-wide / 107-ultrawide / 29-short-tele / 18-tele / 8-supertele / 135-immersive) with optics.fieldOfViewDegrees 8-135 matching the preset, and add lensOutcome + antiDriftLock when the look must stay locked. Set cameraBehavior as physical operator behavior (height / distance / angle / side / subjectSize / screenPlacement / focusBehavior / depthOfField / handheldQuality). Add physicsAnchors for walk / run / weapon / liquid / particle. Per participant set torsoFacing when the body turns away from the eyeline, and anchorDistance when a landmark anchors the scene. At scene level return firstFrameLock.requiredSubjectIds (only existing asset ids that MUST be on screen in frame one) and lightingDirection (primarySource / direction / exposurePriority / allowHighlights / forbid).",
     "State, not transition: write mid-action states (jaw clenched, strides lengthening), never transition chains (starts to... / begins to...). Groups react in staggered waves with different intensities, never in unison.",
     "Dialogue: write only scripted lines for this scene; when a character speaks, everyone else stays quiet. For an intentional silence, hold 1 second of quiet before and after the line; for an immediate interruption, start the line within 0.3 seconds.",
-    "Beats: each shot gets 1-4 ordered beats (start order at 1). Each beat has verb + actorId + targetCharacterId/targetPropId (only existing IDs) when applicable, actionText in the scene language, optional dialogue (include dialogue text in the same language as the scene), optional stateBefore/stateAfter (propId must be an existing prop), optional required flag, and optional cutRule.",
+    "Beats: each shot gets 1-4 ordered beats (start order at 1). Each beat has verb + actorId + targetCharacterId/targetPropId (only existing IDs) when applicable, actionText in the scene language, optional dialogue (include dialogue text in the same language as the scene), optional stateBefore/stateAfter (propId must be an existing prop), optional required flag, and optional cutRule. If a supporting character visibly tightens a grip, changes eyeline, shifts posture, or reacts before dialogue, create a separate beat for that supporting character instead of burying the action in the lead character's beat text.",
     "propStatesAtStart / propStatesAtEnd: use only existing prop IDs; the state chain must be consistent across shots.",
     "Negative prompt: produce one comma-separated string of concrete negative constraints for this scene in the language of the scene (Chinese if the scene is Chinese), covering character/wardrobe drift, extra limbs, physics, floating props, water/dust on lens where relevant, and scene-specific artifacts to avoid.",
-    "Audio: use the user audio plan above as the source of truth. Rephrase or clarify it only inside the AUDIO director layer when needed; do not invent a replacement plan, do not return a top-level audioPlan key, and do not change the user's audio settings.",
-    "DIRECTOR LAYERS: also produce \"directorLayers\", an object that lays out this scene as a director-level document in this exact order. Each key maps to one full text block whose FIRST line is its own section header (Chinese header when the scene is Chinese, English uppercase otherwise).",
-    `Layer keys in order: ${DIRECTOR_LAYER_ORDER.join(", ")}.`,
-    "Use only these canonical section headers; never invent, translate, rename, or omit a header. Choose the Chinese header for a Chinese scene and the English uppercase header for an English scene:",
-    "sceneContext=场景上下文 / SCENE CONTEXT; activeReferences=活动引用 / ACTIVE REFERENCES; locationMap=位置图 / LOCATION MAP; firstFrame=首帧与站位 / FIRST FRAME AND SPATIAL BLOCKING; formatMode=格式模式 / FORMAT MODE; optics=光学 / OPTICS; camera=相机 / CAMERA; actionTiming=动作时间 / ACTION TIMING; physics=物理 / PHYSICS; lighting=光线 / LIGHTING; audio=音频 / AUDIO; positiveConstraints=正向约束 / POSITIVE CONSTRAINTS; negativeLocks=负面局部锁 / NEGATIVE LOCKS.",
-    "sceneContext: one or two sentences for this scene only (no scene number, no prior-context summary).",
-    "activeReferences: list ONLY the @tag assets provided in the scene-reference asset lists; never mention assets absent from those lists.",
-    "locationMap: camera position/orientation, foreground-midground-background, landmarks, movement paths, light direction.",
-    "firstFrame: first-frame occupancy lock + spatial blocking (who/where at frame one).",
-    "formatMode: SINGLE CONTINUOUS TAKE or CONTROLLED MULTI-SHOT SEQUENCE (long-take vs multi-shot).",
-    "optics: diagonal field-of-view + observable lens outcome + anti-drift lock.",
-    "camera: physical operator behavior (height, distance, angle, side, screen placement, focus, depth of field, handheld quality).",
-    "actionTiming: wall-clock time blocks (0:00-0:03 …), grouped and labeled per shot; each block carries position/action/camera/prop/physics/audio. The structured shot inspector fields remain authoritative when this prose conflicts with them.",
-    "physics: physics anchors + walk/run/weapon/liquid/particle locks per shot.",
-    "lighting: structured light-direction lock (key light, direction, exposure priority, highlights, forbids).",
-    "audio: audio + dialogue rules + per-character voice lock.",
-    "positiveConstraints: positive hard constraints (character count lock, strict identity, user hard constraints).",
-    "negativeLocks: only global failure modes (identity drift, floating motion, text/watermark); local locks go inline in their own section instead.",
-    "Never output project-management metadata such as enabled assets, disabled assets, unused assets, or project-only assets. Never mention an asset by name unless it is in the scene-reference asset lists.",
+    "Audio: use the user audio plan above only to understand pacing and on-screen behavior. Do not invent a replacement plan, do not return a top-level audioPlan key, and do not change the user's audio settings. The compiler, not the AI layers, applies the user's explicitly selected music, SFX, score, and subtitle settings to final delivery.",
     "",
     "Return ONLY a JSON object matching this schema:",
-    "The top-level object MUST also include \"negativePrompt\": string (see Negative prompt rule) and \"directorLayers\": object (see DIRECTOR LAYERS rule).",
+    "The top-level object MUST also include \"negativePrompt\": string (see Negative prompt rule).",
     SCENE_DRAFT_JSON_SCHEMA,
     ...vocabLines,
-    "Do NOT invent character/prop IDs. Do NOT add prose or keys outside the schema (the only exceptions are the top-level negativePrompt and directorLayers fields).",
-  ].join("\n"));
+    "Do NOT invent character/prop IDs. Do NOT add prose or keys outside the schema (the only exception is the top-level negativePrompt field).",
+  ].join("\n"), t?.onProgress);
 
-  return normalizeSceneDraft(project, scene, data, seconds);
+  const normalized = normalizeSceneDraft(project, scene, data, seconds);
+  t?.onProgress?.("validating");
+  const durationIssue = auditFinalPrompt(normalized.scene).issues.find((issue) => issue.code === "FINAL.DURATION_EXCEEDED");
+  if (durationIssue) {
+    throw new Error(locale === "zh"
+      ? `AI 分镜总时长超过用户设置的 ${durationLimit}${seconds}，本次规划未应用，请重新编译。`
+      : `The AI storyboard exceeds the user's ${durationLimit}${seconds} limit. This plan was not applied; compile again.`);
+  }
+  return normalized;
 }
 
 /** 解析 AI 返回的 directorLayers：仅保留 canonical 层 key，且值非空。 */
@@ -850,7 +941,9 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
   };
 
   const rawShots = Array.isArray(obj.shots) ? obj.shots : [];
-  const generated: GeneratedShotResult[] = rawShots.slice(0, 12).map((raw) => ((raw ?? {}) as GeneratedShotResult));
+  // Long take is structurally one shot. Ignore extra AI coverage rather than
+  // letting a non-compliant response turn into a multi-shot final export.
+  const generated: GeneratedShotResult[] = rawShots.slice(0, scene.shootingMode !== "multi-shot" ? 1 : 8).map((raw) => ((raw ?? {}) as GeneratedShotResult));
   const shots: ShotV2[] = [];
   let cursor = 0;
   for (const raw of generated) {

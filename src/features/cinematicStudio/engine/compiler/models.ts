@@ -6,6 +6,7 @@
 import type { ModelProfile, ProjectV2, SceneV2, ShotV2 } from "../../shared-types";
 import type { PromptLocale } from "../i18n/lexicon";
 import { compileAssetIdPrompt, type CompileOptions } from "./asset-id";
+import { compileDirectorSequence } from "./director";
 import { compileProSequence, type ProSequenceOptions } from "./pro";
 import { compileShotCards, type ShotCardsOptions } from "./shot-cards";
 
@@ -74,6 +75,16 @@ export function compilePrompt(project: ProjectV2, scene: SceneV2, shot: ShotV2, 
   const syntax = profile?.imageReferenceSyntax ?? "at-mention";
   const audioEnabled = profile ? profile.supportsAudio : true;
   const negativeEnabled = profile ? profile.supportsNegativePrompt : true;
+
+  // Final delivery has one canonical format. Target-model profiles still control
+  // reference syntax and audio capability, but must not downgrade final output to
+  // a legacy shot-card/technical-brief template that exposes AI reference inputs.
+  if (request.director === true) {
+    return {
+      text: compileDirectorSequence(project, scene, { syntax, locale, audioEnabled }),
+      strategyNotes: notes,
+    };
+  }
 
   // 多镜头不支持：pro-sequence 自动降级 shot-cards
   let template = request.template;

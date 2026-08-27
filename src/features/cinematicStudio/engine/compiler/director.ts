@@ -6,16 +6,17 @@
  * - 光线 / 物理从技术 Profile 拆出为优先级锁段；
  * - 负面词局部锁：就近挂到 PHYSICS / LIGHTING / POSITIVE CONSTRAINTS，仅全局失败模式保留精简尾段（P0.3）。
  */
-import type { CameraBehavior, LightingDirection, ProjectV2, SceneV2 } from "../../shared-types";
+import type { CameraBehavior, LightingDirection, ProjectV2, SceneV2, ShotV2 } from "../../shared-types";
+import { assetCanonicalDescription } from "../asset-naming";
 import {
-  assetRefName, buildSceneAssetRegistry, renderAssetLine, renderCharacterCountLock, renderStrictIdentityLock,
+  buildSceneAssetRegistry, renderCharacterCountLock, renderPropDefaults,
 } from "./renderer";
 import {
-  renderActingSection, renderAudioSection, renderLocalLocks, renderShotSection, renderVoiceLockSection,
-  type PromptLocale, type ReferenceSyntax, unifiedCameraForScene,
+  renderLocalLocks, renderVoiceLockSection,
+  type PromptLocale, type ReferenceSyntax,
 } from "./sections";
-import { lensById, lensByFov, physicsAnchorById, renderLightingLayer, renderPhysicsLayer, renderTechnicalProfile } from "../presets";
-import { sanitizeDirectorText, validateDirectorLayers } from "../quality";
+import { legacyFocalLengthToFov, lensById, lensByFov, physicsAnchorById } from "../presets";
+import { auditFinalPromptWithProject, createFinalPromptDocument, normalizeOpticsText, sanitizeDirectorText } from "../quality";
 
 export interface DirectorOptions {
   syntax?: ReferenceSyntax;
@@ -31,12 +32,12 @@ export interface DirectorOptions {
 export const DIRECTOR_LAYERS = [
   { key: "sceneContext", zh: "场景上下文", en: "SCENE CONTEXT" },
   { key: "activeReferences", zh: "活动引用", en: "ACTIVE REFERENCES" },
-  { key: "locationMap", zh: "位置图", en: "LOCATION MAP" },
+  { key: "locationMap", zh: "场景地图", en: "LOCATION MAP" },
   { key: "firstFrame", zh: "首帧与站位", en: "FIRST FRAME AND SPATIAL BLOCKING" },
   { key: "formatMode", zh: "格式模式", en: "FORMAT MODE" },
   { key: "optics", zh: "光学", en: "OPTICS" },
   { key: "camera", zh: "相机", en: "CAMERA" },
-  { key: "actionTiming", zh: "动作时间", en: "ACTION TIMING" },
+  { key: "actionTiming", zh: "镜头执行", en: "SHOT EXECUTION" },
   { key: "physics", zh: "物理", en: "PHYSICS" },
   { key: "lighting", zh: "光线", en: "LIGHTING" },
   { key: "audio", zh: "音频", en: "AUDIO" },
@@ -52,65 +53,143 @@ export function directorLayerLabel(key: DirectorLayerKey, locale: "zh" | "en"): 
   return found ? found[locale] : key;
 }
 
-const sentence = (text: string): string => {
-  const t = text.trim();
-  if (!t) return "";
-  if (/[。．.!！?？]$/.test(t)) return t;
-  return `${t}.`;
-};
-
-/** SCENE CONTEXT：仅当前场景一句话到两句，无场景编号。 */
-function renderSceneContext(scene: SceneV2): string {
-  const parts = [scene.name, scene.duration, scene.location, scene.time, scene.weather].filter((part) => part.trim());
-  const line = parts.join(", ") + (scene.logline?.trim() ? `. ${sentence(scene.logline.trim())}` : "");
-  const body = [line];
-  const prior = scene.staging?.priorContext?.trim();
-  if (prior) body.push(`Prior context: ${sentence(prior)}`);
-  return body.join("\n");
-}
-
 /** LOCATION MAP：从场景站位派生（位置参考 → 锚点 → 角色顺序 → 间距 → 屏幕方向）。 */
-function renderLocationMap(project: ProjectV2, scene: SceneV2, syntax: ReferenceSyntax): string {
+function renderLocationMap(project: ProjectV2, scene: SceneV2, locale: PromptLocale): string {
   const staging = scene.staging;
   if (!staging) return "";
-  const ref = assetRefName(project, syntax);
+  const zh = locale === "zh";
+  const ref = (id: string) => project.assets?.find((asset) => asset.id === id)?.name?.trim() || id;
   const lines: string[] = [];
-  if (staging.locationAssetId) lines.push(`Location reference: ${ref(staging.locationAssetId)}`);
-  if (staging.anchorDescription?.trim()) lines.push(`Anchor: ${staging.anchorDescription.trim()}`);
-  if ((staging.characterOrder ?? []).length > 0) lines.push(`Character order, left to right: ${staging.characterOrder!.map(ref).join(", ")}`);
-  if (staging.spacing?.trim()) lines.push(`Spacing: ${staging.spacing.trim()}`);
-  if (staging.axisDirection) lines.push(`Screen direction: ${staging.axisDirection}`);
+  if (staging.locationAssetId) lines.push(zh ? `地点参考：${ref(staging.locationAssetId)}` : `Location reference: ${ref(staging.locationAssetId)}`);
+  if (staging.anchorDescription?.trim()) lines.push(zh ? `空间锚点：${staging.anchorDescription.trim()}` : `Anchor: ${staging.anchorDescription.trim()}`);
+  if ((staging.characterOrder ?? []).length > 0) lines.push(zh ? `角色从左到右：${staging.characterOrder!.map(ref).join("、")}` : `Character order, left to right: ${staging.characterOrder!.map(ref).join(", ")}`);
+  if (staging.spacing?.trim()) lines.push(zh ? `间距：${staging.spacing.trim()}` : `Spacing: ${staging.spacing.trim()}`);
+  if (staging.axisDirection) lines.push(zh
+    ? `屏幕方向：${staging.axisDirection === "left-to-right" ? "从左到右" : "从右到左"}`
+    : `Screen direction: ${staging.axisDirection}`);
   return lines.join("\n");
 }
 
+/** Final prompts register every reference once; later shot prose uses untagged names. */
+function renderActiveReferences(project: ProjectV2, scene: SceneV2, locale: PromptLocale, syntax: ReferenceSyntax): string {
+  const registry = buildSceneAssetRegistry(project, scene);
+  if (registry.orderedAssets.length === 0) return "";
+  const zh = locale === "zh";
+  let imageIndex = 0;
+  let audioIndex = 0;
+  return registry.orderedAssets.map((asset) => {
+    const referenceName = asset.referenceTag?.trim() || asset.name.trim() || asset.id;
+    const tag = syntax === "plain-text" ? referenceName : `@${referenceName}`;
+    const description = assetCanonicalDescription(asset, locale) || referenceName;
+    const anchors = asset.lockLevel === "strict"
+      ? [...(asset.uniqueMarkers ?? []), ...(asset.alwaysVisible ?? [])].filter(Boolean)
+      : [];
+    const anchorText = anchors.length > 0
+      ? (zh ? `；身份锚：${anchors.join("；")}` : `; identity anchors: ${anchors.join("; ")}`)
+      : "";
+    const locationScope = asset.kind === "location"
+      ? (zh ? "；仅控制空间几何、材质、光线和氛围，不控制取景" : "; controls geometry, materials, light and atmosphere only, not framing")
+      : "";
+    const holderName = (id: string) => {
+      const holder = registry.orderedAssets.find((candidate) => candidate.id === id);
+      if (!holder) return id;
+      const holderReference = holder.referenceTag?.trim() || holder.name.trim() || holder.id;
+      return `@${holderReference}`;
+    };
+    const propDefaults = renderPropDefaults(asset, locale, holderName);
+    const propScope = propDefaults ? `；${propDefaults}` : "";
+    const imageToken = asset.referencePaths?.[0]?.trim() ? ` [image${++imageIndex}]` : "";
+    const voiceToken = asset.voiceClip?.trim() ? (zh ? `；声音参考：[audio${++audioIndex}]` : `; Voice reference: [audio${++audioIndex}]`) : "";
+    return zh
+      ? `${tag}${imageToken}：${description}${anchorText}${locationScope}${propScope}${voiceToken}。`
+      : `${tag}${imageToken}: ${description}${anchorText}${locationScope}${propScope}${voiceToken}.`;
+  }).join("\n");
+}
+
 function push(list: string[], header: string, body: string): void {
-  if (body?.trim()) list.push(`${header}\n${body.trim()}`);
+  if (!body?.trim()) return;
+  const separator = /^[\x00-\x7F\s]+$/.test(header) ? ":" : "：";
+  list.push(header ? `${header}${/[：:]$/.test(header) ? "" : separator}\n${body.trim()}` : body.trim());
 }
 
 /** P1.2 OPTICS 层：可观测结果优先于焦距与品牌。长镜头统一 FOV 锁；多镜头逐镜锁定。 */
 function renderOpticsLayer(scene: SceneV2, locale: PromptLocale): string {
-  const shots = (scene.shots ?? []).filter((shot) => shot.optics);
+  const shots = scene.shots ?? [];
   if (shots.length === 0) return "";
   const zh = locale === "zh";
+  const fovFor = (shot: ShotV2) => shot.optics?.fieldOfViewDegrees ?? lensByFov(legacyFocalLengthToFov(shot.lens))?.fov;
   const lines: string[] = [];
+  const renderShotOptics = (shot: ShotV2, prefix: string) => {
+    const optics = shot.optics;
+    const preset = lensById(optics?.lensCharacter) ?? lensByFov(fovFor(shot));
+    const fov = preset?.fov ?? fovFor(shot);
+    if (fov == null) return "";
+    const outcome = optics?.lensOutcome?.length ? optics.lensOutcome : (preset ? (zh ? preset.outcomeZh : preset.outcome) : []);
+    const lensName = preset
+      ? (zh ? preset.zh : preset.en).replace(/\s*\d+°\s*$/, "")
+      : (zh ? "视场角" : "FOV");
+    const outcomeText = outcome.map((item) => normalizeOpticsText(item, fov).text).filter(Boolean).join(zh ? "；" : "; ");
+    const base = `${prefix}${zh ? "：" : ": "}${fov}° ${lensName}`;
+    return outcomeText ? `${base}${zh ? "；" : ". "}${outcomeText}` : base;
+  };
   if (scene.shootingMode === "long-take") {
-    const optics = shots[0].optics!;
-    const preset = lensById(optics.lensCharacter) ?? lensByFov(optics.fieldOfViewDegrees);
-    const anti = optics.antiDriftLock?.trim() || (preset ? (zh ? preset.antiDriftZh : preset.antiDrift) : "");
+    const optics = shots[0].optics;
+    const fov = fovFor(shots[0]);
+    const preset = lensById(optics?.lensCharacter) ?? lensByFov(fov);
+    const anti = optics?.antiDriftLock?.trim() || (preset ? (zh ? preset.antiDriftZh : preset.antiDrift) : "");
+    const visibleResult = renderShotOptics(shots[0], zh ? "全段统一" : "ONE FOV THROUGHOUT");
+    if (visibleResult) lines.push(visibleResult);
     if (anti) lines.push(anti);
-    const outcome = optics.lensOutcome?.length ? optics.lensOutcome : (preset ? (zh ? preset.outcomeZh : preset.outcome) : []);
-    lines.push(...outcome);
   } else {
-    for (const shot of shots) {
-      const optics = shot.optics!;
-      const preset = lensById(optics.lensCharacter) ?? lensByFov(optics.fieldOfViewDegrees);
-      const fov = preset?.fov ?? optics.fieldOfViewDegrees;
-      if (fov != null) {
-        lines.push(zh ? `镜头锁定 ${shot.label} = ${fov}°。` : `LENS LOCK SHOT ${shot.label} = ${fov}°.`);
-        lines.push(zh ? `镜头检查 ${shot.label}：${fov}° 保持，不漂移。` : `LENS CHECK SHOT ${shot.label}: ${fov}° maintained, no drift.`);
-      }
+    for (const [index, shot] of shots.entries()) {
+      const line = renderShotOptics(shot, zh ? `镜头 ${index + 1}` : `SHOT ${index + 1}`);
+      if (line) lines.push(`${line}${/[。.!！?？]$/.test(line) ? "" : (zh ? "。" : ".")}`);
     }
   }
+  return lines.join("\n");
+}
+
+/**
+ * Audio defaults are explicit: no score and no subtitles. User-selected audio
+ * plan fields are authoritative, while character voice locks remain tied to
+ * actual dialogue instead of being emitted for silent characters.
+ */
+function renderDialogueSoundLayer(project: ProjectV2, scene: SceneV2, locale: PromptLocale): string {
+  const zh = locale === "zh";
+  const names = new Map((project.assets ?? []).map((asset) => [asset.id, asset.name.trim() || asset.id]));
+  const dialogueOrder: string[] = [];
+  for (const shot of scene.shots ?? []) {
+    for (const beat of [...(shot.beats ?? [])].sort((a, b) => a.order - b.order)) {
+      if (!beat.dialogue?.trim() || !beat.actorId) continue;
+      const name = names.get(beat.actorId) ?? beat.actorId;
+      dialogueOrder.push(zh ? `${name}说“${beat.dialogue.trim()}”` : `${name} says "${beat.dialogue.trim()}"`);
+    }
+  }
+  const voiceLocks = renderVoiceLockSection(project, scene, locale)
+    .replace(/^(声音锁：|VOICE LOCKS:)\n?/, "").trim();
+  const audio = project.audioPlan;
+  const lines: string[] = [];
+  lines.push(zh
+    ? "默认环境声：保留与地点和天气一致的连续环境底噪；人物呼吸、衣料、脚步、道具接触、摩擦与碰撞仅在画面实际发生时同步出现，具有真实距离、重量和材质。"
+    : "Default environmental sound: retain continuous ambience consistent with the location and weather; breathing, cloth, footsteps, prop contact, friction, and impacts occur only when visible on screen, with credible distance, weight, and material.");
+  if ((audio?.diegeticMusic ?? []).length > 0) {
+    lines.push(zh ? `画内音乐：${audio!.diegeticMusic!.join("、")}。` : `Diegetic music: ${audio!.diegeticMusic!.join(", ")}.`);
+  }
+  if ((audio?.sfx ?? []).length > 0) {
+    lines.push(zh ? `环境音效：${audio!.sfx!.join("、")}。` : `Environmental SFX: ${audio!.sfx!.join(", ")}.`);
+  }
+  const hasScore = audio?.score === "original-score";
+  const hasSubtitles = audio?.subtitles === true;
+  lines.push(zh
+    ? `配乐：${hasScore ? "原始配乐" : "无"}。字幕：${hasSubtitles ? "烧录字幕" : "无"}。`
+    : `Score: ${hasScore ? "original score" : "none"}. Subtitles: ${hasSubtitles ? "burned-in" : "none"}.`);
+  if (dialogueOrder.length > 0) {
+    lines.push(zh ? `对白顺序：${dialogueOrder.join("；")}。` : `Dialogue order: ${dialogueOrder.join("; ")}.`);
+    lines.push(zh
+      ? "每句对白结束后保留约 0.5–1 秒环境声尾巴；只有明确的抢话或即时打断才省略该尾巴。"
+      : "After each line, retain roughly 0.5–1 second of environmental sound tail; omit it only for an explicit interruption or immediate overlap.");
+  }
+  if (voiceLocks) lines.push(voiceLocks);
   return lines.join("\n");
 }
 
@@ -132,7 +211,9 @@ function renderCameraLayer(scene: SceneV2, locale: PromptLocale): string {
     }
     return parts.join(zh ? "；" : "; ");
   };
-  if (scene.shootingMode === "long-take") return render(shots[0].cameraBehavior!);
+  if (scene.shootingMode === "long-take") {
+    return scene.shots[0]?.cameraBehavior ? render(scene.shots[0].cameraBehavior) : "";
+  }
   return shots.map((shot) => `${zh ? "镜头" : "SHOT"} ${shot.label}：${render(shot.cameraBehavior!)}`).join("\n");
 }
 
@@ -146,22 +227,86 @@ function renderFirstFrameLayer(scene: SceneV2, locale: PromptLocale): string {
     : "The first visible frame already contains all required characters in their correct positions. No empty establishing frame. No delayed character reveal.");
 }
 
-/** P1.5 动作时间块：按 startSeconds + duration 生成墙钟区间。 */
-function renderActionTimingLayer(scene: SceneV2, locale: PromptLocale): string {
+/**
+ * 最终交付把动作时间与角色表演合并为同一镜头执行表。
+ * UI 仍独立维护节拍/表演字段；导出时每个动作仅写一次，避免模型把
+ * 同一动作理解为二次执行。
+ */
+function renderShotExecutionLayer(
+  project: ProjectV2,
+  scene: SceneV2,
+  locale: PromptLocale,
+  shotTimes: Map<string, { startSeconds: number; endSeconds: number }>,
+): string {
   const zh = locale === "zh";
-  const blocks: string[] = [];
-  for (const shot of scene.shots ?? []) {
-    for (const beat of shot.beats ?? []) {
-      if (beat.startSeconds == null) continue;
-      const start = beat.startSeconds;
-      const end = start + (beat.duration ?? 0);
-      const fmt = (sec: number) => {
-        const total = Math.round(sec);
-        return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
-      };
-      const verb = beat.verb || beat.actionText?.trim() || "";
-      blocks.push(zh ? `时间块 ${fmt(start)} 至 ${fmt(end)}：${verb}。` : `TIME BLOCK ${fmt(start)} to ${fmt(end)}: ${verb}.`);
+  const displayName = (id: string) => project.assets?.find((asset) => asset.id === id)?.name?.trim() || id;
+  const sentenceEnd = /[。．.!！?？][”」』)）\"']?$/;
+  const sentence = (text: string) => {
+    const trimmed = text.trim();
+    return trimmed ? (sentenceEnd.test(trimmed) ? trimmed : `${trimmed}${zh ? "。" : "."}`) : "";
+  };
+  const fragment = (text: string) => text.trim().replace(/[。．.!！?？][”」』)）\"']?$/, "");
+  const fmt = (sec: number) => {
+    const total = Math.round(sec);
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+  };
+
+  const renderShotDetails = (shot: ShotV2): string[] => {
+    const lines: string[] = [];
+    const beats = [...(shot.beats ?? [])].sort((a, b) => a.order - b.order);
+    if (shot.acting?.trim()) lines.push(zh ? `表演基调：${sentence(shot.acting)}` : `Performance tone: ${sentence(shot.acting)}`);
+    if (shot.eyeLife?.trim()) lines.push(zh ? `镜头眼神：${sentence(shot.eyeLife)}` : `Eye line: ${sentence(shot.eyeLife)}`);
+
+    const actorIds = [...new Set(beats.map((beat) => beat.actorId).filter((id): id is string => Boolean(id)))];
+    for (const actorId of actorIds) {
+      const parts: string[] = [];
+      for (const beat of beats.filter((item) => item.actorId === actorId)) {
+        const action = beat.actionText?.trim() || beat.verb?.trim();
+        const targetId = beat.targetCharacterId ?? beat.targetPropId;
+        const target = targetId && targetId !== actorId ? displayName(targetId) : "";
+        if (action) parts.push(zh ? `动作：${fragment(action)}` : `Action: ${fragment(action)}`);
+        if (target) parts.push(zh ? `对象：${target}` : `Target: ${target}`);
+        if (beat.beatChange?.trim()) parts.push(zh ? `节拍变化：${fragment(beat.beatChange)}` : `Beat change: ${fragment(beat.beatChange)}`);
+        if (beat.reactionBeforeLine?.trim()) parts.push(zh
+          ? `对白前反应：${fragment(beat.reactionBeforeLine)}`
+          : `Reaction before the other line ends: ${fragment(beat.reactionBeforeLine)}`);
+        if (beat.dialogue?.trim()) parts.push(zh ? `对白：“${beat.dialogue.trim()}”` : `Dialogue: "${beat.dialogue.trim()}"`);
+      }
+      if (parts.length > 0) lines.push(zh ? `${displayName(actorId)}：${parts.join("；")}。` : `${displayName(actorId)}: ${parts.join("; ")}.`);
     }
+
+    if (beats.length === 0 && shot.action?.trim()) {
+      lines.push(zh ? `镜头动作：${sentence(shot.action)}` : `Shot action: ${sentence(shot.action)}`);
+    }
+    return lines;
+  };
+
+  const blocks: string[] = [];
+  const longTakeDetails: string[] = [];
+  for (const [index, shot] of (scene.shots ?? []).entries()) {
+    const time = shotTimes.get(shot.id);
+    if (!time) continue;
+    const details = renderShotDetails(shot);
+    if (scene.shootingMode === "long-take") {
+      longTakeDetails.push(...details);
+      continue;
+    }
+    const prefix = scene.shootingMode === "multi-shot"
+      ? (zh ? `镜头 ${index + 1} ${fmt(time.startSeconds)}–${fmt(time.endSeconds)}：` : `SHOT ${index + 1} ${fmt(time.startSeconds)}-${fmt(time.endSeconds)}:`)
+      : (zh ? `${fmt(time.startSeconds)}–${fmt(time.endSeconds)}：` : `${fmt(time.startSeconds)}-${fmt(time.endSeconds)}:`);
+    const cut = index > 0 && scene.shootingMode === "multi-shot"
+      ? ({
+          "hard-cut": zh ? `硬切进入镜头 ${index + 1}；` : `Hard cut into shot ${index + 1}; `,
+          "match-cut": zh ? `动作匹配剪辑进入镜头 ${index + 1}；` : `Match cut into shot ${index + 1}; `,
+          overlap: zh ? `以声音或动作重叠进入镜头 ${index + 1}；` : `Enter shot ${index + 1} on sound or action overlap; `,
+        }[shot.cutStyle ?? scene.cutStyleDefault ?? "hard-cut"])
+      : "";
+    blocks.push(`${prefix}${cut}\n${details.map((line) => `- ${line}`).join("\n")}`);
+  }
+  if (scene.shootingMode === "long-take" && longTakeDetails.length > 0) {
+    const end = Math.max(0, ...[...shotTimes.values()].map((time) => time.endSeconds));
+    const uniqueDetails = [...new Set(longTakeDetails)];
+    return `${fmt(0)}${zh ? "–" : "-"}${fmt(end)}${zh ? "：" : ":"}\n${uniqueDetails.map((line) => `- ${line}`).join("\n")}`;
   }
   return blocks.join("\n");
 }
@@ -197,134 +342,51 @@ function renderPhysicsAnchors(scene: SceneV2, locale: PromptLocale): string[] {
   return lines;
 }
 
-/**
- * V2.14：把检查器的结构化镜头字段追加到 AI 导演分层之后。
- * 分层文本保留叙事与导演意图，检查器字段负责逐镜的可执行细节；两者冲突时，
- * 该附录放在后面并明确声明以结构化字段为准，避免检查器内容只停留在 UI。
- */
-function renderStructuredShotAppendix(
-  project: ProjectV2,
-  scene: SceneV2,
-  locale: PromptLocale,
-  syntax: ReferenceSyntax,
-): string {
-  const zh = locale === "zh";
-  const blocks: string[] = [
-    zh
-      ? "镜头结构化检查器：\n以下逐镜内容来自检查器字段；如与前文导演描述冲突，以本段为准。"
-      : "STRUCTURED SHOT INSPECTOR:\nThe following per-shot blocks come from the structured inspector fields; when they conflict with earlier director prose, follow this section.",
-  ];
-  const cameraOverride = unifiedCameraForScene(scene);
-
-  for (const shot of scene.shots ?? []) {
-    const shotBlocks: string[] = [];
-    const shotRegistry = buildSceneAssetRegistry(project, scene, "shot", shot);
-    if (shotRegistry.orderedAssets.length > 0) {
-      const lines = shotRegistry.orderedAssets.map((asset, index) => renderAssetLine(asset, index + 1, syntax, locale));
-      shotBlocks.push(`${zh ? "镜头活动引用：" : "SHOT ACTIVE REFERENCES:"}\n${lines.join("\n")}`);
-    }
-    const shotText = renderShotSection(project, scene, shot, locale, syntax, cameraOverride).trim();
-    if (shotText) shotBlocks.push(shotText);
-    if (shotBlocks.length > 0) blocks.push(shotBlocks.join("\n\n"));
-  }
-
-  const voiceLocks = renderVoiceLockSection(project, scene, locale);
-  if (voiceLocks) blocks.push(voiceLocks);
-  return blocks.length > 1 ? blocks.join("\n\n") : "";
-}
-
 export function compileDirectorSequence(project: ProjectV2, scene: SceneV2, options: DirectorOptions = {}): string {
   const syntax = options.syntax ?? "asset-id";
   const locale: PromptLocale = options.locale ?? "zh";
-  // P0.5：若场景已存有 AI 产出的分层导演文档，则按 canonical 层序直接拼接；
-  // 这样用户编辑/锁定过的层文本能原样进入最终提示词（P0.6 锁定语义的落点）。
-  const storedLayers = scene.directorLayers;
-  if (storedLayers) {
-    // V2.2：AI 分层文本在进入最终提示词前必须过质量门；
-    // error 级结构冲突 → 丢弃整份分层文档，回退结构化编译（每镜一卡，天然分块）。
-    const issues = validateDirectorLayers(storedLayers, project, scene);
-    const hasBlockingErrors = issues.some((issue) => issue.severity === "error");
-    if (!hasBlockingErrors) {
-      const joined = DIRECTOR_LAYER_ORDER
-        .map((key) => (storedLayers[key] ?? "").trim())
-        .filter(Boolean)
-        .join("\n\n");
-      if (joined) {
-        const appendix = renderStructuredShotAppendix(project, scene, locale, syntax);
-        const layerBlocks: string[] = [];
-        let appendixInserted = false;
-        for (const key of DIRECTOR_LAYER_ORDER) {
-          const layer = (storedLayers[key] ?? "").trim();
-          if (layer) layerBlocks.push(layer);
-          if (key === "actionTiming" && appendix) {
-            layerBlocks.push(appendix);
-            appendixInserted = true;
-          }
-        }
-        if (appendix && !appendixInserted) layerBlocks.push(appendix);
-        return sanitizeDirectorText(layerBlocks.join("\n\n"));
-      }
-    }
-  }
-  /* 结构化编译路径（V2.2 起作为 AI 分层文档的校验回退兜底） */
-  const registry = buildSceneAssetRegistry(project, scene);
+  // AI directorLayers are source material only. The final export is always
+  // rebuilt from structured scene data so raw UI/inspector text cannot leak.
+  const finalAudit = auditFinalPromptWithProject(scene, project.assets ?? []);
+  const finalDocument = createFinalPromptDocument(scene, finalAudit);
+  const shotTimes = finalDocument.shotTimes;
   const locks = renderLocalLocks(project, locale);
   const sections: string[] = [];
+  const header = (key: DirectorLayerKey) => directorLayerLabel(key, locale);
 
-  push(sections, "SCENE CONTEXT", renderSceneContext(scene));
+  // The scene brief, prior context, global technical profile, and style brief are
+  // planning inputs. They guide AI compilation but must never be copied into final
+  // delivery. The director document starts from executable scene data instead.
+  push(sections, header("activeReferences"), renderActiveReferences(project, scene, locale, syntax));
 
-  push(sections, "LOCATION MAP", renderLocationMap(project, scene, syntax));
+  push(sections, header("locationMap"), renderLocationMap(project, scene, locale));
 
-  push(sections, "FIRST FRAME", renderFirstFrameLayer(scene, locale));
+  push(sections, header("firstFrame"), renderFirstFrameLayer(scene, locale));
 
   // FORMAT MODE：长镜头 = 单连续镜头；多镜头 = 受控多镜序列。
-  push(sections, "FORMAT MODE", scene.shootingMode === "multi-shot" ? "CONTROLLED MULTI-SHOT SEQUENCE" : "SINGLE CONTINUOUS TAKE");
+  push(sections, header("formatMode"), scene.shootingMode === "multi-shot"
+    ? (locale === "zh" ? "受控多镜头序列；仅在明确镜头边界处切换。" : "CONTROLLED MULTI-SHOT SEQUENCE. Cut only at explicit shot boundaries.")
+    : (locale === "zh" ? "单一连续长镜头；全段保持同一摄影机、FOV 与轴线。" : "SINGLE CONTINUOUS TAKE. Keep one camera, FOV and screen axis throughout."));
 
-  // STYLE PROFILE：光学 / 相机 / 风格母版（尚未拆落到 OPTICS/CAMERA，P1 精化）。
-  const styleProfile = renderTechnicalProfile(project, locale, ["lighting", "physics"]);
-  push(sections, "STYLE PROFILE", styleProfile);
-
-  push(sections, "OPTICS", renderOpticsLayer(scene, locale));
-  push(sections, "CAMERA", renderCameraLayer(scene, locale));
-  push(sections, "ACTION TIMING", renderActionTimingLayer(scene, locale));
-  push(sections, locale === "zh" ? "表演" : "ACTING", renderActingSection(project, scene, locale));
-
-  // 每个镜头是一份密封文档：只列本镜活动引用（上下文隔离），再附动作 / 空间 / 相机细节。
-  const cameraOverride = unifiedCameraForScene(scene);
-  for (const shot of scene.shots) {
-    const shotRegistry = buildSceneAssetRegistry(project, scene, "shot", shot);
-    if (shotRegistry.orderedAssets.length > 0) {
-      const lines = shotRegistry.orderedAssets.map((asset, index) => renderAssetLine(asset, index + 1, syntax, locale));
-      push(sections, "ACTIVE REFERENCES", lines.join("\n"));
-    }
-    push(sections, "", renderShotSection(project, scene, shot, locale, syntax, cameraOverride));
-  }
+  push(sections, header("optics"), renderOpticsLayer(scene, locale));
+  push(sections, header("camera"), renderCameraLayer(scene, locale));
+  push(sections, header("actionTiming"), renderShotExecutionLayer(project, scene, locale, shotTimes));
 
   // PHYSICS / LIGHTING 优先级锁（正向先写，负向骨折就近内联）。
-  const physicsBits = [renderPhysicsLayer(project, locale), locks.physics.join(locale === "zh" ? "；" : "; "), ...renderPhysicsAnchors(scene, locale)].filter(Boolean);
-  push(sections, "PHYSICS", physicsBits.join(locale === "zh" ? "；" : "; "));
-  const lightingBits = [renderLightingDirection(scene.lightingDirection, locale), renderLightingLayer(project, locale), scene.lighting?.trim(), locks.lighting.join(locale === "zh" ? "；" : "; ")].filter(Boolean);
-  push(sections, "LIGHTING", lightingBits.join(locale === "zh" ? "；" : "; "));
+  const physicsBits = [locks.physics.join(locale === "zh" ? "；" : "; "), ...renderPhysicsAnchors(scene, locale)].filter(Boolean);
+  push(sections, header("physics"), physicsBits.join(locale === "zh" ? "；" : "; "));
+  const lightingBits = [renderLightingDirection(scene.lightingDirection, locale), locks.lighting.join(locale === "zh" ? "；" : "; ")].filter(Boolean);
+  push(sections, header("lighting"), lightingBits.join(locale === "zh" ? "；" : "; "));
 
-  // AUDIO
-  const audio = renderAudioSection(project, scene, locale, options.audioEnabled !== false);
-  if (audio?.trim()) sections.push(audio.trim());
-
-  // POSITIVE CONSTRAINTS：数量锁 + 身份强锁 + 外观漂移/多余肢体内联锁 + 用户正向硬约束。
+  if (options.audioEnabled !== false) push(sections, header("audio"), renderDialogueSoundLayer(project, scene, locale));
+  // Identity anchors already appear once in ACTIVE REFERENCES. Keep only
+  // count and user-authored positive constraints here.
   const positives: string[] = [];
   const count = renderCharacterCountLock(project, locale);
   if (count) positives.push(count);
-  const strict = renderStrictIdentityLock(registry, project.identityRules ?? [], locale).replace(/^[^\n]+\n/, "").trim();
-  if (strict) positives.push(strict);
   if (locks.character.length) positives.push(locks.character.join(locale === "zh" ? "；" : "; "));
   for (const item of project.positiveConstraints ?? []) if (item.trim()) positives.push(item.trim());
-  push(sections, "POSITIVE CONSTRAINTS", positives.join("\n"));
-
-  // 全局失败模式（身份漂移 / 悬浮运动 / 文字水印）保留精简尾段；camera 词待 P1 CAMERA 段落位前暂归尾段。
-  const globalLocks = [...locks.global, ...locks.camera];
-  if (globalLocks.length > 0) {
-    push(sections, "NEGATIVE LOCKS (GLOBAL ONLY)", globalLocks.join(locale === "zh" ? "；" : "; "));
-  }
+  push(sections, header("positiveConstraints"), positives.join("\n"));
 
   return sanitizeDirectorText(sections.filter(Boolean).join("\n\n"));
 }

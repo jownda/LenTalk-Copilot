@@ -6,18 +6,36 @@ export const SCHEMA_VERSION = 3;
 export const rainPreview = "./assets/rain-night-reference.jpg";
 
 export const seedProject: ProjectV2 = {
-  id: "rain-night", title: "雨夜", description: "一个男人穿过暴雨中的城市，把所有情绪压在心底。", preset: "Hollywood Naturalism", styleId: "wong-kar-wai",
+  id: "cinematic-project", title: "未命名影片", description: "", preset: "custom", styleId: undefined,
   negativePrompt: DEFAULT_NEGATIVE, schemaVersion: SCHEMA_VERSION,
   characters: [],
   scenes: [{
-    id: "scene-01", name: "雨夜", logline: "一个男人独自穿过被暴雨冲刷的市中心街道。他压抑悲伤，却没有流泪。",
-    location: "密集的城市街道", time: "夜晚", weather: "暴雨", duration: "15秒", palette: "蓝灰 60 / 钠灯琥珀 30 / 红色 10", lighting: "街灯与湿润霓虹", environmentLock: true,
+    id: "scene-01", name: "新场景", logline: "",
+    location: "", time: "", weather: "", duration: "15秒", palette: "", lighting: "", environmentLock: false,
     shots: [
-      { id: "shot-01", label: "镜头 01", duration: "0-8秒", framing: "3/4 medium, behind subject", lens: "35mm", camera: "sony-venice-2", lensModel: "cooke-s7i", movement: "Tracking", action: "关杰穿过雨幕，大衣被雨水打湿后显得沉重。", acting: "克制的悲伤；视线下垂，呼吸浅促，下颌紧绷。", direction: "left-to-right" },
-      { id: "shot-02", label: "镜头 02", duration: "8-15秒", framing: "Extreme close-up, profile", lens: "85mm", camera: "arri-alexa-35", lensModel: "arri-master-prime", movement: "Handheld", action: "他在闪烁的雨棚下驻足，随后继续前行。", acting: "反应延迟；没有落泪，一次呼吸微微顿住。", direction: "left-to-right" }
+      { id: "shot-01", label: "镜头 01", duration: "0-15秒", framing: "Wide", lens: "35mm", camera: "arri-alexa-35", lensModel: "arri-master-prime", movement: "Static", action: "", acting: "", direction: "left-to-right" }
     ]
   }]
 };
+
+/** Only replace the untouched bundled demo; never reset a user-customized project. */
+function isUntouchedLegacySeed(project: ProjectV2): boolean {
+  const scene = project.scenes?.[0];
+  const shots = scene?.shots ?? [];
+  return project.id === "rain-night"
+    && (project.title === "雨夜" || project.title === "Rain Night")
+    && project.description === "一个男人穿过暴雨中的城市，把所有情绪压在心底。"
+    && project.scenes?.length === 1
+    && scene?.id === "scene-01"
+    && scene.name === "雨夜"
+    && scene.logline === "一个男人独自穿过被暴雨冲刷的市中心街道。他压抑悲伤，却没有流泪。"
+    && scene.location === "密集的城市街道"
+    && scene.time === "夜晚"
+    && scene.weather === "暴雨"
+    && shots.length === 2
+    && shots[0]?.action === "关杰穿过雨幕，大衣被雨水打湿后显得沉重。"
+    && shots[1]?.action === "他在闪烁的雨棚下驻足，随后继续前行。";
+}
 
 /**
  * V0.1 → V0.2 项目迁移：
@@ -116,8 +134,9 @@ export function migrateProject(raw: unknown): ProjectV2 {
 export function loadProject(): ProjectV2 {
   try {
     const stored = JSON.parse(localStorage.getItem("cineprompt-project") || "") as ProjectV2;
-    // Refresh only the bundled demonstration project when upgrading to the Chinese default.
-    const base = stored.id === seedProject.id && stored.title === "Rain Night" ? seedProject : stored;
+    // Refresh the old bundled demonstration project in all legacy language variants.
+    // User-created projects retain their data, even if they use similar wording.
+    const base = isUntouchedLegacySeed(stored) ? seedProject : stored;
     const migrated = migrateProject(base);
     return {
       ...migrated,

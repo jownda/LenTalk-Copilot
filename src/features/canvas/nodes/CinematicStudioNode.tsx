@@ -61,18 +61,20 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   }, []);
 
   const handleStateChange = useCallback(
-    (snapshot: { projectTitle?: string; projectDescription?: string; promptPreview?: string }) => {
+    (snapshot: { projectTitle?: string; projectDescription?: string; promptPreview?: string; referenceImages?: string[]; referenceAudio?: string[] }) => {
       updateNodeData(id, {
         lastProjectTitle: typeof snapshot.projectTitle === 'string' ? snapshot.projectTitle : null,
         lastProjectDescription: typeof snapshot.projectDescription === 'string' ? snapshot.projectDescription : null,
         lastPromptPreview: typeof snapshot.promptPreview === 'string' ? snapshot.promptPreview : null,
+        studioReferenceImages: Array.isArray(snapshot.referenceImages) ? snapshot.referenceImages : [],
+        studioReferenceAudio: Array.isArray(snapshot.referenceAudio) ? snapshot.referenceAudio : [],
       });
     },
     [id, updateNodeData]
   );
 
-  const handleSendToVideo = useCallback((prompt: string) => {
-    const nextPrompt = prompt.trim();
+  const handleSendToVideo = useCallback((payload: { prompt: string; referenceImages: string[]; referenceAudio: string[] }) => {
+    const nextPrompt = payload.prompt.trim();
     if (!nextPrompt) return;
     const placement = findNodePosition(id, 420, 360);
     const videoNodeId = addNode(CANVAS_NODE_TYPES.videoGen, placement, {
@@ -82,21 +84,22 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       aspectRatio: '16:9',
       resolution: '720p',
       imageMode: 'reference',
+      studioReferenceImages: payload.referenceImages,
+      studioReferenceAudio: payload.referenceAudio,
     });
     addEdge(id, videoNodeId);
     setSelectedNode(videoNodeId);
   }, [addEdge, addNode, findNodePosition, id, setSelectedNode]);
 
-  const projectTitle = typeof data.lastProjectTitle === 'string' && data.lastProjectTitle.trim()
-    ? data.lastProjectTitle.trim()
-    : null;
-  const promptPreview = typeof data.lastPromptPreview === 'string' && data.lastPromptPreview.trim()
-    ? data.lastPromptPreview.trim()
-    : null;
-  const projectDescription = typeof data.lastProjectDescription === 'string' && data.lastProjectDescription.trim()
-    ? data.lastProjectDescription.trim()
-    : null;
-  const nodeSummary = projectDescription ?? promptPreview;
+  const cachedTitle = typeof data.lastProjectTitle === 'string' ? data.lastProjectTitle.trim() : '';
+  const cachedDescription = typeof data.lastProjectDescription === 'string' ? data.lastProjectDescription.trim() : '';
+  // Do not keep showing the bundled Rain Night demo in nodes created by older builds.
+  const isLegacyPreview = (cachedTitle === '雨夜' || cachedTitle === 'Rain Night')
+    && cachedDescription === '一个男人穿过暴雨中的城市，把所有情绪压在心底。';
+  const projectTitle = cachedTitle && !isLegacyPreview ? cachedTitle : null;
+  const projectDescription = cachedDescription && !isLegacyPreview ? cachedDescription : null;
+  // 节点标题和简介必须反映工程元数据，不能把最终提示词片段误当作项目简介。
+  const nodeTitle = projectTitle ?? displayName;
 
   return (
     <div
@@ -107,7 +110,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           : 'border-[rgba(15,23,42,0.22)] hover:border-[rgba(15,23,42,0.34)] dark:border-[rgba(255,255,255,0.22)] dark:hover:border-[rgba(255,255,255,0.34)]'}
       `}
       style={{ width: resolvedWidth, height: resolvedHeight }}
-      onClick={(event) => {
+      onDoubleClick={(event) => {
         const target = event.target as HTMLElement | null;
         if (target?.closest('button, input, textarea, select, .react-flow__handle')) {
           return;
@@ -118,34 +121,29 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       <NodeHeader
         className={NODE_HEADER_FLOATING_POSITION_CLASS}
         icon={<Clapperboard className="h-4 w-4" />}
-        titleText={displayName}
-        editable
-        onTitleChange={(nextTitle) => updateNodeData(id, { displayName: nextTitle })}
+        titleText={nodeTitle}
+        editable={false}
       />
 
       <button
         type="button"
-        className="nodrag relative flex min-h-0 flex-1 flex-col items-center justify-center gap-2 overflow-hidden rounded-lg border border-[rgba(255,255,255,0.12)] bg-bg-dark/70 transition-colors hover:border-[rgba(255,255,255,0.24)]"
-        onClick={handleOpen}
-        title="进入电影提示词工作室"
+        className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-2 overflow-hidden rounded-lg border border-[rgba(255,255,255,0.12)] bg-bg-dark/70 transition-colors hover:border-[rgba(255,255,255,0.24)]"
+        onDoubleClick={handleOpen}
+        title="双击进入电影提示词工作室"
       >
         <Clapperboard className="h-10 w-10 text-text-muted/60" />
 
-        {projectTitle && (
-          <span className="line-clamp-1 max-w-[calc(100%-16px)] px-2 text-xs font-medium text-text-dark">
-            {projectTitle}
-          </span>
-        )}
-
-        {nodeSummary && (
+        {projectDescription ? (
           <span className="line-clamp-2 max-w-[calc(100%-16px)] px-2 text-center text-[11px] leading-snug text-text-muted">
-            {nodeSummary}
+            {projectDescription}
           </span>
+        ) : (
+          <span className="px-2 text-center text-[11px] text-text-muted">暂无项目简介</span>
         )}
 
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-center gap-1.5 bg-gradient-to-t from-black/70 to-transparent px-2 pb-2 pt-6">
           <MousePointer2 className="h-3.5 w-3.5 text-white/85" />
-          <span className="text-[11px] text-white/90">单击进入</span>
+          <span className="text-[11px] text-white/90">双击进入</span>
         </div>
       </button>
 

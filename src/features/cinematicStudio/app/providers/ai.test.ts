@@ -75,8 +75,22 @@ describe("collectSceneAssetIds", () => {
     expect(result.scene).not.toHaveProperty("audioPlan");
   });
 
-  it("AI 分镜 schema 不再要求 AI 返回音频计划或旧 mm 焦段", () => {
+  it("长镜头 AI 规划只写回一个连续镜头，忽略额外覆盖镜头", () => {
+    const longTake = { ...scene, shootingMode: "long-take" as const, duration: "8秒" };
+    const result = normalizeSceneDraft(project, longTake, {
+      shots: [
+        { label: "镜头 1", time: { startSeconds: 0, endSeconds: 5 }, action: "角色停住观察", acting: "克制", movement: "Static", direction: "left-to-right" },
+        { label: "镜头 2", time: { startSeconds: 5, endSeconds: 8 }, action: "角色继续前进", acting: "克制", movement: "Tracking", direction: "left-to-right" },
+      ],
+    }, "秒");
+
+    expect(result.scene.shots).toHaveLength(1);
+    expect(result.scene.shots[0].time).toEqual({ startSeconds: 0, endSeconds: 5 });
+  });
+
+  it("AI 分镜 schema 不再要求 AI 返回音频计划、重复导演文档或旧 mm 焦段", () => {
     expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"audioPlan"');
+    expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"directorLayers"');
     expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"lens": string');
     expect(SCENE_DRAFT_JSON_SCHEMA).toContain('"fieldOfViewDegrees": number');
   });

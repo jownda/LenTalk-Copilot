@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
 
 import type { ProjectV2 } from "../shared-types";
-import { migrateProject } from "./model";
+import { migrateProject, seedProject } from "./model";
 
 describe("project optics migration", () => {
+  it("uses a neutral project seed instead of the old Rain Night demo", () => {
+    expect(seedProject.title).toBe("未命名影片");
+    expect(seedProject.description).toBe("");
+    expect(seedProject.scenes[0].name).toBe("新场景");
+    expect(seedProject.scenes[0].logline).toBe("");
+  });
+
   it("adds FOV optics to an existing schema-v2 shot that only has mm", () => {
     const project = {
       schemaVersion: 2,

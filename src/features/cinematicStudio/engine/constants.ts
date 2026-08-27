@@ -70,8 +70,11 @@ const normalizeNegative = (item: string): string => item.trim().toLowerCase().re
 export function canonicalNegativeId(item: string): string | undefined {
   const trimmed = item.trim();
   if (NEGATIVE_TERMS[trimmed]) return trimmed;
-  const hyphenated = trimmed.toLowerCase().replace(/\s+/g, "-");
-  return NEGATIVE_TERMS[hyphenated] ? hyphenated : undefined;
+  const normalized = trimmed.toLowerCase().replace(/\s+/g, " ");
+  const withoutPrefix = normalized.replace(/^(?:no\s+|不要\s*|禁止\s*)/i, "");
+  const hyphenated = withoutPrefix.replace(/\s+/g, "-");
+  if (NEGATIVE_TERMS[hyphenated]) return hyphenated;
+  return Object.entries(NEGATIVE_TERMS).find(([, term]) => term.zh === withoutPrefix)?.[0];
 }
 
 /** 负面词归类：内置 ID 优先，其次自由文本关键词，未知词保守归 global（P0.3） */

@@ -26,6 +26,43 @@ const DIR_ZH: Record<string, string> = {
 };
 const dirLabel = (d?: string) => (d ? DIR_ZH[d] ?? d : "");
 
+type ScreenSide = "left" | "right";
+
+function screenSideFromText(value?: string): ScreenSide | undefined {
+  if (!value) return undefined;
+  const normalized = value.toLowerCase();
+  if (/(?:screen|画面|屏幕)?[\s-]*(?:left|左)/i.test(normalized)) return "left";
+  if (/(?:screen|画面|屏幕)?[\s-]*(?:right|右)/i.test(normalized)) return "right";
+  return undefined;
+}
+
+function participantScreenSide(scene: SceneV2, shot: SceneV2["shots"][number], characterId: string): ScreenSide | undefined {
+  const participant = (shot.participants ?? []).find((item) => item.characterId === characterId);
+  const explicitSide = screenSideFromText(participant?.position);
+  if (explicitSide) return explicitSide;
+
+  const order = resolveCharacterOrder(scene, shot);
+  const index = order.indexOf(characterId);
+  if (order.length >= 2 && index === 0) return "left";
+  if (order.length >= 2 && index === order.length - 1) return "right";
+  return undefined;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function directionTowardNamedTarget(text: string, name: string): ScreenSide | undefined {
+  const escapedName = escapeRegExp(name.trim());
+  if (!escapedName) return undefined;
+  const chinese = new RegExp(`(?:向|往)?(左|右)(?:摇(?:镜)?|移(?:动)?|推|转(?:向)?|平移|跟拍)[^。；.!?]{0,36}${escapedName}`);
+  const chineseMatch = text.match(chinese);
+  if (chineseMatch) return chineseMatch[1] === "左" ? "left" : "right";
+  const english = new RegExp(`\\b(?:pan|move|track|push|turn)\\s+(?:the\\s+camera\\s+)?(left|right)\\b[^.!?]{0,50}${escapedName}`, "i");
+  const englishMatch = text.match(english);
+  return englishMatch ? englishMatch[1].toLowerCase() as ScreenSide : undefined;
+}
+
 /** 规则组（P0.5 全部启用：Identity/Spatial/Prop/Causality/Technical/Audio；P5.3 增加 Acting；P3 增加 Context） */
 export type RuleGroup = "identity" | "spatial" | "prop" | "causality" | "technical" | "audio" | "acting" | "context";
 
@@ -256,9 +293,37 @@ export function checkSpatial(project: ProjectV2, scene: SceneV2, _options: Conti
         detailZh: `镜头「${shot.label}」：站位顺序包含 ${inOrderNotInShot.join("、")}，但该角色并非本镜头的参与者。`,
       });
     }
+
+    // 4. 只有「明确目标 + 明确屏幕侧 + 明确镜头方向」才判断，不从散文猜测空间事实。
+    const directionalFields = [
+      { source: "action", sourceZh: "镜头动作", text: shot.action },
+      { source: "note", sourceZh: "镜头备注", text: shot.note },
+      ...(shot.beats ?? []).flatMap((beat) => [
+        { source: `beat ${beat.order} action`, sourceZh: `节拍 ${beat.order} 动作`, text: beat.actionText },
+        { source: `beat ${beat.order} cut rule`, sourceZh: `节拍 ${beat.order} 切点`, text: beat.cutRule },
+      ]),
+    ].filter((field): field is { source: string; sourceZh: string; text: string } => Boolean(field.text?.trim()));
+    for (const participant of participants) {
+      const asset = (project.assets ?? []).find((item) => item.id === participant.characterId);
+      const name = asset?.name?.trim();
+      const targetSide = participantScreenSide(scene, shot, participant.characterId);
+      if (!name || !targetSide) continue;
+      for (const field of directionalFields) {
+        const direction = directionTowardNamedTarget(field.text, name);
+        if (!direction || direction === targetSide) continue;
+        issues.push({
+          code: "SPATIAL.TARGET_DIRECTION_CONFLICT",
+          severity: "error",
+          entityId: shot.id,
+          label: "Camera direction contradicts target position",
+          detail: `Shot ${shot.label}: ${field.source} says to move ${direction} to ${name}, but ${name} is explicitly screen-${targetSide}. Change the movement direction or the target position.`,
+          detailZh: `镜头「${shot.label}」：${field.sourceZh}写着“向${direction === "left" ? "左" : "右"}移动到${name}”，但 ${name} 的明确屏幕位置是${targetSide === "left" ? "左" : "右"}侧。请修改镜头移动方向或角色位置。`,
+        });
+      }
+    }
   }
 
-  // 4. 弱词锚定（P1 验收）：站位文本命中 near/around/nearby/somewhere → 建议替换为可观测距离
+  // 5. 弱词锚定（P1 验收）：站位文本命中 near/around/nearby/somewhere → 建议替换为可观测距离
   const WEAK_ANCHOR_RE = /\b(near|around|nearby|in the area|somewhere)\b/i;
   const weakFields: { entityId: string; text: string }[] = [];
   if (scene.staging?.anchorDescription?.trim()) weakFields.push({ entityId: scene.id, text: scene.staging.anchorDescription });
@@ -787,18 +852,9 @@ export function checkAudio(project: ProjectV2, scene: SceneV2, _options: Continu
       });
     }
   }
-  if (!audio) {
-    issues.push({
-      code: "AUDIO.PLAN_MISSING",
-      severity: "info",
-      entityId: scene.id,
-      label: "Audio plan",
-      detail: "No audio plan configured; diegetic music, SFX and score are unspecified.",
-      detailZh: "未配置音频计划；画内音乐、环境音效和配乐均未指定。",
-      fixLabel: "Create default audio plan",
-    });
-    return issues;
-  }
+  // 音频计划只描述用户主动选择的画内音乐、额外音效、配乐和字幕。
+  // 即使没有计划，编译器仍会输出场景环境声和动作同步声，因此不应报缺失。
+  if (!audio) return issues;
   if (hasDialogue && audio.subtitles === false) {
     issues.push({
       code: "AUDIO.DIALOGUE_UNSUBTITLED",

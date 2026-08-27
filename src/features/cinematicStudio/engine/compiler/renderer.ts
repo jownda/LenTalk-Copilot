@@ -33,20 +33,39 @@ export function renderIgnore(asset: Asset, locale: PromptLocale = "zh"): string 
   return locale === "zh" ? ` 忽略：${ignore.join("、")}。` : ` Ignore ${ignore.join(", ")}.`;
 }
 
+/** 道具资产默认信息：形状/材质仍来自参考图，文本只补充用途、接触位置和可见状态。 */
+export function renderPropDefaults(asset: Asset, locale: PromptLocale = "zh", holderName?: (id: string) => string): string {
+  if (asset.kind !== "prop") return "";
+  const zh = locale === "zh";
+  const usage = (zh ? asset.propUsageZh : asset.propUsage)?.trim();
+  const position = (zh ? asset.propPositionZh : asset.propPosition)?.trim();
+  const state = (zh ? asset.propDefaultStateZh : asset.propDefaultState)?.trim();
+  const holderId = asset.propHolderCharacterId;
+  const holder = holderId ? (holderName?.(holderId) || holderId) : "";
+  const parts: string[] = [];
+  if (usage) parts.push(zh ? `使用：${usage}` : `use: ${usage}`);
+  if (holder) parts.push(zh ? `持有者：${holder}` : `holder: ${holder}`);
+  if (position) parts.push(zh ? `位置：${position}` : `position: ${position}`);
+  if (state) parts.push(zh ? `状态：${state}` : `state: ${state}`);
+  if (parts.length === 0) return "";
+  return zh ? `道具默认：${parts.join("；")}` : `Prop default: ${parts.join("; ")}`;
+}
+
 /** 图片引用语法（P2.1 模型 Profile 决定） */
 export type ReferenceSyntax = "asset-id" | "at-mention" | "plain-text";
 
 /** 单条资产 canonical 行（Asset-ID 模板；P2.1 支持三种引用语法，P0.2 双语） */
-export function renderAssetLine(asset: Asset, imageIndex: number, syntax: ReferenceSyntax = "asset-id", locale: PromptLocale = "zh"): string {
+export function renderAssetLine(asset: Asset, imageIndex: number | undefined, syntax: ReferenceSyntax = "asset-id", locale: PromptLocale = "zh", holderName?: (id: string) => string, audioIndex?: number): string {
   const lex = promptLexicon(locale);
   const desc = assetCanonicalDescription(asset, locale) || asset.name.trim();
   const namePart = asset.referenceTag?.trim() || asset.name.trim() || desc;
-  const n = String(imageIndex);
-  const head = syntax === "at-mention"
+  const n = imageIndex ? String(imageIndex) : "";
+  const headTemplate = syntax === "at-mention"
     ? fillTemplate(lex.templates.assetHeadAtMention, { name: namePart, n, desc })
     : syntax === "plain-text"
       ? fillTemplate(lex.templates.assetHeadPlain, { name: namePart, n, desc })
       : fillTemplate(lex.templates.assetHead, { id: asset.id, name: namePart, n, desc });
+  const head = imageIndex ? headTemplate : headTemplate.replace(/\s*\[image\]/, "");
   const parts: string[] = [head];
   const useFor = renderUseFor(asset, locale);
   if (useFor) parts.push(useFor.trim());
@@ -57,6 +76,9 @@ export function renderAssetLine(asset: Asset, imageIndex: number, syntax: Refere
   if (markers.length > 0) parts.push(`${lex.labels.uniqueMarkers}: ${markers.join(locale === "zh" ? "；" : "; ")}.`);
   const always = (asset.alwaysVisible ?? []).filter(Boolean);
   if (always.length > 0) parts.push(`${lex.labels.alwaysVisible}: ${always.join(locale === "zh" ? "；" : "; ")}.`);
+  const propDefaults = renderPropDefaults(asset, locale, holderName);
+  if (propDefaults) parts.push(propDefaults);
+  if (audioIndex && asset.voiceClip?.trim()) parts.push(locale === "zh" ? `声音参考：[audio${audioIndex}]。` : `Voice reference: [audio${audioIndex}].`);
   return parts.join(" ");
 }
 
@@ -79,7 +101,10 @@ export function buildAssetRegistry(project: ProjectV2, scene: SceneV2, shot: Sho
   const visited: string[] = [];
   const visit = (id?: string) => {
     if (!id || visited.includes(id)) return;
-    if (byId.has(id)) visited.push(id);
+    const asset = byId.get(id);
+    if (!asset) return;
+    visited.push(id);
+    if (asset.kind === "character") for (const propId of asset.attachedPropIds ?? []) visit(propId);
   };
   visit(scene.staging?.locationAssetId);
   for (const participant of shot.participants ?? []) visit(participant.characterId);
@@ -119,7 +144,10 @@ export function buildSceneAssetRegistry(
   const visited: string[] = [];
   const visit = (id?: string) => {
     if (!id || visited.includes(id)) return;
-    if (byId.has(id)) visited.push(id);
+    const asset = byId.get(id);
+    if (!asset) return;
+    visited.push(id);
+    if (asset.kind === "character") for (const propId of asset.attachedPropIds ?? []) visit(propId);
   };
   visit(scene.staging?.locationAssetId);
   for (const shot of scene.shots) {
@@ -323,9 +351,17 @@ export function assetRefName(project: ProjectV2, syntax: ReferenceSyntax = "asse
 
 /** 有效左到右顺序：镜头覆写优先，其次场景站位（useSceneStaging !== false 时继承） */
 export function resolveCharacterOrder(scene: SceneV2, shot: ShotV2): string[] {
-  if (shot.layout?.characterOrder && shot.layout.characterOrder.length > 0) return shot.layout.characterOrder;
-  if (shot.layout?.useSceneStaging === false) return [];
-  return scene.staging?.characterOrder ?? [];
+  const participants = (shot.participants ?? []).map((participant) => participant.characterId);
+  const participantSet = new Set(participants);
+  const restrictToParticipants = (order: string[]) => participants.length > 0
+    ? order.filter((id) => participantSet.has(id))
+    : order;
+  if (shot.layout?.characterOrder && shot.layout.characterOrder.length > 0) {
+    return restrictToParticipants(shot.layout.characterOrder);
+  }
+  if (shot.layout?.useSceneStaging === false) return participants;
+  const staged = restrictToParticipants(scene.staging?.characterOrder ?? []);
+  return staged.length > 0 ? staged : participants;
 }
 
 /** 镜头内各角色持有的道具（仅起始状态，P2.2：结束状态不回灌站位文本） */

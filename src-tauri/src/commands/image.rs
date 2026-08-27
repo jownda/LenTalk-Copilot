@@ -20,6 +20,7 @@ use tracing::info;
 const STORYBOARD_METADATA_PNG_TEXT_KEY: &str = "StoryboardCopilotMetadata";
 const FAST_PREVIEW_BYPASS_MAX_BYTES: usize = 2_000_000;
 const FAST_PREVIEW_BYPASS_MAX_DIMENSION: u32 = 2048;
+const REMOTE_IMAGE_DOWNLOAD_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1270,43 +1271,93 @@ async fn resolve_source_bytes(source: &str) -> Result<(Vec<u8>, String), String>
     }
 
     if source.starts_with("http://") || source.starts_with("https://") {
-        // 远程下载加 20s 超时: 结果 URL 若挂起(慢 CDN / 失效签名), 快速失败
-        // 而非无限等待, 避免节点"一直生成中"无响应。
+        // 生成服务的 CDN 有时会在压缩传输或 HTTP/2 连接复用期间中断响应体。
+        // 图片下载量很小，使用 HTTP/1.1、原始内容编码并作有限重试更可靠。
         let client = reqwest::Client::builder()
             .no_proxy()
-            .timeout(std::time::Duration::from_secs(20))
+            .http1_only()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(45))
             .build()
             .map_err(|e| format!("Failed to build image download client: {}", e))?;
-        let response = client
-            .get(source)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to download remote image: {}", e))?;
 
-        if !response.status().is_success() {
-            return Err(format!(
-                "Remote image request failed with status {}",
-                response.status()
-            ));
+        let mut last_error = String::new();
+        for attempt in 1..=REMOTE_IMAGE_DOWNLOAD_ATTEMPTS {
+            let response = match client
+                .get(source)
+                .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = format!("request error: {}", error);
+                    if attempt < REMOTE_IMAGE_DOWNLOAD_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            300 * attempt as u64,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string();
+            let content_length = response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string();
+
+            if !status.is_success() {
+                return Err(format!(
+                    "Remote image request failed with status {} (content-type: {}, content-length: {})",
+                    status, content_type, content_length
+                ));
+            }
+
+            let mime_ext = Some(extension_from_mime(&content_type));
+            match response.bytes().await {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let ext = mime_ext
+                        .or_else(|| extension_from_path_like(source))
+                        .unwrap_or_else(|| "png".to_string());
+                    return Ok((bytes.to_vec(), ext));
+                }
+                Ok(_) => {
+                    last_error = format!(
+                        "empty response body (content-type: {}, content-length: {})",
+                        content_type, content_length
+                    );
+                }
+                Err(error) => {
+                    last_error = format!(
+                        "body read error: {} (content-type: {}, content-length: {})",
+                        error, content_type, content_length
+                    );
+                }
+            }
+
+            if attempt < REMOTE_IMAGE_DOWNLOAD_ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    300 * attempt as u64,
+                ))
+                .await;
+            }
         }
 
-        let mime_ext = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(extension_from_mime);
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| format!("Failed to read remote image body: {}", e))?
-            .to_vec();
-
-        let ext = mime_ext
-            .or_else(|| extension_from_path_like(source))
-            .unwrap_or_else(|| "png".to_string());
-
-        return Ok((bytes, ext));
+        return Err(format!(
+            "Failed to download remote image after {} attempts: {}",
+            REMOTE_IMAGE_DOWNLOAD_ATTEMPTS, last_error
+        ));
     }
 
     if source.starts_with("file://") {

@@ -1,5 +1,6 @@
 import {
   isDirectorDeskNode,
+  isCinematicStudioNode,
   isAudioNode,
   isExportImageNode,
   isGroupNode,
@@ -88,6 +89,10 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
       return node.data.lastCaptureUrl ? [node.data.lastCaptureUrl] : [];
     }
 
+    if (isCinematicStudioNode(node)) {
+      return Array.isArray(node.data.studioReferenceImages) ? node.data.studioReferenceImages.filter(Boolean) : [];
+    }
+
     if (isUploadNode(node) || isImageEditNode(node) || isExportImageNode(node)) {
       return node.data.imageUrl ? [node.data.imageUrl] : [];
     }
@@ -107,6 +112,10 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
 
     if (isAudioNode(node) && node.data.mediaType !== "video" && node.data.sourcePath) {
       return [node.data.sourcePath];
+    }
+
+    if (isCinematicStudioNode(node)) {
+      return Array.isArray(node.data.studioReferenceAudio) ? node.data.studioReferenceAudio.filter(Boolean) : [];
     }
 
     return [];

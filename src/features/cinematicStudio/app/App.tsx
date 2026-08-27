@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers } from "../engine";
-import type { CameraMovement, ContinuityIssueV2, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
-import { ArrowLeft, ChevronDown, Copy, Download, FileJson, FileText, FolderOpen, PenLine, Plus, Save, Send, X } from "lucide-react";
-import { classifyError, fillSceneDraft, getAssistant } from "./providers/ai";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, auditFinalPromptWithProject, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers, type FinalPromptAuditIssue } from "../engine";
+import type { CameraMovement, ContinuityIssueV2, FinalAuditLogEntry, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
+import { ArrowLeft, AudioLines, ChevronDown, Copy, Download, FileJson, FileText, FolderOpen, PenLine, Plus, Save, Send, X } from "lucide-react";
+import { classifyError, fillSceneDraft, getAssistant, optimizeSceneBrief, type SceneCompileProgress } from "./providers/ai";
 import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type AISettings } from "./providers/aiSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { loadProjectFromDisk, recordVersionToSqlite, savePromptToDisk, saveProjectToDisk } from "./providers/projectStorage";
@@ -18,6 +18,8 @@ import PropStateEditor from "./components/PropStateEditor";
 import OpticsCameraEditor from "./components/OpticsCameraEditor";
 import { projectReducer, type ProjectAction } from "./store/projectReducer";
 import { addVersion, loadHistory } from "./store/promptHistory";
+import { collectCinematicMediaReferences } from "../mediaReferences";
+import { findReferenceTokens } from "@/features/canvas/application/referenceTokenEditing";
 
 const movements: CameraMovement[] = ["Static", "Handheld", "Steadicam", "Dolly", "Tracking", "Crane", "POV", "OTS"];
 const newId = () => crypto.randomUUID();
@@ -32,12 +34,14 @@ export interface CinematicStudioAppStateSnapshot {
   projectTitle?: string;
   projectDescription?: string;
   promptPreview?: string;
+  referenceImages?: string[];
+  referenceAudio?: string[];
 }
 
 export interface CinematicStudioAppProps {
   onClose?: () => void;
   onStateChange?: (snapshot: CinematicStudioAppStateSnapshot) => void;
-  onSendToVideo?: (prompt: string) => void;
+  onSendToVideo?: (payload: { prompt: string; referenceImages: string[]; referenceAudio: string[] }) => void;
 }
 
 export default function App({ onClose, onStateChange, onSendToVideo }: CinematicStudioAppProps = {}) {
@@ -50,6 +54,8 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
   const [sceneCompileBusy, setSceneCompileBusy] = useState(false);
+  const [sceneCompileProgress, setSceneCompileProgress] = useState<SceneCompileProgress>("idle");
+  const [briefOptimizeBusy, setBriefOptimizeBusy] = useState(false);
   const [aiCompileError, setAiCompileError] = useState("");
   const [aiCompileErrorDetail, setAiCompileErrorDetail] = useState("");
   const [aiErrorCopied, setAiErrorCopied] = useState(false);
@@ -61,18 +67,81 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
   const chatModels = useMemo(() => listLenTalkChatModels(), [customApis]);
   /** 手动覆写文本：编辑器内容与最近编译输出不一致时记录（P2.2） */
   const [manualOverride, setManualOverride] = useState<string | null>(null);
+  const [mediaPreview, setMediaPreview] = useState<{ kind: "image" | "audio"; source: string } | null>(null);
+  const [promptScrollTop, setPromptScrollTop] = useState(0);
+  const [auditDetailsOpen, setAuditDetailsOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const [projectCodeDraft, setProjectCodeDraft] = useState(() => project.projectCode ?? "");
   const scene = project.scenes.find((item) => item.id === sceneId) ?? project.scenes[0];
   const shot = scene.shots.find((item) => item.id === shotId) ?? scene.shots[0];
   const issues = useMemo(() => checkContinuityV2(project, scene), [project, scene]);
   const directorLayerIssues = useMemo(() => scene.directorLayers ? validateDirectorLayers(scene.directorLayers, project, scene) : [], [project, scene]);
-  const hasExportErrors = issues.some((i) => i.severity === "error");
+  const finalAudit = useMemo(() => auditFinalPromptWithProject(scene, project.assets ?? []), [project.assets, scene]);
+  const finalAuditErrors = finalAudit.issues.filter((issue) => issue.severity === "error");
+  const continuityExportErrors = issues.filter((issue) => issue.severity === "error");
+  const exportBlockingIssues = [...finalAuditErrors, ...continuityExportErrors];
+  const hasExportErrors = exportBlockingIssues.length > 0;
+  const auditStatusDetails = [
+    ...finalAudit.issues.map((issue) => locale === "zh" ? issue.detailZh : issue.detail),
+    ...issues.map((issue) => locale === "zh" ? (issue.detailZh ?? issue.detail) : issue.detail),
+  ].filter(Boolean).join("\n");
   const t: CopyZh = copy[locale] as CopyZh;
   const selectedChatModel = aiSettings.provider && aiSettings.model ? `${aiSettings.provider}:${aiSettings.model}` : "";
+  const mediaReferences = useMemo(() => collectCinematicMediaReferences(project, scene), [project, scene]);
 
   /** 结构更新统一走 reducer（Compiler/Continuity 只读不可变快照） */
   const dispatch = (action: ProjectAction) => setProject((prev) => projectReducer(prev, action));
+
+  const recordFinalAudit = (targetScene: SceneV2, audit = auditFinalPromptWithProject(targetScene, project.assets ?? []), continuity = checkContinuityV2(project, targetScene)) => {
+    const allIssues = [
+      ...audit.issues,
+      ...continuity.map((issue) => ({ code: issue.code, severity: issue.severity, detail: issue.detail, detailZh: issue.detailZh, shotId: issue.entityId })),
+    ];
+    const record: FinalAuditLogEntry = {
+      id: crypto.randomUUID(),
+      createdAt: new Date().toISOString(),
+      sceneId: targetScene.id,
+      status: allIssues.some((issue) => issue.severity === "error") ? "blocked" : "passed",
+      automaticFixes: audit.adjustments,
+      issues: allIssues,
+    };
+    dispatch({ type: "RECORD_FINAL_AUDIT", record });
+    return record;
+  };
+
+  const focusAuditIssue = (issue: Pick<FinalPromptAuditIssue, "shotId" | "field">) => {
+    if (issue.shotId && scene.shots.some((candidate) => candidate.id === issue.shotId)) {
+      setShotId(issue.shotId);
+      setInspectorOpen(true);
+      window.requestAnimationFrame(() => document.getElementById("cinematic-shot-inspector")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+      return;
+    }
+    const target = issue.field === "lighting" || issue.field === "staging" ? "cinematic-director-brief" : "cinematic-shot-inspector";
+    window.requestAnimationFrame(() => document.getElementById(target)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  };
+  const auditRecommendation = (action: FinalPromptAuditIssue["action"] | undefined): string | undefined => {
+    if (!action) return undefined;
+    const labels = locale === "zh"
+      ? {
+          "review-staging": "建议：返回场景地图补充首帧与站位。",
+          "review-lighting": "建议：返回场景光线，保留一种可同时成立的事实。",
+          "review-optics": "建议：检查该镜头的 FOV 与可见结果。",
+          "review-acting": "建议：改为可拍摄的眼神、呼吸、手部或姿势变化。",
+          "review-voice": "建议：为开口角色补充声音锁。",
+          "review-action": "建议：补充可见动作节拍，或重新 AI 编译。",
+          recompile: "建议：根据当前结构化数据重新 AI 编译。",
+        }
+      : {
+          "review-staging": "Recommended: return to the scene map and complete first-frame blocking.",
+          "review-lighting": "Recommended: return to lighting and keep one compatible visual fact.",
+          "review-optics": "Recommended: review this shot's FOV and visible result.",
+          "review-acting": "Recommended: use visible eye, breath, hand, or posture behavior.",
+          "review-voice": "Recommended: add a voice lock for the speaking character.",
+          "review-action": "Recommended: add visible action beats or recompile with AI.",
+          recompile: "Recommended: recompile from the current structured data.",
+        };
+    return labels[action];
+  };
 
   useEffect(() => { persistProject(project); }, [project]);
   useEffect(() => { localStorage.setItem("cineprompt-locale", locale); }, [locale]);
@@ -105,19 +174,30 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
         projectTitle: project.title,
         projectDescription: project.description,
         promptPreview: prompt,
+        referenceImages: mediaReferences.referenceImages,
+        referenceAudio: mediaReferences.referenceAudio,
       });
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [onStateChange, project.description, project.title, prompt]);
+  }, [mediaReferences.referenceAudio, mediaReferences.referenceImages, onStateChange, project.description, project.title, prompt]);
   useEffect(() => {
     if ((project.compiledPrompt ?? "") === prompt) return;
     dispatch({ type: "PATCH_PROJECT", patch: { compiledPrompt: prompt } });
   }, [project.compiledPrompt, prompt]);
   /** P2.2/P0/P1.4：编译入口（生成 + 存档版本历史；locale 决定输出语言；项目包内落盘） */
-  const runCompile = (noticeKey: "promptCompiled" | "promptRebuilt" | "promptLocalCompiled", targetScene: SceneV2 = scene) => {
-    const result = compilePrompt(project, targetScene, shot, { template, profile: modelProfileById(modelProfileId), locale, director: true });
+  const runCompile = (noticeKey: "promptCompiled" | "promptRebuilt" | "promptLocalCompiled", targetScene: SceneV2 = scene, forceStructured = false) => {
     const issues = checkContinuityV2(project, targetScene);
-    const text = manualOverride !== null ? manualOverride : result.text;
+    const audit = auditFinalPromptWithProject(targetScene, project.assets ?? []);
+    const blockers = audit.issues.filter((issue) => issue.severity === "error").length + issues.filter((issue) => issue.severity === "error").length;
+    recordFinalAudit(targetScene, audit, issues);
+    if (blockers > 0) {
+      setNotice(locale === "zh"
+        ? `最终审核发现 ${blockers} 项事实冲突。请修正后继续生成；当前有效提示词未被覆盖。`
+        : `Final review found ${blockers} factual conflict(s). Fix them and continue; the current valid prompt was not overwritten.`);
+      return;
+    }
+    const result = compilePrompt(project, targetScene, shot, { template, profile: modelProfileById(modelProfileId), locale, director: true });
+    const text = !forceStructured && manualOverride !== null ? manualOverride : result.text;
     setPrompt(text);
     const record = addVersion({
       template,
@@ -273,9 +353,10 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
     if (sceneCompileBusy) return;
     if (!isRemoteConfigured()) { setNotice(t.aiNotConfigured); return; }
     setSceneCompileBusy(true);
+    setSceneCompileProgress("preparing");
     setAiCompileError("");
     try {
-      const draft = await fillSceneDraft(project, scene, { seconds: t.seconds, locale });
+      const draft = await fillSceneDraft(project, scene, { seconds: t.seconds, locale, onProgress: setSceneCompileProgress });
       const targetScene = draft.scene;
       // P0.6：用户锁定的导演文档层在再次 AI 编译时保留，不被新生成覆盖。
       const lockedKeys = (scene.lockedDirectorLayers ?? []).filter((key) => (scene.directorLayers?.[key] ?? "").trim());
@@ -298,6 +379,18 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
       setProject(nextProject);
       setManualOverride(null);
       setShotId(mergedScene.shots[0]?.id ?? "");
+      setSceneCompileProgress("validating");
+      const audit = auditFinalPromptWithProject(mergedScene, project.assets ?? []);
+      const nextIssues = checkContinuityV2(nextProject, mergedScene);
+      const blockers = audit.issues.filter((issue) => issue.severity === "error").length
+        + nextIssues.filter((issue) => issue.severity === "error").length;
+      recordFinalAudit(mergedScene, audit, nextIssues);
+      if (blockers > 0) {
+        setNotice(locale === "zh"
+          ? `AI 已生成可编辑分镜草案，但最终审核发现 ${blockers} 项事实冲突。修正后继续生成，最后一次有效提示词不会被覆盖。`
+          : `AI generated an editable storyboard draft, but final review found ${blockers} factual conflict(s). Fix them and continue; the last valid prompt was preserved.`);
+        return;
+      }
       const result = compilePrompt(nextProject, mergedScene, mergedScene.shots[0] ?? shot, { template, profile: modelProfileById(modelProfileId), locale, director: true });
       setPrompt(result.text);
       setNotice(t.aiCompileDone);
@@ -312,12 +405,40 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
       setAiCompileErrorDetail(message);
     } finally {
       setSceneCompileBusy(false);
+      setSceneCompileProgress("idle");
+    }
+  };
+  /** 仅补齐导演简报中的 AI 参考字段，不生成镜头或最终提示词。 */
+  const aiOptimizeBrief = async () => {
+    if (briefOptimizeBusy || sceneCompileBusy) return;
+    if (!isRemoteConfigured()) { setNotice(t.aiNotConfigured); return; }
+    setBriefOptimizeBusy(true);
+    try {
+      const optimized = await optimizeSceneBrief(project, scene, locale);
+      setProject((current) => ({
+        ...current,
+        scenes: current.scenes.map((item) => item.id === scene.id ? {
+          ...item,
+          mustHappen: optimized.mustHappen,
+          forbid: optimized.forbid,
+          ...(optimized.dialogue ? { dialogue: optimized.dialogue } : {}),
+          ...(optimized.emotionArc ? { emotionArc: optimized.emotionArc } : {}),
+          actingObjectives: optimized.actingObjectives,
+        } : item),
+        audioPlan: optimized.audioPlan,
+      }));
+      setNotice(t.aiBriefOptimized);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setNotice(`${t.aiOptimizeBriefFailed}${message}`);
+    } finally {
+      setBriefOptimizeBusy(false);
     }
   };
   /** 本地编译：不调用 AI，直接按当前已填写内容编译到提示词编辑器（含存档/落盘） */
   const localCompileScene = () => {
     setManualOverride(null);
-    runCompile("promptLocalCompiled");
+    runCompile("promptLocalCompiled", scene, true);
   };
   const copyAiError = async () => {
     const detail = aiCompileErrorDetail || aiCompileError;
@@ -339,9 +460,13 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
     window.setTimeout(() => setAiErrorCopied(false), 2000);
   };
   const deleteShot = (id: string) => {
+    if (scene.shots.length <= 1) {
+      setNotice(t.keepOneShot);
+      return;
+    }
     const remaining = scene.shots.filter((item) => item.id !== id);
     updateScene({ shots: remaining });
-    if (shotId === id) { const next = remaining.find((item) => item.id !== id) ?? remaining[0]; setShotId(next?.id ?? ""); }
+    if (shotId === id) setShotId(remaining[0].id);
   };
   const addScene = () => {
     const created = { ...scene, id: newId(), name: t.newSceneName, shots: [] };
@@ -353,7 +478,14 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
     setProject((current) => ({ ...current, scenes: remaining }));
     if (sceneId === id) { setSceneId(remaining[0].id); setShotId(remaining[0].shots[0]?.id ?? ""); }
   };
-  const copyPrompt = async () => { await navigator.clipboard.writeText(sanitizeDirectorText(prompt)); setNotice(t.promptCopied); };
+  const copyPrompt = async () => {
+    if (hasExportErrors) {
+      setNotice(locale === "zh" ? "最终审计未通过，不能复制提示词。" : "Final audit has blocking issues; prompt copy is disabled.");
+      return;
+    }
+    await navigator.clipboard.writeText(sanitizeDirectorText(prompt));
+    setNotice(t.promptCopied);
+  };
   const exportProject = (format: "txt" | "md" | "json") => {
     if (format !== "json") {
       const exportErrors = issues.filter((i) => i.severity === "error");
@@ -370,12 +502,15 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
     <section className="content">
       <div className="content-main">
       {/* ── 1. 导演简报卡（P0.4：合并风格配方 / 场景 / 音频计划）── */}
+      <div id="cinematic-director-brief">
       <DirectorBriefCard
         project={project}
         scene={scene}
         t={t}
         locale={locale}
         compileBusy={sceneCompileBusy}
+        compileProgress={sceneCompileProgress}
+        briefOptimizeBusy={briefOptimizeBusy}
         aiCompileError={aiCompileError}
         aiCompileErrorDetail={aiCompileErrorDetail}
         aiErrorCopied={aiErrorCopied}
@@ -387,12 +522,14 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
         onUpdateStaging={(patch) => updateScene({ staging: { ...scene.staging, ...patch } })}
         onUpdateProject={(patch) => setProject((current) => ({ ...current, ...patch }))}
         onAiCompile={() => void aiCompileScene()}
+        onAiOptimizeBrief={() => void aiOptimizeBrief()}
         onLocalCompile={localCompileScene}
         onCopyAiError={() => void copyAiError()}
         chatModels={chatModels}
         selectedChatModel={selectedChatModel}
         onSelectChatModel={selectChatModel}
       />
+      </div>
 
       {/* ── 2. 分层导演文档卡（P0.6：AI 编译产出各层，可展开编辑 + 锁定）── */}
       <DirectorLayersCard scene={scene} t={t} locale={locale} onUpdateScene={updateScene} />
@@ -437,7 +574,7 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
       </section>
 
       {/* ── 5. 镜头检查器（竖向）── */}
-      <section className="card inspector-card">
+      <section id="cinematic-shot-inspector" className="card inspector-card">
         <div className="card-head inspector-toggle" onClick={() => setInspectorOpen((open) => !open)}>
           <div className="card-head-title"><span className="eyebrow">{t.inspector}</span><h2>{shot?.label || t.noShot}</h2></div>
           {inspectorOpen ? <ChevronDown size={16} className="inspector-caret" /> : <ChevronDown size={16} className="inspector-caret collapsed" />}
@@ -572,24 +709,94 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
             <ChevronDown size={14} />
           </span>
         </div>
-        <span className="output-language">{locale === "zh" ? "输出语言：中文" : "Output language: English"}</span>
-        <div className="prompt-send-row">
+        <div className="prompt-editor-toolbar">
+          <div className="prompt-editor-status">
+            <div className="audit-action-row">
+              <button type="button" className="outline-button audit-details-toggle" onClick={() => setAuditDetailsOpen((open) => !open)}>
+                {auditDetailsOpen
+                  ? (locale === "zh" ? "收起审计详情" : "Hide audit details")
+                  : (locale === "zh" ? "查看审计详情" : "View audit details")}
+              </button>
+              {hasExportErrors && <button
+                type="button"
+                className="outline-button audit-continue-button"
+                onClick={localCompileScene}
+                title={locale === "zh" ? "根据当前已修正的数据重新生成最终提示词" : "Regenerate the final prompt from the corrected current data"}
+              >
+                {locale === "zh" ? "修正后继续生成" : "Continue after fixing"}
+              </button>}
+            </div>
+            <div className="audit-status-row">
+              <span className="output-language">{locale === "zh" ? "输出语言：中文" : "Output language: English"}</span>
+              <span
+                className={`final-audit-status ${hasExportErrors ? "error" : finalAudit.issues.length > 0 ? "warning" : "passed"}`}
+                title={auditStatusDetails}
+              >
+                {hasExportErrors
+                  ? (locale === "zh" ? `最终审核：整体规则已整理，${exportBlockingIssues.length} 项冲突待修正` : `Final review: overall rules are organized; ${exportBlockingIssues.length} conflict(s) to fix`)
+                  : finalAudit.issues.length > 0
+                    ? (locale === "zh" ? `最终审核：整体规则符合，已整理 ${finalAudit.issues.length} 项` : `Final review: overall rules conform; ${finalAudit.issues.length} item(s) organized`)
+                    : (locale === "zh" ? "最终审核：整体规则符合" : "Final review: overall rules conform")}
+              </span>
+            </div>
+          </div>
           <button
             type="button"
             className="primary-button prompt-send-video-button"
-            disabled={!onSendToVideo || !prompt.trim()}
-            title={!onSendToVideo ? (locale === "zh" ? "请从画布中的电影提示词工作室节点打开" : "Open this from a Cinematic Prompt Studio node on the canvas") : undefined}
+            disabled={!onSendToVideo || !prompt.trim() || hasExportErrors}
+            title={hasExportErrors
+              ? (locale === "zh" ? "最终审计未通过，请先修正场景中的阻断问题。" : "Final audit has blocking issues. Fix the scene before sending.")
+              : !onSendToVideo ? (locale === "zh" ? "请从画布中的电影提示词工作室节点打开" : "Open this from a Cinematic Prompt Studio node on the canvas") : undefined}
             onClick={() => {
               const nextPrompt = prompt.trim();
-              if (!nextPrompt || !onSendToVideo) return;
-              onSendToVideo(nextPrompt);
+              if (!nextPrompt || !onSendToVideo || hasExportErrors) return;
+              onSendToVideo({ prompt: nextPrompt, ...mediaReferences });
               setNotice(t.sentToVideoNode);
             }}
           >
-            <Send size={14} /> {t.sendToVideoNode}
+            <Send size={16} /> {t.sendToVideoNode}
           </button>
         </div>
-        <textarea className="prompt-editor" value={prompt} onChange={(event) => { setPrompt(event.target.value); if (manualOverride === null && event.target.value.trim()) setManualOverride(event.target.value); }} spellCheck={false} />
+        {auditDetailsOpen && <div className="final-audit-details">
+          <section>
+            <h3>{locale === "zh" ? "自动修正" : "Automatic corrections"}</h3>
+            {finalAudit.adjustments.length > 0 ? <ul>
+              {finalAudit.adjustments.map((adjustment, index) => <li key={`${adjustment.code}-${adjustment.shotId ?? "scene"}-${index}`}>
+                <span>{locale === "zh" ? adjustment.detailZh : adjustment.detail}</span>
+                {adjustment.shotId && <button type="button" className="text-button" onClick={() => focusAuditIssue({ shotId: adjustment.shotId })}>{locale === "zh" ? "定位镜头" : "Locate shot"}</button>}
+              </li>)}
+            </ul> : <p>{locale === "zh" ? "本次没有需要自动修正的格式或术语。" : "No format or terminology corrections were needed."}</p>}
+          </section>
+          <section>
+            <h3>{locale === "zh" ? "待处理问题" : "Issues to review"}</h3>
+            {([...finalAudit.issues, ...issues] as Array<FinalPromptAuditIssue | ContinuityIssueV2>).length > 0 ? <ul>
+              {[...finalAudit.issues, ...issues].map((issue, index) => {
+                const shotTargetId = "shotId" in issue
+                  ? (issue as FinalPromptAuditIssue).shotId
+                  : (issue as ContinuityIssueV2).entityId;
+                const field = "field" in issue ? issue.field : undefined;
+                const recommendation = auditRecommendation("action" in issue ? issue.action : undefined)
+                  ?? ("fixLabel" in issue ? issue.fixLabel : undefined);
+                return <li key={`${issue.code}-${shotTargetId ?? "scene"}-${index}`} className={issue.severity}>
+                  <span><b>{issue.severity === "error" ? (locale === "zh" ? "必须修正" : "Blocking") : (locale === "zh" ? "建议检查" : "Review")}</b>{locale === "zh" ? (issue.detailZh ?? issue.detail) : issue.detail}{recommendation && <small className="audit-recommendation">{recommendation}</small>}</span>
+                  {(shotTargetId || field) && <button type="button" className="text-button" onClick={() => focusAuditIssue({ shotId: shotTargetId, field })}>{locale === "zh" ? "定位" : "Locate"}</button>}
+                </li>;
+              })}
+            </ul> : <p>{locale === "zh" ? "没有待处理问题。" : "No issues require review."}</p>}
+          </section>
+          {(project.finalAuditLog ?? []).length > 0 && <section>
+            <h3>{locale === "zh" ? "审计变更记录" : "Audit change log"}</h3>
+            <ul className="audit-history-list">
+              {(project.finalAuditLog ?? []).slice(0, 3).map((entry) => <li key={entry.id} className={entry.status}>
+                <span>{new Date(entry.createdAt).toLocaleString(locale === "zh" ? "zh-CN" : "en-US")} · {entry.status === "blocked" ? (locale === "zh" ? "需修正" : "Blocked") : (locale === "zh" ? "已通过" : "Passed")} · {entry.automaticFixes.length} {locale === "zh" ? "项自动修正" : "automatic correction(s)"}</span>
+              </li>)}
+            </ul>
+          </section>}
+        </div>}
+        <div className="prompt-media-editor">
+          <PromptMediaOverlay prompt={prompt} images={mediaReferences.referenceImages} audio={mediaReferences.referenceAudio} scrollTop={promptScrollTop} onPreview={(kind, source) => setMediaPreview({ kind, source })} />
+          <textarea className="prompt-editor" value={prompt} onChange={(event) => { setPrompt(event.target.value); if (manualOverride === null && event.target.value.trim()) setManualOverride(event.target.value); }} onScroll={(event) => setPromptScrollTop(event.currentTarget.scrollTop)} spellCheck={false} />
+        </div>
         {manualOverride !== null && <div className="manual-override-bar">
           <span><PenLine size={13} /> {t.manualOverride}</span>
           <button className="outline-button" onClick={() => { setManualOverride(null); setPrompt(compilePrompt(project, scene, shot, { template, profile: modelProfileById(modelProfileId), locale, director: true }).text); }}>{t.rebuild}</button>
@@ -597,9 +804,41 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
         </div>}
       </section>
       </aside>
+      {mediaPreview && <div className="modal-overlay prompt-media-preview-overlay" onClick={() => setMediaPreview(null)}>
+        <div className="prompt-media-preview" onClick={(event) => event.stopPropagation()}>
+          <button className="modal-close" title={t.cancel} onClick={() => setMediaPreview(null)}><X size={15} /></button>
+          {mediaPreview.kind === "image" ? <img src={mediaPreview.source} alt="" /> : <audio controls autoPlay src={mediaPreview.source} />}
+        </div>
+      </div>}
     </section>
     {notice && <div className="toast">{notice}<button onClick={() => setNotice("")}><X size={14} /></button></div>}
   </main>;
+}
+
+function PromptMediaOverlay({ prompt, images, audio, scrollTop, onPreview }: {
+  prompt: string;
+  images: string[];
+  audio: string[];
+  scrollTop: number;
+  onPreview(kind: "image" | "audio", source: string): void;
+}) {
+  const tokens = findReferenceTokens(prompt, images.length, audio.length);
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  for (const token of tokens) {
+    if (token.start > cursor) parts.push(<span key={`text-${cursor}`}>{prompt.slice(cursor, token.start)}</span>);
+    const source = token.kind === "image" ? images[token.value - 1] : audio[token.value - 1];
+    if (!source) {
+      parts.push(<span key={`token-${token.start}`}>{token.token}</span>);
+    } else if (token.kind === "image") {
+      parts.push(<button key={`token-${token.start}`} type="button" className="prompt-media-image" title={token.token} onClick={() => onPreview("image", source)}><img src={source} alt={token.token} /></button>);
+    } else {
+      parts.push(<button key={`token-${token.start}`} type="button" className="prompt-media-audio" title={token.token} onClick={() => onPreview("audio", source)}><AudioLines size={13} /> {token.token}</button>);
+    }
+    cursor = token.end;
+  }
+  if (cursor < prompt.length) parts.push(<span key={`text-${cursor}`}>{prompt.slice(cursor)}</span>);
+  return <div className="prompt-media-overlay"><div className="prompt-media-overlay-content" style={{ transform: `translateY(-${scrollTop}px)` }}>{parts}</div></div>;
 }
 
 function InspectorSection({ title, children }: { title?: string; children: React.ReactNode }) { return <section className="inspector-section">{title ? <h3>{title}</h3> : null}{children}</section>; }

@@ -46,4 +46,21 @@ describe("projectReducer asset naming", () => {
       referenceTag: "char_cb_kel_wet_v2",
     });
   });
+
+  it("links and unlinks a prop from a character", () => {
+    const linked = projectReducer(project, { type: "SET_PROP_CHARACTER_LINK", propId: "lighter", characterId: "kel", linked: true });
+    expect(linked.assets?.[0].attachedPropIds).toEqual(["lighter"]);
+    const unlinked = projectReducer(linked, { type: "SET_PROP_CHARACTER_LINK", propId: "lighter", characterId: "kel", linked: false });
+    expect(unlinked.assets?.[0].attachedPropIds).toEqual([]);
+  });
+
+  it("keeps final audit records in newest-first project change history", () => {
+    const first = projectReducer(project, { type: "RECORD_FINAL_AUDIT", record: {
+      id: "audit-1", createdAt: "2026-08-27T01:00:00.000Z", sceneId: "scene-1", status: "passed", automaticFixes: [], issues: [],
+    } });
+    const next = projectReducer(first, { type: "RECORD_FINAL_AUDIT", record: {
+      id: "audit-2", createdAt: "2026-08-27T02:00:00.000Z", sceneId: "scene-1", status: "blocked", automaticFixes: [], issues: [],
+    } });
+    expect(next.finalAuditLog?.map((record) => record.id)).toEqual(["audit-2", "audit-1"]);
+  });
 });

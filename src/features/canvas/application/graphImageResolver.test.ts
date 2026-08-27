@@ -73,4 +73,20 @@ describe("DefaultGraphImageResolver", () => {
       "mosaic-output.png",
     ]);
   });
+
+  it("forwards cinematic studio image and audio references through a video edge", () => {
+    const targetId = "video";
+    const resolver = new DefaultGraphImageResolver();
+    const nodes = [
+      createNode("cinematic", CANVAS_NODE_TYPES.cinematicStudio, {
+        studioReferenceImages: ["location.png", "character.png"],
+        studioReferenceAudio: ["character-voice.mp3"],
+      }),
+      createNode(targetId, CANVAS_NODE_TYPES.videoGen, {}),
+    ];
+    const edges = [createEdge("cinematic", targetId)];
+
+    expect(resolver.collectInputImages(targetId, nodes, edges)).toEqual(["location.png", "character.png"]);
+    expect(resolver.collectInputAudio(targetId, nodes, edges)).toEqual(["character-voice.mp3"]);
+  });
 });

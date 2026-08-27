@@ -8,7 +8,7 @@ import { getCamera, getLens } from "../gear";
 import { legacyFocalLengthToFov, lensByFov, renderTechnicalProfile } from "../presets";
 import { beatVerbZh } from "../beats";
 import {
-  canonicalNegativeId, classifyNegative, renderDefaultNegative, renderNegativeItems, DEFAULT_NEGATIVE_IDS,
+  canonicalNegativeId, classifyNegative, renderDefaultNegative, DEFAULT_NEGATIVE_IDS,
   type NegativeCategory,
 } from "../constants";
 import { fillTemplate, localizePromptValue, promptLexicon, type PromptLocale } from "../i18n/lexicon";
@@ -54,7 +54,22 @@ export function renderCountSection(project: ProjectV2, locale: PromptLocale = "z
 export function renderAssetSection(registry: AssetRegistry, syntax: ReferenceSyntax = "asset-id", locale: PromptLocale = "zh"): string {
   if (registry.orderedAssets.length === 0) return "";
   const heading = promptLexicon(locale).headings.assets;
-  const assetLines = registry.orderedAssets.map((asset, index) => renderAssetLine(asset, index + 1, syntax, locale));
+  const holderName = (id: string) => {
+    const holder = registry.orderedAssets.find((asset) => asset.id === id);
+    if (!holder) return id;
+    const name = holder.referenceTag?.trim() || holder.name.trim() || holder.id;
+    return syntax === "at-mention" ? `@${name}` : name;
+  };
+  let imageIndex = 0;
+  let audioIndex = 0;
+  const assetLines = registry.orderedAssets.map((asset) => renderAssetLine(
+    asset,
+    asset.referencePaths?.[0]?.trim() ? ++imageIndex : undefined,
+    syntax,
+    locale,
+    holderName,
+    asset.voiceClip?.trim() ? ++audioIndex : undefined,
+  ));
   return `${heading}:\n${assetLines.join("\n")}`;
 }
 
@@ -180,15 +195,6 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
   if (shot.acting?.trim()) actingBits.push(sentence(shot.acting.trim()));
   if (shot.eyeLife?.trim()) actingBits.push(locale === "zh" ? `眼部生活：${sentence(shot.eyeLife.trim())}` : `Eye life: ${sentence(shot.eyeLife.trim())}`);
   if (actingBits.length > 0) shotLines.push(locale === "zh" ? `表演：${actingBits.join(" ")}` : `Acting: ${actingBits.join(" ")}`);
-  if (shot.performanceLevel != null) {
-    const level = Number(shot.performanceLevel);
-    if (Number.isFinite(level) && level >= 0 && level <= 5) {
-      const levelText = locale === "zh"
-        ? ["0 假人", "1 朗诵", "2 勤勉", "3 匠人", "4 鲜活", "5 磁铁"][level]
-        : ["0 mannequin", "1 reciting", "2 diligent", "3 craftsman", "4 alive", "5 magnet"][level];
-      shotLines.push(locale === "zh" ? `表演评分：${level}（${levelText}）。` : `Performance level: ${level} (${levelText}).`);
-    }
-  }
   if (shot.note?.trim()) shotLines.push(locale === "zh" ? `备注：${sentence(shot.note.trim())}` : `NOTE: ${sentence(shot.note.trim())}`);
   return shotLines.join("\n");
 }
@@ -292,6 +298,39 @@ export interface NegativeLocks {
   global: string[];
 }
 
+function renderPositiveLock(item: string, locale: PromptLocale): string {
+  const canonical = canonicalNegativeId(item);
+  if (!canonical) return item.trim();
+  const zh = locale === "zh";
+  const locks: Record<string, { zh: string; en: string }> = {
+    "character-drift": {
+      zh: "所有角色始终与活动引用中的身份锚一致",
+      en: "every character remains consistent with the identity anchors in active references",
+    },
+    "wardrobe-changes": {
+      zh: "服装在全段保持不变",
+      en: "wardrobe remains unchanged throughout the sequence",
+    },
+    "extra-limbs": {
+      zh: "每位角色仅保留一组正常、完整的肢体",
+      en: "each character retains one anatomically normal, complete set of limbs",
+    },
+    "no-gravity-movement": {
+      zh: "人物与物体遵循重力、重量和惯性",
+      en: "people and objects obey gravity, weight and inertia",
+    },
+    "floating-props": {
+      zh: "所有道具始终有明确的接触点、重量和位置",
+      en: "every prop keeps an explicit contact point, weight and position",
+    },
+    "text-or-watermarks": {
+      zh: "画面保持干净，不出现界面文字、logo 或水印",
+      en: "the image stays clean with no interface text, logos or watermarks",
+    },
+  };
+  return locks[canonical]?.[zh ? "zh" : "en"] ?? item.trim();
+}
+
 /**
  * 负面词局部锁（P0.3，替代 director 模式的整段负面）。
  * 读取 project.negativePrompt（自由文本或内置 ID），按类别拆到宿主：
@@ -309,7 +348,7 @@ export function renderLocalLocks(project: ProjectV2, locale: PromptLocale = "zh"
   for (const item of items) {
     const category: NegativeCategory = classifyNegative(item);
     const canonical = canonicalNegativeId(item);
-    const rendered = renderNegativeItems([canonical ?? item], locale)[0];
+    const rendered = renderPositiveLock(canonical ?? item, locale);
     if (!rendered) continue;
     locks[category].push(rendered);
   }

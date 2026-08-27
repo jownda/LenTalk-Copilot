@@ -3,7 +3,7 @@
  * 把原来的「风格配方 / 场景 / 音频计划」三张卡合并为一张导演简报卡：
  * - 剧情：故事梗概 + 前情续接 + 参与角色（@ 资产点选）
  * - 场景站位：复用 StagingEditor（地点 / 轴 / 排序 / 间距 / 空间锚点）
- * - 风格倾向：风格配方（收起 12 字段）+ 一句风格话
+ * - 风格描述：可直接填写；预制风格仅作为填充描述的辅助入口
  * - 硬约束：长镜头 / 多镜头 + 时长 + 必须发生 / 禁止发生
  * - 对白 + 情绪走向（可选）
  * - 音频计划：复用 AudioPlanEditor
@@ -14,10 +14,10 @@ import type { ActingObjective, ProjectV2, SceneStaging, SceneV2 } from "../../sh
 import { Check, ChevronDown, Clapperboard, Copy, Film, Plus, Sparkles, X } from "lucide-react";
 import type { CopyZh, Locale } from "../i18n";
 import type { LenTalkChatModelOption } from "../providers/aiSettings";
+import type { SceneCompileProgress } from "../providers/ai";
 import AudioPlanEditor from "./AudioPlanEditor";
 import StagingEditor from "./StagingEditor";
-import TechnicalProfileCard from "./TechnicalProfileCard";
-import { getStyle, localizedStyleBrief, styleBriefDescription } from "../../engine";
+import { getStyle, localizedStyleBrief, MASTER_STYLES, styleBriefDescription } from "../../engine";
 
 interface DirectorBriefCardProps {
   project: ProjectV2;
@@ -25,6 +25,8 @@ interface DirectorBriefCardProps {
   t: CopyZh;
   locale: Locale;
   compileBusy: boolean;
+  compileProgress: SceneCompileProgress;
+  briefOptimizeBusy: boolean;
   aiCompileError: string;
   aiCompileErrorDetail: string;
   aiErrorCopied: boolean;
@@ -36,6 +38,7 @@ interface DirectorBriefCardProps {
   onUpdateStaging(patch: Partial<SceneStaging>): void;
   onUpdateProject(patch: Partial<ProjectV2>): void;
   onAiCompile(): void;
+  onAiOptimizeBrief(): void;
   onLocalCompile(): void;
   onCopyAiError(): void;
   chatModels: LenTalkChatModelOption[];
@@ -48,13 +51,14 @@ const splitLines = (text: string): string[] => text.split(/\r?\n/).map((item) =>
 
 export default function DirectorBriefCard(props: DirectorBriefCardProps) {
   const {
-    project, scene, t, locale, compileBusy, aiCompileError, aiCompileErrorDetail, aiErrorCopied,
+    project, scene, t, locale, compileBusy, compileProgress, briefOptimizeBusy, aiCompileError, aiCompileErrorDetail, aiErrorCopied,
     onSelectScene, onAddScene, onDeleteScene, onRenameScene, onUpdateScene,
-    onUpdateStaging, onUpdateProject, onAiCompile, onLocalCompile, onCopyAiError,
+    onUpdateStaging, onUpdateProject, onAiCompile, onAiOptimizeBrief, onLocalCompile, onCopyAiError,
     chatModels, selectedChatModel, onSelectChatModel,
   } = props;
   const [pickingCharacter, setPickingCharacter] = useState(false);
   const [audioOpen, setAudioOpen] = useState(false);
+  const [stylePresetOpen, setStylePresetOpen] = useState(false);
   const [busySeconds, setBusySeconds] = useState(0);
   useEffect(() => {
     if (!compileBusy) { setBusySeconds(0); return; }
@@ -70,6 +74,21 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
   const audio = project.audioPlan ?? { score: "none" as const, subtitles: false };
   const styleBrief = localizedStyleBrief(project, locale);
   const audioSummary = `${t.score} ${audio.score === "original-score" ? t.scoreOriginal : t.scoreNone} · ${t.subtitles} ${audio.subtitles ? t.subtitlesBurned : t.subtitlesNone} · ${t.diegeticMusic} ${(audio.diegeticMusic ?? []).length} · ${t.sfx} ${(audio.sfx ?? []).length}`;
+  const compileProgressText = locale === "zh"
+    ? ({
+        preparing: "正在整理场景、资产与约束",
+        waiting: busySeconds >= 15 ? "仍在等待模型返回，连接保持中" : "请求已发出，正在等待模型生成",
+        parsing: "模型已返回，正在解析分镜数据",
+        validating: "正在校验时长、镜头和资产引用",
+        idle: "",
+      } satisfies Record<SceneCompileProgress, string>)[compileProgress]
+    : ({
+        preparing: "Preparing scene, assets, and constraints",
+        waiting: busySeconds >= 15 ? "Still waiting for the model; the connection remains open" : "Request sent; waiting for model generation",
+        parsing: "Model returned; parsing storyboard data",
+        validating: "Validating timing, shots, and asset references",
+        idle: "",
+      } satisfies Record<SceneCompileProgress, string>)[compileProgress];
 
   const addCharacter = (id: string) => {
     if (order.includes(id)) return;
@@ -139,36 +158,38 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
       <StagingEditor project={project} scene={scene} t={t} onChange={onUpdateStaging} />
     </div>
 
-    {/* 风格倾向 */}
-    <div className="brief-group">
-      <div className="brief-group-head"><span className="eyebrow">{t.styleGroup}</span></div>
-      <TechnicalProfileCard
-        project={project}
-        t={t}
-        locale={locale}
-        onChange={(profile) => onUpdateProject({ technicalProfile: profile })}
-        onStyleChange={(styleId) => {
-          if (!styleId) {
-            onUpdateProject({ styleId: undefined });
-            return;
-          }
-          const generated = styleBriefDescription(getStyle(styleId), locale);
-          onUpdateProject({
-            styleId,
-            styleBrief: generated,
-            ...(locale === "zh" ? { styleBriefZh: generated } : { styleBriefEn: generated }),
-          });
-        }}
-      />
-      <label className="field-label">{t.styleBrief}<textarea className="modal-textarea" value={styleBrief} placeholder={t.styleBriefPlaceholder} onChange={(event) => {
+    {/* 风格描述：预制风格只辅助填充文本，不再占用独立的大型配方卡 */}
+    <div className="brief-group brief-style-group">
+      <div className="brief-group-head"><span className="eyebrow">{t.styleBrief}</span></div>
+      <textarea className="modal-textarea" value={styleBrief} placeholder={t.styleBriefPlaceholder} onChange={(event) => {
         const value = event.target.value || undefined;
         onUpdateProject({ styleBrief: value, ...(locale === "zh" ? { styleBriefZh: value } : { styleBriefEn: value }) });
-      }} /></label>
+      }} />
+      <div className="style-preset-row">
+        <button className="outline-button style-preset-button" type="button" aria-expanded={stylePresetOpen} onClick={() => setStylePresetOpen((open) => !open)}>
+          {getStyle(project.styleId)?.[locale === "zh" ? "nameZh" : "name"] ?? t.selectStylePreset}
+          <ChevronDown size={13} className={stylePresetOpen ? "open" : ""} />
+        </button>
+        {stylePresetOpen && <div className="style-preset-menu" role="listbox" aria-label={t.selectStylePreset}>
+          {MASTER_STYLES.map((style) => (
+            <button key={style.id} type="button" role="option" aria-selected={project.styleId === style.id} className={project.styleId === style.id ? "active" : ""} onClick={() => {
+              const generated = styleBriefDescription(style, locale);
+              onUpdateProject({
+                styleId: style.id,
+                styleBrief: generated,
+                ...(locale === "zh" ? { styleBriefZh: generated } : { styleBriefEn: generated }),
+              });
+              setStylePresetOpen(false);
+            }}>{locale === "zh" ? style.nameZh : style.name}</button>
+          ))}
+          <button type="button" className="style-preset-clear" onClick={() => { onUpdateProject({ styleId: undefined }); setStylePresetOpen(false); }}>{t.clearStylePreset}</button>
+        </div>}
+      </div>
     </div>
 
     {/* 硬约束 */}
     <div className="brief-group">
-      <div className="brief-group-head"><span className="eyebrow">{t.constraintGroup}</span></div>
+      <div className="brief-group-head"><span className="eyebrow">{t.constraintGroup}</span><span className="brief-user-badge">{t.userInputAiReference}</span></div>
       <div className="shooting-mode">
         <span className="eyebrow">{t.shootingMode}</span>
         <div className="shooting-mode-toggle" role="radiogroup" aria-label={t.shootingMode}>
@@ -180,8 +201,9 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
           </button>
         </div>
       </div>
-      <div className="fields-grid two">
-        <label className="field-label">{t.metaDuration}<input className="modal-input" value={scene.duration} onChange={(event) => onUpdateScene({ duration: event.target.value })} /></label>
+      <div className="fields-grid two brief-duration-grid">
+        <label className="field-label"><span>{t.metaDuration}</span><input className="modal-input" value={scene.duration} onChange={(event) => onUpdateScene({ duration: event.target.value })} /></label>
+        <div className="brief-duration-action"><button className="primary-button brief-optimize-button" disabled={briefOptimizeBusy || compileBusy} onClick={onAiOptimizeBrief}>{briefOptimizeBusy ? <span className="spin-dot" /> : <Sparkles size={14} />} {briefOptimizeBusy ? t.aiOptimizingBrief : t.aiOptimizeBrief}</button></div>
       </div>
       <label className="field-label">{t.mustHappen}<textarea className="modal-textarea" value={(scene.mustHappen ?? []).join("\n")} placeholder={t.mustHappenPlaceholder} onChange={(event) => onUpdateScene({ mustHappen: splitLines(event.target.value) })} /></label>
       <label className="field-label">{t.forbidLabel}<textarea className="modal-textarea" value={(scene.forbid ?? []).join("\n")} placeholder={t.forbidPlaceholder} onChange={(event) => onUpdateScene({ forbid: splitLines(event.target.value) })} /></label>
@@ -189,6 +211,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
 
     {/* 对白 + 情绪走向 */}
     <div className="brief-group">
+      <div className="brief-group-head"><span className="brief-user-badge">{t.userInputAiReference}</span></div>
       <div className="fields-grid two">
         <label className="field-label">{t.dialogue}<textarea className="modal-textarea" value={scene.dialogue ?? ""} placeholder={t.dialoguePlaceholder} onChange={(event) => onUpdateScene({ dialogue: event.target.value || undefined })} /></label>
         <label className="field-label">{t.emotionArc}<textarea className="modal-textarea" value={scene.emotionArc ?? ""} placeholder={t.emotionArcPlaceholder} onChange={(event) => onUpdateScene({ emotionArc: event.target.value || undefined })} /></label>
@@ -197,7 +220,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
 
     {/* 表演目标（P2）：每参与角色的目的/阻碍/代价/贯穿目标 */}
     <div className="brief-group">
-      <div className="brief-group-head"><span className="eyebrow">{t.actingObjectives}</span></div>
+      <div className="brief-group-head"><span className="eyebrow">{t.actingObjectives}</span><span className="brief-user-badge">{t.userInputAiReference}</span></div>
       <ActingObjectivesEditor
         t={t}
         characters={characterAssets}
@@ -232,8 +255,9 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
         </select>
         <ChevronDown size={13} />
       </label>
-      <button className="primary-button" disabled={compileBusy} onClick={onAiCompile}>{compileBusy ? <span className="spin-dot" /> : <Sparkles size={16} />} {compileBusy ? `${t.aiCompiling} ${busySeconds}s` : t.aiCompilePrompt}</button>
+      <button className="primary-button" disabled={compileBusy} onClick={onAiCompile}>{compileBusy ? <span className="spin-dot" /> : <Sparkles size={16} />} {compileBusy ? t.aiCompiling : t.aiCompilePrompt}</button>
       <button className="primary-button" onClick={onLocalCompile}>{t.localCompile}</button>
+      {compileBusy && <span className="compile-progress" role="status" aria-live="polite"><span className="compile-progress-dot" />{compileProgressText}<time>{busySeconds}s</time></span>}
       {aiCompileError && (
         <span className="ai-error-wrap">
           <span className="ai-error-badge" title={aiCompileErrorDetail || aiCompileError}><span className="ai-error-dot" /> {aiCompileError}</span>

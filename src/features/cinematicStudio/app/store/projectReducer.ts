@@ -4,20 +4,22 @@
  * 场景/镜头/节拍操作在 P0.2-P0.4 分批迁入。
  */
 import { deriveProjectCode, withAssetReferenceTag } from "../../engine";
-import type { Asset, AssetKind, ProjectV2 } from "../../shared-types";
+import type { Asset, AssetKind, FinalAuditLogEntry, ProjectV2 } from "../../shared-types";
 
 export const newId = () => crypto.randomUUID();
 
 export type ProjectAction =
   | { type: "SET_PROJECT"; project: ProjectV2 }
   | { type: "PATCH_PROJECT"; patch: Partial<ProjectV2> }
-  | { type: "ADD_ASSET"; kind: AssetKind; name?: string }
+  | { type: "ADD_ASSET"; kind: AssetKind; name?: string; id?: string; referencePaths?: string[]; propHolderCharacterId?: string }
+  | { type: "SET_PROP_CHARACTER_LINK"; propId: string; characterId: string; linked: boolean }
   | { type: "CREATE_ASSET_VARIANT"; sourceId: string; id: string; stateName: string }
   | { type: "UPDATE_ASSET"; id: string; patch: Partial<Asset> }
   | { type: "DELETE_ASSET"; id: string }
   | { type: "SET_CHARACTER_COUNT_LOCK"; count?: number }
   | { type: "UPSERT_IDENTITY_RULE"; characterId: string; patch: Partial<NonNullable<ProjectV2["identityRules"]>[number]> }
-  | { type: "DELETE_IDENTITY_RULE"; characterId: string };
+  | { type: "DELETE_IDENTITY_RULE"; characterId: string }
+  | { type: "RECORD_FINAL_AUDIT"; record: FinalAuditLogEntry };
 
 export function assetKindLabel(kind: AssetKind): string {
   return { character: "character", location: "location", prop: "prop", "style-reference": "style-reference", "audio-reference": "audio-reference" }[kind];
@@ -34,14 +36,15 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
       return { ...next, projectCode, assets: (next.assets ?? []).map((asset) => withAssetReferenceTag(asset, projectCode)) };
     }
     case "ADD_ASSET": {
-      const id = newId();
+      const id = action.id ?? newId();
       const created: Asset = withAssetReferenceTag({
         id,
         kind: action.kind,
         name: action.name ?? `NEW ${assetKindLabel(action.kind).toUpperCase()}`,
         description: "",
         descriptionZh: "",
-        referencePaths: [],
+        referencePaths: action.referencePaths ?? [],
+        propHolderCharacterId: action.propHolderCharacterId,
         lockLevel: "none",
         tags: [],
         variantGroupId: id,
@@ -52,6 +55,17 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
       }, state.projectCode?.trim() || deriveProjectCode(state.title));
       return { ...state, assets: [...(state.assets ?? []), created] };
     }
+    case "SET_PROP_CHARACTER_LINK":
+      return {
+        ...state,
+        assets: (state.assets ?? []).map((asset) => {
+          if (asset.id !== action.characterId || asset.kind !== "character") return asset;
+          const attached = asset.attachedPropIds ?? [];
+          return action.linked
+            ? (attached.includes(action.propId) ? asset : { ...asset, attachedPropIds: [...attached, action.propId] })
+            : { ...asset, attachedPropIds: attached.filter((id) => id !== action.propId) };
+        }),
+      };
     case "CREATE_ASSET_VARIANT": {
       const source = (state.assets ?? []).find((asset) => asset.id === action.sourceId);
       if (!source) return state;
@@ -84,7 +98,11 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
     case "DELETE_ASSET":
       return {
         ...state,
-        assets: (state.assets ?? []).filter((asset) => asset.id !== action.id),
+        assets: (state.assets ?? [])
+          .filter((asset) => asset.id !== action.id)
+          .map((asset) => asset.attachedPropIds?.includes(action.id)
+            ? { ...asset, attachedPropIds: asset.attachedPropIds.filter((id) => id !== action.id) }
+            : asset),
         // 删除资产时同步清理风格配方绑定
         technicalProfile: {
           ...(state.technicalProfile ?? {}),
@@ -122,6 +140,8 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
     }
     case "DELETE_IDENTITY_RULE":
       return { ...state, identityRules: (state.identityRules ?? []).filter((rule) => rule.characterId !== action.characterId) };
+    case "RECORD_FINAL_AUDIT":
+      return { ...state, finalAuditLog: [action.record, ...(state.finalAuditLog ?? [])].slice(0, 30) };
     default:
       return state;
   }

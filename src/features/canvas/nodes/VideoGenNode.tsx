@@ -20,6 +20,7 @@ import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { canvasAiGateway, graphImageResolver } from '@/features/canvas/application/canvasServices';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
 import { CURRENT_RUNTIME_SESSION_ID } from '@/features/canvas/application/generationErrorReport';
+import { mergeMediaReferenceSources } from '@/features/canvas/application/mediaReferenceSources';
 import { recordGenerationOutcome } from '@/features/canvas/application/usageRecording';
 import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
 import { getDefaultVideoModelId, getModelProvider, getVideoModel, JIMENG_CLI_PROVIDER_ID, listVideoModels, resolveVideoModelProfile } from '@/features/canvas/models';
@@ -373,9 +374,30 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     () => graphImageResolver.collectInputText(id, nodes, edges),
     [edges, id, nodes]
   );
+  // “发送到视频节点”会把附件直接写入新节点；同时保留连线输入，覆盖状态回传尚在防抖的瞬间。
+  const directReferenceImages = useMemo(
+    () => Array.isArray(data.studioReferenceImages)
+      ? data.studioReferenceImages.map((value) => value.trim()).filter(Boolean)
+      : [],
+    [data.studioReferenceImages]
+  );
+  const directReferenceAudio = useMemo(
+    () => Array.isArray(data.studioReferenceAudio)
+      ? data.studioReferenceAudio.map((value) => value.trim()).filter(Boolean)
+      : [],
+    [data.studioReferenceAudio]
+  );
+  const resolvedInputImages = useMemo(
+    () => mergeMediaReferenceSources(directReferenceImages, inputImages),
+    [directReferenceImages, inputImages]
+  );
+  const resolvedInputAudio = useMemo(
+    () => mergeMediaReferenceSources(directReferenceAudio, inputAudio),
+    [directReferenceAudio, inputAudio]
+  );
   // 文本引用预览现在按行渲染(每行一个上游文本), 不再需要合并字符串
   // 首尾帧与上游参考图是两种互斥输入方式。首尾帧只使用节点内上传的两张图。
-  const referenceInputImages = imageMode === 'reference' ? inputImages : [];
+  const referenceInputImages = imageMode === 'reference' ? resolvedInputImages : [];
   const firstLastFrameImages = useMemo(
     () => [data.firstFrameImageUrl, data.lastFrameImageUrl]
       .filter((imageUrl): imageUrl is string => typeof imageUrl === 'string' && imageUrl.trim().length > 0),
@@ -442,14 +464,14 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         label: item.label,
         source: item.imageUrl,
       })),
-      ...inputAudio.map((source, index) => ({
+      ...resolvedInputAudio.map((source, index) => ({
         kind: 'audio' as const,
         index,
         label: resolveAudioLabel(source, index),
         source,
       })),
     ],
-    [inputAudio, inputImageItems, resolveAudioLabel]
+    [inputImageItems, resolveAudioLabel, resolvedInputAudio]
   );
   const title = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.videoGen, data), [data]);
   const resolvedWidth = Math.max(VIDEO_GEN_NODE_MIN_WIDTH, Math.round(width ?? VIDEO_GEN_NODE_DEFAULT_WIDTH));
@@ -485,14 +507,14 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     const cleanedPrompt = removeOutOfRangeReferenceTokens(
       promptDraftRef.current,
       referenceInputImages.length,
-      inputAudio.length
+      resolvedInputAudio.length
     );
     if (cleanedPrompt !== promptDraftRef.current) {
       promptDraftRef.current = cleanedPrompt;
       setPromptDraft(cleanedPrompt);
       updateNodeData(id, { prompt: cleanedPrompt });
     }
-  }, [id, imageMode, inputAudio.length, referenceInputImages.length, updateNodeData]);
+  }, [id, imageMode, referenceInputImages.length, resolvedInputAudio.length, updateNodeData]);
 
   useEffect(() => {
     if (referencePickerItems.length === 0) {
@@ -614,7 +636,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         selectionEnd,
         deletionDirection,
         referenceInputImages.length,
-        inputAudio.length
+        resolvedInputAudio.length
       );
       if (deleteRange) {
         event.preventDefault();
@@ -667,7 +689,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       setPickerActiveIndex(0);
       setShowImagePicker(true);
     }
-  }, [id, inputAudio.length, insertReference, pickerActiveIndex, referenceInputImages.length, referencePickerItems, showImagePicker, updateNodeData]);
+  }, [id, insertReference, pickerActiveIndex, referenceInputImages.length, referencePickerItems, resolvedInputAudio.length, showImagePicker, updateNodeData]);
 
   const handleFrameFileChange = useCallback(async (
     slot: FrameSlot,
@@ -776,7 +798,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         videoResolution: selectedVideoResolution,
         imageMode,
         referenceImages: videoReferenceImages,
-        referenceAudio: inputAudio,
+        referenceAudio: resolvedInputAudio,
         extraParams: {},
       },
     });
@@ -798,7 +820,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         videoResolution: selectedVideoResolution,
         imageMode,
         referenceImages: videoReferenceImages,
-        referenceAudio: inputAudio,
+        referenceAudio: resolvedInputAudio,
         extraParams: {},
       });
       recordGenerationOutcome({
@@ -847,7 +869,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     } finally {
       setIsGenerating(false);
     }
-  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, id, imageMode, inputAudio, inputText, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, t, updateNodeData, updateNodeSize, videoReferenceImages]);
+  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, id, imageMode, inputText, resolvedInputAudio, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, t, updateNodeData, updateNodeSize, videoReferenceImages]);
 
   return (
     <div
@@ -875,9 +897,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
               {renderPromptWithHighlights(
                 promptDraft,
                 referenceInputImages.length,
-                inputAudio.length,
+                resolvedInputAudio.length,
                 inputImageDisplayUrls,
-                inputAudio,
+                resolvedInputAudio,
                 resolveAudioLabel,
                 (displayUrl, event) => {
                   setPreviewState({ url: displayUrl, x: event.clientX, y: event.clientY });
@@ -960,10 +982,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           </div>
         )}
       </div>
-      {inputAudio.length > 0 && (
+      {resolvedInputAudio.length > 0 && (
         <div className="flex items-center gap-1 text-[11px] text-text-muted">
           <AudioLines className="h-3.5 w-3.5 text-accent" />
-          <span>已引用 {inputAudio.length} 段音频</span>
+          <span>已引用 {resolvedInputAudio.length} 段音频</span>
         </div>
       )}
       <div className="flex items-center gap-1" role="group" aria-label={t('node.videoGen.imageMode')}>

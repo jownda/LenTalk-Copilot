@@ -136,16 +136,43 @@ export function localizeReferenceTokens(prompt: string, model: string): string {
   );
 }
 
-/** 参考图片直传: http(s) URL 直接透传(平台可下载); 本地路径/dataURL 转 base64 内嵌。 */
+const CUSTOM_IMAGE_REFERENCE_TOTAL_BUDGET = 8_000_000;
+const CUSTOM_IMAGE_REFERENCE_MAX_DIMENSION = 2048;
+const CUSTOM_IMAGE_REFERENCE_QUALITY = 0.9;
+const imageReferenceDataUrlCache = new Map<string, string>();
+
+/**
+ * 参考图片直传: http(s) URL 直接透传(平台可下载); 本地路径/dataURL 转 base64 内嵌。
+ * 部分图片中转会在接收多张 4K data URL 时直接关闭连接而不返回 HTTP 状态。
+ * 自定义图片模型因此为本地大图预留总共约 8MB 的请求预算；小图不会重编码。
+ */
 async function normalizeReferenceUrls(
-  urls: string[] | undefined
+  urls: string[] | undefined,
+  options?: { compactCustomImages?: boolean }
 ): Promise<string[] | undefined> {
   if (!urls?.length) return undefined;
+  const compactCustomImages = options?.compactCustomImages === true;
+  const nonEmptyUrls = urls.map((url) => url.trim()).filter(Boolean);
+  const perImageBudget = Math.max(
+    1_500_000,
+    Math.floor(CUSTOM_IMAGE_REFERENCE_TOTAL_BUDGET / Math.max(1, nonEmptyUrls.length))
+  );
+
   return await Promise.all(
-    urls
-      .map((url) => url.trim())
-      .filter(Boolean)
-      .map(async (url) => (/^https?:\/\//i.test(url) ? url : await imageUrlToDataUrl(url)))
+    nonEmptyUrls.map(async (url) => {
+      if (/^https?:\/\//i.test(url)) return url;
+
+      const rawDataUrl = imageReferenceDataUrlCache.get(url) ?? await imageUrlToDataUrl(url);
+      imageReferenceDataUrlCache.set(url, rawDataUrl);
+      if (!compactCustomImages || rawDataUrl.length <= perImageBudget) return rawDataUrl;
+
+      return await createCompactImageDataUrl(
+        url,
+        CUSTOM_IMAGE_REFERENCE_MAX_DIMENSION,
+        CUSTOM_IMAGE_REFERENCE_QUALITY,
+        perImageBudget
+      );
+    })
   );
 }
 
@@ -226,8 +253,10 @@ export const tauriAiGateway: AiGateway = {
     // 显式同步通道(等价 Infinite-Canvas /api/generate): 强制 request_mode=sync,
     // 后端走 generate_image 直出, 不创建异步任务, 避免 poll 不收敛导致的永久转圈。
     const injected = injectCustomApiRequestMode(payload, 'sync');
-    // 图片直传: http URL 透传, 本地路径转 base64(平台需能下载)
-    const normalizedReferenceImages = await normalizeReferenceUrls(injected.referenceImages);
+    // 图片直传: http URL 透传。本地多张大图为自定义中转压缩到安全请求体大小。
+    const normalizedReferenceImages = await normalizeReferenceUrls(injected.referenceImages, {
+      compactCustomImages: injected.model.startsWith('custom:'),
+    });
     const mergedExtraParams = mergeNegativePrompt(injected);
 
     return await generateImage({
@@ -247,8 +276,10 @@ export const tauriAiGateway: AiGateway = {
     // 只有平台明确配置 requestMode=async 时才进入任务轮询；普通 OpenAI
     // 兼容接口走同步提交，避免猜测不存在的查询端点导致永久 pending。
     const injected = injectCustomApiRequestMode(payload);
-    // 图片直传: http URL 透传, 本地路径转 base64
-    const normalizedReferenceImages = await normalizeReferenceUrls(injected.referenceImages);
+    // 图片直传: http URL 透传。本地多张大图为自定义中转压缩到安全请求体大小。
+    const normalizedReferenceImages = await normalizeReferenceUrls(injected.referenceImages, {
+      compactCustomImages: injected.model.startsWith('custom:'),
+    });
     const mergedExtraParams = mergeNegativePrompt(injected);
     return await submitGenerateImageJob({
       prompt: localizeReferenceTokens(

@@ -2,7 +2,7 @@
  * 场景站位（P0.2 · 卡片按钮 + 画面调整弹窗）
  * 场景卡片中以一张可点击的「场景站位」卡片展示：自动提取地点资产参考图作为场景缩略图，
  * 并生成简短描述。点击后在弹窗中调整画面参数（地点资产缩略图选择、180° 轴方向、
- * 左到右排序、人物间距、空间锚点、前情续接）。
+ * 左到右排序、人物间距、空间锚点）。
  */
 import { useState } from "react";
 import type { Asset, SceneStaging, SceneV2, ProjectV2 } from "../../shared-types";
@@ -138,7 +138,6 @@ export default function StagingEditor({ project, scene, t, onChange }: StagingEd
         </div>
 
         <label className="field-label">{t.spatialAnchor}<textarea className="modal-textarea" value={staging.anchorDescription ?? ""} placeholder={t.spatialAnchorPlaceholder} onChange={(event) => onChange({ anchorDescription: event.target.value || undefined })} /></label>
-        <label className="field-label">{t.priorContext}<textarea className="modal-textarea" value={staging.priorContext ?? ""} placeholder={t.priorContextPlaceholder} onChange={(event) => onChange({ priorContext: event.target.value || undefined })} /></label>
 
         <div className="modal-actions">
           <button className="outline-button" onClick={() => setOpen(false)}>{t.cancel}</button>

@@ -238,6 +238,12 @@ function applyCinematicStudioPromptToTarget(
   if (!prompt) {
     return nodes;
   }
+  const referenceImages = Array.isArray((source.data as { studioReferenceImages?: unknown }).studioReferenceImages)
+    ? (source.data as { studioReferenceImages: unknown[] }).studioReferenceImages.filter((value): value is string => typeof value === 'string' && value.length > 0)
+    : [];
+  const referenceAudio = Array.isArray((source.data as { studioReferenceAudio?: unknown }).studioReferenceAudio)
+    ? (source.data as { studioReferenceAudio: unknown[] }).studioReferenceAudio.filter((value): value is string => typeof value === 'string' && value.length > 0)
+    : [];
 
   return nodes.map((node) => {
     if (node.id !== targetId) {
@@ -245,7 +251,7 @@ function applyCinematicStudioPromptToTarget(
     }
 
     if (node.type === CANVAS_NODE_TYPES.videoGen) {
-      return { ...node, data: { ...node.data, prompt } } as CanvasNode;
+      return { ...node, data: { ...node.data, prompt, studioReferenceImages: referenceImages, studioReferenceAudio: referenceAudio } } as CanvasNode;
     }
 
     return { ...node, data: { ...node.data, content: prompt } } as CanvasNode;

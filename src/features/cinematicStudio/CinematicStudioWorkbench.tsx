@@ -5,7 +5,7 @@ import './app/styles.css';
 export interface CinematicStudioWorkbenchProps {
   onClose: () => void;
   onStateChange?: (snapshot: CinematicStudioAppStateSnapshot) => void;
-  onSendToVideo?: (prompt: string) => void;
+  onSendToVideo?: (payload: { prompt: string; referenceImages: string[]; referenceAudio: string[] }) => void;
 }
 
 /**

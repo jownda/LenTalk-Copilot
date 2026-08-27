@@ -146,6 +146,9 @@ export interface VideoGenNodeData extends NodeDisplayData {
   firstFramePreviewImageUrl?: string | null;
   lastFrameImageUrl?: string | null;
   lastFramePreviewImageUrl?: string | null;
+  /** 工作室“发送到视频节点”时随节点快照保存，避免宿主状态防抖期间丢失附件。 */
+  studioReferenceImages?: string[];
+  studioReferenceAudio?: string[];
 }
 
 export interface StoryboardFrameItem {
@@ -231,7 +234,7 @@ export interface DirectorDeskNodeData extends NodeDisplayData {
   [key: string]: unknown;
 }
 
-/** Cinematic Prompt Studio 节点：单击进入独立提示词工作台。 */
+/** Cinematic Prompt Studio 节点：双击进入独立提示词工作台。 */
 export interface CinematicStudioNodeData extends NodeDisplayData {
   /** 最近一次保存的工程标题(仅用于节点预览) */
   lastProjectTitle?: string | null;
@@ -239,6 +242,9 @@ export interface CinematicStudioNodeData extends NodeDisplayData {
   lastProjectDescription?: string | null;
   /** 最近一次编译的提示词摘要(仅用于节点预览) */
   lastPromptPreview?: string | null;
+  /** 工作室当前提示词对应的附件；下游视频节点通过连线接收。 */
+  studioReferenceImages?: string[];
+  studioReferenceAudio?: string[];
   [key: string]: unknown;
 }
 
@@ -414,6 +420,12 @@ export function isDirectorDeskNode(
   node: CanvasNode | null | undefined,
 ): node is Node<DirectorDeskNodeData, typeof CANVAS_NODE_TYPES.directorDesk> {
   return node?.type === CANVAS_NODE_TYPES.directorDesk;
+}
+
+export function isCinematicStudioNode(
+  node: CanvasNode | null | undefined,
+): node is Node<CinematicStudioNodeData, typeof CANVAS_NODE_TYPES.cinematicStudio> {
+  return node?.type === CANVAS_NODE_TYPES.cinematicStudio;
 }
 
 export function isAudioNode(
