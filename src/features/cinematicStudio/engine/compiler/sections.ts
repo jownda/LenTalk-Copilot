@@ -14,8 +14,8 @@ import {
 import { fillTemplate, localizePromptValue, promptLexicon, type PromptLocale } from "../i18n/lexicon";
 import {
   assetRefName, buildAssetRegistry, renderAssetLine, renderAxisBreakNote, renderCharacterCountLock,
-  renderParticipantsLine, renderPropState, renderShotTime, renderSpatialLayoutLine, renderStagingDetails,
-  renderStateChain, renderStrictIdentityLock, resolveAnchor, resolveCharacterOrder,
+  renderParticipantsLine, renderShotTime, renderSpatialLayoutLine, renderStagingDetails,
+  renderStrictIdentityLock, resolveAnchor, resolveCharacterOrder,
   type AssetRegistry, type ReferenceSyntax,
 } from "./renderer";
 
@@ -133,16 +133,11 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
     shotLines.push(locale === "zh" ? `角色：${name(shot.characterId)}。` : `Participant: ${name(shot.characterId)}.`);
   }
 
-  // 状态段（状态链优先；无变化时输出开始/结束状态）
-  const stateLines = renderStateChain(project, shot, locale, syntax);
-  if (stateLines.length > 0) {
-    shotLines.push(`${lex.labels.stateTransitions}:\n${stateLines.join("\n")}`);
-  } else if ((shot.propStatesAtStart ?? []).length > 0 || (shot.propStatesAtEnd ?? []).length > 0) {
-    const assetName = assetRefName(project, syntax);
-    const start = (shot.propStatesAtStart ?? []).map((s) => renderPropState(s, assetName, locale)).join(locale === "zh" ? "；" : "; ");
-    const end = (shot.propStatesAtEnd ?? []).map((s) => renderPropState(s, assetName, locale)).join(locale === "zh" ? "；" : "; ");
-    if (start) shotLines.push(`${lex.labels.startingStates}：${start}。`);
-    if (end) shotLines.push(`${lex.labels.endingStates}：${end}。`);
+  // 道具变化只保留一段镜头级自然语言，避免开始/结束状态互相冲突。
+  if (shot.propChangeDescription?.trim()) {
+    shotLines.push(locale === "zh"
+      ? `道具变化：${sentence(shot.propChangeDescription.trim())}`
+      : `Prop changes: ${sentence(shot.propChangeDescription.trim())}`);
   }
 
   // Beats
@@ -167,16 +162,6 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
       } else if (never.length > 0) {
         line += locale === "zh" ? ` 禁止目标：${never.join("、")}。` : ` Never target: ${never.join(", ")}.`;
       }
-      const before = new Map((beat.stateBefore ?? []).map((s) => [s.propId, s.state]));
-      const changes = (beat.stateAfter ?? []).filter((s) => before.get(s.propId) !== s.state);
-      if (changes.length > 0) {
-        const changeText = changes.map((s) => {
-          const prev = before.get(s.propId);
-          const prevLocal = prev ? localizePromptValue(prev, locale) : "";
-          return `${assetName(s.propId)}${prevLocal ? ` ${prevLocal}` : ""} → ${localizePromptValue(s.state, locale)}`;
-        }).join(locale === "zh" ? "；" : "; ");
-        line += locale === "zh" ? ` 状态：${changeText}。` : ` State: ${changeText}.`;
-      }
       if (beat.required) line += locale === "zh" ? ` 必须发生。` : " MUST occur.";
       if (beat.cutRule?.trim()) line += ` ${sentence(beat.cutRule.trim())}`;
       if (beat.tactic?.trim()) line += locale === "zh" ? ` 策略：${sentence(beat.tactic.trim())}` : ` Tactic: ${sentence(beat.tactic.trim())}`;
@@ -194,6 +179,14 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
   const actingBits: string[] = [];
   if (shot.acting?.trim()) actingBits.push(sentence(shot.acting.trim()));
   if (shot.eyeLife?.trim()) actingBits.push(locale === "zh" ? `眼部生活：${sentence(shot.eyeLife.trim())}` : `Eye life: ${sentence(shot.eyeLife.trim())}`);
+  for (const participant of shot.participants ?? []) {
+    const performance = participant.acting?.trim();
+    const eyeLife = participant.eyeLife?.trim();
+    if (!performance && !eyeLife) continue;
+    const name = assetRefName(project, syntax)(participant.characterId);
+    const details = [performance ? sentence(performance) : "", eyeLife ? (locale === "zh" ? `眼部生活：${sentence(eyeLife)}` : `Eye life: ${sentence(eyeLife)}`) : ""].filter(Boolean);
+    actingBits.push(locale === "zh" ? `${name}：${details.join(" ")}` : `${name}: ${details.join(" ")}`);
+  }
   if (actingBits.length > 0) shotLines.push(locale === "zh" ? `表演：${actingBits.join(" ")}` : `Acting: ${actingBits.join(" ")}`);
   if (shot.note?.trim()) shotLines.push(locale === "zh" ? `备注：${sentence(shot.note.trim())}` : `NOTE: ${sentence(shot.note.trim())}`);
   return shotLines.join("\n");

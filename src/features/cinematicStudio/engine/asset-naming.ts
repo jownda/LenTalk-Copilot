@@ -53,5 +53,11 @@ export function assetCanonicalDescription(asset: Asset, locale: "zh" | "en"): st
   const current = locale === "zh"
     ? (asset.descriptionZh?.trim() || asset.description.trim())
     : (asset.description.trim() || asset.descriptionZh?.trim());
-  return [base, current].filter(Boolean).join(locale === "zh" ? "；" : "; ");
+  const description = [base, current].filter(Boolean).join(locale === "zh" ? "；" : "; ");
+  if (description) return description;
+  const kind = locale === "zh"
+    ? ({ character: "角色", location: "地点", prop: "道具", "style-reference": "风格参考", "audio-reference": "音频参考" }[asset.kind])
+    : asset.kind.replace("-", " ");
+  const name = asset.name.trim();
+  return name ? (locale === "zh" ? `${name}（${kind}）` : `${name} (${kind})`) : kind;
 }

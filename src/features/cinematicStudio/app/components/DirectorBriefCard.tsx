@@ -7,7 +7,7 @@
  * - 硬约束：长镜头 / 多镜头 + 时长 + 必须发生 / 禁止发生
  * - 对白 + 情绪走向（可选）
  * - 音频计划：复用 AudioPlanEditor
- * 底部保留「AI编译提示词 / 本地编译」按钮与 AI 错误展示。
+ * 底部保留「AI编译提示词 / 最终生成」按钮与 AI 错误展示。
  */
 import { useEffect, useState } from "react";
 import type { ActingObjective, ProjectV2, SceneStaging, SceneV2 } from "../../shared-types";
@@ -25,6 +25,7 @@ interface DirectorBriefCardProps {
   t: CopyZh;
   locale: Locale;
   compileBusy: boolean;
+  finalGenerateBusy: boolean;
   compileProgress: SceneCompileProgress;
   briefOptimizeBusy: boolean;
   aiCompileError: string;
@@ -51,7 +52,7 @@ const splitLines = (text: string): string[] => text.split(/\r?\n/).map((item) =>
 
 export default function DirectorBriefCard(props: DirectorBriefCardProps) {
   const {
-    project, scene, t, locale, compileBusy, compileProgress, briefOptimizeBusy, aiCompileError, aiCompileErrorDetail, aiErrorCopied,
+    project, scene, t, locale, compileBusy, finalGenerateBusy, compileProgress, briefOptimizeBusy, aiCompileError, aiCompileErrorDetail, aiErrorCopied,
     onSelectScene, onAddScene, onDeleteScene, onRenameScene, onUpdateScene,
     onUpdateStaging, onUpdateProject, onAiCompile, onAiOptimizeBrief, onLocalCompile, onCopyAiError,
     chatModels, selectedChatModel, onSelectChatModel,
@@ -125,7 +126,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
       </div>
       <label className="field-label">{t.priorContext}<textarea className="modal-textarea" value={staging.priorContext ?? ""} placeholder={t.priorContextPlaceholder} onChange={(event) => onUpdateStaging({ priorContext: event.target.value || undefined })} /></label>
 
-      <div className="field-label">{t.participants}
+      <div className="field-label">{t.sceneCharacterRoster}
         <div className="stage-row">
           {order.length === 0 ? <span className="stage-row-empty">{t.emptyOrderHint}</span> : order.map((id) => (
             <span className="stage-chip order-chip" key={id}>
@@ -150,6 +151,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
                 ))}
               </div>}
         </div>}
+        <p className="hint-text">{t.sceneCharacterRosterHint}</p>
       </div>
     </div>
 
@@ -225,7 +227,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
         t={t}
         characters={characterAssets}
         objectives={scene.actingObjectives ?? []}
-        boundIds={order}
+        boundIds={[...new Set(scene.shots.flatMap((shot) => shot.participants?.map((participant) => participant.characterId) ?? []))]}
         onChange={(actingObjectives) => onUpdateScene({ actingObjectives })}
       />
     </div>
@@ -255,8 +257,8 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
         </select>
         <ChevronDown size={13} />
       </label>
-      <button className="primary-button" disabled={compileBusy} onClick={onAiCompile}>{compileBusy ? <span className="spin-dot" /> : <Sparkles size={16} />} {compileBusy ? t.aiCompiling : t.aiCompilePrompt}</button>
-      <button className="primary-button" onClick={onLocalCompile}>{t.localCompile}</button>
+      <button className="primary-button" disabled={compileBusy || finalGenerateBusy} onClick={onAiCompile}>{compileBusy ? <span className="spin-dot" /> : <Sparkles size={16} />} {compileBusy ? t.aiCompiling : t.aiCompilePrompt}</button>
+      <button className="primary-button" disabled={compileBusy || finalGenerateBusy} onClick={onLocalCompile}>{finalGenerateBusy ? <span className="spin-dot" /> : <Sparkles size={16} />} {finalGenerateBusy ? t.finalGenerating : t.localCompile}</button>
       {compileBusy && <span className="compile-progress" role="status" aria-live="polite"><span className="compile-progress-dot" />{compileProgressText}<time>{busySeconds}s</time></span>}
       {aiCompileError && (
         <span className="ai-error-wrap">

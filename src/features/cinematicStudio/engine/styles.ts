@@ -101,6 +101,66 @@ export const MASTER_STYLES: MasterStyle[] = [
   }
 ];
 
+/**
+ * Final-prompt style language. These descriptions intentionally stay at the
+ * level of visual texture, color, composition, and atmosphere; shot optics,
+ * camera behavior, and lighting direction are compiled into their own layers.
+ */
+const FINAL_STYLE_DESCRIPTIONS: Record<string, { zh: string; en: string }> = {
+  "wong-kar-wai": {
+    zh: "潮湿都市夜色中的碎片化记忆质感；霓虹色与深暗部形成克制的冷暖冲撞；遮挡、切分和偶然失衡的构图让人物像被困在时间里；皮肤、烟雾与湿街反光保持真实，整体疏离却有呼吸。",
+    en: "Fragmented memory texture within a humid urban night; restrained warm-cool collision between neon color and deep shadow; occlusion, visual partitions, and deliberate imbalance make the character feel trapped in time; skin, smoke, and wet street reflections remain physically believable, distant yet still breathing.",
+  },
+  "roger-deakins": {
+    zh: "冷静、克制、纪实的画面质地；构图清楚而不炫技，暗部保留层次，高光收敛；烟尘、墙面与衣料呈现可信材质，色彩接近现场所见。",
+    en: "Calm, restrained documentary image texture; clear composition without showmanship, layered shadows, and controlled highlights; smoke, walls, and fabric remain materially believable, with colors close to what the location truly looks like.",
+  },
+  "wes-anderson": {
+    zh: "严格几何、平衡而居中的画面秩序；明快粉彩与整洁的平面化道具陈列形成复古色彩；场景带有微缩模型般的细密质感，人物反应保持具体、克制和干燥的俏皮节奏。",
+    en: "Strict geometric order with balanced centered composition; bright pastels and tidy planar prop arrangements create a retro palette; the scene has a finely organized miniature texture while reactions stay specific, restrained, and dryly playful.",
+  },
+  "stanley-kubrick": {
+    zh: "冷峻、理性、近乎仪式化的画面秩序；单点透视、对称结构与大面积留白制造不可逃离的压迫；材质边界清楚，人物动作被压缩成精确而不浪漫化的细节。",
+    en: "A cool, rational, almost ritualized visual order; one-point perspective, symmetrical structures, and generous negative space create inescapable pressure; material boundaries stay precise and character movement is reduced to exact, unsentimental details.",
+  },
+  "christopher-nolan": {
+    zh: "大尺度、坚实而肃穆的画面质感；人物与环境的比例承担叙事压力；冷蓝与琥珀形成克制对照，实拍颗粒、坚硬材质和严谨调度共同建立史诗般的可信重量。",
+    en: "Large-scale, solid, and solemn image texture; the proportion between characters and environment carries narrative pressure; restrained blue-and-amber contrast, practical grain, hard materials, and rigorous staging build credible epic weight.",
+  },
+  "andrei-tarkovsky": {
+    zh: "缓慢沉积的时间质感；潮湿表面、水雾、泥土和旧材料保留细微触感；低饱和大地色与梦境般但不脱离现实的意象并置，让沉思从空间细节中自然生长。",
+    en: "A slowly accumulating texture of time; wet surfaces, mist, earth, and aged materials retain tactile detail; low-saturation earth tones sit beside dreamlike but grounded imagery, allowing contemplation to grow naturally from spatial detail.",
+  },
+  "denis-villeneuve": {
+    zh: "极简、荒凉而具有纪念碑感的画面结构；土黄、灰蓝与厚重颗粒压低色彩情绪；人物暴露在巨大的留白和坚实环境中，形成肃穆、疏离且带有未知压力的视觉气候。",
+    en: "Minimal, desolate, and monumental visual structure; ochre, gray-blue tones, and heavy grain restrain the palette; characters are exposed within vast negative space and solid environments, creating a solemn, distant climate charged with unknown pressure.",
+  },
+  "bong-joon-ho": {
+    zh: "社会写实的可触质感与黑色幽默的干涩节奏并置；逼仄空间、雨水和都市材料形成现实压力；荒诞反应被拍得具体而克制，越日常越显得锋利。",
+    en: "Tactile social realism sits beside the dry rhythm of dark comedy; cramped space, rain, and urban materials create everyday pressure; absurd reactions remain specific and restrained, becoming sharper the more ordinary they feel.",
+  },
+  "ridley-scott": {
+    zh: "暗调工业画面中的厚重金属质感；烟尘、磨损表面、冷硬反光和巨大的空间尺度共同制造压迫；人物轮廓与环境细节清晰，整体具有肃杀而坚实的史诗重量。",
+    en: "Heavy metallic texture within a dark industrial image; smoke, worn surfaces, hard reflections, and monumental scale create pressure; character silhouettes and environmental detail remain clear, giving the frame severe, solid epic weight.",
+  },
+  "hayao-miyazaki": {
+    zh: "通透、手工绘制般的自然质感；植物、云层、风和天空保留柔软而连续的细节；低饱和暖色让世界温柔开阔，梦幻意象仍然拥有真实的情感重量。",
+    en: "A translucent, hand-painted natural texture; plants, clouds, wind, and sky retain soft continuous detail; low-saturation warmth makes the world gentle and open while dreamlike imagery keeps real emotional weight.",
+  },
+  "makoto-shinkai": {
+    zh: "清澈、精致而带有青春感伤的画面质地；天空、云层、雨滴和玻璃反光拥有高密度细节；通透的蓝色与明亮色彩形成辽阔和孤独并存的空间感。",
+    en: "Clear, finely detailed image texture with a wistful youthful charge; skies, clouds, rain, and glass reflections carry dense detail; luminous blues and bright color create a spatial feeling where openness and loneliness coexist.",
+  },
+  "david-fincher": {
+    zh: "冷调、低饱和且信息密度高的数字质感；干净的几何结构压缩情绪空间，暗部细节保持可读；表面克制、边缘精确，紧张感从距离和未说出口的判断中累积。",
+    en: "Cool, desaturated digital texture with high information density; clean geometric structures compress emotional space while shadow detail stays readable; surfaces remain restrained and edges precise, letting tension accumulate through distance and unspoken judgment.",
+  },
+  "emmanuel-lubezki": {
+    zh: "连续、呼吸式的画面能量；自然主义的流动调度让人物、环境和动作彼此牵引；暖肤色、通透高光与真实材质保持生命感，画面自由却不松散。",
+    en: "Continuous, breathing image energy; naturalistic fluid staging lets characters, environment, and action pull on one another; warm skin, translucent highlights, and believable materials keep the frame alive, free without becoming loose.",
+  },
+};
+
 export const getStyle = (id?: string): MasterStyle | undefined => MASTER_STYLES.find((style) => style.id === id);
 
 const FALLBACK_STYLE_BRIEF = {
@@ -112,6 +172,12 @@ const FALLBACK_STYLE_BRIEF = {
 export function styleBriefDescription(style: MasterStyle | undefined, locale: "zh" | "en"): string {
   if (!style) return FALLBACK_STYLE_BRIEF[locale];
   return locale === "zh" ? style.descriptionZh : style.description;
+}
+
+/** Final style language, separated from the planning brief and technical recipe. */
+export function finalStyleDescription(style: MasterStyle | undefined, locale: "zh" | "en"): string {
+  if (!style) return "";
+  return FINAL_STYLE_DESCRIPTIONS[style.id]?.[locale] ?? styleBriefDescription(style, locale);
 }
 
 /** 读取项目当前语言的风格短句；旧项目单字段只在语种匹配时兼容读取。 */

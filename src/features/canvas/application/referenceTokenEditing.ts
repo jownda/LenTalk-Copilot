@@ -44,6 +44,8 @@ export function findReferenceTokens(
       ? { kind: 'image' as const, prefixLength: 2, closesWithBracket: false }
       : text.startsWith('@音频', index)
         ? { kind: 'audio' as const, prefixLength: 3, closesWithBracket: false }
+        : text.startsWith('@audio', index)
+          ? { kind: 'audio' as const, prefixLength: 6, closesWithBracket: false }
         : text.startsWith('[image', index)
           ? { kind: 'image' as const, prefixLength: 6, closesWithBracket: true }
           : text.startsWith('[audio', index)
@@ -85,6 +87,23 @@ export function findReferenceTokens(
   }
 
   return tokens;
+}
+
+/** Remove or re-number audio references after a connected source is removed. */
+export function remapAudioReferenceTokens(text: string, oldSources: readonly string[], nextSources: readonly string[]): string {
+  return text
+    .replace(/@audio(\d+)|@音频(\d+)|\[audio(\d+)\]/g, (token, asciiIndex?: string, chineseIndex?: string, bracketIndex?: string) => {
+      const oldIndex = Number(asciiIndex || chineseIndex || bracketIndex);
+      const source = oldSources[oldIndex - 1];
+      if (!source) return token;
+      const nextIndex = nextSources.indexOf(source);
+      if (nextIndex < 0) return '';
+      const value = nextIndex + 1;
+      if (token.startsWith('[')) return `[audio${value}]`;
+      if (token.startsWith('@音频')) return `@音频${value}`;
+      return `@audio${value}`;
+    })
+    .replace(/[ \t]{2,}/g, ' ');
 }
 
 function findTokenRanges(

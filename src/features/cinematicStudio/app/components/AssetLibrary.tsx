@@ -8,11 +8,12 @@
 import { createPortal } from "react-dom";
 import { useState } from "react";
 import type { Asset, AssetActingProfile, AssetKind, LockLevel, ProjectV2, SceneV2 } from "../../shared-types";
-import { ImagePlus, Lock, LockKeyhole, Mic, Plus, Sparkles, Trash2, X } from "lucide-react";
+import { ImagePlus, Lock, LockKeyhole, Plus, Sparkles, Trash2, X } from "lucide-react";
 import type { ProjectAction } from "../store/projectReducer";
 import type { Locale } from "../i18n";
 import { classifyError, fillAssetDetails } from "../providers/ai";
 import { isRemoteConfigured } from "../providers/aiSettings";
+import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 
 const TABS: { kind: AssetKind; labelKey: "assetTabCharacter" | "assetTabLocation" | "assetTabProp" }[] = [
   { kind: "character", labelKey: "assetTabCharacter" },
@@ -58,6 +59,12 @@ interface AssetLibraryProps {
   locale: Locale;
   t: Copy;
   setNotice: (message: string) => void;
+  canvasAudioSources: CanvasAudioSource[];
+}
+
+export interface CanvasAudioSource {
+  source: string;
+  label: string;
 }
 
 function sceneUsesAsset(scene: SceneV2, assetId: string): boolean {
@@ -78,7 +85,7 @@ function projectUsageCount(project: ProjectV2, assetId: string): number {
   return project.scenes.filter((scene) => sceneUsesAsset(scene, assetId)).length;
 }
 
-export default function AssetLibrary({ project, scene, dispatch, locale, t, setNotice }: AssetLibraryProps) {
+export default function AssetLibrary({ project, scene, dispatch, locale, t, setNotice, canvasAudioSources }: AssetLibraryProps) {
   const [tab, setTab] = useState<AssetKind>("character");
   const [editingId, setEditingId] = useState<string | null>(null);
   const assets = (project.assets ?? []).filter((asset) => asset.kind === tab);
@@ -106,7 +113,7 @@ export default function AssetLibrary({ project, scene, dispatch, locale, t, setN
     {editing && typeof document !== "undefined" && (() => {
       const host = document.querySelector<HTMLElement>("[data-cinematic-studio]");
       return host ? createPortal(
-        <AssetEditor project={project} scene={scene} asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />,
+        <AssetEditor project={project} scene={scene} asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} canvasAudioSources={canvasAudioSources} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />,
         host,
       ) : null;
     })()}
@@ -138,12 +145,11 @@ function AssetTile({ asset, locale, t, activeInCurrentScene, projectUsageCount, 
   </div>;
 }
 
-function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, onCreateVariant, onClose }: { project: ProjectV2; scene: SceneV2; asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; onCreateVariant(id: string): void; onClose(): void }) {
+function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, canvasAudioSources, onCreateVariant, onClose }: { project: ProjectV2; scene: SceneV2; asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; canvasAudioSources: CanvasAudioSource[]; onCreateVariant(id: string): void; onClose(): void }) {
   const [imageBusy, setImageBusy] = useState(false);
   const [propImageBusy, setPropImageBusy] = useState(false);
   const [propPickerOpen, setPropPickerOpen] = useState(false);
   const [propPickerMode, setPropPickerMode] = useState<"choices" | "library" | "create">("choices");
-  const [voiceBusy, setVoiceBusy] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [variantComposerOpen, setVariantComposerOpen] = useState(false);
   const [variantStateName, setVariantStateName] = useState("");
@@ -206,18 +212,11 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, on
     } catch { setNotice(t.uploadFailed); } finally { setPropImageBusy(false); }
   };
 
-  /** 声音音色上传：音频文件 → dataURL（角色配音/音色参考） */
-  const uploadVoice = (file?: File) => {
-    if (!file) return;
-    setVoiceBusy(true);
-    const reader = new FileReader();
-    reader.onload = () => {
-      update({ voiceClip: String(reader.result) });
-      setVoiceBusy(false);
-      setNotice(t.voiceUploaded);
-    };
-    reader.onerror = () => { setVoiceBusy(false); setNotice(t.voiceUploadFailed); };
-    reader.readAsDataURL(file);
+  const replaceVoiceFromCanvas = (source: string) => {
+    const selected = canvasAudioSources.find((item) => item.source === source);
+    if (!selected) return;
+    update({ voiceClip: selected.source });
+    setNotice(t.voiceCanvasReplaced.replace("{name}", selected.label));
   };
 
   const isBaseCard = (asset.baseAssetId ?? asset.id) === asset.id;
@@ -251,9 +250,11 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, on
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const classified = classifyError(error);
-      const friendly = classified.kind === "timeout" || classified.kind === "network"
-        ? t.aiRequestInterrupted
-        : message;
+      const friendly = classified.kind === "gateway-timeout"
+        ? t.aiGatewayTimeout
+        : classified.kind === "timeout" || classified.kind === "network"
+          ? t.aiRequestInterrupted
+          : message;
       setNotice(`${t.aiFillFailed}${friendly}`);
     } finally {
       setAiBusy(false);
@@ -344,20 +345,21 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, on
             <label className="field-label">{t.propDefaultState}<input className="modal-input" value={locale === "zh" ? (asset.propDefaultStateZh ?? "") : (asset.propDefaultState ?? "")} placeholder={t.propDefaultStatePlaceholder} onChange={(event) => update(locale === "zh" ? { propDefaultStateZh: event.target.value } : { propDefaultState: event.target.value })} /></label>
             <span className="hint-text">{t.propDefaultsHint}</span>
           </div>}
-          {/* 角色声音参考：不参与最终提示词，只用于音色和配音参考 */}
+          {/* 角色声音参考会在最终提示词的活动引用中按 @audioN 输出。 */}
           {asset.kind === "character" && <div className="field-label">{t.voiceClip}
             {asset.voiceClip ? (
               <div className="voice-clip">
-                <audio controls src={asset.voiceClip} preload="none" />
+                <audio controls src={resolveImageDisplayUrl(asset.voiceClip)} preload="none" />
                 <button className="icon-button" title={t.deleteAsset} onClick={() => update({ voiceClip: undefined })}><X size={13} /></button>
               </div>
-            ) : (
-              <label className="voice-upload" title={t.voiceClip}>
-                {voiceBusy ? <span className="spin-dot" /> : <Mic size={15} />}
-                <span>{t.voiceUploadHint}</span>
-                <input className="hidden" type="file" accept="audio/*" onChange={(event) => void uploadVoice(event.target.files?.[0])} />
-              </label>
-            )}
+            ) : null}
+            {canvasAudioSources.length > 0 ? <div className="voice-canvas-picker">
+              <span>{t.voiceCanvasSource}</span>
+              <select value="" aria-label={t.voiceCanvasChoose} onChange={(event) => replaceVoiceFromCanvas(event.target.value)}>
+                <option value="">{t.voiceCanvasChoose}</option>
+                {canvasAudioSources.map((item) => <option key={item.source} value={item.source}>{item.label}</option>)}
+              </select>
+            </div> : <div className="voice-canvas-empty">{t.voiceCanvasEmpty}</div>}
           </div>}
           <div className="field-label">{t.stressTest}<div className="lock-options">
             {(["untested", "passed", "failed"] as const).map((status) => <button key={status} className={`lock-option ${asset.stressTestStatus === status ? "active" : ""}`} onClick={() => update({ stressTestStatus: status })}>{t[status === "untested" ? "stressUntested" : status === "passed" ? "stressPassed" : "stressFailed"]}</button>)}

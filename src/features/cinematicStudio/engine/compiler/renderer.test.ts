@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Asset, SceneV2, ShotV2 } from "../../shared-types";
 import { buildAssetReferenceTag, buildSceneAssetRegistry, renderAssetLine, resolveCharacterOrder } from "../../engine";
+import { renderShotSection } from "./sections";
 
 const asset: Asset = {
   id: "hero", kind: "character", name: "HERO", description: "A man in a navy suit.",
@@ -28,7 +29,19 @@ describe("renderAssetLine user notes isolation", () => {
       propPositionZh: "右手握持", propDefaultStateZh: "未点燃",
     };
     const output = renderAssetLine(prop, 2, "at-mention", "zh", (id) => id === "hero" ? "@hero" : id);
-    expect(output).toContain("道具默认：使用：仅用于点烟；持有者：@hero；位置：右手握持；状态：未点燃");
+    expect(output).toContain("由@hero持有，放在右手握持，用于仅用于点烟，保持未点燃状态");
+    expect(output).not.toContain("道具默认");
+  });
+
+  it("uses a readable name-and-kind fallback instead of repeating an internal prop id", () => {
+    const prop: Asset = {
+      id: "prop_internal_123", kind: "prop", name: "红色托特包", referenceTag: "prop_cully_tote_base_v1",
+      description: "", descriptionZh: "", referencePaths: [], lockLevel: "none", tags: [],
+    };
+    const output = renderAssetLine(prop, 1, "at-mention", "zh");
+    expect(output).toContain("@prop_cully_tote_base_v1 [image1] — 红色托特包：红色托特包（道具）");
+    expect(output).not.toContain("：prop_cully_tote_base_v1");
+    expect(output).not.toContain("prop_internal_123");
   });
 });
 
@@ -51,6 +64,33 @@ describe("asset reference naming", () => {
   });
 });
 
+describe("prop changes", () => {
+  it("renders one prop-change description and never exports legacy start/end states", () => {
+    const prop: Asset = {
+      id: "lighter", kind: "prop", name: "打火机", description: "", descriptionZh: "银色打火机",
+      referencePaths: [], lockLevel: "none", tags: [],
+    };
+    const scene: SceneV2 = {
+      id: "scene", name: "场景", logline: "", location: "", time: "", weather: "", duration: "5秒", palette: "", lighting: "", environmentLock: true,
+      shots: [],
+    };
+    const shot: ShotV2 = {
+      id: "shot", label: "01", duration: "0-5秒", framing: "Medium close-up", lens: "50mm", movement: "Static", action: "", acting: "", direction: "left-to-right",
+      propChangeDescription: "角色拿起打火机并点燃，始终握在右手。",
+      propStatesAtStart: [{ propId: "lighter", state: "intact" }],
+      propStatesAtEnd: [{ propId: "lighter", state: "burning" }],
+    };
+    const project = { id: "project", title: "测试", description: "", preset: "custom" as const, scenes: [scene], characters: [], assets: [prop] };
+
+    const output = renderShotSection(project, scene, shot, "zh");
+    expect(output).toContain("道具变化：角色拿起打火机并点燃，始终握在右手。");
+    expect(output).not.toContain("起始状态");
+    expect(output).not.toContain("结束状态");
+    expect(output).not.toContain("intact");
+    expect(output).not.toContain("burning");
+  });
+});
+
 describe("shot participant isolation", () => {
   it("镜头已有 participants 时，只用场景站位为其排序，不泄漏未出镜角色", () => {
     const scene = {
@@ -69,7 +109,7 @@ describe("shot participant isolation", () => {
 });
 
 describe("attached character props", () => {
-  it("includes character-linked props whenever the character is referenced", () => {
+  it("includes a character-linked prop when that character is active in a shot", () => {
     const hero = { ...asset, id: "hero", attachedPropIds: ["lighter"] };
     const lighter: Asset = {
       id: "lighter", kind: "prop", name: "打火机", description: "", descriptionZh: "银色打火机",

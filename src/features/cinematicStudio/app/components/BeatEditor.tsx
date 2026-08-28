@@ -7,8 +7,8 @@
  * 自动拆镜建议：镜头内焦段切换 ≥3 次时提示。
  */
 import { useState } from "react";
-import type { ActionBeat, ProjectV2, PropState, ShotV2 } from "../../shared-types";
-import { BEAT_VERBS, beatVerbZh, STATE_LABELS } from "../../engine";
+import type { ActionBeat, ProjectV2, ShotV2 } from "../../shared-types";
+import { BEAT_VERBS, beatVerbZh } from "../../engine";
 import { getAssistant } from "../providers/ai";
 import { ChevronDown, ChevronLeft, ChevronRight, Plus, Sparkles, X } from "lucide-react";
 import type { CopyZh } from "../i18n";
@@ -32,7 +32,7 @@ export default function BeatEditor({ project, shot, t, onUpdate }: BeatEditorPro
     onUpdate({ beats: beats.map((b) => b.id === id ? { ...b, ...patch } : b) });
   };
   const addBeat = () => {
-    const created: ActionBeat = { id: crypto.randomUUID(), order: beats.length + 1, verb: "pauses", duration: 2 };
+    const created: ActionBeat = { id: crypto.randomUUID(), order: beats.length + 1, actorId: participants[0], verb: "pauses", duration: 2 };
     onUpdate({ beats: [...beats, created] });
     setExpanded(created.id);
   };
@@ -65,8 +65,6 @@ export default function BeatEditor({ project, shot, t, onUpdate }: BeatEditorPro
       actionText: s.actionText,
       required: s.required,
       forbiddenTargets: s.forbiddenTargets,
-      stateBefore: s.stateBefore,
-      stateAfter: s.stateAfter,
       duration: 2,
     }));
     onUpdate({ beats: [...beats, ...created] });
@@ -79,10 +77,9 @@ export default function BeatEditor({ project, shot, t, onUpdate }: BeatEditorPro
     return prev.framing && prev.framing !== beat.framing ? count + 1 : count;
   }, 0);
 
-  const actorOptions = participants.length > 0 ? characterAssets.filter((a) => participants.includes(a.id)) : characterAssets;
+  const actorOptions = characterAssets.filter((asset) => participants.includes(asset.id));
 
   return <div className="beat-editor">
-    <datalist id="beat-state-options">{STATE_LABELS.map((label) => <option key={label.id} value={label.id}>{label.zh}</option>)}</datalist>
     {framingSwitches >= 3 && <div className="beat-advice"><Sparkles size={12} /> {t.beatSplitAdvice}</div>}
     <div className="beat-list">
       {beats.length === 0 && <span className="hint-text">{t.noDesc}</span>}
@@ -92,7 +89,7 @@ export default function BeatEditor({ project, shot, t, onUpdate }: BeatEditorPro
           <div className="beat-row-head">
             <span className="beat-order">{String(beat.order).padStart(2, "0")}</span>
             <span className="select-wrap small beat-actor">
-              <select value={beat.actorId ?? ""} onChange={(event) => updateBeat(beat.id, { actorId: event.target.value || undefined })}>
+              <select value={beat.actorId ?? ""} disabled={actorOptions.length === 0} onChange={(event) => updateBeat(beat.id, { actorId: event.target.value || undefined })}>
                 <option value="">{t.actor}: —</option>
                 {actorOptions.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
               </select><ChevronDown size={12} />
@@ -136,11 +133,6 @@ export default function BeatEditor({ project, shot, t, onUpdate }: BeatEditorPro
               <label className="field-label">{t.bodyPart}<input className="modal-input" value={beat.targetBodyPart ?? ""} placeholder={t.bodyPartPlaceholder} onChange={(event) => updateBeat(beat.id, { targetBodyPart: event.target.value || undefined })} /></label>
             </div>
 
-            <div className="beat-state-row">
-              <MiniStateList label={t.stateBefore} states={beat.stateBefore ?? []} assets={stateableAssets} onChange={(states) => updateBeat(beat.id, { stateBefore: states })} />
-              <MiniStateList label={t.stateAfter} states={beat.stateAfter ?? []} assets={stateableAssets} onChange={(states) => updateBeat(beat.id, { stateAfter: states })} />
-            </div>
-
             <label className="field-label">{t.dialogue}<input className="modal-input" value={beat.dialogue ?? ""} placeholder={t.dialogue} onChange={(event) => updateBeat(beat.id, { dialogue: event.target.value || undefined })} /></label>
 
             <div className="fields-grid two beat-p2">
@@ -174,29 +166,5 @@ export default function BeatEditor({ project, shot, t, onUpdate }: BeatEditorPro
     </div>
   </div>;
 }
-
-/** 迷你状态列表：资产 select + 状态 select（前置/后置共用） */
-function MiniStateList({ label, states, assets, onChange }: {
-  label: string; states: PropState[]; assets: { id: string; name: string }[];
-  onChange(states: PropState[]): void;
-}) {
-  const update = (index: number, patch: Partial<PropState>) => onChange(states.map((s, i) => i === index ? { ...s, ...patch } : s));
-  return <div className="mini-state-list">
-    <span className="state-block-title">{label}</span>
-    {states.map((state, index) => (
-      <div className="mini-state-row" key={index}>
-        <span className="select-wrap small">
-          <select value={state.propId} onChange={(event) => update(index, { propId: event.target.value })}>
-            {assets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
-          </select><ChevronDown size={12} />
-        </span>
-        <input className="mini-input" value={state.state} list="beat-state-options" placeholder={label} onChange={(event) => update(index, { state: event.target.value })} />
-        <button className="mini-del" onClick={() => onChange(states.filter((_, i) => i !== index))}><X size={11} /></button>
-      </div>
-    ))}
-    <button className="mini-add" onClick={() => onChange([...states, { propId: assets[0]?.id ?? "", state: "intact" }])}><Plus size={11} /></button>
-  </div>;
-}
-
 
 export { beatVerbZh };

@@ -212,6 +212,10 @@ export interface ShotParticipant {
   torsoFacing?: string;
   /** 标志物距离锚点（P1.5）：within 1 meter of the burned-out car */
   anchorDistance?: string;
+  /** 本镜头的表演改写：只写可见、可拍的身体/声线/节拍行为，不复制角色母版。 */
+  acting?: string;
+  /** 本镜头此角色的眼神生命：扫视、眨眼、瞳光、眼先于头部的反应。 */
+  eyeLife?: string;
 }
 
 /** 道具/角色/地点状态 */
@@ -376,6 +380,8 @@ export interface SceneV02 {
   shootingMode?: "long-take" | "multi-shot";
   /** 导演文档分层（P0.5）：AI 编译产出的各层完整文本（key → 含段头文本块） */
   directorLayers?: Record<string, string>;
+  /** 场景语境（V3-P0）：最终提示词第一段，只描述当前片段事实，不包含前情/备注 */
+  sceneContext?: string;
   /** 已锁定的导演文档层 key（P0.6）：再次 AI 编译不覆盖这些层 */
   lockedDirectorLayers?: string[];
   /** 首帧占位锁（P1.3）：首帧必须出现的角色/道具 + 占位文案 */
@@ -467,6 +473,8 @@ export interface ShotV02 {
   participants?: ShotParticipant[];
   /** 按时间排列的动作节拍 */
   beats?: ActionBeat[];
+  /** 镜头内道具变化的自然语言描述；不再拆分为起始/结束状态 */
+  propChangeDescription?: string;
   /** 镜头开始时道具状态 */
   propStatesAtStart?: PropState[];
   /** 镜头结束时道具状态（跨镜头状态链：下一镜头自动继承） */

@@ -1,6 +1,5 @@
 # 电影提示词引擎 V2 优化文档（LenTalk-Copilot 集成版）
 
-> 关联旧文档：`cinematic-prompt-studio/docs/CINEDANCE-ACTING-OPTIMIZATION.md`（旧仓库、旧路径）。
 > 本文件**重新立项**：以集成后的真实代码路径为准，重新记录现状，并把最近一次实测生成结果的走查问题收进 V2 优化清单。
 >
 > 代码根：`src/features/cinematicStudio/`

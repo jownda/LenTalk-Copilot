@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Asset, ProjectV2, SceneV2 } from "../../shared-types";
-import { compileDirectorSequence } from "./director";
+import { buildDirectorDocumentLayers, compileDirectorSequence, DIRECTOR_LAYERS } from "./director";
 import { compilePrompt } from "./models";
 
 function makeScene(overrides: Partial<SceneV2> = {}): SceneV2 {
@@ -45,6 +45,37 @@ function makeProject(scene: SceneV2): ProjectV2 {
 }
 
 describe("compileDirectorSequence final export audit", () => {
+  it("导演文档层不包含镜头执行，镜头执行仍从结构化镜头导出", () => {
+    const scene = makeScene();
+    const project = makeProject(scene);
+    const layers = buildDirectorDocumentLayers(project, scene, { locale: "zh" });
+
+    expect(DIRECTOR_LAYERS.map((layer) => layer.key)).not.toContain("actionTiming");
+    expect(layers).not.toHaveProperty("actionTiming");
+    expect(layers.sceneContext).toContain("测试场景");
+    expect(compileDirectorSequence(project, scene, { locale: "zh" })).toContain("镜头执行：");
+  });
+
+  it("将选中的导演风格写入导演文档，并位于光线之后、正向约束之前", () => {
+    const scene = makeScene();
+    const project = { ...makeProject(scene), styleId: "wong-kar-wai" };
+    const output = compileDirectorSequence(project, scene, { locale: "zh" });
+    const layers = buildDirectorDocumentLayers(project, scene, { locale: "zh" });
+
+    expect(output).toContain("风格：\n王家卫风格：");
+    expect(layers.style).toContain("王家卫风格：");
+    expect(output.indexOf("光线：")).toBeLessThan(output.indexOf("风格："));
+    expect(output.indexOf("风格：")).toBeLessThan(output.indexOf("正向约束："));
+  });
+
+  it("没有预设导演时仍输出用户填写的自定义风格", () => {
+    const scene = makeScene();
+    const project = { ...makeProject(scene), styleBriefZh: "低饱和的潮湿现实质感。" };
+    const output = compileDirectorSequence(project, scene, { locale: "zh" });
+
+    expect(output).toContain("风格：\n低饱和的潮湿现实质感。");
+  });
+
   it("不再原样透传 storedLayers，也不导出用户填写的场景简报", () => {
     const storedLayers = {
       sceneContext: "SCENE CONTEXT:\nStored scene text.",
@@ -55,7 +86,10 @@ describe("compileDirectorSequence final export audit", () => {
     const output = compileDirectorSequence(makeProject(scene), scene, { locale: "en" });
 
     expect(output).toContain("FORMAT MODE:");
-    expect(output).not.toContain("SCENE CONTEXT:");
+    expect(output).toContain("SCENE CONTEXT:");
+    const context = output.split("\n\n")[0];
+    expect(context).toContain("5 seconds");
+    expect(context).not.toMatch(/[\u3400-\u9fff]/);
     expect(output).not.toContain("Stored scene text.");
     expect(output).not.toContain("No watermark.");
     expect(output).not.toContain("STRUCTURED SHOT INSPECTOR:");
@@ -93,10 +127,14 @@ describe("compileDirectorSequence final export audit", () => {
       name: "林警官",
       description: "middle-aged man",
       descriptionZh: "中年男性",
-      referencePaths: [],
+      referencePaths: ["actor-image"],
+      voiceClip: "actor-voice",
       lockLevel: "none",
       tags: [],
-      actingProfile: { voicePromptZh: "低沉克制，压力下呼吸加重。" },
+      actingProfile: {
+        masterProfileZh: "重心压低，先用停顿判断对手，再用缓慢转头逼近。",
+        voicePromptZh: "低沉克制，压力下呼吸加重。",
+      },
     };
     const scene = makeScene({
       directorLayers: {
@@ -135,10 +173,29 @@ describe("compileDirectorSequence final export audit", () => {
     expect(output).toContain("音频：");
     expect(output).toContain("对白顺序：林警官说“我听见了。”");
     expect(output).toContain("每句对白结束后保留约 0.5–1 秒环境声尾巴");
-    expect(output).toContain("声音锁（林警官）：低沉克制，压力下呼吸加重。");
+    expect(output).toContain("表演模板：重心压低，先用停顿判断对手，再用缓慢转头逼近。");
+    expect(output).toContain("声音锁：低沉克制，压力下呼吸加重。");
+    expect(output).toContain("声音参考：@audio1");
+    expect(output).not.toContain("声音锁（林警官）");
     expect(output).not.toContain("镜头结构化检查器");
     expect(output).not.toContain("AI timing reference.");
     expect((output.match(/@林警官/g) ?? [])).toHaveLength(1);
+  });
+
+  it("身份锚不会重复完整描述中已有的服装或发型", () => {
+    const actor: Asset = {
+      id: "actor-1", kind: "character", name: "阿俊", description: "", descriptionZh: "阿俊穿黑色风衣，留短发，左眉有一道旧疤。",
+      referencePaths: [], lockLevel: "strict", tags: [], uniqueMarkers: ["黑色风衣", "短发", "左眉旧疤"], alwaysVisible: ["左眉旧疤"],
+    };
+    const scene = makeScene({ shots: [{ ...makeScene().shots[0], participants: [{ characterId: actor.id, role: "primary" }] }] });
+    const project = makeProject(scene);
+    project.assets = [actor];
+    const output = compileDirectorSequence(project, scene, { locale: "zh", syntax: "at-mention" });
+    const references = output.split("\n\n")[1];
+    expect(references).toContain("左眉有一道旧疤");
+    expect(references).not.toContain("身份锚：黑色风衣");
+    expect(references).not.toContain("身份锚：短发");
+    expect(references).not.toContain("身份锚：左眉旧疤");
   });
 
   it("error 级分层冲突时回退结构化编译，不透传错误 storedLayers", () => {
@@ -154,12 +211,70 @@ describe("compileDirectorSequence final export audit", () => {
     const output = compileDirectorSequence(makeProject(scene), scene, { locale: "en" });
 
     expect(output).toContain("FORMAT MODE");
-    expect(output).not.toContain("SCENE CONTEXT");
+    expect(output).toContain("SCENE CONTEXT:");
     expect(output).toContain("SHOT 1 0:00-0:05:");
     expect(output).toContain("SHOT 1: 47° Standard");
     expect(output).not.toContain("35mm");
     expect(output).not.toContain("AI generated scene.");
     expect(output).not.toContain("continuous action without shot blocks.");
+  });
+
+  it("场景上下文作为最终提示词第一段，且不泄漏前情或故事梗概", () => {
+    const scene = makeScene({
+      sceneContext: "阿俊坐在车厢中央，看向窗外。",
+      logline: "仅供 AI 规划的故事梗概。",
+      staging: { priorContext: "仅供 AI 规划的前情提要。" },
+    });
+    const output = compileDirectorSequence(makeProject(scene), scene, { locale: "zh" });
+
+    expect(output.startsWith("场景上下文：\n阿俊坐在车厢中央，看向窗外。")).toBe(true);
+    expect(output).not.toContain("仅供 AI 规划的");
+  });
+
+  it("没有 AI 场景上下文时使用确定性回退，仍输出为第一段", () => {
+    const scene = makeScene();
+    const output = compileDirectorSequence(makeProject(scene), scene, { locale: "zh" });
+
+    expect(output.startsWith("场景上下文：")).toBe(true);
+    expect(output).toContain("测试场景，5秒。");
+    expect(output).toContain("发生在地铁车厢，夜晚，晴。");
+    expect(output).toContain("角色保持坐姿。");
+  });
+
+  it("AI 场景上下文混入元信息时回退到结构化事实", () => {
+    const scene = makeScene({
+      sceneContext: "前情提要：上集林警官追查列车。本集阿俊看向窗外。",
+    });
+    const output = compileDirectorSequence(makeProject(scene), scene, { locale: "zh" });
+
+    expect(output.startsWith("场景上下文：")).toBe(true);
+    expect(output).not.toContain("前情提要");
+    expect(output).not.toContain("上集");
+  });
+
+  it("场景上下文回退只取首镜角色并限制为三句", () => {
+    const first = { id: "first", kind: "character" as const, name: "阿俊", description: "", descriptionZh: "", referencePaths: [], lockLevel: "none" as const, tags: [] };
+    const later = { id: "later", kind: "character" as const, name: "琪琪", description: "", descriptionZh: "", referencePaths: [], lockLevel: "none" as const, tags: [] };
+    const scene = makeScene({
+      name: "车厢",
+      shots: [{ ...makeScene().shots[0], participants: [{ characterId: "first", role: "primary" }] }],
+    });
+    const project = makeProject(scene);
+    project.assets = [first, later];
+    const output = compileDirectorSequence(project, scene, { locale: "zh" });
+    const context = output.split("\n\n")[0];
+    expect(context).toContain("阿俊");
+    expect(context).not.toContain("琪琪");
+    expect((context.match(/[。！？]/g) ?? []).length).toBeLessThanOrEqual(3);
+  });
+
+  it("英文界面拒绝中文 AI 语境并使用英文回退", () => {
+    const scene = makeScene({ sceneContext: "阿俊坐在车厢中央，看向窗外。" });
+    const output = compileDirectorSequence(makeProject(scene), scene, { locale: "en" });
+    const context = output.split("\n\n")[0];
+    expect(context).toContain("SCENE CONTEXT:");
+    expect(context).not.toMatch(/[\u3400-\u9fff]/);
+    expect(context).toContain("seconds");
   });
 
   it("多镜头在镜头执行中明确输出每个切点，并合并表演与动作", () => {
@@ -178,6 +293,38 @@ describe("compileDirectorSequence final export audit", () => {
     expect(output).toContain("镜头 2 0:02–0:05：动作匹配剪辑进入镜头 2；\n- 表演基调：克制。\n- 镜头动作：角色转身离开。");
     expect(output).not.toContain("角色表演：");
     expect(output).not.toContain("角色站位（从左到右）");
+  });
+
+  it("按镜头隔离活动人物引用，不把场景角色表复制到每一镜", () => {
+    const ajun: Asset = { id: "ajun", kind: "character", name: "阿俊", description: "", descriptionZh: "阿俊", referencePaths: [], lockLevel: "none", tags: [] };
+    const qiqi: Asset = { id: "qiqi", kind: "character", name: "琪琪", description: "", descriptionZh: "琪琪", referencePaths: [], lockLevel: "none", tags: [] };
+    const base = makeScene().shots[0];
+    const scene = makeScene({ shootingMode: "multi-shot", shots: [
+      { ...base, id: "shot-ajun", label: "阿俊特写", participants: [{ characterId: ajun.id, role: "primary" }] },
+      { ...base, id: "shot-qiqi", label: "琪琪反应", time: { startSeconds: 5, endSeconds: 8 }, participants: [{ characterId: qiqi.id, role: "primary" }] },
+    ] });
+    const project = makeProject(scene);
+    project.assets = [ajun, qiqi];
+    const references = compileDirectorSequence(project, scene, { locale: "zh", syntax: "at-mention" }).split("场景地图：")[0];
+    const firstShotReferences = references.split("镜头 2（琪琪反应）")[0];
+
+    expect(firstShotReferences).toContain("镜头 1（阿俊特写）");
+    expect(firstShotReferences).toContain("@阿俊");
+    expect(firstShotReferences).not.toContain("@琪琪");
+    expect(references).toContain("镜头 2（琪琪反应）");
+  });
+
+  it("将角色级镜头表演绑定到实际参与者", () => {
+    const actor: Asset = { id: "actor", kind: "character", name: "林警官", description: "", descriptionZh: "", referencePaths: [], lockLevel: "none", tags: [] };
+    const scene = makeScene({ shots: [{
+      ...makeScene().shots[0],
+      participants: [{ characterId: actor.id, role: "primary", acting: "手指停在烟灰缸边，压低呼吸", eyeLife: "视线先掠过车门，慢眨一次后回到对手" }],
+    }] });
+    const project = makeProject(scene);
+    project.assets = [actor];
+    const output = compileDirectorSequence(project, scene, { locale: "zh" });
+
+    expect(output).toContain("林警官：行为：手指停在烟灰缸边，压低呼吸；眼神：视线先掠过车门，慢眨一次后回到对手。");
   });
 
   it("镜头执行使用角色显示名，并明确目标，不泄漏内部资产标签", () => {

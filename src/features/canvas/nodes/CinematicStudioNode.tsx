@@ -5,9 +5,11 @@ import { Clapperboard, MousePointer2 } from 'lucide-react';
 
 import {
   CANVAS_NODE_TYPES,
+  isAudioNode,
   type CinematicStudioNodeData,
 } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
+import { graphImageResolver } from '@/features/canvas/application/canvasServices';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { useCanvasStore } from '@/stores/canvasStore';
@@ -25,6 +27,8 @@ const CINEMATIC_STUDIO_NODE_MIN_HEIGHT = 160;
 export const CinematicStudioNode = memo(({ id, data, selected, width, height }: CinematicStudioNodeProps) => {
   const updateNodeInternals = useUpdateNodeInternals();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
+  const nodes = useCanvasStore((state) => state.nodes);
+  const edges = useCanvasStore((state) => state.edges);
   const addEdge = useCanvasStore((state) => state.addEdge);
   const addNode = useCanvasStore((state) => state.addNode);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
@@ -42,6 +46,25 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     () => resolveNodeDisplayName(CANVAS_NODE_TYPES.cinematicStudio, data),
     [data]
   );
+
+  const canvasAudioSources = useMemo(() => {
+    const connectedSources = graphImageResolver.collectInputAudio(id, nodes, edges);
+    const labelBySource = new Map<string, string>();
+
+    for (const node of nodes) {
+      if (!isAudioNode(node) || node.data.mediaType === 'video' || !node.data.sourcePath) {
+        continue;
+      }
+      const source = node.data.sourcePath;
+      const nodeLabel = resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, node.data);
+      const fileName = source.split(/[\\/]/).pop()?.trim() ?? '';
+      labelBySource.set(source, nodeLabel !== '媒体' ? nodeLabel : fileName || '画布音频');
+    }
+
+    return connectedSources
+      .filter((source) => labelBySource.has(source))
+      .map((source) => ({ source, label: labelBySource.get(source) ?? '画布音频' }));
+  }, [edges, id, nodes]);
 
   useEffect(() => {
     updateNodeInternals(id);
@@ -163,7 +186,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
 
       {isOpen && typeof document !== 'undefined'
         ? createPortal(
-          <CinematicStudioWorkbench onClose={handleClose} onStateChange={handleStateChange} onSendToVideo={handleSendToVideo} />,
+          <CinematicStudioWorkbench onClose={handleClose} onStateChange={handleStateChange} onSendToVideo={handleSendToVideo} canvasAudioSources={canvasAudioSources} />,
           document.body
         )
         : null}

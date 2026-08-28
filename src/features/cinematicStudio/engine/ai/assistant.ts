@@ -55,6 +55,16 @@ export interface AIAssistant {
   generateStructuredScene(input: { logline: string; assets: { id: string; name: string; kind: AssetKind }[]; shotCount: number }): Promise<SceneSuggestion>;
   generateBeats(input: { logline: string; scene: SceneV2; participants: string[]; props: string[] }): Promise<BeatSuggestion[]>;
   repairContinuity(input: { issue: ContinuityIssueV2; project: ProjectV2; scene: SceneV2; shot?: ShotV2 }): Promise<FixSuggestion>;
+  /** 审核详情内的一键修复：生成可预览、用户确认后再写入的短文本（表演/首帧/声音锁/重分镜意图）。 */
+  generateAuditRepairText(input: {
+    code: string;
+    locale: "zh" | "en";
+    generateFor: "acting" | "first-frame" | "voice" | "beats" | "replan";
+    scene: SceneV2;
+    shot?: ShotV2;
+    characterName?: string;
+    issueSummary: string;
+  }): Promise<{ text: string }>;
 }
 
 const USE_FOR_BY_KIND: Record<AssetKind, string[]> = {
@@ -144,6 +154,47 @@ export class LocalSuggestionProvider implements AIAssistant {
       label: issue.label,
       detail: `Review this ${issue.severity}-level issue in ${shot?.label ?? input.scene.name}.`,
       apply: "Manually resolve the conflicting fields before export.",
+    };
+  }
+
+  async generateAuditRepairText(input: { code: string; locale: "zh" | "en"; generateFor: "acting" | "first-frame" | "voice" | "beats" | "replan"; scene: SceneV2; shot?: ShotV2; characterName?: string; issueSummary: string }): Promise<{ text: string }> {
+    const shotLabel = input.shot?.label ?? input.scene.name;
+    const participantNames = input.scene.shots?.find((item) => item.id === input.shot?.id)?.participants?.length
+      ? `${input.scene.shots.find((item) => item.id === input.shot?.id)!.participants!.length} 位参与角色`
+      : "场景内的参与角色";
+    if (input.generateFor === "acting") {
+      return {
+        text: input.locale === "zh"
+          ? `深吸一口气，目光先在远处落定两拍，再向下扫向双手：指尖微微收紧，肩膀随呼吸下沉，最后抬眼看向对手，完成一个可见的眼神转折。`
+          : `${shotLabel}: inhale; the gaze lands on the distance for two beats, drops to the hands as the fingers tighten, the shoulders settle with the breath, then the eyes lift to the partner — one visible turning point.`,
+      };
+    }
+    if (input.generateFor === "first-frame") {
+      return {
+        text: input.locale === "zh"
+          ? `首帧锁定：${participantNames}占据画面主体位置，先完成视线建立，再开始摄影机运动；首帧不得出现未引用的资产。`
+          : `First-frame lock: the scene's participants occupy the visual center, establish eyeline, then the camera moves; no unreferenced asset appears on the first frame.`,
+      };
+    }
+    if (input.generateFor === "voice") {
+      const name = input.characterName ?? "该角色";
+      return {
+        text: input.locale === "zh"
+          ? `${name}：低沉、克制、略带磁性的男中音；句尾干净利落，重音放在关键词上，紧张时音量微降、语速不变。`
+          : `${name}: low, restrained baritone; clean line endings, emphasis on key words, volume drops slightly under pressure without changing pace.`,
+      };
+    }
+    if (input.generateFor === "replan") {
+      return {
+        text: input.locale === "zh"
+          ? "重新分镜：按剧情节奏压缩为更少的镜头，总时长不超过场景上限；慢节奏场景减少镜头数量，快节奏场景保留推进感。"
+          : "Re-plan: fewer shots when the pacing is slow and more momentum when it is fast; the total must stay within the scene limit.",
+      };
+    }
+    return {
+      text: input.locale === "zh"
+        ? `节拍：${shotLabel} 中，角色先完成一次可见的停顿与呼吸，再继续动作。`
+        : `Beat: in ${shotLabel}, the character holds a visible pause with breath before the next action.`,
     };
   }
 }

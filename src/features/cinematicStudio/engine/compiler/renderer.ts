@@ -42,13 +42,21 @@ export function renderPropDefaults(asset: Asset, locale: PromptLocale = "zh", ho
   const state = (zh ? asset.propDefaultStateZh : asset.propDefaultState)?.trim();
   const holderId = asset.propHolderCharacterId;
   const holder = holderId ? (holderName?.(holderId) || holderId) : "";
+  if (!usage && !holder && !position && !state) return "";
+  if (zh) {
+    const parts: string[] = [];
+    if (holder) parts.push(`由${holder}持有`);
+    if (position) parts.push(`放在${position}`);
+    if (usage) parts.push(`用于${usage}`);
+    if (state) parts.push(`保持${state}状态`);
+    return parts.join("，");
+  }
   const parts: string[] = [];
-  if (usage) parts.push(zh ? `使用：${usage}` : `use: ${usage}`);
-  if (holder) parts.push(zh ? `持有者：${holder}` : `holder: ${holder}`);
-  if (position) parts.push(zh ? `位置：${position}` : `position: ${position}`);
-  if (state) parts.push(zh ? `状态：${state}` : `state: ${state}`);
-  if (parts.length === 0) return "";
-  return zh ? `道具默认：${parts.join("；")}` : `Prop default: ${parts.join("; ")}`;
+  if (holder) parts.push(`held by ${holder}`);
+  if (position) parts.push(`kept at ${position}`);
+  if (usage) parts.push(`used only for ${usage}`);
+  if (state) parts.push(`kept ${state}`);
+  return parts.join(", ");
 }
 
 /** 图片引用语法（P2.1 模型 Profile 决定） */
@@ -58,14 +66,15 @@ export type ReferenceSyntax = "asset-id" | "at-mention" | "plain-text";
 export function renderAssetLine(asset: Asset, imageIndex: number | undefined, syntax: ReferenceSyntax = "asset-id", locale: PromptLocale = "zh", holderName?: (id: string) => string, audioIndex?: number): string {
   const lex = promptLexicon(locale);
   const desc = assetCanonicalDescription(asset, locale) || asset.name.trim();
-  const namePart = asset.referenceTag?.trim() || asset.name.trim() || desc;
+  const referenceName = asset.referenceTag?.trim() || asset.name.trim() || asset.id;
+  const displayName = asset.name.trim() || desc;
   const n = imageIndex ? String(imageIndex) : "";
-  const headTemplate = syntax === "at-mention"
-    ? fillTemplate(lex.templates.assetHeadAtMention, { name: namePart, n, desc })
+  const image = imageIndex ? ` [image${n}]` : "";
+  const head = syntax === "at-mention"
+    ? `@${referenceName}${image} — ${displayName}${locale === "zh" ? "：" : ": "}${desc}`
     : syntax === "plain-text"
-      ? fillTemplate(lex.templates.assetHeadPlain, { name: namePart, n, desc })
-      : fillTemplate(lex.templates.assetHead, { id: asset.id, name: namePart, n, desc });
-  const head = imageIndex ? headTemplate : headTemplate.replace(/\s*\[image\]/, "");
+      ? `${image.trim()} — ${displayName}${locale === "zh" ? "：" : ": "}${desc}`
+      : `<<<${asset.id}>>>${image} — ${displayName}${locale === "zh" ? "：" : ": "}${desc}`;
   const parts: string[] = [head];
   const useFor = renderUseFor(asset, locale);
   if (useFor) parts.push(useFor.trim());
@@ -78,7 +87,7 @@ export function renderAssetLine(asset: Asset, imageIndex: number | undefined, sy
   if (always.length > 0) parts.push(`${lex.labels.alwaysVisible}: ${always.join(locale === "zh" ? "；" : "; ")}.`);
   const propDefaults = renderPropDefaults(asset, locale, holderName);
   if (propDefaults) parts.push(propDefaults);
-  if (audioIndex && asset.voiceClip?.trim()) parts.push(locale === "zh" ? `声音参考：[audio${audioIndex}]。` : `Voice reference: [audio${audioIndex}].`);
+  if (audioIndex && asset.voiceClip?.trim()) parts.push(locale === "zh" ? `声音参考：@audio${audioIndex}。` : `Voice reference: @audio${audioIndex}.`);
   return parts.join(" ");
 }
 
@@ -104,12 +113,17 @@ export function buildAssetRegistry(project: ProjectV2, scene: SceneV2, shot: Sho
     const asset = byId.get(id);
     if (!asset) return;
     visited.push(id);
-    if (asset.kind === "character") for (const propId of asset.attachedPropIds ?? []) visit(propId);
+    // Character-bound props are visible with that active character in this shot.
+    if (asset.kind === "character") {
+      for (const propId of asset.attachedPropIds ?? []) visit(propId);
+    }
   };
   visit(scene.staging?.locationAssetId);
   for (const participant of shot.participants ?? []) visit(participant.characterId);
   visit(shot.characterId);
-  for (const state of shot.propStatesAtStart ?? []) visit(state.propId);
+  // Legacy project data may still identify a visible prop through state fields.
+  // Keep that asset in the registry, but do not render the state chain.
+  for (const state of [...(shot.propStatesAtStart ?? []), ...(shot.propStatesAtEnd ?? [])]) visit(state.propId);
   for (const beat of shot.beats ?? []) {
     visit(beat.actorId);
     visit(beat.targetCharacterId);
@@ -147,14 +161,15 @@ export function buildSceneAssetRegistry(
     const asset = byId.get(id);
     if (!asset) return;
     visited.push(id);
-    if (asset.kind === "character") for (const propId of asset.attachedPropIds ?? []) visit(propId);
+    if (asset.kind === "character") {
+      for (const propId of asset.attachedPropIds ?? []) visit(propId);
+    }
   };
   visit(scene.staging?.locationAssetId);
   for (const shot of scene.shots) {
     for (const participant of shot.participants ?? []) visit(participant.characterId);
     visit(shot.characterId);
-    for (const state of shot.propStatesAtStart ?? []) visit(state.propId);
-    for (const state of shot.propStatesAtEnd ?? []) visit(state.propId);
+    for (const state of [...(shot.propStatesAtStart ?? []), ...(shot.propStatesAtEnd ?? [])]) visit(state.propId);
     for (const beat of shot.beats ?? []) {
       visit(beat.actorId);
       visit(beat.targetCharacterId);
@@ -353,9 +368,11 @@ export function assetRefName(project: ProjectV2, syntax: ReferenceSyntax = "asse
 export function resolveCharacterOrder(scene: SceneV2, shot: ShotV2): string[] {
   const participants = (shot.participants ?? []).map((participant) => participant.characterId);
   const participantSet = new Set(participants);
-  const restrictToParticipants = (order: string[]) => participants.length > 0
-    ? order.filter((id) => participantSet.has(id))
-    : order;
+  const restrictToParticipants = (order: string[]) => {
+    if (participants.length === 0) return order;
+    const ordered = order.filter((id) => participantSet.has(id));
+    return [...ordered, ...participants.filter((id) => !ordered.includes(id))];
+  };
   if (shot.layout?.characterOrder && shot.layout.characterOrder.length > 0) {
     return restrictToParticipants(shot.layout.characterOrder);
   }
@@ -366,14 +383,8 @@ export function resolveCharacterOrder(scene: SceneV2, shot: ShotV2): string[] {
 
 /** 镜头内各角色持有的道具（仅起始状态，P2.2：结束状态不回灌站位文本） */
 export function heldPropsByCharacter(shot: ShotV2): Map<string, { propId: string; state?: string; position?: string }[]> {
-  const map = new Map<string, { propId: string; state?: string; position?: string }[]>();
-  for (const state of shot.propStatesAtStart ?? []) {
-    if (!state.holderCharacterId) continue;
-    const props = map.get(state.holderCharacterId) ?? [];
-    props.push({ propId: state.propId, state: state.state, position: state.position });
-    map.set(state.holderCharacterId, props);
-  }
-  return map;
+  void shot;
+  return new Map();
 }
 
 /** Participants 行：按有效站位顺序输出角色名（P0.2 双语；P2.1 语法） */

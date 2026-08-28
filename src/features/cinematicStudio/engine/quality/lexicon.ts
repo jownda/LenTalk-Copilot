@@ -10,7 +10,8 @@
  */
 export const DIRECTOR_LAYER_KEYS: readonly string[] = [
   "sceneContext", "activeReferences", "locationMap", "firstFrame", "formatMode",
-  "optics", "camera", "actionTiming", "physics", "lighting", "audio",
+  "optics", "camera", "physics", "lighting", "audio",
+  "style",
   "positiveConstraints", "negativeLocks",
 ];
 
@@ -85,5 +86,5 @@ export const EN_IDENT_WORDS = [
 export const LAYER_ZH_LABELS: Record<string, string> = {
   sceneContext: "场景上下文", activeReferences: "活动引用", locationMap: "位置图", firstFrame: "首帧",
   formatMode: "格式模式", optics: "光学", camera: "相机", actionTiming: "动作时序", physics: "物理",
-  lighting: "光线", audio: "音频", positiveConstraints: "正向约束", negativeLocks: "全局失败锁",
+  lighting: "光线", audio: "音频", style: "风格", positiveConstraints: "正向约束", negativeLocks: "全局失败锁",
 };

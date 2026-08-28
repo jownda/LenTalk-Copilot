@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { MASTER_STYLES, getStyle, localizedStyleBrief, styleBriefDescription } from "./styles";
+import { finalStyleDescription, MASTER_STYLES, getStyle, localizedStyleBrief, styleBriefDescription } from "./styles";
 
 describe("localized style briefs", () => {
   it("provides a substantial description for every master style", () => {
@@ -24,5 +24,14 @@ describe("localized style briefs", () => {
     expect(localizedStyleBrief({ styleBrief: "旧文本", styleBriefZh: "中文风格段落" }, "zh")).toBe("中文风格段落");
     expect(localizedStyleBrief({ styleBrief: "Legacy text", styleBriefEn: "English style paragraph" }, "en")).toBe("English style paragraph");
     expect(getStyle("emmanuel-lubezki")?.descriptionZh).toContain("摄影机贴近人物");
+  });
+
+  it("为预设导演提供独立的最终画面风格描述", () => {
+    const style = getStyle("wong-kar-wai");
+    const description = finalStyleDescription(style, "zh");
+
+    expect(description).toContain("潮湿都市夜色");
+    expect(description).not.toContain("镜头");
+    expect(description).not.toContain("光线锁");
   });
 });

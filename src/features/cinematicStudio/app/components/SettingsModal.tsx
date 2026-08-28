@@ -58,6 +58,7 @@ export default function SettingsModal({ t, onClose, onSaved }: SettingsModalProp
       ? { ok: true, text: t.testOk.replace("{model}", result.model ?? draft.model) }
       : { ok: false, text: t.testFailed.replace("{error}",
           result.errorKind === "network" ? t.networkErrorHint
+            : result.errorKind === "gateway-timeout" ? t.aiGatewayTimeout
             : result.errorKind === "timeout" ? t.aiRequestInterrupted
             : (result.error ?? "unknown")) });
   };

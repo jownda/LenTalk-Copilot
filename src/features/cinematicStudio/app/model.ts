@@ -1,9 +1,7 @@
 import type { Asset, Project, ProjectV2 } from "../shared-types";
-import { DEFAULT_NEGATIVE, deriveProjectCode, fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, withAssetReferenceTag, withNegativePrefix, bakeryRescueProject, museumRedDoorsProject } from "../engine";
+import { DEFAULT_NEGATIVE, deriveProjectCode, fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, withAssetReferenceTag, withNegativePrefix } from "../engine";
 
 export const SCHEMA_VERSION = 3;
-
-export const rainPreview = "./assets/rain-night-reference.jpg";
 
 export const seedProject: ProjectV2 = {
   id: "cinematic-project", title: "未命名影片", description: "", preset: "custom", styleId: undefined,
@@ -17,25 +15,6 @@ export const seedProject: ProjectV2 = {
     ]
   }]
 };
-
-/** Only replace the untouched bundled demo; never reset a user-customized project. */
-function isUntouchedLegacySeed(project: ProjectV2): boolean {
-  const scene = project.scenes?.[0];
-  const shots = scene?.shots ?? [];
-  return project.id === "rain-night"
-    && (project.title === "雨夜" || project.title === "Rain Night")
-    && project.description === "一个男人穿过暴雨中的城市，把所有情绪压在心底。"
-    && project.scenes?.length === 1
-    && scene?.id === "scene-01"
-    && scene.name === "雨夜"
-    && scene.logline === "一个男人独自穿过被暴雨冲刷的市中心街道。他压抑悲伤，却没有流泪。"
-    && scene.location === "密集的城市街道"
-    && scene.time === "夜晚"
-    && scene.weather === "暴雨"
-    && shots.length === 2
-    && shots[0]?.action === "关杰穿过雨幕，大衣被雨水打湿后显得沉重。"
-    && shots[1]?.action === "他在闪烁的雨棚下驻足，随后继续前行。";
-}
 
 /**
  * V0.1 → V0.2 项目迁移：
@@ -134,10 +113,7 @@ export function migrateProject(raw: unknown): ProjectV2 {
 export function loadProject(): ProjectV2 {
   try {
     const stored = JSON.parse(localStorage.getItem("cineprompt-project") || "") as ProjectV2;
-    // Refresh the old bundled demonstration project in all legacy language variants.
-    // User-created projects retain their data, even if they use similar wording.
-    const base = isUntouchedLegacySeed(stored) ? seedProject : stored;
-    const migrated = migrateProject(base);
+    const migrated = migrateProject(stored);
     return {
       ...migrated,
       styleId: migrated.styleId ?? "wong-kar-wai",
@@ -155,5 +131,3 @@ export function persistProject(project: ProjectV2) {
     console.warn("persistProject failed", error);
   }
 }
-
-export { museumRedDoorsProject, bakeryRescueProject };

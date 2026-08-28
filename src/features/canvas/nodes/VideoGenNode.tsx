@@ -33,6 +33,7 @@ import { prepareNodeImageFromFile, resolveImageDisplayUrl } from '@/features/can
 import {
   findReferenceTokens,
   insertReferenceToken,
+  remapAudioReferenceTokens,
   removeOutOfRangeReferenceTokens,
   removeTextRange,
   resolveReferenceAwareDeleteRange,
@@ -395,6 +396,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     () => mergeMediaReferenceSources(directReferenceAudio, inputAudio),
     [directReferenceAudio, inputAudio]
   );
+  // 即梦 CLI 只接受通过画布连接进来的本地音频节点；工作室快照仅供
+  // 其他支持直接音频附件的模型使用。
+  const usableInputAudio = isJimengCli ? inputAudio : resolvedInputAudio;
   // 文本引用预览现在按行渲染(每行一个上游文本), 不再需要合并字符串
   // 首尾帧与上游参考图是两种互斥输入方式。首尾帧只使用节点内上传的两张图。
   const referenceInputImages = imageMode === 'reference' ? resolvedInputImages : [];
@@ -464,15 +468,25 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         label: item.label,
         source: item.imageUrl,
       })),
-      ...resolvedInputAudio.map((source, index) => ({
+      ...usableInputAudio.map((source, index) => ({
         kind: 'audio' as const,
         index,
         label: resolveAudioLabel(source, index),
         source,
       })),
     ],
-    [inputImageItems, resolveAudioLabel, resolvedInputAudio]
+    [inputImageItems, resolveAudioLabel, usableInputAudio]
   );
+  const removeStudioAudio = useCallback((source: string) => {
+    const nextDirectAudio = directReferenceAudio.filter((item) => item !== source);
+    const nextUsableAudio = isJimengCli
+      ? inputAudio
+      : mergeMediaReferenceSources(nextDirectAudio, inputAudio);
+    const nextPrompt = remapAudioReferenceTokens(promptDraftRef.current, usableInputAudio, nextUsableAudio);
+    promptDraftRef.current = nextPrompt;
+    setPromptDraft(nextPrompt);
+    updateNodeData(id, { studioReferenceAudio: nextDirectAudio, prompt: nextPrompt });
+  }, [directReferenceAudio, id, inputAudio, isJimengCli, usableInputAudio, updateNodeData]);
   const title = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.videoGen, data), [data]);
   const resolvedWidth = Math.max(VIDEO_GEN_NODE_MIN_WIDTH, Math.round(width ?? VIDEO_GEN_NODE_DEFAULT_WIDTH));
   const resolvedHeight = Math.max(VIDEO_GEN_NODE_MIN_HEIGHT, Math.round(height ?? VIDEO_GEN_NODE_DEFAULT_HEIGHT));
@@ -507,14 +521,14 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     const cleanedPrompt = removeOutOfRangeReferenceTokens(
       promptDraftRef.current,
       referenceInputImages.length,
-      resolvedInputAudio.length
+      usableInputAudio.length
     );
     if (cleanedPrompt !== promptDraftRef.current) {
       promptDraftRef.current = cleanedPrompt;
       setPromptDraft(cleanedPrompt);
       updateNodeData(id, { prompt: cleanedPrompt });
     }
-  }, [id, imageMode, referenceInputImages.length, resolvedInputAudio.length, updateNodeData]);
+  }, [id, imageMode, referenceInputImages.length, usableInputAudio.length, updateNodeData]);
 
   useEffect(() => {
     if (referencePickerItems.length === 0) {
@@ -636,7 +650,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         selectionEnd,
         deletionDirection,
         referenceInputImages.length,
-        resolvedInputAudio.length
+        usableInputAudio.length
       );
       if (deleteRange) {
         event.preventDefault();
@@ -689,7 +703,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       setPickerActiveIndex(0);
       setShowImagePicker(true);
     }
-  }, [id, insertReference, pickerActiveIndex, referenceInputImages.length, referencePickerItems, resolvedInputAudio.length, showImagePicker, updateNodeData]);
+  }, [id, insertReference, pickerActiveIndex, referenceInputImages.length, referencePickerItems, showImagePicker, usableInputAudio.length, updateNodeData]);
 
   const handleFrameFileChange = useCallback(async (
     slot: FrameSlot,
@@ -899,7 +913,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                 referenceInputImages.length,
                 resolvedInputAudio.length,
                 inputImageDisplayUrls,
-                resolvedInputAudio,
+                usableInputAudio,
                 resolveAudioLabel,
                 (displayUrl, event) => {
                   setPreviewState({ url: displayUrl, x: event.clientX, y: event.clientY });
@@ -982,10 +996,31 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           </div>
         )}
       </div>
-      {resolvedInputAudio.length > 0 && (
+      {directReferenceAudio.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1 text-[11px] text-text-muted">
+          <AudioLines className="h-3.5 w-3.5 text-accent" />
+          <span>{isJimengCli ? '工作室音频（即梦不使用）' : '工作室音频'}</span>
+          {directReferenceAudio.map((source, index) => (
+            <button
+              key={`${source}-${index}`}
+              type="button"
+              className="nodrag inline-flex max-w-[150px] items-center gap-1 rounded border border-border-dark px-1.5 py-0.5 text-[10px] text-text-dark hover:border-accent"
+              title="移除这段工作室音频引用"
+              onClick={(event) => {
+                event.stopPropagation();
+                removeStudioAudio(source);
+              }}
+            >
+              <span className="truncate">{resolveAudioLabel(source, index)}</span>
+              <Trash2 className="h-3 w-3 shrink-0" />
+            </button>
+          ))}
+        </div>
+      )}
+      {usableInputAudio.length > 0 && (
         <div className="flex items-center gap-1 text-[11px] text-text-muted">
           <AudioLines className="h-3.5 w-3.5 text-accent" />
-          <span>已引用 {resolvedInputAudio.length} 段音频</span>
+          <span>已连接 {usableInputAudio.length} 段音频</span>
         </div>
       )}
       <div className="flex items-center gap-1" role="group" aria-label={t('node.videoGen.imageMode')}>

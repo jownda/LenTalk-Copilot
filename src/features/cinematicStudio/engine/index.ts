@@ -17,7 +17,6 @@ export * from "./ai/assistant";
 export * from "./compiler";
 export * from "./continuity";
 export * from "./quality";
-export * from "./golden";
 export * from "./asset-naming";
 export interface ContinuityIssue { status: "ok" | "warning"; label: string; detail: string; }
 

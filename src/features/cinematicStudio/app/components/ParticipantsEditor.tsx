@@ -45,6 +45,12 @@ export default function ParticipantsEditor({ project, scene, shot, t, onUpdate }
     onUpdate({
       participants: participants.filter((p) => p.characterId !== characterId),
       layout: { ...layout, characterOrder: order.filter((id) => id !== characterId) },
+      beats: (shot.beats ?? []).map((beat) => ({
+        ...beat,
+        ...(beat.actorId === characterId ? { actorId: undefined, dialogue: undefined } : {}),
+        ...(beat.targetCharacterId === characterId ? { targetCharacterId: undefined } : {}),
+        forbiddenTargets: (beat.forbiddenTargets ?? []).filter((id) => id !== characterId),
+      })),
     });
     if (expanded === characterId) setExpanded(null);
   };
@@ -106,6 +112,10 @@ export default function ParticipantsEditor({ project, scene, shot, t, onUpdate }
           <LabeledMini label={t.facing} value={participant.facing ?? ""} options={[["", t.none], ...FACING_KEYS.map(([v, k]) => [v, t[k]] as [string, string])]} onChange={(value) => updateParticipant(expanded, { facing: value || undefined })} />
         </div>
         <label className="field-label">{t.eyeline}<input className="modal-input" value={participant.eyeline ?? ""} placeholder={t.none} onChange={(event) => updateParticipant(expanded, { eyeline: event.target.value || undefined })} /></label>
+        <div className="fields-grid two">
+          <label className="field-label">{t.characterShotActing}<textarea className="modal-textarea" value={participant.acting ?? ""} placeholder={t.characterShotActingPlaceholder} onChange={(event) => updateParticipant(expanded, { acting: event.target.value || undefined })} /></label>
+          <label className="field-label">{t.characterShotEyeLife}<textarea className="modal-textarea" value={participant.eyeLife ?? ""} placeholder={t.shotEyeLifePlaceholder} onChange={(event) => updateParticipant(expanded, { eyeLife: event.target.value || undefined })} /></label>
+        </div>
       </div>;
     })()}
 

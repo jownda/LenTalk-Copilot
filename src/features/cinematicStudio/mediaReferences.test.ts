@@ -4,7 +4,7 @@ import type { ProjectV2, SceneV2 } from "./shared-types";
 import { collectCinematicMediaReferences } from "./mediaReferences";
 
 describe("collectCinematicMediaReferences", () => {
-  it("keeps active asset images and voice clips in compiler reference order", () => {
+  it("keeps only explicitly active asset images and voice clips in compiler reference order", () => {
     const scene = {
       id: "scene", name: "测试", logline: "", location: "车厢", time: "夜", weather: "雨", duration: "8秒",
       palette: "", lighting: "", environmentLock: true,

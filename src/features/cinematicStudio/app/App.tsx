@@ -2,13 +2,14 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, auditFinalPromptWithProject, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers, type FinalPromptAuditIssue } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, FinalAuditLogEntry, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
 import { ArrowLeft, AudioLines, ChevronDown, Copy, Download, FileJson, FileText, FolderOpen, PenLine, Plus, Save, Send, X } from "lucide-react";
-import { classifyError, fillSceneDraft, getAssistant, optimizeSceneBrief, type SceneCompileProgress } from "./providers/ai";
+import { buildFinalGenerationSource, classifyError, fillSceneDraft, generateFinalPrompt, getAssistant, optimizeSceneBrief, type SceneCompileProgress } from "./providers/ai";
 import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type AISettings } from "./providers/aiSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { loadProjectFromDisk, recordVersionToSqlite, savePromptToDisk, saveProjectToDisk } from "./providers/projectStorage";
 import { loadProject, migrateProject, persistProject } from "./model";
 import { cameraLabels, copy, framingLabels, type CopyZh, type Locale } from "./i18n";
 import AssetLibrary from "./components/AssetLibrary";
+import type { CanvasAudioSource } from "./components/AssetLibrary";
 import BeatEditor from "./components/BeatEditor";
 import ContinuityPanel from "./components/ContinuityPanel";
 import DirectorBriefCard from "./components/DirectorBriefCard";
@@ -23,6 +24,7 @@ import { findReferenceTokens } from "@/features/canvas/application/referenceToke
 
 const movements: CameraMovement[] = ["Static", "Handheld", "Steadicam", "Dolly", "Tracking", "Crane", "POV", "OTS"];
 const newId = () => crypto.randomUUID();
+const DIRECTOR_SEQUENCE_TEMPLATE = "pro-sequence" as const;
 const SHOT_PERF_TIPS = ["perf0Tip", "perf1Tip", "perf2Tip", "perf3Tip", "perf4Tip", "perf5Tip"] as const;
 const SHOT_PERF_KEYS = ["perf0", "perf1", "perf2", "perf3", "perf4", "perf5"] as const;
 
@@ -42,9 +44,10 @@ export interface CinematicStudioAppProps {
   onClose?: () => void;
   onStateChange?: (snapshot: CinematicStudioAppStateSnapshot) => void;
   onSendToVideo?: (payload: { prompt: string; referenceImages: string[]; referenceAudio: string[] }) => void;
+  canvasAudioSources?: CanvasAudioSource[];
 }
 
-export default function App({ onClose, onStateChange, onSendToVideo }: CinematicStudioAppProps = {}) {
+export default function App({ onClose, onStateChange, onSendToVideo, canvasAudioSources = [] }: CinematicStudioAppProps = {}) {
   const [project, setProject] = useState<ProjectV2>(loadProject);
   const [locale, setLocale] = useState<Locale>(() => localStorage.getItem("cineprompt-locale") === "en" ? "en" : "zh");
   const [sceneId, setSceneId] = useState(project.scenes[0].id);
@@ -54,12 +57,13 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
   const [sceneCompileBusy, setSceneCompileBusy] = useState(false);
+  const [finalGenerateBusy, setFinalGenerateBusy] = useState(false);
   const [sceneCompileProgress, setSceneCompileProgress] = useState<SceneCompileProgress>("idle");
   const [briefOptimizeBusy, setBriefOptimizeBusy] = useState(false);
   const [aiCompileError, setAiCompileError] = useState("");
   const [aiCompileErrorDetail, setAiCompileErrorDetail] = useState("");
   const [aiErrorCopied, setAiErrorCopied] = useState(false);
-  const [template, setTemplate] = useState<"pro-sequence" | "shot-cards" | "asset-id-tagged">("pro-sequence");
+  const template = DIRECTOR_SEQUENCE_TEMPLATE;
   const [modelProfileId, setModelProfileId] = useState<string>(() => localStorage.getItem("cineprompt-model") ?? "");
   const [, setHistory] = useState<PromptVersion[]>(loadHistory);
   const [aiSettings, setAiSettings] = useState<AISettings>(() => loadAISettings());
@@ -184,40 +188,6 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
     if ((project.compiledPrompt ?? "") === prompt) return;
     dispatch({ type: "PATCH_PROJECT", patch: { compiledPrompt: prompt } });
   }, [project.compiledPrompt, prompt]);
-  /** P2.2/P0/P1.4：编译入口（生成 + 存档版本历史；locale 决定输出语言；项目包内落盘） */
-  const runCompile = (noticeKey: "promptCompiled" | "promptRebuilt" | "promptLocalCompiled", targetScene: SceneV2 = scene, forceStructured = false) => {
-    const issues = checkContinuityV2(project, targetScene);
-    const audit = auditFinalPromptWithProject(targetScene, project.assets ?? []);
-    const blockers = audit.issues.filter((issue) => issue.severity === "error").length + issues.filter((issue) => issue.severity === "error").length;
-    recordFinalAudit(targetScene, audit, issues);
-    if (blockers > 0) {
-      setNotice(locale === "zh"
-        ? `最终审核发现 ${blockers} 项事实冲突。请修正后继续生成；当前有效提示词未被覆盖。`
-        : `Final review found ${blockers} factual conflict(s). Fix them and continue; the current valid prompt was not overwritten.`);
-      return;
-    }
-    const result = compilePrompt(project, targetScene, shot, { template, profile: modelProfileById(modelProfileId), locale, director: true });
-    const text = !forceStructured && manualOverride !== null ? manualOverride : result.text;
-    setPrompt(text);
-    const record = addVersion({
-      template,
-      modelProfileId: modelProfileId || undefined,
-      outputText: result.text,
-      projectSnapshot: structuredClone({ ...project, scenes: project.scenes.map((item) => item.id === targetScene.id ? targetScene : item) }),
-      continuitySummary: { total: issues.length, errors: issues.filter((i) => i.severity === "error").length, warnings: issues.filter((i) => i.severity === "warning").length },
-      manualOverride: manualOverride ?? undefined,
-    });
-    setHistory(record);
-    // P1.4：项目包已打开时落盘 prompts/<id>.md + SQLite 摘要
-    if (projectPackageDir) {
-      const latest = record[0];
-      if (latest) {
-        void savePromptToDisk(projectPackageDir, latest.id, result.text);
-        void recordVersionToSqlite(projectPackageDir, latest.id, template, JSON.stringify(latest.continuitySummary));
-      }
-    }
-    setNotice(t[noticeKey]);
-  };
   /** P1：当前打开的项目包目录（成功保存后记录，用于版本落盘） */
   const [projectPackageDir, setProjectPackageDir] = useState<string | null>(() => sessionStorage.getItem("cineprompt-package-dir"));
   /** P3/P1.2：保存工程到 .cineprompt 目录包（父目录选择 + slug.cineprompt） */
@@ -348,7 +318,7 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
     const created: ShotV2 = { id: newId(), label: String(scene.shots.length + 1).padStart(2, "0"), duration: `${end}-${end + step}${t.seconds}`, time: { startSeconds: end, endSeconds: end + step }, framing: "Medium close-up", lens: "50mm", optics: { lensCharacter: "47-standard", fieldOfViewDegrees: 47 }, movement: "Static", action: t.defineAction, acting: t.naturalPerformance, direction: scene.shots[scene.shots.length - 1]?.direction ?? "left-to-right", cutStyle: scene.cutStyleDefault ?? "hard-cut" };
     setProject((current) => ({ ...current, scenes: current.scenes.map((item) => item.id === scene.id ? { ...item, shots: [...item.shots, created] } : item) })); setShotId(created.id);
   };
-  /** AI 智能分镜：读取用户音频计划作为参考，生成镜头列表/检查器/导演文档，最后编译到提示词编辑器 */
+  /** AI 智能分镜：只生成导演文档与镜头分镜，审核冲突后停在结构化编辑阶段。 */
   const aiCompileScene = async () => {
     if (sceneCompileBusy) return;
     if (!isRemoteConfigured()) { setNotice(t.aiNotConfigured); return; }
@@ -374,7 +344,6 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
       const nextProject: ProjectV2 = {
         ...project,
         scenes: project.scenes.map((item) => item.id === mergedScene.id ? mergedScene : item),
-        ...(draft.negativePrompt !== undefined ? { negativePrompt: draft.negativePrompt } : {}),
       };
       setProject(nextProject);
       setManualOverride(null);
@@ -382,8 +351,10 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
       setSceneCompileProgress("validating");
       const audit = auditFinalPromptWithProject(mergedScene, project.assets ?? []);
       const nextIssues = checkContinuityV2(nextProject, mergedScene);
+      const layerIssues = validateDirectorLayers(mergedScene.directorLayers ?? {}, nextProject, mergedScene);
       const blockers = audit.issues.filter((issue) => issue.severity === "error").length
-        + nextIssues.filter((issue) => issue.severity === "error").length;
+        + nextIssues.filter((issue) => issue.severity === "error").length
+        + layerIssues.filter((issue) => issue.severity === "error").length;
       recordFinalAudit(mergedScene, audit, nextIssues);
       if (blockers > 0) {
         setNotice(locale === "zh"
@@ -391,15 +362,15 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
           : `AI generated an editable storyboard draft, but final review found ${blockers} factual conflict(s). Fix them and continue; the last valid prompt was preserved.`);
         return;
       }
-      const result = compilePrompt(nextProject, mergedScene, mergedScene.shots[0] ?? shot, { template, profile: modelProfileById(modelProfileId), locale, director: true });
-      setPrompt(result.text);
       setNotice(t.aiCompileDone);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const classified = classifyError(error);
-      const friendly = classified.kind === "timeout" || classified.kind === "network"
-        ? t.aiRequestInterrupted
-        : message;
+      const friendly = classified.kind === "gateway-timeout"
+        ? t.aiGatewayTimeout
+        : classified.kind === "timeout" || classified.kind === "network"
+          ? t.aiRequestInterrupted
+          : message;
       setNotice(`${t.aiCompileFailed}${friendly}`);
       setAiCompileError(friendly);
       setAiCompileErrorDetail(message);
@@ -430,15 +401,71 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
       setNotice(t.aiBriefOptimized);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setNotice(`${t.aiOptimizeBriefFailed}${message}`);
+      const classified = classifyError(error);
+      const friendly = classified.kind === "gateway-timeout"
+        ? t.aiGatewayTimeout
+        : classified.kind === "timeout" || classified.kind === "network"
+          ? t.aiRequestInterrupted
+          : message;
+      setNotice(`${t.aiOptimizeBriefFailed}${friendly}`);
     } finally {
       setBriefOptimizeBusy(false);
     }
   };
-  /** 本地编译：不调用 AI，直接按当前已填写内容编译到提示词编辑器（含存档/落盘） */
-  const localCompileScene = () => {
-    setManualOverride(null);
-    runCompile("promptLocalCompiled", scene, true);
+  /** 最终生成：审核当前结构化内容后，先本地生成 canonical source，再由 AI 组织最终提示词。 */
+  const localCompileScene = async () => {
+    if (sceneCompileBusy || finalGenerateBusy) return;
+    if (!isRemoteConfigured()) { setNotice(t.aiNotConfigured); return; }
+    const issues = checkContinuityV2(project, scene);
+    const audit = auditFinalPromptWithProject(scene, project.assets ?? []);
+    const layerIssues = validateDirectorLayers(scene.directorLayers ?? {}, project, scene);
+    const blockers = audit.issues.filter((issue) => issue.severity === "error").length
+      + issues.filter((issue) => issue.severity === "error").length
+      + layerIssues.filter((issue) => issue.severity === "error").length;
+    recordFinalAudit(scene, audit, issues);
+    if (blockers > 0) {
+      setNotice(locale === "zh"
+        ? `最终审核发现 ${blockers} 项事实冲突，请修正后再最终生成。`
+        : `Final review found ${blockers} factual conflict(s). Fix them before final generation.`);
+      return;
+    }
+    setFinalGenerateBusy(true);
+    setAiCompileError("");
+    try {
+      const canonical = buildFinalGenerationSource(project, scene);
+      const text = await generateFinalPrompt(canonical, locale);
+      setManualOverride(null);
+      setPrompt(text);
+      const record = addVersion({
+        template,
+        modelProfileId: modelProfileId || undefined,
+        outputText: text,
+        projectSnapshot: structuredClone(project),
+        continuitySummary: { total: issues.length, errors: issues.filter((issue) => issue.severity === "error").length, warnings: issues.filter((issue) => issue.severity === "warning").length },
+      });
+      setHistory(record);
+      if (projectPackageDir) {
+        const latest = record[0];
+        if (latest) {
+          void savePromptToDisk(projectPackageDir, latest.id, text);
+          void recordVersionToSqlite(projectPackageDir, latest.id, template, JSON.stringify(latest.continuitySummary));
+        }
+      }
+      setNotice(t.promptLocalCompiled);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const classified = classifyError(error);
+      const friendly = classified.kind === "gateway-timeout"
+        ? t.aiGatewayTimeout
+        : classified.kind === "timeout" || classified.kind === "network"
+          ? t.aiRequestInterrupted
+          : message;
+      setNotice(`${t.aiCompileFailed}${friendly}`);
+      setAiCompileError(friendly);
+      setAiCompileErrorDetail(message);
+    } finally {
+      setFinalGenerateBusy(false);
+    }
   };
   const copyAiError = async () => {
     const detail = aiCompileErrorDetail || aiCompileError;
@@ -509,6 +536,7 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
         t={t}
         locale={locale}
         compileBusy={sceneCompileBusy}
+        finalGenerateBusy={finalGenerateBusy}
         compileProgress={sceneCompileProgress}
         briefOptimizeBusy={briefOptimizeBusy}
         aiCompileError={aiCompileError}
@@ -534,10 +562,10 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
       {/* ── 2. 分层导演文档卡（P0.6：AI 编译产出各层，可展开编辑 + 锁定）── */}
       <DirectorLayersCard scene={scene} t={t} locale={locale} onUpdateScene={updateScene} />
 
-      {/* ── 4. 镜头列表（时间线横排，P1.2）── */}
+      {/* ── 4. 镜头执行：时间线、动作、角色表演与节拍共用同一结构化数据 ── */}
       <section className="card shots-card">
         <div className="card-head">
-          <div className="card-head-title"><span className="eyebrow">{t.shotList}</span><strong>{scene.shots.length} {t.cuts}</strong></div>
+          <div className="card-head-title"><span className="eyebrow">{locale === "zh" ? "镜头执行" : "Shot execution"}</span><strong>{scene.shots.length} {t.cuts}</strong></div>
           <div className="shot-actions">
             <div className="template-menu">
               <button className="outline-button" onClick={() => setTemplateMenuOpen((v) => !v)}><Plus size={14} /> {t.addShot} <ChevronDown size={13} /></button>
@@ -567,16 +595,21 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
                 </select><ChevronDown size={10} /></span>
               </span>
               <span className="shot-camera">{(() => { const fov = item.optics?.fieldOfViewDegrees ?? lensById(item.optics?.lensCharacter)?.fov ?? lensByFov(legacyFocalLengthToFov(item.lens))?.fov; return fov == null ? "—" : `${fov}°`; })()}<small>{cameraLabels[locale][item.movement]}</small></span>
+              <span className={`shot-cast ${(item.participants ?? []).length === 0 ? "empty" : ""}`} title={t.participants}>
+                {(item.participants ?? []).length === 0
+                  ? t.noShotParticipants
+                  : (item.participants ?? []).map((participant) => project.assets?.find((asset) => asset.id === participant.characterId)?.name ?? participant.characterId).join(" · ")}
+              </span>
               <button className="shot-delete" title={t.deleteShot} onClick={(event) => { event.stopPropagation(); deleteShot(item.id); }}><X size={13} /></button>
             </div>;
           })}
         </div>
       </section>
 
-      {/* ── 5. 镜头检查器（竖向）── */}
+      {/* ── 5. 镜头执行详情：编辑当前镜头的动作、角色表演、节拍与空间 ── */}
       <section id="cinematic-shot-inspector" className="card inspector-card">
         <div className="card-head inspector-toggle" onClick={() => setInspectorOpen((open) => !open)}>
-          <div className="card-head-title"><span className="eyebrow">{t.inspector}</span><h2>{shot?.label || t.noShot}</h2></div>
+          <div className="card-head-title"><span className="eyebrow">{locale === "zh" ? "镜头执行详情" : "Shot execution details"}</span><h2>{shot?.label || t.noShot}</h2></div>
           {inspectorOpen ? <ChevronDown size={16} className="inspector-caret" /> : <ChevronDown size={16} className="inspector-caret collapsed" />}
         </div>
         {inspectorOpen && (shot ? <div className="inspector-body">
@@ -671,7 +704,7 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
       </section>
       {/* ── 资产库（右侧固定栏）── */}
       <div id="asset-library-card">
-        <AssetLibrary project={project} scene={scene} dispatch={dispatch} locale={locale} t={t} setNotice={setNotice} />
+        <AssetLibrary project={project} scene={scene} dispatch={dispatch} locale={locale} t={t} setNotice={setNotice} canvasAudioSources={canvasAudioSources} />
       </div>
       <section className="card prompt-card">
         <div className="card-head">
@@ -686,22 +719,11 @@ export default function App({ onClose, onStateChange, onSendToVideo }: Cinematic
           </div>
         </div>
         <div className="compile-row">
-          <span className="chip-label">{t.compileTarget}</span>
-          <span className="template-select">
-            <select value={template} aria-label={t.compileTarget} onChange={(event) => setTemplate(event.target.value as typeof template)}>
-              <option value="asset-id-tagged">{t.assetIdTemplate}</option>
-              <option value="pro-sequence">{t.proSequenceTemplate}</option>
-              <option value="shot-cards">{t.shotCardsTemplate}</option>
-            </select>
-            <ChevronDown size={14} />
-          </span>
           <span className="template-select model-select" title={t.targetModelHint}>
             <select value={modelProfileId} aria-label={t.targetModel} onChange={(event) => {
               const id = event.target.value;
               setModelProfileId(id);
               localStorage.setItem("cineprompt-model", id);
-              const profile = modelProfileById(id);
-              if (profile?.preferredTemplate) setTemplate(profile.preferredTemplate);
             }}>
               <option value="">{t.modelNone}</option>
               {MODEL_PROFILES.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
