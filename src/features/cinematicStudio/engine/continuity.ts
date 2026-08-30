@@ -7,7 +7,7 @@
  *   warning — 可能造成模型漂移；允许导出，但要求用户确认
  *   info    — 质量建议；可忽略
  *
- * P0.1 范围：Identity 组（角色数量锁、唯一标记、始终可见、强锁定存在性、无重复角色）
+ * P0.1 范围：Identity 组（角色数量锁、唯一标记、始终可见、无重复角色）
  * P0.2 范围：Spatial 组（地点资产、180° 轴线、故意越轴、站位顺序一致性）
  * 其余规则组在 P0.3-P0.5 分批加入。
  */
@@ -130,21 +130,7 @@ export function checkIdentity(project: ProjectV2, scene: SceneV2, _options: Cont
     }
   }
 
-  // 2. 强锁定角色是否出现在场景
-  for (const asset of ctx.characterAssets) {
-    if (asset.lockLevel === "strict" && !ctx.referencedCharacterIds.has(asset.id)) {
-      issues.push({
-        code: "IDENTITY.STRICT_NOT_REFERENCED",
-        severity: "warning",
-        entityId: asset.id,
-        label: "Strict identity not used",
-        detail: `Strict-locked character ${asset.name} is not referenced by any shot in this scene.`,
-        detailZh: `强锁定角色「${asset.name}」未被本场景任何镜头引用。`,
-      });
-    }
-  }
-
-  // 3. alwaysVisible 完整性：声明了始终可见物件的角色出现在场景时，
+  // 2. alwaysVisible 完整性：声明了始终可见物件的角色出现在场景时，
   //    校验物件关键词是否有资产描述/独特标记作为证据（编译器保证输出，这里给出质量建议）
   for (const characterId of ctx.visibleLockedCharacterIds) {
     const asset = ctx.characterAssets.find((item) => item.id === characterId);
@@ -170,7 +156,7 @@ export function checkIdentity(project: ProjectV2, scene: SceneV2, _options: Cont
     }
   }
 
-  // 4. 唯一标记缺失（强锁定角色）
+  // 3. 唯一标记缺失（强锁定角色）
   for (const asset of ctx.characterAssets) {
     if (asset.lockLevel !== "strict") continue;
     const rule = ctx.rulesByCharacter.get(asset.id);
@@ -789,9 +775,8 @@ export function checkTechnical(project: ProjectV2, scene: SceneV2, _options: Con
 /**
  * Audio 组检查（P0.5/P1.3）：
  * 1. 无音频计划 → info（可一键创建默认）
- * 2. 有对白但字幕未开启 → info（可一键开启字幕）
- * 3. SFX 字段误填画内音乐（boombox beat 等）→ warning（可一键移动到画内音乐）
- * 4. 画内音乐来源道具不存在 → warning
+ * 2. SFX 字段误填画内音乐（boombox beat 等）→ warning（可一键移动到画内音乐）
+ * 3. 画内音乐来源道具不存在 → warning
  */
 export function checkAudio(project: ProjectV2, scene: SceneV2, _options: ContinuityCheckOptions = {}): ContinuityIssueV2[] {
   const issues: ContinuityIssueV2[] = [];
@@ -855,17 +840,6 @@ export function checkAudio(project: ProjectV2, scene: SceneV2, _options: Continu
   // 音频计划只描述用户主动选择的画内音乐、额外音效、配乐和字幕。
   // 即使没有计划，编译器仍会输出场景环境声和动作同步声，因此不应报缺失。
   if (!audio) return issues;
-  if (hasDialogue && audio.subtitles === false) {
-    issues.push({
-      code: "AUDIO.DIALOGUE_UNSUBTITLED",
-      severity: "info",
-      entityId: scene.id,
-      label: "Dialogue subtitles",
-      detail: "Beats contain dialogue but subtitles are off.",
-      detailZh: "节拍中包含对白，但字幕已关闭。",
-      fixLabel: "Enable subtitles",
-    });
-  }
   // P1.3 冲突规则：SFX 字段含音乐类词 → 属于画内音乐而非 SFX
   const MUSIC_TOKENS = ["boombox", "beat", "radio", "band", "music", "playback", "jingle", "melody"];
   const musicLikeSfx = (audio.sfx ?? []).find((sfx) => MUSIC_TOKENS.some((token) => sfx.toLowerCase().includes(token)));
@@ -898,6 +872,26 @@ export function checkAudio(project: ProjectV2, scene: SceneV2, _options: Continu
  * Acting 组检查（P5.3）：仅当角色有表演母版时触发，校验母版结构质量与声音锁完整性。
  * 全为 warning / info 级：不阻塞导出，只给出可执行修复建议。
  */
+const OBSERVABLE_ACTING_MARKER = /呼吸|吞咽|下唇|嘴唇|下颌|脸|面部|眼|眨|视线|目光|手指|手掌|手|肩|姿势|站|坐|走|重心|步幅|语速|吐字|声音|声线|音色|停顿|距离|breath|swallow|lip|jaw|face|eye|blink|gaze|hand|finger|shoulder|posture|walk|weight|stride|step|torso|arm|head|tempo|voice|pause|distance/i;
+const INNER_STATE_WORD = /紧张|焦虑|害怕|恐惧|愤怒|悲伤|难过|痛苦|不安|羞耻|兴奋|慌乱|恐慌|nervous|anxious|afraid|fear|angry|sad|grief|pain|uneasy|ashamed|excited|panic/i;
+const TIC_WORD = /习惯|抽动|抽搐|抖动|下意识|habit|tic|twitch|fidget|compulsiv/i;
+const TRIGGER_WORD = /当|每当|每逢|一旦|触发|(?:在)?[^。；;\n]{1,24}(?:时|时刻)|when(?:ever)?|once|if|trigger|during|under pressure/i;
+function actingClauses(text: string): string[] {
+  return text.split(/[\n。！？.!?]+/).map((part) => part.trim()).filter(Boolean);
+}
+
+function hasUngroundedInnerState(text: string): boolean {
+  return actingClauses(text).some((clause) => INNER_STATE_WORD.test(clause) && !OBSERVABLE_ACTING_MARKER.test(clause));
+}
+
+function hasMultipleSofteningTargets(text: string): boolean {
+  const line = text.split("\n").find((part) => /软化目标|softening target|softens for/i.test(part));
+  if (!line) return false;
+  const target = line.replace(/.*?(?:软化目标|softening target|softens for)\s*[:：]?/i, "").trim();
+  if (!target || /^(无|没有|不适用|none|n\/a)$/i.test(target)) return false;
+  return /、|，|,|以及|和|及|与|\band\b|\bor\b/i.test(target);
+}
+
 export function checkActing(project: ProjectV2, scene: SceneV2, _options: ContinuityCheckOptions = {}): ContinuityIssueV2[] {
   const issues: ContinuityIssueV2[] = [];
   const characters = (project.assets ?? []).filter((asset) => asset.kind === "character");
@@ -915,23 +909,9 @@ export function checkActing(project: ProjectV2, scene: SceneV2, _options: Contin
     const master = `${masterEn}\n${masterZh}`;
     if (!master.trim()) continue;
 
-    // MASK_NO_CRACK：压力裂缝（However, when X… / 然而，当 X…）缺失 → 冷静面具可能扁平
-    if (!/however\s*,?\s*when|但当|但是当|然而[,，]?\s*当|一旦/i.test(master)) {
-      issues.push({
-        code: "ACTING.MASK_NO_CRACK",
-        severity: "warning",
-        entityId: asset.id,
-        label: "Acting mask without crack",
-        detail: `Character ${asset.name} master profile lacks a "However, when X…" mask+crack; the calm mask may read as flat.`,
-        detailZh: `角色「${asset.name}」的表演母版缺少“然而，当 X……时”的面具+裂缝结构，冷静面具可能显得扁平。`,
-        fixLabel: "Add mask + crack",
-      });
-    }
-
-    // TIC_NO_TRIGGER：出现习惯/抽动词，却没有任何触发条件
-    const hasTic = /习惯|抽动|抽搐|抖动|下意识|habit|tic|twitch|fidget|compulsiv/i.test(master);
-    const hasTrigger = /当|每当|每逢|一旦|触发|when(ever)?|once|if|trigger|每逢/i.test(master);
-    if (hasTic && !hasTrigger) {
+    // TIC_NO_TRIGGER：每个包含习惯/抽动的行都必须在同一行给出触发条件。
+    const ticLines = master.split("\n").map((line) => line.trim()).filter((line) => TIC_WORD.test(line));
+    if (ticLines.some((line) => !TRIGGER_WORD.test(line))) {
       issues.push({
         code: "ACTING.TIC_NO_TRIGGER",
         severity: "warning",
@@ -943,15 +923,52 @@ export function checkActing(project: ProjectV2, scene: SceneV2, _options: Contin
       });
     }
 
-    // WARDROBE_IN_PROFILE：母版混入服装 / 相机 / 色彩（应归到描述或技术段）
-    if (/相机|镜头|景别|焦距|焦段|色彩|色调|服装|衬衫|西装|外套|领带|裤|裙|鞋|帽|camera|lens|framing|focal|\bmm\b|costume|outfit|wardrobe|suit|shirt|dress|pants|shoes/i.test(master)) {
+    // WARDROBE_IN_PROFILE：母版混入服装 / 相机 / 光线 / 色彩（应归到其他段落）
+    if (/相机|镜头|景别|焦距|焦段|色彩|色调|调色|光线|灯光|照明|服装|衬衫|西装|外套|领带|裤|裙|鞋|帽|camera|lens|framing|focal|\bmm\b|costume|outfit|wardrobe|suit|shirt|dress|pants|shoes|lighting|\blight\b|grade/i.test(master)) {
       issues.push({
         code: "ACTING.WARDROBE_IN_PROFILE",
         severity: "info",
         entityId: asset.id,
-        label: "Wardrobe / camera in profile",
-        detail: `Character ${asset.name} master profile mixes wardrobe / camera / color wording; move it to the description or technical section.`,
-        detailZh: `角色「${asset.name}」的表演母版混入了服装/相机/色彩的描述，请移到资产描述或技术段落。`,
+        label: "Non-performance direction in profile",
+        detail: `Character ${asset.name} master profile mixes wardrobe / camera / lighting / color wording; move it to the description or technical section.`,
+        detailZh: `角色「${asset.name}」的表演母版混入了服装/相机/光线/色彩的描述，请移到资产描述或技术段落。`,
+      });
+    }
+
+    if (hasUngroundedInnerState(master)) {
+      issues.push({
+        code: "ACTING.INNER_STATE_UNGROUNDED",
+        severity: "warning",
+        entityId: asset.id,
+        label: "Inner state lacks a body marker",
+        detail: `Character ${asset.name} names an inner state without a visible body, voice, or timing marker in the same clause.`,
+        detailZh: `角色「${asset.name}」写出了内心状态，但同一语句没有对应的身体、声线或节奏标记；请改成可观察行为。`,
+        fixLabel: "Ground in behavior",
+      });
+    }
+
+    if (!/身体传记|body biography|职业|旧伤|伤病|经历|过去|自我形象|工作|profession|injur|past struggle|self-image|biograph/i.test(master) ||
+      !/年龄|\d+\s*岁|体型|身材|身形|肩|姿态|站姿|build|physique|age|posture|shoulder/i.test(master)) {
+      issues.push({
+        code: "ACTING.BODY_BIOGRAPHY_MISSING",
+        severity: "info",
+        entityId: asset.id,
+        label: "Body biography is under-specified",
+        detail: `Character ${asset.name} master profile does not clearly connect physique or posture to age, history, profession, injury, or self-image.`,
+        detailZh: `角色「${asset.name}」的表演母版没有明确让体型或姿态体现年龄、经历、职业、旧伤或自我形象。`,
+        fixLabel: "Add body biography",
+      });
+    }
+
+    if (hasMultipleSofteningTargets(master)) {
+      issues.push({
+        code: "ACTING.SOFTENING_TARGETS",
+        severity: "info",
+        entityId: asset.id,
+        label: "Multiple softening targets",
+        detail: `Character ${asset.name} lists more than one softening target; keep at most one person, animal, or object.`,
+        detailZh: `角色「${asset.name}」列出了多个软化目标；最多保留一个人、动物或物件。`,
+        fixLabel: "Keep one target",
       });
     }
 

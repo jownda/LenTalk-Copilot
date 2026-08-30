@@ -30,11 +30,9 @@ import {
   graphImageResolver,
 } from '@/features/canvas/application/canvasServices';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
-import { recordGenerationOutcome } from '@/features/canvas/application/usageRecording';
 import {
   detectAspectRatio,
   parseAspectRatio,
-  prepareNodeImage,
   resolveImageDisplayUrl,
 } from '@/features/canvas/application/imageData';
 import {
@@ -416,8 +414,6 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const updateNodeInternals = useUpdateNodeInternals();
   const [error, setError] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
-  // 生成通道固定为 sync 直出(移除 UI 切换按钮; async 仅用于旧项目数据兼容恢复)
-  const generationMode = 'sync' as const;
   const generationLockRef = useRef(false);
 
   const rootRef = useRef<HTMLDivElement>(null);
@@ -438,7 +434,6 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const edges = useCanvasStore((state) => state.edges);
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
-  const updateNodeDataTransient = useCanvasStore((state) => state.updateNodeDataTransient);
   const addNode = useCanvasStore((state) => state.addNode);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
   const addEdge = useCanvasStore((state) => state.addEdge);
@@ -737,8 +732,6 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         isGenerating: true,
         generationStartedAt,
         generationDurationMs,
-        // 记录生成通道: Canvas 恢复/重试时按此分流(避免重试误入异步轮询卡死)
-        generationMode,
         // 创建即标记当前运行会话: 提交拿到 jobId 前的窗口期内, Canvas 的
         // "无 jobId 自动恢复"逻辑不会把本节点当作残留任务重复提交(重复扣费)
         generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
@@ -821,47 +814,16 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         osBuild: runtimeDiagnostics.osBuild,
         userAgent: runtimeDiagnostics.userAgent,
       };
-      if (generationMode === 'sync') {
-        // 同步通道(等价 Infinite-Canvas /api/generate): generate_image 直出,
-        // 不创建异步任务, 由后端一次请求等结果返回, 避免轮询不收敛卡死。
-        const imageSource = await canvasAiGateway.generateImage(generationPayload);
-        const prepared = await prepareNodeImage(imageSource);
-        recordGenerationOutcome({
-          nodeId: newNodeId,
-          kind: 'image',
-          providerId: selectedModel.providerId,
-          modelId: requestResolution.requestModel,
-          size: selectedResolution.value,
-          referenceCount: incomingImages.length,
-          status: 'succeeded',
-        });
-        updateNodeDataTransient(newNodeId, {
-          imageUrl: prepared.imageUrl,
-          previewImageUrl: prepared.previewImageUrl,
-          aspectRatio: prepared.aspectRatio,
-          isGenerating: false,
-          generationStartedAt: null,
-          generationJobId: null,
-          generationProviderId: null,
-          generationClientSessionId: null,
-          generationStoryboardMetadata: undefined,
-          generationError: null,
-          generationErrorDetails: null,
-          generationDebugContext,
-          generationRequest: undefined,
-        });
-      } else {
-        // 异步通道(等价 Infinite-Canvas /api/canvas-image-tasks): 提交任务,
-        // 写入 jobId 后由 Canvas 统一轮询 getGenerateImageJob 收敛。
-        const jobId = await canvasAiGateway.submitGenerateImageJob(generationPayload);
-        updateNodeData(newNodeId, {
-          generationJobId: jobId,
-          generationSourceType: 'imageEdit',
-          generationProviderId: selectedModel.providerId,
-          generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
-          generationDebugContext,
-        });
-      }
+      // Every image request is a local background job. Canvas is the single
+      // completion path and can resume polling after the view is remounted.
+      const jobId = await canvasAiGateway.submitGenerateImageJob(generationPayload);
+      updateNodeData(newNodeId, {
+        generationJobId: jobId,
+        generationSourceType: 'imageEdit',
+        generationProviderId: selectedModel.providerId,
+        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+        generationDebugContext,
+      });
     } catch (generationError) {
       const resolvedError = resolveErrorContent(generationError, t('ai.error'));
       const runtimeDiagnostics = await runtimeDiagnosticsPromise;
@@ -926,8 +888,6 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     supportedAspectRatioValues,
     t,
     updateNodeData,
-    updateNodeDataTransient,
-    generationMode,
   ]);
 
   const syncPromptHighlightScroll = () => {

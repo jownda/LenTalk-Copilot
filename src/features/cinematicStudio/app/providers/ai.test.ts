@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Asset, ProjectV2, SceneV2 } from "../../shared-types";
-import { buildFinalGenerationSource, buildFinalPromptRequest, classifyError, collectSceneAssetIds, normalizeSceneDraft, sanitizeFinalPromptResponse, SCENE_DRAFT_JSON_SCHEMA } from "./ai";
+import { AI_RESPONSE_TIMEOUT_MS, buildFinalGenerationSource, buildFinalPromptRequest, ChatCompletionInterruptedError, classifyError, collectSceneAssetIds, normalizeSceneDraft, readChatCompletionText, sanitizeFinalPromptResponse, SCENE_DRAFT_JSON_SCHEMA } from "./ai";
 
 const assets: Asset[] = [
   { id: "location", kind: "location", name: "车厢", description: "carriage", referencePaths: [], lockLevel: "none", tags: [] },
@@ -29,6 +29,31 @@ const project: ProjectV2 = {
 };
 
 describe("collectSceneAssetIds", () => {
+  it("保留较长生成等待窗口，并兼容流式与普通 Chat Completions 响应", async () => {
+    expect(AI_RESPONSE_TIMEOUT_MS).toBe(15 * 60 * 1000);
+
+    const streamed = new Response([
+      `data: ${JSON.stringify({ choices: [{ delta: { content: "场景上下文：" } }] })}`,
+      `data: ${JSON.stringify({ choices: [{ delta: { content: "车厢内。" } }] })}`,
+      "data: [DONE]",
+      "",
+    ].join("\n"), { headers: { "Content-Type": "text/event-stream" } });
+    expect(await readChatCompletionText(streamed)).toBe("场景上下文：车厢内。");
+
+    const ordinary = new Response(JSON.stringify({ choices: [{ message: { content: "普通响应" } }] }), {
+      headers: { "Content-Type": "application/json" },
+    });
+    expect(await readChatCompletionText(ordinary)).toBe("普通响应");
+
+    const interrupted = new Response(`data: ${JSON.stringify({ choices: [{ delta: { content: "已收到的前半段" } }] })}\n`, {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+    await expect(readChatCompletionText(interrupted)).rejects.toMatchObject({
+      name: "ChatCompletionInterruptedError",
+      partialText: "已收到的前半段",
+    } satisfies Partial<ChatCompletionInterruptedError>);
+  });
+
   it("清理最终提示词开头的隐藏推理标签，保留中文首个类别标题", () => {
     const response = "<think>**Ensuring precise Chinese heading order**</think>\n\n场景上下文：\n阿俊站在车厢内。\n\n活动引用：\n@char_demo_hero_base_v1 [image1]：阿俊。";
     expect(sanitizeFinalPromptResponse(response)).toBe("场景上下文：\n阿俊站在车厢内。\n\n活动引用：\n@char_demo_hero_base_v1 [image1]：阿俊。");
@@ -47,6 +72,17 @@ describe("collectSceneAssetIds", () => {
     expect(request.user).toContain("Every @asset_tag, [imageN], and @audioN token");
   });
 
+  it("英文界面要求最终提示词使用英文类别和英文正文", () => {
+    const request = buildFinalPromptRequest("SCENE CONTEXT:\nA train carriage.", "en");
+
+    expect(request.system).toContain("clear, cinematic-grade English");
+    expect(request.system).not.toContain("cinematic-grade Chinese");
+    expect(request.user).toContain("Output only clear, cinematic-grade English");
+    expect(request.user).toContain("SCENE CONTEXT, ACTIVE REFERENCES, LOCATION MAP");
+    expect(request.user).toContain("attach acting to the corresponding shot and character inside ACTION TIMING");
+    expect(request.user).not.toContain("场景上下文、活动引用、场景地图");
+  });
+
   it("最终生成源按 CINEDANCE 类别顺序合并导演文档与镜头执行", () => {
     const sceneWithDocument: SceneV2 = {
       ...scene,
@@ -60,7 +96,7 @@ describe("collectSceneAssetIds", () => {
 
     expect(source).toContain("SCENE CONTEXT:\n已编辑的场景上下文。");
     expect(source).toContain("ACTION TIMING:\n");
-    expect(source).toContain("Performance tone");
+    expect(source).toContain("@林警官: 克制 拿起 toward 香烟.");
     expect(source.indexOf("SCENE CONTEXT:")).toBeLessThan(source.indexOf("ACTIVE REFERENCES:"));
     expect(source.indexOf("CAMERA:")).toBeLessThan(source.indexOf("ACTION TIMING:"));
     expect(source.indexOf("ACTION TIMING:")).toBeLessThan(source.indexOf("PHYSICS:"));
@@ -106,7 +142,7 @@ describe("collectSceneAssetIds", () => {
     // The prop declaration names its holder with the same @ handle, as required
     // by Seedance. The character's image, appearance, profile, and voice data
     // are still declared only once on the character line.
-    expect((source.match(/@char_demo_hero_base_v1/g) ?? [])).toHaveLength(2);
+    expect((source.match(/@char_demo_hero_base_v1/g) ?? [])).toHaveLength(3);
     expect((source.match(/@prop_demo_bag_base_v1/g) ?? [])).toHaveLength(1);
   });
 
@@ -189,6 +225,23 @@ describe("collectSceneAssetIds", () => {
 
     expect(result.scene.shots).toHaveLength(1);
     expect(result.scene.shots[0].time).toEqual({ startSeconds: 0, endSeconds: 5 });
+  });
+
+  it("AI 返回景别和镜头语言冲突时自动归一为可匹配组合", () => {
+    const result = normalizeSceneDraft(project, scene, {
+      shots: [{
+        label: "失踪传说后的确认",
+        framing: "Medium close-up",
+        optics: { lensCharacter: "47-standard", fieldOfViewDegrees: 47 },
+        action: "人物确认对方身份",
+        acting: "克制",
+        movement: "Static",
+        direction: "left-to-right",
+      }],
+    }, "秒");
+
+    expect(result.scene.shots[0].framing).toBe("Medium close-up");
+    expect(result.scene.shots[0].optics).toMatchObject({ lensCharacter: "29-short-tele", fieldOfViewDegrees: 29 });
   });
 
   it("AI 分镜 schema 不再要求 AI 返回音频计划、旧 mm 焦段或道具状态链", () => {

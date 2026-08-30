@@ -142,7 +142,7 @@
   },
   "node": {
     "menu": {
-      "uploadImage": "Upload Image",
+      "uploadImage": "Local Upload",
       "aiImageGeneration": "AI Image",
       "aiVideoGeneration": "AI Video",
       "storyboard": "Storyboard Node",
@@ -150,7 +150,7 @@
       "textAnnotation": "Text",
       "panorama": "360 Panorama",
       "directorDesk": "3D Director Desk",
-      "cinematicStudio": "Cinematic Prompt Studio",
+      "cinematicStudio": "Prompt Studio",
       "audio": "Media",
       "promptOptimizer": "Prompt Optimizer",
       "seamlessMosaic": "Seamless Mosaic"
@@ -196,7 +196,7 @@
     },
     "upload": {
       "uploadedAlt": "Uploaded image",
-      "hint": "Click or drag to upload image"
+      "hint": "Double-click to upload an image, video, or audio"
     },
     "storyboardNode": {
       "title": "Storyboard Node",
@@ -468,7 +468,7 @@
     "customApiFetch": "Fetch Models",
     "customApiFetching": "Fetching…",
     "customApiTestNeedUrl": "Please fill in the Base URL first",
-    "customApiTestOk": "Probe complete: {{protocol}}, reference field {{field}}, encoding {{encoding}}, {{confidence}} confidence; {{count}} models detected. Values are in this form; click Save",
+    "customApiTestOk": "Probe complete: {{protocol}}, reference field {{field}}, encoding {{encoding}}, image transport {{transport}}, {{confidence}} confidence; {{count}} models detected. Values are in this form; click Save",
     "customApiTestFailed": "Connection failed:",
     "customApiFetched": "Fetched {{count}} models",
     "customApiFetchFailed": "Fetch failed:",
@@ -481,7 +481,7 @@
     "customApiReferenceField": "Reference field",
     "customApiReferenceEncoding": "Reference encoding",
     "customApiReferenceEncodingAuto": "Auto (by field)",
-    "customApiProbeHint": "Protocol verification uses only non-billable probes such as /v1/models and OPTIONS. It fills image protocol, reference field, and encoding; sync/async cannot be safely detected, so choose it manually."
+    "customApiProbeHint": "Protocol verification uses only non-billable probes such as /v1/models and OPTIONS. It fills image protocol, reference field, encoding, and image transport; sync/async cannot be safely detected, so choose it manually."
   },
   "pricing": {
     "nativePrice": "Native: {{value}}",
@@ -491,9 +491,6 @@
   },
   "update": {
     "dialogTitle": "Update Available",
-    "dialogDescription": "A new version is available. Download the installer for this system from GitHub.",
-    "goToGithubDownload": "View GitHub Release",
-    "downloadGithubInstaller": "Download Installer",
     "versionLine": "Current: {{currentVersion}}, Latest: {{latestVersion}}",
     "ignoreRule": "Ignore reminder rule",
     "ignoreTodayVersion": "Do not remind this version today",

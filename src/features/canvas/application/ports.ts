@@ -134,6 +134,11 @@ export interface CanvasEventMap {
     nodeId: string;
     file: File;
   };
+  'upload-node/convert-media': {
+    nodeId: string;
+    file: File;
+    mediaType: 'video' | 'audio';
+  };
   'group-node/rename': {
     nodeId: string;
   };

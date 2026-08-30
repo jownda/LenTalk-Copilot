@@ -14,6 +14,7 @@ import {
   BackgroundVariant,
   SelectionMode,
   useReactFlow,
+  useUpdateNodeInternals,
   type Connection,
   type EdgeChange,
   type FinalConnectionState,
@@ -23,6 +24,7 @@ import {
   type Viewport,
 } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
+import { isTauri } from "@tauri-apps/api/core";
 import { AlignJustify, Film, Keyboard, Layers, Library, Magnet } from "lucide-react";
 import "@xyflow/react/dist/style.css";
 
@@ -55,6 +57,7 @@ import {
   nodeHasTargetHandle,
 } from "@/features/canvas/domain/nodeRegistry";
 import { embedStoryboardImageMetadata } from "@/commands/image";
+import { persistLibraryAssetBinary, persistLibraryAssetFile } from "@/commands/assetLibrary";
 import type { NodeAlignMode } from "@/features/canvas/application/canvasLayout";
 import { nodeTypes } from "./nodes";
 import { edgeTypes } from "./edges";
@@ -82,6 +85,29 @@ import { usePromptLibraryStore, type PromptTemplate } from "@/features/prompts/p
 import { UiButton, UiInput, UiModal } from "@/components/ui";
 
 const DEFAULT_VIEWPORT: Viewport = { x: 0, y: 0, zoom: 1 };
+
+type LocalUploadMediaType = 'image' | 'video' | 'audio';
+
+function resolveLocalUploadMediaType(file: File): LocalUploadMediaType | null {
+  if (file.type.startsWith('image/')) return 'image';
+  if (file.type.startsWith('video/')) return 'video';
+  if (file.type.startsWith('audio/')) return 'audio';
+
+  const extension = file.name.split('.').pop()?.toLowerCase() ?? '';
+  if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif', 'heic', 'heif'].includes(extension)) return 'image';
+  if (['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv'].includes(extension)) return 'video';
+  if (['mp3', 'm4a', 'wav', 'aac', 'flac', 'ogg'].includes(extension)) return 'audio';
+  return null;
+}
+
+async function persistLocalMediaFile(file: File, mediaType: 'video' | 'audio'): Promise<string> {
+  const extension = file.name.split('.').pop()?.trim() || (mediaType === 'video' ? 'mp4' : 'mp3');
+  const nativePath = (file as File & { path?: unknown }).path;
+  if (isTauri() && typeof nativePath === 'string' && nativePath.trim()) {
+    return await persistLibraryAssetFile(nativePath, extension);
+  }
+  return await persistLibraryAssetBinary(new Uint8Array(await file.arrayBuffer()), extension);
+}
 
 const ALIGN_OPTIONS: Array<{ mode: NodeAlignMode; label: string }> = [
   { mode: "left", label: "左对齐" },
@@ -383,6 +409,7 @@ interface PreviewConnectionLine {
 export function Canvas() {
   const { t } = useTranslation();
   const reactFlowInstance = useReactFlow();
+  const updateNodeInternals = useUpdateNodeInternals();
 
   const wrapperRef = useRef<HTMLDivElement>(null);
   const suppressNextPaneClickRef = useRef(false);
@@ -436,12 +463,14 @@ export function Canvas() {
   const recoveryPollerCountRef = useRef(0);
   const recoveryMountedRef = useRef(true);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // StrictMode dev 下挂载会模拟一次卸载+重挂载, setup 必须把标志置回 true,
+    // 否则轮询器启动即退出, 后台完成的生成任务永远不会同步回节点。
+    recoveryMountedRef.current = true;
+    return () => {
       recoveryMountedRef.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
   const duplicateNodesRef = useRef<((sourceNodeIds: string[], options?: DuplicateOptions) => string | null) | null>(
     null,
   );
@@ -473,6 +502,7 @@ export function Canvas() {
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const updateNodeDataTransient = useCanvasStore((state) => state.updateNodeDataTransient);
   const addNode = useCanvasStore((state) => state.addNode);
+  const replaceNodeType = useCanvasStore((state) => state.replaceNodeType);
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const selectedNodeId = useCanvasStore((state) => state.selectedNodeId);
   const deleteEdge = useCanvasStore((state) => state.deleteEdge);
@@ -678,15 +708,30 @@ export function Canvas() {
               }
             }
 
-            // A user-triggered retry has no provider job id yet: submit the
-            // persisted request and then use the normal job poller.
+            // A missing job id is only recoverable when the user explicitly
+            // requested a retry. Never resubmit a persisted request merely
+            // because the project was reopened: the previous request may
+            // already have been billed upstream.
             if (!jobId && generationRequest?.kind === "image") {
+              const isExplicitRetry = currentData.generationRetryRequested === true;
               // 当前运行会话正常提交的节点: 提交方马上会写入 jobId,
               // 无 jobId 只是窗口期, 直接等待下一轮轮询, 绝不重复提交(重复扣费)
-              if (currentData.generationClientSessionId === CURRENT_RUNTIME_SESSION_ID) {
+              if (!isExplicitRetry && currentData.generationClientSessionId === CURRENT_RUNTIME_SESSION_ID) {
                 await sleep(GENERATION_JOB_POLL_INTERVAL_MS);
                 continue;
               }
+
+              if (!isExplicitRetry) {
+                const interruptedMessage = "应用退出时任务中断，可从节点重试";
+                updateNodeDataTransient(pendingNode.id, {
+                  isGenerating: false,
+                  generationStartedAt: null,
+                  generationError: interruptedMessage,
+                  generationErrorDetails: interruptedMessage,
+                });
+                break;
+              }
+
               try {
                 const retryPayload = {
                   prompt: typeof generationRequest.prompt === "string" ? generationRequest.prompt : "",
@@ -704,68 +749,12 @@ export function Canvas() {
                       ? (generationRequest.extraParams as Record<string, unknown>)
                       : undefined,
                 };
-                // 按节点记录的生成通道分流: sync 直出(绕开异步轮询,
-                // 兼容 OpenAI 兼容同步平台如 comfly), async 提交后轮询。
-                if (currentData.generationMode === "sync") {
-                  const imageSource = await canvasAiGateway.generateImage(retryPayload);
-                  recordGenerationOutcome({
-                    nodeId: pendingNode.id,
-                    kind: "image",
-                    providerId: generationProviderId,
-                    modelId: requestModel,
-                    size: typeof generationRequest?.size === "string" ? generationRequest.size : "1K",
-                    referenceCount: Array.isArray(generationRequest?.referenceImages)
-                      ? generationRequest.referenceImages.length
-                      : 0,
-                    status: "succeeded",
-                  });
-                  const prepared = await prepareNodeImage(imageSource);
-                  const storyboardMetadataRaw = currentData.generationStoryboardMetadata as
-                    GenerationStoryboardMetadata | undefined;
-                  const hasStoryboardMetadata = Boolean(
-                    storyboardMetadataRaw &&
-                    Number.isFinite(storyboardMetadataRaw.gridRows) &&
-                    Number.isFinite(storyboardMetadataRaw.gridCols) &&
-                    Array.isArray(storyboardMetadataRaw.frameNotes),
-                  );
-                  let imageWithMetadata = prepared.imageUrl;
-                  if (hasStoryboardMetadata && storyboardMetadataRaw) {
-                    imageWithMetadata = await embedStoryboardImageMetadata(prepared.imageUrl, {
-                      gridRows: Math.max(1, Math.round(storyboardMetadataRaw.gridRows)),
-                      gridCols: Math.max(1, Math.round(storyboardMetadataRaw.gridCols)),
-                      frameNotes: storyboardMetadataRaw.frameNotes,
-                    }).catch((error) => {
-                      console.warn("[GenerationJob] embed storyboard metadata failed", {
-                        nodeId: pendingNode.id,
-                        error,
-                      });
-                      return prepared.imageUrl;
-                    });
-                  }
-                  const previewWithMetadata =
-                    prepared.previewImageUrl === prepared.imageUrl ? imageWithMetadata : prepared.previewImageUrl;
-                  updateNodeDataTransient(pendingNode.id, {
-                    imageUrl: imageWithMetadata,
-                    previewImageUrl: previewWithMetadata,
-                    aspectRatio: prepared.aspectRatio,
-                    isGenerating: false,
-                    generationStartedAt: null,
-                    generationJobId: null,
-                    generationProviderId: null,
-                    generationClientSessionId: null,
-                    generationStoryboardMetadata: undefined,
-                    generationError: null,
-                    generationErrorDetails: null,
-                    generationDebugContext: undefined,
-                    generationRequest: undefined,
-                  });
-                  break;
-                }
                 const submittedJobId = await canvasAiGateway.submitGenerateImageJob(retryPayload);
-                updateNodeDataTransient(pendingNode.id, {
+                updateNodeData(pendingNode.id, {
                   generationJobId: submittedJobId,
                   generationProviderId: generationProviderId || null,
                   generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+                  generationRetryRequested: false,
                 });
                 await sleep(GENERATION_JOB_POLL_INTERVAL_MS);
                 continue;
@@ -774,6 +763,7 @@ export function Canvas() {
                 updateNodeDataTransient(pendingNode.id, {
                   isGenerating: false,
                   generationStartedAt: null,
+                  generationRetryRequested: false,
                   generationError: errorMessage,
                   generationErrorDetails: errorMessage,
                 });
@@ -796,6 +786,7 @@ export function Canvas() {
             }
 
             if (status.status === "succeeded" && typeof status.result === "string" && status.result.trim()) {
+              const resultSource = status.result;
               recordGenerationOutcome({
                 nodeId: pendingNode.id,
                 kind: "image",
@@ -807,7 +798,9 @@ export function Canvas() {
                   : 0,
                 status: "succeeded",
               });
-              const prepared = await prepareNodeImage(status.result);
+              // Show the provider result immediately. Persisting the original
+              // image and building a preview can take seconds for large data
+              // URLs, and must not keep the result node on its placeholder.
               const storyboardMetadataRaw = currentData.generationStoryboardMetadata as
                 GenerationStoryboardMetadata | undefined;
               const hasStoryboardMetadata = Boolean(
@@ -816,27 +809,10 @@ export function Canvas() {
                 Number.isFinite(storyboardMetadataRaw.gridCols) &&
                 Array.isArray(storyboardMetadataRaw.frameNotes),
               );
-              let imageWithMetadata = prepared.imageUrl;
-              if (hasStoryboardMetadata && storyboardMetadataRaw) {
-                imageWithMetadata = await embedStoryboardImageMetadata(prepared.imageUrl, {
-                  gridRows: Math.max(1, Math.round(storyboardMetadataRaw.gridRows)),
-                  gridCols: Math.max(1, Math.round(storyboardMetadataRaw.gridCols)),
-                  frameNotes: storyboardMetadataRaw.frameNotes,
-                }).catch((error) => {
-                  console.warn("[GenerationJob] embed storyboard metadata failed", {
-                    nodeId: pendingNode.id,
-                    error,
-                  });
-                  return prepared.imageUrl;
-                });
-              }
-              const previewWithMetadata =
-                prepared.previewImageUrl === prepared.imageUrl ? imageWithMetadata : prepared.previewImageUrl;
-
               updateNodeDataTransient(pendingNode.id, {
-                imageUrl: imageWithMetadata,
-                previewImageUrl: previewWithMetadata,
-                aspectRatio: prepared.aspectRatio,
+                imageUrl: resultSource,
+                previewImageUrl: resultSource,
+                generationResultProtected: true,
                 isGenerating: false,
                 generationStartedAt: null,
                 generationJobId: null,
@@ -848,6 +824,43 @@ export function Canvas() {
                 generationDebugContext: undefined,
                 generationRequest: undefined,
               });
+              requestAnimationFrame(() => updateNodeInternals(pendingNode.id));
+
+              // The immediate source keeps the canvas responsive. Replace it
+              // with the durable local image and preview once preparation has
+              // finished; a failure here must never hide the already visible
+              // provider result.
+              void (async () => {
+                try {
+                  const prepared = await prepareNodeImage(resultSource);
+                  let imageWithMetadata = prepared.imageUrl;
+                  if (hasStoryboardMetadata && storyboardMetadataRaw) {
+                    imageWithMetadata = await embedStoryboardImageMetadata(prepared.imageUrl, {
+                      gridRows: Math.max(1, Math.round(storyboardMetadataRaw.gridRows)),
+                      gridCols: Math.max(1, Math.round(storyboardMetadataRaw.gridCols)),
+                      frameNotes: storyboardMetadataRaw.frameNotes,
+                    });
+                  }
+                  const previewWithMetadata =
+                    prepared.previewImageUrl === prepared.imageUrl ? imageWithMetadata : prepared.previewImageUrl;
+                  const latestNode = useCanvasStore.getState().nodes.find((node) => node.id === pendingNode.id);
+                  const latestData = latestNode?.data as Record<string, unknown> | undefined;
+                  if (latestData?.imageUrl !== resultSource || latestData?.isGenerating === true) {
+                    return;
+                  }
+                  updateNodeDataTransient(pendingNode.id, {
+                    imageUrl: imageWithMetadata,
+                    previewImageUrl: previewWithMetadata,
+                    aspectRatio: prepared.aspectRatio,
+                  });
+                  requestAnimationFrame(() => updateNodeInternals(pendingNode.id));
+                } catch (error) {
+                  console.warn("[GenerationJob] image persistence failed after result display", {
+                    nodeId: pendingNode.id,
+                    error,
+                  });
+                }
+              })();
               break;
             }
 
@@ -894,7 +907,7 @@ export function Canvas() {
         }
       })();
     }
-  }, [apiKeys, nodes, updateNodeDataTransient]);
+  }, [apiKeys, nodes, updateNodeData, updateNodeDataTransient, updateNodeInternals]);
 
   // Video generation currently uses provider-specific HTTP flows without a
   // shared task-status command. A restart leaves the request available for
@@ -1034,6 +1047,7 @@ export function Canvas() {
           });
           updateNodeDataTransient(pendingNode.id, {
             sourcePath: videoUrl,
+            generationResultProtected: true,
             isGenerating: false,
             generationStartedAt: null,
             generationError: null,
@@ -1847,6 +1861,31 @@ export function Canvas() {
     [addNode, scheduleCanvasPersist, setSelectedNode],
   );
 
+  // 本地上传节点收到视频/音频后替换为媒体节点, 保留原节点 ID 和已有连线。
+  useEffect(() => {
+    return canvasEventBus.subscribe('upload-node/convert-media', ({ nodeId, file, mediaType }) => {
+      void (async () => {
+        try {
+          const sourcePath = await persistLocalMediaFile(file, mediaType);
+          const replaced = replaceNodeType(nodeId, CANVAS_NODE_TYPES.audio, {
+            sourcePath,
+            mediaType,
+            previewImageUrl: null,
+            aspectRatio: '1:1',
+            displayName: file.name.replace(/\.[^.]+$/, '').trim() || file.name,
+          });
+          if (replaced) {
+            setSelectedNode(nodeId);
+            scheduleCanvasPersist(0);
+          }
+        } catch (error) {
+          console.warn('[localUpload] media conversion failed', error);
+          void showErrorDialog('本地媒体导入失败', '上传失败', error instanceof Error ? error.message : String(error));
+        }
+      })();
+    });
+  }, [replaceNodeType, scheduleCanvasPersist, setSelectedNode]);
+
   const handleAssetLibraryDrop = useCallback(
     (event: ReactDragEvent) => {
       const types = event.dataTransfer.types;
@@ -1917,25 +1956,31 @@ export function Canvas() {
     [addNode, reactFlowInstance, scheduleCanvasPersist, setSelectedNode],
   );
 
-  // 从系统文件管理器拖入图片文件 → 每张生成一个图片节点(支持多张一起拖入)
+  // 从系统文件管理器拖入本地文件 → 按类型创建图片或媒体节点。
   const handleFileDrop = useCallback(
     async (event: ReactDragEvent) => {
-      const files = Array.from(event.dataTransfer?.files ?? []).filter((file) => file.type.startsWith("image/"));
+      const files = Array.from(event.dataTransfer?.files ?? []).filter((file) => resolveLocalUploadMediaType(file));
       if (files.length === 0) {
         return;
       }
       event.preventDefault();
       event.stopPropagation();
 
-      const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.upload);
       const basePosition = reactFlowInstance.screenToFlowPosition({
         x: event.clientX,
         y: event.clientY,
       });
 
+      const imageFiles = files.filter((file) => resolveLocalUploadMediaType(file) === 'image');
+      const mediaFiles = files.filter((file) => {
+        const type = resolveLocalUploadMediaType(file);
+        return type === 'video' || type === 'audio';
+      });
+      const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.upload);
+
       // 先处理所有文件拿到宽高比, 再按网格对齐排列(每行 3 张, 行列对齐)
       const prepared = [];
-      for (const file of files) {
+      for (const file of imageFiles) {
         prepared.push(await prepareNodeImageFromFile(file));
       }
 
@@ -1954,7 +1999,7 @@ export function Canvas() {
 
       for (let index = 0; index < prepared.length; index += 1) {
         const item = prepared[index];
-        const file = files[index];
+        const file = imageFiles[index];
         const size = sizeFor(item.aspectRatio ?? "1:1");
         if (index > 0 && index % COLS === 0) {
           // 换行: x 回到起点, y 下移上一行最大高度 + 间距
@@ -1977,6 +2022,31 @@ export function Canvas() {
         lastNodeId = nodeId;
         cursorX += size.width + GAP;
         rowMaxHeight = Math.max(rowMaxHeight, size.height);
+      }
+
+      // 视频/音频使用媒体节点, 从图片网格下方开始排列避免重叠。
+      if (mediaFiles.length > 0) {
+        const mediaDefinition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.audio);
+        let mediaX = basePosition.x;
+        const mediaY = imageFiles.length > 0 ? cursorY + rowMaxHeight + GAP : basePosition.y;
+        for (const file of mediaFiles) {
+          const mediaType = resolveLocalUploadMediaType(file);
+          if (mediaType !== 'video' && mediaType !== 'audio') continue;
+          try {
+            const sourcePath = await persistLocalMediaFile(file, mediaType);
+            const mediaNodeId = addNode(CANVAS_NODE_TYPES.audio, { x: mediaX, y: mediaY }, {
+              ...mediaDefinition.createDefaultData(),
+              sourcePath,
+              mediaType,
+              displayName: file.name.replace(/\.[^.]+$/, '').trim() || file.name,
+            });
+            lastNodeId = mediaNodeId;
+            mediaX += 344;
+          } catch (error) {
+            console.warn('[localUpload] file drop failed', error);
+            void showErrorDialog('本地媒体导入失败', '上传失败', error instanceof Error ? error.message : String(error));
+          }
+        }
       }
 
       if (lastNodeId) {

@@ -76,7 +76,7 @@ const groupStaging: ShotTemplate = {
       acting: "Still, grounded presence.",
       direction: "left-to-right",
     };
-    return { shot, requiredFields: ["场景左到右排序（未配置时）", "道具位置", "空间锚点"] };
+    return { shot, requiredFields: ["场景左到右排序（未配置时）", "道具位置"] };
   },
 };
 

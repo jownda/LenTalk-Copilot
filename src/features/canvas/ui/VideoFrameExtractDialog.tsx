@@ -4,12 +4,18 @@ import { Camera, Film, Plus, X } from 'lucide-react';
 
 import { UiButton, UiModal } from '@/components/ui/primitives';
 import { useCanvasStore } from '@/stores/canvasStore';
-import { CANVAS_NODE_TYPES } from '@/features/canvas/domain/canvasNodes';
+import {
+  CANVAS_NODE_TYPES,
+  EXPORT_RESULT_NODE_MIN_HEIGHT,
+  EXPORT_RESULT_NODE_MIN_WIDTH,
+} from '@/features/canvas/domain/canvasNodes';
 import { nodeCatalog } from '@/features/canvas/application/nodeCatalog';
 import {
   prepareNodeImage,
   resolveImageDisplayUrl,
 } from '@/features/canvas/application/imageData';
+import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
+import { resolveFrameInsertPositions } from '@/features/canvas/application/videoFramePlacement';
 import { useAssetLibraryStore } from '@/features/library/assetStore';
 import { createAssetId } from '@/features/library/importAssets';
 
@@ -149,14 +155,32 @@ export function VideoFrameExtractDialog({ open, onClose }: VideoFrameExtractDial
     try {
       const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.upload);
       const defaultData = definition.createDefaultData();
+      const preparedFrames: Array<{
+        frame: ExtractedFrame;
+        prepared: Awaited<ReturnType<typeof prepareNodeImage>>;
+      }> = [];
       for (const frame of frames) {
         try {
-          const prepared = await prepareNodeImage(frame.dataUrl);
-          const position = {
-            x: Math.round(120 + Math.random() * 260),
-            y: Math.round(120 + Math.random() * 260),
-          };
-          addNode(CANVAS_NODE_TYPES.upload, position, {
+          preparedFrames.push({ frame, prepared: await prepareNodeImage(frame.dataUrl) });
+        } catch (error) {
+          console.warn('[videoFrame] prepare frame failed', error);
+        }
+      }
+
+      const canvasState = useCanvasStore.getState();
+      const positions = resolveFrameInsertPositions(
+        canvasState.nodes,
+        canvasState.currentViewport,
+        canvasState.canvasViewportSize,
+        preparedFrames.map(({ prepared }) => resolveMinEdgeFittedSize(prepared.aspectRatio, {
+          minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
+          minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
+        })),
+      );
+
+      for (const [index, { frame, prepared }] of preparedFrames.entries()) {
+        try {
+          addNode(CANVAS_NODE_TYPES.upload, positions[index] ?? { x: 0, y: 0 }, {
             ...defaultData,
             imageUrl: prepared.imageUrl,
             previewImageUrl: prepared.previewImageUrl,

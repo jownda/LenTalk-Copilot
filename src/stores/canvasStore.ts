@@ -98,6 +98,7 @@ interface CanvasState {
     position: { x: number; y: number; parentId?: string; groupResize?: { id: string; width: number; height: number } },
     data?: Partial<CanvasNodeData>
   ) => string;
+  replaceNodeType: (nodeId: string, type: CanvasNodeType, data?: Partial<CanvasNodeData>) => boolean;
   addEdge: (source: string, target: string) => string | null;
   findNodePosition: (
     sourceNodeId: string,
@@ -371,6 +372,95 @@ function normalizeHistory(history?: CanvasHistoryState): CanvasHistoryState {
 
 function createSnapshot(nodes: CanvasNode[], edges: CanvasEdge[]): CanvasHistorySnapshot {
   return { nodes, edges };
+}
+
+function isCompletedGenerationResultNode(node: CanvasNode): boolean {
+  const data = node.data as Record<string, unknown>;
+  if (data.generationResultProtected !== true || data.isGenerating === true) {
+    return false;
+  }
+
+  if (node.type === CANVAS_NODE_TYPES.exportImage) {
+    return typeof data.imageUrl === 'string' && data.imageUrl.trim().length > 0;
+  }
+
+  return (
+    node.type === CANVAS_NODE_TYPES.audio &&
+    data.mediaType === 'video' &&
+    typeof data.sourcePath === 'string' &&
+    data.sourcePath.trim().length > 0
+  );
+}
+
+/**
+ * Generation completion is transient, while node creation and request state
+ * are historical. Keep a completed AI result when undo targets one of those
+ * older snapshots, so undo cannot turn a finished result back into a spinner.
+ */
+function preserveCompletedGenerationResults(
+  currentNodes: CanvasNode[],
+  currentEdges: CanvasEdge[],
+  targetNodes: CanvasNode[],
+  targetEdges: CanvasEdge[],
+): CanvasHistorySnapshot {
+  const protectedNodes = currentNodes.filter(isCompletedGenerationResultNode);
+  if (protectedNodes.length === 0) {
+    return { nodes: targetNodes, edges: targetEdges };
+  }
+
+  const targetNodeIds = new Set(targetNodes.map((node) => node.id));
+  const nextNodes = targetNodes.map((targetNode) => {
+    const currentNode = protectedNodes.find((node) => node.id === targetNode.id);
+    if (!currentNode) {
+      return targetNode;
+    }
+
+    const currentData = currentNode.data as Record<string, unknown>;
+    const targetData = targetNode.data as Record<string, unknown>;
+    const mediaData = currentNode.type === CANVAS_NODE_TYPES.exportImage
+      ? {
+          imageUrl: currentData.imageUrl,
+          previewImageUrl: currentData.previewImageUrl,
+          aspectRatio: currentData.aspectRatio,
+        }
+      : {
+          sourcePath: currentData.sourcePath,
+          previewImageUrl: currentData.previewImageUrl,
+          mediaType: currentData.mediaType,
+          aspectRatio: currentData.aspectRatio,
+        };
+
+    return {
+      ...targetNode,
+      data: {
+        ...targetData,
+        ...mediaData,
+        isGenerating: false,
+        generationStartedAt: null,
+        generationJobId: null,
+        generationRequest: undefined,
+        generationError: null,
+        generationErrorDetails: null,
+        generationResultProtected: true,
+      },
+    } as CanvasNode;
+  });
+
+  const missingProtectedNodes = protectedNodes.filter((node) => !targetNodeIds.has(node.id));
+  const resultNodes = [...nextNodes, ...missingProtectedNodes];
+  const resultNodeIds = new Set(resultNodes.map((node) => node.id));
+  const targetEdgeIds = new Set(targetEdges.map((edge) => edge.id));
+  const preservedEdges = currentEdges.filter(
+    (edge) =>
+      !targetEdgeIds.has(edge.id) &&
+      resultNodeIds.has(edge.source) &&
+      resultNodeIds.has(edge.target),
+  );
+
+  return {
+    nodes: resultNodes,
+    edges: [...targetEdges, ...preservedEdges],
+  };
 }
 
 /** 深度比较两个快照/任意结构的内容是否一致(用于历史栈内容级去重) */
@@ -1067,6 +1157,58 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       dragHistorySnapshot: null,
     });
     return newNode.id;
+  },
+
+  replaceNodeType: (nodeId, type, data = {}) => {
+    let changed = false;
+    set((state) => {
+      const currentNode = state.nodes.find((node) => node.id === nodeId);
+      if (!currentNode || currentNode.type === type) {
+        return {};
+      }
+
+      const definition = nodeCatalog.getDefinition(type);
+      const nextData = {
+        ...definition.createDefaultData(),
+        ...data,
+      } as CanvasNodeData;
+      changed = true;
+
+      const shouldUseCompactMediaSize =
+        currentNode.type === CANVAS_NODE_TYPES.upload &&
+        type === CANVAS_NODE_TYPES.audio &&
+        Boolean(definition.defaultSize);
+      const nextDimensions = shouldUseCompactMediaSize ? definition.defaultSize : undefined;
+
+      return {
+        nodes: state.nodes.map((node) =>
+          node.id === nodeId
+            ? {
+                ...node,
+                type,
+                data: nextData,
+                ...(nextDimensions
+                  ? {
+                      width: nextDimensions.width,
+                      height: nextDimensions.height,
+                      style: {
+                        ...(node.style ?? {}),
+                        width: nextDimensions.width,
+                        height: nextDimensions.height,
+                      },
+                    }
+                  : {}),
+              }
+            : node
+        ),
+        history: {
+          past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
+          future: [],
+        },
+        dragHistorySnapshot: null,
+      };
+    });
+    return changed;
   },
 
   addEdge: (source, target) => {
@@ -2242,12 +2384,18 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     const currentSnapshot = createSnapshot(state.nodes, state.edges);
     const nextPast = state.history.past.slice(0, -1);
+    const restoredSnapshot = preserveCompletedGenerationResults(
+      state.nodes,
+      state.edges,
+      target.nodes,
+      target.edges,
+    );
 
     set({
-      nodes: target.nodes,
-      edges: target.edges,
-      selectedNodeId: resolveSelectedNodeId(state.selectedNodeId, target.nodes),
-      activeToolDialog: resolveActiveToolDialog(state.activeToolDialog, target.nodes),
+      nodes: restoredSnapshot.nodes,
+      edges: restoredSnapshot.edges,
+      selectedNodeId: resolveSelectedNodeId(state.selectedNodeId, restoredSnapshot.nodes),
+      activeToolDialog: resolveActiveToolDialog(state.activeToolDialog, restoredSnapshot.nodes),
       history: {
         past: nextPast,
         future: pushSnapshot(state.history.future, currentSnapshot),

@@ -2,9 +2,11 @@ use std::path::PathBuf;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
+
+use crate::database;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,18 +30,6 @@ pub struct ProjectRecord {
     pub edges_json: String,
     pub viewport_json: String,
     pub history_json: String,
-}
-
-fn resolve_db_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
-
-    std::fs::create_dir_all(&app_data_dir)
-        .map_err(|e| format!("Failed to create app data dir: {}", e))?;
-
-    Ok(app_data_dir.join("projects.db"))
 }
 
 fn ensure_projects_table(conn: &Connection) -> Result<(), String> {
@@ -212,6 +202,44 @@ fn resolve_images_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(images_dir)
 }
 
+fn collect_asset_library_paths_from_json(raw: &str, referenced: &mut HashSet<String>) {
+    let Ok(state) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let Some(assets) = state.get("assets").and_then(|value| value.as_array()) else {
+        return;
+    };
+
+    for asset in assets {
+        for key in ["sourcePath", "previewImageUrl"] {
+            if let Some(path) = asset.get(key).and_then(|value| value.as_str()) {
+                if !path.trim().is_empty() {
+                    referenced.insert(path.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn collect_asset_library_paths(
+    conn: &Connection,
+    referenced: &mut HashSet<String>,
+) -> Result<(), String> {
+    let state_json = conn
+        .query_row(
+            "SELECT value_json FROM app_settings WHERE key = 'asset-library' LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to query asset library refs: {}", e))?;
+
+    if let Some(raw) = state_json {
+        collect_asset_library_paths_from_json(&raw, referenced);
+    }
+    Ok(())
+}
+
 fn prune_unreferenced_images(app: &AppHandle) -> Result<(), String> {
     let conn = open_db(app)?;
     let mut stmt = conn
@@ -227,6 +255,9 @@ fn prune_unreferenced_images(app: &AppHandle) -> Result<(), String> {
         let path = path_result.map_err(|e| format!("Failed to decode image ref row: {}", e))?;
         referenced.insert(path);
     }
+    // Older asset-library records may point into the shared images directory.
+    // Keep those files protected even after their source canvas node is gone.
+    collect_asset_library_paths(&conn, &mut referenced)?;
 
     let images_dir = resolve_images_dir(app)?;
     // Image persistence and project-reference persistence are separate IPC
@@ -266,19 +297,33 @@ fn prune_unreferenced_images(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::collect_asset_library_paths_from_json;
+    use std::collections::HashSet;
+
+    #[test]
+    fn asset_library_paths_are_protected_from_project_image_pruning() {
+        let mut referenced = HashSet::new();
+        collect_asset_library_paths_from_json(
+            r#"{"assets":[{"sourcePath":"/app/images/original.png","previewImageUrl":"/app/images/preview.png"}]}"#,
+            &mut referenced,
+        );
+
+        assert!(referenced.contains("/app/images/original.png"));
+        assert!(referenced.contains("/app/images/preview.png"));
+    }
+
+    #[test]
+    fn malformed_asset_library_state_does_not_break_project_pruning() {
+        let mut referenced = HashSet::new();
+        collect_asset_library_paths_from_json("not-json", &mut referenced);
+        assert!(referenced.is_empty());
+    }
+}
+
 fn open_db(app: &AppHandle) -> Result<Connection, String> {
-    let db_path = resolve_db_path(app)?;
-    let conn = Connection::open(db_path).map_err(|e| format!("Failed to open SQLite DB: {}", e))?;
-
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|e| format!("Failed to set journal_mode=WAL: {}", e))?;
-    conn.pragma_update(None, "synchronous", "NORMAL")
-        .map_err(|e| format!("Failed to set synchronous=NORMAL: {}", e))?;
-    conn.pragma_update(None, "temp_store", "MEMORY")
-        .map_err(|e| format!("Failed to set temp_store=MEMORY: {}", e))?;
-    conn.busy_timeout(Duration::from_millis(3000))
-        .map_err(|e| format!("Failed to set busy timeout: {}", e))?;
-
+    let conn = database::open(app)?;
     ensure_projects_table(&conn)?;
     Ok(conn)
 }

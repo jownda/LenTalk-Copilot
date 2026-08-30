@@ -44,9 +44,6 @@ function App() {
   const [showUpdateDialog, setShowUpdateDialog] = useState(false);
   const [latestVersion, setLatestVersion] = useState<string>('');
   const [currentVersion, setCurrentVersion] = useState<string>('');
-  const [updateDownloadUrl, setUpdateDownloadUrl] = useState<string | undefined>();
-  const [updateReleaseUrl, setUpdateReleaseUrl] = useState<string | undefined>();
-  const [updateReleaseNotes, setUpdateReleaseNotes] = useState<string | undefined>();
   const [globalError, setGlobalError] = useState<GlobalErrorDialogDetail | null>(null);
 
   const isHydrated = useProjectStore((state) => state.isHydrated);
@@ -158,9 +155,6 @@ function App() {
         }
         setLatestVersion(result.latestVersion ?? '');
         setCurrentVersion(result.currentVersion ?? '');
-        setUpdateDownloadUrl(result.downloadUrl);
-        setUpdateReleaseUrl(result.releaseUrl);
-        setUpdateReleaseNotes(result.releaseNotes);
         setShowUpdateDialog(true);
       }
     };
@@ -179,9 +173,6 @@ function App() {
 
     setLatestVersion(result.latestVersion ?? '');
     setCurrentVersion(result.currentVersion ?? '');
-    setUpdateDownloadUrl(result.downloadUrl);
-    setUpdateReleaseUrl(result.releaseUrl);
-    setUpdateReleaseNotes(result.releaseNotes);
 
     if (enableUpdateDialog) {
       setShowUpdateDialog(true);
@@ -224,7 +215,7 @@ function App() {
           onBackClick={closeProject}
         />
 
-        <main className="flex-1 relative">{currentProjectId ? <Canvas /> : <ProjectManager />}</main>
+        <main className="relative min-h-0 min-w-0 flex-1">{currentProjectId ? <Canvas /> : <ProjectManager />}</main>
 
         <SettingsDialog
           isOpen={showSettings}
@@ -238,9 +229,6 @@ function App() {
           onClose={() => setShowUpdateDialog(false)}
           latestVersion={latestVersion}
           currentVersion={currentVersion}
-          downloadUrl={updateDownloadUrl}
-          releaseUrl={updateReleaseUrl}
-          releaseNotes={updateReleaseNotes}
           onApplyIgnore={handleApplyIgnore}
         />
         <GlobalErrorDialog

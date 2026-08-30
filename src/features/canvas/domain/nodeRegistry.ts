@@ -2,6 +2,8 @@ import {
   AUTO_REQUEST_ASPECT_RATIO,
   CANVAS_NODE_TYPES,
   DEFAULT_ASPECT_RATIO,
+  EXPORT_RESULT_NODE_DEFAULT_WIDTH,
+  EXPORT_RESULT_NODE_LAYOUT_HEIGHT,
   type AudioNodeData,
   type CinematicStudioNodeData,
   type DirectorDeskNodeData,
@@ -193,7 +195,8 @@ const audioNodeDefinition: CanvasNodeDefinition<AudioNodeData> = {
   type: CANVAS_NODE_TYPES.audio,
   menuLabelKey: 'node.menu.audio',
   menuIcon: 'music',
-  visibleInMenu: true,
+  // 本地上传统一入口会根据文件类型创建媒体节点;媒体节点本身仍可由素材库和生成流程创建。
+  visibleInMenu: false,
   capabilities: {
     toolbar: true,
     promptInput: false,
@@ -213,7 +216,8 @@ const audioNodeDefinition: CanvasNodeDefinition<AudioNodeData> = {
     aspectRatio: DEFAULT_ASPECT_RATIO,
     mediaType: 'audio',
   }),
-  defaultSize: { width: 320, height: 250 },
+  // 媒体节点与图片结果节点保持同一紧凑尺寸, 避免本地视频占满画布。
+  defaultSize: { width: EXPORT_RESULT_NODE_DEFAULT_WIDTH, height: EXPORT_RESULT_NODE_LAYOUT_HEIGHT },
 };
 
 const textAnnotationNodeDefinition: CanvasNodeDefinition<TextAnnotationNodeData> = {
@@ -475,10 +479,10 @@ export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition>
   [CANVAS_NODE_TYPES.textAnnotation]: textAnnotationNodeDefinition,
   [CANVAS_NODE_TYPES.group]: groupNodeDefinition,
   [CANVAS_NODE_TYPES.storyboardSplit]: storyboardSplitDefinition,
+  [CANVAS_NODE_TYPES.cinematicStudio]: cinematicStudioNodeDefinition,
   [CANVAS_NODE_TYPES.storyboardGen]: storyboardGenNodeDefinition,
   [CANVAS_NODE_TYPES.panorama]: panoramaNodeDefinition,
   [CANVAS_NODE_TYPES.directorDesk]: directorDeskNodeDefinition,
-  [CANVAS_NODE_TYPES.cinematicStudio]: cinematicStudioNodeDefinition,
   [CANVAS_NODE_TYPES.audio]: audioNodeDefinition,
   [CANVAS_NODE_TYPES.promptOptimizer]: promptOptimizerNodeDefinition,
   [CANVAS_NODE_TYPES.seamlessMosaic]: seamlessMosaicNodeDefinition,

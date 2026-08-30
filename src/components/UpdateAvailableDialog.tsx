@@ -11,9 +11,6 @@ interface UpdateAvailableDialogProps {
   onClose: () => void;
   latestVersion?: string;
   currentVersion?: string;
-  downloadUrl?: string;
-  releaseUrl?: string;
-  releaseNotes?: string;
   onApplyIgnore?: (mode: UpdateIgnoreMode) => void;
 }
 
@@ -22,7 +19,6 @@ export function UpdateAvailableDialog({
   onClose,
   latestVersion,
   currentVersion,
-  releaseNotes,
   onApplyIgnore
 }: UpdateAvailableDialogProps) {
   const { t } = useTranslation();
@@ -97,20 +93,14 @@ export function UpdateAvailableDialog({
       {updateState === 'error' && updateError && (
         <p className="mb-3 text-xs text-red-400">{updateError}</p>
       )}
-      <div className="text-sm text-text-muted leading-6">
-        <p>{t('update.dialogDescription')}</p>
+      <div className="text-sm leading-6">
         {(latestVersion || currentVersion) && (
-          <p className="mt-2 text-xs">
+          <p className="text-xs text-text-muted">
             {t('update.versionLine', {
               currentVersion: currentVersion ?? '-',
               latestVersion: latestVersion ?? '-'
             })}
           </p>
-        )}
-        {releaseNotes && (
-          <div className="mt-3 max-h-32 overflow-y-auto whitespace-pre-wrap rounded-md bg-bg-dark/60 px-3 py-2 text-xs leading-5 text-text-muted">
-            {releaseNotes}
-          </div>
         )}
         <div className="mt-3">
           <p className="mb-1 text-xs text-text-muted">{t('update.ignoreRule')}</p>

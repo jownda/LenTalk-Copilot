@@ -123,23 +123,45 @@ export function listVideoModels(): VideoModelDefinition[] {
     ])).map((model) => {
       const modelId = buildCustomModelId(api.id, model);
       const profile = resolveVideoModelProfile(modelId);
+      const normalizedModel = model.trim().toLowerCase();
       const isZzdh = api.id.trim().toLowerCase() === 'zizidonghua'
         || api.baseUrl.trim().toLowerCase().includes('zizidonghua.com');
+      const isSub2Api = api.id.trim().toLowerCase() === 'sub2api-video'
+        || api.baseUrl.trim().toLowerCase().includes('video.rjm.us.ci');
+      const sub2ApiDuration = normalizedModel === 'seedance2.5'
+        ? 30
+        : normalizedModel === 'seedance2.0'
+          ? 15
+          : undefined;
+      const isSub2ApiSeedance = isSub2Api && sub2ApiDuration !== undefined;
       const modelResolution = model.trim().match(/(?:^|[-_])(480p|720p|1080p|2k)(?:[-_]|$)/i)?.[1]?.toLowerCase();
-      const resolutionValues = isZzdh
-        ? (modelResolution ? [modelResolution] : ['720p', '1080p'])
-        : undefined;
+      const resolutionValues = isSub2ApiSeedance
+        ? ['720p']
+        : isZzdh
+          ? (modelResolution ? [modelResolution] : ['720p', '1080p'])
+          : undefined;
+      const aspectRatios = isSub2ApiSeedance
+        ? ['16:9', '9:16']
+        : CUSTOM_ASPECT_RATIOS;
+      const durationOptions = sub2ApiDuration !== undefined
+        ? [sub2ApiDuration]
+        : Array.from({ length: 30 }, (_, index) => index + 1);
+      const displayModelName = normalizedModel === 'seedance2.5'
+        ? 'Seedance 2.5'
+        : normalizedModel === 'seedance2.0'
+          ? 'Seedance 2.0'
+          : model;
       return {
         id: modelId,
         mediaType: 'video' as const,
-        displayName: `${api.name} · ${model}`,
+        displayName: `${api.name} · ${displayModelName}`,
         providerId: buildCustomProviderId(api.id),
-        description: `${api.name} · ${model}`,
+        description: `${api.name} · ${displayModelName}`,
         expectedDurationMs: 180000,
-        aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
+        aspectRatios: aspectRatios.map((value) => ({ value, label: value })),
         defaultAspectRatio: '16:9',
-        durationOptions: Array.from({ length: 30 }, (_, index) => index + 1),
-        defaultDuration: 5,
+        durationOptions,
+        defaultDuration: sub2ApiDuration ?? 5,
         ...(resolutionValues ? {
           resolutions: resolutionValues.map((value) => ({
             value,

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from 'react';
 import StudioApp, { type CinematicStudioAppStateSnapshot } from './app/App';
 import type { CanvasAudioSource } from './app/components/AssetLibrary';
+import type { CanvasImageSource } from './app/components/DirectorLayersCard';
 import './app/styles.css';
 
 export interface CinematicStudioWorkbenchProps {
@@ -8,13 +9,14 @@ export interface CinematicStudioWorkbenchProps {
   onStateChange?: (snapshot: CinematicStudioAppStateSnapshot) => void;
   onSendToVideo?: (payload: { prompt: string; referenceImages: string[]; referenceAudio: string[] }) => void;
   canvasAudioSources?: CanvasAudioSource[];
+  canvasImageSources?: CanvasImageSource[];
 }
 
 /**
- * 电影提示词工作室全屏嵌入层。顶层留有 LenTalk 标题栏高度(top-10),
+ * 提示词工作室全屏嵌入层。顶层留有 LenTalk 标题栏高度(top-10),
  * 与 3D 导演台保持一致;样式通过 .cinematic-studio-app 作用域隔离。
  */
-export function CinematicStudioWorkbench({ onClose, onStateChange, onSendToVideo, canvasAudioSources }: CinematicStudioWorkbenchProps) {
+export function CinematicStudioWorkbench({ onClose, onStateChange, onSendToVideo, canvasAudioSources, canvasImageSources }: CinematicStudioWorkbenchProps) {
   const latestSnapshot = useRef<CinematicStudioAppStateSnapshot>({});
 
   const handleStateChange = useCallback(
@@ -52,7 +54,7 @@ export function CinematicStudioWorkbench({ onClose, onStateChange, onSendToVideo
       }}
     >
       <main className="cinematic-studio-body">
-        <StudioApp onClose={handleClose} onStateChange={handleStateChange} onSendToVideo={onSendToVideo} canvasAudioSources={canvasAudioSources} />
+        <StudioApp onClose={handleClose} onStateChange={handleStateChange} onSendToVideo={onSendToVideo} canvasAudioSources={canvasAudioSources} canvasImageSources={canvasImageSources} />
       </main>
     </div>
   );

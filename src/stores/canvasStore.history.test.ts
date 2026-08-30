@@ -133,4 +133,66 @@ describe('canvasStore history (undo/redo)', () => {
     expect(state.history.past.length).toBe(1);
     expect(state.history.future.length).toBe(1);
   });
+
+  it('图片生成完成后 undo 不会恢复生成中节点或删除图片', () => {
+    const sourceId = addTextNode();
+    const resultId = useCanvasStore.getState().addNode('exportImageNode', { x: 400, y: 100 }, {
+      isGenerating: true,
+      generationRequest: {
+        kind: 'image',
+        prompt: '生成一张图',
+        model: 'test/image',
+        size: '1K',
+        aspectRatio: '1:1',
+      },
+    });
+    useCanvasStore.getState().addEdge(sourceId, resultId);
+    useCanvasStore.getState().updateNodeData(resultId, { generationJobId: 'job-1' });
+    useCanvasStore.getState().updateNodeDataTransient(resultId, {
+      imageUrl: 'file:///generated.png',
+      isGenerating: false,
+      generationResultProtected: true,
+    });
+
+    expect(useCanvasStore.getState().undo()).toBe(true);
+    const result = useCanvasStore.getState().nodes.find((node) => node.id === resultId);
+    expect(result?.data.imageUrl).toBe('file:///generated.png');
+    expect(result?.data.isGenerating).toBe(false);
+    expect(useCanvasStore.getState().nodes.some((node) => node.id === resultId)).toBe(true);
+  });
+
+  it('视频生成完成后 undo 不会删除视频结果', () => {
+    const sourceId = addTextNode();
+    const resultId = useCanvasStore.getState().addNode('audioNode', { x: 400, y: 100 }, {
+      mediaType: 'video',
+      isGenerating: true,
+      generationRequest: {
+        kind: 'video',
+        prompt: '生成一段视频',
+        model: 'test/video',
+        duration: 5,
+        aspectRatio: '16:9',
+      },
+    });
+    useCanvasStore.getState().addEdge(sourceId, resultId);
+    useCanvasStore.getState().updateNodeDataTransient(resultId, {
+      sourcePath: 'file:///generated.mp4',
+      isGenerating: false,
+      generationResultProtected: true,
+    });
+
+    expect(useCanvasStore.getState().undo()).toBe(true);
+    const result = useCanvasStore.getState().nodes.find((node) => node.id === resultId);
+    expect(result?.data.sourcePath).toBe('file:///generated.mp4');
+    expect(useCanvasStore.getState().nodes.some((node) => node.id === resultId)).toBe(true);
+  });
+
+  it('普通上传图片不受生成结果保护影响', () => {
+    const resultId = useCanvasStore.getState().addNode('uploadNode', { x: 100, y: 100 }, {
+      imageUrl: 'file:///uploaded.png',
+    });
+
+    expect(useCanvasStore.getState().undo()).toBe(true);
+    expect(useCanvasStore.getState().nodes.some((node) => node.id === resultId)).toBe(false);
+  });
 });

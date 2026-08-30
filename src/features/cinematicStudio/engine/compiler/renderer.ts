@@ -453,7 +453,11 @@ export function renderAxisBreakNote(shot: ShotV2, locale: PromptLocale = "zh"): 
   const lex = promptLexicon(locale);
   const note = shot.layout.axisNote?.trim();
   if (locale === "zh") {
-    return note ? `${lex.labels.axisBreak}：${note}。` : "故意越轴：屏幕方向有意反向。";
+    return note
+      ? `${lex.labels.axisBreak}：摄影机有意跨过180°轴线；${note}。`
+      : "故意越轴：摄影机有意跨过180°轴线，允许屏幕方向反向。";
   }
-  return note ? `${lex.labels.axisBreak}: ${note}.` : "Intentional axis break: screen direction reverses on purpose.";
+  return note
+    ? `${lex.labels.axisBreak}: the camera intentionally crosses the 180-degree line; ${note}.`
+    : "Intentional axis break: the camera intentionally crosses the 180-degree line, allowing screen direction to reverse.";
 }

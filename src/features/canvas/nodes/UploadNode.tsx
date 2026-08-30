@@ -58,15 +58,27 @@ function resolveNodeDimension(value: number | undefined, fallback: number): numb
   return fallback;
 }
 
-function resolveDroppedImageFile(event: DragEvent<HTMLElement>): File | null {
+type LocalUploadMediaType = 'image' | 'video' | 'audio';
+
+function resolveLocalUploadMediaType(file: File): LocalUploadMediaType | null {
+  if (file.type.startsWith('image/')) return 'image';
+  if (file.type.startsWith('video/')) return 'video';
+  if (file.type.startsWith('audio/')) return 'audio';
+
+  const extension = file.name.split('.').pop()?.toLowerCase() ?? '';
+  if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif', 'heic', 'heif'].includes(extension)) return 'image';
+  if (['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv'].includes(extension)) return 'video';
+  if (['mp3', 'm4a', 'wav', 'aac', 'flac', 'ogg'].includes(extension)) return 'audio';
+  return null;
+}
+
+function resolveDroppedLocalFile(event: DragEvent<HTMLElement>): File | null {
   const directFile = event.dataTransfer.files?.[0];
   if (directFile) {
     return directFile;
   }
 
-  const item = Array.from(event.dataTransfer.items || []).find(
-    (candidate) => candidate.kind === 'file' && candidate.type.startsWith('image/')
-  );
+  const item = Array.from(event.dataTransfer.items || []).find((candidate) => candidate.kind === 'file');
   return item?.getAsFile() ?? null;
 }
 
@@ -125,6 +137,19 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
 
   const processFile = useCallback(
     async (file: File) => {
+      const mediaType = resolveLocalUploadMediaType(file);
+      if (!mediaType) {
+        return;
+      }
+      if (mediaType !== 'image') {
+        canvasEventBus.publish('upload-node/convert-media', {
+          nodeId: id,
+          file,
+          mediaType,
+        });
+        return;
+      }
+
       const sequence = uploadSequenceRef.current + 1;
       uploadSequenceRef.current = sequence;
       const started = performance.now();
@@ -230,8 +255,8 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
     async (event: DragEvent<HTMLElement>) => {
       event.preventDefault();
       event.stopPropagation();
-      const file = resolveDroppedImageFile(event);
-      if (!file || !file.type.startsWith('image/')) {
+      const file = resolveDroppedLocalFile(event);
+      if (!file || !resolveLocalUploadMediaType(file)) {
         return;
       }
 
@@ -246,9 +271,9 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
   }, []);
 
   const handleFileChange = useCallback(
-    async (event: ChangeEvent<HTMLInputElement>) => {
+      async (event: ChangeEvent<HTMLInputElement>) => {
       const file = event.target.files?.[0];
-      if (!file || !file.type.startsWith('image/')) {
+      if (!file || !resolveLocalUploadMediaType(file)) {
         return;
       }
 
@@ -278,10 +303,16 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
 
   const handleNodeClick = useCallback(() => {
     setSelectedNode(id);
-    if (!data.imageUrl && !transientPreviewUrl) {
-      inputRef.current?.click();
+  }, [id, setSelectedNode]);
+
+  const handleNodeDoubleClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement | null;
+    if (target?.closest('button, input, textarea, select, .react-flow__handle')) {
+      return;
     }
-  }, [data.imageUrl, id, setSelectedNode, transientPreviewUrl]);
+    event.stopPropagation();
+    inputRef.current?.click();
+  }, []);
 
   useEffect(() => () => {
     uploadPerfRef.current = null;
@@ -313,6 +344,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
       `}
       style={{ width: resolvedWidth, height: resolvedHeight }}
       onClick={handleNodeClick}
+      onDoubleClick={handleNodeDoubleClick}
       onDrop={handleDrop}
       onDragOver={handleDragOver}
     >
@@ -349,7 +381,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
       <input
         ref={inputRef}
         type="file"
-        accept="image/*"
+        accept="image/*,video/*,audio/*"
         className="hidden"
         onChange={handleFileChange}
       />

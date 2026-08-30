@@ -2,11 +2,47 @@ import { v4 as uuid } from 'uuid';
 import { isTauri } from '@tauri-apps/api/core';
 
 import { persistLibraryAssetBinary, extractVideoThumbnail } from '@/commands/assetLibrary';
-import { imageUrlToDataUrl, prepareNodeImageFromFile, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
+import {
+  blobToDataUrl,
+  createPreviewDataUrl,
+  detectAspectRatio,
+  imageUrlToDataUrl,
+  resolveImageDisplayUrl,
+} from '@/features/canvas/application/imageData';
 import { ASSET_LIBRARY_MIME_PREFIX, type AssetMediaType, type LibraryAsset } from './types';
 
 export function createAssetId(): string {
   return `asset-${uuid().slice(0, 12)}`;
+}
+
+async function persistImageBlobForLibrary(
+  blob: Blob,
+  extension: string
+): Promise<{ sourcePath: string; previewImageUrl: string; aspectRatio: string }> {
+  const sourceDataUrl = await blobToDataUrl(blob);
+  const aspectRatio = await detectAspectRatio(sourceDataUrl);
+  const previewDataUrl = await createPreviewDataUrl(sourceDataUrl);
+
+  if (!isTauri()) {
+    return {
+      sourcePath: sourceDataUrl,
+      previewImageUrl: previewDataUrl,
+      aspectRatio,
+    };
+  }
+
+  // 素材库图片必须使用独立目录，不能复用画布的 images 目录。
+  const sourcePath = await persistLibraryAssetBinary(
+    new Uint8Array(await blob.arrayBuffer()),
+    extension
+  );
+  const previewResponse = await fetch(previewDataUrl);
+  const previewBlob = await previewResponse.blob();
+  const previewImageUrl = await persistLibraryAssetBinary(
+    new Uint8Array(await previewBlob.arrayBuffer()),
+    'png'
+  );
+  return { sourcePath, previewImageUrl, aspectRatio };
 }
 
 /**
@@ -28,17 +64,16 @@ export async function importImageUrlToAsset(
     const blob = await response.blob();
     const extension = blob.type.split('/')[1] ?? 'png';
     const fileName = `canvas-image-${Date.now()}.${extension}`;
-    const file = new File([blob], fileName, { type: blob.type || 'image/png' });
-    const prepared = await prepareNodeImageFromFile(file);
+    const stored = await persistImageBlobForLibrary(blob, extension);
     return {
       id: createAssetId(),
       libraryId,
       categoryId,
       name: `画布图片 ${new Date().toLocaleTimeString()}`,
       mediaType: 'image',
-      sourcePath: prepared.imageUrl,
-      previewImageUrl: prepared.previewImageUrl,
-      aspectRatio: prepared.aspectRatio || '1:1',
+      sourcePath: stored.sourcePath,
+      previewImageUrl: stored.previewImageUrl,
+      aspectRatio: stored.aspectRatio || '1:1',
       sourceFileName: fileName,
       tags: [],
       createdAt: Date.now(),
@@ -249,16 +284,16 @@ export async function importFilesToAssets(
     try {
       const createdAt = Date.now();
       if (mediaType === 'image') {
-        const prepared = await prepareNodeImageFromFile(file);
+        const stored = await persistImageBlobForLibrary(file, extensionForFile(file));
         imported.push({
           id: createAssetId(),
           libraryId,
           categoryId,
           name: assetNameFromFile(file),
           mediaType,
-          sourcePath: prepared.imageUrl,
-          previewImageUrl: prepared.previewImageUrl,
-          aspectRatio: prepared.aspectRatio || '1:1',
+          sourcePath: stored.sourcePath,
+          previewImageUrl: stored.previewImageUrl,
+          aspectRatio: stored.aspectRatio || '1:1',
           sourceFileName: file.name,
           tags: [],
           createdAt,

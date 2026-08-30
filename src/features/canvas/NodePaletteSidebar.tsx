@@ -21,13 +21,12 @@ export function NodePaletteSidebar({ open, onToggle, onSelect }: NodePaletteSide
 
   return (
     <aside
-      className={`absolute left-3 top-3 z-30 flex max-h-[calc(100%-24px)] w-56 flex-col overflow-hidden rounded-lg border border-border-dark bg-surface-dark shadow-xl transition-transform duration-150 ${
+      className={`absolute left-3 top-3 z-30 flex max-h-[calc(100%-24px)] w-12 flex-col overflow-hidden rounded-lg border border-border-dark bg-surface-dark shadow-xl transition-transform duration-150 ${
         open ? 'translate-x-0' : '-translate-x-[calc(100%+16px)]'
       }`}
       aria-label={t('canvas.nodePalette.title', '节点')}
     >
-      <div className="flex h-10 shrink-0 items-center justify-between border-b border-border-dark px-3">
-        <span className="text-sm font-medium text-text-dark">{t('canvas.nodePalette.title', '节点')}</span>
+      <div className="flex h-10 shrink-0 items-center justify-center border-b border-border-dark">
         <button
           type="button"
           className="flex h-7 w-7 items-center justify-center rounded text-text-muted transition-colors hover:bg-bg-dark hover:text-text-dark"
@@ -46,8 +45,9 @@ export function NodePaletteSidebar({ open, onToggle, onSelect }: NodePaletteSide
               key={item.type}
               type="button"
               draggable
-              className="flex w-full cursor-grab items-center gap-2.5 rounded px-2 py-2 text-left transition-colors hover:bg-bg-dark active:cursor-grabbing"
+              className="flex min-h-12 w-full cursor-grab flex-col items-center justify-center gap-0.5 rounded px-0.5 py-1 transition-colors hover:bg-bg-dark active:cursor-grabbing"
               title={t(item.menuLabelKey)}
+              aria-label={t(item.menuLabelKey)}
               onClick={() => onSelect(item.type)}
               onDragStart={(event) => {
                 event.dataTransfer.setData(CANVAS_NODE_DRAG_DATA_TYPE, item.type);
@@ -57,7 +57,9 @@ export function NodePaletteSidebar({ open, onToggle, onSelect }: NodePaletteSide
               <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-bg-dark">
                 <Icon className="h-4 w-4 text-accent" />
               </span>
-              <span className="truncate text-xs text-text-dark">{t(item.menuLabelKey)}</span>
+              <span className="w-full break-words text-center text-[10px] leading-3 text-text-dark">
+                {t(item.menuLabelKey)}
+              </span>
             </button>
           );
         })}

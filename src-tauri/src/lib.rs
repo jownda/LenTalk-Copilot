@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod commands;
+pub mod database;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -99,6 +100,8 @@ pub fn run() {
             show_main_window(&window.app_handle());
         })
         .setup(|app| {
+            database::initialize(app.handle())?;
+
             let window_config = app
                 .config()
                 .app
@@ -167,6 +170,11 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
+            database::load_app_setting,
+            database::save_app_setting,
+            database::delete_app_setting,
+            database::load_cinematic_project,
+            database::save_cinematic_project,
             image::split_image,
             image::split_image_source,
             image::prepare_node_image_source,

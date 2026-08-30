@@ -1,15 +1,14 @@
 // ---------------------------------------------------------------------------
 // 用量/扣费记录(账单)
 // 每次 AI 生成(图片/视频)完成或失败时写一条记录, 供「账单」抽屉查询核对。
-// 表与项目数据共用 projects.db; 费用为本地估算值(基于模型定价), 仅作参考,
+// 表与项目数据共用统一 lentalk.db; 费用为本地估算值(基于模型定价), 仅作参考,
 // 实际扣费以平台账单为准。
 // ---------------------------------------------------------------------------
-use std::path::PathBuf;
-
 use rusqlite::{params, Connection};
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+
+use crate::database;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,18 +43,6 @@ pub struct UsageLogSummary {
     pub month_cost: f64,
 }
 
-fn resolve_db_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
-
-    std::fs::create_dir_all(&app_data_dir)
-        .map_err(|e| format!("Failed to create app data dir: {}", e))?;
-
-    Ok(app_data_dir.join("projects.db"))
-}
-
 fn ensure_usage_log_table(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         r#"
@@ -87,14 +74,7 @@ fn ensure_usage_log_table(conn: &Connection) -> Result<(), String> {
 }
 
 fn open_connection(app: &AppHandle) -> Result<Connection, String> {
-    let db_path = resolve_db_path(app)?;
-    let conn = Connection::open(db_path).map_err(|e| format!("Failed to open db: {}", e))?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|e| format!("Failed to set journal_mode=WAL: {}", e))?;
-    conn.pragma_update(None, "synchronous", "NORMAL")
-        .map_err(|e| format!("Failed to set synchronous=NORMAL: {}", e))?;
-    conn.busy_timeout(Duration::from_millis(3000))
-        .map_err(|e| format!("Failed to set busy timeout: {}", e))?;
+    let conn = database::open(app)?;
     ensure_usage_log_table(&conn)?;
     Ok(conn)
 }

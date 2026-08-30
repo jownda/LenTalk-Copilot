@@ -2,6 +2,8 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from '@/stores/settingsStore';
 import type { CustomApiCapabilities } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
+import { isKnownOpenAiImagesBaseUrl } from '@/features/settings/recommendedApis';
+import { persistImageBinary } from '@/commands/image';
 
 export interface GenerateRequest {
   prompt: string;
@@ -427,6 +429,13 @@ interface ProviderJsonResponse {
   text(): Promise<string>;
 }
 
+interface ProviderBinaryResponse {
+  ok: boolean;
+  status: number;
+  bytes: Uint8Array;
+  text(): Promise<string>;
+}
+
 /**
  * Desktop provider requests must use Rust's native HTTP client. A number of
  * custom video gateways do not enable CORS, so WebView fetch is only retained
@@ -459,6 +468,44 @@ export async function requestProviderJson(
     status: result.status,
     text: async () => result.body,
   };
+}
+
+async function requestProviderBinary(
+  url: string,
+  init: { method?: string; headers?: Record<string, string> }
+): Promise<ProviderBinaryResponse> {
+  if (!isTauri()) {
+    const response = await fetch(url, init);
+    return {
+      ok: response.ok,
+      status: response.status,
+      bytes: new Uint8Array(await response.arrayBuffer()),
+      text: () => response.text(),
+    };
+  }
+
+  const result = await invoke<{ status: number; body: string; body_base64?: string | null }>('request_provider_json', {
+    url,
+    method: init.method ?? 'GET',
+    headers: init.headers ?? {},
+    responseEncoding: 'base64',
+  });
+  const encoded = result.body_base64 ?? '';
+  const binary = encoded ? atob(encoded) : '';
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return {
+    ok: result.status >= 200 && result.status < 300,
+    status: result.status,
+    bytes,
+    text: async () => new TextDecoder().decode(bytes),
+  };
+}
+
+async function persistSub2ApiVideo(bytes: Uint8Array): Promise<string> {
+  if (isTauri()) {
+    return await persistImageBinary(bytes, 'mp4');
+  }
+  return URL.createObjectURL(new Blob([bytes], { type: 'video/mp4' }));
 }
 
 /** 把图片宽高映射到 zzdh 支持的画幅标签(取最接近) */
@@ -575,6 +622,181 @@ async function generateZzdhVideo(
   }
 }
 
+function extractSub2ApiUploadImageId(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null;
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const imageId = extractSub2ApiUploadImageId(item);
+      if (imageId) return imageId;
+    }
+    return null;
+  }
+  const record = payload as Record<string, unknown>;
+  const imageId = record.image_id ?? record.imageId;
+  if (typeof imageId === 'string' && imageId.trim()) return imageId.trim();
+  for (const key of ['data', 'file', 'result']) {
+    const nestedId = extractSub2ApiUploadImageId(record[key]);
+    if (nestedId) return nestedId;
+  }
+  return null;
+}
+
+function getDataUrlBase64(source: string): string | null {
+  const match = source.trim().match(/^data:[^;,]+(?:;[^,]*)?;base64,([a-z0-9+/=]+)$/i);
+  return match?.[1] ?? null;
+}
+
+async function uploadSub2ApiReferenceImage(
+  source: string,
+  baseUrl: string,
+  headers: Record<string, string>
+): Promise<string> {
+  const imageB64 = getDataUrlBase64(source);
+  if (!imageB64) {
+    throw new Error('Sub2API 本地参考图必须转换为 Base64 图片数据后上传');
+  }
+  const uploadUrl = `${baseUrl}/v1/files`;
+  const response = await requestProviderJson(uploadUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ image_b64: imageB64 }),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`Sub2API 参考图上传失败: 平台返回了非 JSON 响应 (${uploadUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`Sub2API 参考图上传失败: ${buildHttpErrorSummary(response.status, rawResponse, uploadUrl)}`);
+  }
+  const imageId = extractSub2ApiUploadImageId(payload);
+  if (!imageId) {
+    throw new Error(`Sub2API 参考图上传响应中未找到 image_id: ${describeVideoResponse(payload)}`);
+  }
+  return imageId;
+}
+
+async function generateSub2ApiVideo(
+  request: GenerateVideoRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>
+): Promise<string> {
+  if (request.reference_audio?.length) {
+    throw new Error('Sub2API 当前推荐的 Seedance 视频链路只支持图片参考，暂不提交音频参考。');
+  }
+  const videoImages = request.image_mode === 'first-last'
+    ? request.reference_images?.slice(0, 2)
+    : request.reference_images;
+  const imageIds: string[] = [];
+  const imageUrls: string[] = [];
+  for (const source of videoImages ?? []) {
+    if (/^https:\/\//i.test(source.trim())) {
+      imageUrls.push(source.trim());
+    } else {
+      imageIds.push(await uploadSub2ApiReferenceImage(source, baseUrl, headers));
+    }
+  }
+
+  const submitUrl = resolveProviderEndpoint(
+    baseUrl,
+    request.extra_params?.video_submit_path,
+    '/v1/videos'
+  );
+  const normalizedApiModel = apiModel.trim().toLowerCase();
+  const fixedSeedanceDuration = normalizedApiModel === 'seedance2.5'
+    ? 30
+    : normalizedApiModel === 'seedance2.0'
+      ? 15
+      : undefined;
+  const isFixedSeedanceModel = fixedSeedanceDuration !== undefined;
+  const ratio = isFixedSeedanceModel && (request.aspect_ratio === '16:9' || request.aspect_ratio === '9:16')
+    ? request.aspect_ratio
+    : isFixedSeedanceModel
+      ? '16:9'
+      : request.aspect_ratio;
+  const idempotencyKey = request.extra_params?.client_job_id;
+  const response = await requestProviderJson(submitUrl, {
+    method: 'POST',
+    headers: {
+      ...headers,
+      'Idempotency-Key': typeof idempotencyKey === 'string' && idempotencyKey.trim()
+        ? idempotencyKey.trim()
+        : crypto.randomUUID(),
+    },
+    body: JSON.stringify({
+      model: apiModel,
+      prompt: request.prompt,
+      duration: fixedSeedanceDuration ?? Math.max(1, Math.round(request.duration)),
+      ratio,
+      ...(isFixedSeedanceModel
+        ? { resolution: '720p' }
+        : request.video_resolution?.trim()
+          ? { resolution: request.video_resolution.trim() }
+          : {}),
+      camera_movement: 'auto',
+      ...(imageIds.length ? { image_ids: imageIds } : {}),
+      ...(imageUrls.length ? { images: imageUrls } : {}),
+    }),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`Sub2API 视频请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`Sub2API 视频请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  }
+  const immediateResult = getVideoResultUrl(payload);
+  if (immediateResult) return immediateResult;
+  const taskId = getVideoTaskId(payload);
+  if (!taskId) {
+    throw new Error(`Sub2API 视频响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
+  }
+
+  const taskUrl = resolveProviderEndpoint(
+    baseUrl,
+    request.extra_params?.video_query_path,
+    '/v1/videos/{taskId}',
+    taskId
+  );
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    const taskResponse = await requestProviderJson(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    try {
+      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`Sub2API 视频查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`Sub2API 视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const videoUrl = getVideoResultUrl(payload);
+    if (videoUrl) return videoUrl;
+    const status = getVideoTaskStatus(payload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`Sub2API 视频生成失败: ${status}`);
+    }
+    if (['COMPLETED', 'COMPLETE', 'SUCCESS', 'SUCCEEDED', 'DONE'].includes(status)) {
+      const contentUrl = `${taskUrl}/content`;
+      const contentResponse = await requestProviderBinary(contentUrl, { headers });
+      if (!contentResponse.ok) {
+        const contentText = await contentResponse.text();
+        throw new Error(`Sub2API 视频下载失败: ${buildHttpErrorSummary(contentResponse.status, contentText, contentUrl)}`);
+      }
+      if (!contentResponse.bytes.length) {
+        throw new Error(`Sub2API 视频下载失败: 内容为空 (${contentUrl})`);
+      }
+      return await persistSub2ApiVideo(contentResponse.bytes);
+    }
+  }
+}
+
 export async function generateVideo(request: GenerateVideoRequest): Promise<string> {
   if (!isCustomModel(request.model)) {
     throw new Error('视频生成仅支持自定义平台(custom:*)模型');
@@ -592,6 +814,9 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
   if (request.extra_params?.video_transport === 'zzdh-v8-video') {
     return await generateZzdhVideo(request, baseUrl, apiModel, headers);
+  }
+  if (request.extra_params?.video_transport === 'sub2api-video') {
+    return await generateSub2ApiVideo(request, baseUrl, apiModel, headers);
   }
   const videoImages = request.image_mode === 'first-last'
     ? request.reference_images?.slice(0, 2)
@@ -738,6 +963,46 @@ function assertWindowsModelSupported(request: GenerateRequest): void {
   }
 }
 
+function uses65535GeminiEdits(
+  providerId: string,
+  apiModel: string,
+  referenceImageCount: number
+): boolean {
+  if (providerId !== 'custom:65535' || referenceImageCount === 0) {
+    return false;
+  }
+  const normalizedModel = apiModel.trim().toLowerCase();
+  return normalizedModel.includes('gemini') && normalizedModel.includes('image');
+}
+
+async function buildBrowserGeminiEditsForm(
+  request: GenerateRequest,
+  apiModel: string,
+  referenceImages: string[]
+): Promise<FormData> {
+  const form = new FormData();
+  form.append('model', apiModel);
+  form.append('prompt', request.prompt);
+  const normalizedSize = request.size.trim().toUpperCase();
+  const size = ['1K', '2K', '4K'].includes(normalizedSize)
+    ? normalizedSize
+    : mapRequestedImageSize(apiModel, request.size, request.aspect_ratio);
+  form.append('size', size);
+  form.append('n', '1');
+  form.append('aspect_ratio', request.aspect_ratio);
+
+  for (const [index, source] of referenceImages.entries()) {
+    const response = await fetch(source);
+    if (!response.ok) {
+      throw new Error(`读取第 ${index + 1} 张参考图失败 (HTTP ${response.status})`);
+    }
+    const blob = await response.blob();
+    const extension = blob.type.split('/')[1]?.split(';')[0] || 'png';
+    form.append('image', blob, `reference-${index + 1}.${extension}`);
+  }
+  return form;
+}
+
 /**
  * 浏览器降级生成:直接调 OpenAI 兼容文生图接口 POST {base}/v1/images/generations。
  * 与 Rust openai_compat provider 行为一致:key 从 settingsStore.apiKeys[providerId] 读,
@@ -771,9 +1036,6 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
   const usesChatProtocol =
     typeof request.extra_params?.protocol === 'string' &&
     request.extra_params.protocol.toLowerCase() === 'chat';
-  const endpoint = `${baseUrl}/v1/${
-    usesResponsesProtocol ? 'responses' : usesChatProtocol ? 'chat/completions' : 'images/generations'
-  }`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 180000);
   try {
@@ -800,6 +1062,16 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
       }
     }
 
+    const useGeminiEdits = uses65535GeminiEdits(providerId, apiModel, referenceImages.length);
+    const endpoint = `${baseUrl}/v1/${
+      usesResponsesProtocol
+        ? 'responses'
+        : usesChatProtocol
+          ? 'chat/completions'
+          : useGeminiEdits
+            ? 'images/edits'
+            : 'images/generations'
+    }`;
     const body: Record<string, unknown> = usesResponsesProtocol
       ? {
           model: apiModel,
@@ -838,15 +1110,24 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
           }
         : buildBrowserImagesRequestBody(request, apiModel, referenceImages);
 
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    const response = useGeminiEdits
+      ? await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: await buildBrowserGeminiEditsForm(request, apiModel, referenceImages),
+          signal: controller.signal,
+        })
+      : await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
 
     let payload: unknown = null;
     try {
@@ -1317,6 +1598,7 @@ export async function detectProviderCapabilities(
   }
 
   const normalized = normalizeBaseUrl(baseUrl);
+  const isKnownOpenAiImages = isKnownOpenAiImagesBaseUrl(normalized);
   const headers: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
   const modelsResponse = await httpFetchWithTimeout(`${normalized}/v1/models`, { method: 'GET', headers });
   if (!modelsResponse.ok) {
@@ -1332,29 +1614,36 @@ export async function detectProviderCapabilities(
       return 0;
     }
   };
-  const [imagesStatus, responsesStatus, chatStatus, videosStatus] = await Promise.all([
-    probe('/v1/images/generations'),
-    probe('/v1/responses'),
-    probe('/v1/chat/completions'),
-    probe('/v1/videos/generations'),
-  ]);
+  const [imagesStatus, responsesStatus, chatStatus, videosStatus] = isKnownOpenAiImages
+    ? [0, 0, 0, 0]
+    : await Promise.all([
+        probe('/v1/images/generations'),
+        probe('/v1/responses'),
+        probe('/v1/chat/completions'),
+        probe('/v1/videos/generations'),
+      ]);
   const hasGptImage = models.some((model) => /gpt-image/i.test(model));
   const probeAvailable = (status: number) => status !== 0 && status !== 404;
-  const imageProtocol = probeAvailable(chatStatus) && !probeAvailable(imagesStatus)
-    ? 'chat'
-    : probeAvailable(responsesStatus) && !probeAvailable(imagesStatus)
-      ? 'responses'
-      : 'images';
-  const imageReferenceField = hasGptImage
-    ? 'input_image'
-    : 'image';
+  const imageProtocol = isKnownOpenAiImages
+    ? 'images'
+    : probeAvailable(chatStatus) && !probeAvailable(imagesStatus)
+      ? 'chat'
+      : probeAvailable(responsesStatus) && !probeAvailable(imagesStatus)
+        ? 'responses'
+        : 'images';
+  const imageReferenceField = isKnownOpenAiImages
+    ? 'image'
+    : hasGptImage
+      ? 'input_image'
+      : 'image';
   const capabilities: CustomApiCapabilities = {
     detectedAt: Date.now(),
     detectionSource: 'probe',
-    confidence: 'low',
+    confidence: isKnownOpenAiImages ? 'high' : 'low',
     imageProtocol: imageProtocol as CustomApiCapabilities['imageProtocol'],
     imageReferenceField,
     imageReferenceEncoding: imageReferenceField === 'input_image' ? 'raw_base64' : 'data_url',
+    imageTransport: isKnownOpenAiImages ? 'generations_json' : 'unknown',
     videoSubmitPath: '/v1/videos/generations',
     videoQueryPath: '/v1/videos/generations/{taskId}',
     videoReferenceEncoding: 'data_url',

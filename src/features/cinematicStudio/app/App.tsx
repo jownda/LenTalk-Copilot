@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, SHOT_TEMPLATES, auditFinalPromptWithProject, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, shotTemplateById, validateDirectorLayers, type FinalPromptAuditIssue } from "../engine";
+import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, auditFinalPromptWithProject, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, validateDirectorLayers, type FinalPromptAuditIssue } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, FinalAuditLogEntry, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
 import { ArrowLeft, AudioLines, ChevronDown, Copy, Download, FileJson, FileText, FolderOpen, PenLine, Plus, Save, Send, X } from "lucide-react";
-import { buildFinalGenerationSource, classifyError, fillSceneDraft, generateFinalPrompt, getAssistant, optimizeSceneBrief, type SceneCompileProgress } from "./providers/ai";
+import { buildFinalGenerationSource, ChatCompletionInterruptedError, classifyError, fillSceneDraft, generateFinalPrompt, getAssistant, optimizeSceneBrief, type SceneCompileProgress } from "./providers/ai";
 import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type AISettings } from "./providers/aiSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { isTauri } from "@tauri-apps/api/core";
 import { loadProjectFromDisk, recordVersionToSqlite, savePromptToDisk, saveProjectToDisk } from "./providers/projectStorage";
-import { loadProject, migrateProject, persistProject } from "./model";
+import { loadProject, loadProjectFromDatabase, migrateProject, persistProject, persistProjectToDatabase } from "./model";
 import { cameraLabels, copy, framingLabels, type CopyZh, type Locale } from "./i18n";
 import AssetLibrary from "./components/AssetLibrary";
 import type { CanvasAudioSource } from "./components/AssetLibrary";
@@ -14,11 +15,12 @@ import BeatEditor from "./components/BeatEditor";
 import ContinuityPanel from "./components/ContinuityPanel";
 import DirectorBriefCard from "./components/DirectorBriefCard";
 import DirectorLayersCard from "./components/DirectorLayersCard";
+import type { CanvasImageSource } from "./components/DirectorLayersCard";
 import ParticipantsEditor from "./components/ParticipantsEditor";
 import PropStateEditor from "./components/PropStateEditor";
 import OpticsCameraEditor from "./components/OpticsCameraEditor";
 import { projectReducer, type ProjectAction } from "./store/projectReducer";
-import { addVersion, loadHistory } from "./store/promptHistory";
+import { addVersion, loadHistory, loadHistoryFromDatabase, persistHistoryToDatabase } from "./store/promptHistory";
 import { collectCinematicMediaReferences } from "../mediaReferences";
 import { findReferenceTokens } from "@/features/canvas/application/referenceTokenEditing";
 
@@ -27,6 +29,12 @@ const newId = () => crypto.randomUUID();
 const DIRECTOR_SEQUENCE_TEMPLATE = "pro-sequence" as const;
 const SHOT_PERF_TIPS = ["perf0Tip", "perf1Tip", "perf2Tip", "perf3Tip", "perf4Tip", "perf5Tip"] as const;
 const SHOT_PERF_KEYS = ["perf0", "perf1", "perf2", "perf3", "perf4", "perf5"] as const;
+
+type ResumeJobKind = "scene" | "final";
+interface ResumeJob {
+  kind: ResumeJobKind;
+  run(): Promise<void>;
+}
 
 function download(name: string, contents: string, type: string) {
   const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([contents], { type })); link.download = name; link.click(); URL.revokeObjectURL(link.href);
@@ -45,17 +53,18 @@ export interface CinematicStudioAppProps {
   onStateChange?: (snapshot: CinematicStudioAppStateSnapshot) => void;
   onSendToVideo?: (payload: { prompt: string; referenceImages: string[]; referenceAudio: string[] }) => void;
   canvasAudioSources?: CanvasAudioSource[];
+  canvasImageSources?: CanvasImageSource[];
 }
 
-export default function App({ onClose, onStateChange, onSendToVideo, canvasAudioSources = [] }: CinematicStudioAppProps = {}) {
+export default function App({ onClose, onStateChange, onSendToVideo, canvasAudioSources = [], canvasImageSources = [] }: CinematicStudioAppProps = {}) {
   const [project, setProject] = useState<ProjectV2>(loadProject);
+  const [projectStorageReady, setProjectStorageReady] = useState(false);
   const [locale, setLocale] = useState<Locale>(() => localStorage.getItem("cineprompt-locale") === "en" ? "en" : "zh");
   const [sceneId, setSceneId] = useState(project.scenes[0].id);
-  const [shotId, setShotId] = useState(project.scenes[0].shots[0].id);
+  const [shotId, setShotId] = useState(project.scenes[0]?.shots[0]?.id ?? "");
   const [prompt, setPrompt] = useState(() => project.compiledPrompt ?? "");
   const [notice, setNotice] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(true);
-  const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
   const [sceneCompileBusy, setSceneCompileBusy] = useState(false);
   const [finalGenerateBusy, setFinalGenerateBusy] = useState(false);
   const [sceneCompileProgress, setSceneCompileProgress] = useState<SceneCompileProgress>("idle");
@@ -63,18 +72,22 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
   const [aiCompileError, setAiCompileError] = useState("");
   const [aiCompileErrorDetail, setAiCompileErrorDetail] = useState("");
   const [aiErrorCopied, setAiErrorCopied] = useState(false);
+  const [resumeAvailable, setResumeAvailable] = useState(false);
+  const [resumeBusy, setResumeBusy] = useState(false);
   const template = DIRECTOR_SEQUENCE_TEMPLATE;
   const [modelProfileId, setModelProfileId] = useState<string>(() => localStorage.getItem("cineprompt-model") ?? "");
   const [, setHistory] = useState<PromptVersion[]>(loadHistory);
   const [aiSettings, setAiSettings] = useState<AISettings>(() => loadAISettings());
   const customApis = useSettingsStore((state) => state.customApis);
-  const chatModels = useMemo(() => listLenTalkChatModels(), [customApis]);
+  const chatModels = listLenTalkChatModels();
   /** 手动覆写文本：编辑器内容与最近编译输出不一致时记录（P2.2） */
   const [manualOverride, setManualOverride] = useState<string | null>(null);
   const [mediaPreview, setMediaPreview] = useState<{ kind: "image" | "audio"; source: string } | null>(null);
   const [promptScrollTop, setPromptScrollTop] = useState(0);
   const [auditDetailsOpen, setAuditDetailsOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const initialProjectRef = useRef(project);
+  const resumeJobRef = useRef<ResumeJob | null>(null);
   const [projectCodeDraft, setProjectCodeDraft] = useState(() => project.projectCode ?? "");
   const scene = project.scenes.find((item) => item.id === sceneId) ?? project.scenes[0];
   const shot = scene.shots.find((item) => item.id === shotId) ?? scene.shots[0];
@@ -82,9 +95,9 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
   const directorLayerIssues = useMemo(() => scene.directorLayers ? validateDirectorLayers(scene.directorLayers, project, scene) : [], [project, scene]);
   const finalAudit = useMemo(() => auditFinalPromptWithProject(scene, project.assets ?? []), [project.assets, scene]);
   const finalAuditErrors = finalAudit.issues.filter((issue) => issue.severity === "error");
-  const continuityExportErrors = issues.filter((issue) => issue.severity === "error");
-  const exportBlockingIssues = [...finalAuditErrors, ...continuityExportErrors];
-  const hasExportErrors = exportBlockingIssues.length > 0;
+  const continuityAuditErrors = issues.filter((issue) => issue.severity === "error");
+  const auditErrorIssues = [...finalAuditErrors, ...continuityAuditErrors];
+  const hasAuditErrors = auditErrorIssues.length > 0;
   const auditStatusDetails = [
     ...finalAudit.issues.map((issue) => locale === "zh" ? issue.detailZh : issue.detail),
     ...issues.map((issue) => locale === "zh" ? (issue.detailZh ?? issue.detail) : issue.detail),
@@ -92,6 +105,71 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
   const t: CopyZh = copy[locale] as CopyZh;
   const selectedChatModel = aiSettings.provider && aiSettings.model ? `${aiSettings.provider}:${aiSettings.model}` : "";
   const mediaReferences = useMemo(() => collectCinematicMediaReferences(project, scene), [project, scene]);
+
+  const clearResume = () => {
+    resumeJobRef.current = null;
+    setResumeAvailable(false);
+  };
+  const registerResume = (error: unknown, kind: ResumeJobKind, apply: (value: unknown) => Promise<void> | void): boolean => {
+    if (!(error instanceof ChatCompletionInterruptedError) || !error.resume) return false;
+    const interrupted = error;
+    resumeJobRef.current = {
+      kind,
+      run: async () => {
+        try {
+          await apply(await interrupted.resume!());
+        } catch (nextError) {
+          if (nextError instanceof ChatCompletionInterruptedError && nextError.resume) {
+            registerResume(nextError, kind, apply);
+          }
+          throw nextError;
+        }
+      },
+    };
+    setResumeAvailable(true);
+    setAiCompileError(t.aiResumeAvailable);
+    setAiCompileErrorDetail(interrupted.message);
+    return true;
+  };
+  const resumeInterrupted = async () => {
+    const job = resumeJobRef.current;
+    if (!job || resumeBusy) return;
+    setResumeBusy(true);
+    setResumeAvailable(false);
+    if (job.kind === "scene") {
+      setSceneCompileBusy(true);
+      setSceneCompileProgress("resuming");
+    } else {
+      setFinalGenerateBusy(true);
+      setSceneCompileProgress("resuming");
+    }
+    try {
+      await job.run();
+      resumeJobRef.current = null;
+      setAiCompileError("");
+      setAiCompileErrorDetail("");
+    } catch (error) {
+      if (error instanceof ChatCompletionInterruptedError && error.resume) {
+        setNotice(t.aiResumeAvailable);
+      } else {
+        const message = error instanceof Error ? error.message : String(error);
+        const classified = classifyError(error);
+        const friendly = classified.kind === "gateway-timeout"
+          ? t.aiGatewayTimeout
+          : classified.kind === "timeout" || classified.kind === "network"
+            ? t.aiRequestInterrupted
+            : message;
+        setNotice(`${job.kind === "scene" ? t.aiCompileFailed : t.aiFinalFailed}${friendly}`);
+        setAiCompileError(friendly);
+        setAiCompileErrorDetail(message);
+      }
+    } finally {
+      if (job.kind === "scene") setSceneCompileBusy(false);
+      else setFinalGenerateBusy(false);
+      setSceneCompileProgress("idle");
+      setResumeBusy(false);
+    }
+  };
 
   /** 结构更新统一走 reducer（Compiler/Continuity 只读不可变快照） */
   const dispatch = (action: ProjectAction) => setProject((prev) => projectReducer(prev, action));
@@ -147,7 +225,46 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
     return labels[action];
   };
 
-  useEffect(() => { persistProject(project); }, [project]);
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      const stored = await loadProjectFromDatabase();
+      if (!active) return;
+      if (stored) {
+        setProject(stored);
+        localStorage.removeItem("cineprompt-project");
+        setSceneId(stored.scenes[0]?.id ?? "");
+        setShotId(stored.scenes[0]?.shots[0]?.id ?? "");
+        setPrompt(stored.compiledPrompt ?? "");
+      } else if (isTauri()) {
+        const migrated = await persistProjectToDatabase(initialProjectRef.current);
+        if (migrated) localStorage.removeItem("cineprompt-project");
+      }
+      if (active) setProjectStorageReady(true);
+    })();
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      const stored = await loadHistoryFromDatabase();
+      if (!active) return;
+      if (stored) {
+        setHistory(stored);
+        localStorage.removeItem("cineprompt-prompt-history");
+      } else if (isTauri()) {
+        const legacy = loadHistory();
+        if (await persistHistoryToDatabase(legacy)) localStorage.removeItem("cineprompt-prompt-history");
+      }
+    })();
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    if (!projectStorageReady) return;
+    void persistProjectToDatabase(project).then((saved) => {
+      if (!saved) persistProject(project);
+    });
+  }, [project, projectStorageReady]);
   useEffect(() => { localStorage.setItem("cineprompt-locale", locale); }, [locale]);
   useEffect(() => { setProjectCodeDraft(project.projectCode ?? ""); }, [project.projectCode]);
   /** LenTalk Chat 配置变更时同步刷新工作室选中的模型（地址/Key 同源） */
@@ -258,9 +375,6 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
       case "AUDIO.PLAN_MISSING":
         setProject((current) => ({ ...current, audioPlan: { score: "none", subtitles: false } }));
         break;
-      case "AUDIO.DIALOGUE_UNSUBTITLED":
-        setProject((current) => ({ ...current, audioPlan: { ...(current.audioPlan ?? { score: "none" as const, subtitles: false }), subtitles: true } }));
-        break;
       case "AUDIO.CONFLICT":
         setProject((current) => {
           const audio = current.audioPlan;
@@ -299,18 +413,37 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
       }),
     }));
   };
-  const shotRange = (() => { if (shot?.time) return { start: shot.time.startSeconds, end: shot.time.endSeconds }; const m = shot?.duration.match(/(\d+)\s*-\s*(\d+)/); return { start: m ? Number(m[1]) : 0, end: m ? Number(m[2]) : 8 }; })();
   const updateScene = (updates: Partial<SceneV2>) => setProject((current) => ({ ...current, scenes: current.scenes.map((item) => item.id === scene.id ? { ...item, ...updates } : item) }));
-  const updateSceneName = (id: string, name: string) => setProject((current) => ({ ...current, scenes: current.scenes.map((item) => item.id === id ? { ...item, name } : item) }));
-  /** 一键镜头模板（P1.2） */
-  const addShotFromTemplate = (templateId: string) => {
-    const template = shotTemplateById(templateId);
-    if (!template) return;
-    const { shot: created, requiredFields } = template.create(project, scene);
-    setProject((current) => ({ ...current, scenes: current.scenes.map((item) => item.id === scene.id ? { ...item, shots: [...item.shots, created] } : item) }));
-    setShotId(created.id);
-    setNotice(requiredFields.length > 0 ? `${t.templateApplied} ${t.templateRequired}: ${requiredFields.join("；")}` : t.templateApplied);
+  const clearGeneratedContent = () => {
+    clearResume();
+    setManualOverride(null);
+    setPrompt("");
+    setShotId("");
+    setAiCompileError("");
+    setAiCompileErrorDetail("");
+    setAiErrorCopied(false);
+    setProject((current) => ({
+      ...current,
+      compiledPrompt: undefined,
+      audioPlan: undefined,
+      finalAuditLog: (current.finalAuditLog ?? []).filter((entry) => entry.sceneId !== scene.id),
+      scenes: current.scenes.map((item) => item.id !== scene.id ? item : {
+        ...item,
+        mustHappen: undefined,
+        forbid: undefined,
+        dialogue: undefined,
+        emotionArc: undefined,
+        actingObjectives: undefined,
+        directorLayers: undefined,
+        lockedDirectorLayers: undefined,
+        firstFrameLock: undefined,
+        lightingDirection: undefined,
+        shots: [],
+      }),
+    }));
+    setNotice(t.briefCleared);
   };
+  const updateSceneName = (id: string, name: string) => setProject((current) => ({ ...current, scenes: current.scenes.map((item) => item.id === id ? { ...item, name } : item) }));
   const addBlankShot = () => {
     const last = scene.shots[scene.shots.length - 1];
     const end = last?.time?.endSeconds ?? (() => { const m = last?.duration.match(/(\d+)\s*-\s*(\d+)/); return m ? Number(m[2]) : 0; })();
@@ -318,52 +451,61 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
     const created: ShotV2 = { id: newId(), label: String(scene.shots.length + 1).padStart(2, "0"), duration: `${end}-${end + step}${t.seconds}`, time: { startSeconds: end, endSeconds: end + step }, framing: "Medium close-up", lens: "50mm", optics: { lensCharacter: "47-standard", fieldOfViewDegrees: 47 }, movement: "Static", action: t.defineAction, acting: t.naturalPerformance, direction: scene.shots[scene.shots.length - 1]?.direction ?? "left-to-right", cutStyle: scene.cutStyleDefault ?? "hard-cut" };
     setProject((current) => ({ ...current, scenes: current.scenes.map((item) => item.id === scene.id ? { ...item, shots: [...item.shots, created] } : item) })); setShotId(created.id);
   };
+
+  const applySceneDraft = (draft: Awaited<ReturnType<typeof fillSceneDraft>>) => {
+    const targetScene = draft.scene;
+    const lockedKeys = (scene.lockedDirectorLayers ?? []).filter((key) => (scene.directorLayers?.[key] ?? "").trim());
+    const incomingLayers = targetScene.directorLayers ?? {};
+    const mergedLayers: Record<string, string> = { ...incomingLayers };
+    for (const key of lockedKeys) {
+      const kept = scene.directorLayers?.[key];
+      if (kept !== undefined) mergedLayers[key] = kept;
+    }
+    const mergedScene: SceneV2 = {
+      ...targetScene,
+      directorLayers: mergedLayers,
+      lockedDirectorLayers: scene.lockedDirectorLayers,
+    };
+    const nextProject: ProjectV2 = {
+      ...project,
+      scenes: project.scenes.map((item) => item.id === mergedScene.id ? mergedScene : item),
+    };
+    setProject(nextProject);
+    setManualOverride(null);
+    setShotId(mergedScene.shots[0]?.id ?? "");
+    setSceneCompileProgress("validating");
+    const audit = auditFinalPromptWithProject(mergedScene, project.assets ?? []);
+    const nextIssues = checkContinuityV2(nextProject, mergedScene);
+    const layerIssues = validateDirectorLayers(mergedScene.directorLayers ?? {}, nextProject, mergedScene);
+    const blockers = audit.issues.filter((issue) => issue.severity === "error").length
+      + nextIssues.filter((issue) => issue.severity === "error").length
+      + layerIssues.filter((issue) => issue.severity === "error").length;
+    recordFinalAudit(mergedScene, audit, nextIssues);
+    if (blockers > 0) {
+      setNotice(locale === "zh"
+        ? `AI 已生成可编辑分镜草案，但最终审核发现 ${blockers} 项事实冲突。修正后继续生成，最后一次有效提示词不会被覆盖。`
+        : `AI generated an editable storyboard draft, but final review found ${blockers} factual conflict(s). Fix them and continue; the last valid prompt was preserved.`);
+      return;
+    }
+    setNotice(t.aiCompileDone);
+  };
+
   /** AI 智能分镜：只生成导演文档与镜头分镜，审核冲突后停在结构化编辑阶段。 */
   const aiCompileScene = async () => {
     if (sceneCompileBusy) return;
     if (!isRemoteConfigured()) { setNotice(t.aiNotConfigured); return; }
+    clearResume();
     setSceneCompileBusy(true);
     setSceneCompileProgress("preparing");
     setAiCompileError("");
     try {
       const draft = await fillSceneDraft(project, scene, { seconds: t.seconds, locale, onProgress: setSceneCompileProgress });
-      const targetScene = draft.scene;
-      // P0.6：用户锁定的导演文档层在再次 AI 编译时保留，不被新生成覆盖。
-      const lockedKeys = (scene.lockedDirectorLayers ?? []).filter((key) => (scene.directorLayers?.[key] ?? "").trim());
-      const incomingLayers = targetScene.directorLayers ?? {};
-      const mergedLayers: Record<string, string> = { ...incomingLayers };
-      for (const key of lockedKeys) {
-        const kept = scene.directorLayers?.[key];
-        if (kept !== undefined) mergedLayers[key] = kept;
-      }
-      const mergedScene: SceneV2 = {
-        ...targetScene,
-        directorLayers: mergedLayers,
-        lockedDirectorLayers: scene.lockedDirectorLayers,
-      };
-      const nextProject: ProjectV2 = {
-        ...project,
-        scenes: project.scenes.map((item) => item.id === mergedScene.id ? mergedScene : item),
-      };
-      setProject(nextProject);
-      setManualOverride(null);
-      setShotId(mergedScene.shots[0]?.id ?? "");
-      setSceneCompileProgress("validating");
-      const audit = auditFinalPromptWithProject(mergedScene, project.assets ?? []);
-      const nextIssues = checkContinuityV2(nextProject, mergedScene);
-      const layerIssues = validateDirectorLayers(mergedScene.directorLayers ?? {}, nextProject, mergedScene);
-      const blockers = audit.issues.filter((issue) => issue.severity === "error").length
-        + nextIssues.filter((issue) => issue.severity === "error").length
-        + layerIssues.filter((issue) => issue.severity === "error").length;
-      recordFinalAudit(mergedScene, audit, nextIssues);
-      if (blockers > 0) {
-        setNotice(locale === "zh"
-          ? `AI 已生成可编辑分镜草案，但最终审核发现 ${blockers} 项事实冲突。修正后继续生成，最后一次有效提示词不会被覆盖。`
-          : `AI generated an editable storyboard draft, but final review found ${blockers} factual conflict(s). Fix them and continue; the last valid prompt was preserved.`);
+      applySceneDraft(draft);
+    } catch (error) {
+      if (registerResume(error, "scene", (value) => applySceneDraft(value as Awaited<ReturnType<typeof fillSceneDraft>>))) {
+        setNotice(`${t.aiCompileFailed}${t.aiResumeAvailable}`);
         return;
       }
-      setNotice(t.aiCompileDone);
-    } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const classified = classifyError(error);
       const friendly = classified.kind === "gateway-timeout"
@@ -419,21 +561,16 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
     const issues = checkContinuityV2(project, scene);
     const audit = auditFinalPromptWithProject(scene, project.assets ?? []);
     const layerIssues = validateDirectorLayers(scene.directorLayers ?? {}, project, scene);
-    const blockers = audit.issues.filter((issue) => issue.severity === "error").length
+    const auditErrorCount = audit.issues.filter((issue) => issue.severity === "error").length
       + issues.filter((issue) => issue.severity === "error").length
       + layerIssues.filter((issue) => issue.severity === "error").length;
     recordFinalAudit(scene, audit, issues);
-    if (blockers > 0) {
-      setNotice(locale === "zh"
-        ? `最终审核发现 ${blockers} 项事实冲突，请修正后再最终生成。`
-        : `Final review found ${blockers} factual conflict(s). Fix them before final generation.`);
-      return;
-    }
+    clearResume();
     setFinalGenerateBusy(true);
     setAiCompileError("");
-    try {
-      const canonical = buildFinalGenerationSource(project, scene);
-      const text = await generateFinalPrompt(canonical, locale);
+    const applyFinalPrompt = (value: unknown) => {
+      if (typeof value !== "string") throw new Error("续写结果不是最终提示词文本");
+      const text = value;
       setManualOverride(null);
       setPrompt(text);
       const record = addVersion({
@@ -444,6 +581,7 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
         continuitySummary: { total: issues.length, errors: issues.filter((issue) => issue.severity === "error").length, warnings: issues.filter((issue) => issue.severity === "warning").length },
       });
       setHistory(record);
+      void persistHistoryToDatabase(record);
       if (projectPackageDir) {
         const latest = record[0];
         if (latest) {
@@ -451,8 +589,21 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
           void recordVersionToSqlite(projectPackageDir, latest.id, template, JSON.stringify(latest.continuitySummary));
         }
       }
-      setNotice(t.promptLocalCompiled);
+      setNotice(auditErrorCount > 0
+        ? (locale === "zh"
+          ? `${t.promptLocalCompiled}（审核保留 ${auditErrorCount} 项待处理问题）`
+          : `${t.promptLocalCompiled} (${auditErrorCount} review issue(s) remain)`)
+        : t.promptLocalCompiled);
+    };
+    try {
+      const canonical = buildFinalGenerationSource(project, scene);
+      const text = await generateFinalPrompt(canonical, locale, setSceneCompileProgress);
+      applyFinalPrompt(text);
     } catch (error) {
+      if (registerResume(error, "final", applyFinalPrompt)) {
+        setNotice(`${t.aiFinalFailed}${t.aiResumeAvailable}`);
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       const classified = classifyError(error);
       const friendly = classified.kind === "gateway-timeout"
@@ -460,7 +611,7 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
         : classified.kind === "timeout" || classified.kind === "network"
           ? t.aiRequestInterrupted
           : message;
-      setNotice(`${t.aiCompileFailed}${friendly}`);
+      setNotice(`${t.aiFinalFailed}${friendly}`);
       setAiCompileError(friendly);
       setAiCompileErrorDetail(message);
     } finally {
@@ -506,20 +657,12 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
     if (sceneId === id) { setSceneId(remaining[0].id); setShotId(remaining[0].shots[0]?.id ?? ""); }
   };
   const copyPrompt = async () => {
-    if (hasExportErrors) {
-      setNotice(locale === "zh" ? "最终审计未通过，不能复制提示词。" : "Final audit has blocking issues; prompt copy is disabled.");
-      return;
-    }
     await navigator.clipboard.writeText(sanitizeDirectorText(prompt));
     setNotice(t.promptCopied);
   };
   const exportProject = (format: "txt" | "md" | "json") => {
-    if (format !== "json") {
-      const exportErrors = issues.filter((i) => i.severity === "error");
-      if (exportErrors.length > 0) { setNotice(t.exportBlockedHint); return; }
-    }
     const scopeLabel = template === "pro-sequence" ? (locale === "zh" ? "当前场景全部镜头" : "all scene shots") : template === "shot-cards" ? (locale === "zh" ? "当前场景逐镜" : "one card per shot") : (locale === "zh" ? "当前选中镜头" : "current shot");
-    const header = format === "json" ? "" : `${locale === "zh" ? "# Cinematic Prompt Studio 导出" : "# Cinematic Prompt Studio export"}\n模板/Template: ${template}\n语言/Language: ${locale}\n范围/Scope: ${scopeLabel}\n\n`;
+    const header = format === "json" ? "" : `${locale === "zh" ? "# 提示词工作室导出" : "# Prompt Studio export"}\n模板/Template: ${template}\n语言/Language: ${locale}\n范围/Scope: ${scopeLabel}\n\n`;
     const exportText = sanitizeDirectorText(prompt);
     const content = format === "json" ? JSON.stringify(project, null, 2) : format === "md" ? `${header}# ${project.title}\n\n${project.description}\n\n## ${scene.name}\n\n\`\`\`text\n${exportText}\n\`\`\`` : `${header}${exportText}`;
     download(`${project.title.replace(/ /g, "-").toLowerCase()}.${format}`, content, format === "json" ? "application/json" : "text/plain"); setNotice(`${format.toUpperCase()} ${locale === "zh" ? "导出已下载。" : "export downloaded."}`);
@@ -542,17 +685,21 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
         aiCompileError={aiCompileError}
         aiCompileErrorDetail={aiCompileErrorDetail}
         aiErrorCopied={aiErrorCopied}
-        onSelectScene={(id) => { setSceneId(id); setShotId(project.scenes.find((item) => item.id === id)?.shots[0]?.id ?? ""); }}
+        resumeAvailable={resumeAvailable}
+        resumeBusy={resumeBusy}
+        onSelectScene={(id) => { clearResume(); setSceneId(id); setShotId(project.scenes.find((item) => item.id === id)?.shots[0]?.id ?? ""); }}
         onAddScene={addScene}
         onDeleteScene={deleteScene}
         onRenameScene={updateSceneName}
         onUpdateScene={updateScene}
         onUpdateStaging={(patch) => updateScene({ staging: { ...scene.staging, ...patch } })}
         onUpdateProject={(patch) => setProject((current) => ({ ...current, ...patch }))}
+        onClearGeneratedContent={clearGeneratedContent}
         onAiCompile={() => void aiCompileScene()}
         onAiOptimizeBrief={() => void aiOptimizeBrief()}
         onLocalCompile={localCompileScene}
         onCopyAiError={() => void copyAiError()}
+        onResumeInterrupted={() => void resumeInterrupted()}
         chatModels={chatModels}
         selectedChatModel={selectedChatModel}
         onSelectChatModel={selectChatModel}
@@ -560,22 +707,14 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
       </div>
 
       {/* ── 2. 分层导演文档卡（P0.6：AI 编译产出各层，可展开编辑 + 锁定）── */}
-      <DirectorLayersCard scene={scene} t={t} locale={locale} onUpdateScene={updateScene} />
+      <DirectorLayersCard project={project} scene={scene} t={t} locale={locale} canvasImageSources={canvasImageSources} onUpdateScene={updateScene} setNotice={setNotice} />
 
       {/* ── 4. 镜头执行：时间线、动作、角色表演与节拍共用同一结构化数据 ── */}
       <section className="card shots-card">
         <div className="card-head">
           <div className="card-head-title"><span className="eyebrow">{locale === "zh" ? "镜头执行" : "Shot execution"}</span><strong>{scene.shots.length} {t.cuts}</strong></div>
           <div className="shot-actions">
-            <div className="template-menu">
-              <button className="outline-button" onClick={() => setTemplateMenuOpen((v) => !v)}><Plus size={14} /> {t.addShot} <ChevronDown size={13} /></button>
-              {templateMenuOpen && <div className="template-options">
-                <button onClick={() => { addBlankShot(); setTemplateMenuOpen(false); }}>{t.addBlankShot}</button>
-                {SHOT_TEMPLATES.map((tpl) => <button key={tpl.id} onClick={() => { addShotFromTemplate(tpl.id); setTemplateMenuOpen(false); }}>
-                  <b>{tpl.name}</b><small>{tpl.description}</small>
-                </button>)}
-              </div>}
-            </div>
+            <button className="outline-button" onClick={addBlankShot}><Plus size={14} /> {t.addShot}</button>
           </div>
         </div>
         <div className="shots-row">
@@ -614,22 +753,13 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
         </div>
         {inspectorOpen && (shot ? <div className="inspector-body">
           <InspectorSection>
-            <div className="fields-grid two">
-              <label className="field-label">{t.startSec}<span className="select-wrap"><select value={shotRange.start} onChange={(event) => updateShotRange(shot.id, Number(event.target.value), shotRange.end)}>{Array.from({ length: 16 }, (_, i) => <option key={i} value={i}>{i} {t.seconds}</option>)}</select><ChevronDown size={14} /></span></label>
-              <label className="field-label">{t.endSec}<span className="select-wrap"><select value={shotRange.end} onChange={(event) => updateShotRange(shot.id, shotRange.start, Number(event.target.value))}>{Array.from({ length: 16 }, (_, i) => <option key={i} value={i}>{i} {t.seconds}</option>)}</select><ChevronDown size={14} /></span></label>
-            </div>
-          </InspectorSection>
-          <InspectorSection>
-            <div className="fields-grid two">
+            <div className="fields-grid three">
               <LabeledSelect label={t.cameraModel} value={shot.camera ?? ""} values={["", ...CAMERAS.map((camera) => camera.id)]} displayValue={(value) => value ? `${CAMERAS.find((camera) => camera.id === value)?.brand} ${CAMERAS.find((camera) => camera.id === value)?.model}` : t.none} onChange={(value) => updateShot({ camera: value || undefined })} />
               <LabeledSelect label={t.lensModel} value={shot.lensModel ?? ""} values={["", ...LENSES.map((lens) => lens.id)]} displayValue={(value) => value ? `${LENSES.find((lens) => lens.id === value)?.brand} ${LENSES.find((lens) => lens.id === value)?.model}` : t.none} onChange={(value) => updateShot({ lensModel: value || undefined })} />
-            </div>
-            <div className="fields-grid">
-              <LabeledSelect label={t.framing} value={shot.framing} values={["Wide", "3/4 medium, behind subject", "Medium close-up", "Extreme close-up, profile"]} displayValue={(value) => framingLabels[locale][value]} onChange={(value) => updateShot({ framing: value })} />
               <LabeledSelect label={t.movement} value={shot.movement} values={movements} displayValue={(value) => cameraLabels[locale][value]} onChange={(value) => updateShot({ movement: value as CameraMovement })} />
             </div>
           </InspectorSection>
-          <OpticsCameraEditor shot={shot} locale={locale} onUpdate={updateShot} />
+          <OpticsCameraEditor shot={shot} framing={shot.framing} locale={locale} onUpdate={updateShot} />
           <InspectorSection>
             <div className="fields-grid two">
               <label className="field-label">{t.action}<textarea value={shot.action} onChange={(event) => updateShot({ action: event.target.value })} /></label>
@@ -651,7 +781,7 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
               <label className="field-label">{t.shotEyeLife}<textarea value={shot.eyeLife ?? ""} placeholder={t.shotEyeLifePlaceholder} onChange={(event) => updateShot({ eyeLife: event.target.value || undefined })} /></label>
             </div>
           </InspectorSection>
-          <InspectorSection title={t.participants}>
+          <InspectorSection>
             <ParticipantsEditor project={project} scene={scene} shot={shot} t={t} onUpdate={updateShot} />
           </InspectorSection>
           <InspectorSection title={t.shotStates}>
@@ -669,10 +799,10 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
         </div> : <div className="empty">{t.addShotHint}</div>)}
       </section>
 
-      {/* ── 5.5 连续性面板（P0.5：分组 + 修复 + 风险评分）── */}
+      {/* ── 5.5 成片质量检查：只显示状态和待处理问题 ── */}
       <section className="card continuity-card">
         <div className="card-head">
-          <div className="card-head-title"><span className="eyebrow">{t.continuity}</span><strong>{issues.length}</strong></div>
+          <div className="card-head-title"><span className="eyebrow">{t.qualityCheck}</span><strong>{issues.length + directorLayerIssues.length}</strong></div>
         </div>
         <ContinuityPanel project={project} scene={scene} issues={issues} directorIssues={directorLayerIssues} t={t} locale={locale} onFix={fixIssue} onAiAdvice={aiAdvice} />
       </section>
@@ -711,9 +841,9 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
           <div className="card-head-title"><span className="eyebrow">{t.promptEditor}</span><span className="provider-pill"><span /> {aiSettings.provider !== "none" && aiSettings.apiKey && aiSettings.model ? `${t.aiProviderRemote} · ${aiSettings.model}` : t.localCompiler}</span></div>
           <div className="dock-actions">
             <button className="icon-button" title={t.copyPrompt} onClick={copyPrompt}><Copy size={16} /></button>
-            <div className="export-menu"><button className={hasExportErrors ? "outline-button export-blocked" : "outline-button"} title={hasExportErrors ? t.exportBlockedHint : undefined}><Download size={15} /> {t.export} <ChevronDown size={14} /></button><div className="export-options">
-              <button disabled={hasExportErrors} title={hasExportErrors ? t.exportBlockedHint : undefined} onClick={() => exportProject("txt")}><FileText size={14} /> TXT</button>
-              <button disabled={hasExportErrors} title={hasExportErrors ? t.exportBlockedHint : undefined} onClick={() => exportProject("md")}><FileText size={14} /> Markdown</button>
+            <div className="export-menu"><button className="outline-button"><Download size={15} /> {t.export} <ChevronDown size={14} /></button><div className="export-options">
+              <button onClick={() => exportProject("txt")}><FileText size={14} /> TXT</button>
+              <button onClick={() => exportProject("md")}><FileText size={14} /> Markdown</button>
               <button onClick={() => exportProject("json")}><FileJson size={14} /> JSON</button>
             </div></div>
           </div>
@@ -739,23 +869,23 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
                   ? (locale === "zh" ? "收起审计详情" : "Hide audit details")
                   : (locale === "zh" ? "查看审计详情" : "View audit details")}
               </button>
-              {hasExportErrors && <button
+              {hasAuditErrors && <button
                 type="button"
                 className="outline-button audit-continue-button"
                 onClick={localCompileScene}
-                title={locale === "zh" ? "根据当前已修正的数据重新生成最终提示词" : "Regenerate the final prompt from the corrected current data"}
+                title={locale === "zh" ? "根据当前数据重新生成最终提示词" : "Regenerate the final prompt from the current data"}
               >
-                {locale === "zh" ? "修正后继续生成" : "Continue after fixing"}
+                {locale === "zh" ? "继续生成" : "Continue generation"}
               </button>}
             </div>
             <div className="audit-status-row">
               <span className="output-language">{locale === "zh" ? "输出语言：中文" : "Output language: English"}</span>
               <span
-                className={`final-audit-status ${hasExportErrors ? "error" : finalAudit.issues.length > 0 ? "warning" : "passed"}`}
+                className={`final-audit-status ${hasAuditErrors ? "error" : finalAudit.issues.length > 0 ? "warning" : "passed"}`}
                 title={auditStatusDetails}
               >
-                {hasExportErrors
-                  ? (locale === "zh" ? `最终审核：整体规则已整理，${exportBlockingIssues.length} 项冲突待修正` : `Final review: overall rules are organized; ${exportBlockingIssues.length} conflict(s) to fix`)
+                {hasAuditErrors
+                  ? (locale === "zh" ? `最终审核：整体规则已整理，${auditErrorIssues.length} 项冲突待处理` : `Final review: overall rules are organized; ${auditErrorIssues.length} conflict(s) remain`)
                   : finalAudit.issues.length > 0
                     ? (locale === "zh" ? `最终审核：整体规则符合，已整理 ${finalAudit.issues.length} 项` : `Final review: overall rules conform; ${finalAudit.issues.length} item(s) organized`)
                     : (locale === "zh" ? "最终审核：整体规则符合" : "Final review: overall rules conform")}
@@ -765,13 +895,11 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
           <button
             type="button"
             className="primary-button prompt-send-video-button"
-            disabled={!onSendToVideo || !prompt.trim() || hasExportErrors}
-            title={hasExportErrors
-              ? (locale === "zh" ? "最终审计未通过，请先修正场景中的阻断问题。" : "Final audit has blocking issues. Fix the scene before sending.")
-              : !onSendToVideo ? (locale === "zh" ? "请从画布中的电影提示词工作室节点打开" : "Open this from a Cinematic Prompt Studio node on the canvas") : undefined}
+            disabled={!onSendToVideo || !prompt.trim()}
+            title={!onSendToVideo ? (locale === "zh" ? "请从画布中的提示词工作室节点打开" : "Open this from a Prompt Studio node on the canvas") : undefined}
             onClick={() => {
               const nextPrompt = prompt.trim();
-              if (!nextPrompt || !onSendToVideo || hasExportErrors) return;
+              if (!nextPrompt || !onSendToVideo) return;
               onSendToVideo({ prompt: nextPrompt, ...mediaReferences });
               setNotice(t.sentToVideoNode);
             }}

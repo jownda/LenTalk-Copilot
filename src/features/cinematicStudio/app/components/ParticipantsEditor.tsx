@@ -2,7 +2,7 @@
  * 镜头参与角色编辑器（P0.2）
  * 镜头检查器新增「参与角色」区域：+ 从资产库选人、可删除、拖拽排序（更新 layout.characterOrder，
  * 不影响 participants 添加顺序 → 身份编号稳定）、每个参与者设置职责/前中后景/入画/朝向/视线、
- * 「使用场景站位」开关、故意越轴标记、镜头级锚点覆写。
+ * 「使用场景站位」开关和每个参与者的镜头内站位。
  */
 import { useState } from "react";
 import type { ProjectV2, SceneV2, ShotParticipant, ShotV2 } from "../../shared-types";
@@ -18,7 +18,6 @@ interface ParticipantsEditorProps {
   onUpdate(patch: Partial<ShotV2>): void;
 }
 
-const ROLE_KEYS = [["primary", "rolePrimary"], ["supporting", "roleSupporting"], ["target", "roleTarget"], ["background", "roleBackground"]] as const;
 const POSITION_KEYS = [["foreground-left", "positionForegroundLeft"], ["center-left", "positionCenterLeft"], ["center", "positionCenter"], ["center-right", "positionCenterRight"], ["background-right", "positionBackgroundRight"]] as const;
 const ENTRANCE_KEYS = [["already-in-frame", "entranceAlready"], ["enters-left", "entranceLeft"], ["enters-right", "entranceRight"]] as const;
 const FACING_KEYS = [["toward-camera", "facingCamera"], ["profile-left", "facingProfileLeft"], ["profile-right", "facingProfileRight"], ["toward-center", "facingCenter"]] as const;
@@ -87,7 +86,6 @@ export default function ParticipantsEditor({ project, scene, shot, t, onUpdate }
           <GripVertical size={11} className="grip" />
           <span className="avatar small">{nameOf(id).slice(0, 1)}</span>
           <b onClick={() => setExpanded(expanded === id ? null : id)}>{nameOf(id)}</b>
-          <small>{t[ROLE_KEYS.find(([v]) => v === participant.role)?.[1] ?? "roleSupporting"]}</small>
           <button title={t.moveLeft} disabled={index === 0} onClick={() => reorder(index, index - 1)}><ChevronLeft size={11} /></button>
           <button title={t.moveRight} disabled={index === order.length - 1} onClick={() => reorder(index, index + 1)}><ChevronRight size={11} /></button>
           <button title={t.deleteParticipant} onClick={() => removeParticipant(id)}><X size={11} /></button>
@@ -106,7 +104,6 @@ export default function ParticipantsEditor({ project, scene, shot, t, onUpdate }
       const participant = participants.find((p) => p.characterId === expanded)!;
       return <div className="participant-detail">
         <div className="fields-grid two">
-          <LabeledMini label={t.role} value={participant.role} options={ROLE_KEYS.map(([v, k]) => [v, t[k]] as [string, string])} onChange={(value) => updateParticipant(expanded, { role: value as ShotParticipant["role"] })} />
           <LabeledMini label={t.position} value={participant.position ?? ""} options={[["", t.none], ...POSITION_KEYS.map(([v, k]) => [v, t[k]] as [string, string])]} onChange={(value) => updateParticipant(expanded, { position: value || undefined })} />
           <LabeledMini label={t.entrance} value={participant.entrance ?? ""} options={[["", t.none], ...ENTRANCE_KEYS.map(([v, k]) => [v, t[k]] as [string, string])]} onChange={(value) => updateParticipant(expanded, { entrance: (value || undefined) as ShotParticipant["entrance"] })} />
           <LabeledMini label={t.facing} value={participant.facing ?? ""} options={[["", t.none], ...FACING_KEYS.map(([v, k]) => [v, t[k]] as [string, string])]} onChange={(value) => updateParticipant(expanded, { facing: value || undefined })} />
@@ -118,12 +115,6 @@ export default function ParticipantsEditor({ project, scene, shot, t, onUpdate }
         </div>
       </div>;
     })()}
-
-    <div className="participant-layout-extras">
-      <label className="check-chip-axis"><input type="checkbox" checked={layout.intentionalAxisBreak ?? false} onChange={(event) => onUpdate({ layout: { ...layout, intentionalAxisBreak: event.target.checked } })} /> {t.intentionalAxisBreak}</label>
-      {layout.intentionalAxisBreak && <input className="modal-input" value={layout.axisNote ?? ""} placeholder={t.axisNotePlaceholder} onChange={(event) => onUpdate({ layout: { ...layout, axisNote: event.target.value || undefined } })} />}
-      <label className="field-label">{t.spatialAnchor}<textarea className="modal-textarea" value={layout.anchorDescription ?? ""} placeholder={t.layoutAnchorPlaceholder} onChange={(event) => onUpdate({ layout: { ...layout, anchorDescription: event.target.value || undefined } })} /></label>
-    </div>
   </div>;
 }
 

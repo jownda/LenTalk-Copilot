@@ -45,11 +45,10 @@ impl OpenAICompatibleProvider {
     }
 
     fn build_client() -> reqwest::Client {
-        // no_proxy(): 不读 HTTP_PROXY/HTTPS_PROXY 环境变量(宿主注入的代理常连不通
-        // 国外 AI 平台), 由系统 Clash 透明代理(TUN)接管即可。
+        // 使用 macOS/Windows 系统代理和用户显式配置的环境代理。部分海外自定义
+        // 平台只能通过系统代理完成 DNS 解析；未配置代理时 reqwest 自动直连。
         reqwest::Client::builder()
             .http1_only()
-            .no_proxy()
             .timeout(std::time::Duration::from_secs(180))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
@@ -60,7 +59,6 @@ impl OpenAICompatibleProvider {
     fn build_short_timeout_client() -> reqwest::Client {
         reqwest::Client::builder()
             .http1_only()
-            .no_proxy()
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
@@ -472,9 +470,16 @@ impl OpenAICompatibleProvider {
 
     fn resolve_image_transport(
         extra_params: &Option<HashMap<String, Value>>,
-        _api_model: &str,
+        provider_id: &str,
+        api_model: &str,
         reference_image_count: usize,
     ) -> &'static str {
+        // The 65535 Gemini image channel requires multipart edits whenever
+        // references are present. Keep this model-specific override ahead of
+        // the legacy generations_json default saved by older builds.
+        if reference_image_count > 0 && Self::uses_65535_gemini_edits(provider_id, api_model) {
+            return "edits_multipart";
+        }
         match extra_params
             .as_ref()
             .and_then(|params| params.get("image_transport"))
@@ -483,15 +488,19 @@ impl OpenAICompatibleProvider {
             Some("generations_json") => "generations_json",
             Some("edits_multipart") => "edits_multipart",
             Some("apimart_json") => "apimart_json",
-            // 默认把所有带参考图的图片请求视作图生图，使用 OpenAI 标准的
-            // /v1/images/edits multipart 上传。仅无参考图才走文生图 generations。
-            // 对不兼容 edits 的中转平台，可在设置中显式改为 JSON/APIMart 适配器。
-            _ if reference_image_count > 0 => "edits_multipart",
             _ => "generations_json",
         }
     }
 
+    fn uses_65535_gemini_edits(provider_id: &str, api_model: &str) -> bool {
+        provider_id == "custom:65535" && {
+            let model = api_model.to_ascii_lowercase();
+            model.contains("gemini") && model.contains("image")
+        }
+    }
+
     async fn build_edits_form(
+        provider_id: &str,
         api_model: &str,
         prompt: &str,
         resolution: &str,
@@ -503,7 +512,14 @@ impl OpenAICompatibleProvider {
             .text("prompt", prompt.to_string())
             .text(
                 "size",
-                Self::map_requested_image_size(api_model, resolution, aspect_ratio),
+                if Self::uses_65535_gemini_edits(provider_id, api_model) {
+                    match resolution.trim().to_ascii_uppercase().as_str() {
+                        "1K" | "2K" | "4K" => resolution.trim().to_ascii_uppercase(),
+                        _ => Self::map_requested_image_size(api_model, resolution, aspect_ratio),
+                    }
+                } else {
+                    Self::map_requested_image_size(api_model, resolution, aspect_ratio)
+                },
             )
             .text("n", "1");
         if !Self::uses_native_image_parameters(api_model) {
@@ -1155,6 +1171,7 @@ impl AIProvider for OpenAICompatibleProvider {
         let reference_image_count = request.reference_images.as_ref().map(|images| images.len()).unwrap_or(0);
         let image_transport = Self::resolve_image_transport(
             &request.extra_params,
+            provider_id,
             api_model,
             reference_image_count,
         );
@@ -1196,6 +1213,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 .await?
         } else if image_transport == "edits_multipart" && reference_image_count > 0 {
             let form = Self::build_edits_form(
+                provider_id,
                 api_model,
                 &request.prompt,
                 &request.size,
@@ -1403,6 +1421,7 @@ impl AIProvider for OpenAICompatibleProvider {
         let reference_image_count = request.reference_images.as_ref().map(|images| images.len()).unwrap_or(0);
         let image_transport = Self::resolve_image_transport(
             &request.extra_params,
+            provider_id,
             api_model,
             reference_image_count,
         );
@@ -1444,6 +1463,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 .await?
         } else if image_transport == "edits_multipart" && reference_image_count > 0 {
             let form = Self::build_edits_form(
+                provider_id,
                 api_model,
                 &request.prompt,
                 &request.size,
@@ -1727,6 +1747,8 @@ impl AIProvider for OpenAICompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::OpenAICompatibleProvider;
+    use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn retries_alternate_reference_field_for_supported_reference_errors() {
@@ -1885,17 +1907,54 @@ mod tests {
     }
 
     #[test]
-    fn uses_edits_transport_for_all_reference_images_by_default() {
+    fn uses_edits_transport_only_for_65535_gemini_reference_images() {
         assert_eq!(
-            OpenAICompatibleProvider::resolve_image_transport(&None, "gpt-image-2", 1),
+            OpenAICompatibleProvider::resolve_image_transport(
+                &None,
+                "custom:65535",
+                "gemini-3-pro-image",
+                1,
+            ),
+            "edits_multipart"
+        );
+        let legacy_generations = Some(HashMap::from([(
+            "image_transport".to_string(),
+            json!("generations_json"),
+        )]));
+        assert_eq!(
+            OpenAICompatibleProvider::resolve_image_transport(
+                &legacy_generations,
+                "custom:65535",
+                "gemini-3.1-flash-image",
+                2,
+            ),
             "edits_multipart"
         );
         assert_eq!(
-            OpenAICompatibleProvider::resolve_image_transport(&None, "gemini-3-pro-image", 1),
-            "edits_multipart"
+            OpenAICompatibleProvider::resolve_image_transport(
+                &None,
+                "custom:65535",
+                "gpt-image-2",
+                1,
+            ),
+            "generations_json"
         );
         assert_eq!(
-            OpenAICompatibleProvider::resolve_image_transport(&None, "gpt-image-2", 0),
+            OpenAICompatibleProvider::resolve_image_transport(
+                &None,
+                "custom:65535",
+                "gemini-3-pro-image",
+                0,
+            ),
+            "generations_json"
+        );
+        assert_eq!(
+            OpenAICompatibleProvider::resolve_image_transport(
+                &None,
+                "custom:other",
+                "gemini-3-pro-image",
+                1,
+            ),
             "generations_json"
         );
     }
@@ -1952,4 +2011,3 @@ mod tests {
         assert!(body.get("aspect_ratio").is_none());
     }
 }
-

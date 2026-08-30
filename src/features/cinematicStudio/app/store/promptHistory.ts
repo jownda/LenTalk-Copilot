@@ -3,9 +3,12 @@
  * localStorage 过渡实现（P3 迁 SQLite）。上限 50 条，最旧优先淘汰。
  */
 import type { PromptVersion } from "../../shared-types";
+import { loadAppSetting, saveAppSetting } from "@/commands/appDatabase";
+import { isTauri } from "@tauri-apps/api/core";
 
 const KEY = "cineprompt-prompt-history";
 const MAX = 50;
+const DATABASE_KEY = "cinematic-prompt-history";
 
 export function loadHistory(): PromptVersion[] {
   try {
@@ -18,6 +21,7 @@ export function loadHistory(): PromptVersion[] {
 
 function persist(list: PromptVersion[]): PromptVersion[] {
   const trimmed = list.slice(0, MAX);
+  if (isTauri()) return trimmed;
   try {
     localStorage.setItem(KEY, JSON.stringify(trimmed));
   } catch {
@@ -51,4 +55,24 @@ export function deleteVersion(id: string): PromptVersion[] {
 
 export function clearHistory(): PromptVersion[] {
   return persist([]);
+}
+
+export async function loadHistoryFromDatabase(): Promise<PromptVersion[] | null> {
+  try {
+    const raw = await loadAppSetting(DATABASE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PromptVersion[]).slice(0, MAX) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function persistHistoryToDatabase(list: PromptVersion[]): Promise<boolean> {
+  try {
+    await saveAppSetting(DATABASE_KEY, JSON.stringify(list.slice(0, MAX)));
+    return true;
+  } catch {
+    return false;
+  }
 }

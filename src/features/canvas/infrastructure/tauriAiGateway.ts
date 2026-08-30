@@ -102,6 +102,9 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
   if (providerId === 'zizidonghua' || providerBaseUrl.includes('zizidonghua.com')) {
     extraParams.video_transport = 'zzdh-v8-video';
   }
+  if (providerId === 'sub2api-video' || providerBaseUrl.includes('video.rjm.us.ci')) {
+    extraParams.video_transport = 'sub2api-video';
+  }
   if (extraParams.reference_image_field == null) {
     extraParams.reference_image_field = referenceImageField;
   }

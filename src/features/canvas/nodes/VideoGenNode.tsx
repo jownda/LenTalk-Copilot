@@ -804,7 +804,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       providerBaseUrl: baseUrl,
       generationRequest: {
         kind: 'video',
-        clientJobId: isJimengCli ? id : undefined,
+        // 作为支持幂等提交的平台的稳定请求键。重试同一个节点时复用，避免
+        // 网络超时后重复创建任务或重复扣费。
+        clientJobId: id,
         prompt,
         model: selectedModel.id,
         duration: selectedDuration,
@@ -826,7 +828,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         await canvasAiGateway.setApiKey(selectedModel.providerId, apiKey);
       }
       const videoUrl = await canvasAiGateway.generateVideo({
-        clientJobId: isJimengCli ? id : undefined,
+        clientJobId: id,
         prompt,
         model: selectedModel.id,
         duration: selectedDuration,
@@ -850,6 +852,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       });
       updateNodeData(outputId, {
         sourcePath: videoUrl,
+        generationResultProtected: true,
         isGenerating: false,
         generationStartedAt: null,
         generationError: null,

@@ -2,6 +2,8 @@ use md5;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
+
+use crate::database;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,7 +58,7 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn state_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn legacy_state_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join("asset-library.json"))
 }
 
@@ -139,17 +141,73 @@ fn normalize_state(mut state: AssetLibraryStateRecord) -> AssetLibraryStateRecor
     state
 }
 
+fn restore_quarantined_asset_file(
+    images_dir: &PathBuf,
+    quarantine_dir: &PathBuf,
+    stored_path: &str,
+) -> Result<(), String> {
+    let target = PathBuf::from(stored_path);
+    if target.exists() || target.parent() != Some(images_dir.as_path()) {
+        return Ok(());
+    }
+
+    let Some(file_name) = target.file_name() else {
+        return Ok(());
+    };
+    let quarantined = quarantine_dir.join(file_name);
+    if quarantined.is_file() {
+        std::fs::rename(&quarantined, &target)
+            .map_err(|error| format!("Failed to restore quarantined asset file: {error}"))?;
+    }
+    Ok(())
+}
+
+fn restore_quarantined_asset_files(
+    app: &AppHandle,
+    state: &AssetLibraryStateRecord,
+) -> Result<(), String> {
+    let images_dir = app_data_dir(app)?.join("images");
+    let quarantine_dir = images_dir.join(".quarantine");
+    if !quarantine_dir.is_dir() {
+        return Ok(());
+    }
+
+    for asset in &state.assets {
+        restore_quarantined_asset_file(&images_dir, &quarantine_dir, &asset.source_path)?;
+        if let Some(preview_path) = asset.preview_image_url.as_deref() {
+            restore_quarantined_asset_file(&images_dir, &quarantine_dir, preview_path)?;
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn load_asset_library_state(app: AppHandle) -> Result<AssetLibraryStateRecord, String> {
-    let path = state_path(&app)?;
-    if !path.exists() {
-        return Ok(default_state());
+    let conn = database::open(&app)?;
+    if let Some(value) = database::get_setting(&conn, "asset-library")? {
+        let state = serde_json::from_str::<AssetLibraryStateRecord>(&value)
+            .map_err(|error| format!("Failed to parse asset library: {error}"))?;
+        restore_quarantined_asset_files(&app, &state)?;
+        return Ok(normalize_state(state));
     }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read asset library: {error}"))?;
-    let state = serde_json::from_str::<AssetLibraryStateRecord>(&text)
-        .map_err(|error| format!("Failed to parse asset library: {error}"))?;
-    Ok(normalize_state(state))
+
+    let path = legacy_state_path(&app)?;
+    if path.exists() {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("Failed to read legacy asset library: {error}"))?;
+        let parsed_state = serde_json::from_str::<AssetLibraryStateRecord>(&text)
+            .map_err(|error| format!("Failed to parse legacy asset library: {error}"))?;
+        restore_quarantined_asset_files(&app, &parsed_state)?;
+        let state = normalize_state(parsed_state);
+        let value = serde_json::to_string(&state)
+            .map_err(|error| format!("Failed to encode asset library: {error}"))?;
+        database::put_setting(&conn, "asset-library", &value)?;
+        let backup = path.with_extension(format!("json.migrated-{}.bak", std::process::id()));
+        std::fs::rename(&path, backup)
+            .map_err(|error| format!("Failed to archive legacy asset library: {error}"))?;
+        return Ok(state);
+    }
+    Ok(default_state())
 }
 
 #[tauri::command]
@@ -158,14 +216,10 @@ pub fn save_asset_library_state(
     state: AssetLibraryStateRecord,
 ) -> Result<AssetLibraryStateRecord, String> {
     let normalized = normalize_state(state);
-    let path = state_path(&app)?;
-    let temporary_path = path.with_extension("json.tmp");
-    let text = serde_json::to_vec_pretty(&normalized)
+    let value = serde_json::to_string(&normalized)
         .map_err(|error| format!("Failed to encode asset library: {error}"))?;
-    std::fs::write(&temporary_path, text)
-        .map_err(|error| format!("Failed to write asset library: {error}"))?;
-    std::fs::rename(&temporary_path, &path)
-        .map_err(|error| format!("Failed to finalize asset library: {error}"))?;
+    let conn = database::open(&app)?;
+    database::put_setting(&conn, "asset-library", &value)?;
     Ok(normalized)
 }
 

@@ -73,6 +73,19 @@ type PersistedProject = Project & {
   imagePool?: string[];
 };
 
+function snapshotCurrentCanvasProject(project: Project): Project {
+  const canvasState = useCanvasStore.getState();
+  return {
+    ...project,
+    nodes: canvasState.nodes,
+    edges: canvasState.edges,
+    viewport: canvasState.currentViewport ?? project.viewport ?? DEFAULT_VIEWPORT,
+    history: canvasState.history ?? project.history ?? createEmptyHistory(),
+    nodeCount: canvasState.nodes.length,
+    updatedAt: Date.now(),
+  };
+}
+
 function encodeImageReference(
   imageUrl: string | null | undefined,
   imagePool: string[],
@@ -831,7 +844,37 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   openProject: (id) => {
     const reqSeq = ++openProjectRequestSeq;
     useCanvasStore.getState().closeImageViewer();
-    set({ isOpeningProject: true });
+    const { currentProjectId, currentProject } = get();
+    const shouldPersistCurrentProject =
+      Boolean(currentProjectId && currentProject && currentProject.id === currentProjectId);
+    const persistedCurrentProject = shouldPersistCurrentProject && currentProject
+      ? snapshotCurrentCanvasProject(currentProject)
+      : null;
+
+    if (persistedCurrentProject) {
+      persistProject(persistedCurrentProject, { immediate: true });
+    }
+
+    set((state) => ({
+      isOpeningProject: true,
+      ...(persistedCurrentProject
+        ? {
+            currentProject: persistedCurrentProject,
+            projects: updateProjectSummary(state.projects, {
+              id: persistedCurrentProject.id,
+              name: persistedCurrentProject.name,
+              createdAt: persistedCurrentProject.createdAt,
+              updatedAt: persistedCurrentProject.updatedAt,
+              nodeCount: persistedCurrentProject.nodeCount,
+              ...(() => {
+                const imagePool = (persistedCurrentProject as PersistedProject).imagePool;
+                const thumbs = extractProjectThumbnails(persistedCurrentProject.nodes, imagePool);
+                return thumbs.length > 0 ? { thumbnails: thumbs } : {};
+              })(),
+            }),
+          }
+        : {}),
+    }));
 
     void (async () => {
       try {
@@ -879,16 +922,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     let persistedSummary: ProjectSummary | null = null;
 
     if (currentProjectId && currentProject && currentProject.id === currentProjectId) {
-      const canvasState = useCanvasStore.getState();
-      const nextProject: Project = {
-        ...currentProject,
-        nodes: canvasState.nodes,
-        edges: canvasState.edges,
-        viewport: canvasState.currentViewport ?? currentProject.viewport ?? DEFAULT_VIEWPORT,
-        history: canvasState.history ?? currentProject.history ?? createEmptyHistory(),
-        nodeCount: canvasState.nodes.length,
-        updatedAt: Date.now(),
-      };
+      const nextProject = snapshotCurrentCanvasProject(currentProject);
 
       persistedSummary = {
         id: nextProject.id,

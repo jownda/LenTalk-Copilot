@@ -3,8 +3,10 @@ import { describe, expect, it } from 'vitest';
 import {
   BALANCE_INSUFFICIENT_MESSAGE,
   IMAGE_EDITS_NETWORK_ERROR_MESSAGE,
+  PROXY_REQUIRED_65535_MESSAGE,
   isBalanceInsufficientError,
   isImageEditsNetworkError,
+  isProxyRequired65535NetworkError,
   resolveErrorContent,
 } from './errorDialog';
 
@@ -47,6 +49,31 @@ describe('isImageEditsNetworkError', () => {
   it('does not suggest a protocol change for other network failures', () => {
     expect(isImageEditsNetworkError('Network error: connection refused')).toBe(false);
     expect(isImageEditsNetworkError('HTTP 400 from /v1/images/edits')).toBe(false);
+  });
+});
+
+describe('isProxyRequired65535NetworkError', () => {
+  const networkError =
+    'Network error: error sending request for url (https://sub-proxy-us.65535.space/v1/images/generations)';
+
+  it('recognizes a transport error for the 65535 overseas endpoint', () => {
+    expect(isProxyRequired65535NetworkError(networkError)).toBe(true);
+  });
+
+  it('replaces the raw transport error with a system-proxy hint', () => {
+    const result = resolveErrorContent(networkError, '生成失败');
+
+    expect(result.message).toBe(PROXY_REQUIRED_65535_MESSAGE);
+    expect(result.details).toContain('sub-proxy-us.65535.space');
+  });
+
+  it('does not suggest a proxy for HTTP responses or unrelated providers', () => {
+    expect(isProxyRequired65535NetworkError(
+      'HTTP 401 Unauthorized from https://sub-proxy-us.65535.space/v1/images/generations'
+    )).toBe(false);
+    expect(isProxyRequired65535NetworkError(
+      'Network error: error sending request for url (https://example.com/v1/images/generations)'
+    )).toBe(false);
   });
 });
 

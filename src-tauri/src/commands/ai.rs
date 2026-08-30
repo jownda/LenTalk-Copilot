@@ -1,17 +1,18 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::ai::error::AIError;
+use crate::database;
 use crate::ai::providers::build_default_providers;
 use crate::ai::providers::openai_compat::OpenAICompatibleProvider;
 use crate::ai::{
@@ -59,6 +60,7 @@ pub struct GenerationJobStatusDto {
 pub struct ProviderHttpResponseDto {
     pub status: u16,
     pub body: String,
+    pub body_base64: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,16 +88,12 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn resolve_db_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
-
-    std::fs::create_dir_all(&app_data_dir)
-        .map_err(|e| format!("Failed to create app data dir: {}", e))?;
-
-    Ok(app_data_dir.join("projects.db"))
+fn request_explicitly_uses_async_mode(extra_params: Option<&HashMap<String, Value>>) -> bool {
+    extra_params
+        .and_then(|params| params.get("request_mode"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.eq_ignore_ascii_case("async"))
+        .unwrap_or(false)
 }
 
 fn ensure_generation_jobs_table(conn: &Connection) -> Result<(), String> {
@@ -123,18 +121,7 @@ fn ensure_generation_jobs_table(conn: &Connection) -> Result<(), String> {
 }
 
 fn open_db(app: &AppHandle) -> Result<Connection, String> {
-    let db_path = resolve_db_path(app)?;
-    let conn = Connection::open(db_path).map_err(|e| format!("Failed to open SQLite DB: {}", e))?;
-
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|e| format!("Failed to set journal_mode=WAL: {}", e))?;
-    conn.pragma_update(None, "synchronous", "NORMAL")
-        .map_err(|e| format!("Failed to set synchronous=NORMAL: {}", e))?;
-    conn.pragma_update(None, "temp_store", "MEMORY")
-        .map_err(|e| format!("Failed to set temp_store=MEMORY: {}", e))?;
-    conn.busy_timeout(Duration::from_millis(3000))
-        .map_err(|e| format!("Failed to set busy timeout: {}", e))?;
-
+    let conn = database::open(app)?;
     ensure_generation_jobs_table(&conn)?;
     Ok(conn)
 }
@@ -206,6 +193,30 @@ fn update_generation_job(
         params![status, result, error, now_ms(), job_id],
     )
     .map_err(|e| format!("Failed to update generation job: {}", e))?;
+    Ok(())
+}
+
+fn mark_generation_job_resumable(
+    app: &AppHandle,
+    job_id: &str,
+    external_task_id: &str,
+    external_task_meta_json: Option<&str>,
+) -> Result<(), String> {
+    let conn = open_db(app)?;
+    conn.execute(
+        r#"
+        UPDATE ai_generation_jobs
+        SET
+          status = 'running',
+          resumable = 1,
+          external_task_id = ?1,
+          external_task_meta_json = ?2,
+          updated_at = ?3
+        WHERE job_id = ?4
+        "#,
+        params![external_task_id, external_task_meta_json, now_ms(), job_id],
+    )
+    .map_err(|e| format!("Failed to mark generation job resumable: {}", e))?;
     Ok(())
 }
 
@@ -372,7 +383,6 @@ pub async fn detect_provider_capabilities(
         return Err("Base URL 为空".to_string());
     }
     let client = reqwest::Client::builder()
-        .no_proxy()
         .timeout(Duration::from_secs(8))
         .build()
         .map_err(|error| format!("Failed to build probe client: {}", error))?;
@@ -404,6 +414,18 @@ pub async fn detect_provider_capabilities(
         })
         .unwrap_or_default();
 
+    let is_known_openai_images = {
+        let normalized = base_url
+            .trim()
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        normalized == "https://www.fhl.mom"
+            || normalized == "https://fhl.mom"
+            || normalized == "https://sub-proxy-us.65535.space"
+    };
+
     async fn options_status(client: &reqwest::Client, url: String, api_key: &str) -> u16 {
         let mut request = client.request(reqwest::Method::OPTIONS, url);
         if !api_key.trim().is_empty() {
@@ -412,12 +434,17 @@ pub async fn detect_provider_capabilities(
         request.send().await.map(|response| response.status().as_u16()).unwrap_or(0)
     }
 
-    let (images_status, responses_status, chat_status, videos_status) = tokio::join!(
-        options_status(&client, format!("{}/v1/images/generations", normalized_base_url), &api_key),
-        options_status(&client, format!("{}/v1/responses", normalized_base_url), &api_key),
-        options_status(&client, format!("{}/v1/chat/completions", normalized_base_url), &api_key),
-        options_status(&client, format!("{}/v1/videos/generations", normalized_base_url), &api_key),
-    );
+    let (images_status, responses_status, chat_status, videos_status) = if is_known_openai_images {
+        // 已知平台的图片链路由协议确定，不向 Chat/视频端点发探测请求。
+        (0, 0, 0, 0)
+    } else {
+        tokio::join!(
+            options_status(&client, format!("{}/v1/images/generations", normalized_base_url), &api_key),
+            options_status(&client, format!("{}/v1/responses", normalized_base_url), &api_key),
+            options_status(&client, format!("{}/v1/chat/completions", normalized_base_url), &api_key),
+            options_status(&client, format!("{}/v1/videos/generations", normalized_base_url), &api_key),
+        )
+    };
     let has_gpt_image = models.iter().any(|model| model.to_ascii_lowercase().contains("gpt-image"));
     // OPTIONS is often handled by a gateway-wide CORS middleware, so its
     // status is diagnostic only. 当某协议端点可明确访问(非 404)时优先推断:
@@ -425,15 +452,29 @@ pub async fn detect_provider_capabilities(
     fn probe_available(status: u16) -> bool {
         status != 0 && status != 404
     }
-    let image_protocol = if probe_available(chat_status) && !probe_available(images_status) {
+    let image_protocol = if is_known_openai_images {
+        "images"
+    } else if probe_available(chat_status) && !probe_available(images_status) {
         "chat"
     } else if probe_available(responses_status) && !probe_available(images_status) {
         "responses"
     } else {
         "images"
     };
-    let image_reference_field = if has_gpt_image { "input_image" } else { "image" };
-    let image_reference_encoding = if has_gpt_image { "raw_base64" } else { "data_url" };
+    let image_reference_field = if is_known_openai_images {
+        "image"
+    } else if has_gpt_image {
+        "input_image"
+    } else {
+        "image"
+    };
+    let image_reference_encoding = if is_known_openai_images {
+        "data_url"
+    } else if has_gpt_image {
+        "raw_base64"
+    } else {
+        "data_url"
+    };
 
     Ok(serde_json::json!({
         "ok": models_status < 500,
@@ -448,10 +489,11 @@ pub async fn detect_provider_capabilities(
         "capabilities": {
             "detectedAt": now_ms(),
             "detectionSource": "probe",
-            "confidence": "low",
+            "confidence": if is_known_openai_images { "high" } else { "low" },
             "imageProtocol": image_protocol,
             "imageReferenceField": image_reference_field,
             "imageReferenceEncoding": image_reference_encoding,
+            "imageTransport": if is_known_openai_images { "generations_json" } else { "unknown" },
             "videoSubmitPath": "/v1/videos/generations",
             "videoQueryPath": "/v1/videos/generations/{taskId}",
             "videoReferenceEncoding": "data_url",
@@ -469,13 +511,21 @@ pub async fn request_provider_json(
     method: String,
     headers: HashMap<String, String>,
     body: Option<Value>,
+    response_encoding: Option<String>,
 ) -> Result<ProviderHttpResponseDto, String> {
     let parsed_url = reqwest::Url::parse(url.trim())
         .map_err(|error| format!("Invalid provider URL: {}", error))?;
     let http_method = reqwest::Method::from_bytes(method.trim().as_bytes())
         .map_err(|error| format!("Invalid provider HTTP method: {}", error))?;
 
-    let client = reqwest::Client::builder().no_proxy().build().unwrap_or_else(|_| reqwest::Client::new());
+    // Prompt compilation/final delivery can legitimately take several minutes.
+    // Keep this aligned with the frontend response window while retaining a
+    // finite bound for a provider that never completes the request.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15 * 60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let mut request = client.request(http_method, parsed_url);
     for (name, value) in headers {
         request = request.header(name, value);
@@ -484,18 +534,50 @@ pub async fn request_provider_json(
         request = request.json(&json_body);
     }
 
-    let response = request
+    let mut response = request
         .send()
         .await
         .map_err(|error| format!("Provider request failed: {}", error))?;
     let status = response.status().as_u16();
-    let response_body = response
-        .text()
-        .await
-        .map_err(|error| format!("Failed to read provider response: {}", error))?;
+    // Keep the bytes already received when a streaming Chat Completions
+    // response is cut short. The frontend can then ask the model to continue
+    // from that exact partial response instead of starting from zero.
+    let mut response_bytes = Vec::new();
+    let mut response_read_error = None;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(error) => {
+                response_read_error = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    if let Some(error) = response_read_error {
+        if status >= 200 && status < 300 && !response_bytes.is_empty() {
+            return Ok(ProviderHttpResponseDto {
+                status,
+                body: if response_encoding.as_deref() == Some("base64") {
+                    String::new()
+                } else {
+                    String::from_utf8_lossy(&response_bytes).into_owned()
+                },
+                body_base64: (response_encoding.as_deref() == Some("base64"))
+                    .then(|| STANDARD.encode(&response_bytes)),
+            });
+        }
+        return Err(format!("Failed to read provider response: {}", error));
+    }
+    let encode_base64 = response_encoding.as_deref() == Some("base64");
     Ok(ProviderHttpResponseDto {
         status,
-        body: response_body,
+        body: if encode_base64 {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&response_bytes).into_owned()
+        },
+        body_base64: encode_base64.then(|| STANDARD.encode(&response_bytes)),
     })
 }
 
@@ -525,41 +607,11 @@ pub async fn submit_generate_image_job(
     let job_id = Uuid::new_v4().to_string();
     let provider_id = provider.name().to_string();
 
-    if provider.supports_task_resume() {
-        match provider.submit_task(req).await.map_err(|e| e.to_string())? {
-            ProviderTaskSubmission::Succeeded(image_source) => {
-                insert_generation_job(
-                    &app,
-                    job_id.as_str(),
-                    provider_id.as_str(),
-                    "succeeded",
-                    true,
-                    None,
-                    None,
-                    Some(image_source.as_str()),
-                    None,
-                )?;
-            }
-            ProviderTaskSubmission::Queued(handle) => {
-                let meta_json = handle
-                    .metadata
-                    .as_ref()
-                    .and_then(|value| serde_json::to_string(value).ok());
-                insert_generation_job(
-                    &app,
-                    job_id.as_str(),
-                    provider_id.as_str(),
-                    "running",
-                    true,
-                    Some(handle.task_id.as_str()),
-                    meta_json.as_deref(),
-                    None,
-                    None,
-                )?;
-            }
-        }
-        return Ok(job_id);
-    }
+    // Only opt into an upstream resumable task when the request explicitly
+    // asks for async mode. A provider may implement submit_task for both
+    // modes, but its sync fallback would otherwise block this command until
+    // the image request completes.
+    let explicit_async = request_explicitly_uses_async_mode(req.extra_params.as_ref());
 
     insert_generation_job(
         &app,
@@ -580,35 +632,78 @@ pub async fn submit_generate_image_job(
     let app_handle = app.clone();
     let spawned_job_id = job_id.clone();
     let spawned_provider = provider.clone();
+    let use_resumable_provider_task = explicit_async && provider.supports_task_resume();
     tauri::async_runtime::spawn(async move {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(30 * 60),
-            spawned_provider.generate(req),
-        )
-        .await
-        .map_err(|_| AIError::TaskFailed("generation timed out after 30 minutes".to_string()))
-        .and_then(|result| result);
-        let update_result = match result {
-            Ok(image_source) => update_generation_job(
-                &app_handle,
-                spawned_job_id.as_str(),
-                "succeeded",
-                Some(image_source.as_str()),
-                None,
-            ),
-            Err(error) => {
-                let message = error.to_string();
-                update_generation_job(
+        let update_result = if use_resumable_provider_task {
+            let submission = tokio::time::timeout(
+                Duration::from_secs(30 * 60),
+                spawned_provider.submit_task(req),
+            )
+            .await
+            .map_err(|_| AIError::TaskFailed("generation timed out after 30 minutes".to_string()))
+            .and_then(|result| result);
+
+            match submission {
+                Ok(ProviderTaskSubmission::Succeeded(image_source)) => update_generation_job(
                     &app_handle,
                     spawned_job_id.as_str(),
-                    "failed",
+                    "succeeded",
+                    Some(image_source.as_str()),
                     None,
-                    Some(message.as_str()),
-                )
+                ),
+                Ok(ProviderTaskSubmission::Queued(handle)) => {
+                    let meta_json = handle
+                        .metadata
+                        .as_ref()
+                        .and_then(|value| serde_json::to_string(value).ok());
+                    mark_generation_job_resumable(
+                        &app_handle,
+                        spawned_job_id.as_str(),
+                        handle.task_id.as_str(),
+                        meta_json.as_deref(),
+                    )
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    update_generation_job(
+                        &app_handle,
+                        spawned_job_id.as_str(),
+                        "failed",
+                        None,
+                        Some(message.as_str()),
+                    )
+                }
+            }
+        } else {
+            let result = tokio::time::timeout(
+                Duration::from_secs(30 * 60),
+                spawned_provider.generate(req),
+            )
+            .await
+            .map_err(|_| AIError::TaskFailed("generation timed out after 30 minutes".to_string()))
+            .and_then(|result| result);
+            match result {
+                Ok(image_source) => update_generation_job(
+                    &app_handle,
+                    spawned_job_id.as_str(),
+                    "succeeded",
+                    Some(image_source.as_str()),
+                    None,
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    update_generation_job(
+                        &app_handle,
+                        spawned_job_id.as_str(),
+                        "failed",
+                        None,
+                        Some(message.as_str()),
+                    )
+                }
             }
         };
         if let Err(error) = update_result {
-            info!("Failed to update non-resumable generation job: {}", error);
+            info!("Failed to update generation job: {}", error);
         }
         let mut active_set = active_non_resumable_job_ids().write().await;
         active_set.remove(spawned_job_id.as_str());
@@ -646,7 +741,7 @@ pub async fn get_generate_image_job(
             return Ok(dto_from_record(&record));
         }
 
-        let interrupted_message = "job interrupted by app restart".to_string();
+        let interrupted_message = "应用退出时任务中断，可从节点重试".to_string();
         update_generation_job(
             &app,
             record.job_id.as_str(),
@@ -773,4 +868,37 @@ pub async fn generate_image(request: GenerateRequestDto) -> Result<String, Strin
 #[tauri::command]
 pub async fn list_models() -> Result<Vec<String>, String> {
     Ok(get_registry().list_models())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_explicitly_uses_async_mode;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn image_jobs_are_sync_by_default() {
+        assert!(!request_explicitly_uses_async_mode(None));
+        assert!(!request_explicitly_uses_async_mode(Some(&HashMap::new())));
+        assert!(!request_explicitly_uses_async_mode(Some(&HashMap::from([
+            ("request_mode".to_string(), json!("sync")),
+        ]))));
+    }
+
+    #[test]
+    fn image_jobs_accept_explicit_async_mode_case_insensitively() {
+        assert!(request_explicitly_uses_async_mode(Some(&HashMap::from([
+            ("request_mode".to_string(), json!("async")),
+        ]))));
+        assert!(request_explicitly_uses_async_mode(Some(&HashMap::from([
+            ("request_mode".to_string(), json!("ASYNC")),
+        ]))));
+    }
+
+    #[test]
+    fn non_string_request_mode_does_not_enable_async_jobs() {
+        assert!(!request_explicitly_uses_async_mode(Some(&HashMap::from([
+            ("request_mode".to_string(), json!(true)),
+        ]))));
+    }
 }

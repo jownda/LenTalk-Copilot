@@ -42,9 +42,14 @@ const BALANCE_INSUFFICIENT_PATTERNS = [
 ];
 
 const IMAGE_EDITS_NETWORK_ERROR_PATTERN = /network error[\s\S]*\/v1\/images\/edits/i;
+const PROXY_REQUIRED_65535_HOST_PATTERN = /sub-proxy-us\.65535\.space/i;
+const NETWORK_TRANSPORT_ERROR_PATTERN = /network error|error sending request|could not resolve host|dns|connection (?:refused|failed)|timed out/i;
 
 export const IMAGE_EDITS_NETWORK_ERROR_MESSAGE =
   '当前平台无法使用 /v1/images/edits 上传参考图。请到 API 配置中将图生图适配器切换为 /v1/images JSON 后重试。';
+
+export const PROXY_REQUIRED_65535_MESSAGE =
+  '无法连接 65535 图片服务。当前网络无法直连该海外节点，请开启系统代理后重试。';
 
 /** 判断错误文本是否为"余额/积分不足"类错误 */
 export function isBalanceInsufficientError(text: string): boolean {
@@ -59,6 +64,13 @@ export function isImageEditsNetworkError(message: string, details?: string): boo
   return IMAGE_EDITS_NETWORK_ERROR_PATTERN.test(`${message}\n${details ?? ''}`);
 }
 
+/** 65535 的海外节点在当前网络无法直连时，给出与原因匹配的系统代理提示。 */
+export function isProxyRequired65535NetworkError(message: string, details?: string): boolean {
+  const combined = `${message}\n${details ?? ''}`;
+  return PROXY_REQUIRED_65535_HOST_PATTERN.test(combined)
+    && NETWORK_TRANSPORT_ERROR_PATTERN.test(combined);
+}
+
 function resolveImageEditsNetworkError(
   message: string,
   details: string | undefined
@@ -70,6 +82,21 @@ function resolveImageEditsNetworkError(
   const rawDetails = details || message;
   return {
     message: IMAGE_EDITS_NETWORK_ERROR_MESSAGE,
+    details: rawDetails.trim() || undefined,
+  };
+}
+
+function resolveProxyRequired65535NetworkError(
+  message: string,
+  details: string | undefined
+): { message: string; details?: string } {
+  if (!isProxyRequired65535NetworkError(message, details)) {
+    return { message, details };
+  }
+
+  const rawDetails = details || message;
+  return {
+    message: PROXY_REQUIRED_65535_MESSAGE,
     details: rawDetails.trim() || undefined,
   };
 }
@@ -127,7 +154,10 @@ export function resolveErrorContent(error: unknown, fallbackMessage: string): Re
   }
 
   const balanceResolved = resolveBalanceInsufficient(resolved.message, resolved.details);
-  return resolveImageEditsNetworkError(balanceResolved.message, balanceResolved.details);
+  if (isImageEditsNetworkError(balanceResolved.message, balanceResolved.details)) {
+    return resolveImageEditsNetworkError(balanceResolved.message, balanceResolved.details);
+  }
+  return resolveProxyRequired65535NetworkError(balanceResolved.message, balanceResolved.details);
 }
 
 export async function showErrorDialog(
@@ -141,7 +171,10 @@ export async function showErrorDialog(
     return;
   }
 
-  const resolved = resolveBalanceInsufficient(content, details?.trim() || undefined);
+  const balanceResolved = resolveBalanceInsufficient(content, details?.trim() || undefined);
+  const resolved = isImageEditsNetworkError(balanceResolved.message, balanceResolved.details)
+    ? resolveImageEditsNetworkError(balanceResolved.message, balanceResolved.details)
+    : resolveProxyRequired65535NetworkError(balanceResolved.message, balanceResolved.details);
   openGlobalErrorDialog({
     title,
     message: resolved.message,

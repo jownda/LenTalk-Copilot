@@ -13,6 +13,32 @@ export interface RecommendedApi {
   advantages: string[];
   models: string[];
   videoModels?: string[];
+  /** 图片协议的明确配置；未声明的平台继续使用通用默认值。 */
+  imageConfig?: RecommendedImageConfig;
+  /** 视频协议的明确配置；用于异步提交、轮询和参考素材适配。 */
+  videoConfig?: RecommendedVideoConfig;
+}
+
+export interface RecommendedImageConfig {
+  protocol: 'images' | 'responses' | 'chat';
+  referenceImageField: 'image' | 'input_image';
+  referenceImageEncoding: 'auto' | 'data_url' | 'raw_base64' | 'url';
+  imageTransport: 'auto' | 'generations_json' | 'edits_multipart' | 'apimart_json';
+}
+
+export interface RecommendedVideoConfig {
+  submitPath: string;
+  queryPath: string;
+  referenceEncoding: 'data_url' | 'raw_base64' | 'url';
+  transport: 'sub2api-video';
+}
+
+/** 已确认的 OpenAI Images 平台不通过 OPTIONS 猜测协议。 */
+export function isKnownOpenAiImagesBaseUrl(value: string): boolean {
+  const normalized = value.trim().replace(/\/+$/, '').replace(/\/v1$/i, '').replace(/\/+$/, '').toLowerCase();
+  return normalized === 'https://www.fhl.mom'
+    || normalized === 'https://fhl.mom'
+    || normalized === 'https://sub-proxy-us.65535.space';
 }
 
 export const recommendedApis: RecommendedApi[] = [
@@ -84,7 +110,7 @@ export const recommendedApis: RecommendedApi[] = [
   {
     id: 'fhl',
     name: 'FHL',
-    baseUrl: 'https://www.fhl.mom',
+    baseUrl: 'https://www.fhl.mom/v1',
     registerUrl: 'https://www.fhl.mom/register?aff=86L574B4T2N9',
     summary: '稳定便宜接入 codex / Claude / GPT Image 2 出图',
     advantages: [
@@ -94,6 +120,53 @@ export const recommendedApis: RecommendedApi[] = [
       '4K ¥0.06/张',
     ],
     models: ['gpt-image-2', 'gpt-image-2-2k', 'gpt-image-2-4k', 'nano-banana'],
+    imageConfig: {
+      protocol: 'images',
+      referenceImageField: 'image',
+      referenceImageEncoding: 'data_url',
+      imageTransport: 'generations_json',
+    },
+  },
+  {
+    id: '65535',
+    name: '65535',
+    baseUrl: 'https://sub-proxy-us.65535.space/v1',
+    registerUrl: 'https://sub-proxy-us.65535.space',
+    summary: 'OpenAI Images 兼容生图平台，支持 GPT Image 2 图片模型',
+    advantages: [
+      'GPT Image 2 使用 /v1/images/generations JSON',
+      '返回 data[0].b64_json',
+      '预填 gpt-image-2、eco、auto',
+      'Gemini 图片编辑使用 /v1/images/edits multipart',
+    ],
+    models: ['gpt-image-2', 'gpt-image-2-eco', 'gpt-image-2-auto'],
+    imageConfig: {
+      protocol: 'images',
+      referenceImageField: 'image',
+      referenceImageEncoding: 'data_url',
+      imageTransport: 'auto',
+    },
+  },
+  {
+    id: 'sub2api-video',
+    name: 'Sub2API 视频',
+    baseUrl: 'https://video.rjm.us.ci',
+    registerUrl: 'https://video.rjm.us.ci',
+    summary: '异步视频任务平台，支持 Seedance 2.0 / 2.5 图片生视频',
+    advantages: [
+      '提交 /v1/videos 后自动轮询任务状态',
+      '本地参考图自动上传为 image_id',
+      '使用 ratio 画幅字段与幂等请求键',
+      'Seedance 2.0 固定 15 秒，2.5 固定 30 秒，均为 720p',
+    ],
+    models: [],
+    videoModels: ['seedance2.5', 'seedance2.0'],
+    videoConfig: {
+      submitPath: '/v1/videos',
+      queryPath: '/v1/videos/{taskId}',
+      referenceEncoding: 'data_url',
+      transport: 'sub2api-video',
+    },
   },
   {
     id: 'runninghub',

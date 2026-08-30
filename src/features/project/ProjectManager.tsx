@@ -80,7 +80,7 @@ export function ProjectManager() {
 
   return (
     <div
-      className="ui-scrollbar h-full w-full overflow-auto p-8"
+      className="ui-scrollbar h-full w-full min-w-0 overflow-auto p-4 sm:p-6 lg:p-8"
       onDoubleClick={(event) => {
         // 双击空白区域新建项目(卡片/按钮/素材库面板上双击不触发)
         const target = event.target as HTMLElement;
@@ -96,11 +96,11 @@ export function ProjectManager() {
         handleCreateProject();
       }}
     >
-      <div className="max-w-5xl mx-auto">
-        <div className="flex items-center justify-between mb-8">
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-bold text-text-dark">{t('project.title')}</h1>
-            <div className="flex items-center gap-2">
+      <div className="mx-auto w-full max-w-[1920px] min-w-0">
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-4 lg:mb-8">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-3">
+            <h1 className="shrink-0 text-2xl font-bold text-text-dark">{t('project.title')}</h1>
+            <div className="flex shrink-0 items-center gap-2">
               <UiSelect
                 aria-label={t('project.sortBy')}
                 value={sortField}
@@ -122,7 +122,7 @@ export function ProjectManager() {
               </UiSelect>
             </div>
             {/* 项目卡片大小滑杆(线性丝滑) */}
-            <div className="flex items-center gap-2 pl-3 border-l border-border-dark">
+            <div className="flex shrink-0 items-center gap-2 border-l border-border-dark pl-3">
               <ImagePlus className="h-4 w-4 shrink-0 text-text-muted" />
               <input
                 type="range"
@@ -138,7 +138,7 @@ export function ProjectManager() {
               <span className="w-9 shrink-0 text-xs tabular-nums text-text-muted">{thumbSize}</span>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:shrink-0">
             <UiButton type="button" variant="muted" onClick={() => setShow3DDirector(true)} className="gap-2">
               <Boxes className="w-5 h-5" />
               3D导演台
@@ -173,7 +173,10 @@ export function ProjectManager() {
             <p className="text-sm mt-2">{t('project.emptyHint')}</p>
           </div>
         ) : (
-          <div className="grid gap-3" style={{ gridTemplateColumns: `repeat(auto-fill, ${thumbSize}px)` }}>
+          <div
+            className="grid gap-3"
+            style={{ gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${thumbSize}px), 1fr))` }}
+          >
             {sortedProjects.map((project) => (
               <div
                 key={project.id}
@@ -182,7 +185,7 @@ export function ProjectManager() {
                 className="bg-surface-dark border border-border-dark rounded-lg overflow-hidden cursor-pointer hover:border-primary/50 hover:shadow-lg transition-all group"
               >
                 {/* 正方形四宫格缩略图封面(高度随卡片宽度等比联动) */}
-                <div className="relative w-full" style={{ height: Math.round(thumbSize * 0.53) }}>
+                <div className="relative aspect-[1.89] w-full">
                   {project.thumbnails && project.thumbnails.length > 0 ? (
                     <div className="absolute inset-0 grid grid-cols-2 grid-rows-2 gap-px bg-bg-dark p-px">
                       {[0, 1, 2, 3].map((index) => {

@@ -6,7 +6,7 @@ import {
 } from './canvasNodes';
 
 export const DEFAULT_NODE_DISPLAY_NAME: Record<CanvasNodeType, string> = {
-  [CANVAS_NODE_TYPES.upload]: '上传图片',
+  [CANVAS_NODE_TYPES.upload]: '本地上传',
   [CANVAS_NODE_TYPES.imageEdit]: 'AI 图片',
   [CANVAS_NODE_TYPES.videoGen]: 'AI 视频',
   [CANVAS_NODE_TYPES.exportImage]: '结果图片',
@@ -16,7 +16,7 @@ export const DEFAULT_NODE_DISPLAY_NAME: Record<CanvasNodeType, string> = {
   [CANVAS_NODE_TYPES.storyboardGen]: '分镜生成',
   [CANVAS_NODE_TYPES.panorama]: '360 全景',
   [CANVAS_NODE_TYPES.directorDesk]: '3D 导演台',
-  [CANVAS_NODE_TYPES.cinematicStudio]: '电影提示词工作室',
+  [CANVAS_NODE_TYPES.cinematicStudio]: '提示词工作室',
   [CANVAS_NODE_TYPES.promptOptimizer]: '提示词优化',
   [CANVAS_NODE_TYPES.audio]: '媒体',
   [CANVAS_NODE_TYPES.seamlessMosaic]: '无缝拼图',
@@ -44,6 +44,20 @@ export function getDefaultNodeDisplayName(type: CanvasNodeType, data: Partial<Ca
 export function resolveNodeDisplayName(type: CanvasNodeType, data: Partial<CanvasNodeData>): string {
   const customTitle = typeof data.displayName === 'string' ? data.displayName.trim() : '';
   if (customTitle) {
+    // Older projects persisted the former default as displayName. Treat only
+    // that exact legacy value as a default so user-customized titles remain intact.
+    if (
+      type === CANVAS_NODE_TYPES.cinematicStudio &&
+      (customTitle === '电影提示词工作室' || customTitle === 'Cinematic Prompt Studio')
+    ) {
+      return DEFAULT_NODE_DISPLAY_NAME[type];
+    }
+    if (
+      type === CANVAS_NODE_TYPES.upload &&
+      (customTitle === '上传图片' || customTitle === 'Upload Image')
+    ) {
+      return DEFAULT_NODE_DISPLAY_NAME[type];
+    }
     return customTitle;
   }
 

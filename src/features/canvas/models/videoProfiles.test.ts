@@ -35,4 +35,13 @@ describe('resolveVideoModelProfile', () => {
     expect(profile.submitPath).toBe('/v8/videos/generations');
     expect(profile.supportsFirstLast).toBe(true);
   });
+
+  it('routes Sub2API video models through the files and videos profile', () => {
+    const profile = resolveVideoModelProfile('custom:sub2api-video/seedance2.5');
+    expect(profile.id).toBe('sub2api-video');
+    expect(profile.submitPath).toBe('/v1/videos');
+    expect(profile.queryPath).toBe('/v1/videos/{taskId}');
+    expect(profile.referenceImageTarget).toBe('platform-file');
+    expect(profile.supportsReferenceImages).toBe(true);
+  });
 });

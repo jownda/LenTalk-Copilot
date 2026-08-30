@@ -25,8 +25,6 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
   temperature: 0.4,
 };
 
-const SELECTION_KEY = "cineprompt-ai-selection";
-
 export interface LenTalkChatModelOption {
   providerId: string;
   providerName: string;
@@ -46,17 +44,7 @@ export function listLenTalkChatModels(): LenTalkChatModelOption[] {
 }
 
 function readSelection(): { provider: string; model: string } {
-  try {
-    const raw = localStorage.getItem(SELECTION_KEY);
-    if (!raw) return { provider: "", model: "" };
-    const parsed = JSON.parse(raw) as { provider?: unknown; model?: unknown };
-    return {
-      provider: typeof parsed.provider === "string" ? parsed.provider : "",
-      model: typeof parsed.model === "string" ? parsed.model : "",
-    };
-  } catch {
-    return { provider: "", model: "" };
-  }
+  return useSettingsStore.getState().cinematicAiSelection;
 }
 
 function resolveSettings(selection: { provider: string; model: string }): AISettings {
@@ -88,15 +76,15 @@ export function loadAISettings(): AISettings {
 
 /** 保存仅持久化「选中的 Chat 模型」；地址/Key 仍由 LenTalk 配置提供 */
 export function saveAISettings(settings: AISettings): AISettings {
-  localStorage.setItem(
-    SELECTION_KEY,
-    JSON.stringify({ provider: settings.provider, model: settings.model }),
-  );
+  useSettingsStore.getState().setCinematicAiSelection({
+    provider: settings.provider,
+    model: settings.model,
+  });
   return resolveSettings({ provider: settings.provider, model: settings.model });
 }
 
 export function clearAISettings(): void {
-  localStorage.removeItem(SELECTION_KEY);
+  useSettingsStore.getState().setCinematicAiSelection({ provider: "", model: "" });
 }
 
 /** 是否已选中 LenTalk 中一个可用的 Chat 模型（含 Key） */

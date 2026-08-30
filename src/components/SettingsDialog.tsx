@@ -211,7 +211,7 @@ export function SettingsDialog({
     requestMode: 'sync' as 'sync' | 'async',
     protocol: 'images' as 'images' | 'responses' | 'chat',
     referenceImageField: 'image' as 'image' | 'input_image',
-    referenceImageEncoding: 'auto' as 'auto' | 'data_url' | 'raw_base64' | 'url',
+    referenceImageEncoding: 'data_url' as 'auto' | 'data_url' | 'raw_base64' | 'url',
     imageTransport: 'auto' as 'auto' | 'generations_json' | 'edits_multipart' | 'apimart_json',
     capabilities: undefined as CustomApiCapabilities | undefined,
   });
@@ -236,11 +236,23 @@ export function SettingsDialog({
       videoModelsText: (api.videoModels ?? []).join('\n'),
       chatModelsText: '',
       requestMode: 'sync',
-      protocol: 'images',
-      referenceImageField: 'image',
-      referenceImageEncoding: 'auto',
-      imageTransport: 'auto',
-      capabilities: undefined,
+      protocol: api.imageConfig?.protocol ?? 'images',
+      referenceImageField: api.imageConfig?.referenceImageField ?? 'image',
+      referenceImageEncoding: api.imageConfig?.referenceImageEncoding ?? 'auto',
+      imageTransport: api.imageConfig?.imageTransport ?? 'auto',
+      capabilities: api.videoConfig ? {
+        detectedAt: Date.now(),
+        detectionSource: 'manual',
+        confidence: 'high',
+        imageProtocol: 'unknown',
+        imageReferenceField: 'unknown',
+        imageReferenceEncoding: 'unknown',
+        imageTransport: 'unknown',
+        videoSubmitPath: api.videoConfig.submitPath,
+        videoQueryPath: api.videoConfig.queryPath,
+        videoReferenceEncoding: api.videoConfig.referenceEncoding,
+        taskProtocol: 'generic',
+      } : undefined,
     });
     setShowAddCustomApi(true);
     setCustomApiStatus(null);
@@ -570,7 +582,8 @@ export function SettingsDialog({
           ? 'responses'
           : result.capabilities.imageProtocol === 'chat' ? 'chat' : 'images';
         const keepManualProtocol =
-          detectedProtocol === 'images'
+          result.capabilities.confidence !== 'high'
+          && detectedProtocol === 'images'
           && (previous.protocol === 'chat' || previous.protocol === 'responses');
         return {
           ...previous,
@@ -581,6 +594,11 @@ export function SettingsDialog({
           referenceImageEncoding: result.capabilities.imageReferenceEncoding === 'raw_base64'
             ? 'raw_base64'
             : result.capabilities.imageReferenceEncoding === 'url' ? 'url' : 'data_url',
+          imageTransport: result.capabilities.imageTransport === 'generations_json'
+            || result.capabilities.imageTransport === 'edits_multipart'
+            || result.capabilities.imageTransport === 'apimart_json'
+            ? result.capabilities.imageTransport
+            : previous.imageTransport,
           capabilities: result.capabilities,
         };
       });
@@ -598,6 +616,13 @@ export function SettingsDialog({
           : result.capabilities.imageProtocol === 'images'
             ? '/v1/images/generations'
             : '未识别';
+      const transportLabel = result.capabilities.imageTransport === 'generations_json'
+        ? '/v1/images/generations JSON'
+        : result.capabilities.imageTransport === 'edits_multipart'
+          ? '/v1/images/edits Multipart'
+          : result.capabilities.imageTransport === 'apimart_json'
+            ? 'APIMart image_urls'
+            : '未确定';
       const confidenceLabel = result.capabilities.confidence === 'high' ? '高' : '低（仅非计费探测）';
       setCustomApiStatus({
         type: 'ok',
@@ -606,6 +631,7 @@ export function SettingsDialog({
           protocol: protocolLabel,
           field: result.capabilities.imageReferenceField,
           encoding: encodingLabel,
+          transport: transportLabel,
           confidence: confidenceLabel,
         }),
       });
@@ -655,7 +681,7 @@ export function SettingsDialog({
       requestMode: 'sync',
       protocol: 'images',
       referenceImageField: 'image',
-      referenceImageEncoding: 'auto',
+      referenceImageEncoding: 'data_url',
       imageTransport: 'auto',
       capabilities: undefined,
     });
@@ -1342,7 +1368,7 @@ export function SettingsDialog({
                               }
                               className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
                             >
-                              <option value="images">/v1/images</option>
+                              <option value="images">/v1/images/generations</option>
                               <option value="responses">/v1/responses</option>
                               <option value="chat">/v1/chat/completions</option>
                             </select>
@@ -1398,7 +1424,7 @@ export function SettingsDialog({
                               className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
                             >
                               <option value="auto">自动（带参考图时用 edits）</option>
-                              <option value="generations_json">/v1/images JSON</option>
+                              <option value="generations_json">/v1/images/generations JSON</option>
                               <option value="edits_multipart">/v1/images/edits 上传图片</option>
                               <option value="apimart_json">APIMart image_urls</option>
                             </select>
@@ -1407,7 +1433,7 @@ export function SettingsDialog({
                         <p className="text-[10px] leading-4 text-text-muted">
                           {t(
                             'settings.customApiProbeHint',
-                            '验证协议只使用 /v1/models 和 OPTIONS 等非计费探测，会自动填写图片协议、参考图字段和编码；同步/异步无法安全探测，请手动选择。'
+                            '验证协议只使用 /v1/models 和 OPTIONS 等非计费探测，会自动填写图片协议、参考图字段、编码和图生图适配器；同步/异步无法安全探测，请手动选择。'
                           )}
                         </p>
                         {/* 连接验证只检查服务可达性和模型列表; 请求协议与参考图编码按上方配置发送。 */}

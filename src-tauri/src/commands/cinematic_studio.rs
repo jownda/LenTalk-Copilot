@@ -4,24 +4,13 @@ use std::path::PathBuf;
 
 use tauri::{AppHandle, Manager};
 
-const SCHEMA_VERSION: &str = "0.2.0";
+use crate::database;
 
-fn ensure_sqlite(base: &PathBuf) -> Result<rusqlite::Connection, String> {
-    let conn = rusqlite::Connection::open(base.join("database.sqlite")).map_err(|e| e.to_string())?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS prompt_versions (
-            id TEXT PRIMARY KEY,
-            template TEXT NOT NULL,
-            summary_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );",
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(conn)
-}
+const SCHEMA_VERSION: &str = "0.2.0";
 
 #[tauri::command]
 pub fn project_save(
+    app: AppHandle,
     dir: String,
     project_json: String,
     assets: HashMap<String, Vec<String>>,
@@ -52,13 +41,14 @@ pub fn project_save(
         }
     }
 
-    ensure_sqlite(&base)?;
+    database::migrate_cinematic_project_database(&app, &base)?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn project_load(dir: String) -> Result<serde_json::Value, String> {
+pub fn project_load(app: AppHandle, dir: String) -> Result<serde_json::Value, String> {
     let base = PathBuf::from(&dir);
+    database::migrate_cinematic_project_database(&app, &base)?;
     if !base.join("project.json").exists() {
         return Err("not a .cineprompt project: project.json missing".to_string());
     }
@@ -129,30 +119,35 @@ pub fn prompt_load(dir: String, version_id: String) -> Result<String, String> {
 
 #[tauri::command]
 pub fn version_record(
+    app: AppHandle,
     dir: String,
     version_id: String,
     template: String,
     summary_json: String,
 ) -> Result<(), String> {
     let base = PathBuf::from(&dir);
-    let conn = ensure_sqlite(&base)?;
+    let project_dir = database::migrate_cinematic_project_database(&app, &base)?;
+    let conn = database::open(&app)?;
     conn.execute(
-        "INSERT INTO prompt_versions (id, template, summary_json, created_at) VALUES (?1, ?2, ?3, datetime('now'))",
-        rusqlite::params![version_id, template, summary_json],
+        "INSERT OR REPLACE INTO cinematic_prompt_versions
+         (project_dir, id, template, summary_json, output_text, created_at)
+         VALUES (?1, ?2, ?3, ?4, '', datetime('now'))",
+        rusqlite::params![project_dir, version_id, template, summary_json],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn version_list(dir: String) -> Result<Vec<serde_json::Value>, String> {
+pub fn version_list(app: AppHandle, dir: String) -> Result<Vec<serde_json::Value>, String> {
     let base = PathBuf::from(&dir);
-    let conn = ensure_sqlite(&base)?;
+    let project_dir = database::migrate_cinematic_project_database(&app, &base)?;
+    let conn = database::open(&app)?;
     let mut stmt = conn
-        .prepare("SELECT id, template, summary_json, created_at FROM prompt_versions ORDER BY created_at DESC")
+        .prepare("SELECT id, template, summary_json, created_at FROM cinematic_prompt_versions WHERE project_dir = ?1 ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(rusqlite::params![project_dir], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "template": row.get::<_, String>(1)?,

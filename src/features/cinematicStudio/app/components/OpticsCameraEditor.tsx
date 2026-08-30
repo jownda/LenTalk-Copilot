@@ -1,19 +1,28 @@
 /**
  * 镜头检查器 · 光学 / 相机 / 物理锚点（P1.1 / P1.2 / P1.7）
  * 把「光学」与「相机操作员行为」从平铺表单升级为分组编辑，并提供镜头决策树：
- * 按内容类别推荐视场角（仅提示，不强制）。物理锚点按动作类别勾选。
+ * 按内容类别推荐视场角（仅提示，不强制）。相机行为和物理锚点按镜头执行需要填写。
  */
 import { useState } from "react";
 import type { LensCharacter, PhysicsAnchorKind, ShotV2 } from "../../shared-types";
 import { LENS_BANK, PHYSICS_ANCHORS, lensById } from "../../engine";
 import { ChevronDown, Sparkles } from "lucide-react";
-import type { Locale } from "../i18n";
+import { framingLabels, type Locale } from "../i18n";
 
 interface OpticsCameraEditorProps {
   shot: ShotV2;
+  framing: string;
   locale: Locale;
   onUpdate(updates: Partial<ShotV2>): void;
 }
+
+const FRAMING_OPTIONS = ["Wide", "3/4 medium, behind subject", "Medium close-up", "Extreme close-up, profile"] as const;
+const FRAMING_LENS_DEFAULTS: Record<(typeof FRAMING_OPTIONS)[number], LensCharacter> = {
+  Wide: "84-wide",
+  "3/4 medium, behind subject": "47-standard",
+  "Medium close-up": "29-short-tele",
+  "Extreme close-up, profile": "18-tele",
+};
 
 /** 内容类别 → 推荐镜头语言（仅提示，不强制） */
 const DECISION_TREE = [
@@ -85,13 +94,14 @@ const T = {
   },
 } as const;
 
-export default function OpticsCameraEditor({ shot, locale, onUpdate }: OpticsCameraEditorProps) {
+export default function OpticsCameraEditor({ shot, framing, locale, onUpdate }: OpticsCameraEditorProps) {
   const [recommended, setRecommended] = useState<LensCharacter | null>(null);
   const zh = locale === "zh";
   const L = T[locale];
   const optics = shot.optics ?? {};
   const activeLens = lensById(optics.lensCharacter);
   const behavior = shot.cameraBehavior ?? {};
+  const layout = shot.layout ?? {};
   const anchors = shot.physicsAnchors ?? [];
 
   const applyLens = (lens: LensCharacter) => {
@@ -109,8 +119,40 @@ export default function OpticsCameraEditor({ shot, locale, onUpdate }: OpticsCam
     onUpdate({ physicsAnchors: has ? anchors.filter((a) => a.kind !== kind) : [...anchors, { kind }] });
   };
 
+  const setFraming = (value: string) => {
+    const nextFraming = FRAMING_OPTIONS.includes(value as (typeof FRAMING_OPTIONS)[number])
+      ? value as (typeof FRAMING_OPTIONS)[number]
+      : "3/4 medium, behind subject";
+    const nextLens = lensById(FRAMING_LENS_DEFAULTS[nextFraming]);
+    onUpdate({
+      framing: value,
+      optics: nextLens ? { ...optics, lensCharacter: nextLens.id, fieldOfViewDegrees: nextLens.fov } : optics,
+    });
+  };
+
   return <section className="inspector-section optics-camera-editor">
     <h3>{L.title}</h3>
+
+    <div className="fields-grid two optics-pair-grid">
+      <label className="field-label">{zh ? "景别" : "Framing"}<span className="select-wrap">
+        <select value={framing} onChange={(event) => setFraming(event.target.value)}>
+          {FRAMING_OPTIONS.map((value) => <option key={value} value={value}>{framingLabels[locale][value] ?? value}</option>)}
+        </select>
+        <ChevronDown size={14} />
+      </span></label>
+      <label className="field-label">{L.lensCharacter}<span className="select-wrap">
+        <select value={optics.lensCharacter ?? ""} onChange={(event) => {
+          const value = event.target.value as LensCharacter | "";
+          if (value) applyLens(value);
+          else onUpdate({ optics: { ...optics, lensCharacter: undefined, fieldOfViewDegrees: undefined } });
+        }}>
+          <option value="">—</option>
+          {LENS_BANK.map((lens) => <option key={lens.id} value={lens.id}>{zh ? lens.zh : lens.en} · {lens.fov}°</option>)}
+        </select>
+        <ChevronDown size={14} />
+      </span></label>
+    </div>
+    <p className="hint-text">{zh ? "景别决定主体大小，镜头语言决定透视结果；修改景别会自动带出匹配镜头语言，仍可手动调整。" : "Framing controls subject size; lens character controls perspective. Changing framing selects a matching lens, which can still be adjusted manually."}</p>
 
     <div className="lens-decision-tree">
       <span className="sub-label">{L.decisionTree}</span>
@@ -136,17 +178,6 @@ export default function OpticsCameraEditor({ shot, locale, onUpdate }: OpticsCam
       })()}
     </div>
 
-    <label className="field-label">{L.lensCharacter}<span className="select-wrap">
-      <select value={optics.lensCharacter ?? ""} onChange={(event) => {
-        const value = event.target.value as LensCharacter | "";
-        if (value) applyLens(value);
-        else onUpdate({ optics: { ...optics, lensCharacter: undefined, fieldOfViewDegrees: undefined } });
-      }}>
-        <option value="">—</option>
-        {LENS_BANK.map((lens) => <option key={lens.id} value={lens.id}>{zh ? lens.zh : lens.en} · {lens.fov}°</option>)}
-      </select>
-      <ChevronDown size={14} />
-    </span></label>
     <p className="hint-text">{L.lensCharacterHint}</p>
     {activeLens && <div className="lens-outcome">
       <span className="sub-label">{L.current} · {zh ? activeLens.zh : activeLens.en} · {activeLens.fov}°</span>
@@ -161,6 +192,22 @@ export default function OpticsCameraEditor({ shot, locale, onUpdate }: OpticsCam
       </label>)}
     </div>
     {behavior.handheldQuality && <p className="hint-text">{L.handheldHint}</p>}
+
+    <label className="check-chip-axis">
+      <input
+        type="checkbox"
+        checked={layout.intentionalAxisBreak ?? false}
+        onChange={(event) => onUpdate({ layout: { ...layout, intentionalAxisBreak: event.target.checked } })}
+      />
+      {zh ? "故意越轴" : "Intentional axis break"}
+    </label>
+    {layout.intentionalAxisBreak && <input
+      className="modal-input axis-note-input"
+      value={layout.axisNote ?? ""}
+      placeholder={zh ? "说明摄影机为何跨过180°轴线…" : "Why the camera crosses the 180-degree line…"}
+      onChange={(event) => onUpdate({ layout: { ...layout, axisNote: event.target.value || undefined } })}
+    />}
+    <p className="hint-text">{zh ? "仅在摄影机有意跨过180°轴线时勾选；该指令会写入最终提示词的 CAMERA 段。" : "Check only when the camera intentionally crosses the 180-degree line; this is compiled into CAMERA."}</p>
 
     <div className="sub-label">{L.physics}</div>
     <div className="physics-anchor-row">

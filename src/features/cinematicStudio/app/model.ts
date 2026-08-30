@@ -1,5 +1,7 @@
 import type { Asset, Project, ProjectV2 } from "../shared-types";
 import { DEFAULT_NEGATIVE, deriveProjectCode, fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, withAssetReferenceTag, withNegativePrefix } from "../engine";
+import { loadCinematicProject, saveCinematicProject } from "@/commands/appDatabase";
+import { isTauri } from "@tauri-apps/api/core";
 
 export const SCHEMA_VERSION = 3;
 
@@ -124,10 +126,32 @@ export function loadProject(): ProjectV2 {
 }
 
 export function persistProject(project: ProjectV2) {
+  if (isTauri()) return;
   try {
     localStorage.setItem("cineprompt-project", JSON.stringify(project));
   } catch (error) {
     // 配额超限(图片/音频 data URL 过大)时静默降级, 避免写入异常导致界面崩溃
     console.warn("persistProject failed", error);
+  }
+}
+
+/** Desktop source of truth for the studio's working draft. */
+export async function loadProjectFromDatabase(): Promise<ProjectV2 | null> {
+  try {
+    const raw = await loadCinematicProject();
+    if (!raw) return null;
+    return migrateProject(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+export async function persistProjectToDatabase(project: ProjectV2): Promise<boolean> {
+  if (!isTauri()) return false;
+  try {
+    await saveCinematicProject(JSON.stringify(project));
+    return true;
+  } catch {
+    return false;
   }
 }

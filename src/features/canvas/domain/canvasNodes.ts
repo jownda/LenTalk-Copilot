@@ -43,6 +43,8 @@ export interface NodeImageData extends NodeDisplayData {
   previewImageUrl?: string | null;
   aspectRatio: string;
   isSizeManuallyAdjusted?: boolean;
+  /** AI 生成完成后保留结果, 撤销时不会恢复为生成中或删除结果。 */
+  generationResultProtected?: boolean;
   [key: string]: unknown;
 }
 
@@ -234,7 +236,7 @@ export interface DirectorDeskNodeData extends NodeDisplayData {
   [key: string]: unknown;
 }
 
-/** Cinematic Prompt Studio 节点：双击进入独立提示词工作台。 */
+/** Prompt Studio 节点：双击进入独立提示词工作台。 */
 export interface CinematicStudioNodeData extends NodeDisplayData {
   /** 最近一次保存的工程标题(仅用于节点预览) */
   lastProjectTitle?: string | null;
@@ -292,7 +294,7 @@ export interface SeamlessMosaicNodeData extends NodeImageData {
   outputPreviewImageUrl?: string | null;
 }
 
-/** 媒体节点(音频/视频共用, 素材库拖入或插入画布) */
+/** 媒体节点(音频/视频共用, 素材库拖入或本地上传转换后插入画布) */
 export interface AudioNodeData extends NodeDisplayData {
   /** 媒体源文件路径/URL */
   sourcePath: string | null;
@@ -311,6 +313,8 @@ export interface AudioNodeData extends NodeDisplayData {
   generationProviderId?: string | null;
   generationModel?: string | null;
   providerBaseUrl?: string | null;
+  /** AI 视频生成完成后保留结果, 撤销时不会恢复为生成中或删除结果。 */
+  generationResultProtected?: boolean;
   generationRequest?: VideoGenerationRequestData;
   [key: string]: unknown;
 }

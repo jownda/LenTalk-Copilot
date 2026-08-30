@@ -14,6 +14,7 @@ import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canv
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { CinematicStudioWorkbench } from '@/features/cinematicStudio/CinematicStudioWorkbench';
+import type { CanvasImageSource } from '@/features/cinematicStudio/app/components/DirectorLayersCard';
 
 type CinematicStudioNodeProps = NodeProps & {
   id: string;
@@ -64,6 +65,23 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     return connectedSources
       .filter((source) => labelBySource.has(source))
       .map((source) => ({ source, label: labelBySource.get(source) ?? '画布音频' }));
+  }, [edges, id, nodes]);
+
+  const canvasImageSources = useMemo<CanvasImageSource[]>(() => {
+    const connectedSources = graphImageResolver.collectInputImages(id, nodes, edges);
+    const labelBySource = new Map<string, string>();
+    for (const node of nodes) {
+      const nodeData = node.data as Record<string, unknown>;
+      const nodeLabel = resolveNodeDisplayName(node.type as typeof CANVAS_NODE_TYPES[keyof typeof CANVAS_NODE_TYPES], node.data);
+      const sources = [
+        nodeData.imageUrl,
+        nodeData.outputImageUrl,
+        nodeData.inputImageUrl,
+        ...(Array.isArray(nodeData.frames) ? nodeData.frames.map((frame) => (frame as Record<string, unknown>).imageUrl ?? (frame as Record<string, unknown>).previewImageUrl) : []),
+      ].filter((source): source is string => typeof source === 'string' && source.trim().length > 0);
+      for (const source of sources) labelBySource.set(source, nodeLabel || '画布图片');
+    }
+    return connectedSources.map((source) => ({ source, label: labelBySource.get(source) ?? '画布图片' }));
   }, [edges, id, nodes]);
 
   useEffect(() => {
@@ -152,7 +170,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         type="button"
         className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-2 overflow-hidden rounded-lg border border-[rgba(255,255,255,0.12)] bg-bg-dark/70 transition-colors hover:border-[rgba(255,255,255,0.24)]"
         onDoubleClick={handleOpen}
-        title="双击进入电影提示词工作室"
+        title="双击进入提示词工作室"
       >
         <Clapperboard className="h-10 w-10 text-text-muted/60" />
 
@@ -186,7 +204,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
 
       {isOpen && typeof document !== 'undefined'
         ? createPortal(
-          <CinematicStudioWorkbench onClose={handleClose} onStateChange={handleStateChange} onSendToVideo={handleSendToVideo} canvasAudioSources={canvasAudioSources} />,
+          <CinematicStudioWorkbench onClose={handleClose} onStateChange={handleStateChange} onSendToVideo={handleSendToVideo} canvasAudioSources={canvasAudioSources} canvasImageSources={canvasImageSources} />,
           document.body
         )
         : null}

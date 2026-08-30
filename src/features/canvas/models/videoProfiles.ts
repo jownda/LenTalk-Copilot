@@ -1,4 +1,4 @@
-export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'zzdh-v8-video' | 'jimeng-cli';
+export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'zzdh-v8-video' | 'jimeng-cli';
 export type VideoProfileStatus = 'verified' | 'pending-adaptation';
 export type VideoReferenceTarget = 'data-url' | 'public-url' | 'platform-file';
 
@@ -40,6 +40,18 @@ const SEEDANCE_V2_PROFILE: VideoModelProfile = {
   supportsReferenceAudio: false,
 };
 
+const SUB2API_VIDEO_PROFILE: VideoModelProfile = {
+  id: 'sub2api-video',
+  status: 'verified',
+  protocolLabel: 'Sub2API Video / 已验证',
+  submitPath: '/v1/videos',
+  queryPath: '/v1/videos/{taskId}',
+  referenceImageTarget: 'platform-file',
+  supportsReferenceImages: true,
+  supportsFirstLast: false,
+  supportsReferenceAudio: false,
+};
+
 /** 即梦 CLI(本地命令)专用: 不走 HTTP 平台协议, 由本地 CLI 自校验模型/时长/分辨率 */
 const JIMENG_CLI_VIDEO_PROFILE: VideoModelProfile = {
   id: 'jimeng-cli',
@@ -69,6 +81,7 @@ export function resolveVideoModelProfile(modelId: string): VideoModelProfile {
   // 即梦 CLI 是本地命令, seedance 系列由 CLI 自行校验, 不套用平台协议适配状态
   if (provider === 'jimeng-cli') return JIMENG_CLI_VIDEO_PROFILE;
   if (provider === 'custom:zizidonghua') return ZZDH_V8_VIDEO_PROFILE;
+  if (provider === 'custom:sub2api-video') return SUB2API_VIDEO_PROFILE;
   if (/^seedance(?:[-_.]?v?2|2(?:[._-]|$))/.test(model)) return SEEDANCE_V2_PROFILE;
   return OPENAI_VIDEO_PROFILE;
 }

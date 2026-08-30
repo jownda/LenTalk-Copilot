@@ -211,7 +211,7 @@ npm run release -- patch --notes-file docs/releases/v0.1.12.md
 
 - 项目数据通过 `projectStore` 自动持久化，不要求手动保存。
 - 重启默认进入项目页；进入项目时恢复上次 viewport。
-- 当前持久化后端为 SQLite，库文件位于 Tauri `app_data_dir/projects.db`。
+- 当前持久化后端为统一 SQLite，库文件位于 Tauri `app_data_dir/lentalk.db`；旧 `projects.db` 首次启动时自动迁移并归档。
 - `projects` 表核心字段：`nodes_json`、`edges_json`、`viewport_json`、`history_json`、`node_count`。
 - 前端持久化采用双通道：
   - 整项目快照：`upsert_project_record`（防抖 + idle 调度）。
@@ -219,7 +219,7 @@ npm run release -- patch --notes-file docs/releases/v0.1.12.md
 - 图片字段通过 `imagePool + __img_ref__` 做去重编码；新增图片字段（如 `previewImageUrl`）需同步编码/解码映射。
 - 变更 SQLite 表结构时：
   - 必须在 `ensure_projects_table` 中做自愈（`PRAGMA table_info` + `ALTER TABLE`）。
-  - 开发阶段可不兼容旧的临时草稿格式，但不能破坏当前 `projects.db` 的基本可读性。
+  - 开发阶段可不兼容旧的临时草稿格式，但不能破坏当前 `lentalk.db` 的基本可读性；旧 `projects.db` 仅由启动迁移逻辑读取。
 
 ## 10. 提交前检查清单
 

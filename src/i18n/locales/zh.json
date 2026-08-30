@@ -142,7 +142,7 @@
   },
   "node": {
     "menu": {
-      "uploadImage": "上传图片",
+      "uploadImage": "本地上传",
       "aiImageGeneration": "AI 图片",
       "aiVideoGeneration": "AI 视频",
       "storyboard": "分镜节点",
@@ -150,7 +150,7 @@
       "textAnnotation": "文本",
       "panorama": "360 全景",
       "directorDesk": "3D 导演台",
-      "cinematicStudio": "电影提示词工作室",
+      "cinematicStudio": "提示词工作室",
       "audio": "媒体",
       "promptOptimizer": "提示词优化",
       "seamlessMosaic": "无缝拼图"
@@ -196,7 +196,7 @@
     },
     "upload": {
       "uploadedAlt": "已上传图片",
-      "hint": "点击或拖拽上传图片"
+      "hint": "双击上传图片、视频或音频"
     },
     "storyboardNode": {
       "title": "分镜节点",
@@ -468,7 +468,7 @@
     "customApiFetch": "拉取模型",
     "customApiFetching": "拉取中…",
     "customApiTestNeedUrl": "请先填写 Base URL",
-    "customApiTestOk": "协议探测完成: {{protocol}},参考图字段 {{field}},编码 {{encoding}},置信度{{confidence}};检测到 {{count}} 个模型。结果已填入当前表单,请点击保存",
+    "customApiTestOk": "协议探测完成: {{protocol}},参考图字段 {{field}},编码 {{encoding}},图片传输 {{transport}},置信度{{confidence}};检测到 {{count}} 个模型。结果已填入当前表单,请点击保存",
     "customApiTestFailed": "连接失败:",
     "customApiFetched": "已拉取 {{count}} 个模型并填入列表",
     "customApiFetchFailed": "拉取失败:",
@@ -481,7 +481,7 @@
     "customApiReferenceField": "参考图字段",
     "customApiReferenceEncoding": "参考图编码",
     "customApiReferenceEncodingAuto": "自动(按字段)",
-    "customApiProbeHint": "验证协议只使用 /v1/models 和 OPTIONS 等非计费探测，会自动填写图片协议、参考图字段和编码；同步/异步无法安全探测，请手动选择。"
+    "customApiProbeHint": "验证协议只使用 /v1/models 和 OPTIONS 等非计费探测，会自动填写图片协议、参考图字段、编码和图生图适配器；同步/异步无法安全探测，请手动选择。"
   },
   "pricing": {
     "nativePrice": "原币种：{{value}}",
@@ -491,9 +491,6 @@
   },
   "update": {
     "dialogTitle": "发现新版本",
-    "dialogDescription": "检测到软件有新版本，可从 GitHub 下载当前系统对应的安装包。",
-    "goToGithubDownload": "查看 GitHub 发布页",
-    "downloadGithubInstaller": "下载更新安装包",
     "versionLine": "当前版本：{{currentVersion}}，最新版本：{{latestVersion}}",
     "ignoreRule": "忽略提醒规则",
     "ignoreTodayVersion": "今日不再提示该版本",

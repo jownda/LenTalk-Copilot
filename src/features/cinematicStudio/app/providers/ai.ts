@@ -6,7 +6,8 @@
 import { buildDirectorDocumentLayers, compileDirectorSequence, DIRECTOR_LAYERS, DIRECTOR_LAYER_ORDER, LocalSuggestionProvider, SHOT_TEMPLATES, localizedStyleBrief } from "../../engine";
 import type { AIAssistant, AssetSuggestion, BeatSuggestion, FixSuggestion, SceneSuggestion } from "../../engine";
 import { buildSceneAssetRegistry } from "../../engine/compiler/renderer";
-import { fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov } from "../../engine/presets";
+import { fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, lensById } from "../../engine/presets";
+import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import { auditFinalPrompt, validateDirectorLayers, type DirectorLayerIssue } from "../../engine/quality";
 import type {
   ActingObjective, ActionBeat, Asset, AssetActingProfile, AssetKind, AudioPlan, CameraBehavior, CameraMovement, ContinuityIssueV2, CutStyle,
@@ -28,13 +29,32 @@ export const SCENE_DRAFT_JSON_SCHEMA = LEGACY_SCENE_DRAFT_JSON_SCHEMA
 
 export const CLEAN_SCENE_DRAFT_PROMPT_SCHEMA = SCENE_DRAFT_JSON_SCHEMA;
 
-export type SceneCompileProgress = "idle" | "preparing" | "waiting" | "parsing" | "validating";
+export type SceneCompileProgress = "idle" | "preparing" | "waiting" | "resuming" | "parsing" | "validating";
+
+/**
+ * 长提示词生成允许模型持续返回较长时间。这个值只限制本地客户端等待，
+ * 无法覆盖 API 中转平台自身的网关上限；stream=true 会尽量避免连接空闲。
+ */
+export const AI_RESPONSE_TIMEOUT_MS = 15 * 60 * 1000;
 
 interface AIModelProxyPayload {
   url: string;
   method: string;
   headers: Record<string, string>;
   body?: string;
+}
+
+/** 流式响应在生成中断时携带已经收到的内容，供同一请求续写一次。 */
+export class ChatCompletionInterruptedError extends Error {
+  readonly partialText: string;
+  readonly resume?: () => Promise<unknown>;
+
+  constructor(partialText: string, resume?: () => Promise<unknown>, message = "模型流式响应中断，已收到部分内容") {
+    super(message);
+    this.name = "ChatCompletionInterruptedError";
+    this.partialText = partialText;
+    this.resume = resume;
+  }
 }
 
 /**
@@ -45,36 +65,34 @@ interface AIModelProxyPayload {
 async function remoteFetch(url: string, init: RequestInit = {}): Promise<Response> {
   const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   if (isTauri) {
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      let body: unknown;
-      if (typeof init.body === "string") {
-        try {
-          body = JSON.parse(init.body);
-        } catch {
-          body = init.body;
-        }
+    const { invoke } = await import("@tauri-apps/api/core");
+    let body: unknown;
+    if (typeof init.body === "string") {
+      try {
+        body = JSON.parse(init.body);
+      } catch {
+        body = init.body;
       }
-      const headers: Record<string, string> = {};
-      if (init.headers instanceof Headers) {
-        init.headers.forEach((value, key) => { headers[key] = value; });
-      } else if (init.headers) {
-        Object.assign(headers, init.headers);
-      }
-      const result = await invoke<{ status: number; body: string }>("request_provider_json", {
-        url,
-        method: init.method ?? "GET",
-        headers,
-        body,
-      });
-      return new Response(result.body, {
-        status: result.status,
-        statusText: result.status >= 200 && result.status < 300 ? "OK" : "Error",
-        headers: { "Content-Type": "application/json" },
-      });
-    } catch {
-      // 宿主未提供该命令时继续走下方浏览器代理/直连降级。
     }
+    const headers: Record<string, string> = {};
+    if (init.headers instanceof Headers) {
+      init.headers.forEach((value, key) => { headers[key] = value; });
+    } else if (init.headers) {
+      Object.assign(headers, init.headers);
+    }
+    // Do not fall through to fetch after a native request error: the provider
+    // may already have accepted the billable request.
+    const result = await invoke<{ status: number; body: string }>("request_provider_json", {
+      url,
+      method: init.method ?? "GET",
+      headers,
+      body,
+    });
+    return new Response(result.body, {
+      status: result.status,
+      statusText: result.status >= 200 && result.status < 300 ? "OK" : "Error",
+      headers: { "Content-Type": "application/json" },
+    });
   }
   const isEmbedded = typeof window !== "undefined" && window.self !== window.top;
   const useProxy = typeof window !== "undefined" && !isEmbedded && window.location.protocol.startsWith("http");
@@ -90,7 +108,7 @@ async function remoteFetch(url: string, init: RequestInit = {}): Promise<Respons
   const abortFromSignal = () => controller.abort();
   if (init.signal?.aborted) controller.abort();
   else init.signal?.addEventListener("abort", abortFromSignal);
-  const timer = setTimeout(() => controller.abort(), 300_000);
+  const timer = setTimeout(() => controller.abort(), AI_RESPONSE_TIMEOUT_MS);
   try {
     const proxyResponse = await fetch("/__ai_proxy", {
       method: "POST",
@@ -147,6 +165,104 @@ function extractJSON<T>(text: string): T {
   throw new Error("模型返回内容不是有效 JSON");
 }
 
+/** 从 OpenAI 兼容的普通 JSON 或 SSE 流中提取模型文本。 */
+export async function readChatCompletionText(response: Response): Promise<string> {
+  const extractContent = (value: unknown): string => {
+    if (!value || typeof value !== "object") return "";
+    const choice = (value as { choices?: unknown[] }).choices?.[0];
+    if (!choice || typeof choice !== "object") return "";
+    const item = choice as { delta?: { content?: unknown }; message?: { content?: unknown } };
+    const content = item.delta?.content ?? item.message?.content;
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content.map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") return (part as { text: string }).text;
+        return "";
+      }).join("");
+    }
+    return "";
+  };
+
+  if (!response.body) {
+    const raw = await response.text();
+    return extractContent(JSON.parse(raw) as unknown);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let raw = "";
+  let content = "";
+  let sawStreamEvent = false;
+  let completed = false;
+  const consumeLine = (line: string) => {
+    raw += `${line}\n`;
+    const payload = line.trim().startsWith("data:") ? line.trim().slice(5).trim() : "";
+    if (!payload) return;
+    if (line.trim().startsWith("data:")) sawStreamEvent = true;
+    if (payload === "[DONE]") { completed = true; return; }
+    try {
+      const data = JSON.parse(payload) as { choices?: { finish_reason?: unknown }[] };
+      content += extractContent(data);
+      if (data.choices?.[0]?.finish_reason) completed = true;
+    } catch {
+      // Keep the complete body for the ordinary JSON fallback below.
+    }
+  };
+
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      pending += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !chunk.done });
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? "";
+      lines.forEach(consumeLine);
+      if (chunk.done) break;
+    }
+  } catch (error) {
+    if (content) throw new ChatCompletionInterruptedError(content);
+    throw error;
+  }
+  if (pending) consumeLine(pending);
+  if (sawStreamEvent && !completed) {
+    if (content) throw new ChatCompletionInterruptedError(content);
+    throw new Error("模型流式响应未正常结束");
+  }
+  if (content) return content;
+
+  try {
+    return extractContent(JSON.parse(raw.trim()) as unknown);
+  } catch {
+    return "";
+  }
+}
+
+const STREAM_UNSUPPORTED_RE = /stream(?:ing)?(?:\s+parameter|\s+field)?[^\n]{0,80}(?:unsupported|not supported|unknown|invalid)|(?:unsupported|not supported|unknown|invalid)[^\n]{0,80}stream/i;
+
+function continuationMessages(messages: unknown[], partialText: string): unknown[] {
+  return [
+    ...messages,
+    { role: "assistant", content: partialText },
+    {
+      role: "user",
+      content: "上一个回答的流式连接在此处中断。请从上一个 assistant 回答的最后一个字符之后继续，只输出尚未完成的后缀，不要重复已有内容，不要添加说明、代码围栏或开场白。",
+    },
+  ];
+}
+
+function mergeContinuationText(partialText: string, continuation: string): string {
+  if (!partialText) return continuation;
+  if (!continuation) return partialText;
+  if (continuation.startsWith(partialText)) return continuation;
+  const maxOverlap = Math.min(partialText.length, continuation.length);
+  for (let length = maxOverlap; length >= 20; length -= 1) {
+    if (partialText.slice(-length) === continuation.slice(0, length)) {
+      return partialText + continuation.slice(length);
+    }
+  }
+  return partialText + continuation;
+}
 
 async function chatCompletionsJSON(
   settings: AISettings,
@@ -154,33 +270,37 @@ async function chatCompletionsJSON(
   user: string,
   imageUrls: string[] = [],
   onProgress?: (stage: SceneCompileProgress) => void,
+  audioUrls: string[] = [],
 ): Promise<unknown> {
   const endpoint = `${openAICompatibleBaseUrl(settings.baseUrl)}/chat/completions`;
+  const audioParts = await Promise.all(audioUrls.map((source) => audioSourceToInputPart(source)));
   const messages = [
     { role: "system", content: system },
     {
       role: "user",
-      content: imageUrls.length > 0
+      content: imageUrls.length > 0 || audioParts.length > 0
         ? [
             { type: "text", text: user },
             ...imageUrls.map((url) => ({ type: "image_url", image_url: { url } })),
+            ...audioParts,
           ]
         : user,
     },
   ];
-  const buildBody = (withJsonMode: boolean) => ({
+  const buildBody = (withJsonMode: boolean, streaming: boolean, requestMessages: unknown[] = messages) => ({
     model: settings.model.trim(),
     temperature: settings.temperature ?? 0.4,
-    messages,
+    messages: requestMessages,
+    stream: streaming,
     ...(withJsonMode ? { response_format: { type: "json_object" as const } } : {}),
   });
-  const request = (withJsonMode: boolean) => remoteFetch(endpoint, {
+  const request = (withJsonMode: boolean, streaming = true, requestMessages: unknown[] = messages) => remoteFetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${settings.apiKey.trim()}`,
     },
-    body: JSON.stringify(buildBody(withJsonMode)),
+    body: JSON.stringify(buildBody(withJsonMode, streaming, requestMessages)),
   });
   onProgress?.("waiting");
   let response = await request(true);
@@ -192,23 +312,105 @@ async function chatCompletionsJSON(
     if (response.status === 502 || /response_format|json_object/i.test(raw)) {
       onProgress?.("waiting");
       response = await request(false);
+    } else if (STREAM_UNSUPPORTED_RE.test(raw)) {
+      onProgress?.("waiting");
+      response = await request(true, false);
+    }
+  } else if (response.status === 422) {
+    const raw = await response.clone().text();
+    if (STREAM_UNSUPPORTED_RE.test(raw)) {
+      onProgress?.("waiting");
+      response = await request(true, false);
     }
   }
   if (!response.ok) {
     const raw = await response.text().catch(() => "");
     throw new Error(`HTTP ${response.status}${raw ? `：${raw.slice(0, 260)}` : ""}`);
   }
-  onProgress?.("parsing");
-  const data = await response.json() as { choices?: { message?: { content?: string } }[] };
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error("响应中没有文本内容");
-  return extractJSON(content);
+  try {
+    const content = await readChatCompletionText(response);
+    if (!content) throw new Error("响应中没有文本内容");
+    onProgress?.("parsing");
+    return extractJSON(content);
+  } catch (error) {
+    if (!(error instanceof ChatCompletionInterruptedError) || !error.partialText.trim()) throw error;
+    const continueFrom = async (partialText: string): Promise<unknown> => {
+      onProgress?.("resuming");
+      const resumedResponse = await request(true, true, continuationMessages(messages, partialText));
+      if (!resumedResponse.ok) {
+        const raw = await resumedResponse.text().catch(() => "");
+        throw new ChatCompletionInterruptedError(
+          partialText,
+          () => continueFrom(partialText),
+          `续写请求 HTTP ${resumedResponse.status}${raw ? `：${raw.slice(0, 260)}` : ""}`,
+        );
+      }
+      let resumed: string;
+      try {
+        resumed = await readChatCompletionText(resumedResponse);
+      } catch (resumeError) {
+        if (resumeError instanceof ChatCompletionInterruptedError) {
+          const merged = mergeContinuationText(partialText, resumeError.partialText);
+          throw new ChatCompletionInterruptedError(merged, () => continueFrom(merged));
+        }
+        throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText));
+      }
+      return extractJSON(mergeContinuationText(partialText, resumed));
+    };
+    return continueFrom(error.partialText);
+  }
+}
+
+interface AudioInputPart {
+  type: "input_audio";
+  input_audio: { data: string; format: "wav" | "mp3" | "m4a" | "ogg" | "flac" };
+}
+
+function audioFormatFromSource(source: string, mimeType = ""): AudioInputPart["input_audio"]["format"] {
+  const normalized = `${mimeType} ${source}`.toLowerCase();
+  if (normalized.includes("wav")) return "wav";
+  if (normalized.includes("m4a") || normalized.includes("mp4")) return "m4a";
+  if (normalized.includes("ogg") || normalized.includes("oga")) return "ogg";
+  if (normalized.includes("flac")) return "flac";
+  return "mp3";
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function audioSourceToInputPart(source: string): Promise<AudioInputPart> {
+  const trimmed = source.trim();
+  if (!trimmed) throw new Error("声音音色音频为空，无法分析。");
+
+  if (trimmed.startsWith("data:audio/")) {
+    const match = trimmed.match(/^data:([^;,]+);base64,(.+)$/s);
+    if (!match) throw new Error("声音音色音频不是有效的 Base64 音频数据。");
+    return {
+      type: "input_audio",
+      input_audio: { data: match[2], format: audioFormatFromSource(trimmed, match[1]) },
+    };
+  }
+
+  const response = await fetch(resolveImageDisplayUrl(trimmed));
+  if (!response.ok) throw new Error(`无法读取声音音色音频（HTTP ${response.status}）。`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  return {
+    type: "input_audio",
+    input_audio: { data: bytesToBase64(bytes), format: audioFormatFromSource(trimmed, response.headers.get("content-type") ?? "") },
+  };
 }
 
 /** Final delivery is prose, so it deliberately skips JSON mode and returns only the model text. */
-async function chatCompletionsText(settings: AISettings, system: string, user: string): Promise<string> {
+async function chatCompletionsText(settings: AISettings, system: string, user: string, onProgress?: (stage: SceneCompileProgress) => void): Promise<string> {
   const endpoint = `${openAICompatibleBaseUrl(settings.baseUrl)}/chat/completions`;
-  const response = await remoteFetch(endpoint, {
+  const baseMessages = [{ role: "system", content: system }, { role: "user", content: user }];
+  const request = (streaming: boolean, messages: unknown[] = baseMessages) => remoteFetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -217,17 +419,55 @@ async function chatCompletionsText(settings: AISettings, system: string, user: s
     body: JSON.stringify({
       model: settings.model.trim(),
       temperature: settings.temperature ?? 0.4,
-      messages: [{ role: "system", content: system }, { role: "user", content: user }],
+      stream: streaming,
+      messages,
     }),
   });
+  onProgress?.("waiting");
+  let response = await request(true);
+  if (!response.ok) {
+    const raw = await response.clone().text().catch(() => "");
+    if ((response.status === 400 || response.status === 422) && STREAM_UNSUPPORTED_RE.test(raw)) {
+      response = await request(false);
+    }
+  }
   if (!response.ok) {
     const raw = await response.text().catch(() => "");
     throw new Error(`HTTP ${response.status}${raw ? `：${raw.slice(0, 260)}` : ""}`);
   }
-  const data = await response.json() as { choices?: { message?: { content?: string } }[] };
-  const content = data.choices?.[0]?.message?.content?.trim();
-  if (!content) throw new Error("响应中没有最终提示词文本");
-  return sanitizeFinalPromptResponse(content);
+  try {
+    const content = (await readChatCompletionText(response)).trim();
+    if (!content) throw new Error("响应中没有最终提示词文本");
+    onProgress?.("parsing");
+    return sanitizeFinalPromptResponse(content);
+  } catch (error) {
+    if (!(error instanceof ChatCompletionInterruptedError) || !error.partialText.trim()) throw error;
+    const continueFrom = async (partialText: string): Promise<string> => {
+      onProgress?.("resuming");
+      const resumedResponse = await request(true, continuationMessages(baseMessages, partialText));
+      if (!resumedResponse.ok) {
+        const raw = await resumedResponse.text().catch(() => "");
+        throw new ChatCompletionInterruptedError(
+          partialText,
+          () => continueFrom(partialText),
+          `续写请求 HTTP ${resumedResponse.status}${raw ? `：${raw.slice(0, 260)}` : ""}`,
+        );
+      }
+      let resumed: string;
+      try {
+        resumed = await readChatCompletionText(resumedResponse);
+      } catch (resumeError) {
+        if (resumeError instanceof ChatCompletionInterruptedError) {
+          const merged = mergeContinuationText(partialText, resumeError.partialText);
+          throw new ChatCompletionInterruptedError(merged, () => continueFrom(merged));
+        }
+        throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText));
+      }
+      onProgress?.("parsing");
+      return sanitizeFinalPromptResponse(mergeContinuationText(partialText, resumed).trim());
+    };
+    return continueFrom(error.partialText);
+  }
 }
 
 /** Remove hidden reasoning emitted by models before the text reaches the prompt editor. */
@@ -597,8 +837,9 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
     throw new Error("AI 未配置，请先在 LenTalk「设置 → 密钥」中配置 Chat 模型与 API Key。");
   }
   const images = (asset.referencePaths ?? []).slice(0, 4);
-  if (images.length === 0) {
-    throw new Error("请先上传至少一张参考图，AI 需要看图才能填写详细。");
+  const audioUrls = asset.kind === "character" && asset.voiceClip?.trim() ? [asset.voiceClip.trim()] : [];
+  if (images.length === 0 && audioUrls.length === 0) {
+    throw new Error("请先添加参考图或角色声音音色音频，AI 才能填写详细。");
   }
 
   const isZh = locale === "zh";
@@ -628,7 +869,7 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
     : "";
   const characterRules = isCharacter
     ? [
-        `- actingProfile.${masterField}: the character's acting master template in ${language} (performance wording for face/body/wardrobe, 3-6 clauses).`,
+        `- actingProfile.${masterField}: the character's compact acting master template in ${language}. It must contain 5-7 concise clauses about observable face, body, voice, and movement only; never include wardrobe, costume, camera, framing, lens, lighting, color, or grade.`,
         `- actingProfile.${voiceField}: the character's voice-lock formula in ${language} (paste it verbatim when the character speaks).`,
         "- actingProfile.performanceTarget: integer 0-5. After writing the master profile, self-score it (0 mannequin / 1 reciting / 2 diligent / 3 craftsman / 4 alive / 5 magnet). If your self-score is below 4, rewrite the master profile until it reaches 4, then set performanceTarget to that final score (default 4).",
       ]
@@ -637,7 +878,7 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
   const data = await chatCompletionsJSON(settings, JSON_SYSTEM, [
     "You are filling in a production asset card for a cinematic AI video prompt studio.",
     `Answer ONLY in ${language}.`,
-    "Analyze the attached reference image(s) carefully. Every field must be grounded in what you can see (or, for style refs, derive consistently) — no invented details.",
+    "Analyze the attached reference image(s) carefully. Every visual field must be grounded in what you can see (or, for style refs, derive consistently) — no invented details.",
     "",
     FILL_ASSET_KIND_HINTS[asset.kind],
     `User notes (${language}, AI reference only; never copy this field into the final prompt): ${isZh ? (asset.notesZh?.trim() || "(none)") : (asset.notes?.trim() || "(none)")}`,
@@ -655,16 +896,36 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
     `- forbiddenConfusions: other known assets this one is easily confused with, in ${language}, or empty if none.`,
     `- tags: 2-5 short production tags in ${language}.`,
     "- lockLevel: \"strict\" only for a character whose identity must be exact, \"soft\" for suggested lock, else \"none\".",
+    ...(isCharacter
+      ? [
+          "ACTING MASTER PROFILE RULES (mandatory):",
+          "1. Only observable behavior. Translate every inner state into a body marker: breath, swallow, lip, jaw, eyes, blink, hands, shoulders, posture, weight, tempo, distance, or voice delivery. Never leave an emotion as an unsupported label such as nervous or angry.",
+          "2. Every habit or tic must include its trigger in the same clause: [visible tic] + [when/why]. A generic trigger category is enough; do not invent a long scene event.",
+          "3. Name the gait with a short quoted name, then unpack its biomechanics: weight distribution, step length, torso and arms, and head position.",
+          "4. Include one compact mask-and-crack clause: [stable facade]. However, when [short trigger type such as challenged / loss of control / core relationship touched] — [visible change]. The trigger may be general, not a specific plot event.",
+          "5. Give exactly one softening target when it fits the character; omit it when it does not. Never list two or more targets.",
+          "6. No wardrobe or costume. No camera, framing, optics, lens, lighting, color, grade, or visual style. Those belong elsewhere in the prompt.",
+          "7. Use physique as biography: age or age impression, build, and posture should reveal profession, past injury, past struggle, or self-image where supported by the user's notes. Keep it compact.",
+        ]
+      : []),
     ...characterRules,
+    ...(isCharacter && audioUrls.length > 0
+      ? [
+          "VOICE LOCK PRIORITY: The attached voice audio is the primary evidence for acoustic traits. Listen to and sample the audio first. If the user's notes explicitly state the character's age or accent, use those stated facts directly; otherwise infer them only when reasonably supported by the audio, and state that they cannot be determined when they are not reliable. User notes may add explicit creative constraints, but must not override audible pitch, register, resonance, timbre, articulation, or delivery.",
+          isZh
+            ? "voicePromptZh 必须只输出一段简洁、准确、可执行的中文声音锁，并严格按此顺序：年龄/年龄感，口音，成年男性或女性及声部，基频约多少 Hz 及常态集中区间，声音重心，音色与明暗，中低频共鸣，泛音密度，高频气声与齿音，整体听感与压力下的说话变化，最后写保持项与避免项。基频和区间必须根据音频估计并使用 Hz；如果用户备注明确标明年龄或口音，直接采用备注中的表述；如果备注没有标明，再根据音频判断，无法可靠判断时写‘无法从音频确定’，不要臆造。参考格式：26岁，南方闽南口音，成年男性低男中音，基频约103–150 Hz，常态集中在110–120 Hz。声音重心位于低频至中低频，音色温厚、偏暗、稳定，不明亮尖锐；中低频共鸣明显，泛音密度适中，高频气声与齿音较弱，整体听感沉着、克制、理性，压力下会加快吐字。保持低男中音和一致的声带厚度，避免变尖、变薄或出现少年感。"
+            : "voicePrompt must be one concise, accurate, executable voice-lock paragraph in this order: age or perceived age, accent, adult gender and register, estimated fundamental frequency in Hz and normal concentration range, vocal-weight center, timbre brightness, low-mid resonance, overtone density, breathiness and sibilance, overall impression and pressure delivery change, then preserve and avoid constraints. Estimate F0 from the audio and state it in Hz. If the user notes explicitly state the age or accent, use those stated facts directly; if they do not, infer only when reasonably supported by the audio, otherwise say it cannot be determined instead of inventing it.",
+        ]
+      : []),
     ...(isCharacter
       ? ["For a character, absorb the user's personality, motivation, speaking habits, and voice notes into actingProfile.masterProfile and actingProfile.voicePrompt; do not output the notes field itself."]
       : ["For this asset, use the user notes only to disambiguate the image and improve the canonical description; do not output the notes field itself."]),
     "",
     `Asset kind: ${asset.kind}`,
-    "Current values already filled by the user (keep them unless the image clearly contradicts them): " + JSON.stringify(existing),
+    "Current values already filled by the user (keep them unless the reference evidence clearly contradicts them): " + JSON.stringify(existing),
     "",
     "Do NOT add prose or keys outside the schema.",
-  ].join("\n"), images);
+  ].join("\n"), images, undefined, audioUrls);
 
   const obj = (data ?? {}) as Record<string, unknown>;
   const lockLevel = asString(obj.lockLevel, "none") as LockLevel;
@@ -904,12 +1165,14 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     "STORYBOARD RULES:",
     "Scene context (first section of the final export): write 1-3 sentences in the user language about this clip only. Cover what is currently happening, who is in frame, where/when it takes place, and the total duration. Never quote prior context, story summary, user notes, AI instructions, warnings, or @ tags.",
     "Director document: return every directorLayers key with concise scene-level direction in the scene language. Do not return actionTiming: all shot timing, actions, beats, and character acting belong exclusively in the shots array. These are editable planning layers, not the final prompt. Keep them consistent with the shots and do not include audit diagnostics or user-only planning text.",
+    "LOCATION MAP is a practical spatial-state map, not a mood paragraph. Write it with these labeled fields in this order: camera position; camera facing direction; foreground; midground; background; main landmark positions; character positions; movement path; lighting direction; depth relationships. Use concrete relative positions, distances, axes, entrances, exits, and front/mid/back depth when known. If a location reference exists, use it for geography, materials, atmosphere, landmarks, and relevant lighting direction only; do not blindly inherit its camera angle, framing, or composition unless explicitly requested. The scene character roster is only a spatial baseline: actual characters remain shot-local and must not be copied into every shot.",
+    "FIRST FRAME AND SPATIAL BLOCKING: if the first shot requires visible characters or props, state directly that the first visible frame already contains every required subject in its correct position, with no empty establishing frame, no delayed reveal, and no opening frame without the required subjects. Allow an empty opening only when the user explicitly requests it. Flash cuts and very short establishing cuts must still contain the required subject or location information immediately; never add an empty flash cut, abstract filler, or random landscape insert. Preserve the user's first-frame reference images and treat them as spatial occupancy references only.",
     isLongTake
       ? `Shooting mode is LONG TAKE. Return EXACTLY ONE shot, starting at 0 and ending no later than ${durationLimit}s. Put the complete story progression into 1-8 continuous beats inside that one shot. Do not create cut points, alternate camera setups, or additional shot entries.`
       : `Shooting mode is MULTI-SHOT. Select 1-8 shots only when the story rhythm needs a new viewpoint. Slow, observational, or dialogue-led scenes normally use 1-3 shots; do not add coverage just to fill a template. Use more shots only for a clear change of information, action, or emotional beat.`,
     `Timeline hard limit: all shots are sequential; shot 1 starts at 0; shot N starts where shot N-1 ends; the final endSeconds MUST be less than or equal to ${durationLimit}s. Never exceed the user's ${durationLimit}${seconds} limit. Duration label uses "${seconds}" suffix.`,
-    "Every shot needs action, acting, framing, optics.fieldOfViewDegrees, movement, direction, and participants (only existing character IDs). Participants are shot-local: add only people visible in frame or required to perform, speak, or receive an on-screen action in that exact shot. Do not copy the scene roster into every shot. Every beat actor and targetCharacterId MUST be listed in that same shot's participants. Assign camera / lensModel from the available IDs when the scene benefits from a specific look, otherwise omit.",
-    "Performance (P2): per shot, set performanceLevel (0-5, 4 default whenever the acting master profile is strong) and eyeLife (micro glances / blink quality / eye glint / eyes leading the turn). For each participant, write acting and eyeLife as this exact shot's observable adaptation: pressure shown through posture, breath, business, timing, distance, gaze, blink and reaction. Do not paste a master profile. Do not use wardrobe, camera, color, or abstract emotion labels. Fill the beats' P2 fields: tactic (press / charm / provoke...), subtext (true intent opposite to the line), beatChange (visible shift: pause / posture / tempo / eye-line cut), reactionBeforeLine (reaction starting before the other speaker finishes). Every visible action must have its real performer in actorId; a listener or reacting character must get a separate beat with that character's actorId. Use targetCharacterId only for the person being watched, addressed, or reacted to. Never assign a listener's prop action, eye movement, hand movement, or body reaction to the speaker.",
+    "Every shot needs action, acting, framing, optics.lensCharacter, optics.fieldOfViewDegrees, movement, direction, and participants (only existing character IDs). Framing and optics are a linked pair: Wide / environmental action normally uses 47-standard or 84-wide; Medium close-up / face portrait uses 29-short-tele; Extreme close-up / detail uses 18-tele; distant observation uses 8-supertele. Never return a close framing with a broad environmental lens or a wide framing with a portrait telephoto unless the user explicitly asks for that contrast. Participants are shot-local: add only people visible in frame or required to perform, speak, or receive an on-screen action in that exact shot. Do not copy the scene roster into every shot. Every beat actor and targetCharacterId MUST be listed in that same shot's participants. Assign camera / lensModel from the available IDs when the scene benefits from a specific look, otherwise omit.",
+    "Performance (P2): the master profile is who the character is; rewrite it into this exact shot's moment. Present characters only: write an acting paragraph only for characters in that shot's participants; no character in frame means no paragraph for that character. Keep the constant core (identity, vocal profile, signature tics, eye life, emotional through-line) and never contradict the master. Re-express it for this shot's posture, action, beat, emotional pressure, and time of day. Transform behaviors that cannot physically happen instead of deleting them: preserve the same engine while changing its outlet. For each participant, write acting as one flowing paragraph in the character's register, with no bullets, headers, dial labels, or abstract emotion-only wording; use observable face, body, breath, voice, gaze, timing, distance, and reaction. If the pipeline uses asset references, begin the paragraph with that character's reference tag. Set performanceLevel (0-5, 4 default whenever the acting master profile is strong) and eyeLife (micro glances / blink quality / eye glint / eyes leading the turn). Do not paste a master profile. Do not use wardrobe, camera, color, or abstract emotion labels. Fill the beats' P2 fields: tactic (press / charm / provoke...), subtext (true intent opposite to the line), beatChange (visible shift: pause / posture / tempo / eye-line cut), reactionBeforeLine (reaction starting before the other speaker finishes). Every visible action must have its real performer in actorId; a listener or reacting character must get a separate beat with that character's actorId. Use targetCharacterId only for the person being watched, addressed, or reacted to. Never assign a listener's prop action, eye movement, hand movement, or body reaction to the speaker.",
     "Photography (P1): prefer observable lens character over focal-length-only strings. Per shot set optics.lensCharacter from the 7 presets (47-standard / 84-wide / 107-ultrawide / 29-short-tele / 18-tele / 8-supertele / 135-immersive) with optics.fieldOfViewDegrees 8-135 matching the preset, and add lensOutcome + antiDriftLock when the look must stay locked. Set cameraBehavior as physical operator behavior (height / distance / angle / side / subjectSize / screenPlacement / focusBehavior / depthOfField / handheldQuality). Add physicsAnchors for walk / run / weapon / liquid / particle. Per participant set torsoFacing when the body turns away from the eyeline, and anchorDistance when a landmark anchors the scene. At scene level return firstFrameLock.requiredSubjectIds (only existing asset ids that MUST be on screen in frame one) and lightingDirection (primarySource / direction / exposurePriority / allowHighlights / forbid).",
     "State, not transition: write mid-action states (jaw clenched, strides lengthening), never transition chains (starts to... / begins to...). Groups react in staggered waves with different intensities, never in unison.",
     "Dialogue: write only scripted lines for this scene; when a character speaks, everyone else stays quiet. For an intentional silence, hold 1 second of quiet before and after the line; for an immediate interruption, start the line within 0.3 seconds.",
@@ -941,27 +1204,38 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
  * Second-stage delivery: re-organize already audited canonical prompt facts.
  * It must not plan shots, alter assets, or use user-planning fields as source material.
  */
-export async function generateFinalPrompt(sourcePrompt: string, locale: Locale): Promise<string> {
+export async function generateFinalPrompt(sourcePrompt: string, locale: Locale, onProgress?: (stage: SceneCompileProgress) => void): Promise<string> {
   const settings = loadAISettings();
   if (!isRemoteConfigured(settings)) {
     throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key。");
   }
   const request = buildFinalPromptRequest(sourcePrompt, locale);
-  return chatCompletionsText(settings, request.system, request.user);
+  return chatCompletionsText(settings, request.system, request.user, onProgress);
 }
 
 export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): { system: string; user: string } {
-  void locale;
+  const zh = locale === "zh";
+  const languageRule = zh
+    ? "只用清晰、电影级的中文输出。即使规范源包含英文，也必须将其忠实转换为自然、直接、可拍摄、可执行的中文提示词；避免翻译腔、空泛形容词和散文化抒情。"
+    : "Output only clear, cinematic-grade English. Even if the canonical source contains Chinese, faithfully convert it into natural, direct, shootable, executable English; avoid literal translation, vague adjectives, and poetic prose.";
+  const headingsRule = zh
+    ? "只输出以下非空类别，必须使用这些中文标题，并严格按此顺序：场景上下文、活动引用、场景地图、首帧与空间走位、格式模式、光学、摄像机、动作节奏、物理、光线、音频、风格、正向约束。仅当源中存在时才输出：负向约束。"
+    : "Output only the following non-empty categories, using exactly these English headings and this order: SCENE CONTEXT, ACTIVE REFERENCES, LOCATION MAP, FIRST FRAME AND SPATIAL BLOCKING, FORMAT MODE, OPTICS, CAMERA, ACTION TIMING, PHYSICS, LIGHTING, AUDIO, STYLE, POSITIVE CONSTRAINTS. Output NEGATIVE CONSTRAINTS only when present in the source.";
+  const styleRule = zh
+    ? "空间锁定必须在摄像机之前，光学必须在一般美术语言之前，光线必须作为优先级锁。允许输出风格，但风格必须位于光线之后、正向约束之前，只描述画面质感、色彩、构图、材质和氛围，不重复光学、摄像机、动作或光线锁。不要新增质量、角色表演或其他标题；角色表演必须附着在动作节奏中对应的镜头和人物之后。"
+    : "Keep spatial locks before camera, optics before general visual language, and lighting as a priority lock. STYLE must come after LIGHTING and before POSITIVE CONSTRAINTS; describe only image texture, color, composition, materials, and atmosphere, without repeating optics, camera, action, or lighting locks. Do not add QUALITY, CHARACTER ACTING, or any other heading; attach acting to the corresponding shot and character inside ACTION TIMING.";
   return {
     system: "You are CINEDANCE V4, the final delivery editor for Seedance and Higgsfield cinematic video prompts. "
-      + "Return only the finished prompt in clear, cinematic-grade Chinese, with no commentary, markdown fence, rationale, audit note, or greeting.",
+      + (zh
+        ? "Return only the finished prompt in clear, cinematic-grade Chinese, with no commentary, markdown fence, rationale, audit note, or greeting."
+        : "Return only the finished prompt in clear, cinematic-grade English, with no commentary, markdown fence, rationale, audit note, or greeting."),
     user: [
-      "只用清晰、电影级的中文输出。即使规范源包含英文，也必须将其忠实转换为自然、直接、可拍摄、可执行的中文提示词；避免翻译腔、空泛形容词和散文化抒情。",
+      languageRule,
       "The canonical source below combines the editable director document with the structured shot execution. Preserve every concrete fact, active reference, timing, character action, acting behavior, and constraint.",
       "Every @asset_tag, [imageN], and @audioN token is an opaque Seedance platform reference. Copy each one exactly as supplied: never translate, delete, rename, normalize, duplicate, or invent one. Keep each asset's appearance, acting template, voice lock, voice reference, and prop description exclusively in ACTIVE REFERENCES; do not repeat those descriptions elsewhere.",
       "Do not invent, remove, reinterpret, or contradict any fact. Do not add prior context, story summaries, user notes, AI instructions, warnings, scores, or diagnostics.",
-      "只输出以下非空类别，必须使用这些中文标题，并严格按此顺序：场景上下文、活动引用、场景地图、首帧与空间走位、格式模式、光学、摄像机、动作节奏、物理、光线、音频、风格、正向约束。仅当源中存在时才输出：负向约束。",
-      "空间锁定必须在摄像机之前，光学必须在一般美术语言之前，光线必须作为优先级锁。允许输出风格，但风格必须位于光线之后、正向约束之前，只描述画面质感、色彩、构图、材质和氛围，不重复光学、摄像机、动作或光线锁。不要新增质量、角色表演或其他标题；角色表演必须附着在动作节奏中对应的镜头和人物之后。",
+      headingsRule,
+      styleRule,
       "",
       "CANONICAL AUDITED SOURCE:",
       sourcePrompt,
@@ -1096,8 +1370,13 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     const part = (raw ?? {}) as Record<string, unknown>;
     const ids = asStringArray(part.requiredSubjectIds).filter((id) => characterIds.has(id) || propIds.has(id));
     const occupancyStatement = asString(part.occupancyStatement, undefined);
-    if (ids.length === 0 && !occupancyStatement) return undefined;
-    return { ...(ids.length > 0 ? { requiredSubjectIds: ids } : {}), ...(occupancyStatement ? { occupancyStatement } : {}) };
+    const referenceImages = (scene.firstFrameLock?.referenceImages ?? []).map((source) => source.trim()).filter(Boolean);
+    if (ids.length === 0 && !occupancyStatement && referenceImages.length === 0) return undefined;
+    return {
+      ...(ids.length > 0 ? { requiredSubjectIds: ids } : {}),
+      ...(occupancyStatement ? { occupancyStatement } : {}),
+      ...(referenceImages.length > 0 ? { referenceImages } : {}),
+    };
   };
   const normalizeLightingDirection = (raw: unknown): LightingDirection | undefined => {
     const part = (raw ?? {}) as Record<string, unknown>;
@@ -1195,8 +1474,28 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     const camera = asString(raw.camera, undefined);
     const shotOptics = normalizeOptics(raw.optics);
     const legacyFov = shotOptics?.fieldOfViewDegrees ?? legacyFocalLengthToFov(legacyLens) ?? 47;
-    const normalizedOptics = shotOptics ?? { fieldOfViewDegrees: legacyFov, lensCharacter: lensByFov(legacyFov)?.id };
-    const lens = legacyLens || fovToLegacyFocalLength(legacyFov);
+    const recommendedLensId = /extreme\s*close|极近特写|细节|macro|insert/i.test(framing)
+      ? "18-tele"
+      : /close[- ]?up|portrait|特写|肖像|面部|面孔|中近景/i.test(framing)
+        ? "29-short-tele"
+        : /wide|full|establishing|全景|远景|广角/i.test(framing)
+          ? "84-wide"
+          : "47-standard";
+    const recommendedLens = lensById(recommendedLensId);
+    const selectedLensId = shotOptics?.lensCharacter ?? lensByFov(legacyFov)?.id;
+    const selectedLens = selectedLensId ? lensById(selectedLensId) : undefined;
+    const needsNarrowLens = /extreme\s*close|close[- ]?up|portrait|特写|肖像|面部|面孔|中近景|细节|macro|insert/i.test(framing);
+    const needsBroadLens = /wide|full|establishing|全景|远景|广角/i.test(framing);
+    const lensIsNarrow = (selectedLens?.contentClasses ?? []).some((item) => item === "face-portrait" || item === "detail-closeup");
+    const lensIsBroad = (selectedLens?.contentClasses ?? []).some((item) => item === "environment-action" || item === "distant-observation");
+    const framingLensMismatch = (needsNarrowLens && !lensIsNarrow) || (needsBroadLens && !lensIsBroad);
+    const normalizedOptics = framingLensMismatch && recommendedLens
+      ? { lensCharacter: recommendedLens.id, fieldOfViewDegrees: recommendedLens.fov }
+      : shotOptics ?? { fieldOfViewDegrees: legacyFov, lensCharacter: lensByFov(legacyFov)?.id };
+    const effectiveFov = normalizedOptics.fieldOfViewDegrees ?? legacyFov;
+    const lens = framingLensMismatch && recommendedLens
+      ? fovToLegacyFocalLength(recommendedLens.fov)
+      : legacyLens || fovToLegacyFocalLength(effectiveFov);
     const shotCameraBehavior = normalizeCameraBehavior(raw.cameraBehavior);
     const shotPhysicsAnchors = normalizePhysicsAnchors(raw.physicsAnchors);
     const direction = asString(raw.direction, "left-to-right") as ShotV2["direction"];
@@ -1258,8 +1557,8 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
   ]);
   const rawFirstFrameLock = normalizeFirstFrameLock(obj.firstFrameLock);
   const requiredSubjectIds = (rawFirstFrameLock?.requiredSubjectIds ?? []).filter((id) => firstShotIds.has(id));
-  const firstFrameLock = rawFirstFrameLock && requiredSubjectIds.length > 0
-    ? { ...rawFirstFrameLock, requiredSubjectIds }
+  const firstFrameLock = rawFirstFrameLock && (requiredSubjectIds.length > 0 || rawFirstFrameLock.occupancyStatement || rawFirstFrameLock.referenceImages?.length)
+    ? { ...rawFirstFrameLock, ...(requiredSubjectIds.length > 0 ? { requiredSubjectIds } : {}) }
     : undefined;
   const lightingDirection = normalizeLightingDirection(obj.lightingDirection);
 

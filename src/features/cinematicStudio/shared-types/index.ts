@@ -452,6 +452,8 @@ export interface FirstFrameLock {
   requiredSubjectIds?: string[];
   /** 输出文案，缺省用模板 */
   occupancyStatement?: string;
+  /** 首帧专属参考图，按顺序映射到最终提示词中的 [imageN] */
+  referenceImages?: string[];
 }
 
 /** 光线方向结构（P1.6） */

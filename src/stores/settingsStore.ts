@@ -1,5 +1,7 @@
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { createJSONStorage, persist } from 'zustand/middleware';
+import { isTauri } from '@tauri-apps/api/core';
+import { loadAppSetting, saveAppSetting, deleteAppSetting } from '@/commands/appDatabase';
 import {
   DEFAULT_GRSAI_CREDIT_TIER_ID,
   PRICE_DISPLAY_CURRENCY_MODES,
@@ -11,6 +13,10 @@ export type UiRadiusPreset = 'compact' | 'default' | 'large';
 export type ThemeTonePreset = 'neutral' | 'warm' | 'cool';
 export type CanvasEdgeRoutingMode = 'spline' | 'orthogonal' | 'smartOrthogonal';
 export type ProviderApiKeys = Record<string, string>;
+export interface CinematicAiSelection {
+  provider: string;
+  model: string;
+}
 export const DEFAULT_GRSAI_NANO_BANANA_PRO_MODEL = 'nano-banana-pro';
 export const DEFAULT_JIMENG_CLI_EXECUTABLE = 'dreamina';
 
@@ -21,6 +27,7 @@ export interface CustomApiCapabilities {
   imageProtocol: 'images' | 'responses' | 'chat' | 'unknown';
   imageReferenceField: 'image' | 'input_image' | 'image_urls' | 'unknown';
   imageReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
+  imageTransport: 'generations_json' | 'edits_multipart' | 'apimart_json' | 'unknown';
   videoSubmitPath: string;
   videoQueryPath: string;
   videoReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
@@ -75,7 +82,7 @@ export interface CustomApiProvider {
   referenceImageField: 'image' | 'input_image';
   /** 参考图编码: auto 按字段选择, 也可显式指定纯 Base64 / data URL / URL。 */
   referenceImageEncoding: 'auto' | 'data_url' | 'raw_base64' | 'url';
-  /** Images 协议的图生图传输方式。auto 会为所有带参考图的请求使用 edits multipart。 */
+  /** Images 协议的图生图传输方式。auto 使用平台/模型专用适配，默认保持 generations JSON。 */
   imageTransport: 'auto' | 'generations_json' | 'edits_multipart' | 'apimart_json';
   capabilities?: CustomApiCapabilities;
 }
@@ -99,6 +106,7 @@ interface SettingsState {
   isHydrated: boolean;
   apiKeys: ProviderApiKeys;
   customApis: CustomApiProvider[];
+  cinematicAiSelection: CinematicAiSelection;
   jimengCli: JimengCliSettings;
   grsaiNanoBananaProModel: string;
   hideProviderGuidePopover: boolean;
@@ -132,6 +140,7 @@ interface SettingsState {
   addCustomApi: (input: Omit<CustomApiProvider, 'id' | 'createdAt'>) => CustomApiProvider;
   updateCustomApi: (id: string, patch: Partial<Omit<CustomApiProvider, 'id'>>) => void;
   removeCustomApi: (id: string) => void;
+  setCinematicAiSelection: (selection: CinematicAiSelection) => void;
   setGrsaiNanoBananaProModel: (model: string) => void;
   setHideProviderGuidePopover: (hide: boolean) => void;
   setDownloadPresetPaths: (paths: string[]) => void;
@@ -157,6 +166,51 @@ interface SettingsState {
   setLastImageModelId: (modelId: string | null) => void;
   markModelAvailable: (modelId: string) => void;
 }
+
+const SETTINGS_STORAGE_KEY = 'settings-storage';
+
+// Zustand's persist middleware supports async storage. Desktop builds use the
+// unified SQLite database; browser previews retain localStorage as a fallback.
+const settingsStorage = {
+  getItem: async (name: string): Promise<string | null> => {
+    if (isTauri()) {
+      const stored = await loadAppSetting(name).catch(() => null);
+      if (stored !== null) {
+        if (typeof localStorage !== 'undefined') localStorage.removeItem(name);
+        return stored;
+      }
+
+      const legacy = typeof localStorage !== 'undefined' ? localStorage.getItem(name) : null;
+      if (legacy !== null) {
+        try {
+          await saveAppSetting(name, legacy);
+          localStorage.removeItem(name);
+        } catch {
+          // Keep the legacy copy if SQLite is temporarily unavailable.
+        }
+      }
+      return legacy;
+    }
+    return typeof localStorage !== 'undefined' ? localStorage.getItem(name) : null;
+  },
+  setItem: async (name: string, value: string): Promise<void> => {
+    if (isTauri()) {
+      try {
+        await saveAppSetting(name, value);
+        return;
+      } catch {
+        // Development/webview fallback; never lose a settings update.
+      }
+    }
+    if (typeof localStorage !== 'undefined') localStorage.setItem(name, value);
+  },
+  removeItem: async (name: string): Promise<void> => {
+    if (isTauri()) {
+      await deleteAppSetting(name).catch(() => undefined);
+    }
+    if (typeof localStorage !== 'undefined') localStorage.removeItem(name);
+  },
+};
 
 const HEX_COLOR_PATTERN = /^#?[0-9a-fA-F]{6}$/;
 
@@ -267,6 +321,7 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
   const protocol = value.imageProtocol;
   const field = value.imageReferenceField;
   const imageEncoding = value.imageReferenceEncoding;
+  const imageTransport = value.imageTransport;
   const videoEncoding = value.videoReferenceEncoding;
   const taskProtocol = value.taskProtocol;
   return {
@@ -277,6 +332,9 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
     imageReferenceField: field === 'input_image' || field === 'image' || field === 'image_urls' ? field : 'unknown',
     imageReferenceEncoding: imageEncoding === 'data_url' || imageEncoding === 'raw_base64' || imageEncoding === 'url' || imageEncoding === 'multipart'
       ? imageEncoding
+      : 'unknown',
+    imageTransport: imageTransport === 'generations_json' || imageTransport === 'edits_multipart' || imageTransport === 'apimart_json'
+      ? imageTransport
       : 'unknown',
     videoSubmitPath: typeof value.videoSubmitPath === 'string' ? value.videoSubmitPath : '/v1/videos/generations',
     videoQueryPath: typeof value.videoQueryPath === 'string' ? value.videoQueryPath : '/v1/videos/generations/{taskId}',
@@ -388,6 +446,7 @@ export const useSettingsStore = create<SettingsState>()(
       isHydrated: false,
       apiKeys: {},
       customApis: [],
+      cinematicAiSelection: { provider: '', model: '' },
       jimengCli: { executable: DEFAULT_JIMENG_CLI_EXECUTABLE },
       grsaiNanoBananaProModel: DEFAULT_GRSAI_NANO_BANANA_PRO_MODEL,
       hideProviderGuidePopover: false,
@@ -463,6 +522,13 @@ export const useSettingsStore = create<SettingsState>()(
           return { customApis, apiKeys: nextKeys };
         });
       },
+      setCinematicAiSelection: (selection) =>
+        set({
+          cinematicAiSelection: {
+            provider: selection.provider.trim(),
+            model: selection.model.trim(),
+          },
+        }),
       setGrsaiNanoBananaProModel: (model) =>
         set({
           grsaiNanoBananaProModel: normalizeGrsaiNanoBananaProModel(model),
@@ -516,7 +582,8 @@ export const useSettingsStore = create<SettingsState>()(
       },
     }),
     {
-      name: 'settings-storage',
+      name: SETTINGS_STORAGE_KEY,
+      storage: createJSONStorage(() => settingsStorage),
       version: 16,
       onRehydrateStorage: () => {
         return (_state, error) => {

@@ -112,6 +112,8 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
   const lens = getLens(lensModelId);
   if (lens) shotBit.push(`${locale === "zh" ? "镜头" : "Lens"}: ${lens.brand} ${lens.model}`);
   if (shotBit.length > 0) shotLines.push(locale === "zh" ? `相机与景别：${shotBit.join("，")}。` : `Camera & framing: ${shotBit.join(", ")}.`);
+  const axisBreak = renderAxisBreakNote(shot, locale);
+  if (axisBreak) shotLines.push(locale === "zh" ? `相机行为：${axisBreak}` : `Camera behavior: ${axisBreak}`);
   if (shot.direction) shotLines.push(locale === "zh" ? `屏幕方向：${shot.direction}。` : `Screen direction: ${shot.direction}.`);
 
   // 参与者与空间站位
@@ -126,8 +128,6 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
     if (details) shotLines.push(details);
     const anchor = resolveAnchor(scene, shot);
     if (anchor) shotLines.push(sentence(anchor));
-    const axisBreak = renderAxisBreakNote(shot, locale);
-    if (axisBreak) shotLines.push(axisBreak);
   } else if (shot.characterId) {
     const name = assetRefName(project, syntax);
     shotLines.push(locale === "zh" ? `角色：${name(shot.characterId)}。` : `Participant: ${name(shot.characterId)}.`);

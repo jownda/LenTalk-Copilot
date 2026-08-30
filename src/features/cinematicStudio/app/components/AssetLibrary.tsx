@@ -240,7 +240,8 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
   const aiFillDetails = async () => {
     if (aiBusy) return;
     if (!isRemoteConfigured()) { setNotice(t.aiNotConfigured); return; }
-    if (!(asset.referencePaths ?? []).length) { setNotice(t.aiFillNeedsImage); return; }
+    const hasVoiceReference = asset.kind === "character" && Boolean(asset.voiceClip?.trim());
+    if (!(asset.referencePaths ?? []).length && !hasVoiceReference) { setNotice(t.aiFillNeedsReference); return; }
     setAiBusy(true);
     setNotice(t.aiFillStarted);
     try {

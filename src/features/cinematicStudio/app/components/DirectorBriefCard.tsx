@@ -11,7 +11,7 @@
  */
 import { useEffect, useState } from "react";
 import type { ActingObjective, ProjectV2, SceneStaging, SceneV2 } from "../../shared-types";
-import { Check, ChevronDown, Clapperboard, Copy, Film, Plus, Sparkles, X } from "lucide-react";
+import { Check, ChevronDown, Clapperboard, Copy, Film, Plus, RefreshCw, Sparkles, Trash2, X } from "lucide-react";
 import type { CopyZh, Locale } from "../i18n";
 import type { LenTalkChatModelOption } from "../providers/aiSettings";
 import type { SceneCompileProgress } from "../providers/ai";
@@ -31,6 +31,8 @@ interface DirectorBriefCardProps {
   aiCompileError: string;
   aiCompileErrorDetail: string;
   aiErrorCopied: boolean;
+  resumeAvailable: boolean;
+  resumeBusy: boolean;
   onSelectScene(id: string): void;
   onAddScene(): void;
   onDeleteScene(id: string): void;
@@ -38,10 +40,12 @@ interface DirectorBriefCardProps {
   onUpdateScene(patch: Partial<SceneV2>): void;
   onUpdateStaging(patch: Partial<SceneStaging>): void;
   onUpdateProject(patch: Partial<ProjectV2>): void;
+  onClearGeneratedContent(): void;
   onAiCompile(): void;
   onAiOptimizeBrief(): void;
   onLocalCompile(): void;
   onCopyAiError(): void;
+  onResumeInterrupted(): void;
   chatModels: LenTalkChatModelOption[];
   selectedChatModel: string;
   onSelectChatModel(value: string): void;
@@ -52,21 +56,22 @@ const splitLines = (text: string): string[] => text.split(/\r?\n/).map((item) =>
 
 export default function DirectorBriefCard(props: DirectorBriefCardProps) {
   const {
-    project, scene, t, locale, compileBusy, finalGenerateBusy, compileProgress, briefOptimizeBusy, aiCompileError, aiCompileErrorDetail, aiErrorCopied,
+    project, scene, t, locale, compileBusy, finalGenerateBusy, compileProgress, briefOptimizeBusy, aiCompileError, aiCompileErrorDetail, aiErrorCopied, resumeAvailable, resumeBusy,
     onSelectScene, onAddScene, onDeleteScene, onRenameScene, onUpdateScene,
-    onUpdateStaging, onUpdateProject, onAiCompile, onAiOptimizeBrief, onLocalCompile, onCopyAiError,
+    onUpdateStaging, onUpdateProject, onClearGeneratedContent, onAiCompile, onAiOptimizeBrief, onLocalCompile, onCopyAiError, onResumeInterrupted,
     chatModels, selectedChatModel, onSelectChatModel,
   } = props;
   const [pickingCharacter, setPickingCharacter] = useState(false);
   const [audioOpen, setAudioOpen] = useState(false);
   const [stylePresetOpen, setStylePresetOpen] = useState(false);
   const [busySeconds, setBusySeconds] = useState(0);
+  const generationBusy = compileBusy || finalGenerateBusy;
   useEffect(() => {
-    if (!compileBusy) { setBusySeconds(0); return; }
+    if (!generationBusy) { setBusySeconds(0); return; }
     const startedAt = Date.now();
     const timer = window.setInterval(() => setBusySeconds(Math.round((Date.now() - startedAt) / 1000)), 1000);
     return () => window.clearInterval(timer);
-  }, [compileBusy]);
+  }, [generationBusy]);
   const staging = scene.staging ?? {};
   const order = staging.characterOrder ?? [];
   const characterAssets = (project.assets ?? []).filter((asset) => asset.kind === "character");
@@ -75,10 +80,15 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
   const audio = project.audioPlan ?? { score: "none" as const, subtitles: false };
   const styleBrief = localizedStyleBrief(project, locale);
   const audioSummary = `${t.score} ${audio.score === "original-score" ? t.scoreOriginal : t.scoreNone} · ${t.subtitles} ${audio.subtitles ? t.subtitlesBurned : t.subtitlesNone} · ${t.diegeticMusic} ${(audio.diegeticMusic ?? []).length} · ${t.sfx} ${(audio.sfx ?? []).length}`;
-  const compileProgressText = locale === "zh"
+  const compileProgressText = compileProgress === "resuming"
+    ? t.aiResuming
+    : finalGenerateBusy
+    ? t.aiFinalWaiting
+    : locale === "zh"
     ? ({
         preparing: "正在整理场景、资产与约束",
         waiting: busySeconds >= 15 ? "仍在等待模型返回，连接保持中" : "请求已发出，正在等待模型生成",
+        resuming: "检测到连接中断，正在从已收到内容继续生成",
         parsing: "模型已返回，正在解析分镜数据",
         validating: "正在校验时长、镜头和资产引用",
         idle: "",
@@ -86,6 +96,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
     : ({
         preparing: "Preparing scene, assets, and constraints",
         waiting: busySeconds >= 15 ? "Still waiting for the model; the connection remains open" : "Request sent; waiting for model generation",
+        resuming: "Connection interrupted; continuing from the received content",
         parsing: "Model returned; parsing storyboard data",
         validating: "Validating timing, shots, and asset references",
         idle: "",
@@ -127,17 +138,24 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
       <label className="field-label">{t.priorContext}<textarea className="modal-textarea" value={staging.priorContext ?? ""} placeholder={t.priorContextPlaceholder} onChange={(event) => onUpdateStaging({ priorContext: event.target.value || undefined })} /></label>
 
       <div className="field-label">{t.sceneCharacterRoster}
-        <div className="stage-row">
-          {order.length === 0 ? <span className="stage-row-empty">{t.emptyOrderHint}</span> : order.map((id) => (
+        <div className="stage-row scene-character-roster-input">
+          {order.map((id) => (
             <span className="stage-chip order-chip" key={id}>
               <span className="avatar small">{nameOf(id).slice(0, 1)}</span>
               <b>{nameOf(id)}</b>
               <button title={t.deleteParticipant} onClick={() => removeCharacter(id)}><X size={11} /></button>
             </span>
           ))}
-        </div>
-        <div className="staging-order-add-row">
-          <button className="staging-order-add" onClick={() => setPickingCharacter((value) => !value)}><Plus size={13} /> {t.stagingAddCharacter}</button>
+          <button
+            type="button"
+            className="scene-character-add"
+            title={t.stagingAddCharacter}
+            aria-label={t.stagingAddCharacter}
+            onClick={() => setPickingCharacter((value) => !value)}
+          >
+            <Plus size={16} />
+          </button>
+          <span className="scene-character-add-hint">{t.stagingAddCharacter}</span>
         </div>
         {pickingCharacter && <div className="staging-location-picker">
           {characterCandidates.length === 0
@@ -205,7 +223,10 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
       </div>
       <div className="fields-grid two brief-duration-grid">
         <label className="field-label"><span>{t.metaDuration}</span><input className="modal-input" value={scene.duration} onChange={(event) => onUpdateScene({ duration: event.target.value })} /></label>
-        <div className="brief-duration-action"><button className="primary-button brief-optimize-button" disabled={briefOptimizeBusy || compileBusy} onClick={onAiOptimizeBrief}>{briefOptimizeBusy ? <span className="spin-dot" /> : <Sparkles size={14} />} {briefOptimizeBusy ? t.aiOptimizingBrief : t.aiOptimizeBrief}</button></div>
+        <div className="brief-duration-action">
+          <button className="outline-button danger brief-clear-button" disabled={generationBusy || briefOptimizeBusy} onClick={onClearGeneratedContent} title={t.clearBrief}><Trash2 size={14} /> {t.clearBrief}</button>
+          <button className="primary-button brief-optimize-button" disabled={briefOptimizeBusy || compileBusy} onClick={onAiOptimizeBrief}>{briefOptimizeBusy ? <span className="spin-dot" /> : <Sparkles size={14} />} {briefOptimizeBusy ? t.aiOptimizingBrief : t.aiOptimizeBrief}</button>
+        </div>
       </div>
       <label className="field-label">{t.mustHappen}<textarea className="modal-textarea" value={(scene.mustHappen ?? []).join("\n")} placeholder={t.mustHappenPlaceholder} onChange={(event) => onUpdateScene({ mustHappen: splitLines(event.target.value) })} /></label>
       <label className="field-label">{t.forbidLabel}<textarea className="modal-textarea" value={(scene.forbid ?? []).join("\n")} placeholder={t.forbidPlaceholder} onChange={(event) => onUpdateScene({ forbid: splitLines(event.target.value) })} /></label>
@@ -259,13 +280,14 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
       </label>
       <button className="primary-button" disabled={compileBusy || finalGenerateBusy} onClick={onAiCompile}>{compileBusy ? <span className="spin-dot" /> : <Sparkles size={16} />} {compileBusy ? t.aiCompiling : t.aiCompilePrompt}</button>
       <button className="primary-button" disabled={compileBusy || finalGenerateBusy} onClick={onLocalCompile}>{finalGenerateBusy ? <span className="spin-dot" /> : <Sparkles size={16} />} {finalGenerateBusy ? t.finalGenerating : t.localCompile}</button>
-      {compileBusy && <span className="compile-progress" role="status" aria-live="polite"><span className="compile-progress-dot" />{compileProgressText}<time>{busySeconds}s</time></span>}
+      {generationBusy && <span className="compile-progress" role="status" aria-live="polite"><span className="compile-progress-dot" />{compileProgressText}<time>{busySeconds}s</time></span>}
       {aiCompileError && (
         <span className="ai-error-wrap">
           <span className="ai-error-badge" title={aiCompileErrorDetail || aiCompileError}><span className="ai-error-dot" /> {aiCompileError}</span>
           <button className={`ai-error-copy${aiErrorCopied ? " copied" : ""}`} title={t.copyAiError} onClick={onCopyAiError}>{aiErrorCopied ? <Check size={12} /> : <Copy size={12} />}</button>
         </span>
       )}
+      {resumeAvailable && <button type="button" className="outline-button resume-interrupted-button" disabled={resumeBusy || generationBusy} title={t.resumeInterrupted} onClick={onResumeInterrupted}><RefreshCw size={14} className={resumeBusy ? "spin-icon" : ""} /> {resumeBusy ? t.resumeInProgress : t.resumeInterrupted}</button>}
     </div>
   </section>;
 }
