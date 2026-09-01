@@ -6,7 +6,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
@@ -61,6 +61,14 @@ pub struct ProviderHttpResponseDto {
     pub status: u16,
     pub body: String,
     pub body_base64: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ProviderStreamEventDto {
+    pub kind: String,
+    pub status: Option<u16>,
+    pub chunk_base64: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,7 +554,15 @@ pub async fn request_provider_json(
     let mut response_read_error = None;
     loop {
         match response.chunk().await {
-            Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
+            Ok(Some(chunk)) => {
+                response_bytes.extend_from_slice(&chunk);
+                // Streaming chat gateways may send SSE [DONE] and leave the
+                // connection open for heartbeats. Stop at the protocol
+                // completion marker so the desktop UI cannot wait forever.
+                if response_bytes.windows(b"data: [DONE]".len()).any(|window| window == b"data: [DONE]") {
+                    break;
+                }
+            },
             Ok(None) => break,
             Err(error) => {
                 response_read_error = Some(error.to_string());
@@ -579,6 +595,95 @@ pub async fn request_provider_json(
         },
         body_base64: encode_base64.then(|| STANDARD.encode(&response_bytes)),
     })
+}
+
+/// Stream an OpenAI-compatible response to the webview one chunk at a time.
+/// This is intentionally a small transport primitive: parsing SSE, tracking
+/// received text, and deciding whether to resume remain frontend concerns.
+#[tauri::command]
+pub async fn request_provider_stream(
+    app: AppHandle,
+    url: String,
+    method: String,
+    headers: HashMap<String, String>,
+    body: Option<Value>,
+    event_name: String,
+) -> Result<(), String> {
+    let emit = |event: &str,
+                status: Option<u16>,
+                chunk_base64: Option<String>,
+                message: Option<String>| {
+        app.emit(
+            event_name.as_str(),
+            ProviderStreamEventDto {
+                kind: event.to_string(),
+                status,
+                chunk_base64,
+                message,
+            },
+        )
+        .map_err(|error| format!("Failed to emit provider stream event: {}", error))
+    };
+
+    let parsed_url = reqwest::Url::parse(url.trim())
+        .map_err(|error| format!("Invalid provider URL: {}", error))?;
+    let http_method = reqwest::Method::from_bytes(method.trim().as_bytes())
+        .map_err(|error| format!("Invalid provider HTTP method: {}", error))?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15 * 60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let mut request = client.request(http_method, parsed_url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    if let Some(json_body) = body {
+        request = request.json(&json_body);
+    }
+
+    let mut response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format!("Provider request failed: {}", error);
+            let _ = emit("error", None, None, Some(message.clone()));
+            return Err(message);
+        }
+    };
+    let status = response.status().as_u16();
+    emit("start", Some(status), None, None)?;
+
+    let mut response_tail = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                response_tail.extend_from_slice(&chunk);
+                emit("chunk", Some(status), Some(STANDARD.encode(&chunk)), None)?;
+                if response_tail
+                    .windows(b"data: [DONE]".len())
+                    .any(|window| window == b"data: [DONE]")
+                {
+                    break;
+                }
+                // Keep only enough tail to detect a marker split across HTTP
+                // chunks without retaining the whole model response twice.
+                let keep = b"data: [DONE]".len().saturating_sub(1);
+                if response_tail.len() > keep {
+                    let drain_count = response_tail.len() - keep;
+                    response_tail.drain(..drain_count);
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                let message = format!("Failed to read provider response: {}", error);
+                emit("error", Some(status), None, Some(message.clone()))?;
+                return Err(message);
+            }
+        }
+    }
+
+    emit("done", Some(status), None, None)?;
+    Ok(())
 }
 
 #[tauri::command]

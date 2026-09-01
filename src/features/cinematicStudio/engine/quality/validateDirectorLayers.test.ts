@@ -117,6 +117,30 @@ describe("validateDirectorLayers（中文 fixture）", () => {
     expect(hit?.detailZh).toContain("节拍");
   });
 
+  it("首帧把后续入画角色提前写入 → error", () => {
+    const scene = makeScene(cleanZhLayers, { shootingMode: "multi-shot" });
+    scene.shots = [
+      makeShot("lin"),
+      { ...makeShot("ajun"), id: "sh-2", label: "镜头 2", participants: [{ characterId: "ajun", role: "primary", position: "screen-right", entrance: "enters-left" }] },
+    ];
+    const layers = {
+      ...cleanZhLayers,
+      firstFrame: "第1段首帧：林警官在画面中央。\n第2段首帧：阿俊已经在画面右侧。",
+    };
+    const issues = validateDirectorLayers(layers, makeProject(ZH_ASSETS, scene), scene);
+    expect(issues.map((issue) => issue.code)).toContain("DIRECTOR.FIRST_FRAME_PARTICIPANT_CONFLICT");
+  });
+
+  it("场景地图的镜头级位置与结构化参与者冲突 → error", () => {
+    const scene = makeScene(cleanZhLayers);
+    scene.shots[0] = { ...scene.shots[0], participants: [{ characterId: "lin", role: "primary", position: "screen-right" }] };
+    const layers = { ...cleanZhLayers, locationMap: "镜头1：林警官位于画面左侧。" };
+    const issues = validateDirectorLayers(layers, makeProject(ZH_ASSETS, scene), scene);
+    const hit = issues.find((issue) => issue.code === "DIRECTOR.LOCATION_MAP_POSITION_CONFLICT");
+    expect(hit?.severity).toBe("error");
+    expect(hit?.detailZh).toContain("结构化镜头");
+  });
+
   it("多镜头声明 + 单一连续时间轴 → error", () => {
     const layers = {
       ...cleanZhLayers,

@@ -21,6 +21,21 @@ const TABS: { kind: AssetKind; labelKey: "assetTabCharacter" | "assetTabLocation
   { kind: "prop", labelKey: "assetTabProp" },
 ];
 
+const REFERENCE_MATCH_LINE = "与参考图 100% 一致。";
+
+function appendReferenceMatchLine(value?: string): string | undefined {
+  const text = value?.trim() ?? "";
+  if (!text) return value;
+
+  const withoutExistingLine = text
+    .replace(/(?:\r?\n|\s)*与参考图\s*100%\s*一致。?\s*$/u, "")
+    .trimEnd();
+
+  return withoutExistingLine
+    ? `${withoutExistingLine}\n${REFERENCE_MATCH_LINE}`
+    : REFERENCE_MATCH_LINE;
+}
+
 /** 压缩上传图片到最长边 maxEdge，返回 JPEG data URL */
 function compressImage(file: File, maxEdge = 720, quality = 0.82): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -246,7 +261,10 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
     setNotice(t.aiFillStarted);
     try {
       const patch = await fillAssetDetails(asset, locale);
-      update(patch);
+      update({
+        ...patch,
+        descriptionZh: appendReferenceMatchLine(patch.descriptionZh),
+      });
       setNotice(t.aiFillDone);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -373,7 +391,7 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
           <button type="button" className="primary-button asset-ai-fill-button" disabled={aiBusy} aria-busy={aiBusy} onClick={() => void aiFillDetails()}>{aiBusy ? <span className="spin-dot" /> : <Sparkles size={14} />} {aiBusy ? t.aiFillStarted : t.aiFillDetails}</button>
           <div className="asset-ai-output-label">{t.assetAiOutput}</div>
           {locale === "zh" ? (
-            <label className="field-label">{t.assetDescriptionZh}<textarea className="modal-textarea" value={asset.descriptionZh ?? ""} placeholder={t.assetDescriptionZhPlaceholder} onChange={(event) => update({ descriptionZh: event.target.value })} /></label>
+            <label className="field-label">{t.assetDescriptionZh}<textarea className="modal-textarea" value={asset.descriptionZh ?? ""} placeholder={t.assetDescriptionZhPlaceholder} onChange={(event) => update({ descriptionZh: event.target.value })} onBlur={() => update({ descriptionZh: appendReferenceMatchLine(asset.descriptionZh) })} /></label>
           ) : (
             <label className="field-label">{t.assetDescription}<textarea className="modal-textarea" value={asset.description} placeholder={t.assetDescriptionPlaceholder} spellCheck={false} onChange={(event) => update({ description: event.target.value })} /></label>
           )}

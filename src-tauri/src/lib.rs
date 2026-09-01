@@ -210,6 +210,7 @@ pub fn run() {
             ai_commands::fetch_provider_models,
             ai_commands::detect_provider_capabilities,
             ai_commands::request_provider_json,
+            ai_commands::request_provider_stream,
             ai_commands::submit_generate_image_job,
             ai_commands::get_generate_image_job,
             ai_commands::generate_image,

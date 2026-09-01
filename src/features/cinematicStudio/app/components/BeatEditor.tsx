@@ -70,17 +70,9 @@ export default function BeatEditor({ project, shot, t, onUpdate }: BeatEditorPro
     onUpdate({ beats: [...beats, ...created] });
   };
 
-  /** 自动拆镜建议：焦段（framing）切换 ≥3 次 */
-  const framingSwitches = beats.reduce((count, beat, index) => {
-    if (index === 0 || !beat.framing) return count;
-    const prev = beats[index - 1];
-    return prev.framing && prev.framing !== beat.framing ? count + 1 : count;
-  }, 0);
-
   const actorOptions = characterAssets.filter((asset) => participants.includes(asset.id));
 
   return <div className="beat-editor">
-    {framingSwitches >= 3 && <div className="beat-advice"><Sparkles size={12} /> {t.beatSplitAdvice}</div>}
     <div className="beat-list">
       {beats.length === 0 && <span className="hint-text">{t.noDesc}</span>}
       {[...beats].sort((a, b) => a.order - b.order).map((beat, index) => {
@@ -110,8 +102,9 @@ export default function BeatEditor({ project, shot, t, onUpdate }: BeatEditorPro
             <button className={`beat-expand ${open ? "open" : ""}`} onClick={() => setExpanded(open ? null : beat.id)}><ChevronDown size={12} /></button>
           </div>
           {open && <div className="beat-detail">
-            <div className="fields-grid two">
-              <label className="field-label">{t.beatDuration}<input className="modal-input" type="number" min={1} max={30} value={beat.duration ?? 2} onChange={(event) => updateBeat(beat.id, { duration: Number(event.target.value) || 2 })} /></label>
+            <div className="fields-grid three">
+              <label className="field-label">{t.beatStart}<input className="modal-input" type="number" min={0} max={3600} step={0.1} placeholder={t.beatStartPlaceholder} value={beat.startSeconds ?? ""} onChange={(event) => updateBeat(beat.id, { startSeconds: event.target.value === "" ? undefined : Math.max(0, Number(event.target.value)) })} /></label>
+              <label className="field-label">{t.beatDuration}<input className="modal-input" type="number" min={0.1} max={30} step={0.1} value={beat.duration ?? 2} onChange={(event) => updateBeat(beat.id, { duration: Number(event.target.value) || 2 })} /></label>
               <label className="field-label">{t.target}<span className="select-wrap">
                 <select value={beat.targetCharacterId ? "character" : beat.targetPropId ? "prop" : ""} onChange={(event) => {
                   const kind = event.target.value;
@@ -134,6 +127,10 @@ export default function BeatEditor({ project, shot, t, onUpdate }: BeatEditorPro
             </div>
 
             <label className="field-label">{t.dialogue}<input className="modal-input" value={beat.dialogue ?? ""} placeholder={t.dialogue} onChange={(event) => updateBeat(beat.id, { dialogue: event.target.value || undefined })} /></label>
+            <div className="fields-grid two">
+              <label className="field-label">{t.beatPropState}<input className="modal-input" value={beat.propState ?? ""} placeholder={t.beatPropStatePlaceholder} onChange={(event) => updateBeat(beat.id, { propState: event.target.value || undefined })} /></label>
+              <label className="field-label">{t.beatAudio}<input className="modal-input" value={beat.audio ?? ""} placeholder={t.beatAudioPlaceholder} onChange={(event) => updateBeat(beat.id, { audio: event.target.value || undefined })} /></label>
+            </div>
 
             <div className="fields-grid two beat-p2">
               <label className="field-label">{t.beatTactic}<input className="modal-input" value={beat.tactic ?? ""} placeholder={t.beatTacticPlaceholder} onChange={(event) => updateBeat(beat.id, { tactic: event.target.value || undefined })} /></label>

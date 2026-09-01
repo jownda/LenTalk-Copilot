@@ -3,7 +3,7 @@
  * 规则：AI 只生成「结构化建议」，用户确认后才写资产/状态；禁止直接返回大段 Prompt。
  * compilePrompt 始终本地执行。
  */
-import type { AssetKind, ContinuityIssueV2, ProjectV2, SceneV2, ShotV2 } from "../../shared-types";
+import type { AssetKind, ProjectV2, SceneV2, ShotV2 } from "../../shared-types";
 import { SHOT_TEMPLATES } from "../shot-templates";
 
 /** 参考图分析建议（写资产前需用户确认） */
@@ -48,13 +48,64 @@ export interface FixSuggestion {
   detail: string;
   /** 修复动作描述（UI 展示；真正执行走本地 fixIssue） */
   apply: string;
+  /** 受限的候选修改；缺省表示只能给出建议，不能自动写回。 */
+  patch?: ContinuityRepairPatch;
+}
+
+export interface ContinuityRepairIssue {
+  code: string;
+  severity: "error" | "warning" | "info";
+  label: string;
+  detail: string;
+  detailZh?: string;
+  entityId?: string;
+  shotId?: string;
+  layerKey?: string;
+}
+
+/** AI 修复允许返回的最小补丁，不允许整场重写。 */
+export interface ContinuityRepairPatch {
+  sceneUpdates?: {
+    environmentLock?: boolean;
+    weather?: string;
+    negativePrompt?: string;
+    audioPlan?: {
+      diegeticMusic?: string[];
+      sfx?: string[];
+      score?: "none" | "original-score";
+      subtitles?: boolean;
+    };
+  };
+  shotUpdates?: Array<{
+    shotId: string;
+    participantUpdates?: Array<{
+      characterId: string;
+      position?: string;
+      entrance?: "already-in-frame" | "enters-left" | "enters-right";
+      facing?: string;
+      eyeline?: string;
+    }>;
+    characterOrder?: string[];
+    intentionalAxisBreak?: boolean;
+    direction?: "left-to-right" | "right-to-left";
+  }>;
+  beatUpdates?: Array<{
+    shotId: string;
+    beatId: string;
+    targetCharacterId?: string;
+    targetPropId?: string;
+  }>;
+  directorLayerUpdates?: Array<{
+    layerKey: "firstFrame" | "locationMap";
+    text: string;
+  }>;
 }
 
 export interface AIAssistant {
   analyzeReferenceImage(input: { assetKind: AssetKind; name?: string; imageHint?: string }): Promise<AssetSuggestion>;
   generateStructuredScene(input: { logline: string; assets: { id: string; name: string; kind: AssetKind }[]; shotCount: number }): Promise<SceneSuggestion>;
   generateBeats(input: { logline: string; scene: SceneV2; participants: string[]; props: string[] }): Promise<BeatSuggestion[]>;
-  repairContinuity(input: { issue: ContinuityIssueV2; project: ProjectV2; scene: SceneV2; shot?: ShotV2 }): Promise<FixSuggestion>;
+  repairContinuity(input: { issue: ContinuityRepairIssue; project: ProjectV2; scene: SceneV2; shot?: ShotV2 }): Promise<FixSuggestion>;
   /** 审核详情内的一键修复：生成可预览、用户确认后再写入的短文本（表演/首帧/声音锁/重分镜意图）。 */
   generateAuditRepairText(input: {
     code: string;
@@ -74,6 +125,46 @@ const USE_FOR_BY_KIND: Record<AssetKind, string[]> = {
   "style-reference": ["appearance"],
   "audio-reference": ["appearance"],
 };
+
+function replaceFirstFrameBlock(text: string, shotIndex: number, transform: (block: string) => string): string {
+  const lines = text.split("\n");
+  const starts = lines.map((line, index) => ({ line, index })).filter(({ line }) => /(?:第\s*)?\d+\s*(?:段|镜头|shot)\s*(?:首帧|first\s*frame)?/i.test(line));
+  if (starts.length === 0) return transform(text);
+  const start = starts[shotIndex]?.index;
+  if (start === undefined) return text;
+  const end = starts.find(({ index }) => index > start)?.index ?? lines.length;
+  lines.splice(start, end - start, transform(lines.slice(start, end).join("\n")));
+  return lines.join("\n");
+}
+
+function localDirectorPatch(input: { issue: ContinuityRepairIssue; project: ProjectV2; scene: SceneV2 }): ContinuityRepairPatch | undefined {
+  const { issue, scene } = input;
+  const shotIndex = scene.shots.findIndex((shot) => shot.id === issue.shotId);
+  const shot = shotIndex >= 0 ? scene.shots[shotIndex] : undefined;
+  if (!shot || !issue.layerKey) return undefined;
+  const asset = (input.project.assets ?? []).find((candidate) => issue.detail.includes(candidate.name) && candidate.kind === "character");
+  if (!asset) return undefined;
+  if (issue.code === "DIRECTOR.FIRST_FRAME_PARTICIPANT_CONFLICT") {
+    const current = scene.directorLayers?.firstFrame ?? "";
+    const text = replaceFirstFrameBlock(current, shotIndex, (block) => {
+      const keptLines = block.split("\n").flatMap((line, index) => {
+        if (!line.includes(asset.name)) return [line];
+        if (index === 0) return [line.split(asset.name).join("").replace(/[：:]\s*$/, "：").trim()];
+        return [];
+      });
+      return keptLines.length > 0 ? keptLines.join("\n") : `第 ${shotIndex + 1} 段首帧：该角色不在第一可见画面中。`;
+    });
+    return { directorLayerUpdates: [{ layerKey: "firstFrame", text }] };
+  }
+  if (issue.code === "DIRECTOR.LOCATION_MAP_POSITION_CONFLICT") {
+    const participant = shot.participants?.find((candidate) => candidate.characterId === asset.id);
+    if (!participant?.position?.trim()) return undefined;
+    const current = scene.directorLayers?.locationMap ?? "";
+    const text = replaceFirstFrameBlock(current, shotIndex, (block) => block.split("\n").map((line) => line.includes(asset.name) ? `第 ${shotIndex + 1} 段：${asset.name} 位于${participant.position}。` : line).join("\n"));
+    return { directorLayerUpdates: [{ layerKey: "locationMap", text }] };
+  }
+  return undefined;
+}
 
 /** 本地建议 Provider：无 API Key 时的确定性模板建议（可测试、可演示） */
 export class LocalSuggestionProvider implements AIAssistant {
@@ -135,19 +226,53 @@ export class LocalSuggestionProvider implements AIAssistant {
     return beats.map((beat, index) => ({ ...beat, order: index + 1 }));
   }
 
-  async repairContinuity(input: { issue: ContinuityIssueV2; project: ProjectV2; scene: SceneV2; shot?: ShotV2 }): Promise<FixSuggestion> {
+  async repairContinuity(input: { issue: ContinuityRepairIssue; project: ProjectV2; scene: SceneV2; shot?: ShotV2 }): Promise<FixSuggestion> {
     const { issue, shot } = input;
-    const fixes: Record<string, { label: string; detail: string; apply: string }> = {
-      "SCENE.ENVIRONMENT_UNLOCKED": { label: "Environment lock", detail: "Enable the environment lock so the model keeps the location stable.", apply: "Set scene.environmentLock = true." },
-      "SCENE.WEATHER_MISSING": { label: "Weather", detail: "Declare weather for the scene (e.g. Overcast, Night rain).", apply: "Fill scene.weather before export." },
-      "TECHNICAL.NEGATIVE_EMPTY": { label: "Negative prompt", detail: "A default negative prompt constrains drift terms.", apply: "Use the built-in default negative prompt." },
-      "AUDIO.PLAN_MISSING": { label: "Audio plan", detail: "A minimal audio plan makes the sound design explicit.", apply: "Create a default audio plan (score none, subtitles off)." },
-      "SPATIAL.AXIS_CONFLICT": { label: "Axis conflict", detail: "Screen direction reverses across the 180° line.", apply: "Mark the shot as an intentional axis break, or flip the direction." },
-      "CAUSALITY.TARGET_MISSING": { label: "Attack target", detail: "Attack beats must declare a target character or prop.", apply: "Set beat.targetCharacterId or beat.targetPropId." },
+    const fixes: Record<string, { label: string; detail: string; apply: string; patch?: ContinuityRepairPatch }> = {
+      "SCENE.ENVIRONMENT_UNLOCKED": { label: "Environment lock", detail: "Enable the environment lock so the model keeps the location stable.", apply: "Set scene.environmentLock = true.", patch: { sceneUpdates: { environmentLock: true } } },
+      "SCENE.WEATHER_MISSING": { label: "Weather", detail: "Declare weather for the scene from the existing scene context.", apply: "Fill scene.weather before export." },
+      "TECHNICAL.NEGATIVE_EMPTY": { label: "Negative prompt", detail: "A default negative prompt constrains drift terms.", apply: "Use the built-in default negative prompt.", patch: { sceneUpdates: { negativePrompt: "no extra characters, no extra limbs, no text, no subtitles, no watermark" } } },
+      "AUDIO.PLAN_MISSING": { label: "Audio plan", detail: "A minimal audio plan makes the sound design explicit.", apply: "Create a default audio plan (score none, subtitles off).", patch: { sceneUpdates: { audioPlan: { score: "none", subtitles: false, diegeticMusic: [], sfx: [] } } } },
+      "SPATIAL.AXIS_CONFLICT": { label: "Axis conflict", detail: "Screen direction reverses across the 180° line.", apply: "Mark the affected shot as an intentional axis break.", patch: input.issue.entityId ? { shotUpdates: [{ shotId: input.issue.entityId, intentionalAxisBreak: true }] } : undefined },
     };
+    const currentIndex = input.issue.entityId ? input.scene.shots.findIndex((item) => item.id === input.issue.entityId) : -1;
+    const previousShot = currentIndex > 0 ? input.scene.shots[currentIndex - 1] : undefined;
+    const currentShot = currentIndex >= 0 ? input.scene.shots[currentIndex] : shot;
+    const currentParticipant = currentShot?.participants?.find((item) => {
+      const asset = input.project.assets?.find((candidate) => candidate.id === item.characterId);
+      return Boolean(asset && (issue.detail.includes(asset.name) || issue.detail.includes(item.characterId)));
+    });
+    const spatialShotId = input.issue.shotId ?? input.issue.entityId ?? currentShot?.id;
+    if (spatialShotId && currentShot) {
+      const previousParticipant = previousShot?.participants?.find((item) => item.characterId === currentParticipant?.characterId);
+      const spatialParticipant = currentParticipant ?? currentShot.participants?.[0];
+      if (spatialParticipant && previousParticipant && ["SPATIAL.POSITION_JUMP", "SPATIAL.DEPTH_JUMP"].includes(issue.code)) {
+        fixes[issue.code] = { label: "Restore spatial position", detail: "Restore the affected character's position to the preceding shot's established position.", apply: "Match the current shot position to the preceding shot.", patch: { shotUpdates: [{ shotId: spatialShotId, participantUpdates: [{ characterId: spatialParticipant.characterId, ...(previousParticipant.position ? { position: previousParticipant.position } : {}) }] }] } };
+      }
+      if (spatialParticipant && ["SPATIAL.REENTRY_UNMARKED", "SPATIAL.ENTRANCE_POSITION_CONFLICT"].includes(issue.code)) {
+        const side = /(?:right|右)/i.test(spatialParticipant.position ?? "") ? "enters-right" : "enters-left";
+        fixes[issue.code] = { label: "Declare entrance", detail: "Declare the affected character's entrance direction at the shot boundary.", apply: "Add an explicit left/right entrance to the affected participant.", patch: { shotUpdates: [{ shotId: spatialShotId, participantUpdates: [{ characterId: spatialParticipant.characterId, entrance: side }] }] } };
+      }
+      if (issue.code === "SPATIAL.ORDER_JUMP") {
+        const order = previousShot?.layout?.characterOrder ?? previousShot?.participants?.map((item) => item.characterId) ?? [];
+        fixes[issue.code] = { label: "Restore character order", detail: "Restore the preceding shot's left-to-right order for shared participants.", apply: "Match the current shot order to the preceding shot.", patch: { shotUpdates: [{ shotId: spatialShotId, characterOrder: order }] } };
+      }
+    }
+    if (issue.code === "CAUSALITY.TARGET_MISSING" && issue.entityId) {
+      const beatShot = input.scene.shots.find((item) => item.beats?.some((beat) => beat.id === issue.entityId));
+      const beat = beatShot?.beats?.find((item) => item.id === issue.entityId);
+      const fallbackTarget = beatShot?.participants?.find((item) => item.characterId !== beat?.actorId)?.characterId;
+      if (beatShot && beat && fallbackTarget) {
+        fixes[issue.code] = { label: "Add attack target", detail: "Use an existing participant as the missing target; no new asset is created.", apply: "Set the attack beat target to the other existing participant.", patch: { beatUpdates: [{ shotId: beatShot.id, beatId: beat.id, targetCharacterId: fallbackTarget }] } };
+      }
+    }
+    const directorPatch = localDirectorPatch(input);
+    if (directorPatch) {
+      fixes[issue.code] = { label: "Repair director layer", detail: "Rewrite only the affected first-frame or location-map block from the existing structured shot facts.", apply: "Update the affected director-document block and rerun the checks.", patch: directorPatch };
+    }
     const known = fixes[issue.code];
     if (known) {
-      return { code: issue.code, label: known.label, detail: known.detail, apply: known.apply };
+      return { code: issue.code, label: known.label, detail: known.detail, apply: known.apply, patch: known.patch };
     }
     return {
       code: issue.code,

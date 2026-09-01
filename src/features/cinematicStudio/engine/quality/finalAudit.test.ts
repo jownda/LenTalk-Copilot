@@ -94,6 +94,19 @@ describe("final prompt audit", () => {
     expect(issue?.field).toBe("staging");
   });
 
+  it("节拍精确时间超出镜头窗口时给出可定位错误", () => {
+    const scene = makeScene({ shots: [{
+      ...makeScene().shots[0],
+      time: { startSeconds: 0, endSeconds: 5 },
+      beats: [{ id: "beat-1", order: 1, startSeconds: 4, duration: 2, verb: "walk", actorId: "actor-1", actionText: "走出画面" }],
+    }] });
+    const issue = auditFinalPrompt(scene).issues.find((item) => item.code === "FINAL.BEAT_TIME_OUT_OF_RANGE");
+    expect(issue?.severity).toBe("error");
+    expect(issue?.shotId).toBe("shot-1");
+    expect(issue?.field).toBe("action");
+    expect(issue?.detailZh).toContain("4 秒–6 秒");
+  });
+
   it("场景上下文包含前情/AI 说明时阻断导出并提示重写", () => {
     const scene = makeScene({ sceneContext: "前情提要：上集林sir追查列车；本集阿俊看向窗外。" });
     const issue = auditFinalPrompt(scene).issues.find((item) => item.code === "FINAL.SCENE_CONTEXT_META_LEAK");

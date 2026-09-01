@@ -15,6 +15,7 @@ import { reversePromptSystemPrompt, reversePromptUserMessage, reversePromptCombi
 import { graphImageResolver } from '@/features/canvas/application/canvasServices';
 import { findReferenceTokens, insertReferenceToken } from '@/features/canvas/application/referenceTokenEditing';
 import { imageUrlToDataUrl, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
+import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
@@ -385,6 +386,14 @@ export const PromptOptimizerNode = memo(({
   const purposeTextareaRef = useRef<HTMLTextAreaElement>(null);
   const purposeHighlightRef = useRef<HTMLDivElement>(null);
   const isPurposeComposingRef = useRef(false);
+  const purposeDraftRef = useRef(purposeDraft);
+  const { cancelCommit: cancelPurposeCommit, flushCommit: flushPurposeCommit, scheduleCommit: schedulePurposeCommit } =
+    useDebouncedNodeTextCommit({
+      nodeId: id,
+      field: 'purpose',
+      valueRef: purposeDraftRef,
+      updateNodeData,
+    });
 
   const taskType: PromptOptimizerTaskType = data.taskType ?? 'auto';
   const resolvedTitle = resolveNodeDisplayName(CANVAS_NODE_TYPES.promptOptimizer, data);
@@ -410,6 +419,7 @@ export const PromptOptimizerNode = memo(({
 
   useEffect(() => {
     if (!isPurposeComposingRef.current) {
+      purposeDraftRef.current = purpose;
       setPurposeDraft(purpose);
     }
   }, [purpose]);
@@ -444,11 +454,6 @@ export const PromptOptimizerNode = memo(({
     [incomingImageItems],
   );
 
-  const referencedImages = useMemo(
-    () => collectReferencedImages(purpose, incomingImages),
-    [purpose, incomingImages],
-  );
-
   const selectedChatModel =
     chatModelOptions.find(
       (option) => option.providerId === data.chatProviderId && option.model === data.chatModel,
@@ -468,8 +473,10 @@ export const PromptOptimizerNode = memo(({
   };
   const handleOptimize = () => {
     selectNode();
+    flushPurposeCommit();
+    const currentPurpose = purposeDraftRef.current;
     const result = optimizeLiraPrompt({
-      purpose,
+      purpose: currentPurpose,
       taskType,
       targetModel: data.targetModel,
       referencePalette: data.referencePalette,
@@ -489,8 +496,10 @@ export const PromptOptimizerNode = memo(({
 
   const handleAiOptimize = async () => {
     selectNode();
+    flushPurposeCommit();
+    const currentPurpose = purposeDraftRef.current;
     const local = optimizeLiraPrompt({
-      purpose,
+      purpose: currentPurpose,
       taskType,
       targetModel: data.targetModel,
       referencePalette: data.referencePalette,
@@ -523,6 +532,7 @@ export const PromptOptimizerNode = memo(({
     setIsAiRunning(true);
     try {
       let finalPrompt = '';
+      const referencedImages = collectReferencedImages(currentPurpose, incomingImages);
       if (referencedImages.length > 0) {
         const imageParts: ChatCompletionContentPart[] = [];
         for (const source of referencedImages) {
@@ -546,7 +556,7 @@ export const PromptOptimizerNode = memo(({
               {
                 type: 'text',
                 text: reversePromptCombineUserMessage({
-                  draft: purpose,
+                  draft: currentPurpose,
                   taskType,
                   imageCount: imageParts.length,
                   lang: outputLang,
@@ -560,7 +570,7 @@ export const PromptOptimizerNode = memo(({
       } else {
         const enhanced = await chatCompletion(provider.baseUrl, provider.apiKey, model, [
           { role: 'system', content: LIRA_AI_SYSTEM_PROMPT },
-          { role: 'user', content: buildAiUserMessage(purpose, local.prompt, local.route.taskType, outputLang) },
+          { role: 'user', content: buildAiUserMessage(currentPurpose, local.prompt, local.route.taskType, outputLang) },
         ]);
         finalPrompt = stripThinkingBlock(enhanced);
       }
@@ -584,8 +594,12 @@ export const PromptOptimizerNode = memo(({
     } finally {
       setIsAiRunning(false);
     }
-  };  const handleReversePrompt = async () => {
+  };
+
+  const handleReversePrompt = async () => {
     selectNode();
+    flushPurposeCommit();
+    const currentPurpose = purposeDraftRef.current;
     if (incomingImages.length === 0) {
       updateNodeData(id, {
         optimizedPrompt: '',
@@ -597,8 +611,8 @@ export const PromptOptimizerNode = memo(({
     }
 
     const refs = incomingImages.map((_, index) => `@图${index + 1}`).join(' ');
-    const fallbackPurpose = purpose.trim()
-      ? `${refs} ${purpose.trim()}`
+    const fallbackPurpose = currentPurpose.trim()
+      ? `${refs} ${currentPurpose.trim()}`
       : `${refs} ${outputLang === 'zh' ? '人物角色设定图' : 'character sheet'}`;
 
     const local = optimizeLiraPrompt({
@@ -648,7 +662,7 @@ export const PromptOptimizerNode = memo(({
               type: 'text',
               text: reversePromptUserMessage({
                 taskType,
-                purpose: purpose.trim(),
+                purpose: currentPurpose.trim(),
                 imageCount: imageParts.length,
                 lang: outputLang,
               }),
@@ -721,7 +735,7 @@ export const PromptOptimizerNode = memo(({
 
   const insertImageReference = useCallback((imageIndex: number) => {
     const marker = `@图${imageIndex + 1}`;
-    let basePurpose = purposeDraft;
+    let basePurpose = purposeDraftRef.current;
     let baseCursor = pickerCursor ?? basePurpose.length;
     const trimmedBefore = basePurpose.slice(0, baseCursor).replace(/\s+$/, '');
     if (trimmedBefore.endsWith('@')) {
@@ -730,7 +744,9 @@ export const PromptOptimizerNode = memo(({
       baseCursor = atIndex;
     }
     const { nextText, nextCursor } = insertReferenceToken(basePurpose, baseCursor, marker);
+    purposeDraftRef.current = nextText;
     setPurposeDraft(nextText);
+    cancelPurposeCommit();
     updateNodeData(id, { purpose: nextText });
     setShowImagePicker(false);
     setPickerCursor(null);
@@ -739,7 +755,7 @@ export const PromptOptimizerNode = memo(({
       purposeTextareaRef.current?.focus();
       purposeTextareaRef.current?.setSelectionRange(nextCursor, nextCursor);
     });
-  }, [id, pickerCursor, purposeDraft, updateNodeData]);
+  }, [cancelPurposeCommit, id, pickerCursor, updateNodeData]);
 
   const handlePurposeKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     if (showImagePicker && incomingImages.length > 0) {
@@ -772,7 +788,7 @@ export const PromptOptimizerNode = memo(({
     const isAtKey = event.key === '@' || (event.shiftKey && event.code === 'Digit2');
     if (isAtKey && !event.ctrlKey && !event.metaKey && !event.altKey && incomingImages.length > 0) {
       event.preventDefault();
-      const cursor = event.currentTarget.selectionStart ?? purposeDraft.length;
+      const cursor = event.currentTarget.selectionStart ?? purposeDraftRef.current.length;
       setPickerAnchor(resolvePickerAnchor(rootRef.current, event.currentTarget, cursor));
       setPickerCursor(cursor);
       setShowImagePicker(true);
@@ -781,9 +797,10 @@ export const PromptOptimizerNode = memo(({
   };
 
   const handlePurposeChange = (value: string) => {
+    purposeDraftRef.current = value;
     setPurposeDraft(value);
     if (!isPurposeComposingRef.current) {
-      updateNodeData(id, { purpose: value });
+      schedulePurposeCommit();
     }
   };
 
@@ -793,8 +810,9 @@ export const PromptOptimizerNode = memo(({
 
   const handlePurposeCompositionEnd = (value: string) => {
     isPurposeComposingRef.current = false;
+    purposeDraftRef.current = value;
     setPurposeDraft(value);
-    updateNodeData(id, { purpose: value });
+    schedulePurposeCommit();
   };
 
   const syncPurposeHighlightScroll = () => {
@@ -894,6 +912,7 @@ export const PromptOptimizerNode = memo(({
             onChange={(event) => handlePurposeChange(event.target.value)}
             onCompositionStart={handlePurposeCompositionStart}
             onCompositionEnd={(event) => handlePurposeCompositionEnd(event.currentTarget.value)}
+            onBlur={flushPurposeCommit}
             onKeyDown={handlePurposeKeyDown}
             onScroll={syncPurposeHighlightScroll}
             onMouseDown={(event) => event.stopPropagation()}

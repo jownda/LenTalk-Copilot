@@ -13,9 +13,18 @@ export type UiRadiusPreset = 'compact' | 'default' | 'large';
 export type ThemeTonePreset = 'neutral' | 'warm' | 'cool';
 export type CanvasEdgeRoutingMode = 'spline' | 'orthogonal' | 'smartOrthogonal';
 export type ProviderApiKeys = Record<string, string>;
+/** 提示词工作室 AI 请求的推理强度；'' 表示不发送 reasoning_effort 参数（兼容非推理模型） */
+export type CinematicReasoningEffort = '' | 'low' | 'medium' | 'high' | 'xhigh';
+const CINEMATIC_REASONING_EFFORTS: CinematicReasoningEffort[] = ['', 'low', 'medium', 'high', 'xhigh'];
+export function normalizeCinematicReasoningEffort(value?: string): CinematicReasoningEffort {
+  return (CINEMATIC_REASONING_EFFORTS as string[]).includes(value ?? '')
+    ? (value as CinematicReasoningEffort)
+    : '';
+}
 export interface CinematicAiSelection {
   provider: string;
   model: string;
+  reasoningEffort?: CinematicReasoningEffort;
 }
 export const DEFAULT_GRSAI_NANO_BANANA_PRO_MODEL = 'nano-banana-pro';
 export const DEFAULT_JIMENG_CLI_EXECUTABLE = 'dreamina';
@@ -446,7 +455,7 @@ export const useSettingsStore = create<SettingsState>()(
       isHydrated: false,
       apiKeys: {},
       customApis: [],
-      cinematicAiSelection: { provider: '', model: '' },
+      cinematicAiSelection: { provider: '', model: '', reasoningEffort: '' },
       jimengCli: { executable: DEFAULT_JIMENG_CLI_EXECUTABLE },
       grsaiNanoBananaProModel: DEFAULT_GRSAI_NANO_BANANA_PRO_MODEL,
       hideProviderGuidePopover: false,
@@ -527,6 +536,7 @@ export const useSettingsStore = create<SettingsState>()(
           cinematicAiSelection: {
             provider: selection.provider.trim(),
             model: selection.model.trim(),
+            reasoningEffort: normalizeCinematicReasoningEffort(selection.reasoningEffort),
           },
         }),
       setGrsaiNanoBananaProModel: (model) =>

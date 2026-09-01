@@ -31,6 +31,8 @@ export interface DirectorLayerIssue {
   label: string;
   detail: string;
   detailZh: string;
+  /** 可选的镜头目标，供质量面板直接定位到该镜头。 */
+  shotId?: string;
   suggestion?: string;
   suggestionZh?: string;
 }
@@ -56,6 +58,166 @@ function hasShotBlocks(...texts: string[]): boolean {
   return /(?:镜头|镜|SHOT|Shot)\s*\d/.test(texts.join("\n"));
 }
 
+type LayerSpatialSide = "left" | "right";
+type LayerSpatialDepth = "foreground" | "midground" | "background";
+
+interface LayerSpatialFacts {
+  side?: LayerSpatialSide;
+  depth?: LayerSpatialDepth;
+}
+
+function layerSpatialFacts(text: string): LayerSpatialFacts {
+  const side = /(?:screen[-\s]?left|画面左|屏幕左|左侧|左边|左方)/i.test(text)
+    ? "left"
+    : /(?:screen[-\s]?right|画面右|屏幕右|右侧|右边|右方)/i.test(text)
+      ? "right"
+      : undefined;
+  const depth = /(?:foreground|前景)/i.test(text)
+    ? "foreground"
+    : /(?:midground|中景)/i.test(text)
+      ? "midground"
+      : /(?:background|后景)/i.test(text)
+        ? "background"
+        : undefined;
+  return { side, depth };
+}
+
+function assetMentioned(text: string, asset: { name: string; referenceTag?: string }): boolean {
+  return text.includes(asset.name.trim()) || Boolean(asset.referenceTag?.trim() && text.includes(asset.referenceTag.trim()));
+}
+
+/** 从首帧层中提取「第 N 段/镜头 N 首帧」的独立文本块。 */
+function firstFrameBlocks(text: string, shotCount: number, multiShot: boolean): Map<number, string> {
+  const blocks = new Map<number, string>();
+  let currentIndex: number | undefined;
+  for (const rawLine of text.split("\n")) {
+    const match = rawLine.match(/(?:第\s*)?(\d+)\s*(?:段|镜头|shot)\s*(?:首帧|first\s*frame)?/i);
+    if (match) {
+      currentIndex = Number(match[1]) - 1;
+      blocks.set(currentIndex, rawLine);
+      continue;
+    }
+    if (currentIndex !== undefined) blocks.set(currentIndex, `${blocks.get(currentIndex) ?? ""}\n${rawLine}`);
+  }
+  if (blocks.size === 0 && !multiShot && shotCount === 1) blocks.set(0, text);
+  return blocks;
+}
+
+/** 首帧必须只描述该段第一可见画面中的参与者。 */
+function checkFirstFrameParticipantConsistency(
+  layers: Record<string, string>, project: ProjectV2, scene: SceneV2,
+): DirectorLayerIssue[] {
+  const text = (layers.firstFrame ?? "").trim();
+  if (!text) return [];
+  const shots = scene.shots ?? [];
+  const blocks = firstFrameBlocks(text, shots.length, scene.shootingMode === "multi-shot");
+  const out: DirectorLayerIssue[] = [];
+
+  if (scene.shootingMode === "multi-shot" && shots.length > 1) {
+    const missingBlocks = shots.map((_, index) => index + 1).filter((index) => !blocks.has(index - 1));
+    if (missingBlocks.length > 0) {
+      out.push({
+        code: "DIRECTOR.FIRST_FRAME_SEGMENT_MISSING",
+        severity: "warning",
+        layerKey: "firstFrame",
+        label: "First-frame occupancy is missing for shot segments",
+        detail: `FIRST FRAME AND SPATIAL BLOCKING has no separate first-frame block for shot(s) ${missingBlocks.join(", ")}.`,
+        detailZh: `「首帧与站位」没有为镜头${missingBlocks.join("、")}分别写首帧占位，无法确认切镜后的第一可见画面。`,
+        suggestion: "Add one labeled first-frame block for every shot segment.",
+        suggestionZh: "为每个镜头段增加带镜头号的独立首帧描述。",
+      });
+    }
+  }
+
+  for (const [shotIndex, block] of blocks.entries()) {
+    const shot = shots[shotIndex];
+    if (!shot) continue;
+    const participants = shot.participants ?? [];
+    for (const participant of participants) {
+      const asset = (project.assets ?? []).find((item) => item.id === participant.characterId);
+      if (!asset || asset.kind !== "character") continue;
+      const isLaterEntrant = participant.entrance === "enters-left" || participant.entrance === "enters-right";
+      const mentioned = assetMentioned(block, asset);
+      if (isLaterEntrant && mentioned) {
+        out.push({
+          code: "DIRECTOR.FIRST_FRAME_PARTICIPANT_CONFLICT",
+          severity: "error",
+          layerKey: "firstFrame",
+          label: "First frame includes a later entrant",
+          shotId: shot.id,
+          detail: `${asset.name} is marked as entering later in shot ${shot.label}, but the first-frame block already includes the character.`,
+          detailZh: `角色「${asset.name}」在镜头「${shot.label}」中标记为后续入画，但该镜头的首帧描述已经包含了这个角色。`,
+          suggestion: "Remove the character from this first-frame block or mark the entrance as already in frame.",
+          suggestionZh: "从该段首帧中移除该角色，或把入画状态改为「已在画面内」。",
+        });
+      } else if (!isLaterEntrant && !mentioned) {
+        out.push({
+          code: "DIRECTOR.FIRST_FRAME_PARTICIPANT_MISSING",
+          severity: "warning",
+          layerKey: "firstFrame",
+          label: "First frame omits a structured participant",
+          shotId: shot.id,
+          detail: `${asset.name} is a visible participant of shot ${shot.label}, but is absent from its first-frame block.`,
+          detailZh: `角色「${asset.name}」是镜头「${shot.label}」的出镜参与者，但没有出现在该镜头的首帧描述中。`,
+          suggestion: "Add the character's first-frame position, depth, orientation, and eyeline.",
+          suggestionZh: "补充该角色在首帧中的左右位置、前中后景、身体朝向和视线。",
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/** 场景地图中的镜头级站位必须与结构化镜头执行一致。 */
+function checkLocationMapPositionConsistency(
+  layers: Record<string, string>, project: ProjectV2, scene: SceneV2,
+): DirectorLayerIssue[] {
+  const text = (layers.locationMap ?? "").trim();
+  if (!text) return [];
+  const shots = scene.shots ?? [];
+  const lines = text.split("\n");
+  const shotLines = new Map<number, string[]>();
+  for (const line of lines) {
+    const match = line.match(/(?:镜头|shot)\s*(\d+)/i);
+    if (!match) continue;
+    const index = Number(match[1]) - 1;
+    if (index >= 0 && index < shots.length) shotLines.set(index, [...(shotLines.get(index) ?? []), line]);
+  }
+  if (shotLines.size === 0 && shots.length === 1) shotLines.set(0, lines);
+
+  const out: DirectorLayerIssue[] = [];
+  for (const [shotIndex, mapLines] of shotLines.entries()) {
+    const shot = shots[shotIndex];
+    if (!shot) continue;
+    for (const participant of shot.participants ?? []) {
+      const asset = (project.assets ?? []).find((item) => item.id === participant.characterId);
+      if (!asset || asset.kind !== "character" || !participant.position?.trim()) continue;
+      const shotFacts = layerSpatialFacts(participant.position);
+      if (!shotFacts.side && !shotFacts.depth) continue;
+      const matchingLine = mapLines.find((line) => assetMentioned(line, asset));
+      if (!matchingLine) continue;
+      const mapFacts = layerSpatialFacts(matchingLine);
+      const sideConflict = shotFacts.side && mapFacts.side && shotFacts.side !== mapFacts.side;
+      const depthConflict = shotFacts.depth && mapFacts.depth && shotFacts.depth !== mapFacts.depth;
+      if (!sideConflict && !depthConflict) continue;
+      const shotPosition = [shotFacts.side, shotFacts.depth].filter(Boolean).join(" / ");
+      const mapPosition = [mapFacts.side, mapFacts.depth].filter(Boolean).join(" / ");
+      out.push({
+        code: "DIRECTOR.LOCATION_MAP_POSITION_CONFLICT",
+        severity: "error",
+        layerKey: "locationMap",
+        label: "Location map conflicts with shot position",
+        shotId: shot.id,
+        detail: `${asset.name} is ${shotPosition} in structured shot ${shot.label}, but the location map says ${mapPosition}.`,
+        detailZh: `角色「${asset.name}」在结构化镜头「${shot.label}」中位于${shotPosition}，但场景地图写成了${mapPosition}。`,
+        suggestion: "Keep the shot-level structured position and rewrite the location-map override to match it.",
+        suggestionZh: "以结构化镜头站位为准，修改场景地图中的镜头级位置覆盖。",
+      });
+    }
+  }
+  return out;
+}
+
 /** 行内是否出现更长的资产名（用于避免「警官」命中「林警官」这类子串误报） */
 function hasLongerAssetPresent(project: ProjectV2, name: string, text: string): boolean {
   return (project.assets ?? []).some((other) => other.name.length > name.length && text.includes(other.name));
@@ -63,7 +225,8 @@ function hasLongerAssetPresent(project: ProjectV2, name: string, text: string): 
 
 /** 拉丁词按词边界匹配，中文按包含匹配 */
 function containsWord(text: string, word: string): boolean {
-  if (/^[\x00-\x7F]+$/.test(word)) {
+  const isAscii = [...word].every((character) => character.charCodeAt(0) <= 0x7f);
+  if (isAscii) {
     const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:$|[^a-z0-9])`, "i").test(text);
   }
@@ -345,6 +508,8 @@ export function validateDirectorLayers(
   return [
     ...checkMultiShotBlocks(layers, scene),
     ...checkInspectorCoverage(project, scene),
+    ...checkFirstFrameParticipantConsistency(layers, project, scene),
+    ...checkLocationMapPositionConsistency(layers, project, scene),
     ...checkUnreferencedAssets(layers, project, scene),
     ...checkMetadataStatements(layers),
     ...checkFirstFramePropsConflict(layers, project, scene),

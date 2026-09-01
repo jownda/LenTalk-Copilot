@@ -4,25 +4,57 @@
  * 并生成简短描述。点击后在弹窗中调整画面参数（地点资产缩略图选择、180° 轴方向、
  * 左到右排序、人物间距、空间锚点）。
  */
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Asset, SceneStaging, SceneV2, ProjectV2 } from "../../shared-types";
-import { ChevronDown, ChevronLeft, ChevronRight, GripVertical, ImagePlus, MapPin, Plus, X } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, GripVertical, ImagePlus, MapPin, Plus, Upload, X } from "lucide-react";
 import type { CopyZh } from "../i18n";
+import type { CanvasImageSource } from "./DirectorLayersCard";
+import { useAssetLibraryStore } from "@/features/library/assetStore";
+import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 
 interface StagingEditorProps {
   project: ProjectV2;
   scene: SceneV2;
   t: CopyZh;
+  canvasImageSources: CanvasImageSource[];
   onChange(patch: Partial<SceneStaging>): void;
 }
 
 const truncate = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}…` : text);
 
-export default function StagingEditor({ project, scene, t, onChange }: StagingEditorProps) {
+function compressStagingReferenceImage(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new window.Image();
+    image.onload = () => {
+      try {
+        const scale = Math.min(1, 1280 / Math.max(image.width, image.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        canvas.getContext("2d")?.drawImage(image, 0, 0, canvas.width, canvas.height);
+        URL.revokeObjectURL(url);
+        resolve(canvas.toDataURL("image/jpeg", 0.86));
+      } catch (error) {
+        URL.revokeObjectURL(url);
+        reject(error);
+      }
+    };
+    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error("image load failed")); };
+    image.src = url;
+  });
+}
+
+export default function StagingEditor({ project, scene, t, canvasImageSources, onChange }: StagingEditorProps) {
+  const hydrate = useAssetLibraryStore((state) => state.hydrate);
+  const libraryAssets = useAssetLibraryStore((state) => state.assets);
   const [open, setOpen] = useState(false);
   const [pickingLocation, setPickingLocation] = useState(false);
   const [pickingCharacter, setPickingCharacter] = useState(false);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [stagingReferenceBusy, setStagingReferenceBusy] = useState(false);
+  const [stagingReferencePickerOpen, setStagingReferencePickerOpen] = useState(false);
+  const [stagingReferencePickerSource, setStagingReferencePickerSource] = useState<"library" | "canvas">("library");
   const staging = scene.staging ?? {};
   const locationAssets = (project.assets ?? []).filter((asset) => asset.kind === "location");
   const characterAssets = (project.assets ?? []).filter((asset) => asset.kind === "character");
@@ -30,6 +62,30 @@ export default function StagingEditor({ project, scene, t, onChange }: StagingEd
   const nameOf = (id: string) => (project.assets ?? []).find((a) => a.id === id)?.name ?? id;
   const order = staging.characterOrder ?? [];
   const characterCandidates = characterAssets.filter((asset) => !order.includes(asset.id));
+  const libraryImages = useMemo(() => [
+    ...(project.assets ?? []).flatMap((asset) => (asset.referencePaths ?? []).filter(Boolean).map((source) => ({ source, label: `${asset.name} · ${t.assetLibrary}` }))),
+    ...libraryAssets.filter((asset) => asset.mediaType === "image").map((asset) => ({ source: asset.sourcePath, label: `${asset.name} · ${t.assetLibrary}` })),
+  ], [libraryAssets, project.assets, t.assetLibrary]);
+
+  useEffect(() => { void hydrate(); }, [hydrate]);
+
+  const uploadStagingReference = async (file?: File) => {
+    if (!file) return;
+    setStagingReferenceBusy(true);
+    try {
+      onChange({ stagingReferenceImage: await compressStagingReferenceImage(file) });
+      setStagingReferencePickerOpen(false);
+    } finally {
+      setStagingReferenceBusy(false);
+    }
+  };
+
+  const selectStagingReference = (source: string) => {
+    const trimmed = source.trim();
+    if (!trimmed) return;
+    onChange({ stagingReferenceImage: trimmed });
+    setStagingReferencePickerOpen(false);
+  };
 
   const reorder = (from: number, to: number) => {
     if (to < 0 || to >= order.length || from === to) return;
@@ -78,7 +134,35 @@ export default function StagingEditor({ project, scene, t, onChange }: StagingEd
                   <span className="staging-location-remove" title={t.deleteAsset} onClick={(event) => { event.stopPropagation(); onChange({ locationAssetId: undefined }); }}><X size={12} /></span>
                 </button>
               : <button className="staging-location-add" onClick={() => setPickingLocation(true)}><Plus size={18} /><span>{t.addFromAssets}</span></button>}
+            <div className="staging-reference-control">
+              <button type="button" className="staging-location-card staging-reference-upload" title={t.stagingReferenceImageHint} onClick={() => setStagingReferencePickerOpen((value) => !value)}>
+                {staging.stagingReferenceImage
+                  ? <img src={resolveImageDisplayUrl(staging.stagingReferenceImage)} alt={t.stagingReferenceImage} />
+                  : <span className="staging-location-fallback small">{stagingReferenceBusy ? "…" : <ImagePlus size={15} />}</span>}
+                <b>{t.stagingReferenceImage}</b>
+              </button>
+              {staging.stagingReferenceImage && <button type="button" className="staging-reference-remove" title={t.deleteAsset} onClick={() => onChange({ stagingReferenceImage: undefined })}><X size={12} /></button>}
+            </div>
           </div>
+
+          {stagingReferencePickerOpen && <div className="staging-reference-picker">
+            <div className="reference-source-tabs">
+              <button type="button" className={stagingReferencePickerSource === "library" ? "active" : ""} onClick={() => setStagingReferencePickerSource("library")}>{t.assetLibrary}</button>
+              <button type="button" className={stagingReferencePickerSource === "canvas" ? "active" : ""} onClick={() => setStagingReferencePickerSource("canvas")}>{t.canvasImages}</button>
+              <label className="first-frame-upload-button">
+                {stagingReferenceBusy ? <span className="spin-dot" /> : <Upload size={13} />} {t.uploadImage}
+                <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadStagingReference(event.target.files?.[0])} />
+              </label>
+            </div>
+            <div className="reference-source-options">
+              {(stagingReferencePickerSource === "library" ? libraryImages : canvasImageSources).length === 0
+                ? <span className="hint-text">{stagingReferencePickerSource === "library" ? t.noImageReferences : t.noCanvasImages}</span>
+                : (stagingReferencePickerSource === "library" ? libraryImages : canvasImageSources).map((item) => <button type="button" key={item.source} className={item.source === staging.stagingReferenceImage ? "active" : ""} onClick={() => selectStagingReference(item.source)}>
+                    <img src={resolveImageDisplayUrl(item.source)} alt={item.label} />
+                    <span>{item.label}</span>
+                  </button>)}
+            </div>
+          </div>}
 
           {pickingLocation && <div className="staging-location-picker">
             <span className="hint-text">{t.stagingChooseLocation}</span>

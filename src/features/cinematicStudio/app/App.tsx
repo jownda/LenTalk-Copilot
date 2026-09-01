@@ -2,8 +2,9 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { CAMERAS, LENSES, MODEL_PROFILES, DEFAULT_NEGATIVE, auditFinalPromptWithProject, checkContinuityV2, compilePrompt, legacyFocalLengthToFov, lensByFov, lensById, modelProfileById, sanitizeDirectorText, validateDirectorLayers, type FinalPromptAuditIssue } from "../engine";
 import type { CameraMovement, ContinuityIssueV2, FinalAuditLogEntry, ProjectV2, PromptVersion, SceneV2, Shot, ShotV2 } from "../shared-types";
 import { ArrowLeft, AudioLines, ChevronDown, Copy, Download, FileJson, FileText, FolderOpen, PenLine, Plus, Save, Send, X } from "lucide-react";
-import { buildFinalGenerationSource, ChatCompletionInterruptedError, classifyError, fillSceneDraft, generateFinalPrompt, getAssistant, optimizeSceneBrief, type SceneCompileProgress } from "./providers/ai";
-import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type AISettings } from "./providers/aiSettings";
+import { buildFinalGenerationSource, ChatCompletionInterruptedError, classifyError, fillSceneDraft, generateFinalPrompt, getAssistant, optimizeSceneBrief, type SceneCompileProgress, type SceneCompileProgressListener } from "./providers/ai";
+import type { ContinuityRepairIssue, ContinuityRepairPatch } from "../engine";
+import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type AISettings, type ReasoningEffort } from "./providers/aiSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { isTauri } from "@tauri-apps/api/core";
 import { loadProjectFromDisk, recordVersionToSqlite, savePromptToDisk, saveProjectToDisk } from "./providers/projectStorage";
@@ -23,6 +24,120 @@ import { projectReducer, type ProjectAction } from "./store/projectReducer";
 import { addVersion, loadHistory, loadHistoryFromDatabase, persistHistoryToDatabase } from "./store/promptHistory";
 import { collectCinematicMediaReferences } from "../mediaReferences";
 import { findReferenceTokens } from "@/features/canvas/application/referenceTokenEditing";
+
+type RepairQualityIssue = ContinuityRepairIssue;
+
+function repairIssueKey(issue: RepairQualityIssue): string {
+  return `${issue.code}|${issue.entityId ?? issue.shotId ?? ""}|${issue.layerKey ?? ""}`;
+}
+
+function patchError(message: string): { error: string } {
+  return { error: message };
+}
+
+/** 应用 AI 补丁前的白名单与当前工程 ID 校验。 */
+function applyContinuityRepairPatch(
+  project: ProjectV2,
+  scene: SceneV2,
+  issue: RepairQualityIssue,
+  patch: ContinuityRepairPatch,
+): { project: ProjectV2; scene: SceneV2 } | { error: string } {
+  const assets = project.assets ?? [];
+  const assetById = new Map(assets.map((asset) => [asset.id, asset]));
+  const shotById = new Map(scene.shots.map((shot) => [shot.id, shot]));
+  const targetShotId = issue.shotId ?? issue.entityId;
+  const allowedSceneCodes = new Set(["SCENE.ENVIRONMENT_UNLOCKED", "SCENE.WEATHER_MISSING", "TECHNICAL.NEGATIVE_EMPTY", "AUDIO.PLAN_MISSING", "AUDIO.CONFLICT"]);
+  const allowedShotCodes = new Set(["SPATIAL.POSITION_JUMP", "SPATIAL.DEPTH_JUMP", "SPATIAL.REENTRY_UNMARKED", "SPATIAL.ENTRANCE_POSITION_CONFLICT", "SPATIAL.ORDER_JUMP", "SPATIAL.AXIS_CONFLICT", "SPATIAL.GAZE_ORIENT_MISSING"]);
+  const allowedBeatCodes = new Set(["CAUSALITY.TARGET_MISSING", "CAUSALITY.FORBIDDEN_TARGET"]);
+  const nextScene: SceneV2 = structuredClone(scene);
+
+  if (patch.sceneUpdates) {
+    if (!allowedSceneCodes.has(issue.code)) return patchError("该问题不允许修改场景级字段。");
+    const updates = patch.sceneUpdates;
+    if (updates.environmentLock !== undefined) nextScene.environmentLock = updates.environmentLock;
+    if (updates.weather !== undefined) nextScene.weather = updates.weather;
+    if (updates.negativePrompt !== undefined) project = { ...project, negativePrompt: updates.negativePrompt };
+    if (updates.audioPlan) {
+      project = {
+        ...project,
+        audioPlan: {
+          ...(project.audioPlan ?? { score: "none", subtitles: false }),
+          ...updates.audioPlan,
+        },
+      };
+    }
+  }
+
+  if (patch.shotUpdates) {
+    if (!allowedShotCodes.has(issue.code)) return patchError("该问题不允许修改镜头执行字段。");
+    for (const update of patch.shotUpdates) {
+      if (targetShotId && update.shotId !== targetShotId) return patchError("AI 补丁试图修改当前问题之外的镜头。");
+      const target = shotById.get(update.shotId);
+      if (!target) return patchError(`镜头 ID 不存在：${update.shotId}`);
+      const participants = new Map((target.participants ?? []).map((participant) => [participant.characterId, participant]));
+      const nextShot = nextScene.shots.find((candidate) => candidate.id === update.shotId);
+      if (!nextShot) return patchError(`镜头 ID 不存在：${update.shotId}`);
+      if (update.participantUpdates) {
+        for (const participantUpdate of update.participantUpdates) {
+          const participant = participants.get(participantUpdate.characterId);
+          const asset = assetById.get(participantUpdate.characterId);
+          if (!participant || !asset || asset.kind !== "character") return patchError("AI 补丁引用了不属于当前镜头的角色。");
+          Object.assign(participant, participantUpdate);
+          delete (participant as { characterId?: string }).characterId;
+          participant.characterId = participantUpdate.characterId;
+        }
+      }
+      if (update.characterOrder) {
+        const participantIds = new Set((nextShot.participants ?? []).map((participant) => participant.characterId));
+        if (new Set(update.characterOrder).size !== update.characterOrder.length || update.characterOrder.some((id) => !participantIds.has(id))) {
+          return patchError("AI 补丁的左右顺序包含非本镜头角色或重复角色。");
+        }
+        nextShot.layout = { ...(nextShot.layout ?? {}), characterOrder: [...update.characterOrder] };
+      }
+      if (update.intentionalAxisBreak !== undefined) nextShot.layout = { ...(nextShot.layout ?? {}), intentionalAxisBreak: update.intentionalAxisBreak };
+      if (update.direction !== undefined) nextShot.direction = update.direction;
+    }
+  }
+
+  if (patch.beatUpdates) {
+    if (!allowedBeatCodes.has(issue.code)) return patchError("该问题不允许修改节拍目标字段。");
+    for (const update of patch.beatUpdates) {
+      if (issue.entityId && update.beatId !== issue.entityId) return patchError("AI 补丁试图修改当前问题之外的节拍。");
+      const targetShot = nextScene.shots.find((candidate) => candidate.id === update.shotId);
+      const beat = targetShot?.beats?.find((candidate) => candidate.id === update.beatId);
+      if (!targetShot || !beat) return patchError("AI 补丁引用了不存在的镜头或节拍。");
+      if (update.targetCharacterId !== undefined) {
+        const asset = assetById.get(update.targetCharacterId);
+        if (!asset || asset.kind !== "character" || !(targetShot.participants ?? []).some((participant) => participant.characterId === update.targetCharacterId)) return patchError("节拍目标角色不是当前镜头的现有参与者。");
+        beat.targetCharacterId = update.targetCharacterId;
+        beat.targetPropId = undefined;
+      }
+      if (update.targetPropId !== undefined) {
+        const asset = assetById.get(update.targetPropId);
+        if (!asset || asset.kind !== "prop") return patchError("节拍目标道具不存在或不是道具资产。");
+        beat.targetPropId = update.targetPropId;
+        beat.targetCharacterId = undefined;
+      }
+    }
+  }
+
+  if (patch.directorLayerUpdates) {
+    if (!issue.layerKey) return patchError("该问题没有可修改的导演文档层。");
+    for (const update of patch.directorLayerUpdates) {
+      if (update.layerKey !== issue.layerKey || !["firstFrame", "locationMap"].includes(update.layerKey)) return patchError("AI 补丁试图修改当前问题之外的导演文档层。");
+      if (!update.text.trim()) return patchError("导演文档修复文本不能为空。");
+      const unknownReference = [...update.text.matchAll(/@[A-Za-z0-9_\-\u4e00-\u9fff]+/g)].map((match) => match[0]).find((token) => {
+        const normalized = token.slice(1);
+        return !assets.some((asset) => asset.referenceTag === normalized || asset.name === normalized);
+      });
+      if (unknownReference) return patchError(`导演文档补丁包含未知资产引用：${unknownReference}`);
+      nextScene.directorLayers = { ...(nextScene.directorLayers ?? {}), [update.layerKey]: update.text.trim() };
+    }
+  }
+
+  const nextProject = { ...project, scenes: project.scenes.map((candidate) => candidate.id === scene.id ? nextScene : candidate) };
+  return { project: nextProject, scene: nextScene };
+}
 
 const movements: CameraMovement[] = ["Static", "Handheld", "Steadicam", "Dolly", "Tracking", "Crane", "POV", "OTS"];
 const newId = () => crypto.randomUUID();
@@ -67,13 +182,16 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [sceneCompileBusy, setSceneCompileBusy] = useState(false);
   const [finalGenerateBusy, setFinalGenerateBusy] = useState(false);
+  const [aiRepairBusy, setAiRepairBusy] = useState(false);
   const [sceneCompileProgress, setSceneCompileProgress] = useState<SceneCompileProgress>("idle");
+  const [compileReceivedChars, setCompileReceivedChars] = useState(0);
   const [briefOptimizeBusy, setBriefOptimizeBusy] = useState(false);
   const [aiCompileError, setAiCompileError] = useState("");
   const [aiCompileErrorDetail, setAiCompileErrorDetail] = useState("");
   const [aiErrorCopied, setAiErrorCopied] = useState(false);
   const [resumeAvailable, setResumeAvailable] = useState(false);
   const [resumeBusy, setResumeBusy] = useState(false);
+  const [focusedDirectorLayer, setFocusedDirectorLayer] = useState<string | null>(null);
   const template = DIRECTOR_SEQUENCE_TEMPLATE;
   const [modelProfileId, setModelProfileId] = useState<string>(() => localStorage.getItem("cineprompt-model") ?? "");
   const [, setHistory] = useState<PromptVersion[]>(loadHistory);
@@ -109,6 +227,12 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
   const clearResume = () => {
     resumeJobRef.current = null;
     setResumeAvailable(false);
+    setCompileReceivedChars(0);
+  };
+  const updateCompileProgress: SceneCompileProgressListener = (stage, receivedChars = 0) => {
+    setSceneCompileProgress(stage);
+    if (stage === "preparing") setCompileReceivedChars(0);
+    if (receivedChars > 0) setCompileReceivedChars(receivedChars);
   };
   const registerResume = (error: unknown, kind: ResumeJobKind, apply: (value: unknown) => Promise<void> | void): boolean => {
     if (!(error instanceof ChatCompletionInterruptedError) || !error.resume) return false;
@@ -127,6 +251,7 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
       },
     };
     setResumeAvailable(true);
+    setCompileReceivedChars(interrupted.partialText.length);
     setAiCompileError(t.aiResumeAvailable);
     setAiCompileErrorDetail(interrupted.message);
     return true;
@@ -136,12 +261,13 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
     if (!job || resumeBusy) return;
     setResumeBusy(true);
     setResumeAvailable(false);
+    resumeJobRef.current = null;
     if (job.kind === "scene") {
       setSceneCompileBusy(true);
-      setSceneCompileProgress("resuming");
+      updateCompileProgress("resuming");
     } else {
       setFinalGenerateBusy(true);
-      setSceneCompileProgress("resuming");
+      updateCompileProgress("resuming");
     }
     try {
       await job.run();
@@ -166,7 +292,8 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
     } finally {
       if (job.kind === "scene") setSceneCompileBusy(false);
       else setFinalGenerateBusy(false);
-      setSceneCompileProgress("idle");
+      updateCompileProgress("idle");
+      if (!resumeJobRef.current) setCompileReceivedChars(0);
       setResumeBusy(false);
     }
   };
@@ -200,6 +327,19 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
     }
     const target = issue.field === "lighting" || issue.field === "staging" ? "cinematic-director-brief" : "cinematic-shot-inspector";
     window.requestAnimationFrame(() => document.getElementById(target)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  };
+  const focusContinuityTarget = (target: { shotId?: string; layerKey?: string }) => {
+    const hasShot = Boolean(target.shotId && scene.shots.some((candidate) => candidate.id === target.shotId));
+    if (hasShot) {
+      setShotId(target.shotId!);
+      setInspectorOpen(true);
+    }
+    if (target.layerKey) {
+      setFocusedDirectorLayer(target.layerKey);
+      window.requestAnimationFrame(() => document.getElementById(`cinematic-director-layer-${target.layerKey}`)?.scrollIntoView({ behavior: "smooth", block: "center" }));
+      return;
+    }
+    window.requestAnimationFrame(() => document.getElementById(hasShot ? "cinematic-shot-inspector" : "cinematic-director-brief")?.scrollIntoView({ behavior: "smooth", block: "start" }));
   };
   const auditRecommendation = (action: FinalPromptAuditIssue["action"] | undefined): string | undefined => {
     if (!action) return undefined;
@@ -275,8 +415,14 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
     const model = separator >= 0 ? value.slice(separator + 1) : "";
     const option = chatModels.find((item) => item.providerId === providerId && item.model === model);
     if (!option) return;
-    setAiSettings(saveAISettings(resolveLenTalkChatModel(option.providerId, option.model)));
+    setAiSettings(saveAISettings({
+      ...resolveLenTalkChatModel(option.providerId, option.model),
+      reasoningEffort: aiSettings.reasoningEffort,
+    }));
     setNotice(t.settingsSaved);
+  };
+  const selectReasoningEffort = (value: ReasoningEffort) => {
+    setAiSettings(saveAISettings({ ...aiSettings, reasoningEffort: value }));
   };
   const commitProjectCode = () => {
     const nextCode = projectCodeDraft.trim();
@@ -353,10 +499,48 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
       fileInput.current?.click();
     }
   };
-  /** P3：AI 修复建议（连续性面板回调） */
-  const aiAdvice = async (issue: ContinuityIssueV2) => {
-    const fix = await getAssistant().repairContinuity({ issue, project, scene, shot });
-    setNotice(`${t.aiFixLabel}: ${fix.apply}`);
+  /** AI 修复：只接受能消除当前问题且不引入新 error 的受限补丁。 */
+  const aiAdvice = async (issue: RepairQualityIssue) => {
+    if (aiRepairBusy) return;
+    setAiRepairBusy(true);
+    try {
+      const targetShot = scene.shots.find((candidate) => candidate.id === issue.shotId || candidate.id === issue.entityId) ?? shot;
+      const fix = await getAssistant().repairContinuity({ issue, project, scene, shot: targetShot });
+      if (!fix.patch) {
+        setNotice(`${t.aiFixLabel}: ${fix.apply}`);
+        return;
+      }
+      const applied = applyContinuityRepairPatch(project, scene, issue, fix.patch);
+      if ("error" in applied) {
+        setNotice(`${t.aiFixLabel}: ${applied.error}`);
+        return;
+      }
+      const beforeIssues: RepairQualityIssue[] = [...issues, ...directorLayerIssues];
+      const candidateContinuity = checkContinuityV2(applied.project, applied.scene);
+      const candidateDirector = applied.scene.directorLayers
+        ? validateDirectorLayers(applied.scene.directorLayers, applied.project, applied.scene)
+        : [];
+      const candidateIssues: RepairQualityIssue[] = [...candidateContinuity, ...candidateDirector];
+      const originalStillPresent = candidateIssues.some((candidate) => repairIssueKey(candidate) === repairIssueKey(issue));
+      const beforeErrorKeys = new Set(beforeIssues.filter((candidate) => candidate.severity === "error").map(repairIssueKey));
+      const newErrors = candidateIssues.filter((candidate) => candidate.severity === "error" && !beforeErrorKeys.has(repairIssueKey(candidate)));
+      if (originalStillPresent) {
+        setNotice(locale === "zh" ? "AI 修复未消除原问题，工程未修改。请定位后手动调整。" : "The AI repair did not remove the original issue. No changes were applied.");
+        return;
+      }
+      if (newErrors.length > 0) {
+        setNotice(locale === "zh" ? `AI 修复引入了 ${newErrors.length} 个新错误，工程未修改。` : `The AI repair introduced ${newErrors.length} new error(s). No changes were applied.`);
+        return;
+      }
+      setProject(applied.project);
+      focusContinuityTarget({ shotId: issue.shotId ?? issue.entityId, layerKey: issue.layerKey });
+      setNotice(locale === "zh" ? "AI 已修复当前问题，并通过复核。" : "AI repaired this issue and the follow-up checks passed.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setNotice(`${t.aiFixLabel}: ${message}`);
+    } finally {
+      setAiRepairBusy(false);
+    }
   };
 
   const updateShot = (updates: Partial<ShotV2>, targetId?: string) => { const target = targetId ?? shot.id; setProject((current) => ({ ...current, scenes: current.scenes.map((item) => item.id !== scene.id ? item : { ...item, shots: item.shots.map((candidate) => candidate.id === target ? { ...candidate, ...updates } : candidate) }) })); };
@@ -455,6 +639,8 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
   const applySceneDraft = (draft: Awaited<ReturnType<typeof fillSceneDraft>>) => {
     const targetScene = draft.scene;
     const lockedKeys = (scene.lockedDirectorLayers ?? []).filter((key) => (scene.directorLayers?.[key] ?? "").trim());
+    // The planner returns shots plus macro decisions. Director layers on the
+    // draft are deterministic local output; only user-locked layers are kept.
     const incomingLayers = targetScene.directorLayers ?? {};
     const mergedLayers: Record<string, string> = { ...incomingLayers };
     for (const key of lockedKeys) {
@@ -473,7 +659,7 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
     setProject(nextProject);
     setManualOverride(null);
     setShotId(mergedScene.shots[0]?.id ?? "");
-    setSceneCompileProgress("validating");
+    updateCompileProgress("validating");
     const audit = auditFinalPromptWithProject(mergedScene, project.assets ?? []);
     const nextIssues = checkContinuityV2(nextProject, mergedScene);
     const layerIssues = validateDirectorLayers(mergedScene.directorLayers ?? {}, nextProject, mergedScene);
@@ -496,10 +682,10 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
     if (!isRemoteConfigured()) { setNotice(t.aiNotConfigured); return; }
     clearResume();
     setSceneCompileBusy(true);
-    setSceneCompileProgress("preparing");
+    updateCompileProgress("preparing");
     setAiCompileError("");
     try {
-      const draft = await fillSceneDraft(project, scene, { seconds: t.seconds, locale, onProgress: setSceneCompileProgress });
+      const draft = await fillSceneDraft(project, scene, { seconds: t.seconds, locale, onProgress: updateCompileProgress });
       applySceneDraft(draft);
     } catch (error) {
       if (registerResume(error, "scene", (value) => applySceneDraft(value as Awaited<ReturnType<typeof fillSceneDraft>>))) {
@@ -518,7 +704,8 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
       setAiCompileErrorDetail(message);
     } finally {
       setSceneCompileBusy(false);
-      setSceneCompileProgress("idle");
+      updateCompileProgress("idle");
+      setCompileReceivedChars(0);
     }
   };
   /** 仅补齐导演简报中的 AI 参考字段，不生成镜头或最终提示词。 */
@@ -596,8 +783,8 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
         : t.promptLocalCompiled);
     };
     try {
-      const canonical = buildFinalGenerationSource(project, scene);
-      const text = await generateFinalPrompt(canonical, locale, setSceneCompileProgress);
+      const canonical = buildFinalGenerationSource(project, scene, locale);
+      const text = await generateFinalPrompt(canonical, locale, updateCompileProgress);
       applyFinalPrompt(text);
     } catch (error) {
       if (registerResume(error, "final", applyFinalPrompt)) {
@@ -673,14 +860,16 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
       <div className="content-main">
       {/* ── 1. 导演简报卡（P0.4：合并风格配方 / 场景 / 音频计划）── */}
       <div id="cinematic-director-brief">
-      <DirectorBriefCard
+        <DirectorBriefCard
         project={project}
         scene={scene}
         t={t}
         locale={locale}
+        canvasImageSources={canvasImageSources}
         compileBusy={sceneCompileBusy}
         finalGenerateBusy={finalGenerateBusy}
         compileProgress={sceneCompileProgress}
+        compileReceivedChars={compileReceivedChars}
         briefOptimizeBusy={briefOptimizeBusy}
         aiCompileError={aiCompileError}
         aiCompileErrorDetail={aiCompileErrorDetail}
@@ -703,11 +892,13 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
         chatModels={chatModels}
         selectedChatModel={selectedChatModel}
         onSelectChatModel={selectChatModel}
+        selectedReasoningEffort={aiSettings.reasoningEffort}
+        onSelectReasoningEffort={selectReasoningEffort}
       />
       </div>
 
-      {/* ── 2. 分层导演文档卡（P0.6：AI 编译产出各层，可展开编辑 + 锁定）── */}
-      <DirectorLayersCard project={project} scene={scene} t={t} locale={locale} canvasImageSources={canvasImageSources} onUpdateScene={updateScene} setNotice={setNotice} />
+      {/* ── 2. 分层导演文档卡（P0.6：本地规则预填各层，可展开编辑 + 锁定）── */}
+      <DirectorLayersCard project={project} scene={scene} t={t} locale={locale} canvasImageSources={canvasImageSources} onUpdateScene={updateScene} setNotice={setNotice} focusLayerKey={focusedDirectorLayer} />
 
       {/* ── 4. 镜头执行：时间线、动作、角色表演与节拍共用同一结构化数据 ── */}
       <section className="card shots-card">
@@ -804,7 +995,7 @@ export default function App({ onClose, onStateChange, onSendToVideo, canvasAudio
         <div className="card-head">
           <div className="card-head-title"><span className="eyebrow">{t.qualityCheck}</span><strong>{issues.length + directorLayerIssues.length}</strong></div>
         </div>
-        <ContinuityPanel project={project} scene={scene} issues={issues} directorIssues={directorLayerIssues} t={t} locale={locale} onFix={fixIssue} onAiAdvice={aiAdvice} />
+        <ContinuityPanel project={project} scene={scene} issues={issues} directorIssues={directorLayerIssues} t={t} locale={locale} onFix={fixIssue} onAiAdvice={aiAdvice} onLocate={focusContinuityTarget} />
       </section>
       </div>
 

@@ -11,7 +11,7 @@
  * P0.2 范围：Spatial 组（地点资产、180° 轴线、故意越轴、站位顺序一致性）
  * 其余规则组在 P0.3-P0.5 分批加入。
  */
-import type { Asset, ContinuityIssueV2, ProjectV2, SceneV2, ShotRisk } from "../shared-types";
+import type { Asset, ContinuityIssueV2, ProjectV2, SceneV2, ShotParticipant, ShotRisk, ShotV2 } from "../shared-types";
 import { resolveCharacterOrder } from "./compiler/renderer";
 import { TERMINAL_STATES, TRIGGER_VERBS } from "./states";
 import { ATTACK_VERBS } from "./beats";
@@ -46,6 +46,156 @@ function participantScreenSide(scene: SceneV2, shot: SceneV2["shots"][number], c
   if (order.length >= 2 && index === 0) return "left";
   if (order.length >= 2 && index === order.length - 1) return "right";
   return undefined;
+}
+
+type SpatialDepth = "foreground" | "midground" | "background";
+
+interface ParticipantSpatialFacts {
+  side?: ScreenSide;
+  depth?: SpatialDepth;
+}
+
+/** 只从明确的空间词读取位置，避免把自由表演文字误判成站位。 */
+function explicitPositionFacts(value?: string): ParticipantSpatialFacts {
+  const text = value?.trim().toLowerCase() ?? "";
+  if (!text) return {};
+  const side = /(?:screen[-\s]?left|画面左|屏幕左|左侧|左边|左方)/i.test(text)
+    ? "left"
+    : /(?:screen[-\s]?right|画面右|屏幕右|右侧|右边|右方)/i.test(text)
+      ? "right"
+      : undefined;
+  const depth = /(?:foreground|前景)/i.test(text)
+    ? "foreground"
+    : /(?:midground|中景)/i.test(text)
+      ? "midground"
+      : /(?:background|后景)/i.test(text)
+        ? "background"
+        : undefined;
+  return { side, depth };
+}
+
+function participantSpatialFacts(scene: SceneV2, shot: ShotV2, participant: ShotParticipant): ParticipantSpatialFacts {
+  const explicit = explicitPositionFacts(participant.position);
+  return {
+    side: explicit.side ?? participantScreenSide(scene, shot, participant.characterId),
+    depth: explicit.depth,
+  };
+}
+
+const EXIT_CUE_RE = /(?:离开(?:画面|镜头)?|走出(?:画面|镜头)?|退出(?:画面|镜头)?|出画|离场|爬走|走远|leave(?:s)?\s+(?:the\s+)?frame|exit(?:s)?\s+(?:the\s+)?frame|out\s+of\s+(?:the\s+)?frame|walk(?:s)?\s+off|move(?:s)?\s+out)/i;
+const CROSSING_CUE_RE = /(?:从左到右|从右到左|横穿|穿过画面|越过画面|left\s+to\s+right|right\s+to\s+left|cross(?:es|ing)?\s+(?:the\s+)?frame|move(?:s)?\s+across|walk(?:s)?\s+across)/i;
+
+function shotTextForCharacter(shot: ShotV2, characterId: string, characterName?: string): string {
+  const chunks = [shot.action, shot.note, ...(shot.beats ?? []).flatMap((beat) => {
+    if (beat.actorId !== characterId && !characterName) return [];
+    return [beat.verb, beat.actionText, beat.note, beat.cutRule];
+  })];
+  const text = chunks.filter((value): value is string => Boolean(value?.trim())).join(" ");
+  return characterName && text && !text.includes(characterName) && !text.includes(characterId) ? `${text} ${characterName}` : text;
+}
+
+function hasExitCue(shot: ShotV2, characterId: string, characterName?: string): boolean {
+  const text = shotTextForCharacter(shot, characterId, characterName);
+  return EXIT_CUE_RE.test(text);
+}
+
+function hasCrossingCue(shot: ShotV2, characterId: string, characterName?: string): boolean {
+  const text = shotTextForCharacter(shot, characterId, characterName);
+  return CROSSING_CUE_RE.test(text);
+}
+
+/** 相邻镜头空间继承：位置变化、出画后重入、入画方向必须明确。 */
+function checkAdjacentCharacterSpatialContinuity(project: ProjectV2, scene: SceneV2): ContinuityIssueV2[] {
+  const assets = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
+  const issues: ContinuityIssueV2[] = [];
+  const shots = scene.shots ?? [];
+
+  for (let index = 1; index < shots.length; index += 1) {
+    const previous = shots[index - 1];
+    const current = shots[index];
+    const previousParticipants = new Map((previous.participants ?? []).map((participant) => [participant.characterId, participant]));
+    const currentParticipants = new Map((current.participants ?? []).map((participant) => [participant.characterId, participant]));
+    const commonIds = [...currentParticipants.keys()].filter((id) => previousParticipants.has(id));
+    const intentionalAxisBreak = current.layout?.intentionalAxisBreak === true;
+
+    for (const characterId of commonIds) {
+      const previousParticipant = previousParticipants.get(characterId)!;
+      const currentParticipant = currentParticipants.get(characterId)!;
+      const name = assets.get(characterId)?.name ?? characterId;
+      const previousFacts = participantSpatialFacts(scene, previous, previousParticipant);
+      const currentFacts = participantSpatialFacts(scene, current, currentParticipant);
+      const hasExplicitReentry = currentParticipant.entrance === "enters-left" || currentParticipant.entrance === "enters-right";
+      const hasExplicitCrossing = hasCrossingCue(current, characterId, name);
+
+      if (!intentionalAxisBreak && !hasExplicitReentry && !hasExplicitCrossing && previousFacts.side && currentFacts.side && previousFacts.side !== currentFacts.side) {
+        issues.push({
+          code: "SPATIAL.POSITION_JUMP",
+          severity: "warning",
+          entityId: current.id,
+          label: "Character position jumps across shots",
+          detail: `${name} is screen-${previousFacts.side} in shot ${previous.label} but screen-${currentFacts.side} in shot ${current.label} without an entrance, crossing, or intentional axis break.`,
+          detailZh: `「${name}」在镜头「${previous.label}」位于画面${previousFacts.side === "left" ? "左" : "右"}侧，但在镜头「${current.label}」突然位于画面${currentFacts.side === "left" ? "左" : "右"}侧；没有标明入画、横穿或故意越轴。`,
+        });
+      }
+
+      if (!intentionalAxisBreak && previousFacts.depth && currentFacts.depth && previousFacts.depth !== currentFacts.depth && !hasExplicitReentry && !hasExplicitCrossing) {
+        issues.push({
+          code: "SPATIAL.DEPTH_JUMP",
+          severity: "warning",
+          entityId: current.id,
+          label: "Character depth jumps across shots",
+          detail: `${name} changes from ${previousFacts.depth} in shot ${previous.label} to ${currentFacts.depth} in shot ${current.label} without a stated movement or entrance.`,
+          detailZh: `「${name}」从镜头「${previous.label}」的${previousFacts.depth === "foreground" ? "前景" : previousFacts.depth === "midground" ? "中景" : "后景"}跳到镜头「${current.label}」的${currentFacts.depth === "foreground" ? "前景" : currentFacts.depth === "midground" ? "中景" : "后景"}，没有标明移动或入画。`,
+        });
+      }
+
+      if (hasExitCue(previous, characterId, name) && !hasExplicitReentry) {
+        issues.push({
+          code: "SPATIAL.REENTRY_UNMARKED",
+          severity: "warning",
+          entityId: current.id,
+          label: "Re-entry is not marked",
+          detail: `${name} exits in shot ${previous.label} but appears again in shot ${current.label} without an explicit left/right entrance.`,
+          detailZh: `「${name}」在镜头「${previous.label}」出画后又出现在镜头「${current.label}」，但没有标明从左侧或右侧入画。`,
+        });
+      }
+    }
+
+    for (const participant of current.participants ?? []) {
+      const facts = participantSpatialFacts(scene, current, participant);
+      const entranceSide = participant.entrance === "enters-left" ? "left" : participant.entrance === "enters-right" ? "right" : undefined;
+      if (entranceSide && facts.side && entranceSide !== facts.side) {
+        const name = assets.get(participant.characterId)?.name ?? participant.characterId;
+        issues.push({
+          code: "SPATIAL.ENTRANCE_POSITION_CONFLICT",
+          severity: "error",
+          entityId: current.id,
+          label: "Entrance direction conflicts with position",
+          detail: `${name} enters from screen-${entranceSide} but is positioned screen-${facts.side} in shot ${current.label}.`,
+          detailZh: `「${name}」标记为从画面${entranceSide === "left" ? "左" : "右"}侧入画，但镜头「${current.label}」的站位写在画面${facts.side === "left" ? "左" : "右"}侧。`,
+        });
+      }
+    }
+
+    const previousOrder = resolveCharacterOrder(scene, previous).filter((id) => previousParticipants.has(id));
+    const currentOrder = resolveCharacterOrder(scene, current).filter((id) => currentParticipants.has(id));
+    const commonOrderIds = previousOrder.filter((id) => currentOrder.includes(id));
+    if (!intentionalAxisBreak && commonOrderIds.length >= 2) {
+      const currentCommonOrder = currentOrder.filter((id) => commonOrderIds.includes(id));
+      const reversed = commonOrderIds.some((id, position) => id !== currentCommonOrder[position]);
+      if (reversed && !commonIds.some((id) => currentParticipants.get(id)?.entrance === "enters-left" || currentParticipants.get(id)?.entrance === "enters-right")) {
+        issues.push({
+          code: "SPATIAL.ORDER_JUMP",
+          severity: "warning",
+          entityId: current.id,
+          label: "Character order reverses across shots",
+          detail: `The shared character order changes from ${previous.label} to ${current.label} without an intentional axis break or entrance cue.`,
+          detailZh: `相邻镜头「${previous.label}」到「${current.label}」的共同人物左右顺序发生反转，但没有标记故意越轴或入画。`,
+        });
+      }
+    }
+  }
+  return issues;
 }
 
 function escapeRegExp(value: string): string {
@@ -224,6 +374,7 @@ export function checkSpatial(project: ProjectV2, scene: SceneV2, _options: Conti
 
   // 2. 相邻镜头轴线（逐对检查，允许故意越轴标记）
   const shots = scene.shots;
+  issues.push(...checkAdjacentCharacterSpatialContinuity(project, scene));
   for (let i = 1; i < shots.length; i += 1) {
     const prev = shots[i - 1];
     const curr = shots[i];
@@ -698,8 +849,8 @@ export function checkTechnical(project: ProjectV2, scene: SceneV2, _options: Con
         severity: "error",
         entityId: shot.id,
         label: "FOV missing",
-        detail: `Shot ${shot.label} declares gear ("${brandText}") but no FOV; choose an observable lens language (47°/84°/107°/29°/18°/8°/135°) before export.`,
-        detailZh: `镜头「${shot.label}」只写了器材（“${brandText}”），没有视场角；导出前请补充可观测的镜头语言（47°/84°/107°/29°/18°/8°/135°）。`,
+        detail: `Shot ${shot.label} declares gear ("${brandText}") but no FOV; choose an observable lens language (180°/135°/107°/84°/63°/47°/29°/18°/12°/8°) before export.`,
+        detailZh: `镜头「${shot.label}」只写了器材（“${brandText}”），没有视场角；导出前请补充可观测的镜头语言（180°/135°/107°/84°/63°/47°/29°/18°/12°/8°）。`,
         fixLabel: "Choose FOV",
       });
     }

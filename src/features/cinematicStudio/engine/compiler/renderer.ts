@@ -251,8 +251,8 @@ export function renderPropState(state: PropState, assetNameById: (id: string) =>
  * 从 propStatesAtStart → beats stateAfter（按 order）→ propStatesAtEnd 聚合，
  * 每个资产一行：propName: s1 → s2 → s3。只输出实际变化，连续重复状态合并。
  */
-export function renderStateChain(project: ProjectV2, shot: ShotV2, locale: PromptLocale = "zh", syntax: ReferenceSyntax = "asset-id"): string[] {
-  const name = assetRefName(project, syntax);
+export function renderStateChain(project: ProjectV2, shot: ShotV2, locale: PromptLocale = "zh", syntax: ReferenceSyntax = "asset-id", imageTokensByAssetId?: ReadonlyMap<string, string>): string[] {
+  const name = assetRefName(project, syntax, imageTokensByAssetId);
   const nameOfHolder = (id?: string) => (id ? assetRefName(project, syntax)(id) : undefined);
   const lex = promptLexicon(locale);
   const stateText = (s: PropState) => {
@@ -352,11 +352,12 @@ export function assetNameById(project: ProjectV2): (id: string) => string {
 }
 
 /** 资产名引用（P2.1 语法）：at-mention → @名字，其余保持原名 */
-export function assetRefName(project: ProjectV2, syntax: ReferenceSyntax = "asset-id"): (id: string) => string {
+export function assetRefName(project: ProjectV2, syntax: ReferenceSyntax = "asset-id", imageTokensByAssetId?: ReadonlyMap<string, string>): (id: string) => string {
   const name = assetNameById(project);
   return (id: string) => {
     const base = name(id);
-    return syntax === "at-mention" ? `@${base}` : base;
+    const imageToken = imageTokensByAssetId?.get(id);
+    return syntax === "at-mention" ? `@${base}${imageToken ? ` ${imageToken}` : ""}` : base;
   };
 }
 

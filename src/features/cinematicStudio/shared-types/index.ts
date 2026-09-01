@@ -188,6 +188,8 @@ export interface IdentityRule {
 /** 场景空间站位 */
 export interface SceneStaging {
   locationAssetId?: string;
+  /** 人物空间布局参考图：只约束站位、轴线、间距、排序与空间锚点，不替代地点资产。 */
+  stagingReferenceImage?: string;
   priorContext?: string;
   /** 空间锚点：backs against white wall next to red doors */
   anchorDescription?: string;
@@ -234,9 +236,6 @@ export interface ActionBeat {
   duration?: number;
   /** 墙钟起始秒（P1.4）：编译器按 startSeconds + duration 生成 0:00 to 0:03 */
   startSeconds?: number;
-  framing?: string;
-  lens?: string;
-  cameraAngle?: string;
   actorId?: string;
   verb: string;
   targetCharacterId?: string;
@@ -244,6 +243,10 @@ export interface ActionBeat {
   targetBodyPart?: string;
   actionText?: string;
   dialogue?: string;
+  /** 本节拍中的关键道具状态，如「已点亮，右手握持」。 */
+  propState?: string;
+  /** 本节拍中的非对白声音，如「沉重叹息」「鞋底摩擦地面」。 */
+  audio?: string;
   note?: string;
   /** 策略动词（P2）：单一策略检测用 */
   tactic?: string;
@@ -378,7 +381,7 @@ export interface SceneV02 {
   cutStyleDefault?: CutStyle;
   /** 拍摄模式（P2.3）：长镜头全镜统一相机参数；多镜头允许各镜换机位 */
   shootingMode?: "long-take" | "multi-shot";
-  /** 导演文档分层（P0.5）：AI 编译产出的各层完整文本（key → 含段头文本块） */
+  /** 导演文档分层（P0.5）：本地编译产出的各层完整文本（key → 含段头文本块） */
   directorLayers?: Record<string, string>;
   /** 场景语境（V3-P0）：最终提示词第一段，只描述当前片段事实，不包含前情/备注 */
   sceneContext?: string;
@@ -403,20 +406,23 @@ export type CutStyle = "hard-cut" | "overlap" | "match-cut";
 
 /* ===================== P1 镜头语言模块 ===================== */
 
-/** 七档镜头语言（P1.1）：数字即 FOV 角度，聚焦可观测结果而非品牌 gear */
+/** 十档镜头语言（P1.1）：数字即 FOV 角度，聚焦可观测结果而非品牌 gear */
 export type LensCharacter =
-  | "47-standard"     // 标准，自然人眼
-  | "84-wide"         // 经典广角，1–1.5m
+  | "180-panoramic"    // 极限沉浸全景环境
+  | "135-immersive"    // 沉浸广角环境
   | "107-ultrawide"   // 广角正射，0.5–0.8m
+  | "84-wide"         // 经典广角，1–1.5m
+  | "63-moderate-wide" // 中广角，环境与人物的平衡视角
+  | "47-standard"     // 标准，自然人眼
   | "29-short-tele"   // 中近特写肖像
   | "18-tele"         // 经典长焦，6–8m
-  | "8-supertele"     // 超长焦观察，20–25m + 前景遮挡
-  | "135-immersive";  // 沉浸广角环境
+  | "12-long-tele"    // 超长焦，约 200mm，远距压缩
+  | "8-supertele";    // 超长焦观察，20–25m + 前景遮挡
 
 /** 光学控制（P1.1）：可观测结果优先于焦距与品牌 */
 export interface Optics {
   lensCharacter?: LensCharacter;
-  /** 视场角 8–135（度） */
+  /** 视场角 8–180（度） */
   fieldOfViewDegrees?: number;
   /** 可观测结果画像（见 lens-bank） */
   lensOutcome?: string[];

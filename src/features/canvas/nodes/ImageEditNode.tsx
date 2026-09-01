@@ -49,6 +49,7 @@ import {
   removeTextRange,
   resolveReferenceAwareDeleteRange,
 } from '@/features/canvas/application/referenceTokenEditing';
+import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
 import {
   DEFAULT_IMAGE_MODEL_ID,
   getImageModel,
@@ -445,6 +446,13 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const usdToCnyRate = useSettingsStore((state) => state.usdToCnyRate);
   const preferDiscountedPrice = useSettingsStore((state) => state.preferDiscountedPrice);
   const grsaiCreditTierId = useSettingsStore((state) => state.grsaiCreditTierId);
+  const { cancelCommit: cancelPromptCommit, flushCommit: flushPromptCommit, scheduleCommit: schedulePromptCommit } =
+    useDebouncedNodeTextCommit({
+      nodeId: id,
+      field: 'prompt',
+      valueRef: promptDraftRef,
+      updateNodeData,
+    });
 
   const incomingImages = useMemo(
     () => graphImageResolver.collectInputImages(id, nodes, edges),
@@ -600,8 +608,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
 
   const commitPromptDraft = useCallback((nextPrompt: string) => {
     promptDraftRef.current = nextPrompt;
+    cancelPromptCommit();
     updateNodeData(id, { prompt: nextPrompt });
-  }, [id, updateNodeData]);
+  }, [cancelPromptCommit, id, updateNodeData]);
 
   // 上游图片断连(数量减少)时, 自动移除提示词中越界的 @图N 引用
   useEffect(() => {
@@ -609,9 +618,10 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     if (cleaned !== promptDraftRef.current) {
       promptDraftRef.current = cleaned;
       setPromptDraft(cleaned);
+      cancelPromptCommit();
       updateNodeData(id, { prompt: cleaned });
     }
-  }, [id, incomingImages.length, updateNodeData]);
+  }, [cancelPromptCommit, id, incomingImages.length, updateNodeData]);
 
   // 轻量预览浮层: Esc 关闭
   useEffect(() => {
@@ -683,9 +693,10 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     }
     generationLockRef.current = true;
     setIsGenerating(true);
+    flushPromptCommit();
 
     const prompt = [
-      promptDraft.replace(/@(?=图\d+)/g, '').trim(),
+      promptDraftRef.current.replace(/@(?=图\d+)/g, '').trim(),
       ...incomingText,
     ].filter(Boolean).join('\n\n').trim();
     if (!prompt) {
@@ -875,8 +886,8 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     providerApiKey,
     findNodePosition,
     incomingText,
-    promptDraft,
     effectiveExtraParams,
+    flushPromptCommit,
     id,
     incomingImages,
     requestResolution.requestModel,
@@ -1152,9 +1163,11 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
                 event.target.value,
                 incomingImages.length
               );
+              promptDraftRef.current = nextValue;
               setPromptDraft(nextValue);
-              commitPromptDraft(nextValue);
+              schedulePromptCommit();
             }}
+            onBlur={flushPromptCommit}
             onSelect={(event) => normalizePromptSelection(event.currentTarget)}
             onKeyDown={handlePromptKeyDown}
             onScroll={syncPromptHighlightScroll}

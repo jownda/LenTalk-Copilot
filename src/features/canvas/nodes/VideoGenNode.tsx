@@ -38,6 +38,7 @@ import {
   removeTextRange,
   resolveReferenceAwareDeleteRange,
 } from '@/features/canvas/application/referenceTokenEditing';
+import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 
@@ -327,6 +328,13 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const [previewState, setPreviewState] = useState<ReferencePreviewState | null>(null);
   /** 预览图按图片比例自适应后的显示尺寸(加载完成前为 null) */
   const [previewSize, setPreviewSize] = useState<{ width: number; height: number } | null>(null);
+  const { cancelCommit: cancelPromptCommit, flushCommit: flushPromptCommit, scheduleCommit: schedulePromptCommit } =
+    useDebouncedNodeTextCommit({
+      nodeId: id,
+      field: 'prompt',
+      valueRef: promptDraftRef,
+      updateNodeData,
+    });
 
   const models = listVideoModels();
   const selectedModel = getVideoModel(data.model) ?? getVideoModel(getDefaultVideoModelId());
@@ -485,8 +493,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     const nextPrompt = remapAudioReferenceTokens(promptDraftRef.current, usableInputAudio, nextUsableAudio);
     promptDraftRef.current = nextPrompt;
     setPromptDraft(nextPrompt);
+    cancelPromptCommit();
     updateNodeData(id, { studioReferenceAudio: nextDirectAudio, prompt: nextPrompt });
-  }, [directReferenceAudio, id, inputAudio, isJimengCli, usableInputAudio, updateNodeData]);
+  }, [cancelPromptCommit, directReferenceAudio, id, inputAudio, isJimengCli, usableInputAudio, updateNodeData]);
   const title = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.videoGen, data), [data]);
   const resolvedWidth = Math.max(VIDEO_GEN_NODE_MIN_WIDTH, Math.round(width ?? VIDEO_GEN_NODE_DEFAULT_WIDTH));
   const resolvedHeight = Math.max(VIDEO_GEN_NODE_MIN_HEIGHT, Math.round(height ?? VIDEO_GEN_NODE_DEFAULT_HEIGHT));
@@ -526,9 +535,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     if (cleanedPrompt !== promptDraftRef.current) {
       promptDraftRef.current = cleanedPrompt;
       setPromptDraft(cleanedPrompt);
+      cancelPromptCommit();
       updateNodeData(id, { prompt: cleanedPrompt });
     }
-  }, [id, imageMode, referenceInputImages.length, usableInputAudio.length, updateNodeData]);
+  }, [cancelPromptCommit, id, imageMode, referenceInputImages.length, usableInputAudio.length, updateNodeData]);
 
   useEffect(() => {
     if (referencePickerItems.length === 0) {
@@ -627,6 +637,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     const { nextText, nextCursor } = insertReferenceToken(basePrompt, baseCursor, marker);
     promptDraftRef.current = nextText;
     setPromptDraft(nextText);
+    cancelPromptCommit();
     updateNodeData(id, { prompt: nextText });
     setShowImagePicker(false);
     setPickerCursor(null);
@@ -636,7 +647,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       promptRef.current?.setSelectionRange(nextCursor, nextCursor);
       syncPromptHighlightScroll();
     });
-  }, [id, pickerCursor, updateNodeData]);
+  }, [cancelPromptCommit, id, pickerCursor, updateNodeData]);
 
   const handlePromptKeyDown = useCallback((event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Backspace' || event.key === 'Delete') {
@@ -657,6 +668,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         const { nextText, nextCursor } = removeTextRange(currentPrompt, deleteRange);
         promptDraftRef.current = nextText;
         setPromptDraft(nextText);
+        cancelPromptCommit();
         updateNodeData(id, { prompt: nextText });
         requestAnimationFrame(() => {
           promptRef.current?.focus();
@@ -703,7 +715,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       setPickerActiveIndex(0);
       setShowImagePicker(true);
     }
-  }, [id, insertReference, pickerActiveIndex, referenceInputImages.length, referencePickerItems, showImagePicker, usableInputAudio.length, updateNodeData]);
+  }, [cancelPromptCommit, id, insertReference, pickerActiveIndex, referenceInputImages.length, referencePickerItems, showImagePicker, usableInputAudio.length, updateNodeData]);
 
   const handleFrameFileChange = useCallback(async (
     slot: FrameSlot,
@@ -761,6 +773,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       void showErrorDialog(message, t('common.error'));
       return;
     }
+    flushPromptCommit();
     const prompt = [
       promptDraftRef.current.trim(),
       ...inputText,
@@ -886,7 +899,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     } finally {
       setIsGenerating(false);
     }
-  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, id, imageMode, inputText, resolvedInputAudio, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, t, updateNodeData, updateNodeSize, videoReferenceImages]);
+  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, flushPromptCommit, id, imageMode, inputText, resolvedInputAudio, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, t, updateNodeData, updateNodeSize, videoReferenceImages]);
 
   return (
     <div
@@ -932,8 +945,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
               const nextValue = event.target.value;
               promptDraftRef.current = nextValue;
               setPromptDraft(nextValue);
-              updateNodeData(id, { prompt: nextValue });
+              schedulePromptCommit();
             }}
+            onBlur={flushPromptCommit}
             onKeyDown={handlePromptKeyDown}
             onScroll={syncPromptHighlightScroll}
             onMouseDown={(event) => event.stopPropagation()}

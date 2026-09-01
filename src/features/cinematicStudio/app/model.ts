@@ -118,7 +118,9 @@ export function loadProject(): ProjectV2 {
     const migrated = migrateProject(stored);
     return {
       ...migrated,
-      styleId: migrated.styleId ?? "wong-kar-wai",
+      // Do not inject a director/style preset into an existing project. A
+      // missing style means the current scene data must stand on its own.
+      styleId: migrated.styleId,
       // 负面提示词统一带「不要」等前缀(旧数据无前缀的自动补, 保证输入框所见即所得)
       negativePrompt: withNegativePrefix(migrated.negativePrompt?.trim() || DEFAULT_NEGATIVE),
     };

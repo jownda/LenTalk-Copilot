@@ -3,8 +3,9 @@
  * 详细规则仍由 continuity engine 执行，本组件只负责把结果转成可操作的 UI。
  */
 import type { ContinuityIssueV2, ProjectV2, SceneV2 } from "../../shared-types";
+import type { ContinuityRepairIssue } from "../../engine";
 import type { DirectorLayerIssue } from "../../engine/quality";
-import { Check, CheckCircle2, CircleAlert, Copy, Info, Sparkles, Wrench, XCircle } from "lucide-react";
+import { Check, CheckCircle2, CircleAlert, Copy, Info, LocateFixed, Sparkles, Wrench, XCircle } from "lucide-react";
 import { useState } from "react";
 import { issueLabels, type CopyZh, type Locale } from "../i18n";
 
@@ -18,10 +19,11 @@ interface ContinuityPanelProps {
   locale: Locale;
   directorIssues?: DirectorLayerIssue[];
   onFix(issue: ContinuityIssueV2): void;
-  onAiAdvice?(issue: ContinuityIssueV2): void;
+  onAiAdvice?(issue: ContinuityRepairIssue): void;
+  onLocate?(target: { shotId?: string; layerKey?: string }): void;
 }
 
-export default function ContinuityPanel({ issues, t, locale, directorIssues = [], onFix, onAiAdvice }: ContinuityPanelProps) {
+export default function ContinuityPanel({ issues, t, locale, directorIssues = [], onFix, onAiAdvice, onLocate }: ContinuityPanelProps) {
   const allIssues = [
     ...directorIssues.map((issue) => ({ kind: "director" as const, issue })),
     ...issues.map((issue) => ({ kind: "continuity" as const, issue })),
@@ -47,13 +49,13 @@ export default function ContinuityPanel({ issues, t, locale, directorIssues = []
     {allIssues.length > 0 && <div className="issue-groups">
       <div className="quality-issues-title">{t.qualityIssues}</div>
       {allIssues.map(({ kind, issue }, issueIndex) => kind === "director"
-        ? <DirectorIssueRow key={`${issue.code}-${issue.layerKey ?? ""}-${issueIndex}`} issue={issue} locale={locale} t={t} />
-        : <IssueRow key={`${issue.code}-${issue.entityId ?? ""}-${issueIndex}`} issue={issue} t={t} locale={locale} onFix={onFix} onAiAdvice={onAiAdvice} />)}
+        ? <DirectorIssueRow key={`${issue.code}-${issue.layerKey ?? ""}-${issueIndex}`} issue={issue} locale={locale} t={t} onLocate={onLocate} onAiAdvice={onAiAdvice} />
+        : <IssueRow key={`${issue.code}-${issue.entityId ?? ""}-${issueIndex}`} issue={issue} t={t} locale={locale} onFix={onFix} onAiAdvice={onAiAdvice} onLocate={onLocate} />)}
     </div>}
   </div>;
 }
 
-function DirectorIssueRow({ issue, locale, t }: { issue: DirectorLayerIssue; locale: Locale; t: CopyZh }) {
+function DirectorIssueRow({ issue, locale, t, onLocate, onAiAdvice }: { issue: DirectorLayerIssue; locale: Locale; t: CopyZh; onLocate?: ContinuityPanelProps["onLocate"]; onAiAdvice?: ContinuityPanelProps["onAiAdvice"] }) {
   const Icon = issue.severity === "error" ? XCircle : CircleAlert;
   const label = locale === "zh" ? issue.detailZh.split("；")[0] || issue.label : issue.label;
   const detail = locale === "zh" ? issue.detailZh : issue.detail;
@@ -66,12 +68,16 @@ function DirectorIssueRow({ issue, locale, t }: { issue: DirectorLayerIssue; loc
       <span className="issue-detail">{detail}{source}</span>
       {suggestion && <span className="issue-detail">{suggestion}</span>}
     </div>
-    <span className="issue-quality-code">{issue.code}</span>
-    <CopyIssueButton text={[label, `${detail}${source}`, suggestion, issue.code].filter(Boolean).join("\n")} t={t} />
+    <div className="issue-actions">
+      <span className="issue-quality-code">{issue.code}</span>
+      <CopyIssueButton text={[label, `${detail}${source}`, suggestion, issue.code].filter(Boolean).join("\n")} t={t} />
+      {onLocate && (issue.shotId || issue.layerKey) && <button type="button" className="issue-fix locate" title={locale === "zh" ? "定位修改位置" : "Locate edit target"} onClick={() => onLocate({ shotId: issue.shotId, layerKey: issue.layerKey })}><LocateFixed size={11} /> {locale === "zh" ? "定位" : "Locate"}</button>}
+      {onAiAdvice && <button className="issue-fix ai" title={t.aiFixLabel} onClick={() => onAiAdvice(issue)}><Sparkles size={11} /> AI</button>}
+    </div>
   </div>;
 }
 
-function IssueRow({ issue, t, locale, onFix, onAiAdvice }: { issue: ContinuityIssueV2; t: CopyZh; locale: Locale; onFix(issue: ContinuityIssueV2): void; onAiAdvice?(issue: ContinuityIssueV2): void }) {
+function IssueRow({ issue, t, locale, onFix, onAiAdvice, onLocate }: { issue: ContinuityIssueV2; t: CopyZh; locale: Locale; onFix(issue: ContinuityIssueV2): void; onAiAdvice?: ContinuityPanelProps["onAiAdvice"]; onLocate?: ContinuityPanelProps["onLocate"] }) {
   const Icon = issue.severity === "error" ? XCircle : issue.severity === "warning" ? CircleAlert : Info;
   const label = locale === "zh" ? (issueLabels.zh[issue.code] ?? issue.label) : issue.label;
   const detail = locale === "zh" ? (issue.detailZh ?? issue.detail) : issue.detail;
@@ -81,9 +87,13 @@ function IssueRow({ issue, t, locale, onFix, onAiAdvice }: { issue: ContinuityIs
       <span className="issue-label">{label}</span>
       <span className="issue-detail">{detail}</span>
     </div>
-    <CopyIssueButton text={[label, detail, issue.code].filter(Boolean).join("\n")} t={t} />
-    {onAiAdvice && <button className="issue-fix ai" title={t.aiFixLabel} onClick={() => onAiAdvice(issue)}><Sparkles size={11} /> AI</button>}
-    {issue.fixLabel && <button className="issue-fix" onClick={() => onFix(issue)}><Wrench size={11} /> {t.fix}</button>}
+    <div className="issue-actions">
+      <span className="issue-quality-code">{issue.code}</span>
+      <CopyIssueButton text={[label, detail, issue.code].filter(Boolean).join("\n")} t={t} />
+      {onLocate && issue.entityId && <button type="button" className="issue-fix locate" title={locale === "zh" ? "定位修改位置" : "Locate edit target"} onClick={() => onLocate({ shotId: issue.entityId })}><LocateFixed size={11} /> {locale === "zh" ? "定位" : "Locate"}</button>}
+      {onAiAdvice && <button className="issue-fix ai" title={t.aiFixLabel} onClick={() => onAiAdvice(issue)}><Sparkles size={11} /> AI</button>}
+      {issue.fixLabel && <button className="issue-fix" onClick={() => onFix(issue)}><Wrench size={11} /> {t.fix}</button>}
+    </div>
   </div>;
 }
 

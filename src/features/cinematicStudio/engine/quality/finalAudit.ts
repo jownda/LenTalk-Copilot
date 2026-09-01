@@ -9,6 +9,7 @@ export interface FinalPromptAuditIssue {
     | "FINAL.WINDOW_LIGHT_FACT_CONFLICT"
     | "FINAL.OPTICS_TERMS_NORMALIZED"
     | "FINAL.ABSTRACT_PERFORMANCE"
+    | "FINAL.BEAT_TIME_OUT_OF_RANGE"
     | "FINAL.SPEAKER_VOICE_LOCK_MISSING"
     | "FINAL.FIRST_FRAME_MISSING"
     | "FINAL.ACTION_BEATS_MISSING"
@@ -263,12 +264,12 @@ export function auditFinalPrompt(scene: SceneV2): FinalPromptAuditResult {
       });
     }
     const sentenceCount = countSceneContextSentences(sceneContext);
-    if (sentenceCount > 3) {
+    if (sentenceCount > 2) {
       issues.push({
         code: "FINAL.SCENE_CONTEXT_TOO_LONG",
         severity: "warning",
-        detail: `Scene context uses ${sentenceCount} sentences. Keep it to 3 sentences; short clips should fit in 1-2.`,
-        detailZh: `场景上下文有 ${sentenceCount} 个句子，超过 3 句上限；15 秒内的短片段请尽量压到 1–2 句。`,
+        detail: `Scene context uses ${sentenceCount} sentences. Keep it to 1-2 short sentences.`,
+        detailZh: `场景上下文有 ${sentenceCount} 个句子，请压缩为 1–2 句简短句子。`,
         field: "staging",
         action: "review-staging",
       });
@@ -353,6 +354,26 @@ export function auditFinalPrompt(scene: SceneV2): FinalPromptAuditResult {
   }
 
   for (const shot of scene.shots ?? []) {
+    const shotTime = shotTimes.get(shot.id);
+    if (shotTime) {
+      for (const beat of shot.beats ?? []) {
+        if (typeof beat.startSeconds !== "number" || !Number.isFinite(beat.startSeconds)) continue;
+        const duration = typeof beat.duration === "number" && Number.isFinite(beat.duration) && beat.duration > 0
+          ? beat.duration
+          : 0;
+        const beatEnd = beat.startSeconds + duration;
+        if (beat.startSeconds >= shotTime.startSeconds && (!duration || beatEnd <= shotTime.endSeconds)) continue;
+        issues.push({
+          code: "FINAL.BEAT_TIME_OUT_OF_RANGE",
+          severity: "error",
+          detail: `Beat ${beat.order} in shot ${shot.label} is timed at ${beat.startSeconds}s${duration ? `–${beatEnd}s` : ""}, outside the shot window ${shotTime.startSeconds}s–${shotTime.endSeconds}s.`,
+          detailZh: `镜头「${shot.label}」的第 ${beat.order} 个节拍时间为 ${beat.startSeconds} 秒${duration ? `–${beatEnd} 秒` : ""}，超出镜头时间范围 ${shotTime.startSeconds}–${shotTime.endSeconds} 秒；请调整镜头时长或节拍时间。`,
+          shotId: shot.id,
+          field: "action",
+          action: "review-action",
+        });
+      }
+    }
     const fov = shot.optics?.fieldOfViewDegrees;
     for (const outcome of shot.optics?.lensOutcome ?? []) {
       const normalized = normalizeOpticsText(outcome, fov);

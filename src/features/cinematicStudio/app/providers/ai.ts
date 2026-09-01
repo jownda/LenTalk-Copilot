@@ -3,33 +3,58 @@
  * 配置了 API Key 时使用远程 OpenAI 兼容 Chat Completions（OpenAI / DeepSeek / Kimi / 通义 / 智谱 / 自定义），
  * 未配置或请求失败时自动回退本地模板建议。
  */
-import { buildDirectorDocumentLayers, compileDirectorSequence, DIRECTOR_LAYERS, DIRECTOR_LAYER_ORDER, LocalSuggestionProvider, SHOT_TEMPLATES, localizedStyleBrief } from "../../engine";
-import type { AIAssistant, AssetSuggestion, BeatSuggestion, FixSuggestion, SceneSuggestion } from "../../engine";
+import { buildDirectorDocumentLayers, compileDirectorSequence, DIRECTOR_LAYERS, DIRECTOR_LAYER_ORDER, isSceneContextUsable, LocalSuggestionProvider, SHOT_TEMPLATES, localizedStyleBrief } from "../../engine";
+import type { AIAssistant, AssetSuggestion, BeatSuggestion, ContinuityRepairIssue, ContinuityRepairPatch, FixSuggestion, SceneSuggestion } from "../../engine";
 import { buildSceneAssetRegistry } from "../../engine/compiler/renderer";
 import { fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, lensById } from "../../engine/presets";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
-import { auditFinalPrompt, validateDirectorLayers, type DirectorLayerIssue } from "../../engine/quality";
+import { listen } from "@tauri-apps/api/event";
+import { auditFinalPrompt, validateDirectorLayers } from "../../engine/quality";
 import type {
-  ActingObjective, ActionBeat, Asset, AssetActingProfile, AssetKind, AudioPlan, CameraBehavior, CameraMovement, ContinuityIssueV2, CutStyle,
-  FirstFrameLock, LightingDirection, LockLevel, Optics, PhysicsAnchor, ProjectV2, SceneV2, ShotParticipant, ShotV2,
+  ActingObjective, ActionBeat, Asset, AssetActingProfile, AssetKind, AudioPlan, CameraBehavior, CameraMovement, CutStyle,
+  LightingDirection, LockLevel, Optics, PhysicsAnchor, ProjectV2, SceneV2, ShotParticipant, ShotV2,
 } from "../../shared-types";
 import { isRemoteConfigured, loadAISettings, normalizeBaseUrl, openAICompatibleBaseUrl, type AISettings } from "./aiSettings";
 import type { Locale } from "../i18n";
 
 const localProvider = new LocalSuggestionProvider();
 
-/** AI 分镜返回结构：FOV 为唯一镜头语言，音频计划只读且不在 AI 返回范围内。 */
-const LEGACY_SCENE_DRAFT_JSON_SCHEMA = `{ "sceneName": string, "sceneContext": string, "directorLayers": { "sceneContext": string | null, "activeReferences": string | null, "locationMap": string | null, "firstFrame": string | null, "formatMode": string | null, "optics": string | null, "camera": string | null, "actionTiming": string | null, "physics": string | null, "lighting": string | null, "audio": string | null, "style": string | null, "positiveConstraints": string | null, "negativeLocks": string | null }, "emotionArc": string, "actingObjectives": [ { "characterId": string, "objective": string, "superObjective": string | null, "obstacle": string | null, "stakes": string | null } ], "firstFrameLock": { "requiredSubjectIds": string[], "occupancyStatement": string | null }, "lightingDirection": { "primarySource": string | null, "direction": string | null, "exposurePriority": string | null, "allowHighlights": string[], "forbid": string[] }, "negativePrompt": string, "shots": [ { "time": { "startSeconds": number, "endSeconds": number }, "label": string, "framing": string, "lensModel": string | null, "camera": string | null, "optics": { "lensCharacter": "47-standard" | "84-wide" | "107-ultrawide" | "29-short-tele" | "18-tele" | "8-supertele" | "135-immersive" | null, "fieldOfViewDegrees": number | null, "lensOutcome": string[] | null, "antiDriftLock": string | null }, "cameraBehavior": { "height": string | null, "distance": string | null, "angle": string | null, "side": string | null, "subjectSize": string | null, "screenPlacement": string | null, "focusBehavior": string | null, "depthOfField": string | null, "handheldQuality": string | null }, "physicsAnchors": [ { "kind": "walk" | "run" | "weapon" | "liquid" | "particle", "detail": string | null } ], "movement": string, "action": string, "acting": string, "performanceLevel": number, "eyeLife": string, "direction": "left-to-right" | "right-to-left", "cutStyle": "hard-cut" | "overlap" | "match-cut", "participants": [ { "characterId": string, "role": "primary" | "supporting" | "target" | "background", "position": string | null, "entrance": "already-in-frame" | "enters-left" | "enters-right" | null, "facing": string | null, "eyeline": string | null, "torsoFacing": string | null, "anchorDistance": string | null, "acting": string | null, "eyeLife": string | null } ], "beats": [ { "order": number, "duration": number, "verb": string, "actorId": string | null, "targetCharacterId": string | null, "targetPropId": string | null, "targetBodyPart": string | null, "actionText": string | null, "dialogue": string | null, "tactic": string | null, "subtext": string | null, "beatChange": string | null, "reactionBeforeLine": string | null, "required": boolean, "forbiddenTargets": string[], "stateBefore": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "stateAfter": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "cutRule": string | null, "note": string | null } ], "propStatesAtStart": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "propStatesAtEnd": [ { "propId": string, "state": string, "holderCharacterId": string | null, "position": string | null } ], "note": string | null } ] }`;
 
-/** 新版 AI 分镜 schema：不再要求任何开始/结束或节拍前后状态字段。 */
-export const SCENE_DRAFT_JSON_SCHEMA = LEGACY_SCENE_DRAFT_JSON_SCHEMA
-  .replace(/, "actionTiming": string \| null/, "")
-  .replace(/, "stateBefore": \[ \{ "propId": string, "state": string, "holderCharacterId": string \| null, "position": string \| null \} \], "stateAfter": \[ \{ "propId": string, "state": string, "holderCharacterId": string \| null, "position": string \| null \} \]/g, "")
-  .replace(/, "propStatesAtStart": \[ \{ "propId": string, "state": string, "holderCharacterId": string \| null, "position": string \| null \} \], "propStatesAtEnd": \[ \{ "propId": string, "state": string, "holderCharacterId": string \| null, "position": string \| null \} \]/g, "");
+/** AI 编译 schema：只要求镜头执行结构和少量宏观决策。 */
+export const SCENE_DRAFT_JSON_SCHEMA = `{
+  "shots": [
+    {
+      "time": { "startSeconds": number, "endSeconds": number },
+      "label": string,
+      "framing": string,
+      "lensModel": string | null,
+      "camera": string | null,
+      "optics": { "lensCharacter": "180-panoramic" | "135-immersive" | "107-ultrawide" | "84-wide" | "63-moderate-wide" | "47-standard" | "29-short-tele" | "18-tele" | "12-long-tele" | "8-supertele" | null, "fieldOfViewDegrees": number | null, "lensOutcome": string[] | null, "antiDriftLock": string | null },
+      "cameraBehavior": { "height": string | null, "distance": string | null, "angle": string | null, "side": string | null, "subjectSize": string | null, "screenPlacement": string | null, "focusBehavior": string | null, "depthOfField": string | null, "handheldQuality": string | null },
+      "physicsAnchors": [ { "kind": "walk" | "run" | "weapon" | "liquid" | "particle", "detail": string | null } ],
+      "movement": string,
+      "action": string,
+      "acting": string,
+      "performanceLevel": number,
+      "eyeLife": string,
+      "direction": "left-to-right" | "right-to-left",
+      "cutStyle": "hard-cut" | "overlap" | "match-cut",
+      "participants": [ { "characterId": string, "role": "primary" | "supporting" | "target" | "background", "position": string | null, "entrance": "already-in-frame" | "enters-left" | "enters-right" | null, "facing": string | null, "eyeline": string | null, "torsoFacing": string | null, "anchorDistance": string | null, "acting": string | null, "eyeLife": string | null } ],
+      "beats": [ { "order": number, "startSeconds": number | null, "duration": number, "verb": string, "actorId": string | null, "targetCharacterId": string | null, "targetPropId": string | null, "targetBodyPart": string | null, "actionText": string | null, "dialogue": string | null, "propState": string | null, "audio": string | null, "tactic": string | null, "subtext": string | null, "beatChange": string | null, "reactionBeforeLine": string | null, "required": boolean, "forbiddenTargets": string[], "cutRule": string | null, "note": string | null } ],
+      "propChangeDescription": string | null,
+      "note": string | null
+    }
+  ],
+  "macro": {
+    "emotionArc": string | null,
+    "lightingDirection": { "primarySource": string | null, "direction": string | null, "exposurePriority": string | null, "allowHighlights": string[], "forbid": string[] } | null
+  }
+}`;
 
 export const CLEAN_SCENE_DRAFT_PROMPT_SCHEMA = SCENE_DRAFT_JSON_SCHEMA;
 
-export type SceneCompileProgress = "idle" | "preparing" | "waiting" | "resuming" | "parsing" | "validating";
+export type SceneCompileProgress = "idle" | "preparing" | "waiting" | "streaming" | "resuming" | "parsing" | "validating";
+export type SceneCompileProgressListener = (stage: SceneCompileProgress, receivedChars?: number) => void;
 
 /**
  * 长提示词生成允许模型持续返回较长时间。这个值只限制本地客户端等待，
@@ -44,7 +69,21 @@ interface AIModelProxyPayload {
   body?: string;
 }
 
-/** 流式响应在生成中断时携带已经收到的内容，供同一请求续写一次。 */
+interface ProviderStreamEvent {
+  kind: "start" | "chunk" | "done" | "error";
+  status?: number;
+  chunk_base64?: string;
+  message?: string;
+}
+
+function decodeBase64Chunk(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+/** 流式响应在生成中断时携带已经收到的内容，供用户反复续写直到完成。 */
 export class ChatCompletionInterruptedError extends Error {
   readonly partialText: string;
   readonly resume?: () => Promise<unknown>;
@@ -80,6 +119,87 @@ async function remoteFetch(url: string, init: RequestInit = {}): Promise<Respons
     } else if (init.headers) {
       Object.assign(headers, init.headers);
     }
+
+    const streamRequested = !!body && typeof body === "object" && (body as { stream?: unknown }).stream === true;
+    if (streamRequested) {
+      const eventName = `ai-provider-stream-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
+      let unlisten: (() => void) | undefined;
+      let started = false;
+      let settled = false;
+      let resolveStart: (status: number) => void = () => undefined;
+      let rejectStart: (error: Error) => void = () => undefined;
+      const startPromise = new Promise<number>((resolve, reject) => {
+        resolveStart = resolve;
+        rejectStart = reject;
+      });
+      const cleanup = () => {
+        unlisten?.();
+        unlisten = undefined;
+      };
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controllerRef = controller;
+        },
+        cancel() {
+          cleanup();
+        },
+      });
+
+      try {
+        unlisten = await listen<ProviderStreamEvent>(eventName, (event) => {
+          const payload = event.payload;
+          if (payload.kind === "start") {
+            started = true;
+            resolveStart(payload.status ?? 200);
+            return;
+          }
+          if (payload.kind === "chunk" && payload.chunk_base64 && !settled) {
+            controllerRef?.enqueue(decodeBase64Chunk(payload.chunk_base64));
+            return;
+          }
+          if (payload.kind === "error") {
+            const error = new Error(payload.message || "Provider stream failed");
+            settled = true;
+            if (!started) rejectStart(error);
+            else controllerRef?.error(error);
+            cleanup();
+            return;
+          }
+          if (payload.kind === "done") {
+            settled = true;
+            if (!started) resolveStart(payload.status ?? 200);
+            controllerRef?.close();
+            cleanup();
+          }
+        });
+
+        void invoke<void>("request_provider_stream", {
+          url,
+          method: init.method ?? "GET",
+          headers,
+          body,
+          eventName,
+        }).catch((error: unknown) => {
+          const requestError = error instanceof Error ? error : new Error(String(error));
+          settled = true;
+          if (!started) rejectStart(requestError);
+          else controllerRef?.error(requestError);
+          cleanup();
+        });
+
+        const status = await startPromise;
+        return new Response(stream, {
+          status,
+          statusText: status >= 200 && status < 300 ? "OK" : "Error",
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      } catch (error) {
+        cleanup();
+        throw error;
+      }
+    }
+
     // Do not fall through to fetch after a native request error: the provider
     // may already have accepted the billable request.
     const result = await invoke<{ status: number; body: string }>("request_provider_json", {
@@ -166,13 +286,16 @@ function extractJSON<T>(text: string): T {
 }
 
 /** 从 OpenAI 兼容的普通 JSON 或 SSE 流中提取模型文本。 */
-export async function readChatCompletionText(response: Response): Promise<string> {
+export async function readChatCompletionText(response: Response, onChunk?: (receivedChars: number) => void): Promise<string> {
   const extractContent = (value: unknown): string => {
     if (!value || typeof value !== "object") return "";
     const choice = (value as { choices?: unknown[] }).choices?.[0];
     if (!choice || typeof choice !== "object") return "";
-    const item = choice as { delta?: { content?: unknown }; message?: { content?: unknown } };
-    const content = item.delta?.content ?? item.message?.content;
+    const item = choice as { delta?: { content?: unknown }; message?: { content?: unknown }; text?: unknown };
+    // `text` is used by a few OpenAI-compatible gateways even when the
+    // endpoint is named /chat/completions. Keep it as a compatibility fallback
+    // without exposing reasoning-only fields to the prompt.
+    const content = item.delta?.content ?? item.message?.content ?? item.text;
     if (typeof content === "string") return content;
     if (Array.isArray(content)) {
       return content.map((part) => {
@@ -205,6 +328,7 @@ export async function readChatCompletionText(response: Response): Promise<string
     try {
       const data = JSON.parse(payload) as { choices?: { finish_reason?: unknown }[] };
       content += extractContent(data);
+      if (content) onChunk?.(content.length);
       if (data.choices?.[0]?.finish_reason) completed = true;
     } catch {
       // Keep the complete body for the ordinary JSON fallback below.
@@ -218,6 +342,13 @@ export async function readChatCompletionText(response: Response): Promise<string
       const lines = pending.split(/\r?\n/);
       pending = lines.pop() ?? "";
       lines.forEach(consumeLine);
+      // Some gateways send [DONE] and keep the HTTP connection alive with
+      // heartbeat bytes. The model response is complete at this marker; do
+      // not wait for the gateway to close the socket.
+      if (completed) {
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
       if (chunk.done) break;
     }
   } catch (error) {
@@ -226,6 +357,10 @@ export async function readChatCompletionText(response: Response): Promise<string
   }
   if (pending) consumeLine(pending);
   if (sawStreamEvent && !completed) {
+    // Without [DONE] we cannot distinguish a gateway that omits the marker
+    // from a response truncated at EOF. Preserve the partial text so the
+    // caller can use the existing continuation flow instead of silently
+    // accepting an incomplete final prompt.
     if (content) throw new ChatCompletionInterruptedError(content);
     throw new Error("模型流式响应未正常结束");
   }
@@ -269,7 +404,7 @@ async function chatCompletionsJSON(
   system: string,
   user: string,
   imageUrls: string[] = [],
-  onProgress?: (stage: SceneCompileProgress) => void,
+  onProgress?: SceneCompileProgressListener,
   audioUrls: string[] = [],
 ): Promise<unknown> {
   const endpoint = `${openAICompatibleBaseUrl(settings.baseUrl)}/chat/completions`;
@@ -292,6 +427,8 @@ async function chatCompletionsJSON(
     temperature: settings.temperature ?? 0.4,
     messages: requestMessages,
     stream: streaming,
+    // 推理强度仅在选择 low/medium/high 时发送；默认不传，兼容非推理模型
+    ...(settings.reasoningEffort ? { reasoning_effort: settings.reasoningEffort } : {}),
     ...(withJsonMode ? { response_format: { type: "json_object" as const } } : {}),
   });
   const request = (withJsonMode: boolean, streaming = true, requestMessages: unknown[] = messages) => remoteFetch(endpoint, {
@@ -328,15 +465,29 @@ async function chatCompletionsJSON(
     throw new Error(`HTTP ${response.status}${raw ? `：${raw.slice(0, 260)}` : ""}`);
   }
   try {
-    const content = await readChatCompletionText(response);
+    const content = await readChatCompletionText(response, (receivedChars) => onProgress?.("streaming", receivedChars));
     if (!content) throw new Error("响应中没有文本内容");
     onProgress?.("parsing");
-    return extractJSON(content);
+    try {
+      return extractJSON(content);
+    } catch (error) {
+      // A gateway can close after sending a syntactically incomplete JSON
+      // document. Keep it resumable instead of exposing a bare JSON.parse
+      // error and losing the already received storyboard.
+      const detail = error instanceof Error ? error.message : "JSON 解析失败";
+      throw new ChatCompletionInterruptedError(content, undefined, `JSON 解析失败，已收到 ${content.length} 个字符：${detail}`);
+    }
   } catch (error) {
     if (!(error instanceof ChatCompletionInterruptedError) || !error.partialText.trim()) throw error;
     const continueFrom = async (partialText: string): Promise<unknown> => {
       onProgress?.("resuming");
-      const resumedResponse = await request(true, true, continuationMessages(messages, partialText));
+      let resumedResponse: Response;
+      try {
+        resumedResponse = await request(true, true, continuationMessages(messages, partialText));
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText), `续写请求失败，已保留 ${partialText.length} 个字符：${detail}`);
+      }
       if (!resumedResponse.ok) {
         const raw = await resumedResponse.text().catch(() => "");
         throw new ChatCompletionInterruptedError(
@@ -347,7 +498,7 @@ async function chatCompletionsJSON(
       }
       let resumed: string;
       try {
-        resumed = await readChatCompletionText(resumedResponse);
+        resumed = await readChatCompletionText(resumedResponse, (receivedChars) => onProgress?.("resuming", partialText.length + receivedChars));
       } catch (resumeError) {
         if (resumeError instanceof ChatCompletionInterruptedError) {
           const merged = mergeContinuationText(partialText, resumeError.partialText);
@@ -355,7 +506,13 @@ async function chatCompletionsJSON(
         }
         throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText));
       }
-      return extractJSON(mergeContinuationText(partialText, resumed));
+      const merged = mergeContinuationText(partialText, resumed);
+      try {
+        return extractJSON(merged);
+      } catch (parseError) {
+        const detail = parseError instanceof Error ? parseError.message : "JSON 解析失败";
+        throw new ChatCompletionInterruptedError(merged, () => continueFrom(merged), `JSON 解析仍未完成，已收到 ${merged.length} 个字符：${detail}`);
+      }
     };
     return continueFrom(error.partialText);
   }
@@ -407,7 +564,7 @@ async function audioSourceToInputPart(source: string): Promise<AudioInputPart> {
 }
 
 /** Final delivery is prose, so it deliberately skips JSON mode and returns only the model text. */
-async function chatCompletionsText(settings: AISettings, system: string, user: string, onProgress?: (stage: SceneCompileProgress) => void): Promise<string> {
+async function chatCompletionsText(settings: AISettings, system: string, user: string, onProgress?: SceneCompileProgressListener, sourcePrompt = "", locale: Locale = "zh"): Promise<string> {
   const endpoint = `${openAICompatibleBaseUrl(settings.baseUrl)}/chat/completions`;
   const baseMessages = [{ role: "system", content: system }, { role: "user", content: user }];
   const request = (streaming: boolean, messages: unknown[] = baseMessages) => remoteFetch(endpoint, {
@@ -420,6 +577,7 @@ async function chatCompletionsText(settings: AISettings, system: string, user: s
       model: settings.model.trim(),
       temperature: settings.temperature ?? 0.4,
       stream: streaming,
+      ...(settings.reasoningEffort ? { reasoning_effort: settings.reasoningEffort } : {}),
       messages,
     }),
   });
@@ -436,15 +594,21 @@ async function chatCompletionsText(settings: AISettings, system: string, user: s
     throw new Error(`HTTP ${response.status}${raw ? `：${raw.slice(0, 260)}` : ""}`);
   }
   try {
-    const content = (await readChatCompletionText(response)).trim();
+    const content = (await readChatCompletionText(response, (receivedChars) => onProgress?.("streaming", receivedChars))).trim();
     if (!content) throw new Error("响应中没有最终提示词文本");
     onProgress?.("parsing");
-    return sanitizeFinalPromptResponse(content);
+    return sanitizeFinalPromptResponse(content, sourcePrompt, locale);
   } catch (error) {
     if (!(error instanceof ChatCompletionInterruptedError) || !error.partialText.trim()) throw error;
     const continueFrom = async (partialText: string): Promise<string> => {
       onProgress?.("resuming");
-      const resumedResponse = await request(true, continuationMessages(baseMessages, partialText));
+      let resumedResponse: Response;
+      try {
+        resumedResponse = await request(true, continuationMessages(baseMessages, partialText));
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText), `续写请求失败，已保留 ${partialText.length} 个字符：${detail}`);
+      }
       if (!resumedResponse.ok) {
         const raw = await resumedResponse.text().catch(() => "");
         throw new ChatCompletionInterruptedError(
@@ -455,7 +619,7 @@ async function chatCompletionsText(settings: AISettings, system: string, user: s
       }
       let resumed: string;
       try {
-        resumed = await readChatCompletionText(resumedResponse);
+        resumed = await readChatCompletionText(resumedResponse, (receivedChars) => onProgress?.("resuming", partialText.length + receivedChars));
       } catch (resumeError) {
         if (resumeError instanceof ChatCompletionInterruptedError) {
           const merged = mergeContinuationText(partialText, resumeError.partialText);
@@ -464,14 +628,110 @@ async function chatCompletionsText(settings: AISettings, system: string, user: s
         throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText));
       }
       onProgress?.("parsing");
-      return sanitizeFinalPromptResponse(mergeContinuationText(partialText, resumed).trim());
+      return sanitizeFinalPromptResponse(mergeContinuationText(partialText, resumed).trim(), sourcePrompt, locale);
     };
     return continueFrom(error.partialText);
   }
 }
 
 /** Remove hidden reasoning emitted by models before the text reaches the prompt editor. */
-export function sanitizeFinalPromptResponse(text: string): string {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function promptClockToSeconds(value: string): number | undefined {
+  const match = /^(\d+):(\d+(?:\.\d+)?)$/.exec(value.trim());
+  if (!match) return undefined;
+  const seconds = Number(match[2]);
+  return Number.isFinite(seconds) ? Number(match[1]) * 60 + seconds : undefined;
+}
+
+interface CanonicalShotRange {
+  number: number;
+  start: number;
+  end: number;
+  startLabel: string;
+  endLabel: string;
+}
+
+function canonicalShotRanges(sourcePrompt: string): CanonicalShotRange[] {
+  const actionSource = extractPromptSection(sourcePrompt, sourcePrompt.includes("镜头执行：") ? "镜头执行" : "SHOT EXECUTION");
+  const ranges: CanonicalShotRange[] = [];
+  const pattern = /(?:^|\n)(?:SHOT\s+(\d+)|(镜头\s*)(\d+))\s+(\d+:\d+(?:\.\d+)?)[-–](\d+:\d+(?:\.\d+)?)[：:]/g;
+  for (const match of actionSource.matchAll(pattern)) {
+    const start = promptClockToSeconds(match[4]);
+    const end = promptClockToSeconds(match[5]);
+    if (start == null || end == null) continue;
+    ranges.push({ number: Number(match[1] ?? match[3]), start, end, startLabel: match[4], endLabel: match[5] });
+  }
+  return ranges;
+}
+
+/** 最终模型偶尔会把分镜时间块压成平面时间线；按 canonical 镜头边界补回分段。 */
+function restoreActionTimingSegments(text: string, sourcePrompt: string, locale: Locale): string {
+  const ranges = canonicalShotRanges(sourcePrompt);
+  if (ranges.length < 2) return text;
+  const headingMatch = /(^|\n)(ACTION TIMING|动作节奏)\s*[:：]\s*\n/i.exec(text);
+  if (!headingMatch) return text;
+  const bodyStart = headingMatch.index + headingMatch[0].length;
+  const nextHeading = /\n\n(?:场景上下文|活动引用|场景地图|首帧与空间走位|格式模式|光学|摄像机|动作节奏|物理|光线|音频|风格|正向约束|负向约束|SCENE CONTEXT|ACTIVE REFERENCES|LOCATION MAP|FIRST FRAME AND SPATIAL BLOCKING|FORMAT MODE|OPTICS|CAMERA|ACTION TIMING|PHYSICS|LIGHTING|AUDIO|STYLE|POSITIVE CONSTRAINTS|NEGATIVE CONSTRAINTS)\s*[:：]\s*\n/igu;
+  nextHeading.lastIndex = bodyStart;
+  const nextMatch = nextHeading.exec(text);
+  const bodyEnd = nextMatch?.index ?? text.length;
+  const body = text.slice(bodyStart, bodyEnd);
+  const hasAllSegmentHeadings = ranges.every((range) => new RegExp(
+    locale === "zh" ? `第\\s*${range.number}\\s*段(?:\\s*[（(：:]|\\s*$)` : `SHOT\\s+${range.number}\\b`,
+    "i",
+  ).test(body));
+  if (hasAllSegmentHeadings) return text;
+
+  const lines = body.split("\n");
+  const output: string[] = [];
+  let lastRange = -1;
+  for (const line of lines) {
+    const existingHeading = locale === "zh"
+      ? /^\s*第\s*(\d+)\s*段(?=\s|[（(：:]|$)/.exec(line)
+      : /^\s*SHOT\s+(\d+)\b/i.exec(line);
+    if (existingHeading) {
+      const existingIndex = ranges.findIndex((range) => range.number === Number(existingHeading[1]));
+      if (existingIndex >= 0) lastRange = existingIndex;
+      output.push(line);
+      continue;
+    }
+    const timeMatch = /^\s*(\d+:\d+(?:\.\d+)?)[–-](\d+:\d+(?:\.\d+)?)\s*[:：]/.exec(line);
+    if (timeMatch) {
+      const start = promptClockToSeconds(timeMatch[1]);
+      const rangeIndex = start == null ? -1 : ranges.findIndex((range, index) => (
+        start >= range.start - 0.001
+        && (index === ranges.length - 1 ? start <= range.end + 0.001 : start < range.end - 0.001)
+      ));
+      if (rangeIndex >= 0 && rangeIndex !== lastRange) {
+        const range = ranges[rangeIndex];
+        output.push(locale === "zh"
+          ? `第 ${range.number} 段（${range.startLabel}–${range.endLabel}）：`
+          : `SHOT ${range.number} (${range.startLabel} to ${range.endLabel}):`);
+        lastRange = rangeIndex;
+      }
+    }
+    output.push(line);
+  }
+  return `${text.slice(0, bodyStart)}${output.join("\n")}${text.slice(bodyEnd)}`;
+}
+
+/** 将 canonical 活动引用中的图片标记同步到最终提示词的所有重复 @资产引用。 */
+function restoreAssetImageTokens(text: string, sourcePrompt: string): string {
+  const imageTokens = new Map<string, string>();
+  const pattern = /@([^\s\x5b\x5d：:，,；;。.!！？?（）()]+)\s+\[image(\d+)\]/g;
+  for (const match of sourcePrompt.matchAll(pattern)) imageTokens.set(match[1], `[image${match[2]}]`);
+  let result = text;
+  for (const [tag, token] of imageTokens) {
+    const reference = new RegExp(`@${escapeRegExp(tag)}(?!\\s*\\[image\\d+\\])`, "g");
+    result = result.replace(reference, `@${tag} ${token}`);
+  }
+  return result;
+}
+
+export function sanitizeFinalPromptResponse(text: string, sourcePrompt = "", locale: Locale = "zh"): string {
   let cleaned = text.replace(/\r\n?/g, "\n");
   cleaned = cleaned.replace(/<(think|analysis|reasoning)\b[^>]*>[\s\S]*?<\/\1>/gi, "");
 
@@ -482,13 +742,15 @@ export function sanitizeFinalPromptResponse(text: string): string {
     cleaned = firstHeading >= 0 ? cleaned.slice(firstHeading).trim() : "";
   }
 
+  cleaned = restoreCanonicalSceneContext(cleaned, sourcePrompt, locale);
+  cleaned = restoreAssetImageTokens(restoreActionTimingSegments(cleaned, sourcePrompt, locale), sourcePrompt);
   return cleaned
     .replace(/^\s*```(?:text|markdown)?\s*/i, "")
     .replace(/\s*```\s*$/, "")
     .trim();
 }
 
-async function chatJSON(settings: AISettings, system: string, user: string, onProgress?: (stage: SceneCompileProgress) => void): Promise<unknown> {
+async function chatJSON(settings: AISettings, system: string, user: string, onProgress?: SceneCompileProgressListener): Promise<unknown> {
   return chatCompletionsJSON(settings, system, user, [], onProgress);
 }
 
@@ -507,6 +769,81 @@ function asNumber(value: unknown, fallback: number): number {
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/** 解析 AI 修复补丁；只读取白名单字段，未知字段永不进入项目状态。 */
+export function normalizeContinuityRepairPatch(value: unknown): ContinuityRepairPatch | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const patch = (raw.patch && typeof raw.patch === "object" && !Array.isArray(raw.patch) ? raw.patch : raw) as Record<string, unknown>;
+  const result: ContinuityRepairPatch = {};
+  const rawScene = patch.sceneUpdates;
+  if (rawScene && typeof rawScene === "object" && !Array.isArray(rawScene)) {
+    const scene = rawScene as Record<string, unknown>;
+    const sceneUpdates: NonNullable<ContinuityRepairPatch["sceneUpdates"]> = {};
+    if (typeof scene.environmentLock === "boolean") sceneUpdates.environmentLock = scene.environmentLock;
+    if (typeof scene.weather === "string") sceneUpdates.weather = scene.weather.trim();
+    if (typeof scene.negativePrompt === "string") sceneUpdates.negativePrompt = scene.negativePrompt.trim();
+    if (scene.audioPlan && typeof scene.audioPlan === "object" && !Array.isArray(scene.audioPlan)) {
+      const audio = scene.audioPlan as Record<string, unknown>;
+      sceneUpdates.audioPlan = {
+        ...(Array.isArray(audio.diegeticMusic) ? { diegeticMusic: asStringArray(audio.diegeticMusic) } : {}),
+        ...(Array.isArray(audio.sfx) ? { sfx: asStringArray(audio.sfx) } : {}),
+        ...(audio.score === "none" || audio.score === "original-score" ? { score: audio.score } : {}),
+        ...(typeof audio.subtitles === "boolean" ? { subtitles: audio.subtitles } : {}),
+      };
+    }
+    if (Object.keys(sceneUpdates).length > 0) result.sceneUpdates = sceneUpdates;
+  }
+  if (Array.isArray(patch.shotUpdates)) {
+    type RepairShotUpdate = NonNullable<ContinuityRepairPatch["shotUpdates"]>[number];
+    const shotUpdates: RepairShotUpdate[] = patch.shotUpdates.flatMap((item): RepairShotUpdate[] => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const rawShot = item as Record<string, unknown>;
+      if (typeof rawShot.shotId !== "string" || !rawShot.shotId.trim()) return [];
+      const next: NonNullable<ContinuityRepairPatch["shotUpdates"]>[number] = { shotId: rawShot.shotId.trim() };
+      if (Array.isArray(rawShot.participantUpdates)) {
+        next.participantUpdates = rawShot.participantUpdates.flatMap((participant) => {
+          if (!participant || typeof participant !== "object" || Array.isArray(participant)) return [];
+          const rawParticipant = participant as Record<string, unknown>;
+          if (typeof rawParticipant.characterId !== "string" || !rawParticipant.characterId.trim()) return [];
+          const update: NonNullable<NonNullable<ContinuityRepairPatch["shotUpdates"]>[number]["participantUpdates"]>[number] = { characterId: rawParticipant.characterId.trim() };
+          for (const key of ["position", "facing", "eyeline"] as const) {
+            if (typeof rawParticipant[key] === "string") update[key] = rawParticipant[key].trim();
+          }
+          if (rawParticipant.entrance === "already-in-frame" || rawParticipant.entrance === "enters-left" || rawParticipant.entrance === "enters-right") update.entrance = rawParticipant.entrance;
+          return [update];
+        });
+      }
+      if (Array.isArray(rawShot.characterOrder)) next.characterOrder = asStringArray(rawShot.characterOrder);
+      if (typeof rawShot.intentionalAxisBreak === "boolean") next.intentionalAxisBreak = rawShot.intentionalAxisBreak;
+      if (rawShot.direction === "left-to-right" || rawShot.direction === "right-to-left") next.direction = rawShot.direction;
+      return [next];
+    }) ?? [];
+    if (shotUpdates.length > 0) result.shotUpdates = shotUpdates;
+  }
+  if (Array.isArray(patch.beatUpdates)) {
+    const beatUpdates = patch.beatUpdates.flatMap((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const rawBeat = item as Record<string, unknown>;
+      if (typeof rawBeat.shotId !== "string" || typeof rawBeat.beatId !== "string") return [];
+      const update: NonNullable<ContinuityRepairPatch["beatUpdates"]>[number] = { shotId: rawBeat.shotId.trim(), beatId: rawBeat.beatId.trim() };
+      if (typeof rawBeat.targetCharacterId === "string") update.targetCharacterId = rawBeat.targetCharacterId.trim();
+      if (typeof rawBeat.targetPropId === "string") update.targetPropId = rawBeat.targetPropId.trim();
+      return [update];
+    });
+    if (beatUpdates.length > 0) result.beatUpdates = beatUpdates;
+  }
+  if (Array.isArray(patch.directorLayerUpdates)) {
+    const directorLayerUpdates = patch.directorLayerUpdates.flatMap((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const rawLayer = item as Record<string, unknown>;
+      if ((rawLayer.layerKey !== "firstFrame" && rawLayer.layerKey !== "locationMap") || typeof rawLayer.text !== "string" || !rawLayer.text.trim()) return [];
+      return [{ layerKey: rawLayer.layerKey as "firstFrame" | "locationMap", text: rawLayer.text.trim() }];
+    });
+    if (directorLayerUpdates.length > 0) result.directorLayerUpdates = directorLayerUpdates;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 /** 生成稳定随机 id */
@@ -617,15 +954,20 @@ class RemoteAssistant implements AIAssistant {
     });
   }
 
-  async repairContinuity(input: { issue: ContinuityIssueV2; project: ProjectV2; scene: SceneV2; shot?: ShotV2 }): Promise<FixSuggestion> {
+  async repairContinuity(input: { issue: ContinuityRepairIssue; project: ProjectV2; scene: SceneV2; shot?: ShotV2 }): Promise<FixSuggestion> {
     return this.fallback(async () => {
       const data = await chatJSON(this.settings, JSON_SYSTEM, [
-        "Return a structured continuity fix. Schema:",
-        `{ "code": string, "label": string, "detail": string, "apply": string }`,
+        "Return one narrowly scoped continuity repair. Schema:",
+        `{ "code": string, "label": string, "detail": string, "apply": string, "patch": { "sceneUpdates"?: { "environmentLock"?: boolean, "weather"?: string, "negativePrompt"?: string, "audioPlan"?: { "diegeticMusic"?: string[], "sfx"?: string[], "score"?: "none" | "original-score", "subtitles"?: boolean } }, "shotUpdates"?: [{ "shotId": string, "participantUpdates"?: [{ "characterId": string, "position"?: string, "entrance"?: "already-in-frame" | "enters-left" | "enters-right", "facing"?: string, "eyeline"?: string }], "characterOrder"?: string[], "intentionalAxisBreak"?: boolean, "direction"?: "left-to-right" | "right-to-left" }], "beatUpdates"?: [{ "shotId": string, "beatId": string, "targetCharacterId"?: string, "targetPropId"?: string }], "directorLayerUpdates"?: [{ "layerKey": "firstFrame" | "locationMap", "text": string }] } | null }`,
         "",
         `Issue: ${JSON.stringify(input.issue)}`,
-        `Shot label: ${input.shot?.label ?? input.scene.name}`,
-        "Keep code identical to the issue code. apply must be a short actionable instruction for the user.",
+        `Scene: ${JSON.stringify({ id: input.scene.id, name: input.scene.name, shootingMode: input.scene.shootingMode, environmentLock: input.scene.environmentLock, weather: input.scene.weather, audioPlan: input.project.audioPlan, shots: input.scene.shots.map((candidate) => ({ id: candidate.id, label: candidate.label, direction: candidate.direction, participants: candidate.participants, layout: candidate.layout, beats: candidate.beats, action: candidate.action, note: candidate.note })) })}`,
+        `Assets: ${JSON.stringify((input.project.assets ?? []).map((asset) => ({ id: asset.id, name: asset.name, kind: asset.kind, referenceTag: asset.referenceTag })))}`,
+        `Relevant director layer: ${input.issue.layerKey ? JSON.stringify(input.scene.directorLayers?.[input.issue.layerKey] ?? "") : "none"}`,
+        `Shot label: ${input.shot?.label ?? input.scene.shots.find((candidate) => candidate.id === input.issue.shotId || candidate.id === input.issue.entityId)?.label ?? input.scene.name}`,
+        "Keep code identical to the issue code. Return patch=null when a safe local change cannot be determined.",
+        "The patch may touch only the fields shown in the schema, only the current scene, only existing shot/beat/character/prop IDs, and only firstFrame or locationMap text when the issue layerKey matches. Never add assets, characters, props, IDs, unrelated prose, or a whole-scene rewrite.",
+        "For a spatial conflict, prefer a precise participant position/entrance/order change. For a director-layer conflict, return only the corrected layer text and preserve all unrelated facts.",
       ].join("\n"));
       const obj = data as Record<string, unknown>;
       return {
@@ -633,6 +975,7 @@ class RemoteAssistant implements AIAssistant {
         label: asString(obj.label, input.issue.label ?? input.issue.code),
         detail: asString(obj.detail, "Review this continuity issue before export."),
         apply: asString(obj.apply, "Manually resolve the conflicting fields before export."),
+        patch: normalizeContinuityRepairPatch(obj.patch),
       };
     });
   }
@@ -1077,16 +1420,15 @@ export function collectSceneAssetIds(project: ProjectV2, scene: SceneV2): string
   return Array.from(new Set([...shotIds, ...stagingCharacterIds]));
 }
 
+
 /**
- * AI 智能分镜：读取场景卡片的内容（地点站位、前情续接、故事梗概、角色/道具资产），
- * 生成完整的剧情分镜（镜头列表 + 各镜头检查器内容），供审核与最终生成阶段使用。
+ * 导演分镜规划器：读取场景卡片和必要的资产摘要，只生成镜头执行结构。
+ * 导演文档由本地编译器预填，最终提示词由后续最终生成步骤组织。
  * @throws 未配置远程模型 / 请求失败
  */
-export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { seconds?: string; locale?: Locale; onProgress?: (stage: SceneCompileProgress) => void }): Promise<{
+export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { seconds?: string; locale?: Locale; onProgress?: SceneCompileProgressListener }): Promise<{
   scene: SceneV2;
-  negativePrompt?: string;
   directorLayers?: Record<string, string>;
-  directorLayerIssues?: DirectorLayerIssue[];
 }> {
   const settings = loadAISettings();
   if (!isRemoteConfigured(settings)) {
@@ -1110,13 +1452,28 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
   const durationLimit = Number(scene.duration.match(/(\d+(?:\.\d+)?)/)?.[1]) || 15;
   const isLongTake = scene.shootingMode !== "multi-shot";
 
+  const compact = (value: string, limit: number) => {
+    const text = value.replace(/\s+/g, " ").trim();
+    return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+  };
   const assetSummary = (ids: string[]): string => ids
     .map((id) => {
       const asset = byId.get(id);
       if (!asset) return "";
-      const desc = asset.description?.trim() || asset.descriptionZh?.trim() || asset.name;
-      const markers = [...(asset.uniqueMarkers ?? []), ...(asset.alwaysVisible ?? [])].join("; ");
-      return `${asset.name}(${id}) — ${desc}${markers ? `; markers: ${markers}` : ""}`;
+      const desc = compact(asset.description?.trim() || asset.descriptionZh?.trim() || asset.name, 180);
+      const markers = [...(asset.uniqueMarkers ?? []), ...(asset.alwaysVisible ?? [])].slice(0, 4).join("; ");
+      return `${asset.name}(${id}) — ${desc}${markers ? `; markers: ${compact(markers, 120)}` : ""}`;
+    })
+    .filter(Boolean)
+    .join(" | ");
+  const actingMasterSummary = characterIds
+    .map((id) => {
+      const asset = byId.get(id);
+      if (!asset) return "";
+      const master = locale === "zh"
+        ? (asset.actingProfile?.masterProfileZh?.trim() || asset.actingProfile?.masterProfile?.trim() || "")
+        : (asset.actingProfile?.masterProfile?.trim() || asset.actingProfile?.masterProfileZh?.trim() || "");
+      return master ? `${asset.name}(${id}) — ${compact(master, 520)}` : "";
     })
     .filter(Boolean)
     .join(" | ");
@@ -1139,57 +1496,58 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
   }
 
   const data = await chatJSON(settings, JSON_SYSTEM, [
-    "You are the AI storyboard planner of a cinematic AI video prompt studio.",
-    "Read the scene card content below and plan a complete, professional storyboard and director document for this scene: shot list, every shot's camera/performance/participants/beats, and the directorLayers object. Treat the style direction as one coherent visual system; do not scatter it into contradictory style labels.",
+    "You are the director storyboard planner of a cinematic AI video prompt studio.",
+    "Your primary job is to plan the shot execution structure. Return structured shots first, with shot-local participants and observable beats. Make only the small macro decisions explicitly allowed by the schema. Do not write a director document or a final prompt.",
     "",
     "SCENE CARD CONTENT:",
     `Logline (故事梗概): ${scene.logline?.trim() || "(empty)"}`,
     `Prior context (前情续接): ${scene.staging?.priorContext?.trim() || "(empty)"}`,
+    `Current location (当前场景地点，仅限本场景): ${scene.location?.trim() || "(empty)"}`,
+    `Current time (当前场景时间，仅限本场景): ${scene.time?.trim() || "(empty)"}`,
+    `Current weather (当前场景天气，仅限本场景): ${scene.weather?.trim() || "(empty)"}`,
+    `Current duration (当前场景时长): ${scene.duration?.trim() || "(empty)"}`,
     `Must happen (user reference only): ${JSON.stringify(scene.mustHappen ?? [])}`,
     `Forbid (user reference only): ${JSON.stringify(scene.forbid ?? [])}`,
     `Scene dialogue (user reference only): ${scene.dialogue?.trim() || "(empty)"}`,
     `Spatial anchor (空间锚点): ${scene.staging?.anchorDescription?.trim() || "(empty)"}`,
+    `Staging reference image (站位参考图): ${scene.staging?.stagingReferenceImage?.trim() ? "provided; use it only for character positions, screen axis, spacing, left-to-right order and spatial anchors" : "(none)"}`,
     `Character order (左到右站位, left-to-right): ${orderIds.length > 0 ? assetSummary(orderIds) : "(none/empty)"}`,
     `Performance objectives (表演目标, per character): ${JSON.stringify(scene.actingObjectives ?? [])}`,
     `Axis direction: ${scene.staging?.axisDirection ?? "left-to-right"}; Spacing: ${scene.staging?.spacing?.trim() || "(default)"}`,
-    `Scene emotion arc: ${scene.emotionArc?.trim() || "(not set)"}; Scene name: ${scene.name}`,
+    `Scene emotion arc: ${scene.emotionArc?.trim() || "(not set)"}`,
     `Style direction: ${styleBrief || "(not set)"}`,
     `User audio plan (AI reference only; do not return or overwrite the audio plan card, and do not copy it directly into the final prompt): ${JSON.stringify(project.audioPlan ?? { score: "none", subtitles: false })}`,
     "",
-    `LOCATION ASSET: ${locationAsset ? `${locationAsset.name}(${locationAsset.id}) — ${locationAsset.description?.trim() || locationAsset.descriptionZh?.trim() || ""}` : "(none)"}`,
+    `LOCATION ASSET: ${locationAsset ? `${locationAsset.name}(${locationAsset.id}) — ${compact(locationAsset.description?.trim() || locationAsset.descriptionZh?.trim() || "", 240)}` : "(none)"}`,
     `CHARACTER ASSETS (scene references only): ${assetSummary(characterIds) || "(none)"}`,
+    `CHARACTER ACTING MASTERS (AI-only reference; never output in ACTIVE REFERENCES): ${actingMasterSummary || "(none)"}`,
     `PROP ASSETS (scene references only): ${assetSummary(propIds) || "(none)"}`,
     `Existing beats may reference: ${allowedBeats.join(", ") || "(none)"}`,
     `Technical profile: ${JSON.stringify(project.technicalProfile ?? {})}`,
     "",
     "STORYBOARD RULES:",
-    "Scene context (first section of the final export): write 1-3 sentences in the user language about this clip only. Cover what is currently happening, who is in frame, where/when it takes place, and the total duration. Never quote prior context, story summary, user notes, AI instructions, warnings, or @ tags.",
-    "Director document: return every directorLayers key with concise scene-level direction in the scene language. Do not return actionTiming: all shot timing, actions, beats, and character acting belong exclusively in the shots array. These are editable planning layers, not the final prompt. Keep them consistent with the shots and do not include audit diagnostics or user-only planning text.",
-    "LOCATION MAP is a practical spatial-state map, not a mood paragraph. Write it with these labeled fields in this order: camera position; camera facing direction; foreground; midground; background; main landmark positions; character positions; movement path; lighting direction; depth relationships. Use concrete relative positions, distances, axes, entrances, exits, and front/mid/back depth when known. If a location reference exists, use it for geography, materials, atmosphere, landmarks, and relevant lighting direction only; do not blindly inherit its camera angle, framing, or composition unless explicitly requested. The scene character roster is only a spatial baseline: actual characters remain shot-local and must not be copied into every shot.",
-    "FIRST FRAME AND SPATIAL BLOCKING: if the first shot requires visible characters or props, state directly that the first visible frame already contains every required subject in its correct position, with no empty establishing frame, no delayed reveal, and no opening frame without the required subjects. Allow an empty opening only when the user explicitly requests it. Flash cuts and very short establishing cuts must still contain the required subject or location information immediately; never add an empty flash cut, abstract filler, or random landscape insert. Preserve the user's first-frame reference images and treat them as spatial occupancy references only.",
+    `Output language: ${locale === "zh" ? "Chinese" : "English"}. Keep all free-text shot fields in this language.`,
+    "Only the structured shots are the execution plan. Do not return scene context, active references, location map, first frame, format mode, audio, style, positive/negative constraints, acting objectives, asset descriptions, voice locks, or directorLayers; those are either retained from user data or generated locally from the resulting shots and asset library.",
     isLongTake
-      ? `Shooting mode is LONG TAKE. Return EXACTLY ONE shot, starting at 0 and ending no later than ${durationLimit}s. Put the complete story progression into 1-8 continuous beats inside that one shot. Do not create cut points, alternate camera setups, or additional shot entries.`
+      ? `Shooting mode is LONG TAKE. Return EXACTLY ONE shot, starting at 0 and ending no later than ${durationLimit}s. Put the complete story progression into continuous beats inside that one shot, splitting by observable events rather than a fixed beat count; do not merge or omit events to fit a limit. Do not create cut points, alternate camera setups, or additional shot entries.`
       : `Shooting mode is MULTI-SHOT. Select 1-8 shots only when the story rhythm needs a new viewpoint. Slow, observational, or dialogue-led scenes normally use 1-3 shots; do not add coverage just to fill a template. Use more shots only for a clear change of information, action, or emotional beat.`,
-    `Timeline hard limit: all shots are sequential; shot 1 starts at 0; shot N starts where shot N-1 ends; the final endSeconds MUST be less than or equal to ${durationLimit}s. Never exceed the user's ${durationLimit}${seconds} limit. Duration label uses "${seconds}" suffix.`,
-    "Every shot needs action, acting, framing, optics.lensCharacter, optics.fieldOfViewDegrees, movement, direction, and participants (only existing character IDs). Framing and optics are a linked pair: Wide / environmental action normally uses 47-standard or 84-wide; Medium close-up / face portrait uses 29-short-tele; Extreme close-up / detail uses 18-tele; distant observation uses 8-supertele. Never return a close framing with a broad environmental lens or a wide framing with a portrait telephoto unless the user explicitly asks for that contrast. Participants are shot-local: add only people visible in frame or required to perform, speak, or receive an on-screen action in that exact shot. Do not copy the scene roster into every shot. Every beat actor and targetCharacterId MUST be listed in that same shot's participants. Assign camera / lensModel from the available IDs when the scene benefits from a specific look, otherwise omit.",
-    "Performance (P2): the master profile is who the character is; rewrite it into this exact shot's moment. Present characters only: write an acting paragraph only for characters in that shot's participants; no character in frame means no paragraph for that character. Keep the constant core (identity, vocal profile, signature tics, eye life, emotional through-line) and never contradict the master. Re-express it for this shot's posture, action, beat, emotional pressure, and time of day. Transform behaviors that cannot physically happen instead of deleting them: preserve the same engine while changing its outlet. For each participant, write acting as one flowing paragraph in the character's register, with no bullets, headers, dial labels, or abstract emotion-only wording; use observable face, body, breath, voice, gaze, timing, distance, and reaction. If the pipeline uses asset references, begin the paragraph with that character's reference tag. Set performanceLevel (0-5, 4 default whenever the acting master profile is strong) and eyeLife (micro glances / blink quality / eye glint / eyes leading the turn). Do not paste a master profile. Do not use wardrobe, camera, color, or abstract emotion labels. Fill the beats' P2 fields: tactic (press / charm / provoke...), subtext (true intent opposite to the line), beatChange (visible shift: pause / posture / tempo / eye-line cut), reactionBeforeLine (reaction starting before the other speaker finishes). Every visible action must have its real performer in actorId; a listener or reacting character must get a separate beat with that character's actorId. Use targetCharacterId only for the person being watched, addressed, or reacted to. Never assign a listener's prop action, eye movement, hand movement, or body reaction to the speaker.",
-    "Photography (P1): prefer observable lens character over focal-length-only strings. Per shot set optics.lensCharacter from the 7 presets (47-standard / 84-wide / 107-ultrawide / 29-short-tele / 18-tele / 8-supertele / 135-immersive) with optics.fieldOfViewDegrees 8-135 matching the preset, and add lensOutcome + antiDriftLock when the look must stay locked. Set cameraBehavior as physical operator behavior (height / distance / angle / side / subjectSize / screenPlacement / focusBehavior / depthOfField / handheldQuality). Add physicsAnchors for walk / run / weapon / liquid / particle. Per participant set torsoFacing when the body turns away from the eyeline, and anchorDistance when a landmark anchors the scene. At scene level return firstFrameLock.requiredSubjectIds (only existing asset ids that MUST be on screen in frame one) and lightingDirection (primarySource / direction / exposurePriority / allowHighlights / forbid).",
+    `Timeline hard limit: all shots are sequential; shot 1 starts at 0; shot N starts where shot N-1 ends; beat startSeconds values are absolute scene times and must stay inside their shot window; the final endSeconds MUST be less than or equal to ${durationLimit}s. Never exceed the user's ${durationLimit}${seconds} limit. Duration label uses "${seconds}" suffix.`,
+    "Every shot needs action, acting, framing, optics.lensCharacter, optics.fieldOfViewDegrees, movement, direction, and participants (only existing character IDs). Framing and optics are a linked pair: Wide / environmental action normally uses 47-standard or 84-wide; Medium close-up / face portrait uses 29-short-tele; Extreme close-up / detail uses 18-tele; distant observation uses 8-supertele. Never return a close framing with a broad environmental lens or a wide framing with a portrait telephoto unless the user explicitly asks for that contrast. Participants are shot-local: add only people visible in frame or required to perform, speak, or receive an on-screen action in that exact shot. Do not copy the scene roster into every shot. Every beat actor and targetCharacterId MUST be listed in that same shot's participants. Local normalization supplies safe defaults when a field is not specified.",
+    "Performance (P2): the CHARACTER ACTING MASTERS block is an AI-only reference. It is the character's identity and behavioral baseline, not text to paste into the prompt. Use the matching master profile to understand who the character is, then write the character performing on top of that baseline in this exact shot's moment. Do not copy, concatenate, or paraphrase the master line by line. Present characters only: write an acting paragraph only for characters in that shot's participants; no character in frame means no paragraph for that character. Keep the constant core (identity, vocal profile, signature tics, eye life, emotional through-line) and never contradict the master. Re-express it for this shot's posture, action, beat, emotional pressure, and time of day. Transform behaviors that cannot physically happen instead of deleting them: preserve the same engine while changing its outlet. For each participant, write acting as one flowing paragraph in the character's register, with no bullets, headers, dial labels, or abstract emotion-only wording; use observable face, body, breath, voice, gaze, timing, distance, and reaction. If the pipeline uses asset references, begin the paragraph with that character's reference tag. Set performanceLevel (0-5, 4 default whenever the acting master profile is strong) and eyeLife (micro glances / blink quality / eye glint / eyes leading the turn). Never copy the master profile into ACTIVE REFERENCES, directorLayers, or any separate CHARACTER ACTING section; only its shot-specific, observable adaptation belongs in the corresponding participant and beat. Do not use wardrobe, camera, color, or abstract emotion labels. Fill the beats' P2 fields: tactic (press / charm / provoke...), subtext (true intent opposite to the line), beatChange (visible shift: pause / posture / tempo / eye-line cut), reactionBeforeLine (reaction starting before the other speaker finishes). Every visible action must have its real performer in actorId; a listener or reacting character must get a separate beat with that character's actorId. Use targetCharacterId only for the person being watched, addressed, or reacted to. Never assign a listener's prop action, eye movement, hand movement, or body reaction to the speaker.",
+    "Photography (P1): prefer observable lens character over focal-length-only strings. Per shot set optics.lensCharacter from the 10 presets (180-panoramic / 135-immersive / 107-ultrawide / 84-wide / 63-moderate-wide / 47-standard / 29-short-tele / 18-tele / 12-long-tele / 8-supertele) with optics.fieldOfViewDegrees 8-180 matching the preset. The 12° long-tele preset is approximately a 200mm full-frame equivalent and is valid for tight portrait or two-person coverage from a distant camera position. Add lensOutcome + antiDriftLock when the look must stay locked. Set cameraBehavior as physical operator behavior (height / distance / angle / side / subjectSize / screenPlacement / focusBehavior / depthOfField / handheldQuality). Add physicsAnchors for walk / run / weapon / liquid / particle. Per participant set torsoFacing when the body turns away from the eyeline, and anchorDistance when a landmark anchors the scene.",
     "State, not transition: write mid-action states (jaw clenched, strides lengthening), never transition chains (starts to... / begins to...). Groups react in staggered waves with different intensities, never in unison.",
     "Dialogue: write only scripted lines for this scene; when a character speaks, everyone else stays quiet. For an intentional silence, hold 1 second of quiet before and after the line; for an immediate interruption, start the line within 0.3 seconds.",
-    "Beats: each shot gets 1-4 ordered beats (start order at 1). Each beat has verb + actorId + targetCharacterId/targetPropId (only existing IDs) when applicable, actionText in the scene language, optional dialogue (include dialogue text in the same language as the scene), optional required flag, and optional cutRule. Do not return stateBefore or stateAfter. If a supporting character visibly tightens a grip, changes eyeline, shifts posture, or reacts before dialogue, create a separate beat for that supporting character instead of burying the action in the lead character's beat text.",
+    "Beats: create 1-8 ordered beats per shot by default (start order at 1), but use more than 8 whenever the shot contains more than 8 distinct visible events; never merge events or omit them just to meet a count. One beat represents one observable event, subject change, or reaction, with a physically clear performer and target. Each beat has verb + actorId + targetCharacterId/targetPropId (only existing IDs) when applicable, actionText in the scene language, optional dialogue (include dialogue text in the same language as the scene), optional propState for a critical prop state in this beat, optional audio for a non-dialogue sound in this beat, optional required flag, and optional cutRule. When an event has a precise cue or must overlap another event, set startSeconds to its absolute scene time in seconds; omit it when ordinary sequential timing is sufficient. Keep duration as the event length. Do not return stateBefore or stateAfter. If a supporting character visibly tightens a grip, changes eyeline, shifts posture, reacts before dialogue, enters, exits, or performs a separate prop action, create a separate beat for that supporting character instead of burying the action in the lead character's beat text. Dense multi-character shots should preserve each person's readable reaction and exit timing as separate beats.",
     "Prop changes: return one natural-language propChangeDescription for each shot. Describe only visible prop use, contact, movement, or change in the scene language. Do not plan or return starting/ending prop states; those fields are legacy and ignored.",
-    "Negative prompt: produce one comma-separated string of concrete negative constraints for this scene in the language of the scene (Chinese if the scene is Chinese), covering character/wardrobe drift, extra limbs, physics, floating props, water/dust on lens where relevant, and scene-specific artifacts to avoid.",
-    "Audio: use the user audio plan above only to understand pacing and on-screen behavior. Do not invent a replacement plan, do not return a top-level audioPlan key, and do not change the user's audio settings. The compiler, not the AI layers, applies the user's explicitly selected music, SFX, score, and subtitle settings to final delivery.",
+    "Macro decisions: return only macro.emotionArc when the current scene needs a concise, camera-readable progression, and macro.lightingDirection when the lighting direction cannot be determined from the scene/location data. Omit a macro field when it is already clear or not needed. Do not use macro fields to restate shot actions or asset facts.",
     "",
-    "Return ONLY a JSON object matching this schema:",
-    "The top-level object MUST also include \"negativePrompt\": string (see Negative prompt rule).",
+    "Return ONLY a JSON object matching this schema. Put the shots array first in the object and return no other keys:",
     CLEAN_SCENE_DRAFT_PROMPT_SCHEMA,
-    "Each shot also has propChangeDescription: string | null. Use it for one natural-language description of visible prop use or change. Do not return propStatesAtStart or propStatesAtEnd.",
     ...vocabLines,
-    "Do NOT invent character/prop IDs. Do NOT add prose or keys outside the schema (the only exception is the top-level negativePrompt field).",
+    "Do NOT invent character/prop IDs. Do NOT add prose, markdown, directorLayers, or keys outside the schema.",
   ].join("\n"), t?.onProgress);
 
-  const normalized = normalizeSceneDraft(project, scene, data, seconds, locale);
+  const normalized = normalizeSceneDraft(project, scene, data, seconds, locale, { preserveSceneContext: false });
   t?.onProgress?.("validating");
   const durationIssue = auditFinalPrompt(normalized.scene).issues.find((issue) => issue.code === "FINAL.DURATION_EXCEEDED");
   if (durationIssue) {
@@ -1204,13 +1562,13 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
  * Second-stage delivery: re-organize already audited canonical prompt facts.
  * It must not plan shots, alter assets, or use user-planning fields as source material.
  */
-export async function generateFinalPrompt(sourcePrompt: string, locale: Locale, onProgress?: (stage: SceneCompileProgress) => void): Promise<string> {
+export async function generateFinalPrompt(sourcePrompt: string, locale: Locale, onProgress?: SceneCompileProgressListener): Promise<string> {
   const settings = loadAISettings();
   if (!isRemoteConfigured(settings)) {
     throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key。");
   }
   const request = buildFinalPromptRequest(sourcePrompt, locale);
-  return chatCompletionsText(settings, request.system, request.user, onProgress);
+  return chatCompletionsText(settings, request.system, request.user, onProgress, sourcePrompt, locale);
 }
 
 export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): { system: string; user: string } {
@@ -1222,8 +1580,20 @@ export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): {
     ? "只输出以下非空类别，必须使用这些中文标题，并严格按此顺序：场景上下文、活动引用、场景地图、首帧与空间走位、格式模式、光学、摄像机、动作节奏、物理、光线、音频、风格、正向约束。仅当源中存在时才输出：负向约束。"
     : "Output only the following non-empty categories, using exactly these English headings and this order: SCENE CONTEXT, ACTIVE REFERENCES, LOCATION MAP, FIRST FRAME AND SPATIAL BLOCKING, FORMAT MODE, OPTICS, CAMERA, ACTION TIMING, PHYSICS, LIGHTING, AUDIO, STYLE, POSITIVE CONSTRAINTS. Output NEGATIVE CONSTRAINTS only when present in the source.";
   const styleRule = zh
-    ? "空间锁定必须在摄像机之前，光学必须在一般美术语言之前，光线必须作为优先级锁。允许输出风格，但风格必须位于光线之后、正向约束之前，只描述画面质感、色彩、构图、材质和氛围，不重复光学、摄像机、动作或光线锁。不要新增质量、角色表演或其他标题；角色表演必须附着在动作节奏中对应的镜头和人物之后。"
-    : "Keep spatial locks before camera, optics before general visual language, and lighting as a priority lock. STYLE must come after LIGHTING and before POSITIVE CONSTRAINTS; describe only image texture, color, composition, materials, and atmosphere, without repeating optics, camera, action, or lighting locks. Do not add QUALITY, CHARACTER ACTING, or any other heading; attach acting to the corresponding shot and character inside ACTION TIMING.";
+    ? "空间锁定必须在摄像机之前，光学必须在一般美术语言之前，光线必须作为优先级锁。STYLE 必须位于光线之后、正向约束之前，并写成一段可执行的画面风格描述：先说整体写实/照片级或其他明确视觉处理，再写环境材质与表面质感、画面色彩层级（源中有比例时保留 60:30:10，并明确主色/次色/点缀色）、画质特征（清晰度、对比度、颗粒/无颗粒、噪点、帧面洁净度、真实感）以及时代或地域还原要求。风格应服务于控制，不要只写诗意情绪或空泛的“电影感”；每个形容词都要落到可见的颜色、材质、纹理、画面质量或时代质感上。可以保留“写实的照片级英国社会现实主义犯罪喜剧”“公屋的污垢感”“紧张而富身体性的视觉质感”这类画面风格信息，但不得照抄导演简报中的风格描述或风格预设名称，应将其转化为简洁、具体的最终画面语言。STYLE 不得重复 OPTICS、CAMERA、ACTION TIMING 或 LIGHTING：ARRI/摄影机型号、镜头型号、焦段、FOV、景深、运动、曝光、光线方向和光源归入对应类别；STYLE 只保留它们造成的可见画质结果，例如锐利清晰、均衡曝光感、无颗粒、年代准确。源中没有确定的色彩比例、颗粒、时代或地域信息时不得臆造。不要新增 QUALITY、CHARACTER ACTING 或其他标题；角色表演必须附着在动作节奏中对应的镜头和人物之后。参考格式：写实的照片级英国社会现实主义犯罪喜剧；公屋的污垢感，紧张而富身体性的视觉质感，叠加反派的威胁气场。60:30:10——主色、次色、点缀色分别写清。画面锐利清晰、帧面干净、无颗粒，准确还原 2011 年或更早的影像质感。"
+    : "Keep spatial locks before camera, optics before general visual language, and lighting as a priority lock. STYLE must come after LIGHTING and before POSITIVE CONSTRAINTS. Write one executable image-style description: first state the overall realistic / photographic or otherwise explicit visual treatment, then the environment materials and surface texture, the color hierarchy (preserve a source-defined 60:30:10 ratio and name the primary / secondary / accent colors), image-quality traits (clarity, contrast, grain / no grain, noise, clean frames, realism), and any period or regional reconstruction requirement. Style must support control, not replace it: avoid purely poetic mood language or vague ‘cinematic’ adjectives; connect every descriptor to a visible color, material, texture, image-quality property, or period treatment. Preserve visual information such as ‘photorealistic British social-realist crime comedy’, ‘the grime of public housing’, and a tense, physically grounded image texture, but do not copy the director brief’s style description or preset name verbatim; distill it into compact, concrete final image language. Do not repeat OPTICS, CAMERA, ACTION TIMING, or LIGHTING: camera body, lens model, focal length, FOV, depth of field, movement, exposure, light direction, and light sources belong in their own categories. STYLE may retain their visible image-quality result, such as sharp clarity, balanced exposure appearance, no grain, or period accuracy. Never invent a color ratio, grain treatment, period, or regional requirement absent from the source. Do not add QUALITY, CHARACTER ACTING, or any other heading; attach acting to the corresponding shot and character inside ACTION TIMING. Example: photorealistic British social-realist crime comedy; public-housing grime with a tense, physically grounded image texture and a theatrical villain threat. 60:30:10 with the primary, secondary, and accent colors named explicitly. Sharp, clean frames with no grain, accurately reconstructing the image quality of 2011 or earlier.";
+  const firstFrameRule = zh
+    ? "首帧与空间走位必须覆盖最终输出中的每一个镜头段。多镜头序列必须逐段单独输出“第 1 段首帧：……”“第 2 段首帧：……”等首帧句，即使相邻段的空间关系相似也不得用“同上”省略。每段首帧必须只写该段第一可见画面中的实际人物和道具：景别或角度、人物在画面左/中/右及前/中/后景的位置、人物之间的距离和遮挡关系、主要背景地标、身体朝向和视线方向；没有出镜的人物绝不能写入该段。首帧是该段的静态占位与空间状态，不要把后续动作、表演过程或整段动作时间线写进首帧。必须与该段 ACTION TIMING 的 participants、位置和进入方式一致；后续才入画的人物只能写在后续时间块。单一连续长镜头只写一次整条长镜头的开场首帧。参考格式：第 1 段首帧：特写躺在黄沙中，双眼紧闭，身后是棕砖楼墙；画面里与凯尔同框的没有其他人。第 2 段首帧：低角度仰拍破窗特写，瘦小人物居中，魁梧人物宽阔的身体挤在窗口一侧，另一名人物紧挨另一侧，身后是昏暗室内与天花板；所有在该段出镜的人物都向外张望搜寻。"
+    : "FIRST FRAME AND SPATIAL BLOCKING must cover every shot segment in the final output. In a multi-shot sequence, write a separate first-frame statement for every segment, labeled exactly as ‘SHOT 1 FIRST FRAME: ...’, ‘SHOT 2 FIRST FRAME: ...’, and so on; never use ‘same as above’ even when adjacent segments are similar. Each segment’s first frame may name only the people and props actually visible in that segment’s first visible frame: framing or angle, left/center/right and foreground/midground/background placement, distance and occlusion between subjects, main background landmarks, body orientation, and eyelines. Never include a character who is not visible in that segment. First frame is static occupancy and spatial state only; do not turn it into the later action, performance progression, or full timeline. It must agree with that segment’s ACTION TIMING participants, positions, and entrances; a character who enters later belongs only in a later time block. A single continuous long take gets one opening first-frame statement for the entire take. Example format: SHOT 1 FIRST FRAME: tight close-up of a figure lying in yellow sand, eyes closed, brown-brick wall behind; no other person shares the frame with Kel. SHOT 2 FIRST FRAME: low-angle close-up looking up through a broken window, the smaller figure centered, the broad figure crowding one side and another figure tight against the opposite side, dim interior and ceiling behind; everyone visible in this segment looks outward and searches.";
+  const formatModeRule = zh
+    ? "FORMAT MODE 是本次生成的整体执行格式摘要，必须完整承接源中已确定的格式事实，不得只写“单一连续长镜头”或“受控多镜头序列”。按源内容明确写出：生成方式（单次生成或其他明确方式）、段数、总时长及各段时长分配（如 4 秒 / 4 秒）、画幅（如 16:9）、速度（实时、慢动作或其他已指定速度）、段间连接方式和连接动作、现场声/配乐范围、每句台词属于哪个角色或对象、字幕与画面帧限制。多段格式必须说明每一段如何结束、下一段如何开始，以及甩切、whip cut、甩镜上摇/下摇、推拉变焦等连接的方向、发生段落和连续因果；不要把明确的甩切泛化成“快速剪辑”。“单次生成”表示整段内容一次生成，不等于只能有一个镜头。各段时长必须与镜头时间轴一致；未在源中确定的时长、画幅、速度、转场、声音或对白归属不得臆造。格式模式只总结生成和段落组织方式，不重复 OPTICS、CAMERA、ACTION TIMING 的具体执行细节。示例：单次生成，两个段落，一次甩切，总长约 8 秒（4 秒 / 4 秒），画幅 16:9。实时速度。快速甩镜上摇结束第 1 段并顺势冲入急推变焦开启第 2 段；快速甩镜下摇结束第 2 段。仅现场音，无配乐；台词只属于提卡；干净的纯画面帧。"
+    : "FORMAT MODE is the overall execution-format summary for this generation. It must carry forward every format fact established in the source, rather than outputting only ‘SINGLE CONTINUOUS TAKE’ or ‘CONTROLLED MULTI-SHOT SEQUENCE’. When supported by the source, state: generation mode (single generation or another explicit mode), segment count, total duration and per-segment allocation (for example, 4 seconds / 4 seconds), aspect ratio (for example, 16:9), speed (real time, slow motion, or another specified speed), the connection between segments and its physical transition, the diegetic-sound / score scope, which character or object owns each line, and subtitle / clean-frame limits. For multi-segment formats, explain how each segment ends and the next begins. Preserve the direction, segment placement, and causal continuity of whip cuts, whip pans up/down, push-ins, zooms, and other stated transitions; do not flatten an explicit whip cut into ‘fast editing’. ‘Single generation’ means one generated output for the whole piece, not a single shot. Segment durations must agree with the shot timeline. Never invent an unprovided duration, aspect ratio, speed, transition, sound rule, or dialogue ownership. FORMAT MODE summarizes generation and segment organization only; do not repeat the detailed OPTICS, CAMERA, or ACTION TIMING instructions. Example: single generation, two segments, one whip cut, approximately 8 seconds total (4 seconds / 4 seconds), 16:9. Real time. A fast whip pan upward ends segment 1 and flows directly into a rapid push-zoom that opens segment 2; a fast whip pan downward ends segment 2. Diegetic sound only, no score; the line belongs only to Tika; clean picture frames.";
+  const cameraRule = zh
+    ? "CAMERA 必须先写一段适用于全程的总摄影机描述，再按镜头段落分别展开，不能直接从第 1 段开始。总描述先锁定全程共用的摄影机语法：是否手持、整体稳定性或晃动质感、统一的倾斜/荷兰角、轴线、机位高度与距离，以及贯穿全程的观察或跟随原则；只有源中明确的信息才能写入，不得臆造导演风格或摄影机行为。总描述之后按“第 1 段：……”“第 2 段：……”逐段写出该段的实际摄影机行为，包括起始状态、运动方向、速度/力度、何时停止或保持不动、如何承接上一段和如何进入下一段。必须把甩镜上摇、甩镜下摇、急推变焦、停机观察等明确动作保留为可执行的摄影机动作及其触发事件，不得笼统改写成“镜头跟随”或“快速移动”。全程统一的摄影机规则只在总描述中说明；段落中只补充该段的变化和执行结果。CAMERA 只写摄影机位置、运动、方向、稳定性和与事件的响应，不重复 OPTICS 的焦段/FOV/景深，也不复制 ACTION TIMING 的完整动作与表演；但可用一句话说明摄影机正在捕捉哪个关键事件。参考格式：全程手持，略带倾斜形成轻度荷兰角。第 1 段：特写人物醒来并在甩沙后快速甩镜上摇冲向破窗。第 2 段：甩镜顺势冲入对窗口人群的硬急推变焦；随后保持不动观察搜寻，最后快速甩镜下摇离开窗口。"
+    : "CAMERA must begin with one overall camera-language paragraph that applies across the entire generation, then expand segment by segment; do not begin directly with shot 1. The overall paragraph first locks the shared camera grammar: handheld or mounted operation, overall stability or shake quality, a consistent tilt / Dutch angle, screen axis, camera height and distance, and the rule for observing or following throughout. Include only information established by the source; never invent a director style or camera behavior. After the overall paragraph, write separate lines labeled ‘SHOT 1: ...’, ‘SHOT 2: ...’, and so on. For each segment, state the actual camera behavior, starting state, movement direction, speed / force, when it stops or holds, how it inherits the previous segment, and how it enters the next one. Preserve explicit actions such as a whip pan up, whip pan down, hard push-zoom, or locked-off observation as executable camera actions with their trigger events; do not flatten them into ‘the camera follows’ or ‘moves quickly’. State shared camera rules once in the overall paragraph; use segment lines only for changes and execution results. CAMERA covers camera position, movement, direction, stability, and response to events. Do not repeat OPTICS focal length / FOV / depth of field or copy the full ACTION TIMING action and acting; one short phrase may identify the key event being captured. Example: full-take handheld operation with a slight tilt creating a mild Dutch angle. SHOT 1: a close-up of the figure waking and shaking off sand, followed by a fast whip pan upward toward the broken window. SHOT 2: the whip pan flows directly into a hard push-zoom on the people at the window; hold still while they search, then finish with a fast whip pan downward away from the window.";
+  const actionTimingRule = zh
+    ? "动作节奏必须按镜头段分组输出，不能把所有镜头的时间块合并成一条平面时间线。多镜头序列先分别写“第 1 段（起止时间）：”“第 2 段（起止时间）：”等段落标题，再在每个段落标题下写该段自己的时间块；段落标题必须保留，即使某段只有一个事件。每个时间块必须保留精确时间（如 0:01.5–0:02.5），只写一个事件的主体位置、动作和该拍结果，并在相关时写入相机行为、关键道具状态、物理锚点和音频/对白；显式起始时间必须按场景绝对时间保留，并允许表达非连续或重叠事件。时间块中的人物和道具目标必须保留源中的 @ 资产引用及其对应 [imageN]，同一资产重复出现时复用同一个图片编号，不得输出裸的 @资产名。长镜头中只写一个连续段落；多镜头序列中每个切点都要保留源里的切换依据，没有依据不得输出切点。"
+    : "ACTION TIMING must remain grouped by shot segment; never flatten all shot events into one timeline. For a multi-shot sequence, first write separate segment headings such as ‘SHOT 1 (start to end):’ and ‘SHOT 2 (start to end):’, then place only that segment's time blocks beneath its heading. Keep every segment heading even when it contains one event. Each time block must preserve its precise time (for example, 0:01.5 to 0:02.5), state one event's subject position, action, and outcome, and include camera behavior, critical prop state, physics anchors, and audio/dialogue when relevant. Preserve explicit absolute start times, including non-contiguous or overlapping events. Every character or prop @ asset reference inside a time block must retain its matching [imageN] token; reuse the same image number for repeated references and never emit a bare @asset tag. A long take gets one continuous segment group. In multi-shot sequences, keep the stated cut reason on every cut and never emit a cut without one.";
   return {
     system: "You are CINEDANCE V4, the final delivery editor for Seedance and Higgsfield cinematic video prompts. "
       + (zh
@@ -1231,11 +1601,18 @@ export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): {
         : "Return only the finished prompt in clear, cinematic-grade English, with no commentary, markdown fence, rationale, audit note, or greeting."),
     user: [
       languageRule,
-      "The canonical source below combines the editable director document with the structured shot execution. Preserve every concrete fact, active reference, timing, character action, acting behavior, and constraint.",
-      "Every @asset_tag, [imageN], and @audioN token is an opaque Seedance platform reference. Copy each one exactly as supplied: never translate, delete, rename, normalize, duplicate, or invent one. Keep each asset's appearance, acting template, voice lock, voice reference, and prop description exclusively in ACTIVE REFERENCES; do not repeat those descriptions elsewhere.",
+      "The canonical source below combines the concise editable director guide with the structured shot execution. ACTIVE REFERENCES and FIRST FRAME AND SPATIAL BLOCKING are compiler-generated from the current asset library and shot participants; treat those sections as the source of truth. Preserve every concrete fact, active reference, timing, character action, acting behavior, and constraint.",
+      "Every @asset_tag, matching [imageN], and @audioN token is an opaque Seedance platform reference. Copy each one exactly as supplied: never translate, delete, rename, normalize, or invent one. Whenever an asset has a matching [imageN] in ACTIVE REFERENCES, every repeated @asset_tag occurrence in ACTION TIMING, FIRST FRAME AND SPATIAL BLOCKING, LOCATION MAP, and AUDIO must keep the same [imageN] immediately after the tag; never emit a bare version of that @asset_tag. Reusing the same @asset_tag and [imageN] is required and is not an accidental duplication. Keep each asset's appearance and prop description exclusively in ACTIVE REFERENCES. Acting master profiles are AI-only references: do not output them in ACTIVE REFERENCES or add a separate CHARACTER ACTING heading; preserve only their shot-specific, observable adaptation in the corresponding ACTION TIMING participant or beat. Keep each speaking or vocal character's voice lock and voice reference in the AUDIO section's character voice block, followed by the shot-local delivery, exact dialogue or non-verbal vocalization, and silence rule; do not repeat the full voice lock elsewhere.",
       "Do not invent, remove, reinterpret, or contradict any fact. Do not add prior context, story summaries, user notes, AI instructions, warnings, scores, or diagnostics.",
+      zh
+        ? "SCENE CONTEXT 必须保留规范源中的当前地点、实际出场人物和正在发生的关键事件。禁止输出“已处于既定在场状态”“已建立的画面状态”“当前空间中的当前动作状态”“当前事件未提供可提取的剧情信息”等空泛占位句；如果规范源缺少事件，保持源句，不得自行编造。"
+        : "SCENE CONTEXT must preserve the canonical source's current location, actual on-screen characters, and key event happening now. Never output vague placeholders such as ‘established on-screen state’, ‘current action state’, or ‘no current story event was provided’; if the canonical source lacks an event, keep its source sentence and do not invent one.",
       headingsRule,
+      firstFrameRule,
+      formatModeRule,
+      cameraRule,
       styleRule,
+      actionTimingRule,
       "",
       "CANONICAL AUDITED SOURCE:",
       sourcePrompt,
@@ -1260,15 +1637,39 @@ const FINAL_SOURCE_SECTIONS = [
   { key: "negativeLocks", heading: "NEGATIVE CONSTRAINTS" },
 ] as const;
 
+const PROMPT_SECTION_HEADINGS = [
+  ...FINAL_SOURCE_SECTIONS.map((section) => section.heading),
+  "场景上下文", "活动引用", "场景地图", "首帧与站位", "格式模式", "光学", "摄像机", "动作节奏", "镜头执行", "物理", "光线", "音频", "风格", "正向约束", "负向约束",
+];
+
 function extractPromptSection(source: string, heading: string): string {
   const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = new RegExp(`(?:^|\\n\\n)${escaped}:\\n`, "m").exec(source);
+  const match = new RegExp(`(?:^|\\n\\n)${escaped}[:：]\\n`, "m").exec(source);
   if (!match) return "";
   const start = match.index + match[0].length;
-  const next = /\n\n[A-Z][A-Z ]+:\n/g;
-  next.lastIndex = start;
-  const end = next.exec(source)?.index ?? source.length;
+  const nextStarts = PROMPT_SECTION_HEADINGS
+    .filter((item) => item !== heading)
+    .map((item) => {
+      const next = new RegExp(`\\n\\n${item.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}[:：]\\n`).exec(source.slice(start));
+      return next ? start + next.index : -1;
+    })
+    .filter((index) => index >= 0);
+  const end = nextStarts.length > 0 ? Math.min(...nextStarts) : source.length;
   return source.slice(start, end).trim();
+}
+
+/** 最终模型偶尔会把场景上下文改写成无事实的占位句，回填本地审核后的当前事件。 */
+function restoreCanonicalSceneContext(text: string, sourcePrompt: string, locale: Locale): string {
+  const heading = locale === "zh" ? "场景上下文" : "SCENE CONTEXT";
+  const canonical = extractPromptSection(sourcePrompt, heading);
+  if (!canonical) return text;
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`(^|\\n)${escaped}\\s*[:：]\\s*\\n`, "i").exec(text);
+  if (!match) return text;
+  const bodyStart = match.index + match[0].length;
+  const next = new RegExp(`\\n\\n(?:${PROMPT_SECTION_HEADINGS.map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})[:：]\\n`, "iu").exec(text.slice(bodyStart));
+  const bodyEnd = next ? bodyStart + next.index : text.length;
+  return `${text.slice(0, bodyStart)}${canonical}${text.slice(bodyEnd)}`;
 }
 
 function withoutLayerHeading(text: string, heading: string, chineseHeading: string): string {
@@ -1277,60 +1678,69 @@ function withoutLayerHeading(text: string, heading: string, chineseHeading: stri
 
 /**
  * Final delivery source is a single canonical sequence, not a director-document
- * dump followed by another full prompt. Edited director layers remain primary;
- * structured shots supply ACTION TIMING so acting and beats stay shot-local.
+ * dump followed by another full prompt. Editable director layers remain primary;
+ * ACTIVE REFERENCES and FIRST FRAME are always rebuilt from current assets and
+ * structured shots so stale prose cannot override executable scene data.
  */
-export function buildFinalGenerationSource(project: ProjectV2, scene: SceneV2): string {
-  const generatedLayers = buildDirectorDocumentLayers(project, scene, { locale: "en" });
+export function buildFinalGenerationSource(project: ProjectV2, scene: SceneV2, locale: Locale = "en"): string {
+  const generatedLayers = buildDirectorDocumentLayers(project, scene, { locale });
   const editedLayers = scene.directorLayers ?? {};
-  const englishSequence = compileDirectorSequence(project, scene, { locale: "en" });
+  const spatialLayerConflicts = new Set(
+    validateDirectorLayers(editedLayers, project, scene)
+      .filter((issue) => issue.severity === "error" && (
+        issue.code === "DIRECTOR.FIRST_FRAME_PARTICIPANT_CONFLICT" ||
+        issue.code === "DIRECTOR.LOCATION_MAP_POSITION_CONFLICT"
+      ))
+      .map((issue) => issue.layerKey)
+      .filter((key): key is string => Boolean(key)),
+  );
+  const canonicalSequence = compileDirectorSequence(project, scene, { locale });
   const labelsByKey = new Map(DIRECTOR_LAYERS.map((layer) => [layer.key, layer]));
   const sections: string[] = [];
 
   for (const section of FINAL_SOURCE_SECTIONS) {
-    let body = "";
+    let body: string;
     if (section.key === "actionTiming") {
-      body = extractPromptSection(englishSequence, "SHOT EXECUTION");
-    } else if (section.key === "activeReferences") {
-      // References are executable data, not an editable prose layer.
-      body = generatedLayers.activeReferences || "";
+      body = extractPromptSection(canonicalSequence, locale === "zh" ? "镜头执行" : "SHOT EXECUTION");
+    } else if (section.key === "activeReferences" || section.key === "firstFrame") {
+      // These sections are executable data, not editable director prose.
+      const layer = labelsByKey.get(section.key as typeof DIRECTOR_LAYER_ORDER[number]);
+      body = extractPromptSection(canonicalSequence, layer?.[locale] ?? section.heading);
     } else {
       const layer = labelsByKey.get(section.key as typeof DIRECTOR_LAYER_ORDER[number]);
       const edited = layer ? withoutLayerHeading(editedLayers[section.key] ?? "", section.heading, layer.zh) : "";
-      body = edited || generatedLayers[section.key as typeof DIRECTOR_LAYER_ORDER[number]] || "";
+      const generated = generatedLayers[section.key as typeof DIRECTOR_LAYER_ORDER[number]] || "";
+      // A contradictory edited spatial layer must not be sent alongside the
+      // structured shot facts. Fall back to the deterministic spatial render;
+      // other valid director layers remain editable and keep their content.
+      const invalidSceneContext = section.key === "sceneContext" && !isSceneContextUsable(project, scene, edited, locale);
+      body = spatialLayerConflicts.has(section.key) || invalidSceneContext ? generated : edited || generated;
     }
     if (body.trim()) sections.push(`${section.heading}:\n${body.trim()}`);
   }
   return sections.join("\n\n");
 }
 
-/** 解析 AI 返回的 directorLayers：仅保留 canonical 层 key，且值非空。 */
-function normalizeDirectorLayers(value: unknown): Record<string, string> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  const result: Record<string, string> = {};
-  for (const key of DIRECTOR_LAYER_ORDER) {
-    const text = asString(raw[key]).trim();
-    if (text) result[key] = text;
-  }
-  return Object.keys(result).length > 0 ? result : undefined;
-}
-
-export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: unknown, seconds: string, locale: Locale = "zh"): {
+export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: unknown, seconds: string, locale: Locale = "zh", options: { preserveSceneContext?: boolean } = {}): {
   scene: SceneV2;
-  negativePrompt?: string;
   directorLayers?: Record<string, string>;
-  directorLayerIssues?: DirectorLayerIssue[];
 } {
   const obj = (data ?? {}) as Record<string, unknown>;
   const assets = project.assets ?? [];
   const characterIds = new Set(assets.filter((asset) => asset.kind === "character").map((asset) => asset.id));
   const propIds = new Set(assets.filter((asset) => asset.kind === "prop").map((asset) => asset.id));
   const orderIds = [...(scene.staging?.characterOrder ?? [])].filter((id) => characterIds.has(id));
-  const sceneContext = asString(obj.sceneContext, scene.sceneContext ?? "").trim();
-  const candidateDirectorLayers = normalizeDirectorLayers(obj.directorLayers);
+  // AI storyboard compilation must not silently carry a stale context from an older preset.
+  // Direct callers can preserve an explicitly edited context for backwards compatibility.
+  // Scene context and director layers are local compiler outputs. The AI
+  // planner may not overwrite them with prose or stale preset material.
+  const sceneContext = options.preserveSceneContext === false ? "" : scene.sceneContext?.trim() ?? "";
+  const macro = obj.macro && typeof obj.macro === "object" && !Array.isArray(obj.macro)
+    ? obj.macro as Record<string, unknown>
+    : {};
+  const macroValue = (key: string) => macro[key] ?? obj[key];
 
-  const LENS_CHARACTERS = new Set(["47-standard", "84-wide", "107-ultrawide", "29-short-tele", "18-tele", "8-supertele", "135-immersive"]);
+  const LENS_CHARACTERS = new Set(["180-panoramic", "135-immersive", "107-ultrawide", "84-wide", "63-moderate-wide", "47-standard", "29-short-tele", "18-tele", "12-long-tele", "8-supertele"]);
   const PHYSICS_ANCHOR_KINDS = new Set(["walk", "run", "weapon", "liquid", "particle"]);
   const normalizeOptics = (raw: unknown): Optics | undefined => {
     const part = (raw ?? {}) as Record<string, unknown>;
@@ -1338,7 +1748,7 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     const lensCharacter = asString(part.lensCharacter, undefined);
     if (lensCharacter && LENS_CHARACTERS.has(lensCharacter)) result.lensCharacter = lensCharacter as Optics["lensCharacter"];
     const fov = asNumber(part.fieldOfViewDegrees, NaN);
-    if (Number.isFinite(fov)) result.fieldOfViewDegrees = Math.max(8, Math.min(135, Math.round(fov)));
+    if (Number.isFinite(fov)) result.fieldOfViewDegrees = Math.max(8, Math.min(180, Math.round(fov)));
     const lensOutcome = asStringArray(part.lensOutcome).slice(0, 6);
     if (lensOutcome.length > 0) result.lensOutcome = lensOutcome;
     const antiDriftLock = asString(part.antiDriftLock, undefined);
@@ -1365,18 +1775,6 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
       list.push({ kind: kind as PhysicsAnchor["kind"], ...(asString(item.detail, undefined) ? { detail: asString(item.detail) } : {}) });
     }
     return list.length > 0 ? list : undefined;
-  };
-  const normalizeFirstFrameLock = (raw: unknown): FirstFrameLock | undefined => {
-    const part = (raw ?? {}) as Record<string, unknown>;
-    const ids = asStringArray(part.requiredSubjectIds).filter((id) => characterIds.has(id) || propIds.has(id));
-    const occupancyStatement = asString(part.occupancyStatement, undefined);
-    const referenceImages = (scene.firstFrameLock?.referenceImages ?? []).map((source) => source.trim()).filter(Boolean);
-    if (ids.length === 0 && !occupancyStatement && referenceImages.length === 0) return undefined;
-    return {
-      ...(ids.length > 0 ? { requiredSubjectIds: ids } : {}),
-      ...(occupancyStatement ? { occupancyStatement } : {}),
-      ...(referenceImages.length > 0 ? { referenceImages } : {}),
-    };
   };
   const normalizeLightingDirection = (raw: unknown): LightingDirection | undefined => {
     const part = (raw ?? {}) as Record<string, unknown>;
@@ -1436,7 +1834,8 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     const beats: ActionBeat[] = [];
     const rawBeats = Array.isArray(raw.beats) ? raw.beats : [];
     let beatOrder = 1;
-    for (const rawBeat of rawBeats.slice(0, 12)) {
+    // 节拍数量由可见事件决定，不设人为上限；最终时长闸门仍会校验每个节拍是否落在镜头窗口内。
+    for (const rawBeat of rawBeats) {
       const beat = (rawBeat ?? {}) as Record<string, unknown>;
       const actorId = asString(beat.actorId, undefined);
       const targetCharacterId = asString(beat.targetCharacterId, undefined);
@@ -1444,9 +1843,16 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
       if (actorId && !participantIds.has(actorId)) continue;
       if (targetCharacterId && !participantIds.has(targetCharacterId)) continue;
       if (targetPropId && !propIds.has(targetPropId)) continue;
+      const rawStartSeconds = beat.startSeconds;
+      const parsedStartSeconds = typeof rawStartSeconds === "number"
+        ? rawStartSeconds
+        : typeof rawStartSeconds === "string" && rawStartSeconds.trim()
+          ? Number(rawStartSeconds)
+          : Number.NaN;
       beats.push({
         id: newId(),
         order: beatOrder++,
+        ...(Number.isFinite(parsedStartSeconds) ? { startSeconds: Math.max(0, parsedStartSeconds) } : {}),
         duration: asNumber(beat.duration, 4),
         actorId,
         verb: asString(beat.verb, "acts"),
@@ -1455,6 +1861,8 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
         targetBodyPart: asString(beat.targetBodyPart, undefined),
         actionText: asString(beat.actionText, undefined),
         dialogue: asString(beat.dialogue, undefined),
+        propState: asString(beat.propState, undefined),
+        audio: asString(beat.audio, undefined),
         tactic: asString(beat.tactic, undefined),
         subtext: asString(beat.subtext, undefined),
         beatChange: asString(beat.beatChange, undefined),
@@ -1533,61 +1941,23 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     } as ShotV2);
   }
 
-  const activeCharacterIds = new Set(shots.flatMap((shot) => shot.participants?.map((participant) => participant.characterId) ?? []));
-  const actingObjectives = (Array.isArray(obj.actingObjectives) ? obj.actingObjectives : [])
-    .map((rawItem) => {
-      const item = (rawItem ?? {}) as Record<string, unknown>;
-      const characterId = asString(item.characterId);
-      if (!activeCharacterIds.has(characterId)) return null;
-      const objective = asString(item.objective);
-      if (!objective) return null;
-      return {
-        characterId,
-        objective,
-        superObjective: asString(item.superObjective, undefined),
-        obstacle: asString(item.obstacle, undefined),
-        stakes: asString(item.stakes, undefined),
-      };
-    })
-    .filter((item): item is NonNullable<typeof item> => item !== null);
-
-  const firstShotIds = new Set([
-    ...(shots[0]?.participants?.map((participant) => participant.characterId) ?? []),
-    ...(shots[0]?.beats?.flatMap((beat) => [beat.targetPropId, beat.targetCharacterId].filter((id): id is string => Boolean(id))) ?? []),
-  ]);
-  const rawFirstFrameLock = normalizeFirstFrameLock(obj.firstFrameLock);
-  const requiredSubjectIds = (rawFirstFrameLock?.requiredSubjectIds ?? []).filter((id) => firstShotIds.has(id));
-  const firstFrameLock = rawFirstFrameLock && (requiredSubjectIds.length > 0 || rawFirstFrameLock.occupancyStatement || rawFirstFrameLock.referenceImages?.length)
-    ? { ...rawFirstFrameLock, ...(requiredSubjectIds.length > 0 ? { requiredSubjectIds } : {}) }
-    : undefined;
-  const lightingDirection = normalizeLightingDirection(obj.lightingDirection);
+  const lightingDirection = normalizeLightingDirection(macroValue("lightingDirection"));
 
   const structuredScene: SceneV2 = {
       ...scene,
-      name: asString(obj.sceneName, scene.name),
-      ...(sceneContext ? { sceneContext } : {}),
-      emotionArc: asString(obj.emotionArc, scene.emotionArc ?? ""),
-      ...(actingObjectives.length > 0 ? { actingObjectives } : {}),
-      ...(firstFrameLock ? { firstFrameLock } : {}),
+      name: scene.name,
+      sceneContext: sceneContext || undefined,
+      emotionArc: asString(macroValue("emotionArc"), scene.emotionArc ?? ""),
       ...(lightingDirection ? { lightingDirection } : {}),
       shots,
   };
-  // Validate AI prose against the newly generated shots, not the obsolete
-  // pre-compile scene. Missing or rejected AI layers are deterministically
-  // rebuilt from the same structured scene so the document is never blank.
-  const directorLayerIssues = candidateDirectorLayers
-    ? validateDirectorLayers(candidateDirectorLayers, project, structuredScene)
-    : [];
+  // The editable director document is always generated locally from the
+  // normalized shots and current assets. There is no second AI prose channel.
   const generatedLayers = buildDirectorDocumentLayers(project, structuredScene, { locale });
-  const acceptedAiLayers = candidateDirectorLayers && !directorLayerIssues.some((issue) => issue.severity === "error")
-    ? candidateDirectorLayers
-    : {};
-  const directorLayers = { ...generatedLayers, ...acceptedAiLayers };
+  const directorLayers: Record<string, string> = { ...generatedLayers };
 
   return {
     scene: { ...structuredScene, directorLayers },
-    negativePrompt: asString(obj.negativePrompt, undefined),
     directorLayers,
-    ...(directorLayerIssues.length > 0 ? { directorLayerIssues } : {}),
   };
 }

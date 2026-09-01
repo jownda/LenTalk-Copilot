@@ -65,6 +65,55 @@ describe("spatial direction gate", () => {
   });
 });
 
+describe("cross-shot spatial inheritance gate", () => {
+  const characters = [
+    { id: "a", kind: "character" as const, name: "甲", description: "", referencePaths: [], lockLevel: "none" as const, tags: [] },
+    { id: "b", kind: "character" as const, name: "乙", description: "", referencePaths: [], lockLevel: "none" as const, tags: [] },
+  ];
+  const shot = (id: string, participants: SceneV2["shots"][number]["participants"], extra: Partial<SceneV2["shots"][number]> = {}): SceneV2["shots"][number] => ({
+    id, label: id, duration: "5s", framing: "Medium", lens: "50mm", movement: "Static", action: "保持位置", acting: "克制", direction: "left-to-right" as const,
+    participants, ...extra,
+  });
+  const sceneWith = (shots: SceneV2["shots"]): SceneV2 => ({
+    id: "scene-1", name: "Test", logline: "", location: "", time: "", weather: "Night", duration: "10s",
+    palette: "", lighting: "", environmentLock: true, staging: { characterOrder: ["a", "b"] }, shots,
+  });
+  const withCharacters = (scene: SceneV2): ProjectV2 => ({ ...project, assets: characters, scenes: [scene] });
+
+  it("detects a character jumping from screen-left to screen-right", () => {
+    const scene = sceneWith([
+      shot("1", [{ characterId: "a", role: "primary", position: "screen-left" }]),
+      shot("2", [{ characterId: "a", role: "primary", position: "screen-right" }]),
+    ]);
+    expect(checkSpatial(withCharacters(scene), scene).some((issue) => issue.code === "SPATIAL.POSITION_JUMP")).toBe(true);
+  });
+
+  it("detects an unmarked re-entry after an explicit exit", () => {
+    const scene = sceneWith([
+      shot("1", [{ characterId: "a", role: "primary", position: "screen-left" }], { action: "甲走出画面" }),
+      shot("2", [{ characterId: "a", role: "primary", position: "screen-left" }]),
+    ]);
+    expect(checkSpatial(withCharacters(scene), scene).some((issue) => issue.code === "SPATIAL.REENTRY_UNMARKED")).toBe(true);
+  });
+
+  it("detects an entrance direction that disagrees with the first position", () => {
+    const scene = sceneWith([
+      shot("1", []),
+      shot("2", [{ characterId: "a", role: "primary", position: "screen-right", entrance: "enters-left" }]),
+    ]);
+    const issue = checkSpatial(withCharacters(scene), scene).find((item) => item.code === "SPATIAL.ENTRANCE_POSITION_CONFLICT");
+    expect(issue?.severity).toBe("error");
+  });
+
+  it("detects a reversed shared character order", () => {
+    const scene = sceneWith([
+      shot("1", [{ characterId: "a", role: "primary" }, { characterId: "b", role: "supporting" }], { layout: { characterOrder: ["a", "b"] } }),
+      shot("2", [{ characterId: "a", role: "primary" }, { characterId: "b", role: "supporting" }], { layout: { characterOrder: ["b", "a"] } }),
+    ]);
+    expect(checkSpatial(withCharacters(scene), scene).some((issue) => issue.code === "SPATIAL.ORDER_JUMP")).toBe(true);
+  });
+});
+
 describe("audio continuity gate", () => {
   it("does not require subtitles when a scene contains dialogue", () => {
     const scene = makeScene({

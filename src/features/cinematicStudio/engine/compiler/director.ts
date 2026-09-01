@@ -6,12 +6,13 @@
  * - 光线 / 物理从技术 Profile 拆出为优先级锁段；
  * - 负面词局部锁：就近挂到 PHYSICS / LIGHTING / POSITIVE CONSTRAINTS，仅全局失败模式保留精简尾段（P0.3）。
  */
-import type { Asset, CameraBehavior, LightingDirection, ProjectV2, SceneV2, ShotV2 } from "../../shared-types";
+import type { ActionBeat, CameraBehavior, LightingDirection, ProjectV2, SceneV2, ShotV2 } from "../../shared-types";
 import { assetCanonicalDescription } from "../asset-naming";
 import { finalStyleDescription, getStyle, localizedStyleBrief } from "../styles";
 import {
   buildAssetRegistry, buildSceneAssetRegistry, renderAxisBreakNote, renderCharacterCountLock, renderPropDefaults, renderStateChain, resolveCharacterOrder,
 } from "./renderer";
+import { localizePromptValue } from "../i18n/lexicon";
 import { renderLocalLocks, type PromptLocale, type ReferenceSyntax } from "./sections";
 import { getCamera, getLens } from "../gear";
 import { legacyFocalLengthToFov, lensById, lensByFov, physicsAnchorById } from "../presets";
@@ -25,7 +26,7 @@ export interface DirectorOptions {
 
 /**
  * 导演文档分层（P0.5）：canonical 层序 + 双语标题。
- * 层 key 稳定，供 AI 生成 / UI 编辑 / 编译器消费三处共用。
+ * 层 key 稳定，供本地编译器 / UI 编辑 / 最终生成三处共用。
  * 每个 directorLayers[key] 的值是「含段头在内的完整文本块」。
  */
 export const DIRECTOR_LAYERS = [
@@ -46,6 +47,8 @@ export const DIRECTOR_LAYERS = [
 
 export type DirectorLayerKey = (typeof DIRECTOR_LAYERS)[number]["key"];
 export const DIRECTOR_LAYER_ORDER: readonly DirectorLayerKey[] = DIRECTOR_LAYERS.map((layer) => layer.key);
+/** 只在最终生成时根据结构化分镜和资产库重建，不作为导演文档的填写层。 */
+export const FINAL_GENERATED_DIRECTOR_LAYER_KEYS: ReadonlySet<DirectorLayerKey> = new Set(["activeReferences", "firstFrame"]);
 const SHOT_EXECUTION_LAYER = { zh: "镜头执行", en: "SHOT EXECUTION" } as const;
 
 export function directorLayerLabel(key: DirectorLayerKey, locale: "zh" | "en"): string {
@@ -131,6 +134,7 @@ function renderLocationMap(project: ProjectV2, scene: SceneV2, locale: PromptLoc
   ];
   const lightDirection = scene.lightingDirection?.direction?.trim();
   const lightSource = scene.lightingDirection?.primarySource?.trim() || scene.lighting?.trim();
+  const stagingImageToken = stagingReferenceImageToken(project, scene);
   const depth = [
     staging.spacing?.trim() ? (zh ? `人物间距：${staging.spacing.trim()}` : `character spacing: ${staging.spacing.trim()}`) : "",
     firstBehavior?.depthOfField?.trim() ? (zh ? firstBehavior.depthOfField.trim() : firstBehavior.depthOfField.trim()) : "",
@@ -141,6 +145,9 @@ function renderLocationMap(project: ProjectV2, scene: SceneV2, locale: PromptLoc
   if (staging.locationAssetId) lines.push(zh
     ? "空间基准：使用地点参考的真实地理关系、材质、地标和相关光线方向；不继承参考图的相机角度、取景或构图。"
     : "Spatial basis: use the location reference for geography, materials, landmarks and relevant light direction; do not inherit its camera angle, framing or composition.");
+  if (stagingImageToken) lines.push(zh
+    ? `站位参考图：${stagingImageToken}；仅用于人物位置、180°轴方向、人物间距、从左到右排序和空间锚点，不控制地点材质、光线、氛围、机位或取景。`
+    : `Staging reference image: ${stagingImageToken}; controls character positions, the 180-degree axis, spacing, left-to-right order and spatial anchors only, not location materials, lighting, atmosphere, camera position or framing.`);
   if (cameraPosition.some(Boolean)) lines.push(zh ? `相机位置：${join(cameraPosition)}` : `Camera position: ${join(cameraPosition)}`);
   if (cameraFacing.some(Boolean)) lines.push(zh ? `相机朝向：${join(cameraFacing)}` : `Camera facing: ${join(cameraFacing)}`);
   if (foreground.length > 0) lines.push(zh ? `前景：${foreground.join("、")}` : `Foreground: ${foreground.join(", ")}`);
@@ -167,19 +174,7 @@ function renderLocationMap(project: ProjectV2, scene: SceneV2, locale: PromptLoc
 function renderActiveReferences(project: ProjectV2, scene: SceneV2, locale: PromptLocale, syntax: ReferenceSyntax): string {
   const zh = locale === "zh";
   const seenAssetIds = new Set<string>();
-  let imageIndex = 0;
-  let audioIndex = 0;
-  const profileText = (asset: Asset, key: "masterProfile" | "voicePrompt") => {
-    const profile = asset.actingProfile;
-    if (key === "masterProfile") {
-      return zh
-        ? (profile?.masterProfileZh?.trim() || profile?.masterProfile?.trim() || "")
-        : (profile?.masterProfile?.trim() || profile?.masterProfileZh?.trim() || "");
-    }
-    return zh
-      ? (profile?.voicePromptZh?.trim() || profile?.voicePrompt?.trim() || "")
-      : (profile?.voicePrompt?.trim() || profile?.voicePromptZh?.trim() || "");
-  };
+  const imageTokensByAssetId = buildSceneImageTokenMap(project, scene);
   const renderReferenceLines = (shot: ShotV2) => {
     const registry = buildAssetRegistry(project, scene, shot);
     return registry.orderedAssets.flatMap((asset) => {
@@ -211,21 +206,15 @@ function renderActiveReferences(project: ProjectV2, scene: SceneV2, locale: Prom
       const holder = registry.orderedAssets.find((candidate) => candidate.id === id);
       if (!holder) return id;
       const holderReference = holder.referenceTag?.trim() || holder.name.trim() || holder.id;
-      return `@${holderReference}`;
+      const imageToken = imageTokensByAssetId.get(holder.id);
+      return `@${holderReference}${imageToken ? ` ${imageToken}` : ""}`;
     };
     const propDefaults = renderPropDefaults(asset, locale, holderName);
     const propScope = propDefaults ? `；${propDefaults}` : "";
-    const imageToken = asset.referencePaths?.[0]?.trim() ? ` [image${++imageIndex}]` : "";
-    const acting = asset.kind === "character" ? profileText(asset, "masterProfile") : "";
-    const voiceLock = asset.kind === "character" ? profileText(asset, "voicePrompt") : "";
-    const actingToken = acting ? (zh ? `；表演模板：${acting}` : `; Acting template: ${acting}`) : "";
-    const voiceLockToken = voiceLock ? (zh ? `；声音锁：${voiceLock}` : `; Voice lock: ${voiceLock}`) : "";
-    const voiceToken = asset.voiceClip?.trim()
-      ? (zh ? `；声音参考：@audio${++audioIndex}` : `; Voice reference: @audio${++audioIndex}`)
-      : "";
+    const imageToken = imageTokensByAssetId.get(asset.id) ? ` ${imageTokensByAssetId.get(asset.id)}` : "";
     return [zh
-      ? `${tag}${imageToken}：${nameAndDescription}${anchorText}${locationScope}${propScope}${actingToken}${voiceLockToken}${voiceToken}。`
-      : `${tag}${imageToken}: ${nameAndDescription}${anchorText}${locationScope}${propScope}${actingToken}${voiceLockToken}${voiceToken}.`];
+      ? `${tag}${imageToken}：${nameAndDescription}${anchorText}${locationScope}${propScope}。`
+      : `${tag}${imageToken}: ${nameAndDescription}${anchorText}${locationScope}${propScope}.`];
     }).join("\n");
   };
   return scene.shots
@@ -237,6 +226,24 @@ function renderActiveReferences(project: ProjectV2, scene: SceneV2, locale: Prom
     })
     .filter(Boolean)
     .join("\n\n");
+}
+
+/** 场景内图片引用编号只生成一次，所有重复出现的 @资产都复用同一个 [imageN]。 */
+function buildSceneImageTokenMap(project: ProjectV2, scene: SceneV2): Map<string, string> {
+  const result = new Map<string, string>();
+  let imageIndex = 0;
+  for (const asset of buildSceneAssetRegistry(project, scene).orderedAssets) {
+    if (asset.referencePaths?.[0]?.trim()) result.set(asset.id, `[image${++imageIndex}]`);
+  }
+  return result;
+}
+
+/** 站位参考图紧跟活动资产图片，随后才是首帧参考图；顺序须与 mediaReferences 保持一致。 */
+function stagingReferenceImageToken(project: ProjectV2, scene: SceneV2): string | undefined {
+  if (!scene.staging?.stagingReferenceImage?.trim()) return undefined;
+  const assetImageCount = buildSceneAssetRegistry(project, scene).orderedAssets
+    .filter((asset) => asset.referencePaths?.[0]?.trim()).length;
+  return `[image${assetImageCount + 1}]`;
 }
 
 function push(list: string[], header: string, body: string): void {
@@ -257,6 +264,16 @@ function hasPlanningMeta(text: string): boolean {
   return /前情|故事梗概|梗概|上集|回顾|continuity|连续性问题|连续性：|警告|warning|AI\s*编译|编译说明|user reference|logline|prior context|previous episode|评分|参考/iu.test(text);
 }
 
+/** 拒绝没有叙事信息的默认占位句，避免空洞文本进入最终提示词。 */
+function hasGenericSceneContext(text: string): boolean {
+  return /可见主体|当前空间|当前动作状态|继续当前动作|角色保持坐姿|维持当前动作|保持当前|既定在场状态|已建立的(?:画面|屏幕)?状态|established (?:on-screen|screen) state|visible subjects remain|continue the current action|maintain the current action|current space|current action state/iu.test(text);
+}
+
+/** 场景上下文不承载场号、镜号或分段标签；详细节奏交给 ACTION TIMING。 */
+function hasSceneHeaderMeta(text: string): boolean {
+  return /(?:第\s*\d+\s*(?:场|镜|段)|(?:scene|shot|segment)\s*\d+)/iu.test(text);
+}
+
 /** 场景语境是面向当前界面的成片文本；不让另一种语言的自由文本穿透回退。 */
 function hasLocaleMismatch(text: string, locale: PromptLocale): boolean {
   return locale === "zh" ? /[A-Za-z]{2,}/.test(text) : /[\u3400-\u9fff]/.test(text);
@@ -267,15 +284,27 @@ function localeText(value: string | undefined, locale: PromptLocale): string {
   return text && !hasLocaleMismatch(text, locale) ? text : "";
 }
 
-function durationText(value: string | undefined, locale: PromptLocale): string {
-  const text = value?.trim() ?? "";
-  const match = text.match(/\d+(?:\.\d+)?/);
-  if (!match) return locale === "zh" ? text : "";
-  return locale === "zh" ? `${match[0]}秒` : `${match[0]} seconds`;
-}
-
 function firstSentence(value: string): string {
   return value.split(/[。！？.!?]/, 1)[0]?.trim() ?? "";
+}
+
+/** 从梗概中截出第一个不涉及未出场角色的事件片段，避免后续剧情污染当前镜头。 */
+function trimSynopsisToActiveEvent(text: string, project: ProjectV2, scene: SceneV2): string {
+  const characterAssets = (project.assets ?? []).filter((asset) => asset.kind === "character" && asset.name.trim());
+  const activeIds = new Set((scene.shots ?? []).flatMap((shot) => (shot.participants ?? []).map((item) => item.characterId)));
+  if (activeIds.size === 0) (scene.staging?.characterOrder ?? []).forEach((id) => activeIds.add(id));
+  let result = text.trim();
+  for (const asset of characterAssets) {
+    if (activeIds.has(asset.id)) continue;
+    const index = result.indexOf(asset.name.trim());
+    if (index < 0) continue;
+    const before = result.slice(0, index);
+    const commaBoundary = Math.max(before.lastIndexOf("，"), before.lastIndexOf(","), before.lastIndexOf("；"), before.lastIndexOf(";"));
+    const andBoundary = Math.max(before.lastIndexOf("并"), before.toLowerCase().lastIndexOf(" and "));
+    const boundary = Math.max(commaBoundary, andBoundary);
+    result = result.slice(0, boundary >= 0 ? boundary : index).trim();
+  }
+  return result;
 }
 
 function countSceneContextSentences(text: string): number {
@@ -284,49 +313,95 @@ function countSceneContextSentences(text: string): number {
   return ends + (/[。！？.!?]$/.test(text.trim()) ? 0 : 1);
 }
 
-/** 取第一个可见动作：优先首镜首节拍，其次首镜动作。 */
-function firstVisibleAction(scene: SceneV2): string | undefined {
+/** 提取当前故事梗概的第一条事件，并截掉未出场角色之后的后续剧情。 */
+function currentSynopsis(project: ProjectV2, scene: SceneV2, locale: PromptLocale): string | undefined {
+  const synopsis = trimSynopsisToActiveEvent(firstSentence(localeText(scene.logline, locale)).slice(0, 240), project, scene);
+  return synopsis && !hasPlanningMeta(synopsis) && !hasGenericSceneContext(synopsis) && !hasInactiveCharacter(synopsis, project, scene)
+    ? synopsis
+    : undefined;
+}
+
+/** 提取当前镜头的可见补充动作；故事梗概仍是场景上下文的主线。 */
+function firstStructuredAction(project: ProjectV2, scene: SceneV2, locale: PromptLocale): string | undefined {
+  let shotActionFallback: string | undefined;
   for (const shot of scene.shots ?? []) {
     const beat = [...(shot.beats ?? [])]
       .sort((a, b) => a.order - b.order)
       .find((item) => item.actionText?.trim() || item.verb?.trim());
-    const text = beat?.actionText?.trim() || beat?.verb?.trim();
-    if (text) return text;
-    if (shot.action?.trim()) return shot.action.trim();
+    const text = localeText(beat?.actionText, locale) || localeText(beat?.verb, locale);
+    if (text && !hasGenericSceneContext(text) && !hasInactiveCharacter(text, project, scene)) return text;
+    const shotAction = localeText(shot.action, locale);
+    if (!shotActionFallback && shotAction && !hasGenericSceneContext(shotAction) && !/continue the scene naturally|natural, restrained performance|保持当前|自然发展/iu.test(shotAction) && !hasInactiveCharacter(shotAction, project, scene)) shotActionFallback = shotAction;
   }
+  if (shotActionFallback) return shotActionFallback;
+  if (localeText(scene.dialogue, locale)) return locale === "zh" ? "围绕现场对白展开交流" : "exchange the scene's scripted dialogue";
   return undefined;
+}
+
+/** 梗概主线加上当前镜头补充动作，去掉重复内容并保持不超过两句。 */
+function combineSceneContextEvents(synopsis: string | undefined, action: string | undefined, locale: PromptLocale): string {
+  const primary = synopsis?.trim() ?? "";
+  const secondary = action?.trim() ?? "";
+  if (!primary) return secondary;
+  if (!secondary) return primary;
+  const normalize = (value: string) => value.toLocaleLowerCase().replace(/[\s，,；;。.!！？?：:]/g, "");
+  const primaryKey = normalize(primary);
+  const secondaryKey = normalize(secondary);
+  if (primaryKey.includes(secondaryKey) || secondaryKey.includes(primaryKey)) return primary;
+  return locale === "zh" ? `${primary}；此刻${secondary}` : `${primary}. At this moment, ${secondary}`;
+}
+
+function activeCharacterNames(project: ProjectV2, scene: SceneV2, locale: PromptLocale): string[] {
+  const assets = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
+  const ids = (scene.shots ?? []).flatMap((shot) => (shot.participants ?? []).map((item) => item.characterId));
+  if (ids.length === 0) ids.push(...(scene.staging?.characterOrder ?? []));
+  return [...new Set(ids)]
+    .map((id) => localeText(assets.get(id)?.name, locale))
+    .filter(Boolean);
+}
+
+function hasInactiveCharacter(text: string, project: ProjectV2, scene: SceneV2): boolean {
+  const characterAssets = (project.assets ?? []).filter((asset) => asset.kind === "character" && asset.name.trim());
+  const activeIds = new Set((scene.shots ?? []).flatMap((shot) => (shot.participants ?? []).map((item) => item.characterId)));
+  if (activeIds.size === 0) (scene.staging?.characterOrder ?? []).forEach((id) => activeIds.add(id));
+  return characterAssets.some((asset) => text.includes(asset.name.trim()) && !activeIds.has(asset.id));
+}
+
+export function isSceneContextUsable(project: ProjectV2, scene: SceneV2, text: string, locale: PromptLocale): boolean {
+  const context = stripSceneContextHeading(text.trim());
+  return Boolean(context)
+    && !hasPlanningMeta(context)
+    && !hasGenericSceneContext(context)
+    && !hasSceneHeaderMeta(context)
+    && !hasLocaleMismatch(context, locale)
+    && !hasInactiveCharacter(context, project, scene)
+    && countSceneContextSentences(context) <= 2;
 }
 
 /**
  * P0 场景上下文：最终提示词第一段。
  * 优先使用 AI 生成的 sceneContext（剥掉段头、剔除规划元信息）；
- * 无可用内容时从结构化数据确定性回退：场景名 + 总时长 + 地点/时间/天气 + 首帧参与角色 + 第一个可见动作。
- * 绝不允许使用用户前情/故事梗概原文。
+ * 无可用内容时从当前故事梗概或结构化数据确定性提取一条当前事件摘要；不原样复制整段梗概。
  */
 function renderSceneContext(project: ProjectV2, scene: SceneV2, locale: PromptLocale): string {
   const zh = locale === "zh";
   const explicit = stripSceneContextHeading(scene.sceneContext?.trim() ?? "");
-  if (explicit && !hasPlanningMeta(explicit) && !hasLocaleMismatch(explicit, locale)
-    && countSceneContextSentences(explicit) <= 3) return explicit;
+  if (isSceneContextUsable(project, scene, explicit, locale)) return explicit;
 
-  const facts: string[] = [];
-  const name = localeText(scene.name, locale);
-  const duration = durationText(scene.duration, locale);
-  const opening = [name, duration].filter(Boolean).join(zh ? "，" : ", ");
-  if (opening) facts.push(zh ? `${opening}。` : `${opening}.`);
-  const where = [scene.location, scene.time, scene.weather].map((value) => localeText(value, locale)).filter(Boolean).join(zh ? "，" : ", ");
-  if (where) facts.push(zh ? `发生在${where}。` : `It takes place in ${where}.`);
-  const firstShot = scene.shots?.[0];
-  const visibleIds = firstShot?.participants?.map((participant) => participant.characterId).filter(Boolean)
-    ?? (firstShot?.characterId ? [firstShot.characterId] : []);
-  const byId = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
-  const visible = visibleIds.map((id) => localeText(byId.get(id)?.name, locale)).filter(Boolean);
-  const visibleText = visible.length > 0
-    ? (zh ? `画面内有：${visible.join("、")}` : `In frame: ${visible.join(", ")}`)
-    : (zh ? "画面内有主要角色" : "The visible characters are in frame");
-  const firstAction = localeText(firstSentence(firstVisibleAction(scene) ?? ""), locale);
-  facts.push(`${visibleText}${firstAction ? (zh ? `，${firstAction}` : `, ${firstAction}`) : ""}${zh ? "。" : "."}`);
-  return facts.join(zh ? "" : " ");
+  const assets = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
+  const locationAsset = scene.staging?.locationAssetId ? assets.get(scene.staging.locationAssetId) : undefined;
+  const location = localeText(scene.location, locale) || localeText(locationAsset?.name, locale);
+  const conditions = [scene.time, scene.weather].map((value) => localeText(value, locale)).filter(Boolean);
+  const names = activeCharacterNames(project, scene, locale);
+  const action = firstStructuredAction(project, scene, locale);
+  const narrative = combineSceneContextEvents(currentSynopsis(project, scene, locale), action ? firstSentence(action).slice(0, 180) : undefined, locale);
+  const setting = location
+    ? (conditions.length > 0 ? `${location}${zh ? `，${conditions.join("、")}` : `, ${conditions.join(", ")}`}` : location)
+    : conditions.join(zh ? "、" : ", ");
+  const place = setting ? (zh ? `在${setting}中` : ` in ${setting}`) : (zh ? "在当前空间中" : " in the current space");
+  const subjects = names.length > 0 ? names.join(zh ? "、" : ", ") : (zh ? "画面中的主体" : "the visible subjects");
+  if (narrative) return zh ? `${subjects}${place}${narrative.startsWith(subjects) ? "" : "，"}${narrative}。` : `${subjects}${place}, ${narrative}.`;
+  return zh ? `${subjects}${place}，当前事件未提供可提取的剧情信息。` : `${subjects}${place}; no current story event was provided for this clip.`;
 }
 
 /** P1.2 OPTICS 层：可观测结果优先于焦距与品牌。长镜头统一 FOV 锁；多镜头逐镜锁定。 */
@@ -377,13 +452,23 @@ function renderOpticsLayer(scene: SceneV2, locale: PromptLocale): string {
  */
 function renderDialogueSoundLayer(project: ProjectV2, scene: SceneV2, locale: PromptLocale): string {
   const zh = locale === "zh";
+  const assetsById = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
+  const imageTokensByAssetId = buildSceneImageTokenMap(project, scene);
   const names = new Map((project.assets ?? []).map((asset) => [asset.id, asset.name.trim() || asset.id]));
   const dialogueOrder: string[] = [];
+  const voiceEvents: Array<{ characterId: string; shotIndex: number; beat: ActionBeat }> = [];
+  const vocalAudio = /叹息|喘息|呼吸|呻吟|喊|叫|笑|哭|咳嗽|哼|sigh|breath|groan|shout|yell|laugh|cry|cough|hum/i;
   for (const shot of scene.shots ?? []) {
+    const shotIndex = scene.shots.indexOf(shot);
     for (const beat of [...(shot.beats ?? [])].sort((a, b) => a.order - b.order)) {
       if (!beat.dialogue?.trim() || !beat.actorId) continue;
       const name = names.get(beat.actorId) ?? beat.actorId;
       dialogueOrder.push(zh ? `${name}说“${beat.dialogue.trim()}”` : `${name} says "${beat.dialogue.trim()}"`);
+      voiceEvents.push({ characterId: beat.actorId, shotIndex, beat });
+    }
+    for (const beat of [...(shot.beats ?? [])].sort((a, b) => a.order - b.order)) {
+      if (beat.dialogue?.trim() || !beat.actorId || !beat.audio?.trim() || !vocalAudio.test(beat.audio)) continue;
+      voiceEvents.push({ characterId: beat.actorId, shotIndex, beat });
     }
   }
   const audio = project.audioPlan;
@@ -407,6 +492,53 @@ function renderDialogueSoundLayer(project: ProjectV2, scene: SceneV2, locale: Pr
     lines.push(zh
       ? "每句对白结束后保留约 0.5–1 秒环境声尾巴；只有明确的抢话或即时打断才省略该尾巴。"
       : "After each line, retain roughly 0.5–1 second of environmental sound tail; omit it only for an explicit interruption or immediate overlap.");
+  }
+
+  // Voice locks belong beside their shot-local delivery, not inside the asset
+  // identity line. This preserves the stable acoustic identity while making
+  // the actual line, sigh, and silence executable in the AUDIO section.
+  const voiceCharacterIds = [...new Set(voiceEvents.map((event) => event.characterId))];
+  let audioIndex = 0;
+  for (const characterId of voiceCharacterIds) {
+    const asset = assetsById.get(characterId);
+    if (!asset || asset.kind !== "character") continue;
+    const referenceName = asset.referenceTag?.trim() || asset.name.trim() || asset.id;
+    const imageToken = imageTokensByAssetId.get(asset.id);
+    const tag = `@${referenceName}${imageToken ? ` ${imageToken}` : ""}`;
+    const voicePrompt = locale === "zh"
+      ? (asset.actingProfile?.voicePromptZh?.trim() || asset.actingProfile?.voicePrompt?.trim() || "")
+      : (asset.actingProfile?.voicePrompt?.trim() || asset.actingProfile?.voicePromptZh?.trim() || "");
+    const voiceReference = asset.voiceClip?.trim()
+      ? (() => {
+        const token = `@audio${++audioIndex}`;
+        return zh ? `；声音参考：${token}` : `; voice reference: ${token}`;
+      })()
+      : "";
+    const label = zh ? `${asset.name.trim() || asset.id}声音` : `${asset.name.trim() || asset.id} VOICE`;
+    const characterEvents = voiceEvents.filter((event) => event.characterId === characterId);
+    const linesForCharacter = [
+      `${label}${zh ? "：" : ": "}${tag}${voicePrompt ? (zh ? `；声音锁：${voicePrompt}` : `; voice lock: ${voicePrompt}`) : ""}${voiceReference}${zh ? "。" : "."}`,
+    ];
+    for (const event of characterEvents) {
+      const beat = event.beat;
+      const shotLabel = scene.shots[event.shotIndex]?.label || `${event.shotIndex + 1}`;
+      const localCues = [
+        beat.tactic?.trim() ? (zh ? `策略为${beat.tactic.trim()}` : `the tactic is ${beat.tactic.trim()}`) : "",
+        beat.beatChange?.trim() ? beat.beatChange.trim() : "",
+      ].filter(Boolean).join(zh ? "，" : ", ");
+      const delivery = localCues ? (zh ? `；本镜头${localCues}` : `; in this shot ${localCues}`) : "";
+      const content = beat.dialogue?.trim()
+        ? (zh ? `台词：“${beat.dialogue.trim()}”` : `line: "${beat.dialogue.trim()}"`)
+        : (zh ? `非语言人声：${beat.audio!.trim()}` : `non-verbal vocalization: ${beat.audio!.trim()}`);
+      linesForCharacter.push(zh
+        ? `镜头 ${event.shotIndex + 1}（${shotLabel}）：${content}${delivery}。`
+        : `SHOT ${event.shotIndex + 1} (${shotLabel}): ${content}${delivery}.`);
+    }
+    const lastEvent = characterEvents[characterEvents.length - 1];
+    if (lastEvent?.beat.dialogue?.trim()) {
+      linesForCharacter.push(zh ? "最后一句台词结束后保持沉默，不添加额外对白。" : "After the final line, remain silent with no extra dialogue.");
+    }
+    lines.push(...linesForCharacter);
   }
   return lines.join("\n");
 }
@@ -448,17 +580,54 @@ function renderCameraLayer(scene: SceneV2, locale: PromptLocale): string {
 
 /** P1.4 首帧占位锁：确保首帧已含所有必需主体，无空镜开场。 */
 function renderFirstFrameLayer(project: ProjectV2, scene: SceneV2, locale: PromptLocale): string {
+  const shots = scene.shots ?? [];
+  if (shots.length === 0) return "";
   const lock = scene.firstFrameLock;
-  if (!lock) return "";
   const zh = locale === "zh";
-  const body = lock.occupancyStatement?.trim() || (zh
-    ? "第一帧已包含所有必需主体，且处于正确位置。无空镜建立镜头。无延迟角色亮相。首帧不得缺少必需主体。空间关系在第一帧立即可读。"
-    : "The first visible frame already contains all required subjects in their correct positions. No empty establishing frame. No delayed character reveal. No opening frame without the required subjects. The spatial relationship is readable immediately in frame one.");
+  const assets = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
+  const frameParticipants = (shot: ShotV2) => (shot.participants ?? []).filter((participant) => participant.entrance !== "enters-left" && participant.entrance !== "enters-right");
+  const renderParticipant = (participant: NonNullable<ShotV2["participants"]>[number]) => {
+    const name = assets.get(participant.characterId)?.name?.trim() || participant.characterId;
+    const details = [
+      participant.position?.trim() ? (zh ? `位置：${participant.position.trim()}` : `position: ${participant.position.trim()}`) : "",
+      participant.facing?.trim() ? (zh ? `朝向：${participant.facing.trim()}` : `facing: ${participant.facing.trim()}`) : "",
+      participant.torsoFacing?.trim() ? (zh ? `身体朝向：${participant.torsoFacing.trim()}` : `torso facing: ${participant.torsoFacing.trim()}`) : "",
+      participant.eyeline?.trim() ? (zh ? `视线：${participant.eyeline.trim()}` : `eyeline: ${participant.eyeline.trim()}`) : "",
+    ].filter(Boolean).join(zh ? "，" : ", ");
+    return details ? `${name}${zh ? `（${details}）` : ` (${details})`}` : name;
+  };
+  const generatedFrames = shots.flatMap((shot, index) => {
+    const participants = frameParticipants(shot);
+    if (participants.length === 0) return [];
+    const behavior = shot.cameraBehavior ?? {};
+    const view = [
+      shot.framing?.trim() ? (zh ? shot.framing.trim() : shot.framing.trim()) : "",
+      behavior.angle?.trim() ? (zh ? behavior.angle.trim() : behavior.angle.trim()) : "",
+    ].filter(Boolean).join(zh ? "，" : ", ");
+    const subjectText = participants.map(renderParticipant).join(zh ? "、" : ", ");
+    const prefix = scene.shootingMode === "multi-shot"
+      ? (zh ? `第 ${index + 1} 段首帧` : `SHOT ${index + 1} FIRST FRAME`)
+      : (zh ? "长镜头首帧" : "LONG-TAKE FIRST FRAME");
+    const occupancy = zh
+      ? `第一可见帧已包含本段实际出镜人物，空间关系立即可读${scene.shootingMode === "multi-shot" ? "" : "，无空镜建立镜头"}`
+      : `The first visible frame already contains every character visible in this segment, with the spatial relationship readable immediately${scene.shootingMode === "multi-shot" ? "" : "; no empty establishing frame"}`;
+    return [`${prefix}：${[view, subjectText, occupancy].filter(Boolean).join(zh ? "；" : "; ")}。`];
+  });
+  const explicitLock = lock?.occupancyStatement?.trim();
+  const defaultLock = lock && (lock.requiredSubjectIds?.length ?? 0) > 0
+    ? (zh
+      ? "首帧锁定：第一帧已包含所有必需主体，且处于正确位置。无空镜建立镜头。无延迟角色亮相。首帧不得缺少锁定主体。空间关系在第一帧立即可读。"
+      : "First-frame lock: the first visible frame already contains all required subjects in their correct positions. No empty establishing frame. No delayed character reveal. No locked subject may be missing. The spatial relationship is readable immediately in frame one.")
+    : "";
+  const body = [explicitLock || defaultLock, ...generatedFrames].filter(Boolean).join("\n") || (zh
+    ? "首帧占位将在最终生成时根据当前镜头参与者重建。"
+    : "First-frame occupancy is rebuilt at final generation from the current shot participants.");
   const activeAssetImageCount = buildSceneAssetRegistry(project, scene).orderedAssets
     .filter((asset) => asset.referencePaths?.[0]?.trim()).length;
-  const referenceImages = (lock.referenceImages ?? []).map((source) => source.trim()).filter(Boolean);
+  const stagingReferenceImageCount = scene.staging?.stagingReferenceImage?.trim() ? 1 : 0;
+  const referenceImages = (lock?.referenceImages ?? []).map((source) => source.trim()).filter(Boolean);
   if (referenceImages.length === 0) return body;
-  const tokens = referenceImages.map((_, index) => `[image${activeAssetImageCount + index + 1}]`).join(zh ? "、" : ", ");
+  const tokens = referenceImages.map((_, index) => `[image${activeAssetImageCount + stagingReferenceImageCount + index + 1}]`).join(zh ? "、" : ", ");
   return `${body}\n${zh ? `首帧参考图：${tokens}` : `First-frame reference images: ${tokens}`}`;
 }
 
@@ -476,19 +645,26 @@ function renderShotExecutionLayer(
 ): string {
   const zh = locale === "zh";
   const assetById = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
-  const displayName = (id: string) => assetById.get(id)?.name?.trim() || id;
+  const imageTokensByAssetId = buildSceneImageTokenMap(project, scene);
   const fmt = (sec: number) => {
-    const total = Math.round(sec);
-    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+    const totalHundredths = Math.max(0, Math.round(sec * 100));
+    const minutes = Math.floor(totalHundredths / 6000);
+    const seconds = (totalHundredths % 6000) / 100;
+    const wholeSeconds = String(Math.floor(seconds)).padStart(2, "0");
+    const fraction = seconds % 1 === 0
+      ? ""
+      : `.${String(Math.round((seconds % 1) * 100)).padStart(2, "0").replace(/0+$/, "")}`;
+    return `${minutes}:${wholeSeconds}${fraction}`;
   };
   const characterReference = (id: string) => {
     const asset = assetById.get(id);
     if (!asset) return id;
-    if (syntax !== "plain-text") return `@${asset.referenceTag?.trim() || asset.name.trim() || asset.id}`;
+    const imageToken = imageTokensByAssetId.get(id);
+    if (syntax !== "plain-text") return `@${asset.referenceTag?.trim() || asset.name.trim() || asset.id}${imageToken ? ` ${imageToken}` : ""}`;
     return asset.name.trim() || asset.id;
   };
   const fragment = (text: string) => text.trim().replace(/[。．.!！?？][”」』)）"']?$/, "");
-  const renderShotDetails = (shot: ShotV2): string[] => {
+  const renderShotDetails = (shot: ShotV2, shotWindow: { startSeconds: number; endSeconds: number }): string[] => {
     const beats = [...(shot.beats ?? [])].sort((a, b) => a.order - b.order);
     const participants = shot.participants ?? [];
     const participantIds = new Set(participants.map((participant) => participant.characterId));
@@ -497,46 +673,146 @@ function renderShotExecutionLayer(
       ...beats.map((beat) => beat.actorId).filter((id): id is string => typeof id === "string" && participantIds.has(id)),
     ])];
     const generalDetails = [shot.acting?.trim(), shot.eyeLife?.trim()].filter(Boolean).map((value) => fragment(value!));
-    const actionFallback = beats.length === 0 && shot.action?.trim() ? fragment(shot.action) : "";
     const lines: string[] = [];
 
     if (shot.propChangeDescription?.trim()) lines.push(zh
       ? `道具变化：${fragment(shot.propChangeDescription)}`
       : `Prop changes: ${fragment(shot.propChangeDescription)}`);
-    lines.push(...renderStateChain(project, shot, locale, syntax));
+    lines.push(...renderStateChain(project, shot, locale, syntax, imageTokensByAssetId));
 
+    // Action timing 规范：有节拍的镜头按事件切成时间块（0:00 to 0:03 式），
+    // 块内 = 主体位置 + 动作 + 节拍级事实；持续性的表演基调作为块外基线行。
+    const subjectWithPosition = (actorId: string) => {
+      const position = fragment(participants.find((item) => item.characterId === actorId)?.position ?? "");
+      const reference = characterReference(actorId);
+      return position ? `${reference}${zh ? `（${position}）` : ` (${position})`}` : reference;
+    };
+    const renderBeatParts = (beat: ActionBeat, actorId: string): string[] => {
+      const parts: string[] = [];
+      const action = beat.actionText?.trim() || beat.verb?.trim();
+      const targetId = beat.targetCharacterId ?? beat.targetPropId;
+      const target = targetId && targetId !== actorId ? characterReference(targetId) : "";
+      if (action) parts.push(fragment(action));
+      if (target) parts.push(zh ? `朝向${target}` : `toward ${target}`);
+      if (beat.targetBodyPart?.trim()) parts.push(zh ? `目标部位：${fragment(beat.targetBodyPart)}` : `target body part: ${fragment(beat.targetBodyPart)}`);
+      const cameraBehavior = shot.cameraBehavior;
+      const cameraBits = [
+        shot.movement?.trim() && shot.movement.toLowerCase() !== "static"
+          ? (zh ? `运动：${fragment(shot.movement)}` : `movement: ${fragment(shot.movement)}`)
+          : cameraBehavior && Object.values(cameraBehavior).some((value) => value?.trim())
+            ? (zh ? "保持当前机位" : "hold the current camera position")
+            : "",
+        cameraBehavior?.handheldQuality?.trim() ? (zh ? `手持：${fragment(cameraBehavior.handheldQuality)}` : `handheld: ${fragment(cameraBehavior.handheldQuality)}`) : "",
+        cameraBehavior?.focusBehavior?.trim() ? (zh ? `对焦：${fragment(cameraBehavior.focusBehavior)}` : `focus: ${fragment(cameraBehavior.focusBehavior)}`) : "",
+      ].filter(Boolean);
+      if (cameraBits.length > 0) parts.push(zh ? `相机行为：${cameraBits.join("，")}` : `camera behavior: ${cameraBits.join(", ")}`);
+      const beatPhysics = (shot.physicsAnchors ?? []).map((anchor) => {
+        const preset = physicsAnchorById(anchor.kind);
+        if (!preset) return "";
+        const points = (zh ? preset.pointsZh : preset.pointsEn).join(zh ? "、" : ", ");
+        const extra = anchor.detail?.trim();
+        return zh ? `${points}${extra ? `；${extra}` : ""}` : `${points}${extra ? `; ${extra}` : ""}`;
+      }).filter(Boolean);
+      if (beatPhysics.length > 0) parts.push(zh ? `物理：${beatPhysics.join("；")}` : `physics: ${beatPhysics.join("; ")}`);
+      if (beat.propState?.trim()) {
+        const prop = beat.targetPropId ? characterReference(beat.targetPropId) : "";
+        const propState = prop ? `${prop}，${fragment(beat.propState)}` : fragment(beat.propState);
+        parts.push(zh ? `关键道具状态：${propState}` : `critical prop state: ${propState}`);
+      }
+      if (beat.audio?.trim()) parts.push(zh ? `声音：${fragment(beat.audio)}` : `audio: ${fragment(beat.audio)}`);
+      const beatStates = [
+        ...(beat.stateBefore ?? []).map((state) => ({ label: zh ? "道具前置状态" : "prop state before", state })),
+        ...(beat.stateAfter ?? []).map((state) => ({ label: zh ? "道具后置状态" : "prop state after", state })),
+      ];
+      if (beatStates.length > 0) {
+        const stateText = beatStates.map(({ label, state }) => {
+          const stateBits = [
+            characterReference(state.propId),
+            state.holderCharacterId ? (zh ? `由${characterReference(state.holderCharacterId)}持有` : `held by ${characterReference(state.holderCharacterId)}`) : "",
+            state.position?.trim() ?? "",
+            state.state?.trim() ? localizePromptValue(state.state.trim(), locale) : "",
+          ].filter(Boolean).join(zh ? "，" : ", ");
+          return `${label}：${stateBits}`;
+        }).join(zh ? "；" : "; ");
+        parts.push(zh ? `关键${stateText}` : `critical ${stateText}`);
+      }
+      if (beat.tactic?.trim()) parts.push(zh ? `策略：${fragment(beat.tactic)}` : `tactic: ${fragment(beat.tactic)}`);
+      if (beat.subtext?.trim()) parts.push(zh ? `潜台词：${fragment(beat.subtext)}` : `subtext: ${fragment(beat.subtext)}`);
+      if (beat.beatChange?.trim()) parts.push(fragment(beat.beatChange));
+      if (beat.reactionBeforeLine?.trim()) parts.push(fragment(beat.reactionBeforeLine));
+      if (beat.dialogue?.trim()) parts.push(zh ? `说：“${beat.dialogue.trim()}”` : `says, "${beat.dialogue.trim()}"`);
+      if (beat.required) parts.push(zh ? "必须发生" : "MUST occur");
+      const forbidden = (beat.forbiddenTargets ?? []).filter((id) => id !== targetId).map(characterReference);
+      if (forbidden.length > 0) parts.push(zh ? `禁止目标：${forbidden.join("、")}` : `never target: ${forbidden.join(", ")}`);
+      if (beat.cutRule?.trim()) parts.push(zh ? `剪辑规则：${fragment(beat.cutRule)}` : `cut rule: ${fragment(beat.cutRule)}`);
+      if (beat.note?.trim()) parts.push(zh ? `备注：${fragment(beat.note)}` : `note: ${fragment(beat.note)}`);
+      return parts;
+    };
+
+    if (beats.length === 0) {
+      // 无节拍镜头没有可切分的事件, 维持镜头级输出。
+      const actionFallback = shot.action?.trim() ? fragment(shot.action) : "";
+      for (const actorId of actorIds) {
+        const participant = participants.find((item) => item.characterId === actorId);
+        const parts: string[] = [];
+        if (generalDetails.length > 0 && actorId === actorIds[0]) parts.push(...generalDetails);
+        if (participant?.acting?.trim()) parts.push(fragment(participant.acting));
+        if (participant?.eyeLife?.trim()) parts.push(fragment(participant.eyeLife));
+        if (actorId === actorIds[0] && actionFallback) parts.push(actionFallback);
+        if (parts.length > 0) lines.push(`${characterReference(actorId)}${zh ? "：" : ": "}${parts.join(zh ? "；" : " ")}${zh ? "。" : "."}`);
+      }
+      if (lines.length === 0) {
+        const fallback = [...generalDetails, actionFallback].filter(Boolean);
+        if (fallback.length > 0) lines.push(`${zh ? "镜头保持" : "The shot holds"}${zh ? "：" : ": "}${fallback.join(zh ? "；" : " ")}${zh ? "。" : "."}`);
+      }
+      return lines;
+    }
+
+    let generalUsed = false;
     for (const actorId of actorIds) {
       const participant = participants.find((item) => item.characterId === actorId);
       const parts: string[] = [];
-      if (generalDetails.length > 0 && actorId === actorIds[0]) parts.push(...generalDetails);
+      if (!generalUsed && generalDetails.length > 0) { parts.push(...generalDetails); generalUsed = true; }
       if (participant?.acting?.trim()) parts.push(fragment(participant.acting));
       if (participant?.eyeLife?.trim()) parts.push(fragment(participant.eyeLife));
-      for (const beat of beats.filter((item) => item.actorId === actorId)) {
-        const action = beat.actionText?.trim() || beat.verb?.trim();
-        const targetId = beat.targetCharacterId ?? beat.targetPropId;
-        const target = targetId && targetId !== actorId ? displayName(targetId) : "";
-        if (action) parts.push(fragment(action));
-        if (target) parts.push(zh ? `朝向${target}` : `toward ${target}`);
-        if (beat.targetBodyPart?.trim()) parts.push(zh ? `目标部位：${fragment(beat.targetBodyPart)}` : `target body part: ${fragment(beat.targetBodyPart)}`);
-        if (beat.duration != null && beat.duration > 0) parts.push(zh ? `节拍时长：${beat.duration}秒` : `beat duration: ${beat.duration}s`);
-        if (beat.tactic?.trim()) parts.push(zh ? `策略：${fragment(beat.tactic)}` : `tactic: ${fragment(beat.tactic)}`);
-        if (beat.subtext?.trim()) parts.push(zh ? `潜台词：${fragment(beat.subtext)}` : `subtext: ${fragment(beat.subtext)}`);
-        if (beat.beatChange?.trim()) parts.push(fragment(beat.beatChange));
-        if (beat.reactionBeforeLine?.trim()) parts.push(fragment(beat.reactionBeforeLine));
-        if (beat.dialogue?.trim()) parts.push(zh ? `说：“${beat.dialogue.trim()}”` : `says, "${beat.dialogue.trim()}"`);
-        if (beat.required) parts.push(zh ? "必须发生" : "MUST occur");
-        const forbidden = (beat.forbiddenTargets ?? []).filter((id) => id !== targetId).map(displayName);
-        if (forbidden.length > 0) parts.push(zh ? `禁止目标：${forbidden.join("、")}` : `never target: ${forbidden.join(", ")}`);
-        if (beat.cutRule?.trim()) parts.push(zh ? `剪辑规则：${fragment(beat.cutRule)}` : `cut rule: ${fragment(beat.cutRule)}`);
-        if (beat.note?.trim()) parts.push(zh ? `备注：${fragment(beat.note)}` : `note: ${fragment(beat.note)}`);
-      }
-      if (actionFallback && actorId === actorIds[0]) parts.push(actionFallback);
-      if (parts.length > 0) lines.push(`${characterReference(actorId)}${zh ? "：" : ": "}${parts.join(zh ? "；" : " ")}${zh ? "。" : "."}`);
+      if (parts.length > 0) lines.push(`${subjectWithPosition(actorId)}${zh ? "：" : ": "}${parts.join(zh ? "；" : " ")}${zh ? "。" : "."}`);
     }
 
-    if (lines.length === 0) {
-      const fallback = [...generalDetails, actionFallback].filter(Boolean);
-      if (fallback.length > 0) lines.push(`${zh ? "镜头保持" : "The shot holds"}${zh ? "：" : ": "}${fallback.join(zh ? "；" : " ")}${zh ? "。" : "."}`);
+    // 节拍时间优先使用场景绝对时间 startSeconds；未填写时才按 order 连续累计。
+    // 因此显式时间可以表达非连续事件和重叠事件，旧数据仍保持原有结果。
+    const windowSeconds = Math.max(0, shotWindow.endSeconds - shotWindow.startSeconds);
+    const knownDurations = beats.filter((beat) => beat.duration != null && beat.duration > 0);
+    const totalKnown = knownDurations.reduce((total, beat) => total + (beat.duration ?? 0), 0);
+    const unknownCount = beats.length - knownDurations.length;
+    const unknownShare = unknownCount > 0 ? (windowSeconds > totalKnown ? (windowSeconds - totalKnown) / unknownCount : 1) : 0;
+    let cursor = shotWindow.startSeconds;
+    const timedBeats: Array<{ beat: ActionBeat; actorId: string; blockStart: number; blockEnd: number; parts: string[] }> = [];
+    for (const beat of beats) {
+      const duration = beat.duration != null && beat.duration > 0 ? beat.duration : unknownShare;
+      const explicitStart = typeof beat.startSeconds === "number" && Number.isFinite(beat.startSeconds)
+        ? beat.startSeconds
+        : undefined;
+      const requestedStart = explicitStart ?? cursor;
+      // Explicit wall-clock times are user-authored facts. Preserve them even
+      // when the audit reports that they fall outside the shot window; never
+      // silently move a precisely timed event.
+      const blockStart = explicitStart === undefined
+        ? Math.max(shotWindow.startSeconds, Math.min(requestedStart, shotWindow.endSeconds))
+        : requestedStart;
+      const blockEnd = blockStart + duration;
+      cursor = Math.max(cursor, blockEnd);
+      if (!beat.actorId || !participantIds.has(beat.actorId)) continue;
+      const parts = renderBeatParts(beat, beat.actorId);
+      if (parts.length === 0) continue;
+      timedBeats.push({ beat, actorId: beat.actorId, blockStart, blockEnd, parts });
+    }
+    timedBeats.sort((a, b) => a.blockStart - b.blockStart || a.beat.order - b.beat.order);
+    for (const timed of timedBeats) {
+      const blockLabel = `${fmt(timed.blockStart)}${zh ? "–" : " to "}${fmt(timed.blockEnd)}`;
+      lines.push(`${blockLabel}${zh ? "：" : ": "}${subjectWithPosition(timed.actorId)}${zh ? "：" : ": "}${timed.parts.join(zh ? "；" : " ")}${zh ? "。" : "."}`);
+    }
+    if (!generalUsed && generalDetails.length > 0) {
+      lines.push(`${zh ? "镜头基调" : "Shot baseline"}${zh ? "：" : ": "}${generalDetails.join(zh ? "；" : " ")}${zh ? "。" : "."}`);
     }
     return lines;
   };
@@ -545,18 +821,26 @@ function renderShotExecutionLayer(
   for (const [index, shot] of (scene.shots ?? []).entries()) {
     const time = shotTimes.get(shot.id);
     if (!time) continue;
-    const details = renderShotDetails(shot);
+    const details = renderShotDetails(shot, time);
     const range = `${fmt(time.startSeconds)}${zh ? "–" : "-"}${fmt(time.endSeconds)}`;
     const prefix = scene.shootingMode === "multi-shot"
       ? (zh ? `镜头 ${index + 1} ${range}：` : `SHOT ${index + 1} ${range}:`)
       : (zh ? `${range}：` : `${range}:`);
-    const cut = index > 0 && scene.shootingMode === "multi-shot"
-      ? ({
-          "hard-cut": zh ? `硬切进入镜头 ${index + 1}；` : `Hard cut into shot ${index + 1}; `,
-          "match-cut": zh ? `动作匹配剪辑进入镜头 ${index + 1}；` : `Match cut into shot ${index + 1}; `,
-          overlap: zh ? `以声音或动作重叠进入镜头 ${index + 1}；` : `Enter shot ${index + 1} on sound or action overlap; `,
-        }[shot.cutStyle ?? scene.cutStyleDefault ?? "hard-cut"])
-      : "";
+    let cut = "";
+    if (index > 0 && scene.shootingMode === "multi-shot") {
+      const label = ({
+        "hard-cut": zh ? `硬切进入镜头 ${index + 1}` : `Hard cut into shot ${index + 1}`,
+        "match-cut": zh ? `动作匹配剪辑进入镜头 ${index + 1}` : `Match cut into shot ${index + 1}`,
+        overlap: zh ? `以声音或动作重叠进入镜头 ${index + 1}` : `Enter shot ${index + 1} on sound or action overlap`,
+      }[shot.cutStyle ?? scene.cutStyleDefault ?? "hard-cut"]);
+      // 每个切点必须有理由：优先复用上一镜节拍上写的剪辑规则。
+      const previousShot = (scene.shots ?? [])[index - 1];
+      const previousCutRule = [...(previousShot?.beats ?? [])]
+        .sort((a, b) => a.order - b.order)
+        .reverse()
+        .find((beat) => beat.cutRule?.trim())?.cutRule?.trim();
+      cut = `${label}${zh ? "；" : "; "}${previousCutRule ? `${zh ? "切换依据" : "cut reason"}：${fragment(previousCutRule)}${zh ? "；" : "; "}` : ""}`;
+    }
     blocks.push(`${prefix}${cut}${details.length > 0 ? `\n${details.join("\n")}` : ""}`);
   }
   return blocks.join("\n");
@@ -608,8 +892,8 @@ function renderStyleLayer(project: ProjectV2, locale: PromptLocale): string {
 export function compileDirectorSequence(project: ProjectV2, scene: SceneV2, options: DirectorOptions = {}): string {
   const syntax = options.syntax ?? "asset-id";
   const locale: PromptLocale = options.locale ?? "zh";
-  // AI directorLayers are source material only. The final export is always
-  // rebuilt from structured scene data so raw UI/inspector text cannot leak.
+  // The final export is always rebuilt from structured scene data so raw
+  // inspector text and stale generated prose cannot leak into executable data.
   const finalAudit = auditFinalPromptWithProject(scene, project.assets ?? []);
   const finalDocument = createFinalPromptDocument(scene, finalAudit);
   const shotTimes = finalDocument.shotTimes;
@@ -681,7 +965,7 @@ export function buildDirectorDocumentLayers(
   }).sort((a, b) => a.sectionStart - b.sectionStart);
   const layers: Partial<Record<DirectorLayerKey, string>> = {};
   for (const [index, section] of starts.entries()) {
-    if (!section.key) continue;
+    if (!section.key || FINAL_GENERATED_DIRECTOR_LAYER_KEYS.has(section.key)) continue;
     const body = source.slice(section.bodyStart, starts[index + 1]?.sectionStart).trim();
     if (body) layers[section.key] = body;
   }

@@ -7,16 +7,17 @@
  * - 硬约束：长镜头 / 多镜头 + 时长 + 必须发生 / 禁止发生
  * - 对白 + 情绪走向（可选）
  * - 音频计划：复用 AudioPlanEditor
- * 底部保留「AI编译提示词 / 最终生成」按钮与 AI 错误展示。
+ * 底部保留「导演分镜规划器 / 最终生成」按钮与 AI 错误展示。
  */
 import { useEffect, useState } from "react";
 import type { ActingObjective, ProjectV2, SceneStaging, SceneV2 } from "../../shared-types";
 import { Check, ChevronDown, Clapperboard, Copy, Film, Plus, RefreshCw, Sparkles, Trash2, X } from "lucide-react";
 import type { CopyZh, Locale } from "../i18n";
-import type { LenTalkChatModelOption } from "../providers/aiSettings";
+import type { LenTalkChatModelOption, ReasoningEffort } from "../providers/aiSettings";
 import type { SceneCompileProgress } from "../providers/ai";
 import AudioPlanEditor from "./AudioPlanEditor";
 import StagingEditor from "./StagingEditor";
+import type { CanvasImageSource } from "./DirectorLayersCard";
 import { getStyle, localizedStyleBrief, MASTER_STYLES, styleBriefDescription } from "../../engine";
 
 interface DirectorBriefCardProps {
@@ -24,9 +25,11 @@ interface DirectorBriefCardProps {
   scene: SceneV2;
   t: CopyZh;
   locale: Locale;
+  canvasImageSources: CanvasImageSource[];
   compileBusy: boolean;
   finalGenerateBusy: boolean;
   compileProgress: SceneCompileProgress;
+  compileReceivedChars: number;
   briefOptimizeBusy: boolean;
   aiCompileError: string;
   aiCompileErrorDetail: string;
@@ -49,6 +52,8 @@ interface DirectorBriefCardProps {
   chatModels: LenTalkChatModelOption[];
   selectedChatModel: string;
   onSelectChatModel(value: string): void;
+  selectedReasoningEffort: ReasoningEffort;
+  onSelectReasoningEffort(value: ReasoningEffort): void;
 }
 
 /** 多行文本 → string[]（按行拆分，过滤空行） */
@@ -56,10 +61,10 @@ const splitLines = (text: string): string[] => text.split(/\r?\n/).map((item) =>
 
 export default function DirectorBriefCard(props: DirectorBriefCardProps) {
   const {
-    project, scene, t, locale, compileBusy, finalGenerateBusy, compileProgress, briefOptimizeBusy, aiCompileError, aiCompileErrorDetail, aiErrorCopied, resumeAvailable, resumeBusy,
+    project, scene, t, locale, canvasImageSources, compileBusy, finalGenerateBusy, compileProgress, compileReceivedChars, briefOptimizeBusy, aiCompileError, aiCompileErrorDetail, aiErrorCopied, resumeAvailable, resumeBusy,
     onSelectScene, onAddScene, onDeleteScene, onRenameScene, onUpdateScene,
     onUpdateStaging, onUpdateProject, onClearGeneratedContent, onAiCompile, onAiOptimizeBrief, onLocalCompile, onCopyAiError, onResumeInterrupted,
-    chatModels, selectedChatModel, onSelectChatModel,
+    chatModels, selectedChatModel, onSelectChatModel, selectedReasoningEffort, onSelectReasoningEffort,
   } = props;
   const [pickingCharacter, setPickingCharacter] = useState(false);
   const [audioOpen, setAudioOpen] = useState(false);
@@ -80,27 +85,28 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
   const audio = project.audioPlan ?? { score: "none" as const, subtitles: false };
   const styleBrief = localizedStyleBrief(project, locale);
   const audioSummary = `${t.score} ${audio.score === "original-score" ? t.scoreOriginal : t.scoreNone} · ${t.subtitles} ${audio.subtitles ? t.subtitlesBurned : t.subtitlesNone} · ${t.diegeticMusic} ${(audio.diegeticMusic ?? []).length} · ${t.sfx} ${(audio.sfx ?? []).length}`;
-  const compileProgressText = compileProgress === "resuming"
-    ? t.aiResuming
-    : finalGenerateBusy
-    ? t.aiFinalWaiting
-    : locale === "zh"
+  const receivedText = compileReceivedChars > 0
+    ? (locale === "zh" ? ` · 已接收 ${compileReceivedChars.toLocaleString()} 字` : ` · ${compileReceivedChars.toLocaleString()} chars received`)
+    : "";
+  const compileProgressText = locale === "zh"
     ? ({
         preparing: "正在整理场景、资产与约束",
-        waiting: busySeconds >= 15 ? "仍在等待模型返回，连接保持中" : "请求已发出，正在等待模型生成",
+        waiting: finalGenerateBusy ? t.aiFinalWaiting : busySeconds >= 15 ? "仍在等待模型返回，连接保持中" : "请求已发出，正在等待模型生成",
+        streaming: "正在接收模型输出",
         resuming: "检测到连接中断，正在从已收到内容继续生成",
-        parsing: "模型已返回，正在解析分镜数据",
-        validating: "正在校验时长、镜头和资产引用",
+        parsing: finalGenerateBusy ? "模型已返回，正在整理最终提示词" : "模型已返回，正在解析分镜数据",
+        validating: finalGenerateBusy ? "正在整理最终提示词的最终格式" : "正在校验时长、镜头和资产引用",
         idle: "",
-      } satisfies Record<SceneCompileProgress, string>)[compileProgress]
+      } satisfies Record<SceneCompileProgress, string>)[compileProgress] + receivedText
     : ({
         preparing: "Preparing scene, assets, and constraints",
-        waiting: busySeconds >= 15 ? "Still waiting for the model; the connection remains open" : "Request sent; waiting for model generation",
+        waiting: finalGenerateBusy ? t.aiFinalWaiting : busySeconds >= 15 ? "Still waiting for the model; the connection remains open" : "Request sent; waiting for model generation",
+        streaming: "Receiving model output",
         resuming: "Connection interrupted; continuing from the received content",
-        parsing: "Model returned; parsing storyboard data",
-        validating: "Validating timing, shots, and asset references",
+        parsing: finalGenerateBusy ? "Model returned; assembling the final prompt" : "Model returned; parsing storyboard data",
+        validating: finalGenerateBusy ? "Formatting the final prompt" : "Validating timing, shots, and asset references",
         idle: "",
-      } satisfies Record<SceneCompileProgress, string>)[compileProgress];
+      } satisfies Record<SceneCompileProgress, string>)[compileProgress] + receivedText;
 
   const addCharacter = (id: string) => {
     if (order.includes(id)) return;
@@ -175,7 +181,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
 
     {/* 场景站位 */}
     <div className="brief-group">
-      <StagingEditor project={project} scene={scene} t={t} onChange={onUpdateStaging} />
+      <StagingEditor project={project} scene={scene} t={t} canvasImageSources={canvasImageSources} onChange={onUpdateStaging} />
     </div>
 
     {/* 风格描述：预制风格只辅助填充文本，不再占用独立的大型配方卡 */}
@@ -275,6 +281,17 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
           {chatModels.length === 0
             ? <option value="">{t.noChatModels}</option>
             : chatModels.map((option) => <option key={`${option.providerId}:${option.model}`} value={`${option.providerId}:${option.model}`}>{option.providerName} · {option.model}</option>)}
+        </select>
+        <ChevronDown size={13} />
+      </label>
+      <label className="brief-model-select brief-effort-select" title={t.reasoningEffortHint}>
+        <span>{t.reasoningEffort}</span>
+        <select value={selectedReasoningEffort} aria-label={t.reasoningEffort} onChange={(event) => onSelectReasoningEffort(event.target.value as ReasoningEffort)}>
+          <option value="">{t.reasoningDefault}</option>
+          <option value="low">{t.reasoningLow}</option>
+          <option value="medium">{t.reasoningMedium}</option>
+          <option value="high">{t.reasoningHigh}</option>
+          <option value="xhigh">{t.reasoningXHigh}</option>
         </select>
         <ChevronDown size={13} />
       </label>

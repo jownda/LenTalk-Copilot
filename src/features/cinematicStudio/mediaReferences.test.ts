@@ -22,10 +22,11 @@ describe("collectCinematicMediaReferences", () => {
     });
   });
 
-  it("appends first-frame-only reference images after active asset references", () => {
+  it("inserts the staging reference after active assets and before first-frame-only images", () => {
     const scene = {
       id: "scene", name: "测试", logline: "", location: "车厢", time: "夜", weather: "雨", duration: "8秒",
       palette: "", lighting: "", environmentLock: true,
+      staging: { stagingReferenceImage: "staging-layout" },
       firstFrameLock: { referenceImages: ["first-frame-a", "first-frame-b"] },
       shots: [{ id: "shot", label: "近景", duration: "3秒", framing: "近景", lens: "50mm", movement: "Static", action: "倾听", acting: "克制", direction: "left-to-right", characterId: "hero" }],
     } as SceneV2;
@@ -33,7 +34,7 @@ describe("collectCinematicMediaReferences", () => {
       assets: [{ id: "hero", kind: "character", name: "林sir", description: "", referencePaths: ["hero-image"], lockLevel: "none", tags: [] }],
     } as unknown as ProjectV2;
     expect(collectCinematicMediaReferences(project, scene).referenceImages).toEqual([
-      "hero-image", "first-frame-a", "first-frame-b",
+      "hero-image", "staging-layout", "first-frame-a", "first-frame-b",
     ]);
   });
 });

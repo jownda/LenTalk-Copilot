@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
 } from 'react';
@@ -17,6 +18,7 @@ import { CANVAS_NODE_TYPES, type TextAnnotationNodeData } from '@/features/canva
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
+import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
 import { useCanvasStore } from '@/stores/canvasStore';
 
 type TextAnnotationNodeProps = NodeProps & {
@@ -45,6 +47,15 @@ export const TextAnnotationNode = memo(({
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const [isEditing, setIsEditing] = useState(false);
   const content = typeof data.content === 'string' ? data.content : '';
+  const [contentDraft, setContentDraft] = useState(content);
+  const contentDraftRef = useRef(contentDraft);
+  const { flushCommit: flushContentCommit, scheduleCommit: scheduleContentCommit } =
+    useDebouncedNodeTextCommit({
+      nodeId: id,
+      field: 'content',
+      valueRef: contentDraftRef,
+      updateNodeData,
+    });
   const resolvedTitle = resolveNodeDisplayName(CANVAS_NODE_TYPES.textAnnotation, data);
   const resolvedWidth = Math.max(MIN_WIDTH, Math.round(width ?? DEFAULT_WIDTH));
   const resolvedHeight = Math.max(MIN_HEIGHT, Math.round(height ?? DEFAULT_HEIGHT));
@@ -54,6 +65,13 @@ export const TextAnnotationNode = memo(({
     }
     void openUrl(href);
   }, []);
+
+  useEffect(() => {
+    if (content !== contentDraftRef.current) {
+      contentDraftRef.current = content;
+      setContentDraft(content);
+    }
+  }, [content]);
 
   // 单击(未拖动)进入编辑; 链接/表单控件/标题按钮上的单击不进入编辑
   const handleNodeClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
@@ -113,11 +131,14 @@ export const TextAnnotationNode = memo(({
       {isEditing ? (
         <textarea
           autoFocus
-          value={content}
+          value={contentDraft}
           onChange={(event) => {
             const nextValue = event.target.value;
-            updateNodeData(id, { content: nextValue });
+            contentDraftRef.current = nextValue;
+            setContentDraft(nextValue);
+            scheduleContentCommit();
           }}
+          onBlur={flushContentCommit}
           placeholder={t('node.textAnnotation.placeholder')}
           className="nodrag nowheel h-full w-full resize-none border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-text-dark outline-none placeholder:text-text-muted/70"
         />
