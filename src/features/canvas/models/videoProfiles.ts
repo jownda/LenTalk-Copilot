@@ -1,4 +1,4 @@
-export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'zzdh-v8-video' | 'jimeng-cli';
+export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'jimeng-cli';
 export type VideoProfileStatus = 'verified' | 'pending-adaptation';
 export type VideoReferenceTarget = 'data-url' | 'public-url' | 'platform-file';
 
@@ -75,15 +75,44 @@ const ZZDH_V8_VIDEO_PROFILE: VideoModelProfile = {
   supportsReferenceAudio: false,
 };
 
-export function resolveVideoModelProfile(modelId: string): VideoModelProfile {
+const BINGHUO_VIDEO_PROFILE: VideoModelProfile = {
+  id: 'binghuo-video',
+  status: 'verified',
+  protocolLabel: '炳火异步视频 / 已验证',
+  submitPath: '/v1/video/generations',
+  queryPath: '/v1/video/generations/{taskId}',
+  referenceImageTarget: 'public-url',
+  supportsReferenceImages: true,
+  supportsFirstLast: true,
+  supportsReferenceAudio: true,
+};
+
+export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: string): VideoModelProfile {
   const provider = modelId.split('/')[0]?.trim().toLowerCase();
   const model = modelId.split('/').slice(1).join('/').trim().toLowerCase();
   // 即梦 CLI 是本地命令, seedance 系列由 CLI 自行校验, 不套用平台协议适配状态
   if (provider === 'jimeng-cli') return JIMENG_CLI_VIDEO_PROFILE;
+  if (/^(?:https?:\/\/)?(?:video|sub2api)\.rjm\.us\.ci(?:[/:]|$)/i.test(providerBaseUrl?.trim() ?? '')
+    || provider === 'custom:sub2api-video') {
+    return SUB2API_VIDEO_PROFILE;
+  }
   if (provider === 'custom:zizidonghua') return ZZDH_V8_VIDEO_PROFILE;
-  if (provider === 'custom:sub2api-video') return SUB2API_VIDEO_PROFILE;
+  if (provider === 'custom:binghuo') return BINGHUO_VIDEO_PROFILE;
   if (/^seedance(?:[-_.]?v?2|2(?:[._-]|$))/.test(model)) return SEEDANCE_V2_PROFILE;
   return OPENAI_VIDEO_PROFILE;
+}
+
+export function getVideoModelProfile(profileId?: string): VideoModelProfile {
+  if (!profileId) return OPENAI_VIDEO_PROFILE;
+  const profiles: Record<VideoProfileId, VideoModelProfile> = {
+    'openai-video': OPENAI_VIDEO_PROFILE,
+    'seedance-v2': SEEDANCE_V2_PROFILE,
+    'sub2api-video': SUB2API_VIDEO_PROFILE,
+    'zzdh-v8-video': ZZDH_V8_VIDEO_PROFILE,
+    'binghuo-video': BINGHUO_VIDEO_PROFILE,
+    'jimeng-cli': JIMENG_CLI_VIDEO_PROFILE,
+  };
+  return profiles[profileId as VideoProfileId] ?? OPENAI_VIDEO_PROFILE;
 }
 
 export function getVideoProfileStatusLabel(profile: VideoModelProfile): string {

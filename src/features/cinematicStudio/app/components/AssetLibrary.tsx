@@ -83,7 +83,7 @@ export interface CanvasAudioSource {
 }
 
 function sceneUsesAsset(scene: SceneV2, assetId: string): boolean {
-  if (scene.staging?.locationAssetId === assetId || (scene.staging?.characterOrder ?? []).includes(assetId)) return true;
+  if (scene.staging?.locationAssetId === assetId || (scene.staging?.characterRoster ?? []).includes(assetId) || (scene.staging?.characterOrder ?? []).includes(assetId)) return true;
   return scene.shots.some((shot) => (
     shot.characterId === assetId ||
     (shot.participants ?? []).some((participant) => participant.characterId === assetId) ||

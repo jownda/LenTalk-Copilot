@@ -28,8 +28,18 @@ export const DisconnectableEdge = memo(function DisconnectableEdge(props: EdgePr
     style,
   } = props;
   const deleteEdge = useCanvasStore((state) => state.deleteEdge);
-  const nodes = useCanvasStore((state) => state.nodes);
+  const routingRevision = useCanvasStore((state) => state.routingRevision);
+  const processingRevision = useCanvasStore((state) => state.processingRevision);
   const canvasEdgeRoutingMode = useSettingsStore((state) => state.canvasEdgeRoutingMode);
+  const routingNodes = useMemo(() => {
+    void routingRevision;
+    return useCanvasStore.getState().nodes;
+  }, [routingRevision]);
+  const processingNodes = useMemo(() => {
+    void processingRevision;
+    void routingRevision;
+    return useCanvasStore.getState().nodes;
+  }, [processingRevision, routingRevision]);
 
   const { edgePath, labelX, labelY } = useMemo(() => {
     if (canvasEdgeRoutingMode === 'spline') {
@@ -57,7 +67,7 @@ export const DisconnectableEdge = memo(function DisconnectableEdge(props: EdgePr
       targetX,
       targetY,
       targetPosition: targetPosition ?? Position.Left,
-      nodes,
+      nodes: routingNodes,
       smartAvoidance: canvasEdgeRoutingMode === 'smartOrthogonal',
     });
     return {
@@ -67,7 +77,7 @@ export const DisconnectableEdge = memo(function DisconnectableEdge(props: EdgePr
     };
   }, [
     canvasEdgeRoutingMode,
-    nodes,
+    routingNodes,
     source,
     sourcePosition,
     sourceX,
@@ -79,8 +89,8 @@ export const DisconnectableEdge = memo(function DisconnectableEdge(props: EdgePr
   ]);
 
   const isProcessingEdge = useMemo(() => {
-    const sourceNode = nodes.find((node) => node.id === source);
-    const targetNode = nodes.find((node) => node.id === target);
+    const sourceNode = processingNodes.find((node) => node.id === source);
+    const targetNode = processingNodes.find((node) => node.id === target);
 
     if (!sourceNode || !targetNode || targetNode.type !== CANVAS_NODE_TYPES.exportImage) {
       return false;
@@ -97,7 +107,7 @@ export const DisconnectableEdge = memo(function DisconnectableEdge(props: EdgePr
       (targetNode.data as { isGenerating?: boolean } | undefined)?.isGenerating === true;
 
     return isTargetGenerating;
-  }, [nodes, source, target]);
+  }, [processingNodes, source, target]);
 
   const processingStroke = 'rgb(var(--accent-rgb) / 0.94)';
   const processingDashStroke = 'rgb(var(--accent-rgb) / 1)';

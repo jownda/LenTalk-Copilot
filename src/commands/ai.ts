@@ -4,6 +4,11 @@ import type { CustomApiCapabilities } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
 import { isKnownOpenAiImagesBaseUrl } from '@/features/settings/recommendedApis';
 import { persistImageBinary } from '@/commands/image';
+import {
+  createVideoIdempotencyKey,
+  getVideoTaskFailureReason,
+  resolveRjmVideoApiBaseUrl,
+} from '@/commands/videoApi';
 
 export interface GenerateRequest {
   prompt: string;
@@ -243,6 +248,8 @@ function getVideoResultUrl(payload: unknown): string | null {
     [
       'video_url',
       'videoUrl',
+      'result_url',
+      'resultUrl',
       'url',
       'uri',
       'value',
@@ -470,6 +477,45 @@ export async function requestProviderJson(
   };
 }
 
+/** Upload a reference asset through the native client or browser fetch. */
+export async function requestProviderMultipart(
+  url: string,
+  init: {
+    headers?: Record<string, string>;
+    fieldName: string;
+    filename: string;
+    contentType: string;
+    bodyBase64: string;
+  }
+): Promise<ProviderJsonResponse> {
+  if (!isTauri()) {
+    const binary = atob(init.bodyBase64);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const form = new FormData();
+    form.append(init.fieldName, new Blob([bytes], { type: init.contentType }), init.filename);
+    const response = await fetch(url, { method: 'POST', headers: init.headers, body: form });
+    return {
+      ok: response.ok,
+      status: response.status,
+      text: () => response.text(),
+    };
+  }
+
+  const result = await invoke<{ status: number; body: string }>('request_provider_multipart', {
+    url,
+    headers: init.headers ?? {},
+    fieldName: init.fieldName,
+    filename: init.filename,
+    contentType: init.contentType,
+    bodyBase64: init.bodyBase64,
+  });
+  return {
+    ok: result.status >= 200 && result.status < 300,
+    status: result.status,
+    text: async () => result.body,
+  };
+}
+
 async function requestProviderBinary(
   url: string,
   init: { method?: string; headers?: Record<string, string> }
@@ -646,6 +692,160 @@ function getDataUrlBase64(source: string): string | null {
   return match?.[1] ?? null;
 }
 
+function resolveRjmSeedanceResolution(model: string, requested: string | undefined): string {
+  const allowed = model.trim().toLowerCase() === 'seedance2.5'
+    ? ['480p', '720p']
+    : ['480p', '720p', '1080p', '4k'];
+  const normalizedRequested = requested?.trim().toLowerCase();
+  return normalizedRequested && allowed.includes(normalizedRequested)
+    ? normalizedRequested
+    : '720p';
+}
+
+function getDataUrlAsset(source: string): { mimeType: string; extension: string; base64: string } | null {
+  const match = source.trim().match(/^data:([^;,]+)(?:;[^,]*)?;base64,([a-z0-9+/=]+)$/i);
+  if (!match) return null;
+  const mimeType = match[1].toLowerCase();
+  const extension = mimeType.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'bin';
+  return { mimeType, extension, base64: match[2] };
+}
+
+function extractBinghuoAssetUrl(payload: unknown): string | null {
+  if (typeof payload === 'string' && /^https?:\/\//i.test(payload.trim())) return payload.trim();
+  if (!payload || typeof payload !== 'object') return null;
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const url = extractBinghuoAssetUrl(item);
+      if (url) return url;
+    }
+    return null;
+  }
+  const record = payload as Record<string, unknown>;
+  for (const key of ['url', 'asset_url', 'assetUrl', 'download_url', 'downloadUrl', 'data', 'result', 'asset']) {
+    const url = extractBinghuoAssetUrl(record[key]);
+    if (url) return url;
+  }
+  return null;
+}
+
+async function uploadBinghuoReferenceAsset(
+  source: string,
+  baseUrl: string,
+  headers: Record<string, string>,
+  index: number,
+): Promise<string> {
+  const trimmed = source.trim();
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  const asset = getDataUrlAsset(trimmed);
+  if (!asset) {
+    throw new Error('炳火 API 参考素材必须是公网 URL 或可读取的本地素材');
+  }
+  const uploadUrl = `${baseUrl}/v1/assets/uploads`;
+  // Let multipart set its own boundary. Forwarding JSON's Content-Type would
+  // make the upload body invalid on both desktop and browser runtimes.
+  const uploadHeaders = Object.fromEntries(
+    Object.entries(headers).filter(([name]) => name.toLowerCase() !== 'content-type'),
+  );
+  const response = await requestProviderMultipart(uploadUrl, {
+    headers: uploadHeaders,
+    fieldName: 'file',
+    filename: `reference-${index + 1}.${asset.extension}`,
+    contentType: asset.mimeType,
+    bodyBase64: asset.base64,
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`炳火 API 参考素材上传失败: 平台返回了非 JSON 响应 (${uploadUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`炳火 API 参考素材上传失败: ${buildHttpErrorSummary(response.status, rawResponse, uploadUrl)}`);
+  }
+  const url = extractBinghuoAssetUrl(payload);
+  if (!url) {
+    throw new Error(`炳火 API 参考素材上传响应中未找到公网 URL: ${describeVideoResponse(payload)}`);
+  }
+  return url;
+}
+
+async function generateBinghuoVideo(
+  request: GenerateVideoRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const rawImages = request.reference_images ?? [];
+  const imageSources = await Promise.all(
+    rawImages.slice(0, request.image_mode === 'first-last' ? 2 : 30)
+      .map((source, index) => uploadBinghuoReferenceAsset(source, baseUrl, headers, index)),
+  );
+  const audioSources = await Promise.all(
+    (request.reference_audio ?? []).slice(0, 3)
+      .map((source, index) => uploadBinghuoReferenceAsset(source, baseUrl, headers, imageSources.length + index)),
+  );
+  const body: Record<string, unknown> = {
+    model: apiModel,
+    prompt: request.prompt,
+    duration: Math.max(1, Math.round(request.duration)),
+    ratio: request.aspect_ratio,
+    generate_audio: true,
+    n: 1,
+  };
+  if (request.image_mode === 'first-last' && imageSources.length > 0) {
+    body.start_frame = [imageSources[0]];
+    if (imageSources[1]) body.end_frame = [imageSources[1]];
+  } else if (imageSources.length > 0) {
+    body.images = imageSources;
+  }
+  if (audioSources.length > 0) body.reference_audios = audioSources;
+  if (request.video_resolution?.trim()) body.resolution = request.video_resolution.trim();
+
+  const submitUrl = `${baseUrl}/v1/video/generations`;
+  const response = await requestProviderJson(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`炳火 API 视频请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`炳火 API 视频请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  }
+  const immediateResult = getVideoResultUrl(payload);
+  if (immediateResult) return immediateResult;
+  const taskId = getVideoTaskId(payload);
+  if (!taskId) {
+    throw new Error(`炳火 API 视频响应中未找到任务 ID: ${describeVideoResponse(payload)}`);
+  }
+  const taskUrl = `${baseUrl}/v1/video/generations/${encodeURIComponent(taskId)}`;
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const taskResponse = await requestProviderJson(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    try {
+      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`炳火 API 视频查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`炳火 API 视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const videoUrl = getVideoResultUrl(payload);
+    if (videoUrl) return videoUrl;
+    const status = getVideoTaskStatus(payload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`炳火 API 视频生成失败: ${describeVideoResponse(payload)}`);
+    }
+  }
+}
+
 async function uploadSub2ApiReferenceImage(
   source: string,
   baseUrl: string,
@@ -682,7 +882,8 @@ async function generateSub2ApiVideo(
   request: GenerateVideoRequest,
   baseUrl: string,
   apiModel: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
+  useRjmProtocol = false,
 ): Promise<string> {
   if (request.reference_audio?.length) {
     throw new Error('Sub2API 当前推荐的 Seedance 视频链路只支持图片参考，暂不提交音频参考。');
@@ -700,11 +901,9 @@ async function generateSub2ApiVideo(
     }
   }
 
-  const submitUrl = resolveProviderEndpoint(
-    baseUrl,
-    request.extra_params?.video_submit_path,
-    '/v1/videos'
-  );
+  const submitUrl = useRjmProtocol
+    ? `${baseUrl}/v1/videos`
+    : resolveProviderEndpoint(baseUrl, request.extra_params?.video_submit_path, '/v1/videos');
   const normalizedApiModel = apiModel.trim().toLowerCase();
   const fixedSeedanceDuration = normalizedApiModel === 'seedance2.5'
     ? 30
@@ -712,7 +911,9 @@ async function generateSub2ApiVideo(
       ? 15
       : undefined;
   const isFixedSeedanceModel = fixedSeedanceDuration !== undefined;
-  const ratio = isFixedSeedanceModel && (request.aspect_ratio === '16:9' || request.aspect_ratio === '9:16')
+  const ratio = request.image_mode === 'first-last' && imageIds.length > 0 && useRjmProtocol
+    ? 'auto'
+    : isFixedSeedanceModel && (request.aspect_ratio === '16:9' || request.aspect_ratio === '9:16')
     ? request.aspect_ratio
     : isFixedSeedanceModel
       ? '16:9'
@@ -724,7 +925,7 @@ async function generateSub2ApiVideo(
       ...headers,
       'Idempotency-Key': typeof idempotencyKey === 'string' && idempotencyKey.trim()
         ? idempotencyKey.trim()
-        : crypto.randomUUID(),
+        : createVideoIdempotencyKey(),
     },
     body: JSON.stringify({
       model: apiModel,
@@ -732,7 +933,11 @@ async function generateSub2ApiVideo(
       duration: fixedSeedanceDuration ?? Math.max(1, Math.round(request.duration)),
       ratio,
       ...(isFixedSeedanceModel
-        ? { resolution: '720p' }
+        ? {
+          resolution: useRjmProtocol
+            ? resolveRjmSeedanceResolution(apiModel, request.video_resolution)
+            : '720p',
+        }
         : request.video_resolution?.trim()
           ? { resolution: request.video_resolution.trim() }
           : {}),
@@ -758,12 +963,9 @@ async function generateSub2ApiVideo(
     throw new Error(`Sub2API 视频响应中未找到任务 ID 或视频地址: ${describeVideoResponse(payload)}`);
   }
 
-  const taskUrl = resolveProviderEndpoint(
-    baseUrl,
-    request.extra_params?.video_query_path,
-    '/v1/videos/{taskId}',
-    taskId
-  );
+  const taskUrl = useRjmProtocol
+    ? `${baseUrl}/v1/videos/${encodeURIComponent(taskId)}`
+    : resolveProviderEndpoint(baseUrl, request.extra_params?.video_query_path, '/v1/videos/{taskId}', taskId);
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 4000));
     const taskResponse = await requestProviderJson(taskUrl, { headers });
@@ -780,7 +982,8 @@ async function generateSub2ApiVideo(
     if (videoUrl) return videoUrl;
     const status = getVideoTaskStatus(payload);
     if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
-      throw new Error(`Sub2API 视频生成失败: ${status}`);
+      const reason = getVideoTaskFailureReason(payload);
+      throw new Error(`Sub2API 视频生成失败: ${reason ?? status}`);
     }
     if (['COMPLETED', 'COMPLETE', 'SUCCESS', 'SUCCEEDED', 'DONE'].includes(status)) {
       const contentUrl = `${taskUrl}/content`;
@@ -812,11 +1015,18 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
     throw new Error('请在设置中配置视频模型对应的 Base URL、API Key 和模型名称');
   }
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  const rjmVideoBaseUrl = resolveRjmVideoApiBaseUrl(baseUrl);
+  if (rjmVideoBaseUrl) {
+    return await generateSub2ApiVideo(request, rjmVideoBaseUrl, apiModel, headers, true);
+  }
   if (request.extra_params?.video_transport === 'zzdh-v8-video') {
     return await generateZzdhVideo(request, baseUrl, apiModel, headers);
   }
   if (request.extra_params?.video_transport === 'sub2api-video') {
     return await generateSub2ApiVideo(request, baseUrl, apiModel, headers);
+  }
+  if (request.extra_params?.video_transport === 'binghuo-video') {
+    return await generateBinghuoVideo(request, baseUrl, apiModel, headers);
   }
   const videoImages = request.image_mode === 'first-last'
     ? request.reference_images?.slice(0, 2)

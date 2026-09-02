@@ -149,6 +149,7 @@ describe("collectSceneAssetIds", () => {
     expect(request.user).toContain("FORMAT MODE 是本次生成的整体执行格式摘要");
     expect(request.user).toContain("两个段落，一次甩切");
     expect(request.user).toContain("CAMERA 必须先写一段适用于全程的总摄影机描述");
+    expect(request.user).toContain("OPTICS 是镜头执行的结构化真源");
     expect(request.user).toContain("第 1 段：……");
     expect(request.user).toContain("STYLE 必须位于光线之后、正向约束之前");
     expect(request.user).toContain("画质特征（清晰度、对比度、颗粒/无颗粒");
@@ -169,6 +170,7 @@ describe("collectSceneAssetIds", () => {
     expect(request.user).toContain("grouped by shot segment");
     expect(request.user).toContain("matching [imageN]");
     expect(request.user).toContain("CAMERA must begin with one overall camera-language paragraph");
+    expect(request.user).toContain("OPTICS is the structured source of truth for shot execution");
     expect(request.user).toContain("SHOT 1: ...");
     expect(request.user).toContain("STYLE must come after LIGHTING and before POSITIVE CONSTRAINTS");
     expect(request.user).toContain("image-quality traits (clarity, contrast, grain / no grain");
@@ -199,7 +201,25 @@ describe("collectSceneAssetIds", () => {
     expect(source).toContain("STYLE:\n");
     expect(source.indexOf("LIGHTING:")).toBeLessThan(source.indexOf("STYLE:"));
     expect(source.indexOf("STYLE:")).toBeLessThan(source.indexOf("POSITIVE CONSTRAINTS:"));
+    expect(source).not.toContain("已编辑的光学。");
     expect(source).not.toContain("SHOT EXECUTION:");
+  });
+
+  it("最终生成始终采用镜头详情中的景别和镜头语言，而不是旧导演文档层", () => {
+    const manualShotScene: SceneV2 = {
+      ...scene,
+      shots: [{
+        ...scene.shots[0],
+        framing: "Tight two-shot",
+        optics: { lensCharacter: "12-long-tele", fieldOfViewDegrees: 12 },
+      }],
+      directorLayers: { optics: "过期的 84° 广角光学文本。" },
+    };
+
+    const source = buildFinalGenerationSource(project, manualShotScene, "zh");
+
+    expect(source).toContain("OPTICS:\n镜头 1：12° 超长焦；景别：紧凑双人镜头");
+    expect(source).not.toContain("过期的 84° 广角光学文本。");
   });
 
   it("最终生成不会采用带场号或超长的旧场景上下文", () => {
@@ -292,6 +312,15 @@ describe("collectSceneAssetIds", () => {
   it("去重并忽略不存在的站位 id", () => {
     const nextScene = { ...scene, staging: { ...scene.staging, characterOrder: ["hero", "missing", "hero"] } };
     expect(collectSceneAssetIds(project, nextScene)).toEqual(["location", "hero", "prop"]);
+  });
+
+  it("将场景候选角色纳入分镜规划资产范围，但不要求进入空间排序", () => {
+    const nextScene = {
+      ...scene,
+      staging: { ...scene.staging, characterRoster: ["unused-character"], characterOrder: [] },
+    };
+
+    expect(collectSceneAssetIds(project, nextScene)).toEqual(["location", "hero", "prop", "unused-character"]);
   });
 
   it("忽略 AI 导演层文本，始终用结构化分镜填充导演文档", () => {

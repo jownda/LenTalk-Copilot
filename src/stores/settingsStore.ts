@@ -41,6 +41,7 @@ export interface CustomApiCapabilities {
   videoQueryPath: string;
   videoReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
   taskProtocol: 'generic' | 'unknown';
+  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video';
 }
 
 /** 即梦 CLI 是本地命令行工具，不使用 OpenAI 兼容平台的 API Key 配置。 */
@@ -50,9 +51,42 @@ export interface JimengCliSettings {
 
 /** 视频模型必须与图片模型分开注册，避免通用模型拉取结果污染图片节点。 */
 export function isVideoGenerationModelName(model: string): boolean {
-  return /seedance|minimax-h3|grok-imagine-video|(?:^|[-_])video(?:[-_]|$)|hailuo|kling|runway|(?:^|[-_])veo(?:[-_]|$)|(?:^|[-_])sora(?:[-_]|$)|pixverse|vidu|luma/i.test(
-    model.trim()
-  );
+  const value = model.trim().toLowerCase();
+  if (!value) {
+    return false;
+  }
+
+  // Keep the markers explicit and boundary-aware. Several video providers use
+  // short IDs such as `sd2.5` and `bh2.0`; matching a bare `sd` or `2` would
+  // incorrectly move image models like `sdxl` into the video list.
+  return [
+    /(?:^|[-_.])seedance(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])bh2(?:\.0)?(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])sd2(?:\.0|\.5)?(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])sdvip(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])sdquan(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])gz-sd(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])rd2(?:\.0|\.5)?(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])wan3(?:\.0)?(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])wanneng(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])doubaofast(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])minimax-h3(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])sp2(?:\.5)?(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])tj-(?:wan3|sp2)(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])quanneng(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])video(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])hailuo(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])kling(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])runway(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])veo(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])sora(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])pixverse(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])vidu(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])luma(?:[-_.]|\d|$)/,
+    /grok-imagine-video/,
+    /xb-sora/,
+    /me-kuaile/,
+  ].some((marker) => marker.test(value));
 }
 
 /** 自定义 AI 平台(OpenAI 兼容),参考 Infinite Canvas 的 API 设置写法 */
@@ -142,6 +176,8 @@ interface SettingsState {
   enableUpdateDialog: boolean;
   /** 最近一次使用的图片生成模型 id(新建 AI 图片节点默认选中) */
   lastImageModelId: string | null;
+  /** 最近一次选择的视频生成时长；AI 视频和即梦 CLI 新节点共用。 */
+  lastVideoDuration: number;
   /** 已实际成功生成过的模型，供拉取模型列表标记为可用。 */
   usableModelIds: string[];
   setProviderApiKey: (providerId: string, key: string) => void;
@@ -173,6 +209,7 @@ interface SettingsState {
   setAutoCheckAppUpdateOnLaunch: (enabled: boolean) => void;
   setEnableUpdateDialog: (enabled: boolean) => void;
   setLastImageModelId: (modelId: string | null) => void;
+  setLastVideoDuration: (duration: number) => void;
   markModelAvailable: (modelId: string) => void;
 }
 
@@ -285,6 +322,11 @@ function normalizeCanvasEdgeRoutingMode(
   return 'spline';
 }
 
+function normalizeVideoDuration(value: number | string | null | undefined): number {
+  const duration = Math.round(Number(value));
+  return Number.isFinite(duration) ? Math.min(30, Math.max(1, duration)) : 5;
+}
+
 function normalizeApiKeys(input: ProviderApiKeys | null | undefined): ProviderApiKeys {
   if (!input) {
     return {};
@@ -333,6 +375,7 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
   const imageTransport = value.imageTransport;
   const videoEncoding = value.videoReferenceEncoding;
   const taskProtocol = value.taskProtocol;
+  const videoTransport = value.videoTransport;
   return {
     detectedAt: typeof value.detectedAt === 'number' ? value.detectedAt : Date.now(),
     detectionSource: value.detectionSource === 'manual' ? 'manual' : 'probe',
@@ -351,6 +394,9 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
       ? videoEncoding
       : 'unknown',
     taskProtocol: taskProtocol === 'unknown' ? 'unknown' : 'generic',
+    ...(videoTransport === 'sub2api-video' || videoTransport === 'zzdh-v8-video' || videoTransport === 'binghuo-video'
+      ? { videoTransport }
+      : {}),
   };
 }
 
@@ -480,6 +526,7 @@ export const useSettingsStore = create<SettingsState>()(
       autoCheckAppUpdateOnLaunch: true,
       enableUpdateDialog: true,
       lastImageModelId: null,
+      lastVideoDuration: 5,
       usableModelIds: [],
       setProviderApiKey: (providerId, key) =>
         set((state) => ({
@@ -583,6 +630,7 @@ export const useSettingsStore = create<SettingsState>()(
       setAutoCheckAppUpdateOnLaunch: (enabled) => set({ autoCheckAppUpdateOnLaunch: enabled }),
       setEnableUpdateDialog: (enabled) => set({ enableUpdateDialog: enabled }),
       setLastImageModelId: (modelId) => set({ lastImageModelId: modelId }),
+      setLastVideoDuration: (duration) => set({ lastVideoDuration: normalizeVideoDuration(duration) }),
       markModelAvailable: (modelId) => {
         const normalizedModelId = modelId.trim();
         if (!normalizedModelId) return;
@@ -594,7 +642,7 @@ export const useSettingsStore = create<SettingsState>()(
     {
       name: SETTINGS_STORAGE_KEY,
       storage: createJSONStorage(() => settingsStorage),
-      version: 16,
+      version: 17,
       onRehydrateStorage: () => {
         return (_state, error) => {
           if (error) {
@@ -618,6 +666,7 @@ export const useSettingsStore = create<SettingsState>()(
           autoCheckAppUpdateOnLaunch?: boolean;
           enableUpdateDialog?: boolean;
           lastImageModelId?: string | null;
+          lastVideoDuration?: number | string | null;
           usableModelIds?: unknown;
           enableStoryboardGenGridPreviewShortcut?: boolean;
           showStoryboardGenAdvancedRatioControls?: boolean;
@@ -652,6 +701,7 @@ export const useSettingsStore = create<SettingsState>()(
             autoCheckAppUpdateOnLaunch: state.autoCheckAppUpdateOnLaunch ?? true,
             enableUpdateDialog: state.enableUpdateDialog ?? true,
             lastImageModelId: typeof state.lastImageModelId === 'string' && state.lastImageModelId ? state.lastImageModelId : null,
+            lastVideoDuration: normalizeVideoDuration(state.lastVideoDuration),
             usableModelIds: normalizeUsableModelIds(state.usableModelIds),
             enableStoryboardGenGridPreviewShortcut:
               state.enableStoryboardGenGridPreviewShortcut ?? false,
@@ -683,6 +733,7 @@ export const useSettingsStore = create<SettingsState>()(
           autoCheckAppUpdateOnLaunch: state.autoCheckAppUpdateOnLaunch ?? true,
           enableUpdateDialog: state.enableUpdateDialog ?? true,
           lastImageModelId: typeof state.lastImageModelId === 'string' && state.lastImageModelId ? state.lastImageModelId : null,
+          lastVideoDuration: normalizeVideoDuration(state.lastVideoDuration),
           usableModelIds: normalizeUsableModelIds(state.usableModelIds),
           enableStoryboardGenGridPreviewShortcut:
             state.enableStoryboardGenGridPreviewShortcut ?? false,

@@ -11,6 +11,7 @@ use commands::cinematic_studio;
 use commands::image;
 use commands::jimeng_cli;
 use commands::project_state;
+use commands::project_archive;
 use commands::system;
 use commands::update;
 use commands::usage_log;
@@ -210,6 +211,7 @@ pub fn run() {
             ai_commands::fetch_provider_models,
             ai_commands::detect_provider_capabilities,
             ai_commands::request_provider_json,
+            ai_commands::request_provider_multipart,
             ai_commands::request_provider_stream,
             ai_commands::submit_generate_image_job,
             ai_commands::get_generate_image_job,
@@ -226,6 +228,8 @@ pub fn run() {
             project_state::update_project_viewport_record,
             project_state::rename_project_record,
             project_state::delete_project_record,
+            project_archive::export_project_bundle,
+            project_archive::import_project_bundle,
             usage_log::append_usage_record,
             usage_log::query_usage_records,
             usage_log::query_usage_summary,

@@ -184,6 +184,8 @@
       "referenceMode": "参考图",
       "firstLastMode": "首尾帧",
       "firstLastHint": "分别上传首帧和尾帧",
+      "referenceImageCount": "参考图 {{count}} 张",
+      "referenceImageLimit": "即梦 CLI 最多支持 9 张参考图",
       "firstFrame": "首帧",
       "lastFrame": "尾帧",
       "uploadFirstFrame": "上传首帧",
@@ -325,7 +327,17 @@
     "empty": "暂无项目",
     "emptyHint": "点击上方按钮创建新项目",
     "assetLibrary": "素材库",
-    "noPreview": "暂无预览"
+    "noPreview": "暂无预览",
+    "moreActions": "更多操作",
+    "import": "导入项目",
+    "importing": "导入中...",
+    "export": "导出项目压缩包",
+    "uploadToCloud": "上传至云空间",
+    "exportSuccess": "项目压缩包已导出。",
+    "uploadToCloudSuccess": "项目已保存到所选云盘目录。",
+    "archiveFailed": "项目压缩包导出失败。",
+    "importSuccess": "项目已导入。",
+    "importFailed": "项目导入失败，请选择有效的 LenTalk 项目文件。"
   },
   "settings": {
     "title": "设置",

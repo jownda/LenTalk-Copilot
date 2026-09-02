@@ -44,4 +44,9 @@ describe('resolveVideoModelProfile', () => {
     expect(profile.referenceImageTarget).toBe('platform-file');
     expect(profile.supportsReferenceImages).toBe(true);
   });
+
+  it('recognizes an RJM URL even when the custom platform has a different id', () => {
+    expect(resolveVideoModelProfile('custom:my-platform/seedance2.5', 'https://sub2api.rjm.us.ci/v1').id)
+      .toBe('sub2api-video');
+  });
 });

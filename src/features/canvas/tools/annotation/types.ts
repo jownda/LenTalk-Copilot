@@ -1,4 +1,4 @@
-export type AnnotationToolType = 'rect' | 'ellipse' | 'arrow' | 'pen' | 'text';
+export type AnnotationToolType = 'rect' | 'ellipse' | 'arrow' | 'pen' | 'eraser' | 'text';
 
 export interface AnnotationStyle {
   stroke: string;
@@ -35,6 +35,14 @@ export interface PenAnnotation extends AnnotationStyle {
   points: number[];
 }
 
+/** White raster-style stroke that removes image content without transparency. */
+export interface EraserAnnotation {
+  id: string;
+  type: 'eraser';
+  points: number[];
+  lineWidth: number;
+}
+
 export interface TextAnnotation {
   id: string;
   type: 'text';
@@ -50,4 +58,5 @@ export type AnnotationItem =
   | EllipseAnnotation
   | ArrowAnnotation
   | PenAnnotation
+  | EraserAnnotation
   | TextAnnotation;

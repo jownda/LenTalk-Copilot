@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// 推荐平台(参考 Infinite Canvas 的 API 设置推荐列表,精简为图像相关字段)
+// 推荐平台(参考 Infinite Canvas 的 API 设置推荐列表,集中维护预填的多媒体协议)
 // 点「添加」→ 预填名称 / Base URL / 模型,保存后即可使用
 // ---------------------------------------------------------------------------
 
@@ -13,6 +13,7 @@ export interface RecommendedApi {
   advantages: string[];
   models: string[];
   videoModels?: string[];
+  chatModels?: string[];
   /** 图片协议的明确配置；未声明的平台继续使用通用默认值。 */
   imageConfig?: RecommendedImageConfig;
   /** 视频协议的明确配置；用于异步提交、轮询和参考素材适配。 */
@@ -30,7 +31,7 @@ export interface RecommendedVideoConfig {
   submitPath: string;
   queryPath: string;
   referenceEncoding: 'data_url' | 'raw_base64' | 'url';
-  transport: 'sub2api-video';
+  transport: 'sub2api-video' | 'binghuo-video';
 }
 
 /** 已确认的 OpenAI Images 平台不通过 OPTIONS 猜测协议。 */
@@ -42,6 +43,120 @@ export function isKnownOpenAiImagesBaseUrl(value: string): boolean {
 }
 
 export const recommendedApis: RecommendedApi[] = [
+  {
+    id: 'binghuo',
+    name: '炳火 API',
+    baseUrl: 'https://api.7tai.cc/v1',
+    registerUrl: 'https://api.7tai.cc/console/log',
+    summary: '统一提供图片、异步视频、LLM 与音频接口的 OpenAI 兼容平台',
+    advantages: [
+      '图片使用 /v1/images/generations，兼容文生图与参考图生图',
+      '视频使用 /v1/video/generations 异步提交与轮询',
+      '支持 Seedance、即梦、Wan、MiniMax 等视频模型',
+      '支持 Chat Completions 流式输出与长上下文模型',
+    ],
+    models: [
+      'gemini-3-pro-image-preview',
+      'gemini-3.1-flash-image-preview',
+      'image2k4k',
+      'image4k',
+      'image2-high',
+      'gpt-image-2',
+      'by-image1k',
+      'by-image2k4k',
+      'cf-image4k',
+    ],
+    videoModels: [
+      'bh2.0-fast-480p',
+      'bh2.0-fast-720p',
+      'bh2.0-480p',
+      'bh2.0-720p',
+      'bh2.0-1080p',
+      'bh2.04K',
+      'bh2.0-mini-480p',
+      'bh2.0-mini-720p',
+      'SD2.0-720P-fast',
+      'SD2.0-1080P',
+      'sdvip4k',
+      'sdvip720p',
+      'sdvip1080p',
+      'gz-sd480p',
+      'gz-sd720p',
+      'gz-sd1080p',
+      'gz-sd4k',
+      'SD2.5-480p',
+      'SD2.5-720p',
+      'SD2.5-1080p',
+      'wan3.0-480p',
+      'wan3.0-720p',
+      'wan3.0-1080p',
+      'tj-wan3-720p',
+      'sd2.5-backup',
+      'sd2.5-480p-ch1',
+      'sd2.5-720p-ch2',
+      'gz-sd2.5-480p',
+      'gz-sd2.5-720p',
+      'gz-sd2.5-1080p',
+      'rd2.5-480p',
+      'rd2.5-720p',
+      'rd2.0-480p',
+      'rd2.0-480pfast',
+      'rd2.0-720p',
+      'rd2.0-1080p',
+      'wanneng1.1',
+      'doubaofast',
+      'minimax-h3-pro-768p',
+      'sd2-fast福利',
+      'seedance-2.0-480p',
+      'SD2.0-720P',
+      'sp2.5-720p',
+      'sp2.5-720p-15s',
+      'sp2.5-720p-30s',
+      'tj-sp2.5',
+      'sd2.5-720p-ch1',
+      'minimax-h3-pro-2k',
+      'sd2-福利',
+      'B-quannengship2.0',
+      'quanneng2.0',
+      'sdquan-2-miao',
+      'hailuo-h3-2k',
+      'quanneng2.0-9tu',
+      'video2.0',
+      'sd2-vip720p',
+      'sd2-vip720p-fast',
+      'keling-3',
+      'xb-sora2',
+      'me-kuaile1.0',
+      'sora-2-z',
+      'veo-omni-flash',
+      'grok-imagine-video-1.5-preview',
+      'grok-imagine-video',
+    ],
+    chatModels: [
+      'o3',
+      'o4-mini',
+      'claude-opus-4-8',
+      'claude-sonnet-4-5',
+      'claude-haiku-4-5',
+      'gemini-2.5-pro',
+      'gemini-2.5-flash',
+      'deepseek-chat',
+      'deepseek-reasoner',
+      'minimax-m2',
+    ],
+    imageConfig: {
+      protocol: 'images',
+      referenceImageField: 'image',
+      referenceImageEncoding: 'url',
+      imageTransport: 'generations_json',
+    },
+    videoConfig: {
+      submitPath: '/v1/video/generations',
+      queryPath: '/v1/video/generations/{taskId}',
+      referenceEncoding: 'url',
+      transport: 'binghuo-video',
+    },
+  },
   {
     id: 'zizidonghua',
     name: '字子动画',

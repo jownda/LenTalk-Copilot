@@ -184,6 +184,8 @@
       "referenceMode": "Reference",
       "firstLastMode": "First / Last Frame",
       "firstLastHint": "Upload the first and last frames separately",
+      "referenceImageCount": "{{count}} reference images",
+      "referenceImageLimit": "Jimeng CLI supports up to 9 reference images",
       "firstFrame": "First frame",
       "lastFrame": "Last frame",
       "uploadFirstFrame": "Upload first frame",
@@ -325,7 +327,17 @@
     "empty": "No Projects",
     "emptyHint": "Click the button above to create a new project",
     "assetLibrary": "Asset Library",
-    "noPreview": "No preview"
+    "noPreview": "No preview",
+    "moreActions": "More actions",
+    "import": "Import project",
+    "importing": "Importing...",
+    "export": "Export project ZIP",
+    "uploadToCloud": "Upload to cloud storage",
+    "exportSuccess": "Project ZIP exported.",
+    "uploadToCloudSuccess": "Project saved to the selected cloud folder.",
+    "archiveFailed": "Project ZIP export failed.",
+    "importSuccess": "Project imported.",
+    "importFailed": "Project import failed. Select a valid LenTalk project file."
   },
   "settings": {
     "title": "Settings",

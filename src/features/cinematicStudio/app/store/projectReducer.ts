@@ -112,7 +112,14 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
         identityRules: (state.identityRules ?? []).filter((rule) => rule.characterId !== action.id),
         scenes: (state.scenes ?? []).map((scene) => ({
           ...scene,
-          staging: scene.staging?.locationAssetId === action.id ? { ...scene.staging, locationAssetId: undefined } : scene.staging,
+          staging: scene.staging
+            ? {
+                ...scene.staging,
+                ...(scene.staging.locationAssetId === action.id ? { locationAssetId: undefined } : {}),
+                characterRoster: (scene.staging.characterRoster ?? []).filter((id) => id !== action.id),
+                characterOrder: (scene.staging.characterOrder ?? []).filter((id) => id !== action.id),
+              }
+            : scene.staging,
           shots: (scene.shots ?? []).map((shot) => ({
             ...shot,
             participants: (shot.participants ?? []).filter((p) => p.characterId !== action.id),

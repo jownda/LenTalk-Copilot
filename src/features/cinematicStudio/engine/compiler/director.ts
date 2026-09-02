@@ -48,7 +48,7 @@ export const DIRECTOR_LAYERS = [
 export type DirectorLayerKey = (typeof DIRECTOR_LAYERS)[number]["key"];
 export const DIRECTOR_LAYER_ORDER: readonly DirectorLayerKey[] = DIRECTOR_LAYERS.map((layer) => layer.key);
 /** 只在最终生成时根据结构化分镜和资产库重建，不作为导演文档的填写层。 */
-export const FINAL_GENERATED_DIRECTOR_LAYER_KEYS: ReadonlySet<DirectorLayerKey> = new Set(["activeReferences", "firstFrame"]);
+export const FINAL_GENERATED_DIRECTOR_LAYER_KEYS: ReadonlySet<DirectorLayerKey> = new Set(["activeReferences", "firstFrame", "optics"]);
 const SHOT_EXECUTION_LAYER = { zh: "镜头执行", en: "SHOT EXECUTION" } as const;
 
 export function directorLayerLabel(key: DirectorLayerKey, locale: "zh" | "en"): string {
@@ -292,7 +292,7 @@ function firstSentence(value: string): string {
 function trimSynopsisToActiveEvent(text: string, project: ProjectV2, scene: SceneV2): string {
   const characterAssets = (project.assets ?? []).filter((asset) => asset.kind === "character" && asset.name.trim());
   const activeIds = new Set((scene.shots ?? []).flatMap((shot) => (shot.participants ?? []).map((item) => item.characterId)));
-  if (activeIds.size === 0) (scene.staging?.characterOrder ?? []).forEach((id) => activeIds.add(id));
+  if (activeIds.size === 0) (scene.staging?.characterRoster?.length ? scene.staging.characterRoster : scene.staging?.characterOrder ?? []).forEach((id) => activeIds.add(id));
   let result = text.trim();
   for (const asset of characterAssets) {
     if (activeIds.has(asset.id)) continue;
@@ -354,7 +354,7 @@ function combineSceneContextEvents(synopsis: string | undefined, action: string 
 function activeCharacterNames(project: ProjectV2, scene: SceneV2, locale: PromptLocale): string[] {
   const assets = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
   const ids = (scene.shots ?? []).flatMap((shot) => (shot.participants ?? []).map((item) => item.characterId));
-  if (ids.length === 0) ids.push(...(scene.staging?.characterOrder ?? []));
+  if (ids.length === 0) ids.push(...(scene.staging?.characterRoster?.length ? scene.staging.characterRoster : scene.staging?.characterOrder ?? []));
   return [...new Set(ids)]
     .map((id) => localeText(assets.get(id)?.name, locale))
     .filter(Boolean);
@@ -363,7 +363,7 @@ function activeCharacterNames(project: ProjectV2, scene: SceneV2, locale: Prompt
 function hasInactiveCharacter(text: string, project: ProjectV2, scene: SceneV2): boolean {
   const characterAssets = (project.assets ?? []).filter((asset) => asset.kind === "character" && asset.name.trim());
   const activeIds = new Set((scene.shots ?? []).flatMap((shot) => (shot.participants ?? []).map((item) => item.characterId)));
-  if (activeIds.size === 0) (scene.staging?.characterOrder ?? []).forEach((id) => activeIds.add(id));
+  if (activeIds.size === 0) (scene.staging?.characterRoster?.length ? scene.staging.characterRoster : scene.staging?.characterOrder ?? []).forEach((id) => activeIds.add(id));
   return characterAssets.some((asset) => text.includes(asset.name.trim()) && !activeIds.has(asset.id));
 }
 
@@ -426,7 +426,10 @@ function renderOpticsLayer(scene: SceneV2, locale: PromptLocale): string {
     const lensText = lens
       ? (zh ? `镜头型号：${lens.brand} ${lens.model}（${lens.focal}；${lens.effect}）` : `lens model: ${lens.brand} ${lens.model} (${lens.focal}; ${lens.effect})`)
       : "";
-    return [base, outcomeText, lensText].filter(Boolean).join(zh ? "；" : ". ");
+    const framing = shot.framing?.trim()
+      ? (zh ? `景别：${localizePromptValue(shot.framing.trim(), locale)}` : `framing: ${localizePromptValue(shot.framing.trim(), locale)}`)
+      : "";
+    return [base, framing, outcomeText, lensText].filter(Boolean).join(zh ? "；" : ". ");
   };
   if (scene.shootingMode === "long-take") {
     const optics = shots[0].optics;
@@ -601,7 +604,7 @@ function renderFirstFrameLayer(project: ProjectV2, scene: SceneV2, locale: Promp
     if (participants.length === 0) return [];
     const behavior = shot.cameraBehavior ?? {};
     const view = [
-      shot.framing?.trim() ? (zh ? shot.framing.trim() : shot.framing.trim()) : "",
+      shot.framing?.trim() ? localizePromptValue(shot.framing.trim(), locale) : "",
       behavior.angle?.trim() ? (zh ? behavior.angle.trim() : behavior.angle.trim()) : "",
     ].filter(Boolean).join(zh ? "，" : ", ");
     const subjectText = participants.map(renderParticipant).join(zh ? "、" : ", ");

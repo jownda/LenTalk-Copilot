@@ -16,11 +16,38 @@ interface OpticsCameraEditorProps {
   onUpdate(updates: Partial<ShotV2>): void;
 }
 
-const FRAMING_OPTIONS = ["Wide", "3/4 medium, behind subject", "Medium close-up", "Extreme close-up, profile"] as const;
+const FRAMING_OPTIONS = [
+  "Extreme wide / establishing",
+  "Wide",
+  "Full shot",
+  "Medium full / cowboy",
+  "Medium",
+  "Medium close-up",
+  "Close-up",
+  "Big close-up",
+  "Extreme close-up",
+  "Insert / detail",
+  "Two-shot",
+  "Tight two-shot",
+  "Over-the-shoulder",
+  "3/4 medium, behind subject",
+  "Extreme close-up, profile",
+] as const;
 const FRAMING_LENS_DEFAULTS: Record<(typeof FRAMING_OPTIONS)[number], LensCharacter> = {
+  "Extreme wide / establishing": "135-immersive",
   Wide: "84-wide",
+  "Full shot": "63-moderate-wide",
+  "Medium full / cowboy": "47-standard",
+  Medium: "47-standard",
   "3/4 medium, behind subject": "47-standard",
   "Medium close-up": "29-short-tele",
+  "Close-up": "29-short-tele",
+  "Big close-up": "18-tele",
+  "Extreme close-up": "18-tele",
+  "Insert / detail": "18-tele",
+  "Two-shot": "47-standard",
+  "Tight two-shot": "12-long-tele",
+  "Over-the-shoulder": "29-short-tele",
   "Extreme close-up, profile": "18-tele",
 };
 
@@ -70,7 +97,6 @@ const T = {
     lensCharacterHint: "优先可观测结果，其次才是焦距 / 品牌",
     fov: "视场角",
     recommended: "推荐",
-    apply: "应用",
     current: "当前",
     cameraBehavior: "相机行为（物理操作员）",
     handheldHint: "只写物理操作员描述（呼吸 / 微调 / 重量转移），不要 digital jitter / gimbal",
@@ -85,7 +111,6 @@ const T = {
     lensCharacterHint: "Prefer observable outcome over focal length / brand",
     fov: "FOV",
     recommended: "Recommended",
-    apply: "Apply",
     current: "Current",
     cameraBehavior: "Camera behavior (physical operator)",
     handheldHint: "Physical operator behavior only (breath / micro-settling / weight shift), no digital jitter / gimbal",
@@ -103,6 +128,9 @@ export default function OpticsCameraEditor({ shot, framing, locale, onUpdate }: 
   const behavior = shot.cameraBehavior ?? {};
   const layout = shot.layout ?? {};
   const anchors = shot.physicsAnchors ?? [];
+  const framingOptions = FRAMING_OPTIONS.includes(framing as (typeof FRAMING_OPTIONS)[number])
+    ? FRAMING_OPTIONS
+    : [framing, ...FRAMING_OPTIONS];
 
   const applyLens = (lens: LensCharacter) => {
     const preset = lensById(lens);
@@ -122,12 +150,11 @@ export default function OpticsCameraEditor({ shot, framing, locale, onUpdate }: 
   const setFraming = (value: string) => {
     const nextFraming = FRAMING_OPTIONS.includes(value as (typeof FRAMING_OPTIONS)[number])
       ? value as (typeof FRAMING_OPTIONS)[number]
-      : "3/4 medium, behind subject";
-    const nextLens = lensById(FRAMING_LENS_DEFAULTS[nextFraming]);
-    onUpdate({
-      framing: value,
-      optics: nextLens ? { ...optics, lensCharacter: nextLens.id, fieldOfViewDegrees: nextLens.fov } : optics,
-    });
+      : "Medium";
+    onUpdate({ framing: value });
+    // Framing and optics are related controls, never a forced pair. Selecting
+    // a framing only exposes the usual lens character as a recommendation.
+    setRecommended(FRAMING_LENS_DEFAULTS[nextFraming]);
   };
 
   return <section className="inspector-section optics-camera-editor">
@@ -136,7 +163,7 @@ export default function OpticsCameraEditor({ shot, framing, locale, onUpdate }: 
     <div className="fields-grid two optics-pair-grid">
       <label className="field-label">{zh ? "景别" : "Framing"}<span className="select-wrap">
         <select value={framing} onChange={(event) => setFraming(event.target.value)}>
-          {FRAMING_OPTIONS.map((value) => <option key={value} value={value}>{framingLabels[locale][value] ?? value}</option>)}
+          {framingOptions.map((value) => <option key={value} value={value}>{framingLabels[locale][value] ?? value}</option>)}
         </select>
         <ChevronDown size={14} />
       </span></label>
@@ -152,7 +179,7 @@ export default function OpticsCameraEditor({ shot, framing, locale, onUpdate }: 
         <ChevronDown size={14} />
       </span></label>
     </div>
-    <p className="hint-text">{zh ? "景别决定主体大小，镜头语言决定透视结果；修改景别会自动带出匹配镜头语言，仍可手动调整。" : "Framing controls subject size; lens character controls perspective. Changing framing selects a matching lens, which can still be adjusted manually."}</p>
+    <p className="hint-text">{zh ? "景别决定主体大小，镜头语言决定透视结果；修改景别只显示推荐镜头语言，不会覆盖当前选择。点击“应用”后才会改变镜头语言。" : "Framing controls subject size; lens character controls perspective. Changing framing only suggests a lens; it never overwrites the current choice unless you click Apply."}</p>
 
     <div className="lens-decision-tree">
       <span className="sub-label">{L.decisionTree}</span>
@@ -173,7 +200,6 @@ export default function OpticsCameraEditor({ shot, framing, locale, onUpdate }: 
         return <div className="decision-recommend">
           <Sparkles size={13} />
           <span>{L.recommended}: <b>{name}</b> · {preset?.fov}°</span>
-          <button className="outline-button" onClick={() => applyLens(recommended)}>{L.apply}</button>
         </div>;
       })()}
     </div>

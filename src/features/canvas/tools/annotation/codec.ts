@@ -66,9 +66,19 @@ function sanitizeAnnotation(item: unknown): AnnotationItem | null {
     };
   }
 
-  if (type === 'pen') {
+  if (type === 'pen' || type === 'eraser') {
     if (!Array.isArray(raw.points) || raw.points.length < 4 || !raw.points.every(isFiniteNumber)) {
       return null;
+    }
+
+    const lineWidth = isFiniteNumber(raw.lineWidth) ? Math.max(1, raw.lineWidth) : 3;
+    if (type === 'eraser') {
+      return {
+        id,
+        type,
+        points: raw.points,
+        lineWidth,
+      };
     }
 
     return {
@@ -76,7 +86,7 @@ function sanitizeAnnotation(item: unknown): AnnotationItem | null {
       type,
       points: raw.points,
       stroke: typeof raw.stroke === 'string' ? raw.stroke : '#ff4d4f',
-      lineWidth: isFiniteNumber(raw.lineWidth) ? Math.max(1, raw.lineWidth) : 3,
+      lineWidth,
     };
   }
 

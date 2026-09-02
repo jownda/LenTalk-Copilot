@@ -54,6 +54,23 @@ describe("projectReducer asset naming", () => {
     expect(unlinked.assets?.[0].attachedPropIds).toEqual([]);
   });
 
+  it("cleans a deleted character from the roster and scene-level spatial order", () => {
+    const state = {
+      ...project,
+      scenes: [{
+        id: "scene-1", name: "Test", logline: "", location: "", time: "", weather: "", duration: "5秒",
+        palette: "", lighting: "", environmentLock: false,
+        staging: { characterRoster: ["kel"], characterOrder: ["kel"] },
+        shots: [],
+      }],
+    } as ProjectV2;
+
+    const next = projectReducer(state, { type: "DELETE_ASSET", id: "kel" });
+
+    expect(next.scenes[0].staging?.characterRoster).toEqual([]);
+    expect(next.scenes[0].staging?.characterOrder).toEqual([]);
+  });
+
   it("keeps final audit records in newest-first project change history", () => {
     const first = projectReducer(project, { type: "RECORD_FINAL_AUDIT", record: {
       id: "audit-1", createdAt: "2026-08-27T01:00:00.000Z", sceneId: "scene-1", status: "passed", automaticFixes: [], issues: [],

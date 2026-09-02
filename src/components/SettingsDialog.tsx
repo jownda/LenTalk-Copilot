@@ -234,7 +234,7 @@ export function SettingsDialog({
       apiKey: '',
       modelsText: api.models.join('\n'),
       videoModelsText: (api.videoModels ?? []).join('\n'),
-      chatModelsText: '',
+      chatModelsText: (api.chatModels ?? []).join('\n'),
       requestMode: 'sync',
       protocol: api.imageConfig?.protocol ?? 'images',
       referenceImageField: api.imageConfig?.referenceImageField ?? 'image',
@@ -252,6 +252,7 @@ export function SettingsDialog({
         videoQueryPath: api.videoConfig.queryPath,
         videoReferenceEncoding: api.videoConfig.referenceEncoding,
         taskProtocol: 'generic',
+        videoTransport: api.videoConfig.transport,
       } : undefined,
     });
     setShowAddCustomApi(true);
@@ -516,6 +517,7 @@ export function SettingsDialog({
     customApiDraft.baseUrl,
     customApiDraft.modelsText,
     customApiDraft.videoModelsText,
+    customApiDraft.chatModelsText,
     t,
   ]);
 

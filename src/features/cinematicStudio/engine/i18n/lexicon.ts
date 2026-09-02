@@ -82,8 +82,11 @@ const ZH: PromptLexicon = {
   },
   values: {
     // 景别
-    "Wide": "全景", "Medium close-up": "中近景", "Close-up": "特写", "Extreme close-up": "大特写",
-    "Medium": "中景", "Medium wide": "中全景", "Low wide": "低角度全景", "Full": "全身", "Insert": "插入特写",
+    "Extreme wide / establishing": "大远景 / 建立镜头", "Wide": "全景", "Full shot": "全身镜头", "Medium full / cowboy": "中全景 / 牛仔镜头",
+    "Medium": "中景", "Medium close-up": "中近景", "Close-up": "近景 / 特写", "Big close-up": "大特写",
+    "Extreme close-up": "极近特写", "Insert / detail": "细节插入", "Two-shot": "双人镜头", "Tight two-shot": "紧凑双人镜头",
+    "Over-the-shoulder": "过肩镜头", "3/4 medium, behind subject": "3/4 中景，人物背后", "Extreme close-up, profile": "极近特写，侧面",
+    "Medium wide": "中全景", "Low wide": "低角度全景", "Full": "全身", "Insert": "插入特写",
     // 镜头运动
     "Static": "静态", "Handheld": "手持", "Dolly": "移轨", "Crane": "升降", "Pan": "摇镜",
     "Tilt": "俯仰", "Push-in": "推近", "Pull-out": "拉远", "Trucking": "横移", "Tracking": "跟拍",

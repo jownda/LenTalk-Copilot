@@ -121,7 +121,6 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     const videoNodeId = addNode(CANVAS_NODE_TYPES.videoGen, placement, {
       prompt: nextPrompt,
       model: '',
-      duration: 5,
       aspectRatio: '16:9',
       resolution: '720p',
       imageMode: 'reference',

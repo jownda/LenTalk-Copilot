@@ -72,9 +72,11 @@ export function drawAnnotations(
       continue;
     }
 
-    if (item.type === 'pen') {
+    if (item.type === 'pen' || item.type === 'eraser') {
       context.save();
-      context.strokeStyle = item.stroke;
+      // The eraser intentionally paints opaque white instead of clearing pixels,
+      // so the final image has a clean white background in erased areas.
+      context.strokeStyle = item.type === 'eraser' ? '#ffffff' : item.stroke;
       context.lineWidth = item.lineWidth;
       context.lineJoin = 'round';
       context.lineCap = 'round';

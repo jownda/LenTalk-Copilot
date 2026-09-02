@@ -16,6 +16,7 @@ use uuid::Uuid;
 static JIMENG_CLI_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLI_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const JIMENG_CLI_MAX_REFERENCE_IMAGES: usize = 9;
 
 #[derive(Debug, Deserialize)]
 pub struct GenerateJimengCliVideoRequest {
@@ -66,6 +67,13 @@ fn generate_video_blocking(
             &input_dir,
             "image",
         )?;
+        if reference_images.len() > JIMENG_CLI_MAX_REFERENCE_IMAGES {
+            return Err(format!(
+                "即梦 CLI 最多支持 {} 张参考图片，当前有 {} 张，请删除多余参考图后重试",
+                JIMENG_CLI_MAX_REFERENCE_IMAGES,
+                reference_images.len()
+            ));
+        }
         let reference_audio = materialize_audio_files(
             request.reference_audio.as_deref().unwrap_or_default(),
         )?;
@@ -776,8 +784,42 @@ fn extract_http_url(output: &str) -> Option<String> {
 
 fn output_summary(output: &str) -> String {
     let compact = output.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Query responses include the prompt before the actual failure reason.
+    // Prefer status/error fields so a long prompt cannot hide the actionable
+    // message in the generated error report.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&compact) {
+        if let Some(object) = value.as_object() {
+            let fields = [
+                "gen_status",
+                "fail_reason",
+                "error",
+                "error_message",
+                "message",
+                "submit_id",
+            ];
+            let summary = fields
+                .iter()
+                .filter_map(|field| object.get(*field).map(|value| format!("{field}={value}")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !summary.is_empty() {
+                return summary;
+            }
+        }
+    }
+
     if compact.len() > 500 {
-        format!("{}…", &compact[..500])
+        // `str::len` is measured in bytes, while Rust string slices must end
+        // on a UTF-8 character boundary. Find the last valid boundary within
+        // the byte limit instead of slicing directly at byte 500.
+        let end = compact
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= 500)
+            .last()
+            .unwrap_or(0);
+        format!("{}…", &compact[..end])
     } else {
         compact
     }
@@ -1032,6 +1074,31 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
         let locations = common_locations("dreamina").into_iter().map(|p| p.replace('\\', "/")).collect::<Vec<_>>();
         assert!(locations.iter().any(|p| p.ends_with(".local/bin/dreamina") || p.ends_with(".local/bin/dreamina.exe")));
         assert!(locations.iter().any(|p| p.ends_with(".cargo/bin/dreamina") || p.ends_with(".cargo/bin/dreamina.exe")));
+    }
+
+    #[test]
+    fn output_summary_truncates_chinese_without_panicking() {
+        let output = format!("{}车后续输出", "a".repeat(498));
+        let summary = output_summary(&output);
+
+        assert_eq!(summary, format!("{}…", "a".repeat(498)));
+    }
+
+    #[test]
+    fn output_summary_prioritizes_cli_failure_reason_over_prompt() {
+        let output = serde_json::json!({
+            "submit_id": "example-task",
+            "prompt": "a very long prompt",
+            "gen_status": "fail",
+            "fail_reason": "image_resource_id_list length is 10, should be <= 9"
+        })
+        .to_string();
+
+        let summary = output_summary(&output);
+
+        assert!(summary.contains("gen_status=\"fail\""));
+        assert!(summary.contains("image_resource_id_list length is 10"));
+        assert!(!summary.contains("very long prompt"));
     }
 }
 

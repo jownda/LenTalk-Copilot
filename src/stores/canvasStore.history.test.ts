@@ -6,6 +6,8 @@ function resetStore() {
   useCanvasStore.setState({
     nodes: [],
     edges: [],
+    routingRevision: 0,
+    processingRevision: 0,
     selectedNodeId: null,
     activeToolDialog: null,
     history: { past: [], future: [] },
@@ -76,6 +78,24 @@ describe('canvasStore history (undo/redo)', () => {
     ]);
 
     expect(useCanvasStore.getState().history.past.length).toBe(pastBefore);
+  });
+
+  it('普通文本更新不会触发连线重新走线', () => {
+    const id = addTextNode();
+    const routingRevision = useCanvasStore.getState().routingRevision;
+
+    useCanvasStore.getState().updateNodeData(id, { content: '只更新文本内容' });
+
+    expect(useCanvasStore.getState().routingRevision).toBe(routingRevision);
+  });
+
+  it('节点移动会触发连线重新走线', () => {
+    const id = addTextNode();
+    const routingRevision = useCanvasStore.getState().routingRevision;
+
+    useCanvasStore.getState().updateNodePosition(id, { x: 260, y: 180 });
+
+    expect(useCanvasStore.getState().routingRevision).toBe(routingRevision + 1);
   });
 
   it('resize 结束(有 resizing: false)且尺寸变化时写入历史', () => {

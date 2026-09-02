@@ -13,6 +13,7 @@ import { Handle, Position, useUpdateNodeInternals, type NodeProps } from '@xyflo
 import { createPortal } from 'react-dom';
 import { Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useShallow } from 'zustand/shallow';
 
 import {
   AUTO_REQUEST_ASPECT_RATIO,
@@ -431,8 +432,12 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const [pickerActiveIndex, setPickerActiveIndex] = useState(0);
   const [pickerAnchor, setPickerAnchor] = useState<PickerAnchor>(PICKER_FALLBACK_ANCHOR);
 
-  const nodes = useCanvasStore((state) => state.nodes);
-  const edges = useCanvasStore((state) => state.edges);
+  const incomingImages = useCanvasStore(useShallow((state) =>
+    graphImageResolver.collectInputImages(id, state.nodes, state.edges)
+  ));
+  const incomingText = useCanvasStore(useShallow((state) =>
+    graphImageResolver.collectInputText(id, state.nodes, state.edges)
+  ));
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const addNode = useCanvasStore((state) => state.addNode);
@@ -454,14 +459,6 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
       updateNodeData,
     });
 
-  const incomingImages = useMemo(
-    () => graphImageResolver.collectInputImages(id, nodes, edges),
-    [id, nodes, edges]
-  );
-  const incomingText = useMemo(
-    () => graphImageResolver.collectInputText(id, nodes, edges),
-    [edges, id, nodes]
-  );
   // 文本引用预览现在按行渲染(每行一个上游文本), 不再需要合并字符串
 
   const incomingImageItems = useMemo(

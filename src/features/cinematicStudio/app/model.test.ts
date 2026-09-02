@@ -39,4 +39,18 @@ describe("project optics migration", () => {
       referenceTag: "char_cully-hill-boys_kel_base_v1",
     });
   });
+
+  it("preserves legacy scene staging as the initial character roster", () => {
+    const project = {
+      schemaVersion: 3,
+      title: "Test",
+      assets: [],
+      scenes: [{ id: "scene-1", staging: { characterOrder: ["hero", "support", "hero"] }, shots: [] }],
+    } as unknown as ProjectV2;
+
+    const migrated = migrateProject(project);
+
+    expect(migrated.scenes[0].staging?.characterRoster).toEqual(["hero", "support"]);
+    expect(migrated.scenes[0].staging?.characterOrder).toEqual(["hero", "support", "hero"]);
+  });
 });

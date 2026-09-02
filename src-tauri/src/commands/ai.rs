@@ -597,6 +597,53 @@ pub async fn request_provider_json(
     })
 }
 
+/// Upload one reference asset through the native desktop HTTP client.
+/// The API requires multipart/form-data and cannot accept a local path or
+/// data URL in a video request.
+#[tauri::command]
+pub async fn request_provider_multipart(
+    url: String,
+    headers: HashMap<String, String>,
+    field_name: String,
+    filename: String,
+    content_type: String,
+    body_base64: String,
+) -> Result<ProviderHttpResponseDto, String> {
+    let parsed_url = reqwest::Url::parse(url.trim())
+        .map_err(|error| format!("Invalid provider URL: {}", error))?;
+    let bytes = STANDARD
+        .decode(body_base64.trim())
+        .map_err(|error| format!("Invalid multipart body: {}", error))?;
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(filename)
+        .mime_str(&content_type)
+        .map_err(|error| format!("Invalid multipart content type: {}", error))?;
+    let form = reqwest::multipart::Form::new().part(field_name, part);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15 * 60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let mut request = client.post(parsed_url).multipart(form);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Provider multipart request failed: {}", error))?;
+    let status = response.status().as_u16();
+    let response_bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Failed to read provider multipart response: {}", error))?;
+    Ok(ProviderHttpResponseDto {
+        status,
+        body: String::from_utf8_lossy(&response_bytes).into_owned(),
+        body_base64: None,
+    })
+}
+
 /// Stream an OpenAI-compatible response to the webview one chunk at a time.
 /// This is intentionally a small transport primitive: parsing SSE, tracking
 /// received text, and deciding whether to resume remain frontend concerns.

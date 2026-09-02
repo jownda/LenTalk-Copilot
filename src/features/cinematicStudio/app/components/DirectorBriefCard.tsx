@@ -78,9 +78,9 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
     return () => window.clearInterval(timer);
   }, [generationBusy]);
   const staging = scene.staging ?? {};
-  const order = staging.characterOrder ?? [];
+  const roster = staging.characterRoster ?? [];
   const characterAssets = (project.assets ?? []).filter((asset) => asset.kind === "character");
-  const characterCandidates = characterAssets.filter((asset) => !order.includes(asset.id));
+  const characterCandidates = characterAssets.filter((asset) => !roster.includes(asset.id));
   const nameOf = (id: string) => (project.assets ?? []).find((asset) => asset.id === id)?.name ?? id;
   const audio = project.audioPlan ?? { score: "none" as const, subtitles: false };
   const styleBrief = localizedStyleBrief(project, locale);
@@ -108,12 +108,16 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
         idle: "",
       } satisfies Record<SceneCompileProgress, string>)[compileProgress] + receivedText;
 
-  const addCharacter = (id: string) => {
-    if (order.includes(id)) return;
-    onUpdateStaging({ characterOrder: [...order, id] });
+  const addRosterCharacter = (id: string) => {
+    if (roster.includes(id)) return;
+    onUpdateStaging({ characterRoster: [...roster, id] });
     setPickingCharacter(false);
   };
-  const removeCharacter = (id: string) => onUpdateStaging({ characterOrder: order.filter((item) => item !== id) });
+  const removeRosterCharacter = (id: string) => onUpdateStaging({
+    characterRoster: roster.filter((item) => item !== id),
+    // Existing shot participants remain intact and are never removed implicitly.
+    characterOrder: (staging.characterOrder ?? []).filter((item) => item !== id),
+  });
 
   return <section className="card director-brief-card">
     <div className="card-head">
@@ -141,15 +145,20 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
         <span className="field-label">{t.loglineTitle}</span>
         <textarea className="logline-input" value={scene.logline} aria-label={t.loglineTitle} placeholder={t.loglinePlaceholder} rows={2} onChange={(event) => onUpdateScene({ logline: event.target.value })} />
       </div>
+      <div className="fields-grid three">
+        <label className="field-label"><span>{t.metaLocation}</span><input className="modal-input" value={scene.location ?? ""} placeholder={t.sceneLocationPlaceholder} onChange={(event) => onUpdateScene({ location: event.target.value })} /></label>
+        <label className="field-label"><span>{t.metaTime}</span><input className="modal-input" value={scene.time ?? ""} placeholder={t.sceneTimePlaceholder} onChange={(event) => onUpdateScene({ time: event.target.value })} /></label>
+        <label className="field-label"><span>{t.metaWeather}</span><input className="modal-input" value={scene.weather ?? ""} placeholder={t.sceneWeatherPlaceholder} onChange={(event) => onUpdateScene({ weather: event.target.value })} /></label>
+      </div>
       <label className="field-label">{t.priorContext}<textarea className="modal-textarea" value={staging.priorContext ?? ""} placeholder={t.priorContextPlaceholder} onChange={(event) => onUpdateStaging({ priorContext: event.target.value || undefined })} /></label>
 
       <div className="field-label">{t.sceneCharacterRoster}
         <div className="stage-row scene-character-roster-input">
-          {order.map((id) => (
+          {roster.map((id) => (
             <span className="stage-chip order-chip" key={id}>
               <span className="avatar small">{nameOf(id).slice(0, 1)}</span>
               <b>{nameOf(id)}</b>
-              <button title={t.deleteParticipant} onClick={() => removeCharacter(id)}><X size={11} /></button>
+              <button title={t.deleteParticipant} onClick={() => removeRosterCharacter(id)}><X size={11} /></button>
             </span>
           ))}
           <button
@@ -168,7 +177,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
             ? <p className="hint-text">{characterAssets.length === 0 ? t.stagingNoCharacterHint : t.stagingAllCharactersAdded}</p>
             : <div className="staging-location-picker-grid">
                 {characterCandidates.map((asset) => (
-                  <button key={asset.id} onClick={() => addCharacter(asset.id)}>
+                  <button key={asset.id} onClick={() => addRosterCharacter(asset.id)}>
                     {asset.referencePaths?.[0] ? <img src={asset.referencePaths[0]} alt={asset.name} /> : <span className="staging-location-fallback">{asset.name.slice(0, 1)}</span>}
                     <span>{asset.name}</span>
                   </button>

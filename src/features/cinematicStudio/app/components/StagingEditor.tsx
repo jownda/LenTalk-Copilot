@@ -61,6 +61,7 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
   const locationAsset = locationAssets.find((asset) => asset.id === staging.locationAssetId);
   const nameOf = (id: string) => (project.assets ?? []).find((a) => a.id === id)?.name ?? id;
   const order = staging.characterOrder ?? [];
+  const roster = staging.characterRoster ?? [];
   const characterCandidates = characterAssets.filter((asset) => !order.includes(asset.id));
   const libraryImages = useMemo(() => [
     ...(project.assets ?? []).flatMap((asset) => (asset.referencePaths ?? []).filter(Boolean).map((source) => ({ source, label: `${asset.name} · ${t.assetLibrary}` }))),
@@ -96,7 +97,12 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
   };
   const addCharacter = (id: string) => {
     if (order.includes(id)) return;
-    onChange({ characterOrder: [...order, id] });
+    onChange({
+      characterOrder: [...order, id],
+      // A staged character is necessarily available to the scene planner, but
+      // roster-only characters do not need a default spatial placement.
+      characterRoster: roster.includes(id) ? roster : [...roster, id],
+    });
   };
 
   const sceneTitle = locationAsset?.name || scene.location?.trim() || "";

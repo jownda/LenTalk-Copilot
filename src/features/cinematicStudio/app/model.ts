@@ -19,6 +19,27 @@ export const seedProject: ProjectV2 = {
 };
 
 /**
+ * 角色候选与空间左右顺序拆分。旧项目只有 characterOrder 时，
+ * 将它作为初始候选角色保留，避免升级后丢失既有场景资产范围。
+ */
+function migrateSceneCharacterRosters(project: ProjectV2): ProjectV2 {
+  return {
+    ...project,
+    scenes: (project.scenes ?? []).map((scene) => {
+      const staging = scene.staging;
+      if (!staging?.characterOrder?.length || Array.isArray(staging.characterRoster)) return scene;
+      return {
+        ...scene,
+        staging: {
+          ...staging,
+          characterRoster: [...new Set(staging.characterOrder)],
+        },
+      };
+    }),
+  };
+}
+
+/**
  * V0.1 → V0.2 项目迁移：
  * - 为每个 Character 登记 character Asset（reference→referencePaths，face/wardrobe→descriptionZh）
  * - 角色道具登记为 prop Asset
@@ -39,7 +60,7 @@ export function migrateProject(raw: unknown): ProjectV2 {
       }
     }
     const projectCode = project.projectCode?.trim() || deriveProjectCode(project.title || project.id);
-    return { ...project, projectCode, assets: project.assets.map((asset) => withAssetReferenceTag(asset, projectCode)) };
+    return migrateSceneCharacterRosters({ ...project, projectCode, assets: project.assets.map((asset) => withAssetReferenceTag(asset, projectCode)) });
   }
 
   const projectCode = project.projectCode?.trim() || deriveProjectCode(project.title || project.id);
@@ -109,7 +130,7 @@ export function migrateProject(raw: unknown): ProjectV2 {
 
   migrated.assets = migrated.assets.map((asset) => withAssetReferenceTag(asset, projectCode));
 
-  return migrated;
+  return migrateSceneCharacterRosters(migrated);
 }
 
 export function loadProject(): ProjectV2 {

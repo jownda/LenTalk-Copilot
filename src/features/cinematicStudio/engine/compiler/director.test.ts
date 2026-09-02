@@ -54,6 +54,7 @@ describe("compileDirectorSequence final export audit", () => {
     expect(layers).not.toHaveProperty("actionTiming");
     expect(layers).not.toHaveProperty("activeReferences");
     expect(layers).not.toHaveProperty("firstFrame");
+    expect(layers).not.toHaveProperty("optics");
     expect(layers.sceneContext).not.toContain("测试场景");
     expect(compileDirectorSequence(project, scene, { locale: "zh" })).toContain("镜头执行：");
   });
@@ -711,8 +712,8 @@ describe("compileDirectorSequence final export audit", () => {
       { ...base, id: "tele", label: "反应", optics: { lensCharacter: "29-short-tele", fieldOfViewDegrees: 29 }, time: { startSeconds: 5, endSeconds: 10 } },
     ] });
     const output = compileDirectorSequence(makeProject(scene), scene, { locale: "zh" });
-    expect(output).toContain("镜头 1：84° 经典广角；主体周围环境被清晰建立");
-    expect(output).toContain("镜头 2：29° 中近特写；讨喜的面部压缩，自然比例");
+    expect(output).toContain("镜头 1：84° 经典广角；景别：中景；主体周围环境被清晰建立");
+    expect(output).toContain("镜头 2：29° 中近特写；景别：中景；讨喜的面部压缩，自然比例");
     expect(output).not.toContain("镜头检查");
   });
 

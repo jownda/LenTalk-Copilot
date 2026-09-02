@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowRight, Brush, Circle, Square, Type, Undo2, Trash2 } from 'lucide-react';
+import { ArrowRight, Brush, Circle, Eraser, Square, Type, Undo2, Trash2 } from 'lucide-react';
 import {
   Arrow,
   Ellipse,
@@ -59,6 +59,7 @@ const TOOL_BUTTONS: ToolButton[] = [
   { type: 'ellipse', label: '圆形', icon: Circle },
   { type: 'arrow', label: '箭头', icon: ArrowRight },
   { type: 'pen', label: '画笔', icon: Brush },
+  { type: 'eraser', label: '橡皮擦', icon: Eraser },
   { type: 'text', label: '文本', icon: Type },
 ];
 
@@ -117,7 +118,7 @@ function getPointsBounds(points: number[]): { minX: number; minY: number } {
 }
 
 function updateAnnotationPosition(item: AnnotationItem, newX: number, newY: number): AnnotationItem {
-  if (item.type === 'arrow' || item.type === 'pen') {
+  if (item.type === 'arrow' || item.type === 'pen' || item.type === 'eraser') {
     const { minX, minY } = getPointsBounds(item.points);
     const dx = newX - minX;
     const dy = newY - minY;
@@ -160,7 +161,7 @@ function updateAnnotationTransform(
     };
   }
 
-  if (item.type === 'arrow' || item.type === 'pen') {
+  if (item.type === 'arrow' || item.type === 'pen' || item.type === 'eraser') {
     const { minX, minY } = getPointsBounds(item.points);
     return {
       ...item,
@@ -299,12 +300,15 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
     () => annotations.find((item) => item.id === selectedId) ?? null,
     [annotations, selectedId]
   );
-  const activeStyleKind = useMemo<'shape' | 'text' | null>(() => {
+  const activeStyleKind = useMemo<'shape' | 'eraser' | 'text' | null>(() => {
     if (tool === 'text') {
       return 'text';
     }
     if (tool === 'rect' || tool === 'ellipse' || tool === 'arrow' || tool === 'pen') {
       return 'shape';
+    }
+    if (tool === 'eraser') {
+      return 'eraser';
     }
     return null;
   }, [tool]);
@@ -445,8 +449,16 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
         return null;
       }
 
-      if (draft.tool === 'pen') {
+      if (draft.tool === 'pen' || draft.tool === 'eraser') {
         const points = [...(draft.points ?? [draft.startX, draft.startY]), currentX, currentY];
+        if (draft.tool === 'eraser') {
+          return {
+            id: 'draft-eraser',
+            type: 'eraser',
+            points,
+            lineWidth,
+          };
+        }
         return {
           id: 'draft-pen',
           type: 'pen',
@@ -493,12 +505,12 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
     if (!draft) {
       return null;
     }
-    if (draft.tool === 'pen') {
+    if (draft.tool === 'pen' || draft.tool === 'eraser') {
       return {
-        id: 'draft-pen',
-        type: 'pen',
+        id: draft.tool === 'eraser' ? 'draft-eraser' : 'draft-pen',
+        type: draft.tool,
         points: draft.points ?? [draft.startX, draft.startY],
-        stroke: color,
+        ...(draft.tool === 'pen' ? { stroke: color } : {}),
         lineWidth,
       } as AnnotationItem;
     }
@@ -531,7 +543,7 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
       startY: point.y,
       currentX: point.x,
       currentY: point.y,
-      points: tool === 'pen' ? [point.x, point.y] : undefined,
+      points: tool === 'pen' || tool === 'eraser' ? [point.x, point.y] : undefined,
     });
   }, [getImagePoint, startTextEditing, tool]);
 
@@ -545,9 +557,9 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
       return;
     }
 
-    if (draft.tool === 'pen') {
+    if (draft.tool === 'pen' || draft.tool === 'eraser') {
       setDraft((previous) => {
-        if (!previous || previous.tool !== 'pen') {
+        if (!previous || (previous.tool !== 'pen' && previous.tool !== 'eraser')) {
           return previous;
         }
         return {
@@ -601,7 +613,7 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
       }
     }
 
-    if (nextItem.type === 'pen' && nextItem.points.length < 6) {
+    if ((nextItem.type === 'pen' || nextItem.type === 'eraser') && nextItem.points.length < 6) {
       setDraft(null);
       return;
     }
@@ -677,6 +689,20 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
         };
       }
 
+      if (item.type === 'eraser') {
+        return {
+          ...item,
+          lineWidth: percentToLineWidth(
+            clamp(
+              toNumber(nextOptions.lineWidthPercent, lineWidthToPercent(item.lineWidth, textBaseSize)),
+              MIN_LINE_WIDTH_PERCENT,
+              MAX_LINE_WIDTH_PERCENT
+            ),
+            textBaseSize
+          ),
+        };
+      }
+
       return {
         ...item,
         stroke: toText(nextOptions.color, item.stroke),
@@ -723,26 +749,32 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
       return;
     }
 
-    let patch: Partial<ToolOptions> = {};
-    if (selectedAnnotation.type === 'text') {
-      patch = {
-        color: selectedAnnotation.color,
-        fontSizePercent: clamp(
-          fontSizeToPercent(selectedAnnotation.fontSize, textBaseSize),
-          MIN_TEXT_SIZE_PERCENT,
-          MAX_TEXT_SIZE_PERCENT
-        ),
-      };
-    } else {
-      patch = {
-        color: selectedAnnotation.stroke,
-        lineWidthPercent: clamp(
-          lineWidthToPercent(selectedAnnotation.lineWidth, textBaseSize),
-          MIN_LINE_WIDTH_PERCENT,
-          MAX_LINE_WIDTH_PERCENT
-        ),
-      };
-    }
+    const patch: Partial<ToolOptions> =
+      selectedAnnotation.type === 'text'
+        ? {
+            color: selectedAnnotation.color,
+            fontSizePercent: clamp(
+              fontSizeToPercent(selectedAnnotation.fontSize, textBaseSize),
+              MIN_TEXT_SIZE_PERCENT,
+              MAX_TEXT_SIZE_PERCENT
+            ),
+          }
+        : selectedAnnotation.type === 'eraser'
+          ? {
+              lineWidthPercent: clamp(
+                lineWidthToPercent(selectedAnnotation.lineWidth, textBaseSize),
+                MIN_LINE_WIDTH_PERCENT,
+                MAX_LINE_WIDTH_PERCENT
+              ),
+            }
+          : {
+              color: selectedAnnotation.stroke,
+              lineWidthPercent: clamp(
+                lineWidthToPercent(selectedAnnotation.lineWidth, textBaseSize),
+                MIN_LINE_WIDTH_PERCENT,
+                MAX_LINE_WIDTH_PERCENT
+              ),
+            };
 
     const safePatch = pruneUndefinedToolOptionsPatch(patch);
     const hasChange = Object.entries(safePatch).some(
@@ -792,7 +824,7 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
     const node = event.target;
     const nextX = node.x();
     const nextY = node.y();
-    if (item.type === 'arrow' || item.type === 'pen') {
+    if (item.type === 'arrow' || item.type === 'pen' || item.type === 'eraser') {
       node.x(0);
       node.y(0);
     }
@@ -812,7 +844,7 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
     const nextY = node.y();
     node.scaleX(1);
     node.scaleY(1);
-    if (item.type === 'arrow' || item.type === 'pen') {
+    if (item.type === 'arrow' || item.type === 'pen' || item.type === 'eraser') {
       node.x(0);
       node.y(0);
     }
@@ -900,13 +932,13 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
       );
     }
 
-    if (item.type === 'pen') {
+    if (item.type === 'pen' || item.type === 'eraser') {
       return (
         <Line
           key={item.id}
           ref={(node) => bindShapeRef(item.id, node)}
           points={item.points}
-          stroke={item.stroke}
+          stroke={item.type === 'eraser' ? '#ffffff' : item.stroke}
           strokeWidth={item.lineWidth}
           lineJoin="round"
           lineCap="round"
@@ -999,13 +1031,15 @@ export function AnnotateToolEditor({ options, onOptionsChange, sourceImageUrl }:
       <div className="flex flex-wrap items-center gap-2">
         {activeStyleKind && (
           <>
-            <input
+            {activeStyleKind !== 'eraser' && (
+              <input
               type="color"
               value={color}
               onChange={(event) => handleStyleInputChange({ color: event.target.value })}
               className="h-9 w-10 cursor-pointer rounded-md border border-[rgba(255,255,255,0.18)] bg-transparent p-1"
-            />
-            {activeStyleKind === 'shape' && (
+              />
+            )}
+            {(activeStyleKind === 'shape' || activeStyleKind === 'eraser') && (
               <>
                 <input
                   type="range"

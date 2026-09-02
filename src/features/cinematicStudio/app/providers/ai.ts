@@ -1415,9 +1415,11 @@ interface GeneratedShotResult {
 export function collectSceneAssetIds(project: ProjectV2, scene: SceneV2): string[] {
   const byId = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
   const shotIds = buildSceneAssetRegistry(project, scene).orderedAssets.map((asset) => asset.id);
+  const rosterCharacterIds = (scene.staging?.characterRoster ?? [])
+    .filter((id) => byId.get(id)?.kind === "character");
   const stagingCharacterIds = (scene.staging?.characterOrder ?? [])
     .filter((id) => byId.get(id)?.kind === "character");
-  return Array.from(new Set([...shotIds, ...stagingCharacterIds]));
+  return Array.from(new Set([...shotIds, ...rosterCharacterIds, ...stagingCharacterIds]));
 }
 
 
@@ -1445,6 +1447,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
   const characterIds = sceneAssetIds.filter((id) => byId.get(id)?.kind === "character");
   const propIds = sceneAssetIds.filter((id) => byId.get(id)?.kind === "prop");
   const locationAsset = scene.staging?.locationAssetId ? byId.get(scene.staging.locationAssetId) : undefined;
+  const rosterIds = [...(scene.staging?.characterRoster ?? [])].filter((id) => byId.has(id) && byId.get(id)?.kind === "character");
   const orderIds = [...(scene.staging?.characterOrder ?? [])].filter((id) => byId.has(id) && byId.get(id)?.kind === "character");
   const seconds = t?.seconds ?? "s";
   const locale = t?.locale ?? "zh";
@@ -1481,7 +1484,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
   const vocabLines = [
     "Available camera IDs: arri-alexa-35, arri-alexa-mini-lf, red-v-raptor, sony-venice-2, bmd-ursa-cine, canon-c300-iii, panasonic-s1h, kinefinity-mavo-edge",
     "Available lensModel IDs: arri-master-prime, zeiss-supreme-prime, zeiss-cp4, cooke-s7i, leica-summicron-c, angenieux-optimo, canon-cne, sigma-cine-ff, cooke-panchro, helios-44-2",
-    "framing: pick from Wide, Medium close-up, or Extreme close-up, profile (free English framing phrases also allowed)",
+    "framing: pick one clear shot size: Extreme wide / establishing, Wide, Full shot, Medium full / cowboy, Medium, Medium close-up, Close-up, Big close-up, Extreme close-up, Insert / detail, Two-shot, Tight two-shot, Over-the-shoulder, or 3/4 medium behind subject (free English framing phrases are also allowed)",
     "movement: pick from Static, Handheld, Steadicam, Dolly, Tracking, Crane, POV, OTS",
     "direction: \"left-to-right\" or \"right-to-left\"; cutStyle: \"hard-cut\" | \"overlap\" | \"match-cut\"",
   ];
@@ -1511,6 +1514,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     `Scene dialogue (user reference only): ${scene.dialogue?.trim() || "(empty)"}`,
     `Spatial anchor (空间锚点): ${scene.staging?.anchorDescription?.trim() || "(empty)"}`,
     `Staging reference image (站位参考图): ${scene.staging?.stagingReferenceImage?.trim() ? "provided; use it only for character positions, screen axis, spacing, left-to-right order and spatial anchors" : "(none)"}`,
+    `Scene character roster (本场可用角色，不等于每镜出场角色): ${rosterIds.length > 0 ? assetSummary(rosterIds) : "(none)"}`,
     `Character order (左到右站位, left-to-right): ${orderIds.length > 0 ? assetSummary(orderIds) : "(none/empty)"}`,
     `Performance objectives (表演目标, per character): ${JSON.stringify(scene.actingObjectives ?? [])}`,
     `Axis direction: ${scene.staging?.axisDirection ?? "left-to-right"}; Spacing: ${scene.staging?.spacing?.trim() || "(default)"}`,
@@ -1532,7 +1536,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
       ? `Shooting mode is LONG TAKE. Return EXACTLY ONE shot, starting at 0 and ending no later than ${durationLimit}s. Put the complete story progression into continuous beats inside that one shot, splitting by observable events rather than a fixed beat count; do not merge or omit events to fit a limit. Do not create cut points, alternate camera setups, or additional shot entries.`
       : `Shooting mode is MULTI-SHOT. Select 1-8 shots only when the story rhythm needs a new viewpoint. Slow, observational, or dialogue-led scenes normally use 1-3 shots; do not add coverage just to fill a template. Use more shots only for a clear change of information, action, or emotional beat.`,
     `Timeline hard limit: all shots are sequential; shot 1 starts at 0; shot N starts where shot N-1 ends; beat startSeconds values are absolute scene times and must stay inside their shot window; the final endSeconds MUST be less than or equal to ${durationLimit}s. Never exceed the user's ${durationLimit}${seconds} limit. Duration label uses "${seconds}" suffix.`,
-    "Every shot needs action, acting, framing, optics.lensCharacter, optics.fieldOfViewDegrees, movement, direction, and participants (only existing character IDs). Framing and optics are a linked pair: Wide / environmental action normally uses 47-standard or 84-wide; Medium close-up / face portrait uses 29-short-tele; Extreme close-up / detail uses 18-tele; distant observation uses 8-supertele. Never return a close framing with a broad environmental lens or a wide framing with a portrait telephoto unless the user explicitly asks for that contrast. Participants are shot-local: add only people visible in frame or required to perform, speak, or receive an on-screen action in that exact shot. Do not copy the scene roster into every shot. Every beat actor and targetCharacterId MUST be listed in that same shot's participants. Local normalization supplies safe defaults when a field is not specified.",
+    "Every shot needs action, acting, framing, optics.lensCharacter, optics.fieldOfViewDegrees, movement, direction, and participants (only existing character IDs). Framing and optics are a linked pair: Extreme wide / establishing normally uses 135-immersive; Wide uses 84-wide; Full shot and Medium full use 63-moderate-wide or 47-standard; Medium uses 47-standard; Medium close-up and Close-up use 29-short-tele; Big close-up, Extreme close-up, and Insert / detail use 18-tele; Tight two-shot may use 12-long-tele; distant observation uses 8-supertele. Never return a close framing with a broad environmental lens or a wide framing with a portrait telephoto unless the user explicitly asks for that contrast. Participants are shot-local: add only people visible in frame or required to perform, speak, or receive an on-screen action in that exact shot. Do not copy the scene roster into every shot. Every beat actor and targetCharacterId MUST be listed in that same shot's participants. Local normalization supplies safe defaults when a field is not specified.",
     "Performance (P2): the CHARACTER ACTING MASTERS block is an AI-only reference. It is the character's identity and behavioral baseline, not text to paste into the prompt. Use the matching master profile to understand who the character is, then write the character performing on top of that baseline in this exact shot's moment. Do not copy, concatenate, or paraphrase the master line by line. Present characters only: write an acting paragraph only for characters in that shot's participants; no character in frame means no paragraph for that character. Keep the constant core (identity, vocal profile, signature tics, eye life, emotional through-line) and never contradict the master. Re-express it for this shot's posture, action, beat, emotional pressure, and time of day. Transform behaviors that cannot physically happen instead of deleting them: preserve the same engine while changing its outlet. For each participant, write acting as one flowing paragraph in the character's register, with no bullets, headers, dial labels, or abstract emotion-only wording; use observable face, body, breath, voice, gaze, timing, distance, and reaction. If the pipeline uses asset references, begin the paragraph with that character's reference tag. Set performanceLevel (0-5, 4 default whenever the acting master profile is strong) and eyeLife (micro glances / blink quality / eye glint / eyes leading the turn). Never copy the master profile into ACTIVE REFERENCES, directorLayers, or any separate CHARACTER ACTING section; only its shot-specific, observable adaptation belongs in the corresponding participant and beat. Do not use wardrobe, camera, color, or abstract emotion labels. Fill the beats' P2 fields: tactic (press / charm / provoke...), subtext (true intent opposite to the line), beatChange (visible shift: pause / posture / tempo / eye-line cut), reactionBeforeLine (reaction starting before the other speaker finishes). Every visible action must have its real performer in actorId; a listener or reacting character must get a separate beat with that character's actorId. Use targetCharacterId only for the person being watched, addressed, or reacted to. Never assign a listener's prop action, eye movement, hand movement, or body reaction to the speaker.",
     "Photography (P1): prefer observable lens character over focal-length-only strings. Per shot set optics.lensCharacter from the 10 presets (180-panoramic / 135-immersive / 107-ultrawide / 84-wide / 63-moderate-wide / 47-standard / 29-short-tele / 18-tele / 12-long-tele / 8-supertele) with optics.fieldOfViewDegrees 8-180 matching the preset. The 12° long-tele preset is approximately a 200mm full-frame equivalent and is valid for tight portrait or two-person coverage from a distant camera position. Add lensOutcome + antiDriftLock when the look must stay locked. Set cameraBehavior as physical operator behavior (height / distance / angle / side / subjectSize / screenPlacement / focusBehavior / depthOfField / handheldQuality). Add physicsAnchors for walk / run / weapon / liquid / particle. Per participant set torsoFacing when the body turns away from the eyeline, and anchorDistance when a landmark anchors the scene.",
     "State, not transition: write mid-action states (jaw clenched, strides lengthening), never transition chains (starts to... / begins to...). Groups react in staggered waves with different intensities, never in unison.",
@@ -1605,6 +1609,9 @@ export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): {
       "Every @asset_tag, matching [imageN], and @audioN token is an opaque Seedance platform reference. Copy each one exactly as supplied: never translate, delete, rename, normalize, or invent one. Whenever an asset has a matching [imageN] in ACTIVE REFERENCES, every repeated @asset_tag occurrence in ACTION TIMING, FIRST FRAME AND SPATIAL BLOCKING, LOCATION MAP, and AUDIO must keep the same [imageN] immediately after the tag; never emit a bare version of that @asset_tag. Reusing the same @asset_tag and [imageN] is required and is not an accidental duplication. Keep each asset's appearance and prop description exclusively in ACTIVE REFERENCES. Acting master profiles are AI-only references: do not output them in ACTIVE REFERENCES or add a separate CHARACTER ACTING heading; preserve only their shot-specific, observable adaptation in the corresponding ACTION TIMING participant or beat. Keep each speaking or vocal character's voice lock and voice reference in the AUDIO section's character voice block, followed by the shot-local delivery, exact dialogue or non-verbal vocalization, and silence rule; do not repeat the full voice lock elsewhere.",
       "Do not invent, remove, reinterpret, or contradict any fact. Do not add prior context, story summaries, user notes, AI instructions, warnings, scores, or diagnostics.",
       zh
+        ? "OPTICS 是镜头执行的结构化真源。逐镜保留其中的景别、FOV、镜头语言和可观测光学结果；不得因为风格、内容类别或你自己的判断替换、归一化或补写另一种镜头。"
+        : "OPTICS is the structured source of truth for shot execution. Preserve every shot's framing, FOV, lens character, and observable optical outcome; never replace, normalize, or add a different lens because of style, content class, or your own judgment.",
+      zh
         ? "SCENE CONTEXT 必须保留规范源中的当前地点、实际出场人物和正在发生的关键事件。禁止输出“已处于既定在场状态”“已建立的画面状态”“当前空间中的当前动作状态”“当前事件未提供可提取的剧情信息”等空泛占位句；如果规范源缺少事件，保持源句，不得自行编造。"
         : "SCENE CONTEXT must preserve the canonical source's current location, actual on-screen characters, and key event happening now. Never output vague placeholders such as ‘established on-screen state’, ‘current action state’, or ‘no current story event was provided’; if the canonical source lacks an event, keep its source sentence and do not invent one.",
       headingsRule,
@@ -1639,7 +1646,7 @@ const FINAL_SOURCE_SECTIONS = [
 
 const PROMPT_SECTION_HEADINGS = [
   ...FINAL_SOURCE_SECTIONS.map((section) => section.heading),
-  "场景上下文", "活动引用", "场景地图", "首帧与站位", "格式模式", "光学", "摄像机", "动作节奏", "镜头执行", "物理", "光线", "音频", "风格", "正向约束", "负向约束",
+  "SHOT EXECUTION", "场景上下文", "活动引用", "场景地图", "首帧与站位", "格式模式", "光学", "摄像机", "动作节奏", "镜头执行", "物理", "光线", "音频", "风格", "正向约束", "负向约束",
 ];
 
 function extractPromptSection(source: string, heading: string): string {
@@ -1702,7 +1709,7 @@ export function buildFinalGenerationSource(project: ProjectV2, scene: SceneV2, l
     let body: string;
     if (section.key === "actionTiming") {
       body = extractPromptSection(canonicalSequence, locale === "zh" ? "镜头执行" : "SHOT EXECUTION");
-    } else if (section.key === "activeReferences" || section.key === "firstFrame") {
+    } else if (section.key === "activeReferences" || section.key === "firstFrame" || section.key === "optics") {
       // These sections are executable data, not editable director prose.
       const layer = labelsByKey.get(section.key as typeof DIRECTOR_LAYER_ORDER[number]);
       body = extractPromptSection(canonicalSequence, layer?.[locale] ?? section.heading);
@@ -1882,18 +1889,22 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     const camera = asString(raw.camera, undefined);
     const shotOptics = normalizeOptics(raw.optics);
     const legacyFov = shotOptics?.fieldOfViewDegrees ?? legacyFocalLengthToFov(legacyLens) ?? 47;
-    const recommendedLensId = /extreme\s*close|极近特写|细节|macro|insert/i.test(framing)
-      ? "18-tele"
-      : /close[- ]?up|portrait|特写|肖像|面部|面孔|中近景/i.test(framing)
-        ? "29-short-tele"
-        : /wide|full|establishing|全景|远景|广角/i.test(framing)
-          ? "84-wide"
-          : "47-standard";
+    const recommendedLensId = /extreme\s*wide|establishing|大远景|建立镜头/i.test(framing)
+      ? "135-immersive"
+      : /extreme\s*close|big\s*close|极近特写|大特写|细节|macro|insert/i.test(framing)
+        ? "18-tele"
+        : /tight\s*two|紧凑双人/i.test(framing)
+          ? "12-long-tele"
+          : /close[- ]?up|portrait|特写|肖像|面部|面孔|中近景|过肩/i.test(framing)
+            ? "29-short-tele"
+            : /wide|full|全景|远景|广角|全身|牛仔|中全景/i.test(framing)
+              ? "84-wide"
+              : "47-standard";
     const recommendedLens = lensById(recommendedLensId);
     const selectedLensId = shotOptics?.lensCharacter ?? lensByFov(legacyFov)?.id;
     const selectedLens = selectedLensId ? lensById(selectedLensId) : undefined;
-    const needsNarrowLens = /extreme\s*close|close[- ]?up|portrait|特写|肖像|面部|面孔|中近景|细节|macro|insert/i.test(framing);
-    const needsBroadLens = /wide|full|establishing|全景|远景|广角/i.test(framing);
+    const needsNarrowLens = /extreme\s*close|big\s*close|close[- ]?up|portrait|tight\s*two|特写|肖像|面部|面孔|中近景|紧凑双人|细节|macro|insert/i.test(framing);
+    const needsBroadLens = /extreme\s*wide|wide|full|establishing|大远景|建立镜头|全景|远景|广角|全身|牛仔|中全景/i.test(framing);
     const lensIsNarrow = (selectedLens?.contentClasses ?? []).some((item) => item === "face-portrait" || item === "detail-closeup");
     const lensIsBroad = (selectedLens?.contentClasses ?? []).some((item) => item === "environment-action" || item === "distant-observation");
     const framingLensMismatch = (needsNarrowLens && !lensIsNarrow) || (needsBroadLens && !lensIsBroad);

@@ -69,6 +69,14 @@ const IMAGE_NODE_VISUAL_MIN_EDGE = 96;
 interface CanvasState {
   nodes: CanvasNode[];
   edges: CanvasEdge[];
+  /**
+   * Changes only when node geometry can affect an orthogonal route. Keeping
+   * this separate from node data prevents every prompt edit from recalculating
+   * every edge on a large canvas.
+   */
+  routingRevision: number;
+  /** Changes only when an edge may need to show or hide its processing state. */
+  processingRevision: number;
   selectedNodeId: string | null;
   activeToolDialog: ActiveToolDialog | null;
   history: CanvasHistoryState;
@@ -903,6 +911,8 @@ function createDefaultStoryboardExportOptions(): StoryboardExportOptions {
 export const useCanvasStore = create<CanvasState>((set, get) => ({
   nodes: [],
   edges: [],
+  routingRevision: 0,
+  processingRevision: 0,
   selectedNodeId: null,
   activeToolDialog: null,
   history: { past: [], future: [] },
@@ -974,6 +984,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       );
       const hasInteractionMove = hasDragMove || hasResizeMove;
       const hasInteractionEnd = hasDragEnd || hasResizeEnd;
+      const hasGeometryChange = changes.some(
+        (change) =>
+          change.type === 'position'
+          || change.type === 'dimensions'
+          || change.type === 'add'
+          || change.type === 'remove'
+          || change.type === 'replace'
+      );
 
       let nextHistory = state.history;
       let nextDragHistorySnapshot = state.dragHistorySnapshot;
@@ -1008,6 +1026,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         activeToolDialog: resolveActiveToolDialog(state.activeToolDialog, nextNodes),
         history: nextHistory,
         dragHistorySnapshot: nextDragHistorySnapshot,
+        ...(hasGeometryChange ? { routingRevision: state.routingRevision + 1 } : {}),
       };
     });
   },
@@ -1060,6 +1079,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     set({
       nodes: normalizedNodes,
       edges: normalizedEdges,
+      routingRevision: get().routingRevision + 1,
+      processingRevision: get().processingRevision + 1,
       selectedNodeId: null,
       activeToolDialog: null,
       history: normalizeHistory(history),
@@ -1150,6 +1171,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     }
     set({
       nodes: nextNodes,
+      routingRevision: state.routingRevision + 1,
       history: {
         past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
         future: [],
@@ -1206,6 +1228,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
           future: [],
         },
         dragHistorySnapshot: null,
+        routingRevision: state.routingRevision + 1,
       };
     });
     return changed;
@@ -1437,6 +1460,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     set({
       nodes: nextNodes,
       selectedNodeId: node.id,
+      routingRevision: state.routingRevision + 1,
       activeToolDialog: null,
       history: {
         past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
@@ -1532,6 +1556,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     set({
       nodes: nextNodes,
       selectedNodeId: node.id,
+      routingRevision: state.routingRevision + 1,
       activeToolDialog: null,
       history: {
         past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
@@ -1586,6 +1611,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     set({
       nodes: nextNodes,
       selectedNodeId: node.id,
+      routingRevision: state.routingRevision + 1,
       activeToolDialog: null,
       history: {
         past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
@@ -1600,6 +1626,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   updateNodeData: (nodeId, data) => {
     set((state) => {
       let changed = false;
+      let geometryChanged = false;
+      let processingChanged = false;
       const nextNodes = state.nodes.map((node) => {
         if (node.id !== nodeId) {
           return node;
@@ -1625,6 +1653,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
           data
         );
 
+        geometryChanged = geometryChanged
+          || resizedNode.width !== node.width
+          || resizedNode.height !== node.height;
+        processingChanged = processingChanged
+          || (node.data as { isGenerating?: unknown }).isGenerating
+            !== (mergedData as { isGenerating?: unknown }).isGenerating;
         changed = true;
         return resizedNode;
       });
@@ -1640,6 +1674,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
           future: [],
         },
         dragHistorySnapshot: null,
+        ...(geometryChanged ? { routingRevision: state.routingRevision + 1 } : {}),
+        ...(processingChanged ? { processingRevision: state.processingRevision + 1 } : {}),
       };
     });
   },
@@ -1647,6 +1683,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   updateNodeDataTransient: (nodeId, data) => {
     set((state) => {
       let changed = false;
+      let geometryChanged = false;
+      let processingChanged = false;
       const nextNodes = state.nodes.map((node) => {
         if (node.id !== nodeId) return node;
         const hasDataChange = Object.entries(data).some(([key, nextValue]) =>
@@ -1655,9 +1693,22 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         if (!hasDataChange) return node;
         changed = true;
         const mergedData = { ...node.data, ...data } as CanvasNodeData;
-        return maybeApplyImageAutoResize({ ...node, data: mergedData }, data);
+        const resizedNode = maybeApplyImageAutoResize({ ...node, data: mergedData }, data);
+        geometryChanged = geometryChanged
+          || resizedNode.width !== node.width
+          || resizedNode.height !== node.height;
+        processingChanged = processingChanged
+          || (node.data as { isGenerating?: unknown }).isGenerating
+            !== (mergedData as { isGenerating?: unknown }).isGenerating;
+        return resizedNode;
       });
-      return changed ? { nodes: nextNodes } : {};
+      return changed
+        ? {
+            nodes: nextNodes,
+            ...(geometryChanged ? { routingRevision: state.routingRevision + 1 } : {}),
+            ...(processingChanged ? { processingRevision: state.processingRevision + 1 } : {}),
+          }
+        : {};
     });
   },
 
@@ -1684,7 +1735,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         return {};
       }
 
-      return { nodes: nextNodes };
+      return { nodes: nextNodes, routingRevision: state.routingRevision + 1 };
     });
   },
 
@@ -1721,7 +1772,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         return {};
       }
 
-      return { nodes: nextNodes };
+      return { nodes: nextNodes, routingRevision: state.routingRevision + 1 };
     });
   },
 
@@ -1851,6 +1902,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return {
         nodes: nextNodes,
         edges: nextEdges,
+        routingRevision: state.routingRevision + 1,
         selectedNodeId:
           state.selectedNodeId && deleteSet.has(state.selectedNodeId) ? null : state.selectedNodeId,
         activeToolDialog:
@@ -1997,6 +2049,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     set({
       nodes: nextNodes,
+      routingRevision: state.routingRevision + 1,
       selectedNodeId: groupNode.id,
       activeToolDialog:
         state.activeToolDialog && memberSet.has(state.activeToolDialog.nodeId)
@@ -2054,6 +2107,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     set({
       nodes: nextNodes,
       edges: nextEdges,
+      routingRevision: state.routingRevision + 1,
       selectedNodeId: state.selectedNodeId === groupNodeId ? null : state.selectedNodeId,
       activeToolDialog:
         state.activeToolDialog?.nodeId === groupNodeId ? null : state.activeToolDialog,
@@ -2118,6 +2172,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     set({
       nodes: nextNodes,
+      routingRevision: state.routingRevision + 1,
       history: {
         past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
         future: [],
@@ -2168,6 +2223,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     set({
       nodes: nextNodes,
+      routingRevision: state.routingRevision + 1,
       history: {
         past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
         future: [],
@@ -2204,6 +2260,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     set({
       nodes: nextNodes,
+      routingRevision: state.routingRevision + 1,
       history: {
         past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
         future: [],
@@ -2263,6 +2320,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     set({
       nodes: nextNodes,
+      routingRevision: state.routingRevision + 1,
       history: {
         past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
         future: [],
@@ -2312,6 +2370,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     set({
       nodes: nextNodes,
+      routingRevision: state.routingRevision + 1,
       history: {
         past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
         future: [],
@@ -2394,6 +2453,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     set({
       nodes: restoredSnapshot.nodes,
       edges: restoredSnapshot.edges,
+      routingRevision: state.routingRevision + 1,
+      processingRevision: state.processingRevision + 1,
       selectedNodeId: resolveSelectedNodeId(state.selectedNodeId, restoredSnapshot.nodes),
       activeToolDialog: resolveActiveToolDialog(state.activeToolDialog, restoredSnapshot.nodes),
       history: {
@@ -2418,6 +2479,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     set({
       nodes: target.nodes,
       edges: target.edges,
+      routingRevision: state.routingRevision + 1,
+      processingRevision: state.processingRevision + 1,
       selectedNodeId: resolveSelectedNodeId(state.selectedNodeId, target.nodes),
       activeToolDialog: resolveActiveToolDialog(state.activeToolDialog, target.nodes),
       history: {
@@ -2438,6 +2501,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return {
         nodes: [],
         edges: [],
+        routingRevision: state.routingRevision + 1,
+        processingRevision: state.processingRevision + 1,
         selectedNodeId: null,
         activeToolDialog: null,
         history: {

@@ -720,6 +720,7 @@ interface ProjectState {
 
   hydrate: () => Promise<void>;
   createProject: (name: string) => string;
+  importProject: (record: ProjectRecord) => Promise<string>;
   deleteProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
   openProject: (id: string) => void;
@@ -790,6 +791,36 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     }));
     persistProject(project, { immediate: true });
     return id;
+  },
+
+  importProject: async (record) => {
+    const now = Date.now();
+    const importedRecord: ProjectRecord = {
+      ...record,
+      id: uuidv4(),
+      createdAt: now,
+      updatedAt: now,
+      ...(record.thumbnails ? { thumbnails: [...record.thumbnails] } : {}),
+    };
+
+    await upsertProjectRecord(importedRecord);
+
+    const project = fromProjectRecord(importedRecord);
+    const thumbnails = extractProjectThumbnails(project.nodes);
+    const summary: ProjectSummary = {
+      id: importedRecord.id,
+      name: importedRecord.name,
+      createdAt: importedRecord.createdAt,
+      updatedAt: importedRecord.updatedAt,
+      nodeCount: project.nodeCount,
+      ...(thumbnails.length > 0 ? { thumbnails } : {}),
+    };
+
+    set((state) => ({
+      projects: [summary, ...state.projects.filter((item) => item.id !== summary.id)],
+    }));
+
+    return importedRecord.id;
   },
 
   deleteProject: (id) => {

@@ -14,6 +14,7 @@ import { listen } from '@tauri-apps/api/event';
 import { Handle, Position, useUpdateNodeInternals } from '@xyflow/react';
 import { AudioLines, ChevronDown, Clapperboard, ImagePlus, LoaderCircle, Plus, Sparkles, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useShallow } from 'zustand/shallow';
 
 import { CANVAS_NODE_TYPES, EXPORT_RESULT_NODE_MIN_HEIGHT, EXPORT_RESULT_NODE_MIN_WIDTH, type VideoGenNodeData } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
@@ -23,7 +24,7 @@ import { CURRENT_RUNTIME_SESSION_ID } from '@/features/canvas/application/genera
 import { mergeMediaReferenceSources } from '@/features/canvas/application/mediaReferenceSources';
 import { recordGenerationOutcome } from '@/features/canvas/application/usageRecording';
 import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
-import { getDefaultVideoModelId, getModelProvider, getVideoModel, JIMENG_CLI_PROVIDER_ID, listVideoModels, resolveVideoModelProfile } from '@/features/canvas/models';
+import { getDefaultVideoModelId, getModelProvider, getVideoModel, getVideoModelProfile, JIMENG_CLI_PROVIDER_ID, listVideoModels } from '@/features/canvas/models';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
@@ -50,6 +51,7 @@ const VIDEO_GEN_NODE_MAX_WIDTH = 720;
 const VIDEO_GEN_NODE_MAX_HEIGHT = 560;
 const VIDEO_GEN_NODE_DEFAULT_WIDTH = 420;
 const VIDEO_GEN_NODE_DEFAULT_HEIGHT = 360;
+const JIMENG_CLI_MAX_REFERENCE_IMAGES = 9;
 
 interface PickerAnchor {
   left: number;
@@ -296,8 +298,18 @@ function renderPromptWithHighlights(
 export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGenNodeProps) => {
   const { t, i18n } = useTranslation();
   const updateNodeInternals = useUpdateNodeInternals();
-  const nodes = useCanvasStore((state) => state.nodes);
-  const edges = useCanvasStore((state) => state.edges);
+  const inputImages = useCanvasStore(useShallow((state) =>
+    graphImageResolver.collectInputImages(id, state.nodes, state.edges)
+  ));
+  const inputAudio = useCanvasStore(useShallow((state) =>
+    graphImageResolver.collectInputAudio(id, state.nodes, state.edges)
+  ));
+  const inputText = useCanvasStore(useShallow((state) =>
+    graphImageResolver.collectInputText(id, state.nodes, state.edges)
+  ));
+  const audioNodes = useCanvasStore(useShallow((state) =>
+    state.nodes.filter((node) => node.type === CANVAS_NODE_TYPES.audio)
+  ));
   const addNode = useCanvasStore((state) => state.addNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
@@ -308,6 +320,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const showNodePrice = useSettingsStore((state) => state.showNodePrice);
   const priceDisplayCurrencyMode = useSettingsStore((state) => state.priceDisplayCurrencyMode);
   const usdToCnyRate = useSettingsStore((state) => state.usdToCnyRate);
+  const preferDiscountedPrice = useSettingsStore((state) => state.preferDiscountedPrice);
+  const grsaiCreditTierId = useSettingsStore((state) => state.grsaiCreditTierId);
+  const setLastVideoDuration = useSettingsStore((state) => state.setLastVideoDuration);
   const [isGenerating, setIsGenerating] = useState(false);
   const [jimengCliStatus, setJimengCliStatus] = useState<JimengCliStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -340,7 +355,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const selectedModel = getVideoModel(data.model) ?? getVideoModel(getDefaultVideoModelId());
   const imageMode = data.imageMode === 'first-last' ? 'first-last' : 'reference';
   const isJimengCli = selectedModel?.providerId === JIMENG_CLI_PROVIDER_ID;
-  const selectedProfile = selectedModel ? resolveVideoModelProfile(selectedModel.id) : null;
+  const selectedProfile = selectedModel ? getVideoModelProfile(selectedModel.profileId) : null;
   const [modelPickerProviderId, setModelPickerProviderId] = useState(
     selectedModel?.providerId ?? ''
   );
@@ -371,18 +386,6 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       ? selectedModel.displayName.slice(prefix.length)
       : selectedModel.displayName;
   }, [selectedModel]);
-  const inputImages = useMemo(
-    () => graphImageResolver.collectInputImages(id, nodes, edges),
-    [edges, id, nodes]
-  );
-  const inputAudio = useMemo(
-    () => graphImageResolver.collectInputAudio(id, nodes, edges),
-    [edges, id, nodes]
-  );
-  const inputText = useMemo(
-    () => graphImageResolver.collectInputText(id, nodes, edges),
-    [edges, id, nodes]
-  );
   // “发送到视频节点”会把附件直接写入新节点；同时保留连线输入，覆盖状态回传尚在防抖的瞬间。
   const directReferenceImages = useMemo(
     () => Array.isArray(data.studioReferenceImages)
@@ -429,7 +432,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   // 默认标题"媒体"没有区分度, 视为未命名, 回退到文件名。
   const audioLabelBySource = useMemo(() => {
     const labelBySource = new Map<string, string>();
-    for (const node of nodes) {
+    for (const node of audioNodes) {
       if (node.type !== CANVAS_NODE_TYPES.audio || typeof node.data.sourcePath !== 'string') {
         continue;
       }
@@ -442,7 +445,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       labelBySource.set(sourcePath, customName);
     }
     return labelBySource;
-  }, [nodes]);
+  }, [audioNodes]);
   const resolveAudioLabel = useCallback((source: string, index: number): string => {
     const customName = audioLabelBySource.get(source);
     if (customName) {
@@ -502,13 +505,28 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const price = useMemo(
     () => selectedModel && showNodePrice
       ? resolveModelPriceDisplay(selectedModel, {
-        resolution: 'video',
+        resolution: selectedVideoResolution,
         extraParams: { duration: selectedDuration },
         language: i18n.language,
-        settings: { displayCurrencyMode: priceDisplayCurrencyMode, usdToCnyRate },
+        settings: {
+          displayCurrencyMode: priceDisplayCurrencyMode,
+          usdToCnyRate,
+          preferDiscountedPrice,
+          grsaiCreditTierId,
+        },
       })
       : null,
-    [i18n.language, priceDisplayCurrencyMode, selectedDuration, selectedModel, showNodePrice, usdToCnyRate]
+    [
+      grsaiCreditTierId,
+      i18n.language,
+      preferDiscountedPrice,
+      priceDisplayCurrencyMode,
+      selectedDuration,
+      selectedModel,
+      selectedVideoResolution,
+      showNodePrice,
+      usdToCnyRate,
+    ]
   );
 
   useEffect(() => {
@@ -773,6 +791,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       void showErrorDialog(message, t('common.error'));
       return;
     }
+    setLastVideoDuration(selectedDuration);
     flushPromptCommit();
     const prompt = [
       promptDraftRef.current.trim(),
@@ -899,7 +918,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     } finally {
       setIsGenerating(false);
     }
-  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, flushPromptCommit, id, imageMode, inputText, resolvedInputAudio, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, t, updateNodeData, updateNodeSize, videoReferenceImages]);
+  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, flushPromptCommit, id, imageMode, inputText, resolvedInputAudio, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, setLastVideoDuration, t, updateNodeData, updateNodeSize, videoReferenceImages]);
 
   return (
     <div
@@ -1072,6 +1091,16 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             {t('node.videoGen.firstLastHint')}
           </span>
         )}
+        <span
+          className={`ml-auto shrink-0 text-[11px] ${isJimengCli && videoReferenceImages.length > JIMENG_CLI_MAX_REFERENCE_IMAGES
+            ? 'text-red-400'
+            : 'text-text-muted'
+            }`}
+          title={isJimengCli ? t('node.videoGen.referenceImageLimit') : undefined}
+        >
+          {t('node.videoGen.referenceImageCount', { count: videoReferenceImages.length })}
+          {isJimengCli ? ` / ${JIMENG_CLI_MAX_REFERENCE_IMAGES}` : ''}
+        </span>
       </div>
       {imageMode === 'first-last' && (
         <div className="grid grid-cols-2 gap-2">
@@ -1362,7 +1391,11 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                 max={durationMaximum}
                 step="1"
                 value={selectedDuration}
-                onChange={(event) => updateNodeData(id, { duration: Number(event.target.value) })}
+                onChange={(event) => {
+                  const duration = Number(event.target.value);
+                  updateNodeData(id, { duration });
+                  setLastVideoDuration(duration);
+                }}
                 className="nodrag nowheel h-1.5 w-full cursor-pointer appearance-none rounded-full bg-border-dark [accent-color:var(--color-accent)]"
                 aria-label="视频时长（秒）"
               />

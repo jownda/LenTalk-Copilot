@@ -191,6 +191,8 @@ export interface SceneStaging {
   /** 人物空间布局参考图：只约束站位、轴线、间距、排序与空间锚点，不替代地点资产。 */
   stagingReferenceImage?: string;
   priorContext?: string;
+  /** 本场可供分镜规划器分配的角色，不等同于空间左右顺序。 */
+  characterRoster?: string[];
   /** 空间锚点：backs against white wall next to red doors */
   anchorDescription?: string;
   /** 左到右角色 ID 排序 */

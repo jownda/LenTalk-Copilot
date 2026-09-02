@@ -13,6 +13,7 @@ import {
 import { useSettingsStore } from '@/stores/settingsStore';
 import { JIMENG_CLI_PROVIDER_ID, resolveVideoModelProfile } from '@/features/canvas/models';
 import { toVideoGenerationRequest } from '@/features/canvas/application/videoGeneration';
+import { isRjmVideoApiBaseUrl } from '@/commands/videoApi';
 
 import type { AiGateway, GenerateImagePayload, GenerateVideoPayload } from '../application/ports';
 
@@ -92,6 +93,9 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
   if (customApi?.capabilities?.confidence === 'high' && customApi.capabilities.videoQueryPath) {
     extraParams.video_query_path = customApi.capabilities.videoQueryPath;
   }
+  if (customApi?.capabilities?.confidence === 'high' && customApi.capabilities.videoTransport) {
+    extraParams.video_transport = customApi.capabilities.videoTransport;
+  }
   if (extraParams.video_reference_encoding == null
     && customApi?.capabilities?.confidence === 'high'
     && customApi.capabilities.videoReferenceEncoding
@@ -102,8 +106,11 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
   if (providerId === 'zizidonghua' || providerBaseUrl.includes('zizidonghua.com')) {
     extraParams.video_transport = 'zzdh-v8-video';
   }
-  if (providerId === 'sub2api-video' || providerBaseUrl.includes('video.rjm.us.ci')) {
+  if (providerId === 'sub2api-video' || isRjmVideoApiBaseUrl(providerBaseUrl)) {
     extraParams.video_transport = 'sub2api-video';
+  }
+  if (providerId === 'binghuo' || providerBaseUrl.includes('api.7tai.cc')) {
+    extraParams.video_transport = 'binghuo-video';
   }
   if (extraParams.reference_image_field == null) {
     extraParams.reference_image_field = referenceImageField;
@@ -322,7 +329,12 @@ export const tauriAiGateway: AiGateway = {
 
     // 视频语义固定为异步任务(提交+轮询), 不受图片默认 sync 影响
     const injected = injectCustomApiRequestMode(payload, 'async');
-    const profile = resolveVideoModelProfile(payload.model);
+    const profile = resolveVideoModelProfile(
+      payload.model,
+      typeof injected.extraParams?.provider_base_url === 'string'
+        ? injected.extraParams.provider_base_url
+        : undefined,
+    );
     if (profile.status === 'pending-adaptation') {
       throw new Error(profile.unavailableReason ?? '该视频模型尚未完成独立适配');
     }
