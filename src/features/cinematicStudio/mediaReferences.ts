@@ -1,4 +1,4 @@
-import { buildSceneAssetRegistry } from "./engine";
+import { buildSceneAssetRegistry, sceneVoiceCharacterIds } from "./engine";
 import type { ProjectV2, SceneV2 } from "./shared-types";
 
 export interface CinematicMediaReferences {
@@ -17,6 +17,9 @@ export function collectCinematicMediaReferences(project: ProjectV2, scene: Scene
       ...(stagingReferenceImage ? [stagingReferenceImage] : []),
       ...firstFrameImages,
     ],
-    referenceAudio: assets.map((asset) => asset.voiceClip?.trim() ?? "").filter(Boolean),
+    // 声音顺序必须与导演 AUDIO 段的 @audioN 对齐：按注册表顺序取实际发声且有 voiceClip 的角色。
+    referenceAudio: sceneVoiceCharacterIds(project, scene)
+      .map((id) => assets.find((asset) => asset.id === id)?.voiceClip?.trim() ?? "")
+      .filter(Boolean),
   };
 }

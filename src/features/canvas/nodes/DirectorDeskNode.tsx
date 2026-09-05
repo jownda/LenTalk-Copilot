@@ -17,6 +17,7 @@ import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canv
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
 import { graphImageResolver } from '@/features/canvas/application/canvasServices';
+import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import {
   prepareNodeImage,
   resolveImageDisplayUrl,
@@ -63,8 +64,7 @@ export const DirectorDeskNode = memo(({ id, data, selected, width, height }: Dir
   const addNode = useCanvasStore((state) => state.addNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
-  const nodes = useCanvasStore((state) => state.nodes);
-  const edges = useCanvasStore((state) => state.edges);
+  const { nodes, edges } = useCanvasInputGraph();
 
   const [isDeskOpen, setIsDeskOpen] = useState(false);
   const [isHandlingCaptures, setIsHandlingCaptures] = useState(false);

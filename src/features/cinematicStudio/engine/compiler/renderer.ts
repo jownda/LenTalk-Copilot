@@ -382,10 +382,22 @@ export function resolveCharacterOrder(scene: SceneV2, shot: ShotV2): string[] {
   return staged.length > 0 ? staged : participants;
 }
 
-/** 镜头内各角色持有的道具（仅起始状态，P2.2：结束状态不回灌站位文本） */
+/**
+ * 镜头内各角色持有的道具（仅起始状态，P2.2：结束状态不回灌站位文本）。
+ * 从 propStatesAtStart 聚合 holderCharacterId 明确标注的持有关系，
+ * 供空间走位文本输出「角色持有什么」，同一道具只记入一次。
+ */
 export function heldPropsByCharacter(shot: ShotV2): Map<string, { propId: string; state?: string; position?: string }[]> {
-  void shot;
-  return new Map();
+  const byHolder = new Map<string, { propId: string; state?: string; position?: string }[]>();
+  for (const state of shot.propStatesAtStart ?? []) {
+    if (!state.holderCharacterId) continue;
+    const list = byHolder.get(state.holderCharacterId) ?? [];
+    if (!list.some((item) => item.propId === state.propId)) {
+      list.push({ propId: state.propId, state: state.state, position: state.position });
+      byHolder.set(state.holderCharacterId, list);
+    }
+  }
+  return byHolder;
 }
 
 /** Participants 行：按有效站位顺序输出角色名（P0.2 双语；P2.1 语法） */

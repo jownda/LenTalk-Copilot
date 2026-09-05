@@ -6,7 +6,7 @@ type UpdateNodeData = (nodeId: string, data: Partial<CanvasNodeData>) => void;
 
 interface UseDebouncedNodeTextCommitOptions {
   nodeId: string;
-  field: "prompt" | "purpose" | "content";
+  field: "prompt" | "purpose" | "content" | "optimizedPrompt";
   valueRef: MutableRefObject<string>;
   updateNodeData: UpdateNodeData;
   delayMs?: number;

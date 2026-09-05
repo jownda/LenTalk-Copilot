@@ -13,7 +13,6 @@ import { Handle, Position, useUpdateNodeInternals, type NodeProps } from '@xyflo
 import { createPortal } from 'react-dom';
 import { Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { useShallow } from 'zustand/shallow';
 
 import {
   AUTO_REQUEST_ASPECT_RATIO,
@@ -46,11 +45,13 @@ import {
 import {
   findReferenceTokens,
   insertReferenceToken,
+  remapImageReferenceTokens,
   removeOutOfRangeReferenceTokens,
   removeTextRange,
   resolveReferenceAwareDeleteRange,
 } from '@/features/canvas/application/referenceTokenEditing';
 import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
+import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import {
   DEFAULT_IMAGE_MODEL_ID,
   getImageModel,
@@ -432,12 +433,16 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const [pickerActiveIndex, setPickerActiveIndex] = useState(0);
   const [pickerAnchor, setPickerAnchor] = useState<PickerAnchor>(PICKER_FALLBACK_ANCHOR);
 
-  const incomingImages = useCanvasStore(useShallow((state) =>
-    graphImageResolver.collectInputImages(id, state.nodes, state.edges)
-  ));
-  const incomingText = useCanvasStore(useShallow((state) =>
-    graphImageResolver.collectInputText(id, state.nodes, state.edges)
-  ));
+  const { nodes, edges } = useCanvasInputGraph();
+  const incomingImages = useMemo(
+    () => graphImageResolver.collectInputImages(id, nodes, edges),
+    [edges, id, nodes]
+  );
+  const previousIncomingImagesRef = useRef(incomingImages);
+  const incomingText = useMemo(
+    () => graphImageResolver.collectInputText(id, nodes, edges),
+    [edges, id, nodes]
+  );
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const addNode = useCanvasStore((state) => state.addNode);
@@ -609,16 +614,23 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     updateNodeData(id, { prompt: nextPrompt });
   }, [cancelPromptCommit, id, updateNodeData]);
 
-  // 上游图片断连(数量减少)时, 自动移除提示词中越界的 @图N 引用
+  // 上游图片断连或重排时，按原始图片来源重映射 @图N；断开的图片
+  // 只删除自己的引用，后续图片不会继承错误编号。
   useEffect(() => {
-    const cleaned = removeOutOfRangeReferenceTokens(promptDraftRef.current, incomingImages.length);
+    const remapped = remapImageReferenceTokens(
+      promptDraftRef.current,
+      previousIncomingImagesRef.current,
+      incomingImages,
+    );
+    const cleaned = removeOutOfRangeReferenceTokens(remapped, incomingImages.length);
+    previousIncomingImagesRef.current = incomingImages;
     if (cleaned !== promptDraftRef.current) {
       promptDraftRef.current = cleaned;
       setPromptDraft(cleaned);
       cancelPromptCommit();
       updateNodeData(id, { prompt: cleaned });
     }
-  }, [cancelPromptCommit, id, incomingImages.length, updateNodeData]);
+  }, [cancelPromptCommit, id, incomingImages, updateNodeData]);
 
   // 轻量预览浮层: Esc 关闭
   useEffect(() => {

@@ -30,6 +30,7 @@ import {
   canvasAiGateway,
   graphImageResolver,
 } from '@/features/canvas/application/canvasServices';
+import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
 import {
   detectAspectRatio,
@@ -542,8 +543,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
   const [isGenerating, setIsGenerating] = useState(false);
   const generationLockRef = useRef(false);
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
-  const nodes = useCanvasStore((state) => state.nodes);
-  const edges = useCanvasStore((state) => state.edges);
+  const { nodes, edges } = useCanvasInputGraph();
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const addNode = useCanvasStore((state) => state.addNode);
   const addEdge = useCanvasStore((state) => state.addEdge);

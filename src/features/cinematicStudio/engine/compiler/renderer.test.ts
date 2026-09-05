@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Asset, SceneV2, ShotV2 } from "../../shared-types";
 import { buildAssetReferenceTag, buildSceneAssetRegistry, renderAssetLine, resolveCharacterOrder } from "../../engine";
+import { renderSpatialLayoutLine } from "./renderer";
 import { renderShotSection } from "./sections";
 
 const asset: Asset = {
@@ -122,5 +123,45 @@ describe("attached character props", () => {
     } as SceneV2;
     const registry = buildSceneAssetRegistry({ assets: [hero, lighter] } as any, scene);
     expect(registry.orderedAssets.map((item) => item.id)).toEqual(["hero", "lighter"]);
+  });
+});
+
+describe("held props in spatial layout", () => {
+  it("renders the holder relationship from propStatesAtStart into the spatial layout line", () => {
+    const hero: Asset = {
+      id: "hero", kind: "character", name: "HERO", description: "A man in a navy suit.",
+      descriptionZh: "穿海军蓝西装的男人。", referencePaths: [], lockLevel: "strict", tags: [],
+    };
+    const partner: Asset = {
+      id: "partner", kind: "character", name: "PARTNER", description: "A woman.",
+      descriptionZh: "一位女性。", referencePaths: [], lockLevel: "strict", tags: [],
+    };
+    const lighter: Asset = {
+      id: "lighter", kind: "prop", name: "打火机", description: "", descriptionZh: "银色金属打火机",
+      referencePaths: [], lockLevel: "none", tags: [],
+    };
+    const scene: SceneV2 = {
+      id: "scene", name: "场景", logline: "", location: "", time: "", weather: "", duration: "5秒",
+      palette: "", lighting: "", environmentLock: true, shots: [],
+    };
+    const shot: ShotV2 = {
+      id: "shot", label: "01", duration: "0-5秒", framing: "中景", lens: "50mm", movement: "Static",
+      action: "", acting: "", direction: "left-to-right",
+      participants: [
+        { characterId: "hero", role: "primary", position: "left" },
+        { characterId: "partner", role: "supporting", position: "right" },
+      ],
+      propStatesAtStart: [{ propId: "lighter", state: "held", holderCharacterId: "hero", position: "右手" }],
+    };
+    const project = {
+      id: "project", title: "测试", description: "", preset: "custom" as const,
+      scenes: [scene], characters: [], assets: [hero, partner, lighter],
+    };
+
+    const output = renderSpatialLayoutLine(project, shot, ["hero", "partner"], "zh");
+    expect(output).toContain("HERO 携带");
+    expect(output).toContain("打火机");
+    expect(output).toContain("右手");
+    expect(output).not.toContain("PARTNER 携带");
   });
 });

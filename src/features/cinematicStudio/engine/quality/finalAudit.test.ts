@@ -87,13 +87,6 @@ describe("final prompt audit", () => {
     expect(issues.find((issue) => issue.code === "FINAL.ACTION_BEATS_MISSING")?.action).toBe("review-action");
   });
 
-  it("缺少场景上下文时给出第一段警告", () => {
-    const issues = auditFinalPrompt(makeScene()).issues;
-    const issue = issues.find((item) => item.code === "FINAL.SCENE_CONTEXT_MISSING");
-    expect(issue?.severity).toBe("warning");
-    expect(issue?.field).toBe("staging");
-  });
-
   it("节拍精确时间超出镜头窗口时给出可定位错误", () => {
     const scene = makeScene({ shots: [{
       ...makeScene().shots[0],
@@ -105,26 +98,6 @@ describe("final prompt audit", () => {
     expect(issue?.shotId).toBe("shot-1");
     expect(issue?.field).toBe("action");
     expect(issue?.detailZh).toContain("4 秒–6 秒");
-  });
-
-  it("场景上下文包含前情/AI 说明时阻断导出并提示重写", () => {
-    const scene = makeScene({ sceneContext: "前情提要：上集林sir追查列车；本集阿俊看向窗外。" });
-    const issue = auditFinalPrompt(scene).issues.find((item) => item.code === "FINAL.SCENE_CONTEXT_META_LEAK");
-    expect(issue?.severity).toBe("error");
-  });
-
-  it("场景上下文超过 3 个句子时给出压缩警告", () => {
-    const scene = makeScene({ sceneContext: "阿俊擦开雾气。他看见窗外只有黑暗。琪琪抱紧公文包。黛莲压住托特包。列车还在行驶。" });
-    const issue = auditFinalPrompt(scene).issues.find((item) => item.code === "FINAL.SCENE_CONTEXT_TOO_LONG");
-    expect(issue?.severity).toBe("warning");
-  });
-
-  it("合规的场景上下文不触发任何场景上下文问题", () => {
-    const scene = makeScene({ sceneContext: "阿俊坐在车厢中央，擦开雾气看向窗外，共 15 秒。" });
-    const codes = auditFinalPrompt(scene).issues.map((issue) => issue.code);
-    expect(codes).not.toContain("FINAL.SCENE_CONTEXT_MISSING");
-    expect(codes).not.toContain("FINAL.SCENE_CONTEXT_META_LEAK");
-    expect(codes).not.toContain("FINAL.SCENE_CONTEXT_TOO_LONG");
   });
 
   it("中间模型只保留最终导出需要的结构化镜头字段", () => {

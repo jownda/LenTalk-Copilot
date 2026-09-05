@@ -145,7 +145,8 @@ function localDirectorPatch(input: { issue: ContinuityRepairIssue; project: Proj
   const asset = (input.project.assets ?? []).find((candidate) => issue.detail.includes(candidate.name) && candidate.kind === "character");
   if (!asset) return undefined;
   if (issue.code === "DIRECTOR.FIRST_FRAME_PARTICIPANT_CONFLICT") {
-    const current = scene.directorLayers?.firstFrame ?? "";
+    // 首帧与场景地图已合并为 locationMap 层；首帧块位于该文本的首帧行。
+    const current = scene.directorLayers?.locationMap ?? "";
     const text = replaceFirstFrameBlock(current, shotIndex, (block) => {
       const keptLines = block.split("\n").flatMap((line, index) => {
         if (!line.includes(asset.name)) return [line];
@@ -154,7 +155,7 @@ function localDirectorPatch(input: { issue: ContinuityRepairIssue; project: Proj
       });
       return keptLines.length > 0 ? keptLines.join("\n") : `第 ${shotIndex + 1} 段首帧：该角色不在第一可见画面中。`;
     });
-    return { directorLayerUpdates: [{ layerKey: "firstFrame", text }] };
+    return { directorLayerUpdates: [{ layerKey: "locationMap", text }] };
   }
   if (issue.code === "DIRECTOR.LOCATION_MAP_POSITION_CONFLICT") {
     const participant = shot.participants?.find((candidate) => candidate.characterId === asset.id);

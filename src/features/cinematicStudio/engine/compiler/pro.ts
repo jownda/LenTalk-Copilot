@@ -26,7 +26,7 @@ export interface ProSequenceOptions {
   /**
    * 导演级分段模式（CINEDANCE V4）。
    * 默认 false = 保留现有「技术→场景→数量锁→资产→强锁→镜头→音频→负面」顺序；
-   * true = 按 SCENE CONTEXT → … → POSITIVE CONSTRAINTS 重组（P0.1 起实现）。
+   * true = 按 ACTIVE REFERENCES → … → POSITIVE CONSTRAINTS 重组（P0.1 起实现）。
    */
   director?: boolean;
 }

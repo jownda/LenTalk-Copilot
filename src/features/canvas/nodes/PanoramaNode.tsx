@@ -24,6 +24,7 @@ import {
   type PanoramaOutputAspect,
 } from '@/features/canvas/domain/canvasNodes';
 import { graphImageResolver } from '@/features/canvas/application/canvasServices';
+import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
@@ -223,8 +224,7 @@ export const PanoramaNode = memo(({ id, data, selected, width, height }: Panoram
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const addDerivedExportNode = useCanvasStore((state) => state.addDerivedExportNode);
-  const nodes = useCanvasStore((state) => state.nodes);
-  const edges = useCanvasStore((state) => state.edges);
+  const { nodes, edges } = useCanvasInputGraph();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);

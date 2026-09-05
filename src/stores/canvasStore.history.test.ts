@@ -8,6 +8,7 @@ function resetStore() {
     edges: [],
     routingRevision: 0,
     processingRevision: 0,
+    inputGraphRevision: 0,
     selectedNodeId: null,
     activeToolDialog: null,
     history: { past: [], future: [] },
@@ -96,6 +97,39 @@ describe('canvasStore history (undo/redo)', () => {
     useCanvasStore.getState().updateNodePosition(id, { x: 260, y: 180 });
 
     expect(useCanvasStore.getState().routingRevision).toBe(routingRevision + 1);
+  });
+
+  it('拖动过程中延后全局连线避障重算，松开时再执行一次', () => {
+    const id = addTextNode();
+    const routingRevision = useCanvasStore.getState().routingRevision;
+    const inputGraphRevision = useCanvasStore.getState().inputGraphRevision;
+
+    useCanvasStore.getState().onNodesChange([
+      { id, type: 'position', position: { x: 160, y: 140 }, dragging: true },
+    ]);
+    expect(useCanvasStore.getState().routingRevision).toBe(routingRevision);
+    expect(useCanvasStore.getState().inputGraphRevision).toBe(inputGraphRevision);
+
+    useCanvasStore.getState().onNodesChange([
+      { id, type: 'position', position: { x: 180, y: 160 }, dragging: false },
+    ]);
+    expect(useCanvasStore.getState().routingRevision).toBe(routingRevision + 1);
+    expect(useCanvasStore.getState().inputGraphRevision).toBe(inputGraphRevision);
+  });
+
+  it('普通表单编辑不刷新输入图，连线变化才刷新', () => {
+    const firstId = addTextNode();
+    const secondId = addTextNode(420, 100);
+    const inputGraphRevision = useCanvasStore.getState().inputGraphRevision;
+
+    useCanvasStore.getState().updateNodeData(firstId, { displayName: '备注' });
+    expect(useCanvasStore.getState().inputGraphRevision).toBe(inputGraphRevision);
+
+    useCanvasStore.getState().updateNodeData(firstId, { content: '可被下游引用的文本' });
+    expect(useCanvasStore.getState().inputGraphRevision).toBe(inputGraphRevision + 1);
+
+    useCanvasStore.getState().addEdge(firstId, secondId);
+    expect(useCanvasStore.getState().inputGraphRevision).toBe(inputGraphRevision + 2);
   });
 
   it('resize 结束(有 resizing: false)且尺寸变化时写入历史', () => {

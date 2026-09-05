@@ -2,7 +2,7 @@ import {
   DIAGNOSTIC_EN_RES, DIAGNOSTIC_ZH_RES, META_EN_RES, META_ZH_RES,
 } from "./lexicon";
 
-const EMPTY_SECTION_RE = /^(?:SCENE CONTEXT|ACTIVE REFERENCES|LOCATION MAP|FIRST FRAME(?: AND SPATIAL BLOCKING)?|FORMAT MODE|OPTICS|CAMERA|SHOT EXECUTION|PHYSICS|LIGHTING|AUDIO|POSITIVE CONSTRAINTS|NEGATIVE LOCKS(?: \(GLOBAL ONLY\))?|场景上下文|场景语境|活动引用|位置图|首帧(?:与站位)?|格式模式|光学|相机|镜头执行|物理|光线|音频|正向约束|负面局部锁)\s*[:：]?\s*$/i;
+const EMPTY_SECTION_RE = /^(?:ACTIVE REFERENCES|SCENE MAP AND STAGING|LOCATION MAP|FIRST FRAME(?: AND SPATIAL BLOCKING)?|FORMAT MODE|OPTICS|CAMERA|SHOT EXECUTION|PHYSICS|LIGHTING|AUDIO|POSITIVE CONSTRAINTS|NEGATIVE LOCKS(?: \(GLOBAL ONLY\))?|活动引用|场景地图和站位|位置图|首帧(?:与空间走位|与站位)?|格式模式|光学|相机|镜头执行|物理|光线|音频|正向约束|负面局部锁)\s*[:：]?\s*$/i;
 
 function isProjectMetadata(line: string): boolean {
   return META_ZH_RES.some((pattern) => pattern.test(line)) || META_EN_RES.some((pattern) => pattern.test(line));

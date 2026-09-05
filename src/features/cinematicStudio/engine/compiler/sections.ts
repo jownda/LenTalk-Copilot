@@ -162,7 +162,6 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
       } else if (never.length > 0) {
         line += locale === "zh" ? ` 禁止目标：${never.join("、")}。` : ` Never target: ${never.join(", ")}.`;
       }
-      if (beat.required) line += locale === "zh" ? ` 必须发生。` : " MUST occur.";
       if (beat.cutRule?.trim()) line += ` ${sentence(beat.cutRule.trim())}`;
       if (beat.tactic?.trim()) line += locale === "zh" ? ` 策略：${sentence(beat.tactic.trim())}` : ` Tactic: ${sentence(beat.tactic.trim())}`;
       if (beat.subtext?.trim()) line += locale === "zh" ? ` 潜台词：${sentence(beat.subtext.trim())}` : ` Subtext: ${sentence(beat.subtext.trim())}`;

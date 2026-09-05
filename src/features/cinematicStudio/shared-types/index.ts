@@ -385,8 +385,6 @@ export interface SceneV02 {
   shootingMode?: "long-take" | "multi-shot";
   /** 导演文档分层（P0.5）：本地编译产出的各层完整文本（key → 含段头文本块） */
   directorLayers?: Record<string, string>;
-  /** 场景语境（V3-P0）：最终提示词第一段，只描述当前片段事实，不包含前情/备注 */
-  sceneContext?: string;
   /** 已锁定的导演文档层 key（P0.6）：再次 AI 编译不覆盖这些层 */
   lockedDirectorLayers?: string[];
   /** 首帧占位锁（P1.3）：首帧必须出现的角色/道具 + 占位文案 */

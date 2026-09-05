@@ -10,6 +10,7 @@ import {
 } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { graphImageResolver } from '@/features/canvas/application/canvasServices';
+import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { useCanvasStore } from '@/stores/canvasStore';
@@ -28,8 +29,7 @@ const CINEMATIC_STUDIO_NODE_MIN_HEIGHT = 160;
 export const CinematicStudioNode = memo(({ id, data, selected, width, height }: CinematicStudioNodeProps) => {
   const updateNodeInternals = useUpdateNodeInternals();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
-  const nodes = useCanvasStore((state) => state.nodes);
-  const edges = useCanvasStore((state) => state.edges);
+  const { nodes, edges } = useCanvasInputGraph();
   const addEdge = useCanvasStore((state) => state.addEdge);
   const addNode = useCanvasStore((state) => state.addNode);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);

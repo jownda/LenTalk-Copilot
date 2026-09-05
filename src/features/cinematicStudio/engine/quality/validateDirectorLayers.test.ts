@@ -86,10 +86,8 @@ function makeProject(assets: Asset[], scene: SceneV2): ProjectV2 {
 }
 
 const cleanZhLayers: Record<string, string> = {
-  sceneContext: "林警官独自坐在高速行驶的无尽地铁车厢中央。",
   activeReferences: "@林警官 — 中年东亚男性，敦实方脸，后梳黑发，浓眉，无胡须，深蓝西装白衬衫。@无尽地铁车厢 — 明亮现代白色车厢。",
-  locationMap: "镜头位于车厢中央过道偏低位置；前景地面散落烟头。",
-  firstFrame: "林警官坐在画面中央偏下，面部朝向镜头。",
+  locationMap: "镜头位于车厢中央过道偏低位置；前景地面散落烟头。\n林警官坐在画面中央偏下，面部朝向镜头。",
   formatMode: "SINGLE CONTINUOUS TAKE",
   optics: "84° 标准视场，广角纵深透视，近大远小，前后景深度拉开。",
   camera: "低角度呼吸式手持，围绕面部做极小幅度修正。",
@@ -125,7 +123,7 @@ describe("validateDirectorLayers（中文 fixture）", () => {
     ];
     const layers = {
       ...cleanZhLayers,
-      firstFrame: "第1段首帧：林警官在画面中央。\n第2段首帧：阿俊已经在画面右侧。",
+      locationMap: `${cleanZhLayers.locationMap}\n第1段首帧：林警官在画面中央。\n第2段首帧：阿俊已经在画面右侧。`,
     };
     const issues = validateDirectorLayers(layers, makeProject(ZH_ASSETS, scene), scene);
     expect(issues.map((issue) => issue.code)).toContain("DIRECTOR.FIRST_FRAME_PARTICIPANT_CONFLICT");
@@ -154,7 +152,7 @@ describe("validateDirectorLayers（中文 fixture）", () => {
   });
 
   it("正文提到未引用资产 → error", () => {
-    const layers = { ...cleanZhLayers, sceneContext: "阿俊坐在车厢角落，手里握着打火机。" };
+    const layers = { ...cleanZhLayers, locationMap: "阿俊坐在车厢角落，手里握着打火机。" };
     const project = makeProject(ZH_ASSETS, makeScene(layers));
     const issues = validateDirectorLayers(layers, project, project.scenes[0]);
     expect(issues.map((i) => i.code)).toContain("DIRECTOR.UNREFERENCED_ASSET");
@@ -168,7 +166,7 @@ describe("validateDirectorLayers（中文 fixture）", () => {
   });
 
   it("诊断摘要（连续性结论）→ error", () => {
-    const layers = { ...cleanZhLayers, sceneContext: "连续性：共 3 个问题（0 个错误，3 个警告）。最终导出前请解决。" };
+    const layers = { ...cleanZhLayers, locationMap: "连续性：共 3 个问题（0 个错误，3 个警告）。最终导出前请解决。" };
     const project = makeProject(ZH_ASSETS, makeScene(layers));
     const issues = validateDirectorLayers(layers, project, project.scenes[0]);
     expect(issues.map((i) => i.code)).toContain("DIRECTOR.DIAGNOSTIC_META");
@@ -191,8 +189,7 @@ describe("validateDirectorLayers（中文 fixture）", () => {
   it("首帧禁新道具 + 具体道具并存 → warning", () => {
     const layers = {
       ...cleanZhLayers,
-      firstFrame: "首帧不得加入新道具，不得加入其他人物。",
-      locationMap: "前景地面散落烟头，车厢中轴线的纵深结构保持完整。",
+      locationMap: "首帧不得加入新道具，不得加入其他人物。\n前景地面散落烟头，车厢中轴线的纵深结构保持完整。",
     };
     const project = makeProject(ZH_ASSETS, makeScene(layers));
     const issues = validateDirectorLayers(layers, project, project.scenes[0]);
@@ -220,10 +217,8 @@ describe("validateDirectorLayers（中文 fixture）", () => {
 // 英文 fixture：校验器必须同时覆盖 en 词表
 // ─────────────────────────────────────────────────────────────
 const cleanEnLayers: Record<string, string> = {
-  sceneContext: "LIN sits alone in the center of the endless subway carriage.",
   activeReferences: "@LIN — middle-aged East Asian man, broad square face, slicked-back black hair, dark navy suit, white shirt. @CAFE INTERIOR — dimly lit cafe.",
-  locationMap: "Camera sits low in the central aisle; the cafe booth and red door are visible behind.",
-  firstFrame: "LIN sits center frame, face toward camera.",
+  locationMap: "Camera sits low in the central aisle; the cafe booth and red door are visible behind.\nLIN sits center frame, face toward camera.",
   formatMode: "SINGLE CONTINUOUS TAKE",
   optics: "84° standard FOV, wide-angle depth with near-large far-small perspective.",
   camera: "Low breathing handheld with minimal corrections.",
@@ -260,7 +255,7 @@ describe("validateDirectorLayers（英文 fixture）", () => {
   it("元数据 / 诊断摘要（英文）→ error", () => {
     const layers = {
       ...cleanEnLayers,
-      sceneContext: "Enabled assets: @LIN, @CAFE INTERIOR. Continuity: 5 issues total (0 errors, 4 warnings). Resolve error-level issues before final export.",
+      locationMap: "Enabled assets: @LIN, @CAFE INTERIOR. Continuity: 5 issues total (0 errors, 4 warnings). Resolve error-level issues before final export.",
     };
     const scene = enScene(layers);
     const issues = validateDirectorLayers(layers, makeProject(EN_ASSETS, scene), scene);
@@ -277,7 +272,7 @@ describe("validateDirectorLayers（英文 fixture）", () => {
   });
 
   it("未引用资产（英文）→ error", () => {
-    const layers = { ...cleanEnLayers, sceneContext: "JAXX stands near the booth with a lighter." };
+    const layers = { ...cleanEnLayers, locationMap: "JAXX stands near the booth with a lighter." };
     const scene = enScene(layers);
     const issues = validateDirectorLayers(layers, makeProject(EN_ASSETS, scene), scene);
     expect(issues.map((i) => i.code)).toContain("DIRECTOR.UNREFERENCED_ASSET");

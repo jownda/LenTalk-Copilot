@@ -3,7 +3,7 @@
  * 配置了 API Key 时使用远程 OpenAI 兼容 Chat Completions（OpenAI / DeepSeek / Kimi / 通义 / 智谱 / 自定义），
  * 未配置或请求失败时自动回退本地模板建议。
  */
-import { buildDirectorDocumentLayers, compileDirectorSequence, DIRECTOR_LAYERS, DIRECTOR_LAYER_ORDER, isSceneContextUsable, LocalSuggestionProvider, SHOT_TEMPLATES, localizedStyleBrief } from "../../engine";
+import { buildDirectorDocumentLayers, compileDirectorSequence, DIRECTOR_LAYERS, DIRECTOR_LAYER_ORDER, getStyle, LocalSuggestionProvider, SHOT_TEMPLATES, localizedStyleBrief } from "../../engine";
 import type { AIAssistant, AssetSuggestion, BeatSuggestion, ContinuityRepairIssue, ContinuityRepairPatch, FixSuggestion, SceneSuggestion } from "../../engine";
 import { buildSceneAssetRegistry } from "../../engine/compiler/renderer";
 import { fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, lensById } from "../../engine/presets";
@@ -674,7 +674,7 @@ function restoreActionTimingSegments(text: string, sourcePrompt: string, locale:
   const headingMatch = /(^|\n)(ACTION TIMING|动作节奏)\s*[:：]\s*\n/i.exec(text);
   if (!headingMatch) return text;
   const bodyStart = headingMatch.index + headingMatch[0].length;
-  const nextHeading = /\n\n(?:场景上下文|活动引用|场景地图|首帧与空间走位|格式模式|光学|摄像机|动作节奏|物理|光线|音频|风格|正向约束|负向约束|SCENE CONTEXT|ACTIVE REFERENCES|LOCATION MAP|FIRST FRAME AND SPATIAL BLOCKING|FORMAT MODE|OPTICS|CAMERA|ACTION TIMING|PHYSICS|LIGHTING|AUDIO|STYLE|POSITIVE CONSTRAINTS|NEGATIVE CONSTRAINTS)\s*[:：]\s*\n/igu;
+  const nextHeading = /\n\n(?:活动引用|场景地图(?:和站位)?|首帧(?:与空间走位|与站位)?|格式模式|光学|摄像机|动作节奏|物理|光线|音频|风格|正向约束|负向约束|ACTIVE REFERENCES|SCENE MAP AND STAGING|LOCATION MAP|FIRST FRAME(?: AND SPATIAL BLOCKING)?|FORMAT MODE|OPTICS|CAMERA|ACTION TIMING|PHYSICS|LIGHTING|AUDIO|STYLE|POSITIVE CONSTRAINTS|NEGATIVE CONSTRAINTS)\s*[:：]\s*\n/igu;
   nextHeading.lastIndex = bodyStart;
   const nextMatch = nextHeading.exec(text);
   const bodyEnd = nextMatch?.index ?? text.length;
@@ -738,11 +738,11 @@ export function sanitizeFinalPromptResponse(text: string, sourcePrompt = "", loc
   // Some reasoning models omit the closing tag. If the response contains a
   // canonical first heading, discard everything before that heading.
   if (/^\s*<(?:think|analysis|reasoning)\b[^>]*>/i.test(cleaned)) {
-    const firstHeading = cleaned.search(/(?:^|\n)(?:场景上下文|SCENE CONTEXT)\s*[:：]?\s*\n/i);
+    const firstHeading = cleaned.search(/(?:^|\n)(?:风格|STYLE)\s*[:：]?\s*\n/i);
     cleaned = firstHeading >= 0 ? cleaned.slice(firstHeading).trim() : "";
   }
 
-  cleaned = restoreCanonicalSceneContext(cleaned, sourcePrompt, locale);
+  cleaned = restoreCanonicalStyle(cleaned, sourcePrompt, locale);
   cleaned = restoreAssetImageTokens(restoreActionTimingSegments(cleaned, sourcePrompt, locale), sourcePrompt);
   return cleaned
     .replace(/^\s*```(?:text|markdown)?\s*/i, "")
@@ -1388,6 +1388,49 @@ export async function optimizeSceneBrief(project: ProjectV2, scene: SceneV2, loc
   };
 }
 
+/** 风格描述专用优化：只返回一段可执行的视觉风格语言，不改动其他导演简报字段。 */
+export async function optimizeStyleDescription(project: ProjectV2, locale: Locale): Promise<string> {
+  const settings = loadAISettings();
+  if (!isRemoteConfigured(settings)) {
+    throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key，再在「AI编译提示词」左侧选择模型。");
+  }
+
+  const zh = locale === "zh";
+  const language = zh ? "简体中文" : "English";
+  const currentStyle = localizedStyleBrief(project, locale).trim();
+  const preset = getStyle(project.styleId);
+  const presetDescription = preset
+    ? (zh ? preset.descriptionZh : preset.description).trim()
+    : "";
+  const checklist = zh
+    ? "整体视觉处理；色彩层级与可量化比例；饱和度、阴影和黑位关系；写实画质与材质细节；空气介质；暗角、运动模糊等画面效果；光线质感；最后写所有镜头的统一性。"
+    : "overall visual treatment; named color hierarchy with controllable ratios; saturation, shadow, and black-level behavior; photographic quality and material detail; atmospheric medium; vignette and motion-blur behavior; light quality; and the cross-shot consistency lock.";
+  const data = await chatJSON(settings, JSON_SYSTEM, [
+    "You are optimizing one visual style description for a cinematic AI video prompt studio.",
+    `Return exactly one compact paragraph in ${language}; do not use headings, bullets, markdown, explanations, or a preface.`,
+    "Rewrite the current description into executable image-style parameters that a video model can follow consistently across every shot.",
+    "The output must be visual style language only. Do not output story, characters, props, dialogue, acting, shot size, focal length, FOV, camera body, camera movement, exposure settings, named lenses, or named directors.",
+    "Do not blindly copy a preset or poetic mood adjectives. Preserve concrete user facts, make them measurable where the source supports it, and do not invent a period, color ratio, grain treatment, or technical specification that has no basis in the source.",
+    "Include, when relevant: overall realistic / photographic treatment; a primary-secondary-accent color hierarchy with percentages; saturation range; shadow and black-level behavior; skin texture and material detail; sparse particles or other air effects; vignette strength; motion blur limited to moving edges; soft diffuse light without flattening all detail; and a final all-shots consistency statement.",
+    `Use this output structure as a writing checklist: ${checklist}`,
+    "A good Chinese-style result may read like: 青绿色与墨色哑光低饱和调色，青绿色约 60%、墨色冷灰约 30%、自然肤色与环境色约 10%；饱和度约 20%–35%，阴影偏青绿，黑位偏墨黑但保留暗部细节。超写实真人实景质感，皮肤保留自然毛孔、细微纹理和自然光泽，禁止过度磨皮与塑料感。空气中只有稀疏细微灰尘；轻微 5%–8% 镜头暗角；快速运动边缘有自然轻微运动模糊，静止区域保持清晰；柔和漫反射光，低对比度但保留完整层次。所有镜头保持统一色调。",
+    "A good English-style result must express the same kind of concrete controls in English, not translate the example's Chinese wording literally.",
+    "Current style description:",
+    currentStyle || "(empty)",
+    "Selected preset description for reference only; do not copy its name or wording verbatim:",
+    presetDescription || "(none)",
+    "Return exactly this JSON schema:",
+    '{ "styleDescription": string }',
+  ].join("\n"));
+
+  const value = data && typeof data === "object" ? data as Record<string, unknown> : {};
+  const result = asString(value.styleDescription);
+  if (!result) {
+    throw new Error("AI 未返回有效的风格描述。");
+  }
+  return result.replace(/\s+/g, " ").trim();
+}
+
 interface GeneratedShotResult {
   label?: unknown;
   time?: { startSeconds?: unknown; endSeconds?: unknown };
@@ -1451,7 +1494,6 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
   const orderIds = [...(scene.staging?.characterOrder ?? [])].filter((id) => byId.has(id) && byId.get(id)?.kind === "character");
   const seconds = t?.seconds ?? "s";
   const locale = t?.locale ?? "zh";
-  const styleBrief = localizedStyleBrief(project, locale);
   const durationLimit = Number(scene.duration.match(/(\d+(?:\.\d+)?)/)?.[1]) || 15;
   const isLongTake = scene.shootingMode !== "multi-shot";
 
@@ -1519,7 +1561,6 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     `Performance objectives (表演目标, per character): ${JSON.stringify(scene.actingObjectives ?? [])}`,
     `Axis direction: ${scene.staging?.axisDirection ?? "left-to-right"}; Spacing: ${scene.staging?.spacing?.trim() || "(default)"}`,
     `Scene emotion arc: ${scene.emotionArc?.trim() || "(not set)"}`,
-    `Style direction: ${styleBrief || "(not set)"}`,
     `User audio plan (AI reference only; do not return or overwrite the audio plan card, and do not copy it directly into the final prompt): ${JSON.stringify(project.audioPlan ?? { score: "none", subtitles: false })}`,
     "",
     `LOCATION ASSET: ${locationAsset ? `${locationAsset.name}(${locationAsset.id}) — ${compact(locationAsset.description?.trim() || locationAsset.descriptionZh?.trim() || "", 240)}` : "(none)"}`,
@@ -1551,7 +1592,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     "Do NOT invent character/prop IDs. Do NOT add prose, markdown, directorLayers, or keys outside the schema.",
   ].join("\n"), t?.onProgress);
 
-  const normalized = normalizeSceneDraft(project, scene, data, seconds, locale, { preserveSceneContext: false });
+  const normalized = normalizeSceneDraft(project, scene, data, seconds, locale);
   t?.onProgress?.("validating");
   const durationIssue = auditFinalPrompt(normalized.scene).issues.find((issue) => issue.code === "FINAL.DURATION_EXCEEDED");
   if (durationIssue) {
@@ -1581,14 +1622,23 @@ export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): {
     ? "只用清晰、电影级的中文输出。即使规范源包含英文，也必须将其忠实转换为自然、直接、可拍摄、可执行的中文提示词；避免翻译腔、空泛形容词和散文化抒情。"
     : "Output only clear, cinematic-grade English. Even if the canonical source contains Chinese, faithfully convert it into natural, direct, shootable, executable English; avoid literal translation, vague adjectives, and poetic prose.";
   const headingsRule = zh
-    ? "只输出以下非空类别，必须使用这些中文标题，并严格按此顺序：场景上下文、活动引用、场景地图、首帧与空间走位、格式模式、光学、摄像机、动作节奏、物理、光线、音频、风格、正向约束。仅当源中存在时才输出：负向约束。"
-    : "Output only the following non-empty categories, using exactly these English headings and this order: SCENE CONTEXT, ACTIVE REFERENCES, LOCATION MAP, FIRST FRAME AND SPATIAL BLOCKING, FORMAT MODE, OPTICS, CAMERA, ACTION TIMING, PHYSICS, LIGHTING, AUDIO, STYLE, POSITIVE CONSTRAINTS. Output NEGATIVE CONSTRAINTS only when present in the source.";
-  const styleRule = zh
+    ? "只输出以下非空类别，必须使用这些中文标题，并严格按此顺序：风格、活动引用、场景地图和站位、光学、摄像机、动作节奏、格式模式、物理、光线、音频、正向约束。仅当源中存在时才输出：负向约束。"
+    : "Output only the following non-empty categories, using exactly these English headings and this order: STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING, OPTICS, CAMERA, ACTION TIMING, FORMAT MODE, PHYSICS, LIGHTING, AUDIO, POSITIVE CONSTRAINTS. Output NEGATIVE CONSTRAINTS only when present in the source.";
+  /* The previous style-writing instructions are retained below only as history;
+   * final STYLE text is now copied from the local director document. */
+  /* const legacyStyleRule = zh
     ? "空间锁定必须在摄像机之前，光学必须在一般美术语言之前，光线必须作为优先级锁。STYLE 必须位于光线之后、正向约束之前，并写成一段可执行的画面风格描述：先说整体写实/照片级或其他明确视觉处理，再写环境材质与表面质感、画面色彩层级（源中有比例时保留 60:30:10，并明确主色/次色/点缀色）、画质特征（清晰度、对比度、颗粒/无颗粒、噪点、帧面洁净度、真实感）以及时代或地域还原要求。风格应服务于控制，不要只写诗意情绪或空泛的“电影感”；每个形容词都要落到可见的颜色、材质、纹理、画面质量或时代质感上。可以保留“写实的照片级英国社会现实主义犯罪喜剧”“公屋的污垢感”“紧张而富身体性的视觉质感”这类画面风格信息，但不得照抄导演简报中的风格描述或风格预设名称，应将其转化为简洁、具体的最终画面语言。STYLE 不得重复 OPTICS、CAMERA、ACTION TIMING 或 LIGHTING：ARRI/摄影机型号、镜头型号、焦段、FOV、景深、运动、曝光、光线方向和光源归入对应类别；STYLE 只保留它们造成的可见画质结果，例如锐利清晰、均衡曝光感、无颗粒、年代准确。源中没有确定的色彩比例、颗粒、时代或地域信息时不得臆造。不要新增 QUALITY、CHARACTER ACTING 或其他标题；角色表演必须附着在动作节奏中对应的镜头和人物之后。参考格式：写实的照片级英国社会现实主义犯罪喜剧；公屋的污垢感，紧张而富身体性的视觉质感，叠加反派的威胁气场。60:30:10——主色、次色、点缀色分别写清。画面锐利清晰、帧面干净、无颗粒，准确还原 2011 年或更早的影像质感。"
     : "Keep spatial locks before camera, optics before general visual language, and lighting as a priority lock. STYLE must come after LIGHTING and before POSITIVE CONSTRAINTS. Write one executable image-style description: first state the overall realistic / photographic or otherwise explicit visual treatment, then the environment materials and surface texture, the color hierarchy (preserve a source-defined 60:30:10 ratio and name the primary / secondary / accent colors), image-quality traits (clarity, contrast, grain / no grain, noise, clean frames, realism), and any period or regional reconstruction requirement. Style must support control, not replace it: avoid purely poetic mood language or vague ‘cinematic’ adjectives; connect every descriptor to a visible color, material, texture, image-quality property, or period treatment. Preserve visual information such as ‘photorealistic British social-realist crime comedy’, ‘the grime of public housing’, and a tense, physically grounded image texture, but do not copy the director brief’s style description or preset name verbatim; distill it into compact, concrete final image language. Do not repeat OPTICS, CAMERA, ACTION TIMING, or LIGHTING: camera body, lens model, focal length, FOV, depth of field, movement, exposure, light direction, and light sources belong in their own categories. STYLE may retain their visible image-quality result, such as sharp clarity, balanced exposure appearance, no grain, or period accuracy. Never invent a color ratio, grain treatment, period, or regional requirement absent from the source. Do not add QUALITY, CHARACTER ACTING, or any other heading; attach acting to the corresponding shot and character inside ACTION TIMING. Example: photorealistic British social-realist crime comedy; public-housing grime with a tense, physically grounded image texture and a theatrical villain threat. 60:30:10 with the primary, secondary, and accent colors named explicitly. Sharp, clean frames with no grain, accurately reconstructing the image quality of 2011 or earlier.";
-  const firstFrameRule = zh
-    ? "首帧与空间走位必须覆盖最终输出中的每一个镜头段。多镜头序列必须逐段单独输出“第 1 段首帧：……”“第 2 段首帧：……”等首帧句，即使相邻段的空间关系相似也不得用“同上”省略。每段首帧必须只写该段第一可见画面中的实际人物和道具：景别或角度、人物在画面左/中/右及前/中/后景的位置、人物之间的距离和遮挡关系、主要背景地标、身体朝向和视线方向；没有出镜的人物绝不能写入该段。首帧是该段的静态占位与空间状态，不要把后续动作、表演过程或整段动作时间线写进首帧。必须与该段 ACTION TIMING 的 participants、位置和进入方式一致；后续才入画的人物只能写在后续时间块。单一连续长镜头只写一次整条长镜头的开场首帧。参考格式：第 1 段首帧：特写躺在黄沙中，双眼紧闭，身后是棕砖楼墙；画面里与凯尔同框的没有其他人。第 2 段首帧：低角度仰拍破窗特写，瘦小人物居中，魁梧人物宽阔的身体挤在窗口一侧，另一名人物紧挨另一侧，身后是昏暗室内与天花板；所有在该段出镜的人物都向外张望搜寻。"
-    : "FIRST FRAME AND SPATIAL BLOCKING must cover every shot segment in the final output. In a multi-shot sequence, write a separate first-frame statement for every segment, labeled exactly as ‘SHOT 1 FIRST FRAME: ...’, ‘SHOT 2 FIRST FRAME: ...’, and so on; never use ‘same as above’ even when adjacent segments are similar. Each segment’s first frame may name only the people and props actually visible in that segment’s first visible frame: framing or angle, left/center/right and foreground/midground/background placement, distance and occlusion between subjects, main background landmarks, body orientation, and eyelines. Never include a character who is not visible in that segment. First frame is static occupancy and spatial state only; do not turn it into the later action, performance progression, or full timeline. It must agree with that segment’s ACTION TIMING participants, positions, and entrances; a character who enters later belongs only in a later time block. A single continuous long take gets one opening first-frame statement for the entire take. Example format: SHOT 1 FIRST FRAME: tight close-up of a figure lying in yellow sand, eyes closed, brown-brick wall behind; no other person shares the frame with Kel. SHOT 2 FIRST FRAME: low-angle close-up looking up through a broken window, the smaller figure centered, the broad figure crowding one side and another figure tight against the opposite side, dim interior and ceiling behind; everyone visible in this segment looks outward and searches.";
+  */
+  const styleRule = zh
+    ? "风格锁放在所有类别最前，先输出 STYLE 再输出其他类别。STYLE 是导演文档中的本地风格原文，必须逐字复制规范源 STYLE 段的正文，不得翻译、改写、润色、压缩、补充、删除或重新解释；保留原有标点、比例、数值和句序。不得让 AI 重新生成风格，也不得把风格预设名称或风格描述改写成另一段文字。STYLE 不得重复 ACTIVE REFERENCES、OPTICS、CAMERA、ACTION TIMING 或 LIGHTING；其他类别中的信息仍按各自类别输出。"
+    : "Style lock comes first: output STYLE before every other category. STYLE is the local style text from the director document: copy the STYLE body from the canonical source character-for-character. Do not translate, rewrite, polish, shorten, expand, delete, or reinterpret it; preserve its punctuation, ratios, numbers, and sentence order. Do not regenerate the style with AI or turn a preset name or style description into different wording. Do not repeat ACTIVE REFERENCES, OPTICS, CAMERA, ACTION TIMING, or LIGHTING inside STYLE; other information remains in its own category.";
+  const actingPlacementRule = zh
+    ? "角色表演只能写在 ACTION TIMING 中对应镜头和人物之后；不要新增 CHARACTER ACTING 标题。"
+    : "Important: attach acting to the corresponding shot and character inside ACTION TIMING; do not add a separate CHARACTER ACTING heading.";
+  const locationMapRule = zh
+    ? "场景地图和站位合并为同一段：段首只输出一份场景级空间总图（地点几何、材质与主要地标、总体 180° 轴与屏幕方向、站位参考图所定义的左到右排序和间距、全场共用的空间锚点、主光方向及总体景深关系；可保留相机相对空间的总体基准，但不得写成某一镜头的构图或运动），段末输出第 1 镜头的开场首帧。场景地图不得复述活动引用中的场景描述，也不得输出“镜头 1/第 1 段”等逐镜人物位置覆盖、逐镜镜头路径、人物入画、表演或时间线；这些信息只属于 ACTION TIMING。首帧只写第 1 镜头第一个可见画面中的实际人物和道具：景别或角度、人物在画面左/中/右及前/中/后景的位置、人物之间的距离和遮挡关系、主要背景地标、身体朝向和视线方向；没有出镜的人物绝不能写入。首帧是静态占位与空间状态，不要写后续动作、表演过程或完整时间线；第一帧必须与第 1 镜头 ACTION TIMING 的参与人物、位置和入画方式一致；后续镜头的人物位置、入画、构图变化和空间关系只在各自的 ACTION TIMING 时间块中写出，不得回填到首帧。无论是多镜头还是长镜头，都只保留一次开场首帧。参考格式：第 1 段首帧：特写人物躺在黄沙中，双眼紧闭，身后是棕砖楼墙；画面里没有其他人物。"
+    : "SCENE MAP AND STAGING is one section: first output one scene-level master map only (location geometry, materials and main landmarks; the overall 180-degree axis and screen direction; the left-to-right order and spacing established by the staging reference; shared spatial anchors; key-light direction; and overall depth relationships; it may retain a global camera-to-space baseline, but never present it as a shot composition or movement), then, at the end of the section, output the opening first frame of SHOT 1. Do not repeat the scene description from ACTIVE REFERENCES, and never output per-shot position overrides, per-shot camera paths, entrances, acting, or timing under this section; those facts belong only in ACTION TIMING. The first frame names only the people and props actually visible in that first visible picture: framing or angle, left/center/right and foreground/midground/background placement, distance and occlusion between subjects, main background landmarks, body orientation, and eyelines; never include a character who is not visible. The first frame is static occupancy and spatial state only; do not turn it into later action, performance progression, or a full timeline. It must agree with SHOT 1 ACTION TIMING participants, positions, and entrances. Later-shot positions, entrances, composition changes, and spatial relationships belong only in their own ACTION TIMING blocks and must not be repeated here. Both multi-shot sequences and long takes retain one opening first-frame statement only. Example: SHOT 1 FIRST FRAME: tight close-up of a figure lying in yellow sand, eyes closed, brown-brick wall behind; no other person shares the frame.";
   const formatModeRule = zh
     ? "FORMAT MODE 是本次生成的整体执行格式摘要，必须完整承接源中已确定的格式事实，不得只写“单一连续长镜头”或“受控多镜头序列”。按源内容明确写出：生成方式（单次生成或其他明确方式）、段数、总时长及各段时长分配（如 4 秒 / 4 秒）、画幅（如 16:9）、速度（实时、慢动作或其他已指定速度）、段间连接方式和连接动作、现场声/配乐范围、每句台词属于哪个角色或对象、字幕与画面帧限制。多段格式必须说明每一段如何结束、下一段如何开始，以及甩切、whip cut、甩镜上摇/下摇、推拉变焦等连接的方向、发生段落和连续因果；不要把明确的甩切泛化成“快速剪辑”。“单次生成”表示整段内容一次生成，不等于只能有一个镜头。各段时长必须与镜头时间轴一致；未在源中确定的时长、画幅、速度、转场、声音或对白归属不得臆造。格式模式只总结生成和段落组织方式，不重复 OPTICS、CAMERA、ACTION TIMING 的具体执行细节。示例：单次生成，两个段落，一次甩切，总长约 8 秒（4 秒 / 4 秒），画幅 16:9。实时速度。快速甩镜上摇结束第 1 段并顺势冲入急推变焦开启第 2 段；快速甩镜下摇结束第 2 段。仅现场音，无配乐；台词只属于提卡；干净的纯画面帧。"
     : "FORMAT MODE is the overall execution-format summary for this generation. It must carry forward every format fact established in the source, rather than outputting only ‘SINGLE CONTINUOUS TAKE’ or ‘CONTROLLED MULTI-SHOT SEQUENCE’. When supported by the source, state: generation mode (single generation or another explicit mode), segment count, total duration and per-segment allocation (for example, 4 seconds / 4 seconds), aspect ratio (for example, 16:9), speed (real time, slow motion, or another specified speed), the connection between segments and its physical transition, the diegetic-sound / score scope, which character or object owns each line, and subtitle / clean-frame limits. For multi-segment formats, explain how each segment ends and the next begins. Preserve the direction, segment placement, and causal continuity of whip cuts, whip pans up/down, push-ins, zooms, and other stated transitions; do not flatten an explicit whip cut into ‘fast editing’. ‘Single generation’ means one generated output for the whole piece, not a single shot. Segment durations must agree with the shot timeline. Never invent an unprovided duration, aspect ratio, speed, transition, sound rule, or dialogue ownership. FORMAT MODE summarizes generation and segment organization only; do not repeat the detailed OPTICS, CAMERA, or ACTION TIMING instructions. Example: single generation, two segments, one whip cut, approximately 8 seconds total (4 seconds / 4 seconds), 16:9. Real time. A fast whip pan upward ends segment 1 and flows directly into a rapid push-zoom that opens segment 2; a fast whip pan downward ends segment 2. Diegetic sound only, no score; the line belongs only to Tika; clean picture frames.";
@@ -1599,26 +1649,27 @@ export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): {
     ? "动作节奏必须按镜头段分组输出，不能把所有镜头的时间块合并成一条平面时间线。多镜头序列先分别写“第 1 段（起止时间）：”“第 2 段（起止时间）：”等段落标题，再在每个段落标题下写该段自己的时间块；段落标题必须保留，即使某段只有一个事件。每个时间块必须保留精确时间（如 0:01.5–0:02.5），只写一个事件的主体位置、动作和该拍结果，并在相关时写入相机行为、关键道具状态、物理锚点和音频/对白；显式起始时间必须按场景绝对时间保留，并允许表达非连续或重叠事件。时间块中的人物和道具目标必须保留源中的 @ 资产引用及其对应 [imageN]，同一资产重复出现时复用同一个图片编号，不得输出裸的 @资产名。长镜头中只写一个连续段落；多镜头序列中每个切点都要保留源里的切换依据，没有依据不得输出切点。"
     : "ACTION TIMING must remain grouped by shot segment; never flatten all shot events into one timeline. For a multi-shot sequence, first write separate segment headings such as ‘SHOT 1 (start to end):’ and ‘SHOT 2 (start to end):’, then place only that segment's time blocks beneath its heading. Keep every segment heading even when it contains one event. Each time block must preserve its precise time (for example, 0:01.5 to 0:02.5), state one event's subject position, action, and outcome, and include camera behavior, critical prop state, physics anchors, and audio/dialogue when relevant. Preserve explicit absolute start times, including non-contiguous or overlapping events. Every character or prop @ asset reference inside a time block must retain its matching [imageN] token; reuse the same image number for repeated references and never emit a bare @asset tag. A long take gets one continuous segment group. In multi-shot sequences, keep the stated cut reason on every cut and never emit a cut without one.";
   return {
-    system: "You are CINEDANCE V4, the final delivery editor for Seedance and Higgsfield cinematic video prompts. "
+    system: "You are CINEDANCE V4, an elite AI film prompt director for Seedance 2.0 and Higgsfield Seedance. "
+      + "Your job is to convert the provided canonical scene input into a clean, production-ready, high-budget cinematic video prompt that works on the first generation as often as possible. "
+      + "You do not simply write beautiful prose: you operate as a film-director agent with internal reasoning, scene diagnosis, spatial blocking, optics selection, physics validation, reference control, continuity control, and silent QA before output. "
+      + "Use simple direct words; avoid abstract poetic language when it weakens control; prefer concrete physical instructions, visible actions, measurable positions, explicit timing, camera-readable behavior, and observable visual outcomes. "
       + (zh
         ? "Return only the finished prompt in clear, cinematic-grade Chinese, with no commentary, markdown fence, rationale, audit note, or greeting."
         : "Return only the finished prompt in clear, cinematic-grade English, with no commentary, markdown fence, rationale, audit note, or greeting."),
     user: [
       languageRule,
-      "The canonical source below combines the concise editable director guide with the structured shot execution. ACTIVE REFERENCES and FIRST FRAME AND SPATIAL BLOCKING are compiler-generated from the current asset library and shot participants; treat those sections as the source of truth. Preserve every concrete fact, active reference, timing, character action, acting behavior, and constraint.",
-      "Every @asset_tag, matching [imageN], and @audioN token is an opaque Seedance platform reference. Copy each one exactly as supplied: never translate, delete, rename, normalize, or invent one. Whenever an asset has a matching [imageN] in ACTIVE REFERENCES, every repeated @asset_tag occurrence in ACTION TIMING, FIRST FRAME AND SPATIAL BLOCKING, LOCATION MAP, and AUDIO must keep the same [imageN] immediately after the tag; never emit a bare version of that @asset_tag. Reusing the same @asset_tag and [imageN] is required and is not an accidental duplication. Keep each asset's appearance and prop description exclusively in ACTIVE REFERENCES. Acting master profiles are AI-only references: do not output them in ACTIVE REFERENCES or add a separate CHARACTER ACTING heading; preserve only their shot-specific, observable adaptation in the corresponding ACTION TIMING participant or beat. Keep each speaking or vocal character's voice lock and voice reference in the AUDIO section's character voice block, followed by the shot-local delivery, exact dialogue or non-verbal vocalization, and silence rule; do not repeat the full voice lock elsewhere.",
+      "The canonical source below combines the concise editable director guide with the structured shot execution. ACTIVE REFERENCES and SCENE MAP AND STAGING are compiler-generated from the current asset library and shot participants; treat those sections as the source of truth. Preserve every concrete fact, active reference, timing, character action, acting behavior, and constraint.",
+      "Every @asset_tag, matching [imageN], and @audioN token is an opaque Seedance platform reference. Copy each one exactly as supplied: never translate, delete, rename, normalize, or invent one. Whenever an asset has a matching [imageN] in ACTIVE REFERENCES, every repeated @asset_tag occurrence in ACTION TIMING, SCENE MAP AND STAGING, and AUDIO must keep the same [imageN] immediately after the tag; never emit a bare version of that @asset_tag. Reusing the same @asset_tag and [imageN] is required and is not an accidental duplication. Keep each asset's appearance and prop description exclusively in ACTIVE REFERENCES. Acting master profiles are AI-only references: do not output them in ACTIVE REFERENCES or add a separate CHARACTER ACTING heading; preserve only their shot-specific, observable adaptation in the corresponding ACTION TIMING participant or beat. Keep each speaking or vocal character's voice lock and voice reference in the AUDIO section's character voice block, followed by the shot-local delivery, exact dialogue or non-verbal vocalization, and silence rule; do not repeat the full voice lock elsewhere.",
       "Do not invent, remove, reinterpret, or contradict any fact. Do not add prior context, story summaries, user notes, AI instructions, warnings, scores, or diagnostics.",
       zh
         ? "OPTICS 是镜头执行的结构化真源。逐镜保留其中的景别、FOV、镜头语言和可观测光学结果；不得因为风格、内容类别或你自己的判断替换、归一化或补写另一种镜头。"
         : "OPTICS is the structured source of truth for shot execution. Preserve every shot's framing, FOV, lens character, and observable optical outcome; never replace, normalize, or add a different lens because of style, content class, or your own judgment.",
-      zh
-        ? "SCENE CONTEXT 必须保留规范源中的当前地点、实际出场人物和正在发生的关键事件。禁止输出“已处于既定在场状态”“已建立的画面状态”“当前空间中的当前动作状态”“当前事件未提供可提取的剧情信息”等空泛占位句；如果规范源缺少事件，保持源句，不得自行编造。"
-        : "SCENE CONTEXT must preserve the canonical source's current location, actual on-screen characters, and key event happening now. Never output vague placeholders such as ‘established on-screen state’, ‘current action state’, or ‘no current story event was provided’; if the canonical source lacks an event, keep its source sentence and do not invent one.",
       headingsRule,
-      firstFrameRule,
+      styleRule,
+      locationMapRule,
       formatModeRule,
       cameraRule,
-      styleRule,
+      actingPlacementRule,
       actionTimingRule,
       "",
       "CANONICAL AUDITED SOURCE:",
@@ -1628,25 +1679,23 @@ export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): {
 }
 
 const FINAL_SOURCE_SECTIONS = [
-  { key: "sceneContext", heading: "SCENE CONTEXT" },
+  { key: "style", heading: "STYLE" },
   { key: "activeReferences", heading: "ACTIVE REFERENCES" },
-  { key: "locationMap", heading: "LOCATION MAP" },
-  { key: "firstFrame", heading: "FIRST FRAME AND SPATIAL BLOCKING" },
-  { key: "formatMode", heading: "FORMAT MODE" },
+  { key: "locationMap", heading: "SCENE MAP AND STAGING" },
   { key: "optics", heading: "OPTICS" },
   { key: "camera", heading: "CAMERA" },
   { key: "actionTiming", heading: "ACTION TIMING" },
+  { key: "formatMode", heading: "FORMAT MODE" },
   { key: "physics", heading: "PHYSICS" },
   { key: "lighting", heading: "LIGHTING" },
   { key: "audio", heading: "AUDIO" },
-  { key: "style", heading: "STYLE" },
   { key: "positiveConstraints", heading: "POSITIVE CONSTRAINTS" },
   { key: "negativeLocks", heading: "NEGATIVE CONSTRAINTS" },
 ] as const;
 
 const PROMPT_SECTION_HEADINGS = [
   ...FINAL_SOURCE_SECTIONS.map((section) => section.heading),
-  "SHOT EXECUTION", "场景上下文", "活动引用", "场景地图", "首帧与站位", "格式模式", "光学", "摄像机", "动作节奏", "镜头执行", "物理", "光线", "音频", "风格", "正向约束", "负向约束",
+  "SHOT EXECUTION", "活动引用", "场景地图和站位", "场景地图", "首帧与空间走位", "首帧与站位", "格式模式", "光学", "摄像机", "动作节奏", "镜头执行", "物理", "光线", "音频", "风格", "正向约束", "负向约束",
 ];
 
 function extractPromptSection(source: string, heading: string): string {
@@ -1665,18 +1714,31 @@ function extractPromptSection(source: string, heading: string): string {
   return source.slice(start, end).trim();
 }
 
-/** 最终模型偶尔会把场景上下文改写成无事实的占位句，回填本地审核后的当前事件。 */
-function restoreCanonicalSceneContext(text: string, sourcePrompt: string, locale: Locale): string {
-  const heading = locale === "zh" ? "场景上下文" : "SCENE CONTEXT";
-  const canonical = extractPromptSection(sourcePrompt, heading);
+/** 移除模型多输出的未知分段，保持最终提示词按 canonical 顺序。 */
+function removePromptSection(text: string, heading: string): string {
+  const escaped = escapeRegExp(heading);
+  let result = text;
+  for (;;) {
+    // 标题可带可不带冒号（如“风格：”或裸“风格”），并允许同段出现多次。
+    const match = new RegExp(`(^|\\n)${escaped}\\s*[:：]?\\s*\\n`, "i").exec(result);
+    if (!match) return result;
+    const bodyStart = match.index + match[0].length;
+    const next = new RegExp(`\\n\\n(?:${PROMPT_SECTION_HEADINGS.map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})[:：]?\\n`, "iu").exec(result.slice(bodyStart));
+    const bodyEnd = next ? bodyStart + next.index : result.length;
+    result = `${result.slice(0, match.index)}${result.slice(bodyEnd)}`.replace(/\n{3,}/g, "\n\n").trim();
+  }
+}
+
+/** STYLE is a local director-document value; never let final delivery rewrite it. */
+function restoreCanonicalStyle(text: string, sourcePrompt: string, locale: Locale): string {
+  const heading = locale === "zh" ? "风格" : "STYLE";
+  // The canonical source always uses English section headings, but accept
+  // either variant so this guard also works on hand-written sources.
+  const canonical = extractPromptSection(sourcePrompt, "STYLE") || extractPromptSection(sourcePrompt, "风格");
   if (!canonical) return text;
-  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = new RegExp(`(^|\\n)${escaped}\\s*[:：]\\s*\\n`, "i").exec(text);
-  if (!match) return text;
-  const bodyStart = match.index + match[0].length;
-  const next = new RegExp(`\\n\\n(?:${PROMPT_SECTION_HEADINGS.map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})[:：]\\n`, "iu").exec(text.slice(bodyStart));
-  const bodyEnd = next ? bodyStart + next.index : text.length;
-  return `${text.slice(0, bodyStart)}${canonical}${text.slice(bodyEnd)}`;
+  let rest = removePromptSection(text, "STYLE");
+  rest = removePromptSection(rest, "风格");
+  return `${heading}${locale === "zh" ? "：" : ":"}\n${canonical}\n\n${rest}`;
 }
 
 function withoutLayerHeading(text: string, heading: string, chineseHeading: string): string {
@@ -1686,8 +1748,8 @@ function withoutLayerHeading(text: string, heading: string, chineseHeading: stri
 /**
  * Final delivery source is a single canonical sequence, not a director-document
  * dump followed by another full prompt. Editable director layers remain primary;
- * ACTIVE REFERENCES and FIRST FRAME are always rebuilt from current assets and
- * structured shots so stale prose cannot override executable scene data.
+ * ACTIVE REFERENCES and SCENE MAP AND STAGING are always rebuilt from current
+ * assets and structured shots so stale prose cannot override executable scene data.
  */
 export function buildFinalGenerationSource(project: ProjectV2, scene: SceneV2, locale: Locale = "en"): string {
   const generatedLayers = buildDirectorDocumentLayers(project, scene, { locale });
@@ -1709,7 +1771,7 @@ export function buildFinalGenerationSource(project: ProjectV2, scene: SceneV2, l
     let body: string;
     if (section.key === "actionTiming") {
       body = extractPromptSection(canonicalSequence, locale === "zh" ? "镜头执行" : "SHOT EXECUTION");
-    } else if (section.key === "activeReferences" || section.key === "firstFrame" || section.key === "optics") {
+    } else if (section.key === "activeReferences" || section.key === "optics") {
       // These sections are executable data, not editable director prose.
       const layer = labelsByKey.get(section.key as typeof DIRECTOR_LAYER_ORDER[number]);
       body = extractPromptSection(canonicalSequence, layer?.[locale] ?? section.heading);
@@ -1717,18 +1779,14 @@ export function buildFinalGenerationSource(project: ProjectV2, scene: SceneV2, l
       const layer = labelsByKey.get(section.key as typeof DIRECTOR_LAYER_ORDER[number]);
       const edited = layer ? withoutLayerHeading(editedLayers[section.key] ?? "", section.heading, layer.zh) : "";
       const generated = generatedLayers[section.key as typeof DIRECTOR_LAYER_ORDER[number]] || "";
-      // A contradictory edited spatial layer must not be sent alongside the
-      // structured shot facts. Fall back to the deterministic spatial render;
-      // other valid director layers remain editable and keep their content.
-      const invalidSceneContext = section.key === "sceneContext" && !isSceneContextUsable(project, scene, edited, locale);
-      body = spatialLayerConflicts.has(section.key) || invalidSceneContext ? generated : edited || generated;
+      body = spatialLayerConflicts.has(section.key) ? generated : edited || generated;
     }
     if (body.trim()) sections.push(`${section.heading}:\n${body.trim()}`);
   }
   return sections.join("\n\n");
 }
 
-export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: unknown, seconds: string, locale: Locale = "zh", options: { preserveSceneContext?: boolean } = {}): {
+export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: unknown, seconds: string, locale: Locale = "zh"): {
   scene: SceneV2;
   directorLayers?: Record<string, string>;
 } {
@@ -1737,11 +1795,6 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
   const characterIds = new Set(assets.filter((asset) => asset.kind === "character").map((asset) => asset.id));
   const propIds = new Set(assets.filter((asset) => asset.kind === "prop").map((asset) => asset.id));
   const orderIds = [...(scene.staging?.characterOrder ?? [])].filter((id) => characterIds.has(id));
-  // AI storyboard compilation must not silently carry a stale context from an older preset.
-  // Direct callers can preserve an explicitly edited context for backwards compatibility.
-  // Scene context and director layers are local compiler outputs. The AI
-  // planner may not overwrite them with prose or stale preset material.
-  const sceneContext = options.preserveSceneContext === false ? "" : scene.sceneContext?.trim() ?? "";
   const macro = obj.macro && typeof obj.macro === "object" && !Array.isArray(obj.macro)
     ? obj.macro as Record<string, unknown>
     : {};
@@ -1957,7 +2010,6 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
   const structuredScene: SceneV2 = {
       ...scene,
       name: scene.name,
-      sceneContext: sceneContext || undefined,
       emotionArc: asString(macroValue("emotionArc"), scene.emotionArc ?? ""),
       ...(lightingDirection ? { lightingDirection } : {}),
       shots,

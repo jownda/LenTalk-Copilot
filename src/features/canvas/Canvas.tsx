@@ -452,6 +452,9 @@ export function Canvas() {
   const flashTimerRef = useRef<number | null>(null);
   /** 拖出蓄力(穿结界)状态: nodeId -> { phase, timer }; phase0=接触边缘待高亮, phase1=高亮中待解锁 */
   const chargeOutTimersRef = useRef<Map<string, { phase: 0 | 1; timer: number }>>(new Map());
+  const hasActiveGroupsDuringDragRef = useRef(false);
+  const pendingGroupDragNodeRef = useRef<CanvasNode | null>(null);
+  const groupDragFeedbackTimerRef = useRef<number | null>(null);
 
   const isRestoringCanvasRef = useRef(true);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -470,6 +473,12 @@ export function Canvas() {
     return () => {
       recoveryMountedRef.current = false;
     };
+  }, []);
+
+  useEffect(() => () => {
+    if (groupDragFeedbackTimerRef.current !== null) {
+      window.clearTimeout(groupDragFeedbackTimerRef.current);
+    }
   }, []);
   const duplicateNodesRef = useRef<((sourceNodeIds: string[], options?: DuplicateOptions) => string | null) | null>(
     null,
@@ -495,6 +504,7 @@ export function Canvas() {
   const edges = useCanvasStore((state) => state.edges);
   const history = useCanvasStore((state) => state.history);
   const dragHistorySnapshot = useCanvasStore((state) => state.dragHistorySnapshot);
+  const processingRevision = useCanvasStore((state) => state.processingRevision);
   const applyNodesChange = useCanvasStore((state) => state.onNodesChange);
   const applyEdgesChange = useCanvasStore((state) => state.onEdgesChange);
   const connectNodes = useCanvasStore((state) => state.onConnect);
@@ -631,7 +641,7 @@ export function Canvas() {
         window.setTimeout(resolve, delayMs);
       });
 
-    const pendingExportNodes = nodes.filter((node) => {
+    const pendingExportNodes = useCanvasStore.getState().nodes.filter((node) => {
       if (node.type !== CANVAS_NODE_TYPES.exportImage) {
         return false;
       }
@@ -907,13 +917,13 @@ export function Canvas() {
         }
       })();
     }
-  }, [apiKeys, nodes, updateNodeData, updateNodeDataTransient, updateNodeInternals]);
+  }, [apiKeys, processingRevision, updateNodeData, updateNodeDataTransient, updateNodeInternals]);
 
   // Video generation currently uses provider-specific HTTP flows without a
   // shared task-status command. A restart leaves the request available for
   // an explicit user-triggered retry from the result node toolbar.
   useEffect(() => {
-    const pendingVideoNodes = nodes.filter((node) => {
+    const pendingVideoNodes = useCanvasStore.getState().nodes.filter((node) => {
       if (node.type !== CANVAS_NODE_TYPES.audio) return false;
       const data = node.data as Record<string, unknown>;
       const request = data.generationRequest;
@@ -1079,7 +1089,7 @@ export function Canvas() {
         }
       })();
     }
-  }, [apiKeys, nodes, updateNodeDataTransient]);
+  }, [apiKeys, processingRevision, updateNodeDataTransient]);
 
   useEffect(() => {
     const element = wrapperRef.current;
@@ -2335,6 +2345,15 @@ export function Canvas() {
 
   const handleNodeDragStart = useCallback(
     (event: ReactMouseEvent, node: CanvasNode) => {
+      if (groupDragFeedbackTimerRef.current !== null) {
+        window.clearTimeout(groupDragFeedbackTimerRef.current);
+        groupDragFeedbackTimerRef.current = null;
+      }
+      pendingGroupDragNodeRef.current = null;
+      hasActiveGroupsDuringDragRef.current = !event.altKey && useCanvasStore.getState().nodes.some(
+        (item) => item.type === CANVAS_NODE_TYPES.group,
+      );
+
       if (!event.altKey) {
         altDragCopyRef.current = null;
         return;
@@ -2539,27 +2558,53 @@ export function Canvas() {
     [applyNodesChange, removeNodesFromGroup, scheduleCanvasPersist, setChargingGroupId],
   );
 
-  const handleNodeDrag = useCallback(
-    (_event: ReactMouseEvent, node: CanvasNode) => {
-      const altCopyState = altDragCopyRef.current;
-      if (!altCopyState) {
-        // 拖拽中: 高亮悬停命中的目标分组
+  const scheduleGroupDragFeedback = useCallback(
+    (node: CanvasNode) => {
+      if (!hasActiveGroupsDuringDragRef.current) {
+        return;
+      }
+
+      pendingGroupDragNodeRef.current = node;
+      if (groupDragFeedbackTimerRef.current !== null) {
+        return;
+      }
+
+      // Group hit testing is visual feedback. Capping it at roughly 20 fps
+      // prevents large grouped canvases from scanning every node per pointer event.
+      groupDragFeedbackTimerRef.current = window.setTimeout(() => {
+        groupDragFeedbackTimerRef.current = null;
+        const pendingNode = pendingGroupDragNodeRef.current;
+        pendingGroupDragNodeRef.current = null;
+        if (!pendingNode || !hasActiveGroupsDuringDragRef.current) {
+          return;
+        }
+
         const state = useCanvasStore.getState();
         const nodeMap = new Map(state.nodes.map((item) => [item.id, item] as const));
         const groups = state.nodes.filter((item) => item.type === CANVAS_NODE_TYPES.group);
         const draggingNodes = state.nodes.filter((item) => Boolean(item.dragging));
-        const targets = draggingNodes.length > 0 ? draggingNodes : [node];
+        const targets = draggingNodes.length > 0 ? draggingNodes : [pendingNode];
 
         if (groups.length === 0) {
+          hasActiveGroupsDuringDragRef.current = false;
           if (state.hoveredGroupId) {
             setHoveredGroupId(null);
           }
           return;
         }
-        const hovered = resolveDragTargetGroupId(targets, nodeMap, groups);
-        setHoveredGroupId(hovered);
-        // 拖出蓄力(穿结界): 节点中心越出父组边界时开始蓄力, 蓄满自动移出
+
+        setHoveredGroupId(resolveDragTargetGroupId(targets, nodeMap, groups));
         updateDragOutCharging(targets, nodeMap);
+      }, 48);
+    },
+    [setHoveredGroupId, updateDragOutCharging],
+  );
+
+  const handleNodeDrag = useCallback(
+    (_event: ReactMouseEvent, node: CanvasNode) => {
+      const altCopyState = altDragCopyRef.current;
+      if (!altCopyState) {
+        scheduleGroupDragFeedback(node);
         return;
       }
 
@@ -2625,11 +2670,18 @@ export function Canvas() {
         applyNodesChange(allChanges);
       }
     },
-    [applyNodesChange, setHoveredGroupId, updateDragOutCharging],
+    [applyNodesChange, scheduleGroupDragFeedback],
   );
 
   const handleNodeDragStop = useCallback(
     (_event: ReactMouseEvent, node: CanvasNode) => {
+      if (groupDragFeedbackTimerRef.current !== null) {
+        window.clearTimeout(groupDragFeedbackTimerRef.current);
+        groupDragFeedbackTimerRef.current = null;
+      }
+      pendingGroupDragNodeRef.current = null;
+      hasActiveGroupsDuringDragRef.current = false;
+
       const altCopyState = altDragCopyRef.current;
       if (!altCopyState) {
         // 非 Alt 复制拖拽: 检测「拖入组 / 拖出组」

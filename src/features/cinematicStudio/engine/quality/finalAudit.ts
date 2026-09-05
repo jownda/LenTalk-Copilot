@@ -13,10 +13,7 @@ export interface FinalPromptAuditIssue {
     | "FINAL.SPEAKER_VOICE_LOCK_MISSING"
     | "FINAL.FIRST_FRAME_MISSING"
     | "FINAL.ACTION_BEATS_MISSING"
-    | "FINAL.EXTERIOR_LIGHT_PATH_MISSING"
-    | "FINAL.SCENE_CONTEXT_MISSING"
-    | "FINAL.SCENE_CONTEXT_META_LEAK"
-    | "FINAL.SCENE_CONTEXT_TOO_LONG";
+    | "FINAL.EXTERIOR_LIGHT_PATH_MISSING";
   severity: "error" | "warning";
   detail: string;
   detailZh: string;
@@ -160,16 +157,6 @@ function findExteriorLightWithoutPath(scene: SceneV2): TextSource | undefined {
   return sources.find((source) => exteriorLight.test(source.text) && !path.test(source.text));
 }
 
-/** 场景上下文只允许描述当前片段事实；出现规划类元信息即视为泄漏。 */
-const SCENE_CONTEXT_META_RE = /前情|故事梗概|梗概|上集|回顾|continuity|连续性|警告|warning|AI\s*编译|编译说明|评分|logline|prior\s*context|previous\s*episode|user\s*reference/iu;
-
-/** 以中文句号/英文句末标点计数；省略句末标点视为一个未闭合句子。 */
-function countSceneContextSentences(text: string): number {
-  if (!text.trim()) return 0;
-  const ends = (text.match(/[。！？]/g) ?? []).length + (text.match(/[.!?](?![0-9])/g) ?? []).length;
-  return ends + (/[。！？.!?]$/.test(text.trim()) ? 0 : 1);
-}
-
 /** Project brief duration is stored as human-readable text such as "15秒" / "15s". */
 export function sceneMaxDurationSeconds(scene: SceneV2): number | undefined {
   return parseSeconds(scene.duration);
@@ -241,40 +228,6 @@ export function auditFinalPrompt(scene: SceneV2): FinalPromptAuditResult {
   const formatRange = (time: TimeRange | undefined) => time
     ? `${time.startSeconds.toFixed(1)}–${time.endSeconds.toFixed(1)}s`
     : "unset";
-
-  const sceneContext = scene.sceneContext?.trim() ?? "";
-  if (!sceneContext) {
-    issues.push({
-      code: "FINAL.SCENE_CONTEXT_MISSING",
-      severity: "warning",
-      detail: "The final export has no scene context. Add one sentence that states what is happening now, who is in frame, where/when it takes place, and the clip duration.",
-      detailZh: "最终提示词缺少第一段场景上下文。请补一句：当前正在发生什么、谁在画面内、在哪里/什么时间、共拍多久。",
-      field: "staging",
-      action: "review-staging",
-    });
-  } else {
-    if (SCENE_CONTEXT_META_RE.test(sceneContext)) {
-      issues.push({
-        code: "FINAL.SCENE_CONTEXT_META_LEAK",
-        severity: "error",
-        detail: "Scene context must describe this clip only. It contains prior context, a story summary, AI instructions, or audit metadata and will not be exported.",
-        detailZh: "场景上下文混入了前情/故事梗概/AI 说明等元信息，不能作为第一段导出，请改为只描述当前片段。",
-        field: "staging",
-        action: "review-staging",
-      });
-    }
-    const sentenceCount = countSceneContextSentences(sceneContext);
-    if (sentenceCount > 2) {
-      issues.push({
-        code: "FINAL.SCENE_CONTEXT_TOO_LONG",
-        severity: "warning",
-        detail: `Scene context uses ${sentenceCount} sentences. Keep it to 1-2 short sentences.`,
-        detailZh: `场景上下文有 ${sentenceCount} 个句子，请压缩为 1–2 句简短句子。`,
-        field: "staging",
-        action: "review-staging",
-      });
-    }
-  }
 
   if (scene.shootingMode === "long-take" && hasMultipleShots) {
     issues.push({

@@ -30,7 +30,6 @@ const project: ProjectV2 = {
 };
 
 const correctedLayers: Record<string, string> = {
-  sceneContext: "场景上下文：林sir坐在高速行驶的无尽地铁车厢中央，疲惫地回忆。",
   activeReferences: "活动引用：@无尽地铁车厢、@林sir、@阿俊。",
   locationMap: "位置图：镜头位于车厢中央过道偏低位置，阿俊在画外右前方。",
   firstFrame: "首帧与站位：林sir已坐在画面中央偏下，阿俊首帧不入画。",
@@ -62,7 +61,7 @@ describe("V2.7 真实片段回归", () => {
       "连续性：共 5 个问题（0 个错误，4 个警告）。",
       "最终导出前请解决错误级问题。",
     ].join("\n\n"));
-    expect(output).toContain("场景上下文：林sir坐在高速行驶的无尽地铁车厢中央");
+    expect(output).not.toContain("场景上下文");
     expect(output).not.toContain("连续性：共 5 个问题");
     expect(output).not.toContain("最终导出前请解决");
   });

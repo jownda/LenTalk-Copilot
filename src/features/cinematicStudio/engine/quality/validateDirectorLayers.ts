@@ -107,7 +107,8 @@ function firstFrameBlocks(text: string, shotCount: number, multiShot: boolean): 
 function checkFirstFrameParticipantConsistency(
   layers: Record<string, string>, project: ProjectV2, scene: SceneV2,
 ): DirectorLayerIssue[] {
-  const text = (layers.firstFrame ?? "").trim();
+  // 首帧与场景地图合并为 locationMap 层；首帧块按「第 N 段首帧」行提取。
+  const text = (layers.locationMap ?? "").trim();
   if (!text) return [];
   const shots = scene.shots ?? [];
   const blocks = firstFrameBlocks(text, shots.length, scene.shootingMode === "multi-shot");
@@ -119,7 +120,7 @@ function checkFirstFrameParticipantConsistency(
       out.push({
         code: "DIRECTOR.FIRST_FRAME_SEGMENT_MISSING",
         severity: "warning",
-        layerKey: "firstFrame",
+        layerKey: "locationMap",
         label: "First-frame occupancy is missing for shot segments",
         detail: `FIRST FRAME AND SPATIAL BLOCKING has no separate first-frame block for shot(s) ${missingBlocks.join(", ")}.`,
         detailZh: `「首帧与站位」没有为镜头${missingBlocks.join("、")}分别写首帧占位，无法确认切镜后的第一可见画面。`,
@@ -142,7 +143,7 @@ function checkFirstFrameParticipantConsistency(
         out.push({
           code: "DIRECTOR.FIRST_FRAME_PARTICIPANT_CONFLICT",
           severity: "error",
-          layerKey: "firstFrame",
+          layerKey: "locationMap",
           label: "First frame includes a later entrant",
           shotId: shot.id,
           detail: `${asset.name} is marked as entering later in shot ${shot.label}, but the first-frame block already includes the character.`,
@@ -154,7 +155,7 @@ function checkFirstFrameParticipantConsistency(
         out.push({
           code: "DIRECTOR.FIRST_FRAME_PARTICIPANT_MISSING",
           severity: "warning",
-          layerKey: "firstFrame",
+          layerKey: "locationMap",
           label: "First frame omits a structured participant",
           shotId: shot.id,
           detail: `${asset.name} is a visible participant of shot ${shot.label}, but is absent from its first-frame block.`,
@@ -386,11 +387,12 @@ function checkMetadataStatements(layers: Record<string, string>): DirectorLayerI
 function checkFirstFramePropsConflict(
   layers: Record<string, string>, project: ProjectV2, scene: SceneV2,
 ): DirectorLayerIssue[] {
-  const forbidding = [layers.firstFrame ?? "", layers.negativeLocks ?? ""].filter(Boolean).join("\n");
+  // 首帧文本已并入 locationMap 层；禁止新道具锁只与 locationMap + 负面局部锁比对。
+  const forbidding = [layers.locationMap ?? "", layers.negativeLocks ?? ""].filter(Boolean).join("\n");
   if (!FORBID_NEW_PROPS_RE.test(forbidding)) return [];
   const registry = buildSceneAssetRegistry(project, scene, "scene");
   const props = registry.orderedAssets.filter((asset) => asset.kind === "prop" && asset.name.trim().length >= 2);
-  const probe = [layers.locationMap ?? "", layers.firstFrame ?? ""].filter(Boolean).join("\n");
+  const probe = (layers.locationMap ?? "").trim();
   const out: DirectorLayerIssue[] = [];
   const seen = new Set<string>();
   for (const prop of props) {
@@ -398,14 +400,13 @@ function checkFirstFramePropsConflict(
     if (seen.has(name) || !probe.includes(name)) continue;
     if (hasLongerAssetPresent(project, name, probe)) continue;
     seen.add(name);
-    const layerKey = (layers.locationMap ?? "").includes(name) ? "locationMap" : "firstFrame";
     out.push({
       code: "DIRECTOR.NO_NEW_PROPS_CONFLICT",
       severity: "warning",
-      layerKey,
+      layerKey: "locationMap",
       label: "First-frame prop ban conflicts with concrete props",
-      detail: `FIRST FRAME bans new props, but a concrete prop ("${name}") is listed in ${layerKey}.`,
-      detailZh: `首帧锁定「不得加入新道具」，但「${LAYER_ZH_LABELS[layerKey] ?? layerKey}」层列出了具体道具「${name}」，指令自相矛盾。`,
+      detail: `FIRST FRAME bans new props, but a concrete prop ("${name}") is listed in SCENE MAP AND STAGING.`,
+      detailZh: `首帧锁定「不得加入新道具」，但「场景地图和站位」层列出了具体道具「${name}」，指令自相矛盾。`,
       suggestion: "Reword to \"no characters or props not already specified in this scene\".",
       suggestionZh: "改成「不加入本场景未指定的角色或道具」。",
     });

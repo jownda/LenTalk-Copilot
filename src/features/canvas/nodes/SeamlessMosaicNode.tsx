@@ -9,6 +9,7 @@ import {
   type SeamlessMosaicNodeData,
 } from "@/features/canvas/domain/canvasNodes";
 import { graphImageResolver } from "@/features/canvas/application/canvasServices";
+import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
 import {
   prepareNodeImage,
   prepareNodeImageFromFile,
@@ -101,8 +102,7 @@ function MosaicCardPreview({ data }: { data: SeamlessMosaicNodeData }) {
 
 export const SeamlessMosaicNode = memo(({ id, data, selected, width, height }: SeamlessMosaicNodeProps) => {
   const updateNodeInternals = useUpdateNodeInternals();
-  const nodes = useCanvasStore((state) => state.nodes);
-  const edges = useCanvasStore((state) => state.edges);
+  const { nodes, edges } = useCanvasInputGraph();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const [isEditorOpen, setIsEditorOpen] = useState(false);

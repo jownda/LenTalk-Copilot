@@ -106,6 +106,25 @@ export function remapAudioReferenceTokens(text: string, oldSources: readonly str
     .replace(/[ \t]{2,}/g, ' ');
 }
 
+/**
+ * Preserve an image token's source when graph inputs are removed or reordered.
+ * A disconnected source loses only its own tokens; surviving sources receive
+ * their new contiguous API index instead of inheriting a neighbor's token.
+ */
+export function remapImageReferenceTokens(text: string, oldSources: readonly string[], nextSources: readonly string[]): string {
+  return text
+    .replace(/@图(\d+)|\[image(\d+)\]/g, (token, chineseIndex?: string, bracketIndex?: string) => {
+      const oldIndex = Number(chineseIndex || bracketIndex);
+      const source = oldSources[oldIndex - 1];
+      if (!source) return token;
+      const nextIndex = nextSources.indexOf(source);
+      if (nextIndex < 0) return '';
+      const value = nextIndex + 1;
+      return token.startsWith('[') ? `[image${value}]` : `@图${value}`;
+    })
+    .replace(/[ \t]{2,}/g, ' ');
+}
+
 function findTokenRanges(
   text: string,
   maxImageCount?: number,

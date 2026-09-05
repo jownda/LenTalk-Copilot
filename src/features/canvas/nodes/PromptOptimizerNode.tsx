@@ -16,6 +16,7 @@ import { graphImageResolver } from '@/features/canvas/application/canvasServices
 import { findReferenceTokens, insertReferenceToken } from '@/features/canvas/application/referenceTokenEditing';
 import { imageUrlToDataUrl, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
+import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
@@ -366,8 +367,7 @@ export const PromptOptimizerNode = memo(({
   const addNode = useCanvasStore((state) => state.addNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
-  const nodes = useCanvasStore((state) => state.nodes);
-  const edges = useCanvasStore((state) => state.edges);
+  const { nodes, edges } = useCanvasInputGraph();
   const purpose = typeof data.purpose === 'string' ? data.purpose : '';
 
   const [isEditingResult, setIsEditingResult] = useState(false);
@@ -381,17 +381,27 @@ export const PromptOptimizerNode = memo(({
   const [previewState, setPreviewState] = useState<ReferencePreviewState | null>(null);
   const [previewSize, setPreviewSize] = useState<{ width: number; height: number } | null>(null);
   const [purposeDraft, setPurposeDraft] = useState(purpose);
+  const optimizedPrompt = typeof data.optimizedPrompt === 'string' ? data.optimizedPrompt : '';
+  const [optimizedPromptDraft, setOptimizedPromptDraft] = useState(optimizedPrompt);
 
   const rootRef = useRef<HTMLDivElement>(null);
   const purposeTextareaRef = useRef<HTMLTextAreaElement>(null);
   const purposeHighlightRef = useRef<HTMLDivElement>(null);
   const isPurposeComposingRef = useRef(false);
   const purposeDraftRef = useRef(purposeDraft);
+  const optimizedPromptDraftRef = useRef(optimizedPromptDraft);
   const { cancelCommit: cancelPurposeCommit, flushCommit: flushPurposeCommit, scheduleCommit: schedulePurposeCommit } =
     useDebouncedNodeTextCommit({
       nodeId: id,
       field: 'purpose',
       valueRef: purposeDraftRef,
+      updateNodeData,
+    });
+  const { flushCommit: flushOptimizedPromptCommit, scheduleCommit: scheduleOptimizedPromptCommit } =
+    useDebouncedNodeTextCommit({
+      nodeId: id,
+      field: 'optimizedPrompt',
+      valueRef: optimizedPromptDraftRef,
       updateNodeData,
     });
 
@@ -423,6 +433,14 @@ export const PromptOptimizerNode = memo(({
       setPurposeDraft(purpose);
     }
   }, [purpose]);
+
+  useEffect(() => {
+    if (isEditingResult) {
+      return;
+    }
+    optimizedPromptDraftRef.current = optimizedPrompt;
+    setOptimizedPromptDraft(optimizedPrompt);
+  }, [isEditingResult, optimizedPrompt]);
 
   const chatModelOptions = useMemo(() => {
     const options: Array<{ providerId: string; model: string; label: string }> = [];
@@ -1031,9 +1049,17 @@ export const PromptOptimizerNode = memo(({
             {isEditingResult ? (
               <textarea
                 autoFocus
-                value={typeof data.optimizedPrompt === 'string' ? data.optimizedPrompt : ''}
-                onChange={(event) => updateNodeData(id, { optimizedPrompt: event.target.value })}
-                onBlur={() => setIsEditingResult(false)}
+                value={optimizedPromptDraft}
+                onChange={(event) => {
+                  const nextValue = event.target.value;
+                  optimizedPromptDraftRef.current = nextValue;
+                  setOptimizedPromptDraft(nextValue);
+                  scheduleOptimizedPromptCommit();
+                }}
+                onBlur={() => {
+                  flushOptimizedPromptCommit();
+                  setIsEditingResult(false);
+                }}
                 className="nodrag nowheel min-h-[100px] w-full flex-1 resize-none rounded-md border border-white/10 bg-black/20 px-2 py-1.5 text-sm leading-5 text-text-dark outline-none focus:border-accent/60"
               />
             ) : (
@@ -1041,6 +1067,8 @@ export const PromptOptimizerNode = memo(({
                 className="nodrag min-h-[80px] w-full flex-1 cursor-text whitespace-pre-wrap overflow-auto rounded-md bg-black/20 px-2 py-1.5 text-sm leading-5 text-text-dark"
                 onClick={(event) => {
                   event.stopPropagation();
+                  optimizedPromptDraftRef.current = optimizedPrompt;
+                  setOptimizedPromptDraft(optimizedPrompt);
                   setIsEditingResult(true);
                 }}
               >

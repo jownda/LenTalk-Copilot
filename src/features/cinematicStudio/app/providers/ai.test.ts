@@ -107,8 +107,8 @@ describe("collectSceneAssetIds", () => {
   });
 
   it("清理最终提示词开头的隐藏推理标签，保留中文首个类别标题", () => {
-    const response = "<think>**Ensuring precise Chinese heading order**</think>\n\n场景上下文：\n阿俊站在车厢内。\n\n活动引用：\n@char_demo_hero_base_v1 [image1]：阿俊。";
-    expect(sanitizeFinalPromptResponse(response)).toBe("场景上下文：\n阿俊站在车厢内。\n\n活动引用：\n@char_demo_hero_base_v1 [image1]：阿俊。");
+    const response = "<think>**Ensuring precise Chinese heading order**</think>\n\n风格：\n王家卫风格。\n\n活动引用：\n@char_demo_hero_base_v1 [image1]：阿俊。";
+    expect(sanitizeFinalPromptResponse(response)).toBe("风格：\n王家卫风格。\n\n活动引用：\n@char_demo_hero_base_v1 [image1]：阿俊。");
   });
 
   it("最终提示词动作节奏缺少分段时，按 canonical 镜头时间边界恢复分组并补齐图片标记", () => {
@@ -132,27 +132,31 @@ describe("collectSceneAssetIds", () => {
   });
 
   it("最终生成只交给 AI 已审核的 canonical source，不让它重新规划场景", () => {
-    const request = buildFinalPromptRequest("场景上下文：\n阿俊在车厢内。", "zh");
+    const request = buildFinalPromptRequest("阿俊在车厢内。", "zh");
     expect(request.user).toContain("CANONICAL AUDITED SOURCE:");
     expect(request.user).toContain("阿俊在车厢内");
     expect(request.user).toContain("Do not invent, remove, reinterpret, or contradict any fact");
     expect(request.user).toContain("Do not add prior context, story summaries, user notes");
     expect(request.user).toContain("清晰、电影级的中文");
     expect(request.system).toContain("clear, cinematic-grade Chinese");
-    expect(request.user).toContain("场景上下文、活动引用、场景地图");
+    expect(request.system).toContain("an elite AI film prompt director for Seedance 2.0 and Higgsfield Seedance");
+    expect(request.system).toContain("scene diagnosis, spatial blocking, optics selection, physics validation");
+    expect(request.user).toContain("风格、活动引用、场景地图和站位");
     expect(request.user).toContain("动作节奏");
     expect(request.user).toContain("Every @asset_tag, matching [imageN], and @audioN token");
     expect(request.user).toContain("Acting master profiles are AI-only references");
     expect(request.user).toContain("only their shot-specific, observable adaptation");
-    expect(request.user).toContain("首帧与空间走位必须覆盖最终输出中的每一个镜头段");
-    expect(request.user).toContain("第 1 段首帧");
+    expect(request.user).toContain("场景地图和站位合并为同一段");
+    expect(request.user).toContain("段首只输出一份场景级空间总图");
+    expect(request.user).toContain("第 1 段首帧"); // 参考格式示例
     expect(request.user).toContain("FORMAT MODE 是本次生成的整体执行格式摘要");
     expect(request.user).toContain("两个段落，一次甩切");
     expect(request.user).toContain("CAMERA 必须先写一段适用于全程的总摄影机描述");
     expect(request.user).toContain("OPTICS 是镜头执行的结构化真源");
     expect(request.user).toContain("第 1 段：……");
-    expect(request.user).toContain("STYLE 必须位于光线之后、正向约束之前");
-    expect(request.user).toContain("画质特征（清晰度、对比度、颗粒/无颗粒");
+    expect(request.user).toContain("STYLE 是导演文档中的本地风格原文");
+    expect(request.user).toContain("必须逐字复制规范源 STYLE 段的正文");
+    expect(request.user).not.toContain("画质特征（清晰度、对比度、颗粒/无颗粒");
   });
 
   it("英文界面要求最终提示词使用英文类别和英文正文", () => {
@@ -160,10 +164,13 @@ describe("collectSceneAssetIds", () => {
 
     expect(request.system).toContain("clear, cinematic-grade English");
     expect(request.system).not.toContain("cinematic-grade Chinese");
+    expect(request.system).toContain("elite AI film prompt director");
+    expect(request.system).toContain("silent QA before output");
     expect(request.user).toContain("Output only clear, cinematic-grade English");
-    expect(request.user).toContain("SCENE CONTEXT, ACTIVE REFERENCES, LOCATION MAP");
+    expect(request.user).toContain("STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING");
     expect(request.user).toContain("attach acting to the corresponding shot and character inside ACTION TIMING");
-    expect(request.user).toContain("FIRST FRAME AND SPATIAL BLOCKING must cover every shot segment");
+    expect(request.user).toContain("SCENE MAP AND STAGING is one section");
+    expect(request.user).toContain("first output one scene-level master map only");
     expect(request.user).toContain("SHOT 1 FIRST FRAME");
     expect(request.user).toContain("FORMAT MODE is the overall execution-format summary");
     expect(request.user).toContain("two segments, one whip cut");
@@ -172,9 +179,63 @@ describe("collectSceneAssetIds", () => {
     expect(request.user).toContain("CAMERA must begin with one overall camera-language paragraph");
     expect(request.user).toContain("OPTICS is the structured source of truth for shot execution");
     expect(request.user).toContain("SHOT 1: ...");
-    expect(request.user).toContain("STYLE must come after LIGHTING and before POSITIVE CONSTRAINTS");
-    expect(request.user).toContain("image-quality traits (clarity, contrast, grain / no grain");
+    expect(request.user).toContain("STYLE is the local style text from the director document");
+    expect(request.user).toContain("copy the STYLE body from the canonical source character-for-character");
+    expect(request.user).not.toContain("image-quality traits (clarity, contrast, grain / no grain");
     expect(request.user).not.toContain("场景上下文、活动引用、场景地图");
+  });
+
+  it("最终提示词的风格段始终直接采用本地规范源", () => {
+    const source = [
+      "SCENE CONTEXT:\nA train carriage.",
+      "STYLE:\n青绿色约 60%、墨色冷灰约 30%、自然肤色与环境色约 10%；所有镜头保持统一色调。",
+      "POSITIVE CONSTRAINTS:\nKeep the same style.",
+    ].join("\n\n");
+    const modelText = [
+      "SCENE CONTEXT:\nA train carriage.",
+      "STYLE:\nA warm, grainy style rewritten by the model.",
+      "POSITIVE CONSTRAINTS:\nKeep the same style.",
+    ].join("\n\n");
+
+    const sanitized = sanitizeFinalPromptResponse(modelText, source, "en");
+    expect(sanitized).toContain("STYLE:\n青绿色约 60%、墨色冷灰约 30%、自然肤色与环境色约 10%；所有镜头保持统一色调。");
+    expect(sanitized).not.toContain("A warm, grainy style rewritten by the model");
+  });
+
+  it("中文界面最终提示词的风格段同样直接采用本地规范源", () => {
+    const source = [
+      "STYLE:\n王家卫风格：潮湿浓烈的红绿色调，慢快门的霓虹拖影，颗粒感保留。",
+      "ACTIVE REFERENCES:\n@loc_demo_base_v1 [image1]：空间。",
+    ].join("\n\n");
+    const modelText = [
+      "风格：\n被 AI 重写的一段风格描述。",
+      "活动引用：\n@loc_demo_base_v1 [image1]：空间。",
+    ].join("\n\n");
+
+    const sanitized = sanitizeFinalPromptResponse(modelText, source, "zh");
+    expect(sanitized).toContain("风格：\n王家卫风格：潮湿浓烈的红绿色调，慢快门的霓虹拖影，颗粒感保留。");
+    expect(sanitized).not.toContain("被 AI 重写的一段风格描述");
+  });
+
+  it("模型重复输出两段风格（一段带冒号一段裸标题）时只保留一份且位于开头", () => {
+    const source = [
+      "STYLE:\n青绿色约 60%、墨色冷灰约 30%；所有镜头保持统一色调。",
+      "ACTIVE REFERENCES:\n@loc_demo_base_v1 [image1]：车厢。",
+      "SHOT EXECUTION:\nSHOT 1 0:00-0:02:\n0:00-0:01: 阿俊转身。",
+    ].join("\n\n");
+    const modelText = [
+      "风格：\n青绿色约 60%、墨色冷灰约 30%；所有镜头保持统一色调。",
+      "风格\n青绿色约 60%、墨色冷灰约 30%；所有镜头保持统一色调。",
+      "活动引用\n@loc_demo_base_v1 [image1]：车厢。",
+      "动作节奏\n0:00–0:01：阿俊转身。",
+    ].join("\n\n");
+
+    const sanitized = sanitizeFinalPromptResponse(modelText, source, "zh");
+
+    expect(sanitized.match(/^风格：/)).not.toBeNull();
+    expect(sanitized.split("青绿色约 60%")).toHaveLength(2);
+    expect(sanitized).toContain("@loc_demo_base_v1 [image1]：车厢。");
+    expect(sanitized).toContain("0:00–0:01：阿俊转身。");
   });
 
 
@@ -182,24 +243,23 @@ describe("collectSceneAssetIds", () => {
     const sceneWithDocument: SceneV2 = {
       ...scene,
       directorLayers: {
-        sceneContext: "Edited scene context.",
         optics: "已编辑的光学。",
         lighting: "已编辑的光线。",
       },
     };
     const source = buildFinalGenerationSource({ ...project, styleId: "wong-kar-wai" }, sceneWithDocument);
 
-    expect(source).toContain("SCENE CONTEXT:\nEdited scene context.");
+    expect(source).not.toContain("SCENE CONTEXT:");
     expect(source).toContain("ACTION TIMING:\n");
-    expect(source).toContain("FIRST FRAME AND SPATIAL BLOCKING:\n");
-    expect(source).toContain("LONG-TAKE FIRST FRAME");
+    expect(source).toContain("SCENE MAP AND STAGING:\n");
+    expect(source).toContain("SHOT 1 FIRST FRAME");
     expect(source).toContain("@林警官: 克制.");
     expect(source).toContain("0:00 to 0:05: @林警官: 拿起 toward @香烟.");
-    expect(source.indexOf("SCENE CONTEXT:")).toBeLessThan(source.indexOf("ACTIVE REFERENCES:"));
+    expect(source.indexOf("STYLE:")).toBeLessThan(source.indexOf("ACTIVE REFERENCES:"));
     expect(source.indexOf("CAMERA:")).toBeLessThan(source.indexOf("ACTION TIMING:"));
     expect(source.indexOf("ACTION TIMING:")).toBeLessThan(source.indexOf("PHYSICS:"));
     expect(source).toContain("STYLE:\n");
-    expect(source.indexOf("LIGHTING:")).toBeLessThan(source.indexOf("STYLE:"));
+    expect(source.indexOf("STYLE:")).toBeLessThan(source.indexOf("LIGHTING:"));
     expect(source.indexOf("STYLE:")).toBeLessThan(source.indexOf("POSITIVE CONSTRAINTS:"));
     expect(source).not.toContain("已编辑的光学。");
     expect(source).not.toContain("SHOT EXECUTION:");
@@ -220,19 +280,6 @@ describe("collectSceneAssetIds", () => {
 
     expect(source).toContain("OPTICS:\n镜头 1：12° 超长焦；景别：紧凑双人镜头");
     expect(source).not.toContain("过期的 84° 广角光学文本。");
-  });
-
-  it("最终生成不会采用带场号或超长的旧场景上下文", () => {
-    const staleContext = "如月车站1场1镜，发生在密集的城市街道，夜晚暴雨。旧预制场景的长篇摘要继续描述无关动作。";
-    const source = buildFinalGenerationSource(project, {
-      ...scene,
-      sceneContext: staleContext,
-      directorLayers: { sceneContext: `SCENE CONTEXT:\n${staleContext}` },
-    });
-
-    expect(source).not.toContain(staleContext);
-    expect(source).not.toContain("密集的城市街道");
-    expect(source).toContain("SCENE CONTEXT:\n");
   });
 
   it("最终生成遇到导演文档空间冲突时，以结构化镜头站位作为空间层兜底", () => {
@@ -292,8 +339,9 @@ describe("collectSceneAssetIds", () => {
     expect(source).not.toContain("未出场角色");
     // The prop declaration names its holder with the same @ handle, as required
     // by Seedance. The character's image, appearance, and acting profile are
-    // declared once; holder, execution, and voice blocks reuse the same @ tag.
-    expect((source.match(/@char_demo_hero_base_v1/g) ?? [])).toHaveLength(5);
+    // declared once; holder, first frame, execution, dialogue order, and voice
+    // blocks reuse the same @ tag (always with [imageN], never a bare name).
+    expect((source.match(/@char_demo_hero_base_v1/g) ?? [])).toHaveLength(8);
     expect((source.match(/@prop_demo_bag_base_v1/g) ?? [])).toHaveLength(1);
   });
 
@@ -327,12 +375,12 @@ describe("collectSceneAssetIds", () => {
     const invalidScene = { ...scene, shootingMode: "multi-shot" as const };
     const result = normalizeSceneDraft(project, invalidScene, {
       directorLayers: {
-        sceneContext: "未出场角色躲在车厢尽头。",
+        optics: "AI 写的错误光学。",
       },
       shots: [],
     }, "秒");
 
-    expect(result.directorLayers?.sceneContext).not.toContain("未出场角色");
+    expect(result.directorLayers).not.toHaveProperty("sceneContext");
     expect(result.directorLayers?.locationMap).toContain("车厢");
     expect(result.scene.directorLayers).toEqual(result.directorLayers);
     expect(result).not.toHaveProperty("directorLayerIssues");
@@ -345,7 +393,6 @@ describe("collectSceneAssetIds", () => {
         lightingDirection: { primarySource: "车厢顶灯", direction: "从上方垂直向下" },
       },
       directorLayers: {
-        sceneContext: "A quiet carriage.",
         formatMode: "FORMAT MODE:\n错误的旧格式。",
       },
       shots: [],
@@ -353,40 +400,11 @@ describe("collectSceneAssetIds", () => {
 
     expect(result.scene.emotionArc).toBe("从等待转为警觉。");
     expect(result.scene.lightingDirection).toMatchObject({ primarySource: "车厢顶灯" });
-    expect(result.directorLayers?.sceneContext).toContain("车厢");
+    expect(result.directorLayers).not.toHaveProperty("sceneContext");
     expect(result.directorLayers?.formatMode).toContain("单一连续长镜头");
     expect(result.directorLayers?.formatMode).not.toContain("错误的旧格式");
     expect(result.scene.directorLayers).toEqual(result.directorLayers);
     expect(result).not.toHaveProperty("directorLayerIssues");
-  });
-
-  it("不接受 AI 返回的场景上下文，改由本地从场景与镜头事实生成", () => {
-    const result = normalizeSceneDraft(project, {
-      ...scene,
-      location: "地铁车厢",
-      logline: "阿俊擦开车窗雾气，看向窗外的黑暗。",
-    }, {
-      sceneContext: "旧预制街道场景。",
-      shots: [],
-    }, "秒", "zh", { preserveSceneContext: false });
-
-    expect(result.scene.sceneContext).toBeUndefined();
-    expect(result.directorLayers?.sceneContext).toContain("地铁车厢");
-    expect(result.directorLayers?.sceneContext).toContain("阿俊擦开车窗雾气");
-  });
-
-  it("保留用户已填写的场景上下文，AI 未返回时不覆盖为空", () => {
-    const sceneWithContext = { ...scene, sceneContext: "林sir坐在车厢中央，等待列车到站。" };
-    const result = normalizeSceneDraft(project, sceneWithContext, { shots: [] }, "秒");
-    expect(result.scene.sceneContext).toBe("林sir坐在车厢中央，等待列车到站。");
-  });
-
-  it("AI 编译不继承旧预制场景的场景上下文", () => {
-    const sceneWithStaleContext = { ...scene, location: "地铁车厢", time: "白天", weather: "晴朗", sceneContext: "旧预制场景：雨夜中角色站在街道上。" };
-    const result = normalizeSceneDraft(project, sceneWithStaleContext, { sceneContext: "旧预制场景：雨夜中角色站在街道上。", shots: [] }, "秒", "zh", { preserveSceneContext: false });
-    expect(result.scene.sceneContext).toBeUndefined();
-    expect(result.directorLayers?.sceneContext).not.toContain("雨夜");
-    expect(result.directorLayers?.sceneContext).toContain("地铁车厢");
   });
 
 

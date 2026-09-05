@@ -14,7 +14,6 @@ import { listen } from '@tauri-apps/api/event';
 import { Handle, Position, useUpdateNodeInternals } from '@xyflow/react';
 import { AudioLines, ChevronDown, Clapperboard, ImagePlus, LoaderCircle, Plus, Sparkles, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { useShallow } from 'zustand/shallow';
 
 import { CANVAS_NODE_TYPES, EXPORT_RESULT_NODE_MIN_HEIGHT, EXPORT_RESULT_NODE_MIN_WIDTH, type VideoGenNodeData } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
@@ -35,11 +34,13 @@ import {
   findReferenceTokens,
   insertReferenceToken,
   remapAudioReferenceTokens,
+  remapImageReferenceTokens,
   removeOutOfRangeReferenceTokens,
   removeTextRange,
   resolveReferenceAwareDeleteRange,
 } from '@/features/canvas/application/referenceTokenEditing';
 import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
+import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 
@@ -298,18 +299,23 @@ function renderPromptWithHighlights(
 export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGenNodeProps) => {
   const { t, i18n } = useTranslation();
   const updateNodeInternals = useUpdateNodeInternals();
-  const inputImages = useCanvasStore(useShallow((state) =>
-    graphImageResolver.collectInputImages(id, state.nodes, state.edges)
-  ));
-  const inputAudio = useCanvasStore(useShallow((state) =>
-    graphImageResolver.collectInputAudio(id, state.nodes, state.edges)
-  ));
-  const inputText = useCanvasStore(useShallow((state) =>
-    graphImageResolver.collectInputText(id, state.nodes, state.edges)
-  ));
-  const audioNodes = useCanvasStore(useShallow((state) =>
-    state.nodes.filter((node) => node.type === CANVAS_NODE_TYPES.audio)
-  ));
+  const { nodes, edges } = useCanvasInputGraph();
+  const inputImages = useMemo(
+    () => graphImageResolver.collectInputImages(id, nodes, edges),
+    [edges, id, nodes]
+  );
+  const inputAudio = useMemo(
+    () => graphImageResolver.collectInputAudio(id, nodes, edges),
+    [edges, id, nodes]
+  );
+  const inputText = useMemo(
+    () => graphImageResolver.collectInputText(id, nodes, edges),
+    [edges, id, nodes]
+  );
+  const audioNodes = useMemo(
+    () => nodes.filter((node) => node.type === CANVAS_NODE_TYPES.audio),
+    [nodes]
+  );
   const addNode = useCanvasStore((state) => state.addNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
@@ -412,7 +418,11 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const usableInputAudio = isJimengCli ? inputAudio : resolvedInputAudio;
   // 文本引用预览现在按行渲染(每行一个上游文本), 不再需要合并字符串
   // 首尾帧与上游参考图是两种互斥输入方式。首尾帧只使用节点内上传的两张图。
-  const referenceInputImages = imageMode === 'reference' ? resolvedInputImages : [];
+  const referenceInputImages = useMemo(
+    () => imageMode === 'reference' ? resolvedInputImages : [],
+    [imageMode, resolvedInputImages]
+  );
+  const previousReferenceImagesRef = useRef(referenceInputImages);
   const firstLastFrameImages = useMemo(
     () => [data.firstFrameImageUrl, data.lastFrameImageUrl]
       .filter((imageUrl): imageUrl is string => typeof imageUrl === 'string' && imageUrl.trim().length > 0),
@@ -545,18 +555,24 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     if (imageMode !== 'reference') {
       return;
     }
-    const cleanedPrompt = removeOutOfRangeReferenceTokens(
+    const remappedPrompt = remapImageReferenceTokens(
       promptDraftRef.current,
+      previousReferenceImagesRef.current,
+      referenceInputImages,
+    );
+    const cleanedPrompt = removeOutOfRangeReferenceTokens(
+      remappedPrompt,
       referenceInputImages.length,
       usableInputAudio.length
     );
+    previousReferenceImagesRef.current = referenceInputImages;
     if (cleanedPrompt !== promptDraftRef.current) {
       promptDraftRef.current = cleanedPrompt;
       setPromptDraft(cleanedPrompt);
       cancelPromptCommit();
       updateNodeData(id, { prompt: cleanedPrompt });
     }
-  }, [cancelPromptCommit, id, imageMode, referenceInputImages.length, usableInputAudio.length, updateNodeData]);
+  }, [cancelPromptCommit, id, imageMode, referenceInputImages, usableInputAudio.length, updateNodeData]);
 
   useEffect(() => {
     if (referencePickerItems.length === 0) {

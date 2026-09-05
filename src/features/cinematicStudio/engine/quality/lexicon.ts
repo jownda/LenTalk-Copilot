@@ -9,7 +9,7 @@
  * 两处顺序由 validateDirectorLayers 双语单测隐式锁定。
  */
 export const DIRECTOR_LAYER_KEYS: readonly string[] = [
-  "sceneContext", "activeReferences", "locationMap", "firstFrame", "formatMode",
+  "activeReferences", "locationMap", "formatMode",
   "optics", "camera", "physics", "lighting", "audio",
   "style",
   "positiveConstraints", "negativeLocks",
@@ -84,7 +84,7 @@ export const EN_IDENT_WORDS = [
 
 /** 层 key → 中文名（校验信息展示用） */
 export const LAYER_ZH_LABELS: Record<string, string> = {
-  sceneContext: "场景上下文", activeReferences: "活动引用", locationMap: "位置图", firstFrame: "首帧",
+  activeReferences: "活动引用", locationMap: "场景地图和站位",
   formatMode: "格式模式", optics: "光学", camera: "相机", actionTiming: "动作时序", physics: "物理",
   lighting: "光线", audio: "音频", style: "风格", positiveConstraints: "正向约束", negativeLocks: "全局失败锁",
 };

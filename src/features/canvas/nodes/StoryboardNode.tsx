@@ -57,6 +57,7 @@ import {
   NODE_CONTROL_PRIMARY_BUTTON_CLASS,
 } from '@/features/canvas/ui/nodeControlStyles';
 import { useCanvasStore } from '@/stores/canvasStore';
+import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import { useProjectStore } from '@/stores/projectStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 
@@ -310,6 +311,38 @@ const FrameCard = memo(
   }: FrameCardProps) => {
     const updateStoryboardFrame = useCanvasStore((state) => state.updateStoryboardFrame);
     const { zoom } = useViewport();
+    const [noteDraft, setNoteDraft] = useState(frame.note);
+    const noteDraftRef = useRef(noteDraft);
+    const noteCommitTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+
+    const flushNoteCommit = useCallback(() => {
+      if (noteCommitTimerRef.current !== null) {
+        window.clearTimeout(noteCommitTimerRef.current);
+        noteCommitTimerRef.current = null;
+      }
+      if (noteDraftRef.current !== frame.note) {
+        updateStoryboardFrame(nodeId, frame.id, { note: noteDraftRef.current });
+      }
+    }, [frame.id, frame.note, nodeId, updateStoryboardFrame]);
+
+    const scheduleNoteCommit = useCallback(() => {
+      if (noteCommitTimerRef.current !== null) {
+        window.clearTimeout(noteCommitTimerRef.current);
+      }
+      noteCommitTimerRef.current = window.setTimeout(() => {
+        noteCommitTimerRef.current = null;
+        flushNoteCommit();
+      }, 480);
+    }, [flushNoteCommit]);
+
+    useEffect(() => {
+      if (frame.note !== noteDraftRef.current) {
+        noteDraftRef.current = frame.note;
+        setNoteDraft(frame.note);
+      }
+    }, [frame.note]);
+
+    useEffect(() => () => flushNoteCommit(), [flushNoteCommit]);
 
     const imageSource = useMemo(() => {
       const preferOriginal = shouldUseOriginalImageByZoom(zoom);
@@ -399,13 +432,14 @@ const FrameCard = memo(
         </div>
 
         <textarea
-          value={frame.note}
+          value={noteDraft}
           onChange={(event) => {
             const nextValue = event.target.value;
-            updateStoryboardFrame(nodeId, frame.id, {
-              note: nextValue,
-            });
+            noteDraftRef.current = nextValue;
+            setNoteDraft(nextValue);
+            scheduleNoteCommit();
           }}
+          onBlur={flushNoteCommit}
           onMouseDown={(event) => event.stopPropagation()}
           onWheelCapture={(event) => event.stopPropagation()}
           placeholder={`分镜 ${String(index + 1).padStart(2, '0')} 描述`}
@@ -425,8 +459,7 @@ export const StoryboardNode = memo(({ id, data, selected, width, height }: Story
   const exportSettingsTriggerRef = useRef<HTMLDivElement>(null);
   const exportSettingsPanelRef = useRef<HTMLDivElement>(null);
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
-  const nodes = useCanvasStore((state) => state.nodes);
-  const edges = useCanvasStore((state) => state.edges);
+  const { nodes, edges } = useCanvasInputGraph();
   const reorderStoryboardFrame = useCanvasStore((state) => state.reorderStoryboardFrame);
   const addDerivedExportNode = useCanvasStore((state) => state.addDerivedExportNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
