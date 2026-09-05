@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod asset_library;
 pub mod cinematic_studio;
+pub mod cloud_drive;
 pub mod image;
 pub mod jimeng_cli;
 pub mod project_state;
@@ -12,6 +13,7 @@ pub mod usage_log;
 pub use ai::*;
 pub use asset_library::*;
 pub use cinematic_studio::*;
+pub use cloud_drive::*;
 pub use image::*;
 pub use project_state::*;
 pub use project_archive::*;

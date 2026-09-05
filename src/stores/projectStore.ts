@@ -719,6 +719,7 @@ interface ProjectState {
   isOpeningProject: boolean;
 
   hydrate: () => Promise<void>;
+  refreshProjects: () => Promise<void>;
   createProject: (name: string) => string;
   importProject: (record: ProjectRecord) => Promise<string>;
   deleteProject: (id: string) => void;
@@ -765,6 +766,16 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         currentProject: null,
         isHydrated: true,
       });
+    }
+  },
+
+  refreshProjects: async () => {
+    try {
+      const records = await listProjectSummaries();
+      const projects = records.map(toProjectSummary).sort((a, b) => b.updatedAt - a.updatedAt);
+      set({ projects });
+    } catch (error) {
+      console.error("Failed to refresh project summaries", error);
     }
   },
 

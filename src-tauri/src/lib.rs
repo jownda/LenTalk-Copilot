@@ -8,6 +8,7 @@ use std::time::Duration;
 use commands::ai as ai_commands;
 use commands::asset_library;
 use commands::cinematic_studio;
+use commands::cloud_drive;
 use commands::image;
 use commands::jimeng_cli;
 use commands::project_state;
@@ -230,6 +231,15 @@ pub fn run() {
             project_state::delete_project_record,
             project_archive::export_project_bundle,
             project_archive::import_project_bundle,
+            cloud_drive::cloud_drive_begin_authorize,
+            cloud_drive::cloud_drive_authorize_complete,
+            cloud_drive::cloud_drive_status,
+            cloud_drive::cloud_drive_set_credentials,
+            cloud_drive::cloud_drive_set_folder,
+            cloud_drive::cloud_drive_disconnect,
+            cloud_drive::cloud_drive_upload_project,
+            cloud_drive::cloud_drive_list_versions,
+            cloud_drive::cloud_drive_restore_project,
             usage_log::append_usage_record,
             usage_log::query_usage_records,
             usage_log::query_usage_summary,

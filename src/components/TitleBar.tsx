@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useRef } from 'react';
 import { isTauri } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Minus, X, Maximize2, Settings, ArrowLeft, Receipt } from 'lucide-react';
@@ -44,6 +44,9 @@ export function TitleBar({ onSettingsClick, onBillingClick, showBackButton, onBa
     && /(Mac|iPhone|iPad|iPod)/i.test(`${navigator.platform} ${navigator.userAgent}`);
   const appTitle = t('app.title');
   const titleText = currentProjectName ? `${currentProjectName} - ${appTitle}` : appTitle;
+  // Windows 下在 mousedown 阶段拦截双击后，DOM 仍可能补发 dblclick；
+  // 用该标记让后续 dblclick 不再重复切换最大化。
+  const doubleClickHandledRef = useRef(false);
 
   const handleMinimize = useCallback(async () => {
     await appWindow.minimize();
@@ -68,13 +71,26 @@ export function TitleBar({ onSettingsClick, onBillingClick, showBackButton, onBa
     if (target?.closest('button') || target?.closest('[data-no-drag="true"]')) {
       return;
     }
+    // Windows 上 startDragging() 会进入原生拖拽循环并吞掉后续 DOM 事件，
+    // 导致 onDoubleClick 永远收不到。这里在第二次 mousedown（detail >= 2）时
+    // 直接切换最大化，不再进入拖拽。
+    if (!isMac && e.detail >= 2) {
+      doubleClickHandledRef.current = true;
+      void handleMaximize();
+      return;
+    }
     await appWindow.startDragging();
-  }, [appWindow]);
+  }, [appWindow, isMac, handleMaximize]);
 
-  // 双击标题栏空白处 = 最大化/还原窗口(macOS 习惯); 按钮上不触发
+  // 双击标题栏空白处 = 最大化/还原窗口(macOS 习惯); 按钮上不触发。
+  // Windows 已由 mousedown 拦截处理，这里仅作为兜底并消费标记避免重复切换。
   const handleTitleDoubleClick = useCallback((e: React.MouseEvent) => {
     const target = e.target as HTMLElement | null;
     if (target?.closest('button') || target?.closest('[data-no-drag="true"]')) {
+      return;
+    }
+    if (doubleClickHandledRef.current) {
+      doubleClickHandledRef.current = false;
       return;
     }
     void handleMaximize();

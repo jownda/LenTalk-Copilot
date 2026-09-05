@@ -10,7 +10,7 @@ import {
   Library,
   Boxes,
   Clapperboard,
-  Download,
+  ArrowUpToLine,
   CloudUpload,
   ArrowDownToLine,
   MoreHorizontal,
@@ -25,6 +25,7 @@ import { AssetLibraryPanel } from "@/features/library/AssetLibraryPanel";
 import { ThreeDDirectorDesk } from "@/features/threeDDirector/ThreeDDirectorDesk";
 import { CinematicStudioWorkbench } from "@/features/cinematicStudio/CinematicStudioWorkbench";
 import { RenameDialog } from "./RenameDialog";
+import { CloudDriveUploadDialog } from "./CloudDriveUploadDialog";
 import {
   importProjectBundle,
   isProjectBundleFile,
@@ -53,12 +54,21 @@ export function ProjectManager() {
   const [openProjectMenuId, setOpenProjectMenuId] = useState<string | null>(null);
   const [projectActionNotice, setProjectActionNotice] = useState<string | null>(null);
   const [busyProjectActionId, setBusyProjectActionId] = useState<string | null>(null);
+  const [cloudUploadProject, setCloudUploadProject] = useState<ProjectRecord | null>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const [isImportingProject, setIsImportingProject] = useState(false);
 
-  const { projects, isOpeningProject, createProject, importProject, deleteProject, renameProject, openProject } =
-    useProjectStore();
+  const {
+    projects,
+    isOpeningProject,
+    createProject,
+    importProject,
+    deleteProject,
+    renameProject,
+    openProject,
+    refreshProjects,
+  } = useProjectStore();
 
   const handleCreateProject = () => {
     setEditingProjectId(null);
@@ -78,7 +88,7 @@ export function ProjectManager() {
     deleteProject(id);
   };
 
-  const handleProjectArchive = async (projectId: string, action: "export" | "cloud", event: React.MouseEvent) => {
+  const handleProjectExport = async (projectId: string, event: React.MouseEvent) => {
     event.stopPropagation();
     setOpenProjectMenuId(null);
     setBusyProjectActionId(projectId);
@@ -90,10 +100,28 @@ export function ProjectManager() {
       }
       const result = await saveProjectArchive(project);
       if (result.saved) {
-        setProjectActionNotice(action === "cloud" ? t("project.uploadToCloudSuccess") : t("project.exportSuccess"));
+        setProjectActionNotice(t("project.exportSuccess"));
       }
     } catch (error) {
       console.error("Failed to archive project", error);
+      setProjectActionNotice(t("project.archiveFailed"));
+    } finally {
+      setBusyProjectActionId(null);
+    }
+  };
+
+  const handleCloudUploadClick = async (projectId: string, event: React.MouseEvent) => {
+    event.stopPropagation();
+    setOpenProjectMenuId(null);
+    setProjectActionNotice(null);
+    try {
+      setBusyProjectActionId(projectId);
+      const project = await getProjectRecord(projectId);
+      if (project) {
+        setCloudUploadProject(project);
+      }
+    } catch (error) {
+      console.error("Failed to load project for cloud upload", error);
       setProjectActionNotice(t("project.archiveFailed"));
     } finally {
       setBusyProjectActionId(null);
@@ -392,17 +420,17 @@ export function ProjectManager() {
                           <button
                             type="button"
                             role="menuitem"
-                            onClick={(event) => void handleProjectArchive(project.id, "export", event)}
+                            onClick={(event) => void handleProjectExport(project.id, event)}
                             disabled={busyProjectActionId === project.id}
                             className="flex w-full items-center gap-2 px-3 py-2 text-left text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-wait disabled:opacity-60"
                           >
-                            <Download className="h-4 w-4" />
+                            <ArrowUpToLine className="h-4 w-4" />
                             {t("project.export")}
                           </button>
                           <button
                             type="button"
                             role="menuitem"
-                            onClick={(event) => void handleProjectArchive(project.id, "cloud", event)}
+                            onClick={(event) => void handleCloudUploadClick(project.id, event)}
                             disabled={busyProjectActionId === project.id}
                             className="flex w-full items-center gap-2 px-3 py-2 text-left text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-wait disabled:opacity-60"
                           >
@@ -456,6 +484,14 @@ export function ProjectManager() {
         onClose={() => setShowRenameDialog(false)}
         onConfirm={handleConfirm}
       />
+
+      {cloudUploadProject && (
+        <CloudDriveUploadDialog
+          project={cloudUploadProject}
+          onClose={() => setCloudUploadProject(null)}
+          onRestored={refreshProjects}
+        />
+      )}
 
       <AssetLibraryPanel
         open={showLibrary}
