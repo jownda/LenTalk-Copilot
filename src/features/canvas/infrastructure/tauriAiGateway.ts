@@ -112,6 +112,9 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
   if (providerId === 'binghuo' || providerBaseUrl.includes('api.7tai.cc')) {
     extraParams.video_transport = 'binghuo-video';
   }
+  if (providerId === 'wgspai' || providerBaseUrl.includes('api.wgspai.cn')) {
+    extraParams.video_transport = 'wgspai-video';
+  }
   if (extraParams.reference_image_field == null) {
     extraParams.reference_image_field = referenceImageField;
   }

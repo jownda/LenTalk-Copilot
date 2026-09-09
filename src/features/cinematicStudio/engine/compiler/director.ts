@@ -129,9 +129,7 @@ function renderLocationMap(project: ProjectV2, scene: SceneV2, locale: PromptLoc
   if (staging.axisDirection) lines.push(zh
     ? `屏幕方向：${staging.axisDirection === "left-to-right" ? "从左到右" : "从右到左"}`
     : `Screen direction: ${staging.axisDirection}`);
-  // 首帧与空间走位已并入「场景地图和站位」层：场景级总图在前，第 1 段首帧占位在后。
-  const firstFrame = renderFirstFrameLayer(project, scene, locale);
-  return [lines.join("\n"), firstFrame].filter(Boolean).join("\n");
+  return lines.join("\n");
 }
 
 /** 活动引用按场景级资产注册表平铺输出一次，不再按镜头分组加前缀。 */
@@ -403,68 +401,6 @@ function renderCameraLayer(scene: SceneV2, locale: PromptLocale): string {
   return shots.map((shot) => `${zh ? "镜头" : "SHOT"} ${shot.label}：${render(shot)}`).join("\n");
 }
 
-/** P1.4 首帧占位锁：确保首帧已含所有必需主体，无空镜开场。 */
-function renderFirstFrameLayer(project: ProjectV2, scene: SceneV2, locale: PromptLocale): string {
-  const shots = scene.shots ?? [];
-  if (shots.length === 0) return "";
-  const lock = scene.firstFrameLock;
-  const zh = locale === "zh";
-  const assets = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
-  const imageTokensByAssetId = buildSceneImageTokenMap(project, scene);
-  // 首帧人物名与活动引用一致：@资产名 [imageN]，避免最终生成时裸名/带图混杂。
-  const ref = (id: string) => {
-    const asset = assets.get(id);
-    if (!asset) return id;
-    const referenceName = asset.referenceTag?.trim() || asset.name.trim() || asset.id;
-    const imageToken = imageTokensByAssetId.get(id);
-    return `@${referenceName}${imageToken ? ` ${imageToken}` : ""}`;
-  };
-  const frameParticipants = (shot: ShotV2) => (shot.participants ?? []).filter((participant) => participant.entrance !== "enters-left" && participant.entrance !== "enters-right");
-  const renderParticipant = (participant: NonNullable<ShotV2["participants"]>[number]) => {
-    const name = ref(participant.characterId);
-    const details = [
-      participant.position?.trim() ? (zh ? `位置：${participant.position.trim()}` : `position: ${participant.position.trim()}`) : "",
-      participant.facing?.trim() ? (zh ? `朝向：${participant.facing.trim()}` : `facing: ${participant.facing.trim()}`) : "",
-      participant.torsoFacing?.trim() ? (zh ? `身体朝向：${participant.torsoFacing.trim()}` : `torso facing: ${participant.torsoFacing.trim()}`) : "",
-      participant.eyeline?.trim() ? (zh ? `视线：${participant.eyeline.trim()}` : `eyeline: ${participant.eyeline.trim()}`) : "",
-    ].filter(Boolean).join(zh ? "，" : ", ");
-    return details ? `${name}${zh ? `（${details}）` : ` (${details})`}` : name;
-  };
-  // First-frame control is the global opening lock, not a restatement of every
-  // cut. Later-shot occupancy and entrances are executed in ACTION TIMING.
-  const firstShot = shots[0];
-  const participants = frameParticipants(firstShot);
-  const behavior = firstShot?.cameraBehavior ?? {};
-  const view = [
-    firstShot?.framing?.trim() ? localizePromptValue(firstShot.framing.trim(), locale) : "",
-    behavior.angle?.trim() ?? "",
-  ].filter(Boolean).join(zh ? "，" : ", ");
-  const subjectText = participants.map(renderParticipant).join(zh ? "、" : ", ");
-  const prefix = zh ? "第 1 段首帧" : "SHOT 1 FIRST FRAME";
-  const occupancy = zh
-    ? "第一可见帧已包含本镜头实际出镜人物，空间关系立即可读，无空镜建立镜头。后续镜头的人物位置、入画与变化仅按动作节奏执行。"
-    : "The first visible frame already contains every character visible in shot 1, with the spatial relationship readable immediately; no empty establishing frame. Later-shot positions, entrances, and changes are executed only in ACTION TIMING.";
-  const generatedFrames = participants.length > 0
-    ? [`${prefix}：${[view, subjectText, occupancy].filter(Boolean).join(zh ? "；" : "; ")}。`]
-    : [];
-  const explicitLock = lock?.occupancyStatement?.trim();
-  const defaultLock = lock && (lock.requiredSubjectIds?.length ?? 0) > 0
-    ? (zh
-      ? "首帧锁定：第一帧已包含所有必需主体，且处于正确位置。无空镜建立镜头。无延迟角色亮相。首帧不得缺少锁定主体。空间关系在第一帧立即可读。"
-      : "First-frame lock: the first visible frame already contains all required subjects in their correct positions. No empty establishing frame. No delayed character reveal. No locked subject may be missing. The spatial relationship is readable immediately in frame one.")
-    : "";
-  const body = [explicitLock || defaultLock, ...generatedFrames].filter(Boolean).join("\n") || (zh
-    ? "首帧占位将在最终生成时根据当前镜头参与者重建。"
-    : "First-frame occupancy is rebuilt at final generation from the current shot participants.");
-  const activeAssetImageCount = buildSceneAssetRegistry(project, scene).orderedAssets
-    .filter((asset) => asset.referencePaths?.[0]?.trim()).length;
-  const stagingReferenceImageCount = scene.staging?.stagingReferenceImage?.trim() ? 1 : 0;
-  const referenceImages = (lock?.referenceImages ?? []).map((source) => source.trim()).filter(Boolean);
-  if (referenceImages.length === 0) return body;
-  const tokens = referenceImages.map((_, index) => `[image${activeAssetImageCount + stagingReferenceImageCount + index + 1}]`).join(zh ? "、" : ", ");
-  return `${body}\n${zh ? `首帧参考图：${tokens}` : `First-frame reference images: ${tokens}`}`;
-}
-
 /**
  * 最终交付把动作时间与角色表演合并为同一镜头执行表。
  * UI 仍独立维护节拍/表演字段；导出时每个动作仅写一次，避免模型把
@@ -591,6 +527,7 @@ function renderShotExecutionLayer(
         if (generalDetails.length > 0 && actorId === actorIds[0]) parts.push(...generalDetails);
         if (participant?.acting?.trim()) parts.push(fragment(participant.acting));
         if (participant?.eyeLife?.trim()) parts.push(fragment(participant.eyeLife));
+        if (participant?.eyeline?.trim()) parts.push(zh ? `视线：${fragment(participant.eyeline)}` : `eyeline: ${fragment(participant.eyeline)}`);
         if (actorId === actorIds[0] && actionFallback) parts.push(actionFallback);
         if (parts.length > 0) lines.push(`${characterReference(actorId)}${zh ? "：" : ": "}${parts.join(zh ? "；" : " ")}${zh ? "。" : "."}`);
       }
@@ -608,6 +545,7 @@ function renderShotExecutionLayer(
       if (!generalUsed && generalDetails.length > 0) { parts.push(...generalDetails); generalUsed = true; }
       if (participant?.acting?.trim()) parts.push(fragment(participant.acting));
       if (participant?.eyeLife?.trim()) parts.push(fragment(participant.eyeLife));
+      if (participant?.eyeline?.trim()) parts.push(zh ? `视线：${fragment(participant.eyeline)}` : `eyeline: ${fragment(participant.eyeline)}`);
       if (parts.length > 0) lines.push(`${subjectWithPosition(actorId)}${zh ? "：" : ": "}${parts.join(zh ? "；" : " ")}${zh ? "。" : "."}`);
     }
 

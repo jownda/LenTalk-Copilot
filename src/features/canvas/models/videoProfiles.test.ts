@@ -49,4 +49,16 @@ describe('resolveVideoModelProfile', () => {
     expect(resolveVideoModelProfile('custom:my-platform/seedance2.5', 'https://sub2api.rjm.us.ci/v1').id)
       .toBe('sub2api-video');
   });
+
+  it('routes WGSPAI custom provider through the dedicated wgspai video profile', () => {
+    const profile = resolveVideoModelProfile('custom:wgspai/seedance2.5');
+    expect(profile.id).toBe('wgspai-video');
+    expect(profile.status).toBe('verified');
+    expect(profile.submitPath).toBe('/v1/video/generations');
+    expect(profile.queryPath).toBe('/v1/video/generations/{taskId}');
+    expect(profile.referenceImageTarget).toBe('data-url');
+    expect(profile.supportsReferenceImages).toBe(true);
+    expect(profile.supportsFirstLast).toBe(true);
+    expect(profile.supportsReferenceAudio).toBe(true);
+  });
 });

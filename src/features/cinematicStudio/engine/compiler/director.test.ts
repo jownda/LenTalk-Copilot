@@ -239,9 +239,9 @@ describe("compileDirectorSequence final export audit", () => {
     expect(output).not.toContain("声音锁（林警官）");
     expect(output).not.toContain("镜头结构化检查器");
     expect(output).not.toContain("AI timing reference.");
-    // 活动引用、场景基准/首帧、动作基线、动作时间块、对白顺序和角色声音段
-    // 都复用同一 @ 引用；出现次数由实际渲染段落决定，但不得出现裸名。
-    expect((output.match(/@林警官/g) ?? [])).toHaveLength(6);
+    // 活动引用、动作基线、动作时间块、对白顺序和角色声音段都复用同一 @ 引用；
+    // 首帧段已按设计从最终导出移除，不再贡献引用；不得出现裸名。
+    expect((output.match(/@林警官/g) ?? [])).toHaveLength(5);
   });
 
   it("身份锚不会重复完整描述中已有的服装或发型", () => {
@@ -279,7 +279,7 @@ describe("compileDirectorSequence final export audit", () => {
     expect(output).not.toContain("continuous action without shot blocks.");
   });
 
-  it("多镜头首帧只输出第 1 段，不输出后续镜头首帧", () => {
+  it("场景地图和站位不再输出任何首帧；首帧只由动作节奏表达", () => {
     const actor = { id: "actor", kind: "character" as const, name: "凯尔", description: "", descriptionZh: "", referencePaths: [], lockLevel: "none" as const, tags: [] };
     const scout = { id: "scout", kind: "character" as const, name: "提卡", description: "", descriptionZh: "", referencePaths: [], lockLevel: "none" as const, tags: [] };
     const base = makeScene().shots[0];
@@ -296,8 +296,8 @@ describe("compileDirectorSequence final export audit", () => {
     project.assets = [actor, scout];
     const output = compileDirectorSequence(project, scene, { locale: "zh" });
 
-    expect(output).toContain("第 1 段首帧");
-    expect(output).not.toContain("第 2 段首帧");
+    expect(output).not.toContain("首帧");
+    expect(output).not.toContain("FIRST FRAME");
   });
 
   it("多镜头在镜头执行中明确输出每个切点，并合并表演与动作", () => {
@@ -527,17 +527,18 @@ describe("compileDirectorSequence final export audit", () => {
     expect(locationMap).not.toContain("Dolly");
   });
 
-  it("首帧参考图写入首帧锁并在活动资产图片之后编号", () => {
+  it("首帧参考图不再写入最终提示词", () => {
     const scene = makeScene({
       firstFrameLock: { occupancyStatement: "第一帧已包含林警官。", referenceImages: ["first-frame-image"] },
       shots: [{ ...makeScene().shots[0], characterId: "actor-1", participants: [{ characterId: "actor-1", role: "primary" }] }],
     });
     const actor: Asset = { id: "actor-1", kind: "character", name: "林警官", description: "中年男性", referencePaths: ["actor-image"], lockLevel: "none", tags: [] };
     const output = compileDirectorSequence({ ...makeProject(scene), assets: [actor] }, scene, { locale: "zh" });
-    expect(output).toContain("首帧参考图：[image2]");
+    expect(output).not.toContain("首帧");
+    expect(output).not.toContain("FIRST FRAME");
   });
 
-  it("站位参考图写入场景地图，并占用活动资产和首帧参考图之间的图片序号", () => {
+  it("站位参考图写入场景地图，并在活动资产图片之后编号", () => {
     const scene = makeScene({
       staging: { stagingReferenceImage: "staging-layout-image", axisDirection: "left-to-right", spacing: "相距一米" },
       firstFrameLock: { referenceImages: ["first-frame-image"] },
@@ -547,15 +548,16 @@ describe("compileDirectorSequence final export audit", () => {
     const output = compileDirectorSequence({ ...makeProject(scene), assets: [actor] }, scene, { locale: "zh" });
 
     expect(output).toContain("站位参考图：[image2]；仅用于人物位置、180°轴方向、人物间距、从左到右排序和空间锚点");
-    expect(output).toContain("首帧参考图：[image3]");
+    expect(output).not.toContain("首帧");
   });
 
-  it("默认首帧锁禁止空镜和延迟亮相", () => {
+  it("首帧锁定文本不再进入最终提示词", () => {
     const scene = makeScene({ firstFrameLock: { requiredSubjectIds: ["actor-1"] } });
     const actor: Asset = { id: "actor-1", kind: "character", name: "林警官", description: "中年男性", referencePaths: [], lockLevel: "none", tags: [] };
     const output = compileDirectorSequence({ ...makeProject(scene), assets: [actor] }, scene, { locale: "zh" });
-    expect(output).toContain("无空镜建立镜头");
-    expect(output).toContain("空间关系在第一帧立即可读");
+    expect(output).not.toContain("无空镜建立镜头");
+    expect(output).not.toContain("空间关系在第一帧立即可读");
+    expect(output).not.toContain("首帧");
   });
 
   it("镜头执行保留可拍摄表演与提前反应，不导出评分或潜台词字段", () => {

@@ -22,7 +22,7 @@ describe("collectCinematicMediaReferences", () => {
     });
   });
 
-  it("inserts the staging reference after active assets and before first-frame-only images", () => {
+  it("inserts the staging reference after active assets and drops first-frame-only images", () => {
     const scene = {
       id: "scene", name: "测试", logline: "", location: "车厢", time: "夜", weather: "雨", duration: "8秒",
       palette: "", lighting: "", environmentLock: true,
@@ -34,7 +34,7 @@ describe("collectCinematicMediaReferences", () => {
       assets: [{ id: "hero", kind: "character", name: "林sir", description: "", referencePaths: ["hero-image"], lockLevel: "none", tags: [] }],
     } as unknown as ProjectV2;
     expect(collectCinematicMediaReferences(project, scene).referenceImages).toEqual([
-      "hero-image", "staging-layout", "first-frame-a", "first-frame-b",
+      "hero-image", "staging-layout",
     ]);
   });
 });

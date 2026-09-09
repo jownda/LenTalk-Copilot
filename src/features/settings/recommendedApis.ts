@@ -158,6 +158,33 @@ export const recommendedApis: RecommendedApi[] = [
     },
   },
   {
+    id: 'wgspai',
+    name: 'WGSPAI 视频',
+    baseUrl: 'https://api.wgspai.cn',
+    registerUrl: 'https://api.wgspai.cn',
+    summary: 'OpenAI 兼容视频生成中转平台，服务端异步提交与轮询',
+    advantages: [
+      '使用 /v1/video/generations 异步提交与轮询任务状态',
+      '支持 Seedance 2.5、Seedance v2、MiniMax、Grok 等视频模型',
+      '复用炳火异步视频协议，参考图按 URL 直传',
+    ],
+    models: [],
+    videoModels: [
+      'seedance2.5',
+      'seedance-v2.5-1080p',
+      'seedance-v2-720p',
+      'hf-seedance-2.5-1080p',
+      'Minimax-h3',
+      'grok-imagine-video-6s',
+    ],
+    videoConfig: {
+      submitPath: '/v1/video/generations',
+      queryPath: '/v1/video/generations/{taskId}',
+      referenceEncoding: 'url',
+      transport: 'binghuo-video',
+    },
+  },
+  {
     id: 'zizidonghua',
     name: '字子动画',
     baseUrl: 'https://www.zizidonghua.com',

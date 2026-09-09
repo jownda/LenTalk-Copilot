@@ -846,6 +846,89 @@ async function generateBinghuoVideo(
   }
 }
 
+/**
+ * wgspai 平台链路：提交/轮询端点与炳火一致(/v1/video/generations)，
+ * 但平台没有 /v1/assets/uploads 独立上传端点，参考素材只能以公网 URL 或
+ * data URL 直接内嵌进请求体，不再执行独立文件上传。
+ */
+async function generateWgspaiVideo(
+  request: GenerateVideoRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const rawImages = request.reference_images ?? [];
+  const imageSources = rawImages.slice(0, request.image_mode === 'first-last' ? 2 : 30);
+  const audioSources = (request.reference_audio ?? []).slice(0, 3);
+  const normalizeSource = (source: string, label: string): string => {
+    const trimmed = source.trim();
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+    if (getDataUrlAsset(trimmed)) return trimmed;
+    throw new Error(`wgspai API 参考${label}必须是公网 URL 或 base64 图片数据(平台不支持独立上传端点)`);
+  };
+  const normalizedImages = imageSources.map((source, index) => normalizeSource(source, `素材 ${index + 1}`));
+  const normalizedAudios = audioSources.map((source, index) => normalizeSource(source, `音频 ${index + 1}`));
+  const body: Record<string, unknown> = {
+    model: apiModel,
+    prompt: request.prompt,
+    duration: Math.max(1, Math.round(request.duration)),
+    ratio: request.aspect_ratio,
+    generate_audio: true,
+    n: 1,
+  };
+  if (request.image_mode === 'first-last' && normalizedImages.length > 0) {
+    body.start_frame = [normalizedImages[0]];
+    if (normalizedImages[1]) body.end_frame = [normalizedImages[1]];
+  } else if (normalizedImages.length > 0) {
+    body.images = normalizedImages;
+  }
+  if (normalizedAudios.length > 0) body.reference_audios = normalizedAudios;
+  if (request.video_resolution?.trim()) body.resolution = request.video_resolution.trim();
+
+  const submitUrl = `${baseUrl}/v1/video/generations`;
+  const response = await requestProviderJson(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`wgspai API 视频请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`wgspai API 视频请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  }
+  const immediateResult = getVideoResultUrl(payload);
+  if (immediateResult) return immediateResult;
+  const taskId = getVideoTaskId(payload);
+  if (!taskId) {
+    throw new Error(`wgspai API 视频响应中未找到任务 ID: ${describeVideoResponse(payload)}`);
+  }
+  const taskUrl = `${baseUrl}/v1/video/generations/${encodeURIComponent(taskId)}`;
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const taskResponse = await requestProviderJson(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    try {
+      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`wgspai API 视频查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`wgspai API 视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const videoUrl = getVideoResultUrl(payload);
+    if (videoUrl) return videoUrl;
+    const status = getVideoTaskStatus(payload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`wgspai API 视频生成失败: ${describeVideoResponse(payload)}`);
+    }
+  }
+}
+
 async function uploadSub2ApiReferenceImage(
   source: string,
   baseUrl: string,
@@ -1027,6 +1110,9 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   }
   if (request.extra_params?.video_transport === 'binghuo-video') {
     return await generateBinghuoVideo(request, baseUrl, apiModel, headers);
+  }
+  if (request.extra_params?.video_transport === 'wgspai-video') {
+    return await generateWgspaiVideo(request, baseUrl, apiModel, headers);
   }
   const videoImages = request.image_mode === 'first-last'
     ? request.reference_images?.slice(0, 2)

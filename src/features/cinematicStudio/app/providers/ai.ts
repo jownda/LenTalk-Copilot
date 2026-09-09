@@ -563,8 +563,12 @@ async function audioSourceToInputPart(source: string): Promise<AudioInputPart> {
   };
 }
 
-/** Final delivery is prose, so it deliberately skips JSON mode and returns only the model text. */
-async function chatCompletionsText(settings: AISettings, system: string, user: string, onProgress?: SceneCompileProgressListener, sourcePrompt = "", locale: Locale = "zh"): Promise<string> {
+/**
+ * Final delivery is prose, so it deliberately skips JSON mode and returns only
+ * the model text. The `sourcePrompt`/`locale` variants keep the legacy
+ * full-prompt path (AI rewrites every category) for callers that need it.
+ */
+async function chatCompletionsTextRaw(settings: AISettings, system: string, user: string, onProgress?: SceneCompileProgressListener): Promise<string> {
   const endpoint = `${openAICompatibleBaseUrl(settings.baseUrl)}/chat/completions`;
   const baseMessages = [{ role: "system", content: system }, { role: "user", content: user }];
   const request = (streaming: boolean, messages: unknown[] = baseMessages) => remoteFetch(endpoint, {
@@ -597,7 +601,7 @@ async function chatCompletionsText(settings: AISettings, system: string, user: s
     const content = (await readChatCompletionText(response, (receivedChars) => onProgress?.("streaming", receivedChars))).trim();
     if (!content) throw new Error("响应中没有最终提示词文本");
     onProgress?.("parsing");
-    return sanitizeFinalPromptResponse(content, sourcePrompt, locale);
+    return content;
   } catch (error) {
     if (!(error instanceof ChatCompletionInterruptedError) || !error.partialText.trim()) throw error;
     const continueFrom = async (partialText: string): Promise<string> => {
@@ -628,7 +632,7 @@ async function chatCompletionsText(settings: AISettings, system: string, user: s
         throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText));
       }
       onProgress?.("parsing");
-      return sanitizeFinalPromptResponse(mergeContinuationText(partialText, resumed).trim(), sourcePrompt, locale);
+      return mergeContinuationText(partialText, resumed).trim();
     };
     return continueFrom(error.partialText);
   }
@@ -1524,7 +1528,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     .join(" | ");
 
   const vocabLines = [
-    "Available camera IDs: arri-alexa-35, arri-alexa-mini-lf, red-v-raptor, sony-venice-2, bmd-ursa-cine, canon-c300-iii, panasonic-s1h, kinefinity-mavo-edge",
+    "Available camera IDs: arri-alexa-35, arri-alexa-mini-lf, red-v-raptor, sony-venice-2, bmd-ursa-cine, canon-c300-iii, panasonic-s1h, kinefinity-mavo-edge, apple-iphone-15-pro, sony-dsc-w830, canon-ixus-130, fujifilm-finepix-f30",
     "Available lensModel IDs: arri-master-prime, zeiss-supreme-prime, zeiss-cp4, cooke-s7i, leica-summicron-c, angenieux-optimo, canon-cne, sigma-cine-ff, cooke-panchro, helios-44-2",
     "framing: pick one clear shot size: Extreme wide / establishing, Wide, Full shot, Medium full / cowboy, Medium, Medium close-up, Close-up, Big close-up, Extreme close-up, Insert / detail, Two-shot, Tight two-shot, Over-the-shoulder, or 3/4 medium behind subject (free English framing phrases are also allowed)",
     "movement: pick from Static, Handheld, Steadicam, Dolly, Tracking, Crane, POV, OTS",
@@ -1612,8 +1616,148 @@ export async function generateFinalPrompt(sourcePrompt: string, locale: Locale, 
   if (!isRemoteConfigured(settings)) {
     throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key。");
   }
-  const request = buildFinalPromptRequest(sourcePrompt, locale);
-  return chatCompletionsText(settings, request.system, request.user, onProgress, sourcePrompt, locale);
+  const request = buildHybridFinalPromptRequest(sourcePrompt, locale);
+  const aiText = await chatCompletionsTextRaw(settings, request.system, request.user, onProgress);
+  return assembleHybridFinalPrompt(sourcePrompt, aiText, locale);
+}
+
+/**
+ * Hybrid final delivery: sections that are already compiler-generated
+ * (STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING, OPTICS, PHYSICS,
+ * LIGHTING, AUDIO, constraints) are passed through verbatim with localized
+ * headings. Only the three sections that genuinely need composition (CAMERA,
+ * ACTION TIMING, FORMAT MODE) are sent to the model, so input and output
+ * tokens drop by roughly half and the generation finishes much faster.
+ */
+export function buildHybridFinalPromptRequest(sourcePrompt: string, locale: Locale): { system: string; user: string } {
+  const zh = locale === "zh";
+  const languageRule = zh
+    ? "只用清晰、电影级的中文输出。即使规范源包含英文，也必须将其忠实转换为自然、直接、可拍摄、可执行的中文提示词；避免翻译腔、空泛形容词和散文化抒情。"
+    : "Output only clear, cinematic-grade English. Even if the canonical source contains Chinese, faithfully convert it into natural, direct, shootable, executable English; avoid literal translation, vague adjectives, and poetic prose.";
+  const headingsRule = zh
+    ? "只输出以下三个非空类别，必须使用这些中文标题，并严格按此顺序：摄像机、动作节奏、格式模式。"
+    : "Output only the following three non-empty categories, using exactly these English headings and this order: CAMERA, ACTION TIMING, FORMAT MODE.";
+  const scopeRule = zh
+    ? "其余类别（风格、活动引用、场景地图和站位、光学、物理、光线、音频、正向约束、负向约束）已由本地确定生成，会原样插入最终提示词。不要输出这些标题或任何其他标题，也不要重复、改写或解释它们的内容。"
+    : "All other categories (STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING, OPTICS, PHYSICS, LIGHTING, AUDIO, POSITIVE CONSTRAINTS, NEGATIVE CONSTRAINTS) are already finalized locally and are inserted verbatim. Do not output those headings, any other heading, or repeat, rewrite, or explain their content.";
+  const sourceRule = zh
+    ? "不得发明、删除、重新解释或矛盾任何事实。不得添加前情、故事梗概、用户备注、AI 说明、警告或诊断。"
+    : "Do not invent, remove, reinterpret, or contradict any fact. Do not add prior context, story summaries, user notes, AI instructions, warnings, scores, or diagnostics.";
+  const opticsRule = zh
+    ? "ACTIVE REFERENCES 与 OPTICS 是结构化真源。逐镜保留其中的景别、FOV、镜头语言和可观测光学结果；不得因为风格、内容类别或你自己的判断替换、归一化或补写另一种镜头。"
+    : "ACTIVE REFERENCES and OPTICS are the structured source of truth. Preserve every shot's framing, FOV, lens character, and observable optical outcome; never replace, normalize, or add a different lens because of style, content class, or your own judgment.";
+  const assetRule = zh
+    ? "每一个 @资产名、匹配的 [imageN] 和 @audioN 都是不透明的 Seedance 平台引用，必须原样照抄：不得翻译、删除、改名、归一化或编造。只要活动引用中该资产带有 [imageN]，动作节奏中每次重复出现的 @资产名都必须紧跟同一个 [imageN]，绝不输出裸 @资产名。同一 @资产名与 [imageN] 的复用是要求，不是重复。资产外观与道具描述只出现在活动引用中。"
+    : "Every @asset_tag, matching [imageN], and @audioN token is an opaque Seedance platform reference. Copy each one exactly as supplied: never translate, delete, rename, normalize, or invent one. Whenever an asset has a matching [imageN] in ACTIVE REFERENCES, every repeated @asset_tag occurrence in ACTION TIMING must keep the same [imageN] immediately after the tag; never emit a bare version of that @asset_tag. Reusing the same @asset_tag and [imageN] is required and is not an accidental duplication. Keep each asset's appearance and prop description exclusively in ACTIVE REFERENCES.";
+  const actingRule = zh
+    ? "角色表演只能写在动作节奏中对应镜头和人物之后；不要新增 CHARACTER ACTING 或其他表演标题。表演母版是仅供 AI 理解角色的参考：不得照抄，只写本镜人物在表演母版基础上的可观测表演。"
+    : "Attach acting to the corresponding shot and character inside ACTION TIMING. Acting master profiles are AI-only references: never paste them; write only each character's shot-specific, observable adaptation on top of the master.";
+  /* The following three rules intentionally mirror buildFinalPromptRequest;
+   * keep them in sync if the full-prompt rules change. */
+  const cameraRule = zh
+    ? "CAMERA 必须先写一段适用于全程的总摄影机描述，再按镜头段落分别展开，不能直接从第 1 段开始。总描述先锁定全程共用的摄影机语法：是否手持、整体稳定性或晃动质感、统一的倾斜/荷兰角、轴线、机位高度与距离，以及贯穿全程的观察或跟随原则；只有源中明确的信息才能写入，不得臆造导演风格或摄影机行为。总描述之后按“第 1 段：……”“第 2 段：……”逐段写出该段的实际摄影机行为，包括起始状态、运动方向、速度/力度、何时停止或保持不动、如何承接上一段和如何进入下一段。必须把甩镜上摇、甩镜下摇、急推变焦、停机观察等明确动作保留为可执行的摄影机动作及其触发事件，不得笼统改写成“镜头跟随”或“快速移动”。全程统一的摄影机规则只在总描述中说明；段落中只补充该段的变化和执行结果。CAMERA 只写摄影机位置、运动、方向、稳定性和与事件的响应，不重复 OPTICS 的焦段/FOV/景深，也不复制 ACTION TIMING 的完整动作与表演；但可用一句话说明摄影机正在捕捉哪个关键事件。参考格式：全程手持，略带倾斜形成轻度荷兰角。第 1 段：特写人物醒来并在甩沙后快速甩镜上摇冲向破窗。第 2 段：甩镜顺势冲入对窗口人群的硬急推变焦；随后保持不动观察搜寻，最后快速甩镜下摇离开窗口。"
+    : "CAMERA must begin with one overall camera-language paragraph that applies across the entire generation, then expand segment by segment; do not begin directly with shot 1. The overall paragraph first locks the shared camera grammar: handheld or mounted operation, overall stability or shake quality, a consistent tilt / Dutch angle, screen axis, camera height and distance, and the rule for observing or following throughout. Include only information established by the source; never invent a director style or camera behavior. After the overall paragraph, write separate lines labeled 'SHOT 1: ...', 'SHOT 2: ...', and so on. For each segment, state the actual camera behavior, starting state, movement direction, speed / force, when it stops or holds, how it inherits the previous segment, and how it enters the next one. Preserve explicit actions such as a whip pan up, whip pan down, hard push-zoom, or locked-off observation as executable camera actions with their trigger events; do not flatten them into 'the camera follows' or 'moves quickly'. State shared camera rules once in the overall paragraph; use segment lines only for changes and execution results. CAMERA covers camera position, movement, direction, stability, and response to events. Do not repeat OPTICS focal length / FOV / depth of field or copy the full ACTION TIMING action and acting; one short phrase may identify the key event being captured. Example: full-take handheld operation with a slight tilt creating a mild Dutch angle. SHOT 1: a close-up of the figure waking and shaking off sand, followed by a fast whip pan upward toward the broken window. SHOT 2: the whip pan flows directly into a hard push-zoom on the people at the window; hold still while they search, then finish with a fast whip pan downward away from the window.";
+  const formatModeRule = zh
+    ? "格式模式是本次生成的整体执行格式摘要，必须完整承接源中已确定的格式事实，不得只写“单一连续长镜头”或“受控多镜头序列”。按源内容明确写出：生成方式（单次生成或其他明确方式）、段数、总时长及各段时长分配（如 4 秒 / 4 秒）、画幅（如 16:9）、速度（实时、慢动作或其他已指定速度）、段间连接方式和连接动作、现场声/配乐范围、每句台词属于哪个角色或对象、字幕与画面帧限制。多段格式必须说明每一段如何结束、下一段如何开始，以及甩切、whip cut、甩镜上摇/下摇、推拉变焦等连接的方向、发生段落和连续因果；不要把明确的甩切泛化成“快速剪辑”。“单次生成”表示整段内容一次生成，不等于只能有一个镜头。各段时长必须与镜头时间轴一致；未在源中确定的时长、画幅、速度、转场、声音或对白归属不得臆造。格式模式只总结生成和段落组织方式，不重复光学、摄像机、动作节奏的具体执行细节。示例：单次生成，两个段落，一次甩切，总长约 8 秒（4 秒 / 4 秒），画幅 16:9。实时速度。快速甩镜上摇结束第 1 段并顺势冲入急推变焦开启第 2 段；快速甩镜下摇结束第 2 段。仅现场音，无配乐；台词只属于提卡；干净的纯画面帧。"
+    : "FORMAT MODE is the overall execution-format summary for this generation. It must carry forward every format fact established in the source, rather than outputting only 'SINGLE CONTINUOUS TAKE' or 'CONTROLLED MULTI-SHOT SEQUENCE'. When supported by the source, state: generation mode (single generation or another explicit mode), segment count, total duration and per-segment allocation (for example, 4 seconds / 4 seconds), aspect ratio (for example, 16:9), speed (real time, slow motion, or another specified speed), the connection between segments and its physical transition, the diegetic-sound / score scope, which character or object owns each line, and subtitle / clean-frame limits. For multi-segment formats, explain how each segment ends and the next begins. Preserve the direction, segment placement, and causal continuity of whip cuts, whip pans up/down, push-ins, zooms, and other stated transitions; do not flatten an explicit whip cut into 'fast editing'. 'Single generation' means one generated output for the whole piece, not a single shot. Segment durations must agree with the shot timeline. Never invent an unprovided duration, aspect ratio, speed, transition, sound rule, or dialogue ownership. FORMAT MODE summarizes generation and segment organization only; do not repeat the detailed OPTICS, CAMERA, or ACTION TIMING instructions. Example: single generation, two segments, one whip cut, approximately 8 seconds total (4 seconds / 4 seconds), 16:9. Real time. A fast whip pan upward ends segment 1 and flows directly into a rapid push-zoom that opens segment 2; a fast whip pan downward ends segment 2. Diegetic sound only, no score; the line belongs only to Tika; clean picture frames.";
+  const actionTimingRule = zh
+    ? "动作节奏必须按镜头段分组输出，不能把所有镜头的时间块合并成一条平面时间线。多镜头序列先分别写“第 1 段（起止时间）：”“第 2 段（起止时间）：”等段落标题，再在每个段落标题下写该段自己的时间块；段落标题必须保留，即使某段只有一个事件。每个时间块必须保留精确时间（如 0:01.5–0:02.5），只写一个事件的主体位置、动作和该拍结果，并在相关时写入相机行为、关键道具状态、物理锚点和音频/对白；显式起始时间必须按场景绝对时间保留，并允许表达非连续或重叠事件。时间块中的人物和道具目标必须保留源中的 @ 资产引用及其对应 [imageN]，同一资产重复出现时复用同一个图片编号，不得输出裸的 @资产名。长镜头中只写一个连续段落；多镜头序列中每个切点都要保留源里的切换依据，没有依据不得输出切点。"
+    : "ACTION TIMING must remain grouped by shot segment; never flatten all shot events into one timeline. For a multi-shot sequence, first write separate segment headings such as 'SHOT 1 (start to end):' and 'SHOT 2 (start to end):', then place only that segment's time blocks beneath its heading. Keep every segment heading even when it contains one event. Each time block must preserve its precise time (for example, 0:01.5 to 0:02.5), state one event's subject position, action, and outcome, and include camera behavior, critical prop state, physics anchors, and audio/dialogue when relevant. Preserve explicit absolute start times, including non-contiguous or overlapping events. Every character or prop @ asset reference inside a time block must retain its matching [imageN] token; reuse the same image number for repeated references and never emit a bare @asset tag. A long take gets one continuous segment group. In multi-shot sequences, keep the stated cut reason on every cut and never emit a cut without one.";
+  const contextSections = [
+    "ACTIVE REFERENCES",
+    "OPTICS",
+    "CAMERA",
+    "FORMAT MODE",
+    "ACTION TIMING",
+    "AUDIO",
+  ].map((heading) => {
+    const body = heading === "ACTION TIMING"
+      ? extractSectionAny(sourcePrompt, ["ACTION TIMING", "SHOT EXECUTION", "镜头执行"])
+      : extractPromptSection(sourcePrompt, heading);
+    return body.trim() ? `${heading}:\n${body.trim()}` : "";
+  }).filter(Boolean).join("\n\n");
+  return {
+    system: "You are CINEDANCE V4, an elite AI film prompt director for Seedance 2.0 and Higgsfield Seedance. "
+      + "Your job is to convert the provided canonical scene sections into clean, production-ready, high-budget cinematic video prompt sections that work on the first generation as often as possible. "
+      + "Use simple direct words; avoid abstract poetic language when it weakens control; prefer concrete physical instructions, visible actions, measurable positions, explicit timing, camera-readable behavior, and observable visual outcomes. "
+      + (zh
+        ? "Return only the three requested sections in clear, cinematic-grade Chinese, with no commentary, markdown fence, rationale, audit note, or greeting."
+        : "Return only the three requested sections in clear, cinematic-grade English, with no commentary, markdown fence, rationale, audit note, or greeting."),
+    user: [
+      languageRule,
+      headingsRule,
+      scopeRule,
+      sourceRule,
+      opticsRule,
+      assetRule,
+      actingRule,
+      cameraRule,
+      actionTimingRule,
+      formatModeRule,
+      "",
+      "CANONICAL SECTIONS (source of truth):",
+      contextSections,
+    ].join("\n"),
+  };
+}
+
+const HYBRID_SECTION_KEYS = [
+  "style", "activeReferences", "locationMap", "optics", "camera",
+  "actionTiming", "formatMode", "physics", "lighting", "audio",
+  "positiveConstraints", "negativeLocks",
+] as const;
+
+type HybridSectionKey = typeof HYBRID_SECTION_KEYS[number];
+
+const HYBRID_ZH_HEADINGS: Record<HybridSectionKey, string> = {
+  style: "风格",
+  activeReferences: "活动引用",
+  locationMap: "场景地图和站位",
+  optics: "光学",
+  camera: "摄像机",
+  actionTiming: "动作节奏",
+  formatMode: "格式模式",
+  physics: "物理",
+  lighting: "光线",
+  audio: "音频",
+  positiveConstraints: "正向约束",
+  negativeLocks: "负向约束",
+};
+
+const HYBRID_AI_COMPOSED_KEYS: ReadonlySet<HybridSectionKey> = new Set(["camera", "actionTiming", "formatMode"]);
+
+function hybridCanonicalBody(sourcePrompt: string, key: HybridSectionKey): string {
+  if (key === "actionTiming") {
+    return extractSectionAny(sourcePrompt, ["ACTION TIMING", "SHOT EXECUTION", "镜头执行"]);
+  }
+  const entry = FINAL_SOURCE_SECTIONS.find((section) => section.key === key);
+  if (!entry) return "";
+  return extractSectionAny(sourcePrompt, [entry.heading, HYBRID_ZH_HEADINGS[key]]);
+}
+
+function hybridAiBody(aiText: string, key: HybridSectionKey, locale: Locale): string {
+  const entry = FINAL_SOURCE_SECTIONS.find((section) => section.key === key);
+  if (!entry) return "";
+  const candidates = locale === "zh"
+    ? [HYBRID_ZH_HEADINGS[key], entry.heading]
+    : [entry.heading, HYBRID_ZH_HEADINGS[key]];
+  return extractSectionAny(aiText, candidates);
+}
+
+/** 本地透传确定段落 + AI 补写的三段，按固定类别顺序拼成最终提示词。 */
+export function assembleHybridFinalPrompt(sourcePrompt: string, aiText: string, locale: Locale): string {
+  const sections: string[] = [];
+  for (const key of HYBRID_SECTION_KEYS) {
+    const composed = HYBRID_AI_COMPOSED_KEYS.has(key);
+    const body = composed
+      ? hybridAiBody(aiText, key, locale) || hybridCanonicalBody(sourcePrompt, key)
+      : hybridCanonicalBody(sourcePrompt, key);
+    if (!body.trim()) continue;
+    const entry = FINAL_SOURCE_SECTIONS.find((section) => section.key === key);
+    const heading = locale === "zh" ? HYBRID_ZH_HEADINGS[key] : entry?.heading ?? key;
+    sections.push(`${heading}${locale === "zh" ? "：" : ":"}\n${body.trim()}`);
+  }
+  return sanitizeFinalPromptResponse(sections.join("\n\n"), sourcePrompt, locale);
 }
 
 export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): { system: string; user: string } {
@@ -1637,8 +1781,8 @@ export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): {
     ? "角色表演只能写在 ACTION TIMING 中对应镜头和人物之后；不要新增 CHARACTER ACTING 标题。"
     : "Important: attach acting to the corresponding shot and character inside ACTION TIMING; do not add a separate CHARACTER ACTING heading.";
   const locationMapRule = zh
-    ? "场景地图和站位合并为同一段：段首只输出一份场景级空间总图（地点几何、材质与主要地标、总体 180° 轴与屏幕方向、站位参考图所定义的左到右排序和间距、全场共用的空间锚点、主光方向及总体景深关系；可保留相机相对空间的总体基准，但不得写成某一镜头的构图或运动），段末输出第 1 镜头的开场首帧。场景地图不得复述活动引用中的场景描述，也不得输出“镜头 1/第 1 段”等逐镜人物位置覆盖、逐镜镜头路径、人物入画、表演或时间线；这些信息只属于 ACTION TIMING。首帧只写第 1 镜头第一个可见画面中的实际人物和道具：景别或角度、人物在画面左/中/右及前/中/后景的位置、人物之间的距离和遮挡关系、主要背景地标、身体朝向和视线方向；没有出镜的人物绝不能写入。首帧是静态占位与空间状态，不要写后续动作、表演过程或完整时间线；第一帧必须与第 1 镜头 ACTION TIMING 的参与人物、位置和入画方式一致；后续镜头的人物位置、入画、构图变化和空间关系只在各自的 ACTION TIMING 时间块中写出，不得回填到首帧。无论是多镜头还是长镜头，都只保留一次开场首帧。参考格式：第 1 段首帧：特写人物躺在黄沙中，双眼紧闭，身后是棕砖楼墙；画面里没有其他人物。"
-    : "SCENE MAP AND STAGING is one section: first output one scene-level master map only (location geometry, materials and main landmarks; the overall 180-degree axis and screen direction; the left-to-right order and spacing established by the staging reference; shared spatial anchors; key-light direction; and overall depth relationships; it may retain a global camera-to-space baseline, but never present it as a shot composition or movement), then, at the end of the section, output the opening first frame of SHOT 1. Do not repeat the scene description from ACTIVE REFERENCES, and never output per-shot position overrides, per-shot camera paths, entrances, acting, or timing under this section; those facts belong only in ACTION TIMING. The first frame names only the people and props actually visible in that first visible picture: framing or angle, left/center/right and foreground/midground/background placement, distance and occlusion between subjects, main background landmarks, body orientation, and eyelines; never include a character who is not visible. The first frame is static occupancy and spatial state only; do not turn it into later action, performance progression, or a full timeline. It must agree with SHOT 1 ACTION TIMING participants, positions, and entrances. Later-shot positions, entrances, composition changes, and spatial relationships belong only in their own ACTION TIMING blocks and must not be repeated here. Both multi-shot sequences and long takes retain one opening first-frame statement only. Example: SHOT 1 FIRST FRAME: tight close-up of a figure lying in yellow sand, eyes closed, brown-brick wall behind; no other person shares the frame.";
+    ? "场景地图和站位合并为同一段：只输出一份场景级空间总图（地点几何、材质与主要地标、总体 180° 轴与屏幕方向、站位参考图所定义的左到右排序和间距、全场共用的空间锚点、主光方向及总体景深关系；可保留相机相对空间的总体基准，但不得写成某一镜头的构图或运动）。不输出任何首帧占位、首帧锁定或首帧参考图，首帧信息不得出现在任何类别中。场景地图不得复述活动引用中的场景描述，也不得输出“镜头 1/第 1 段”等逐镜人物位置覆盖、逐镜镜头路径、人物入画、表演或时间线；这些信息只属于 ACTION TIMING。"
+    : "SCENE MAP AND STAGING is one section: output one scene-level master map only (location geometry, materials and main landmarks; the overall 180-degree axis and screen direction; the left-to-right order and spacing established by the staging reference; shared spatial anchors; key-light direction; and overall depth relationships; it may retain a global camera-to-space baseline, but never present it as a shot composition or movement). Do not output any first-frame occupancy block, first-frame lock, or first-frame reference images, and do not introduce first-frame information in any other category. Do not repeat the scene description from ACTIVE REFERENCES, and never output per-shot position overrides, per-shot camera paths, entrances, acting, or timing under this section; those facts belong only in ACTION TIMING.";
   const formatModeRule = zh
     ? "FORMAT MODE 是本次生成的整体执行格式摘要，必须完整承接源中已确定的格式事实，不得只写“单一连续长镜头”或“受控多镜头序列”。按源内容明确写出：生成方式（单次生成或其他明确方式）、段数、总时长及各段时长分配（如 4 秒 / 4 秒）、画幅（如 16:9）、速度（实时、慢动作或其他已指定速度）、段间连接方式和连接动作、现场声/配乐范围、每句台词属于哪个角色或对象、字幕与画面帧限制。多段格式必须说明每一段如何结束、下一段如何开始，以及甩切、whip cut、甩镜上摇/下摇、推拉变焦等连接的方向、发生段落和连续因果；不要把明确的甩切泛化成“快速剪辑”。“单次生成”表示整段内容一次生成，不等于只能有一个镜头。各段时长必须与镜头时间轴一致；未在源中确定的时长、画幅、速度、转场、声音或对白归属不得臆造。格式模式只总结生成和段落组织方式，不重复 OPTICS、CAMERA、ACTION TIMING 的具体执行细节。示例：单次生成，两个段落，一次甩切，总长约 8 秒（4 秒 / 4 秒），画幅 16:9。实时速度。快速甩镜上摇结束第 1 段并顺势冲入急推变焦开启第 2 段；快速甩镜下摇结束第 2 段。仅现场音，无配乐；台词只属于提卡；干净的纯画面帧。"
     : "FORMAT MODE is the overall execution-format summary for this generation. It must carry forward every format fact established in the source, rather than outputting only ‘SINGLE CONTINUOUS TAKE’ or ‘CONTROLLED MULTI-SHOT SEQUENCE’. When supported by the source, state: generation mode (single generation or another explicit mode), segment count, total duration and per-segment allocation (for example, 4 seconds / 4 seconds), aspect ratio (for example, 16:9), speed (real time, slow motion, or another specified speed), the connection between segments and its physical transition, the diegetic-sound / score scope, which character or object owns each line, and subtitle / clean-frame limits. For multi-segment formats, explain how each segment ends and the next begins. Preserve the direction, segment placement, and causal continuity of whip cuts, whip pans up/down, push-ins, zooms, and other stated transitions; do not flatten an explicit whip cut into ‘fast editing’. ‘Single generation’ means one generated output for the whole piece, not a single shot. Segment durations must agree with the shot timeline. Never invent an unprovided duration, aspect ratio, speed, transition, sound rule, or dialogue ownership. FORMAT MODE summarizes generation and segment organization only; do not repeat the detailed OPTICS, CAMERA, or ACTION TIMING instructions. Example: single generation, two segments, one whip cut, approximately 8 seconds total (4 seconds / 4 seconds), 16:9. Real time. A fast whip pan upward ends segment 1 and flows directly into a rapid push-zoom that opens segment 2; a fast whip pan downward ends segment 2. Diegetic sound only, no score; the line belongs only to Tika; clean picture frames.";
@@ -1714,6 +1858,15 @@ function extractPromptSection(source: string, heading: string): string {
   return source.slice(start, end).trim();
 }
 
+/** Try each heading in order and return the first with a non-empty body. */
+function extractSectionAny(source: string, headings: string[]): string {
+  for (const heading of headings) {
+    const body = extractPromptSection(source, heading);
+    if (body.trim()) return body;
+  }
+  return "";
+}
+
 /** 移除模型多输出的未知分段，保持最终提示词按 canonical 顺序。 */
 function removePromptSection(text: string, heading: string): string {
   const escaped = escapeRegExp(heading);
@@ -1743,6 +1896,20 @@ function restoreCanonicalStyle(text: string, sourcePrompt: string, locale: Local
 
 function withoutLayerHeading(text: string, heading: string, chineseHeading: string): string {
   return text.trim().replace(new RegExp(`^(?:${heading}|${chineseHeading})[：:]\\s*`, "i"), "").trim();
+}
+
+/**
+ * 最终生成不再输出首帧；去掉旧素材或用户改写层里遗留下的首帧段，
+ * 避免“第 N 段首帧 / 首帧锁定 / 首帧参考图”等内容进入 canonical 源。
+ */
+function stripFirstFrameBlocks(text: string): string {
+  const marker = /^(?:第\s*\d+\s*(?:段|镜头|shot)\s*首帧|SHOT\s*\d+\s*FIRST\s*FRAME|首帧锁定|FIRST[- ]?FRAME\s*LOCK|首帧参考图|FIRST[- ]?FRAME\s*REFERENCE\s*IMAGES|首帧占位)/iu;
+  return text
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter((paragraph) => !marker.test(paragraph.replace(/[:：]\s*$/, "")))
+    .join("\n\n")
+    .trim();
 }
 
 /**
@@ -1781,6 +1948,7 @@ export function buildFinalGenerationSource(project: ProjectV2, scene: SceneV2, l
       const generated = generatedLayers[section.key as typeof DIRECTOR_LAYER_ORDER[number]] || "";
       body = spatialLayerConflicts.has(section.key) ? generated : edited || generated;
     }
+    if (section.key === "locationMap") body = stripFirstFrameBlocks(body);
     if (body.trim()) sections.push(`${section.heading}:\n${body.trim()}`);
   }
   return sections.join("\n\n");

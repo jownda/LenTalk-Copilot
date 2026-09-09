@@ -130,7 +130,9 @@ export function listVideoModels(): VideoModelDefinition[] {
       const isSub2Api = api.id.trim().toLowerCase() === 'sub2api-video'
         || isRjmVideoApiBaseUrl(api.baseUrl);
       const isBinghuo = api.id.trim().toLowerCase() === 'binghuo'
-        || api.baseUrl.trim().toLowerCase().includes('api.7tai.cc');
+        || api.baseUrl.trim().toLowerCase().includes('api.7tai.cc')
+        || api.id.trim().toLowerCase() === 'wgspai'
+        || api.baseUrl.trim().toLowerCase().includes('api.wgspai.cn');
       const binghuoOptions = isBinghuo ? resolveBinghuoVideoOptions(model) : undefined;
       const sub2ApiDuration = normalizedModel === 'seedance2.5'
         ? 30

@@ -1,4 +1,4 @@
-export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'jimeng-cli';
+export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'jimeng-cli';
 export type VideoProfileStatus = 'verified' | 'pending-adaptation';
 export type VideoReferenceTarget = 'data-url' | 'public-url' | 'platform-file';
 
@@ -87,6 +87,22 @@ const BINGHUO_VIDEO_PROFILE: VideoModelProfile = {
   supportsReferenceAudio: true,
 };
 
+/**
+ * wgspai 平台链路：提交/轮询端点与炳火同构(/v1/video/generations)，
+ * 但平台没有 /v1/assets/uploads 独立上传端点，参考图必须作为 data URL 直接内嵌进请求体。
+ */
+const WGSPAI_VIDEO_PROFILE: VideoModelProfile = {
+  id: 'wgspai-video',
+  status: 'verified',
+  protocolLabel: 'wgspai 异步视频 / 已验证',
+  submitPath: '/v1/video/generations',
+  queryPath: '/v1/video/generations/{taskId}',
+  referenceImageTarget: 'data-url',
+  supportsReferenceImages: true,
+  supportsFirstLast: true,
+  supportsReferenceAudio: true,
+};
+
 export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: string): VideoModelProfile {
   const provider = modelId.split('/')[0]?.trim().toLowerCase();
   const model = modelId.split('/').slice(1).join('/').trim().toLowerCase();
@@ -98,6 +114,7 @@ export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: stri
   }
   if (provider === 'custom:zizidonghua') return ZZDH_V8_VIDEO_PROFILE;
   if (provider === 'custom:binghuo') return BINGHUO_VIDEO_PROFILE;
+  if (provider === 'custom:wgspai') return WGSPAI_VIDEO_PROFILE;
   if (/^seedance(?:[-_.]?v?2|2(?:[._-]|$))/.test(model)) return SEEDANCE_V2_PROFILE;
   return OPENAI_VIDEO_PROFILE;
 }
@@ -110,6 +127,7 @@ export function getVideoModelProfile(profileId?: string): VideoModelProfile {
     'sub2api-video': SUB2API_VIDEO_PROFILE,
     'zzdh-v8-video': ZZDH_V8_VIDEO_PROFILE,
     'binghuo-video': BINGHUO_VIDEO_PROFILE,
+    'wgspai-video': WGSPAI_VIDEO_PROFILE,
     'jimeng-cli': JIMENG_CLI_VIDEO_PROFILE,
   };
   return profiles[profileId as VideoProfileId] ?? OPENAI_VIDEO_PROFILE;

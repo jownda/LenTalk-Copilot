@@ -3,22 +3,15 @@ import {
   CAMERAS,
   LENSES,
   MODEL_PROFILES,
-  DEFAULT_NEGATIVE,
-  auditFinalPromptWithProject,
-  checkContinuityV2,
   compilePrompt,
   legacyFocalLengthToFov,
   lensByFov,
   lensById,
   modelProfileById,
   sanitizeDirectorText,
-  validateDirectorLayers,
-  type FinalPromptAuditIssue,
 } from "../engine";
 import type {
   CameraMovement,
-  ContinuityIssueV2,
-  FinalAuditLogEntry,
   ProjectV2,
   PromptVersion,
   SceneV2,
@@ -46,13 +39,11 @@ import {
   classifyError,
   fillSceneDraft,
   generateFinalPrompt,
-  getAssistant,
   optimizeSceneBrief,
   optimizeStyleDescription,
   type SceneCompileProgress,
   type SceneCompileProgressListener,
 } from "./providers/ai";
-import type { ContinuityRepairIssue, ContinuityRepairPatch } from "../engine";
 import {
   isRemoteConfigured,
   listLenTalkChatModels,
@@ -81,7 +72,6 @@ import { cameraLabels, copy, framingLabels, type CopyZh, type Locale } from "./i
 import AssetLibrary from "./components/AssetLibrary";
 import type { CanvasAudioSource } from "./components/AssetLibrary";
 import BeatEditor from "./components/BeatEditor";
-import ContinuityPanel from "./components/ContinuityPanel";
 import DirectorBriefCard from "./components/DirectorBriefCard";
 import DirectorLayersCard from "./components/DirectorLayersCard";
 import type { CanvasImageSource } from "./components/DirectorLayersCard";
@@ -92,152 +82,6 @@ import { projectReducer, type ProjectAction } from "./store/projectReducer";
 import { addVersion, loadHistory, loadHistoryFromDatabase, persistHistoryToDatabase } from "./store/promptHistory";
 import { collectCinematicMediaReferences } from "../mediaReferences";
 import { findReferenceTokens } from "@/features/canvas/application/referenceTokenEditing";
-
-type RepairQualityIssue = ContinuityRepairIssue;
-
-function repairIssueKey(issue: RepairQualityIssue): string {
-  return `${issue.code}|${issue.entityId ?? issue.shotId ?? ""}|${issue.layerKey ?? ""}`;
-}
-
-function patchError(message: string): { error: string } {
-  return { error: message };
-}
-
-/** 应用 AI 补丁前的白名单与当前工程 ID 校验。 */
-function applyContinuityRepairPatch(
-  project: ProjectV2,
-  scene: SceneV2,
-  issue: RepairQualityIssue,
-  patch: ContinuityRepairPatch,
-): { project: ProjectV2; scene: SceneV2 } | { error: string } {
-  const assets = project.assets ?? [];
-  const assetById = new Map(assets.map((asset) => [asset.id, asset]));
-  const shotById = new Map(scene.shots.map((shot) => [shot.id, shot]));
-  const targetShotId = issue.shotId ?? issue.entityId;
-  const allowedSceneCodes = new Set([
-    "SCENE.ENVIRONMENT_UNLOCKED",
-    "SCENE.WEATHER_MISSING",
-    "TECHNICAL.NEGATIVE_EMPTY",
-    "AUDIO.PLAN_MISSING",
-    "AUDIO.CONFLICT",
-  ]);
-  const allowedShotCodes = new Set([
-    "SPATIAL.POSITION_JUMP",
-    "SPATIAL.DEPTH_JUMP",
-    "SPATIAL.REENTRY_UNMARKED",
-    "SPATIAL.ENTRANCE_POSITION_CONFLICT",
-    "SPATIAL.ORDER_JUMP",
-    "SPATIAL.AXIS_CONFLICT",
-    "SPATIAL.GAZE_ORIENT_MISSING",
-  ]);
-  const allowedBeatCodes = new Set(["CAUSALITY.TARGET_MISSING", "CAUSALITY.FORBIDDEN_TARGET"]);
-  const nextScene: SceneV2 = structuredClone(scene);
-
-  if (patch.sceneUpdates) {
-    if (!allowedSceneCodes.has(issue.code)) return patchError("该问题不允许修改场景级字段。");
-    const updates = patch.sceneUpdates;
-    if (updates.environmentLock !== undefined) nextScene.environmentLock = updates.environmentLock;
-    if (updates.weather !== undefined) nextScene.weather = updates.weather;
-    if (updates.negativePrompt !== undefined) project = { ...project, negativePrompt: updates.negativePrompt };
-    if (updates.audioPlan) {
-      project = {
-        ...project,
-        audioPlan: {
-          ...(project.audioPlan ?? { score: "none", subtitles: false }),
-          ...updates.audioPlan,
-        },
-      };
-    }
-  }
-
-  if (patch.shotUpdates) {
-    if (!allowedShotCodes.has(issue.code)) return patchError("该问题不允许修改镜头执行字段。");
-    for (const update of patch.shotUpdates) {
-      if (targetShotId && update.shotId !== targetShotId) return patchError("AI 补丁试图修改当前问题之外的镜头。");
-      const target = shotById.get(update.shotId);
-      if (!target) return patchError(`镜头 ID 不存在：${update.shotId}`);
-      const participants = new Map(
-        (target.participants ?? []).map((participant) => [participant.characterId, participant]),
-      );
-      const nextShot = nextScene.shots.find((candidate) => candidate.id === update.shotId);
-      if (!nextShot) return patchError(`镜头 ID 不存在：${update.shotId}`);
-      if (update.participantUpdates) {
-        for (const participantUpdate of update.participantUpdates) {
-          const participant = participants.get(participantUpdate.characterId);
-          const asset = assetById.get(participantUpdate.characterId);
-          if (!participant || !asset || asset.kind !== "character")
-            return patchError("AI 补丁引用了不属于当前镜头的角色。");
-          Object.assign(participant, participantUpdate);
-          delete (participant as { characterId?: string }).characterId;
-          participant.characterId = participantUpdate.characterId;
-        }
-      }
-      if (update.characterOrder) {
-        const participantIds = new Set((nextShot.participants ?? []).map((participant) => participant.characterId));
-        if (
-          new Set(update.characterOrder).size !== update.characterOrder.length ||
-          update.characterOrder.some((id) => !participantIds.has(id))
-        ) {
-          return patchError("AI 补丁的左右顺序包含非本镜头角色或重复角色。");
-        }
-        nextShot.layout = { ...(nextShot.layout ?? {}), characterOrder: [...update.characterOrder] };
-      }
-      if (update.intentionalAxisBreak !== undefined)
-        nextShot.layout = { ...(nextShot.layout ?? {}), intentionalAxisBreak: update.intentionalAxisBreak };
-      if (update.direction !== undefined) nextShot.direction = update.direction;
-    }
-  }
-
-  if (patch.beatUpdates) {
-    if (!allowedBeatCodes.has(issue.code)) return patchError("该问题不允许修改节拍目标字段。");
-    for (const update of patch.beatUpdates) {
-      if (issue.entityId && update.beatId !== issue.entityId) return patchError("AI 补丁试图修改当前问题之外的节拍。");
-      const targetShot = nextScene.shots.find((candidate) => candidate.id === update.shotId);
-      const beat = targetShot?.beats?.find((candidate) => candidate.id === update.beatId);
-      if (!targetShot || !beat) return patchError("AI 补丁引用了不存在的镜头或节拍。");
-      if (update.targetCharacterId !== undefined) {
-        const asset = assetById.get(update.targetCharacterId);
-        if (
-          !asset ||
-          asset.kind !== "character" ||
-          !(targetShot.participants ?? []).some((participant) => participant.characterId === update.targetCharacterId)
-        )
-          return patchError("节拍目标角色不是当前镜头的现有参与者。");
-        beat.targetCharacterId = update.targetCharacterId;
-        beat.targetPropId = undefined;
-      }
-      if (update.targetPropId !== undefined) {
-        const asset = assetById.get(update.targetPropId);
-        if (!asset || asset.kind !== "prop") return patchError("节拍目标道具不存在或不是道具资产。");
-        beat.targetPropId = update.targetPropId;
-        beat.targetCharacterId = undefined;
-      }
-    }
-  }
-
-  if (patch.directorLayerUpdates) {
-    if (!issue.layerKey) return patchError("该问题没有可修改的导演文档层。");
-    for (const update of patch.directorLayerUpdates) {
-      if (update.layerKey !== issue.layerKey || !["firstFrame", "locationMap"].includes(update.layerKey))
-        return patchError("AI 补丁试图修改当前问题之外的导演文档层。");
-      if (!update.text.trim()) return patchError("导演文档修复文本不能为空。");
-      const unknownReference = [...update.text.matchAll(/@[A-Za-z0-9_\-\u4e00-\u9fff]+/g)]
-        .map((match) => match[0])
-        .find((token) => {
-          const normalized = token.slice(1);
-          return !assets.some((asset) => asset.referenceTag === normalized || asset.name === normalized);
-        });
-      if (unknownReference) return patchError(`导演文档补丁包含未知资产引用：${unknownReference}`);
-      nextScene.directorLayers = { ...(nextScene.directorLayers ?? {}), [update.layerKey]: update.text.trim() };
-    }
-  }
-
-  const nextProject = {
-    ...project,
-    scenes: project.scenes.map((candidate) => (candidate.id === scene.id ? nextScene : candidate)),
-  };
-  return { project: nextProject, scene: nextScene };
-}
 
 const movements: CameraMovement[] = ["Static", "Handheld", "Steadicam", "Dolly", "Tracking", "Crane", "POV", "OTS"];
 const newId = () => crypto.randomUUID();
@@ -294,7 +138,6 @@ export default function App({
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [sceneCompileBusy, setSceneCompileBusy] = useState(false);
   const [finalGenerateBusy, setFinalGenerateBusy] = useState(false);
-  const [aiRepairBusy, setAiRepairBusy] = useState(false);
   const [sceneCompileProgress, setSceneCompileProgress] = useState<SceneCompileProgress>("idle");
   const [compileReceivedChars, setCompileReceivedChars] = useState(0);
   const [briefOptimizeBusy, setBriefOptimizeBusy] = useState(false);
@@ -304,7 +147,6 @@ export default function App({
   const [aiErrorCopied, setAiErrorCopied] = useState(false);
   const [resumeAvailable, setResumeAvailable] = useState(false);
   const [resumeBusy, setResumeBusy] = useState(false);
-  const [focusedDirectorLayer, setFocusedDirectorLayer] = useState<string | null>(null);
   const template = DIRECTOR_SEQUENCE_TEMPLATE;
   const [modelProfileId, setModelProfileId] = useState<string>(() => localStorage.getItem("cineprompt-model") ?? "");
   const [, setHistory] = useState<PromptVersion[]>(loadHistory);
@@ -315,30 +157,12 @@ export default function App({
   const [manualOverride, setManualOverride] = useState<string | null>(null);
   const [mediaPreview, setMediaPreview] = useState<{ kind: "image" | "audio"; source: string } | null>(null);
   const [promptScrollTop, setPromptScrollTop] = useState(0);
-  const [auditDetailsOpen, setAuditDetailsOpen] = useState(false);
-  const [qualityCheckOpen, setQualityCheckOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const initialProjectRef = useRef(project);
   const resumeJobRef = useRef<ResumeJob | null>(null);
   const [projectCodeDraft, setProjectCodeDraft] = useState(() => project.projectCode ?? "");
   const scene = project.scenes.find((item) => item.id === sceneId) ?? project.scenes[0];
   const shot = scene.shots.find((item) => item.id === shotId) ?? scene.shots[0];
-  const issues = useMemo(() => checkContinuityV2(project, scene), [project, scene]);
-  const directorLayerIssues = useMemo(
-    () => (scene.directorLayers ? validateDirectorLayers(scene.directorLayers, project, scene) : []),
-    [project, scene],
-  );
-  const finalAudit = useMemo(() => auditFinalPromptWithProject(scene, project.assets ?? []), [project.assets, scene]);
-  const finalAuditErrors = finalAudit.issues.filter((issue) => issue.severity === "error");
-  const continuityAuditErrors = issues.filter((issue) => issue.severity === "error");
-  const auditErrorIssues = [...finalAuditErrors, ...continuityAuditErrors];
-  const hasAuditErrors = auditErrorIssues.length > 0;
-  const auditStatusDetails = [
-    ...finalAudit.issues.map((issue) => (locale === "zh" ? issue.detailZh : issue.detail)),
-    ...issues.map((issue) => (locale === "zh" ? (issue.detailZh ?? issue.detail) : issue.detail)),
-  ]
-    .filter(Boolean)
-    .join("\n");
   const t: CopyZh = copy[locale] as CopyZh;
   const selectedChatModel = aiSettings.provider && aiSettings.model ? `${aiSettings.provider}:${aiSettings.model}` : "";
   const mediaReferences = useMemo(() => collectCinematicMediaReferences(project, scene), [project, scene]);
@@ -424,94 +248,6 @@ export default function App({
 
   /** 结构更新统一走 reducer（Compiler/Continuity 只读不可变快照） */
   const dispatch = (action: ProjectAction) => setProject((prev) => projectReducer(prev, action));
-
-  const recordFinalAudit = (
-    targetScene: SceneV2,
-    audit = auditFinalPromptWithProject(targetScene, project.assets ?? []),
-    continuity = checkContinuityV2(project, targetScene),
-  ) => {
-    const allIssues = [
-      ...audit.issues,
-      ...continuity.map((issue) => ({
-        code: issue.code,
-        severity: issue.severity,
-        detail: issue.detail,
-        detailZh: issue.detailZh,
-        shotId: issue.entityId,
-      })),
-    ];
-    const record: FinalAuditLogEntry = {
-      id: crypto.randomUUID(),
-      createdAt: new Date().toISOString(),
-      sceneId: targetScene.id,
-      status: allIssues.some((issue) => issue.severity === "error") ? "blocked" : "passed",
-      automaticFixes: audit.adjustments,
-      issues: allIssues,
-    };
-    dispatch({ type: "RECORD_FINAL_AUDIT", record });
-    return record;
-  };
-
-  const focusAuditIssue = (issue: Pick<FinalPromptAuditIssue, "shotId" | "field">) => {
-    if (issue.shotId && scene.shots.some((candidate) => candidate.id === issue.shotId)) {
-      setShotId(issue.shotId);
-      setInspectorOpen(true);
-      window.requestAnimationFrame(() =>
-        document.getElementById("cinematic-shot-inspector")?.scrollIntoView({ behavior: "smooth", block: "start" }),
-      );
-      return;
-    }
-    const target =
-      issue.field === "lighting" || issue.field === "staging" ? "cinematic-director-brief" : "cinematic-shot-inspector";
-    window.requestAnimationFrame(() =>
-      document.getElementById(target)?.scrollIntoView({ behavior: "smooth", block: "start" }),
-    );
-  };
-  const focusContinuityTarget = (target: { shotId?: string; layerKey?: string }) => {
-    const hasShot = Boolean(target.shotId && scene.shots.some((candidate) => candidate.id === target.shotId));
-    if (hasShot) {
-      setShotId(target.shotId!);
-      setInspectorOpen(true);
-    }
-    if (target.layerKey) {
-      setFocusedDirectorLayer(target.layerKey);
-      window.requestAnimationFrame(() =>
-        document
-          .getElementById(`cinematic-director-layer-${target.layerKey}`)
-          ?.scrollIntoView({ behavior: "smooth", block: "center" }),
-      );
-      return;
-    }
-    window.requestAnimationFrame(() =>
-      document
-        .getElementById(hasShot ? "cinematic-shot-inspector" : "cinematic-director-brief")
-        ?.scrollIntoView({ behavior: "smooth", block: "start" }),
-    );
-  };
-  const auditRecommendation = (action: FinalPromptAuditIssue["action"] | undefined): string | undefined => {
-    if (!action) return undefined;
-    const labels =
-      locale === "zh"
-        ? {
-            "review-staging": "建议：返回场景地图补充首帧与站位。",
-            "review-lighting": "建议：返回场景光线，保留一种可同时成立的事实。",
-            "review-optics": "建议：检查该镜头的 FOV 与可见结果。",
-            "review-acting": "建议：改为可拍摄的眼神、呼吸、手部或姿势变化。",
-            "review-voice": "建议：为开口角色补充声音锁。",
-            "review-action": "建议：补充可见动作节拍，或重新 AI 编译。",
-            recompile: "建议：根据当前结构化数据重新 AI 编译。",
-          }
-        : {
-            "review-staging": "Recommended: return to the scene map and complete first-frame blocking.",
-            "review-lighting": "Recommended: return to lighting and keep one compatible visual fact.",
-            "review-optics": "Recommended: review this shot's FOV and visible result.",
-            "review-acting": "Recommended: use visible eye, breath, hand, or posture behavior.",
-            "review-voice": "Recommended: add a voice lock for the speaking character.",
-            "review-action": "Recommended: add visible action beats or recompile with AI.",
-            recompile: "Recommended: recompile from the current structured data.",
-          };
-    return labels[action];
-  };
 
   useEffect(() => {
     let active = true;
@@ -672,67 +408,6 @@ export default function App({
       fileInput.current?.click();
     }
   };
-  /** AI 修复：只接受能消除当前问题且不引入新 error 的受限补丁。 */
-  const aiAdvice = async (issue: RepairQualityIssue) => {
-    if (aiRepairBusy) return;
-    setAiRepairBusy(true);
-    try {
-      const targetShot =
-        scene.shots.find((candidate) => candidate.id === issue.shotId || candidate.id === issue.entityId) ?? shot;
-      const fix = await getAssistant().repairContinuity({ issue, project, scene, shot: targetShot });
-      if (!fix.patch) {
-        setNotice(`${t.aiFixLabel}: ${fix.apply}`);
-        return;
-      }
-      const applied = applyContinuityRepairPatch(project, scene, issue, fix.patch);
-      if ("error" in applied) {
-        setNotice(`${t.aiFixLabel}: ${applied.error}`);
-        return;
-      }
-      const beforeIssues: RepairQualityIssue[] = [...issues, ...directorLayerIssues];
-      const candidateContinuity = checkContinuityV2(applied.project, applied.scene);
-      const candidateDirector = applied.scene.directorLayers
-        ? validateDirectorLayers(applied.scene.directorLayers, applied.project, applied.scene)
-        : [];
-      const candidateIssues: RepairQualityIssue[] = [...candidateContinuity, ...candidateDirector];
-      const originalStillPresent = candidateIssues.some(
-        (candidate) => repairIssueKey(candidate) === repairIssueKey(issue),
-      );
-      const beforeErrorKeys = new Set(
-        beforeIssues.filter((candidate) => candidate.severity === "error").map(repairIssueKey),
-      );
-      const newErrors = candidateIssues.filter(
-        (candidate) => candidate.severity === "error" && !beforeErrorKeys.has(repairIssueKey(candidate)),
-      );
-      if (originalStillPresent) {
-        setNotice(
-          locale === "zh"
-            ? "AI 修复未消除原问题，工程未修改。请定位后手动调整。"
-            : "The AI repair did not remove the original issue. No changes were applied.",
-        );
-        return;
-      }
-      if (newErrors.length > 0) {
-        setNotice(
-          locale === "zh"
-            ? `AI 修复引入了 ${newErrors.length} 个新错误，工程未修改。`
-            : `The AI repair introduced ${newErrors.length} new error(s). No changes were applied.`,
-        );
-        return;
-      }
-      setProject(applied.project);
-      focusContinuityTarget({ shotId: issue.shotId ?? issue.entityId, layerKey: issue.layerKey });
-      setNotice(
-        locale === "zh" ? "AI 已修复当前问题，并通过复核。" : "AI repaired this issue and the follow-up checks passed.",
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setNotice(`${t.aiFixLabel}: ${message}`);
-    } finally {
-      setAiRepairBusy(false);
-    }
-  };
-
   const updateShot = (updates: Partial<ShotV2>, targetId?: string) => {
     const target = targetId ?? shot.id;
     setProject((current) => ({
@@ -748,56 +423,6 @@ export default function App({
             },
       ),
     }));
-  };
-  /** 一键修复：根据 issue.code 应用对应修复（P0.5） */
-  const fixIssue = (issue: ContinuityIssueV2) => {
-    switch (issue.code) {
-      case "SCENE.ENVIRONMENT_UNLOCKED":
-        updateScene({ environmentLock: true });
-        break;
-      case "TECHNICAL.PROFILE_MISSING":
-        setProject((current) => ({
-          ...current,
-          technicalProfile: {
-            format: "photoreal",
-            resolution: "4K",
-            fps: 24,
-            shutterAngle: 180,
-            filmStock: "35mm Kodak Vision3 250D",
-          },
-        }));
-        break;
-      case "TECHNICAL.NEGATIVE_EMPTY":
-        setProject((current) => ({ ...current, negativePrompt: DEFAULT_NEGATIVE }));
-        break;
-      case "AUDIO.PLAN_MISSING":
-        setProject((current) => ({ ...current, audioPlan: { score: "none", subtitles: false } }));
-        break;
-      case "AUDIO.CONFLICT":
-        setProject((current) => {
-          const audio = current.audioPlan;
-          if (!audio) return current;
-          const MUSIC_TOKENS = ["boombox", "beat", "radio", "band", "music", "playback", "jingle", "melody"];
-          const moved = (audio.sfx ?? []).filter((sfx) =>
-            MUSIC_TOKENS.some((token) => sfx.toLowerCase().includes(token)),
-          );
-          return {
-            ...current,
-            audioPlan: {
-              ...audio,
-              sfx: (audio.sfx ?? []).filter((sfx) => !moved.includes(sfx)),
-              diegeticMusic: [...(audio.diegeticMusic ?? []), ...moved],
-            },
-          };
-        });
-        break;
-      case "SPATIAL.AXIS_CONFLICT":
-        if (issue.entityId) updateShot({ layout: { ...shot.layout, intentionalAxisBreak: true } }, issue.entityId);
-        break;
-      default:
-        return;
-    }
-    setNotice(t.fixed);
   };
   /** 更新镜头时间（结构化 time）并联动下一个镜头：下一镜 start = 当前 end（自动吸附） */
   const updateShotRange = (id: string, start: number, end: number) => {
@@ -853,7 +478,6 @@ export default function App({
       ...current,
       compiledPrompt: undefined,
       audioPlan: undefined,
-      finalAuditLog: (current.finalAuditLog ?? []).filter((entry) => entry.sceneId !== scene.id),
       scenes: current.scenes.map((item) =>
         item.id !== scene.id
           ? item
@@ -1050,21 +674,13 @@ export default function App({
       setStyleOptimizeBusy(false);
     }
   };
-  /** 最终生成：审核当前结构化内容后，先本地生成 canonical source，再由 AI 组织最终提示词。 */
+  /** 最终生成：先本地生成 canonical source，再由 AI 组织最终提示词。 */
   const localCompileScene = async () => {
     if (sceneCompileBusy || finalGenerateBusy) return;
     if (!isRemoteConfigured()) {
       setNotice(t.aiNotConfigured);
       return;
     }
-    const issues = checkContinuityV2(project, scene);
-    const audit = auditFinalPromptWithProject(scene, project.assets ?? []);
-    const layerIssues = validateDirectorLayers(scene.directorLayers ?? {}, project, scene);
-    const auditErrorCount =
-      audit.issues.filter((issue) => issue.severity === "error").length +
-      issues.filter((issue) => issue.severity === "error").length +
-      layerIssues.filter((issue) => issue.severity === "error").length;
-    recordFinalAudit(scene, audit, issues);
     clearResume();
     setFinalGenerateBusy(true);
     setAiCompileError("");
@@ -1078,11 +694,7 @@ export default function App({
         modelProfileId: modelProfileId || undefined,
         outputText: text,
         projectSnapshot: structuredClone(project),
-        continuitySummary: {
-          total: issues.length,
-          errors: issues.filter((issue) => issue.severity === "error").length,
-          warnings: issues.filter((issue) => issue.severity === "warning").length,
-        },
+        continuitySummary: { total: 0, errors: 0, warnings: 0 },
       });
       setHistory(record);
       void persistHistoryToDatabase(record);
@@ -1093,13 +705,7 @@ export default function App({
           void recordVersionToSqlite(projectPackageDir, latest.id, template, JSON.stringify(latest.continuitySummary));
         }
       }
-      setNotice(
-        auditErrorCount > 0
-          ? locale === "zh"
-            ? `${t.promptLocalCompiled}（审核保留 ${auditErrorCount} 项待处理问题）`
-            : `${t.promptLocalCompiled} (${auditErrorCount} review issue(s) remain)`
-          : t.promptLocalCompiled,
-      );
+      setNotice(t.promptLocalCompiled);
     };
     try {
       const canonical = buildFinalGenerationSource(project, scene, locale);
@@ -1280,7 +886,7 @@ export default function App({
             canvasImageSources={canvasImageSources}
             onUpdateScene={updateScene}
             setNotice={setNotice}
-            focusLayerKey={focusedDirectorLayer}
+            focusLayerKey={null}
           />
 
           {/* ── 4. 镜头执行：时间线、动作、角色表演与节拍共用同一结构化数据 ── */}
@@ -1501,7 +1107,7 @@ export default function App({
                   <InspectorSection title={t.beats}>
                     <BeatEditor project={project} shot={shot} t={t} onUpdate={updateShot} />
                   </InspectorSection>
-                  <InspectorSection title={t.continuity}>
+                  <InspectorSection title={t.shotLocks}>
                     <div className="fields-grid">
                       <div className="locked-character">
                         <span className="avatar large">
@@ -1527,30 +1133,6 @@ export default function App({
               ) : (
                 <div className="empty">{t.addShotHint}</div>
               ))}
-          </section>
-
-          {/* ── 5.5 成片质量检查：只显示状态和待处理问题 ── */}
-          <section className="card continuity-card">
-            <div className="card-head inspector-toggle" onClick={() => setQualityCheckOpen((open) => !open)}>
-              <div className="card-head-title">
-                <span className="eyebrow">{t.qualityCheck}</span>
-                <strong>{issues.length + directorLayerIssues.length}</strong>
-              </div>
-              <ChevronDown size={16} className={`inspector-caret${qualityCheckOpen ? "" : " collapsed"}`} />
-            </div>
-            {qualityCheckOpen && (
-              <ContinuityPanel
-                project={project}
-                scene={scene}
-                issues={issues}
-                directorIssues={directorLayerIssues}
-                t={t}
-                locale={locale}
-                onFix={fixIssue}
-                onAiAdvice={aiAdvice}
-                onLocate={focusContinuityTarget}
-              />
-            )}
           </section>
         </div>
 
@@ -1665,56 +1247,9 @@ export default function App({
             </div>
             <div className="prompt-editor-toolbar">
               <div className="prompt-editor-status">
-                <div className="audit-action-row">
-                  <button
-                    type="button"
-                    className="outline-button audit-details-toggle"
-                    onClick={() => setAuditDetailsOpen((open) => !open)}
-                  >
-                    {auditDetailsOpen
-                      ? locale === "zh"
-                        ? "收起审计详情"
-                        : "Hide audit details"
-                      : locale === "zh"
-                        ? "查看审计详情"
-                        : "View audit details"}
-                  </button>
-                  {hasAuditErrors && (
-                    <button
-                      type="button"
-                      className="outline-button audit-continue-button"
-                      onClick={localCompileScene}
-                      title={
-                        locale === "zh"
-                          ? "根据当前数据重新生成最终提示词"
-                          : "Regenerate the final prompt from the current data"
-                      }
-                    >
-                      {locale === "zh" ? "继续生成" : "Continue generation"}
-                    </button>
-                  )}
-                </div>
-                <div className="audit-status-row">
-                  <span className="output-language">
-                    {locale === "zh" ? "输出语言：中文" : "Output language: English"}
-                  </span>
-                  <span
-                    className={`final-audit-status ${hasAuditErrors ? "error" : finalAudit.issues.length > 0 ? "warning" : "passed"}`}
-                    title={auditStatusDetails}
-                  >
-                    {hasAuditErrors
-                      ? locale === "zh"
-                        ? `最终审核：整体规则已整理，${auditErrorIssues.length} 项冲突待处理`
-                        : `Final review: overall rules are organized; ${auditErrorIssues.length} conflict(s) remain`
-                      : finalAudit.issues.length > 0
-                        ? locale === "zh"
-                          ? `最终审核：整体规则符合，已整理 ${finalAudit.issues.length} 项`
-                          : `Final review: overall rules conform; ${finalAudit.issues.length} item(s) organized`
-                        : locale === "zh"
-                          ? "最终审核：整体规则符合"
-                          : "Final review: overall rules conform"}
-                  </span>
-                </div>
+                <span className="output-language">
+                  {locale === "zh" ? "输出语言：中文" : "Output language: English"}
+                </span>
               </div>
               <button
                 type="button"
@@ -1737,105 +1272,6 @@ export default function App({
                 <Send size={16} /> {t.sendToVideoNode}
               </button>
             </div>
-            {auditDetailsOpen && (
-              <div className="final-audit-details">
-                <section>
-                  <h3>{locale === "zh" ? "自动修正" : "Automatic corrections"}</h3>
-                  {finalAudit.adjustments.length > 0 ? (
-                    <ul>
-                      {finalAudit.adjustments.map((adjustment, index) => (
-                        <li key={`${adjustment.code}-${adjustment.shotId ?? "scene"}-${index}`}>
-                          <span>{locale === "zh" ? adjustment.detailZh : adjustment.detail}</span>
-                          {adjustment.shotId && (
-                            <button
-                              type="button"
-                              className="text-button"
-                              onClick={() => focusAuditIssue({ shotId: adjustment.shotId })}
-                            >
-                              {locale === "zh" ? "定位镜头" : "Locate shot"}
-                            </button>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p>
-                      {locale === "zh"
-                        ? "本次没有需要自动修正的格式或术语。"
-                        : "No format or terminology corrections were needed."}
-                    </p>
-                  )}
-                </section>
-                <section>
-                  <h3>{locale === "zh" ? "待处理问题" : "Issues to review"}</h3>
-                  {([...finalAudit.issues, ...issues] as Array<FinalPromptAuditIssue | ContinuityIssueV2>).length >
-                  0 ? (
-                    <ul>
-                      {[...finalAudit.issues, ...issues].map((issue, index) => {
-                        const shotTargetId =
-                          "shotId" in issue
-                            ? (issue as FinalPromptAuditIssue).shotId
-                            : (issue as ContinuityIssueV2).entityId;
-                        const field = "field" in issue ? issue.field : undefined;
-                        const recommendation =
-                          auditRecommendation("action" in issue ? issue.action : undefined) ??
-                          ("fixLabel" in issue ? issue.fixLabel : undefined);
-                        return (
-                          <li key={`${issue.code}-${shotTargetId ?? "scene"}-${index}`} className={issue.severity}>
-                            <span>
-                              <b>
-                                {issue.severity === "error"
-                                  ? locale === "zh"
-                                    ? "必须修正"
-                                    : "Blocking"
-                                  : locale === "zh"
-                                    ? "建议检查"
-                                    : "Review"}
-                              </b>
-                              {locale === "zh" ? (issue.detailZh ?? issue.detail) : issue.detail}
-                              {recommendation && <small className="audit-recommendation">{recommendation}</small>}
-                            </span>
-                            {(shotTargetId || field) && (
-                              <button
-                                type="button"
-                                className="text-button"
-                                onClick={() => focusAuditIssue({ shotId: shotTargetId, field })}
-                              >
-                                {locale === "zh" ? "定位" : "Locate"}
-                              </button>
-                            )}
-                          </li>
-                        );
-                      })}
-                    </ul>
-                  ) : (
-                    <p>{locale === "zh" ? "没有待处理问题。" : "No issues require review."}</p>
-                  )}
-                </section>
-                {(project.finalAuditLog ?? []).length > 0 && (
-                  <section>
-                    <h3>{locale === "zh" ? "审计变更记录" : "Audit change log"}</h3>
-                    <ul className="audit-history-list">
-                      {(project.finalAuditLog ?? []).slice(0, 3).map((entry) => (
-                        <li key={entry.id} className={entry.status}>
-                          <span>
-                            {new Date(entry.createdAt).toLocaleString(locale === "zh" ? "zh-CN" : "en-US")} ·{" "}
-                            {entry.status === "blocked"
-                              ? locale === "zh"
-                                ? "需修正"
-                                : "Blocked"
-                              : locale === "zh"
-                                ? "已通过"
-                                : "Passed"}{" "}
-                            · {entry.automaticFixes.length} {locale === "zh" ? "项自动修正" : "automatic correction(s)"}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  </section>
-                )}
-              </div>
-            )}
             <div className="prompt-media-editor">
               <PromptMediaOverlay
                 prompt={prompt}

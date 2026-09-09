@@ -30,7 +30,11 @@ export const CAMERAS: CameraGear[] = [
   { id: "bmd-ursa-cine", brand: "Blackmagic", model: "URSA Cine 12K", effect: "大画幅电影色彩, 双原生 ISO, 电影感色彩科学, 性价比高的专业电影机" },
   { id: "canon-c300-iii", brand: "Canon", model: "C300 Mark III", effect: "DGO 双增益传感器, 优秀的 HDR 表现, 自然纪录片级肤色" },
   { id: "panasonic-s1h", brand: "Panasonic", model: "S1H", effect: "全画幅 V-Log, 双原生 ISO, 柔和肤色, 电影与纪录片通用的紧凑机身" },
-  { id: "kinefinity-mavo-edge", brand: "Kinefinity", model: "MAVO Edge", effect: "中画幅 6K 浅景深, 优异的暗部质感, 柔和的高光滚降" }
+  { id: "kinefinity-mavo-edge", brand: "Kinefinity", model: "MAVO Edge", effect: "中画幅 6K 浅景深, 优异的暗部质感, 柔和的高光滚降" },
+  { id: "apple-iphone-15-pro", brand: "Apple", model: "iPhone 15 Pro Max", effect: "计算摄影直出质感, 智能 HDR 压高光, 锐利的数字细节, 主摄等效 24mm 大景深, 夜景多帧降噪, 随手拍的真实生活感" },
+  { id: "sony-dsc-w830", brand: "Sony", model: "Cyber-shot DSC-W830", effect: "2010 年代家用 CCD 卡片机, 小底传感器高感噪点明显, 高光容易溢出成死白, 色彩低饱和偏洋红, 闪光灯直打人像, 强烈的千禧年怀旧数码感" },
+  { id: "canon-ixus-130", brand: "Canon", model: "IXUS 130", effect: "Y2K 时代金属滑盖 CCD 卡片机, 冷调偏青的色彩, 暗部偏绿, 边缘画质松散柔化, 夜晚明显彩色噪点, 即拍即晒的生活快照质感" },
+  { id: "fujifilm-finepix-f30", brand: "Fujifilm", model: "FinePix F30", effect: "富士超级 CCD, 浓郁胶片式色彩, 高感光度下独特的颗粒噪点, 暗部轻微绿移, 2000 年代中期经典便携机, 复古而富有氛围" }
 ];
 
 export const LENSES: LensGear[] = [

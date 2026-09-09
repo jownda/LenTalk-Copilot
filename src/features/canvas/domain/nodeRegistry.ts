@@ -431,6 +431,7 @@ const promptOptimizerNodeDefinition: CanvasNodeDefinition<PromptOptimizerNodeDat
     taskType: 'auto',
     targetModel: '',
     referencePalette: '',
+    outputLang: 'zh',
     optimizedPrompt: '',
     routeSummary: '',
     notes: [],

@@ -11,7 +11,7 @@ export interface LiraOptimizeInput {
   taskType: PromptOptimizerTaskType;
   targetModel?: string;
   referencePalette?: string;
-  /** 输出语言：zh=中文, en=English(默认)。 */
+  /** 输出语言：zh=中文(默认), en=English。 */
   lang?: 'zh' | 'en';
 }
 
@@ -278,8 +278,9 @@ export function optimizeLiraPrompt(input: LiraOptimizeInput): LiraOptimizeResult
     notes.push("角色设定图按项目规范：全身图从颈部以下取景，脸部仅由四分之三特写承载。");
   }
 
+  const lang = input.lang ?? 'zh';
   const prompt =
-    input.lang === 'zh'
+    lang === 'zh'
       ? buildPromptZh(inferred, purpose, input.referencePalette)
       : buildPrompt(inferred, purpose, input.referencePalette);
   return {

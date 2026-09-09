@@ -147,8 +147,8 @@ describe("collectSceneAssetIds", () => {
     expect(request.user).toContain("Acting master profiles are AI-only references");
     expect(request.user).toContain("only their shot-specific, observable adaptation");
     expect(request.user).toContain("场景地图和站位合并为同一段");
-    expect(request.user).toContain("段首只输出一份场景级空间总图");
-    expect(request.user).toContain("第 1 段首帧"); // 参考格式示例
+    expect(request.user).toContain("只输出一份场景级空间总图");
+    expect(request.user).toContain("不输出任何首帧占位"); // 首帧已从最终导出整体移除
     expect(request.user).toContain("FORMAT MODE 是本次生成的整体执行格式摘要");
     expect(request.user).toContain("两个段落，一次甩切");
     expect(request.user).toContain("CAMERA 必须先写一段适用于全程的总摄影机描述");
@@ -170,8 +170,8 @@ describe("collectSceneAssetIds", () => {
     expect(request.user).toContain("STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING");
     expect(request.user).toContain("attach acting to the corresponding shot and character inside ACTION TIMING");
     expect(request.user).toContain("SCENE MAP AND STAGING is one section");
-    expect(request.user).toContain("first output one scene-level master map only");
-    expect(request.user).toContain("SHOT 1 FIRST FRAME");
+    expect(request.user).toContain("output one scene-level master map only");
+    expect(request.user).toContain("Do not output any first-frame occupancy block");
     expect(request.user).toContain("FORMAT MODE is the overall execution-format summary");
     expect(request.user).toContain("two segments, one whip cut");
     expect(request.user).toContain("grouped by shot segment");
@@ -252,7 +252,8 @@ describe("collectSceneAssetIds", () => {
     expect(source).not.toContain("SCENE CONTEXT:");
     expect(source).toContain("ACTION TIMING:\n");
     expect(source).toContain("SCENE MAP AND STAGING:\n");
-    expect(source).toContain("SHOT 1 FIRST FRAME");
+    expect(source).not.toContain("SHOT 1 FIRST FRAME");
+    expect(source).not.toContain("FIRST FRAME");
     expect(source).toContain("@林警官: 克制.");
     expect(source).toContain("0:00 to 0:05: @林警官: 拿起 toward @香烟.");
     expect(source.indexOf("STYLE:")).toBeLessThan(source.indexOf("ACTIVE REFERENCES:"));
@@ -293,8 +294,10 @@ describe("collectSceneAssetIds", () => {
     };
     const source = buildFinalGenerationSource(project, conflictingScene);
 
-    expect(source).toContain("shot 1");
-    expect(source).toContain("position: screen-right");
+    // 空间冲突时回退为本地生成的场景级总图（不再输出逐镜首帧占位）。
+    expect(source).toContain("Location reference: @车厢");
+    // 参与者站位仍由镜头执行的 ACTION TIMING 逐镜承载。
+    expect(source).toContain("(screen-right)");
     expect(source).not.toContain("林警官位于画面左侧");
   });
 
@@ -339,9 +342,11 @@ describe("collectSceneAssetIds", () => {
     expect(source).not.toContain("未出场角色");
     // The prop declaration names its holder with the same @ handle, as required
     // by Seedance. The character's image, appearance, and acting profile are
-    // declared once; holder, first frame, execution, dialogue order, and voice
-    // blocks reuse the same @ tag (always with [imageN], never a bare name).
-    expect((source.match(/@char_demo_hero_base_v1/g) ?? [])).toHaveLength(8);
+    // declared once; holder, execution, dialogue order, and voice blocks reuse
+    // the same @ tag (always with [imageN], never a bare name). The first-frame
+    // block was intentionally removed from the final export and no longer
+    // contributes a reference.
+    expect((source.match(/@char_demo_hero_base_v1/g) ?? [])).toHaveLength(7);
     expect((source.match(/@prop_demo_bag_base_v1/g) ?? [])).toHaveLength(1);
   });
 

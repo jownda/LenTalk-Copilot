@@ -411,7 +411,7 @@ export const PromptOptimizerNode = memo(({
   const resolvedHeight = Math.max(MIN_HEIGHT, Math.round(height ?? DEFAULT_HEIGHT));
   const enhanceMode = data.enhanceMode;
   const customApis = useSettingsStore((state) => state.customApis);
-  const outputLang: 'zh' | 'en' = data.outputLang ?? 'en';
+  const outputLang: 'zh' | 'en' = data.outputLang ?? 'zh';
 
   useEffect(() => {
     const element = rootRef.current;
