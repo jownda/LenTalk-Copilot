@@ -282,7 +282,7 @@ function checkInspectorCoverage(project: ProjectV2, scene: SceneV2): DirectorLay
       (scene.staging?.characterOrder ?? []).length > 0,
     );
     if (!hasParticipantPosition && !hasShotLayout && !hasSceneLayout) missing.push("staging / 站位");
-    if (!shot.acting?.trim()) missing.push("acting / 表演");
+    if (!shot.performanceDescription?.trim() && !shot.acting?.trim()) missing.push("acting / 表演");
 
     const speakers = new Set(
       (shot.beats ?? [])

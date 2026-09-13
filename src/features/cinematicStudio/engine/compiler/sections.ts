@@ -133,17 +133,11 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
     shotLines.push(locale === "zh" ? `角色：${name(shot.characterId)}。` : `Participant: ${name(shot.characterId)}.`);
   }
 
-  // 道具变化只保留一段镜头级自然语言，避免开始/结束状态互相冲突。
-  if (shot.propChangeDescription?.trim()) {
-    shotLines.push(locale === "zh"
-      ? `道具变化：${sentence(shot.propChangeDescription.trim())}`
-      : `Prop changes: ${sentence(shot.propChangeDescription.trim())}`);
-  }
-
   // Beats
   if ((shot.beats ?? []).length > 0) {
     const assetName = assetRefName(project, syntax);
-    for (const beat of [...(shot.beats ?? [])].sort((a, b) => a.order - b.order)) {
+    const beats = [...(shot.beats ?? [])].sort((a, b) => a.order - b.order);
+    for (const [index, beat] of beats.entries()) {
       const bits: string[] = [];
       if (beat.actorId) bits.push(assetName(beat.actorId));
       if (beat.verb) bits.push(locale === "zh" ? (beatVerbZh[beat.verb as keyof typeof beatVerbZh] ?? beat.verb) : beat.verb);
@@ -151,6 +145,7 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
       if (beat.targetPropId) bits.push(assetName(beat.targetPropId));
       if (beat.targetBodyPart) bits.push(beat.targetBodyPart);
       if (beat.actionText?.trim()) bits.push(beat.actionText.trim());
+      if (shot.propChangeDescription?.trim() && (beat.targetPropId || index === 0)) bits.push(shot.propChangeDescription.trim());
       let line = fillTemplate(lex.templates.beatLine, { order: String(beat.order), content: `${bits.join(" ")}${bits.length ? "." : ""}` });
       const targetId = beat.targetCharacterId ?? beat.targetPropId;
       const never = (beat.forbiddenTargets ?? []).filter((id) => id !== targetId).map(assetName);
@@ -173,11 +168,18 @@ export function renderShotSection(project: ProjectV2, scene: SceneV2, shot: Shot
     }
   }
 
+  if (shot.performanceDescription?.trim()) {
+    shotLines.push(locale === "zh" ? `动作与表演执行：${sentence(shot.performanceDescription.trim())}` : `Action & performance execution: ${sentence(shot.performanceDescription.trim())}`);
   // V0.1 兼容动作
-  if (shot.action?.trim() && (shot.beats ?? []).length === 0) shotLines.push(locale === "zh" ? `动作：${sentence(shot.action.trim())}` : `Action: ${sentence(shot.action.trim())}`);
+  } else if ((shot.action?.trim() || shot.propChangeDescription?.trim()) && (shot.beats ?? []).length === 0) {
+    const action = [shot.action?.trim(), shot.propChangeDescription?.trim()].filter(Boolean).join(locale === "zh" ? "；" : "; ");
+    shotLines.push(locale === "zh" ? `动作：${sentence(action)}` : `Action: ${sentence(action)}`);
+  }
   const actingBits: string[] = [];
-  if (shot.acting?.trim()) actingBits.push(sentence(shot.acting.trim()));
-  if (shot.eyeLife?.trim()) actingBits.push(locale === "zh" ? `眼部生活：${sentence(shot.eyeLife.trim())}` : `Eye life: ${sentence(shot.eyeLife.trim())}`);
+  if (!shot.performanceDescription?.trim()) {
+    if (shot.acting?.trim()) actingBits.push(sentence(shot.acting.trim()));
+    if (shot.eyeLife?.trim()) actingBits.push(locale === "zh" ? `眼部生活：${sentence(shot.eyeLife.trim())}` : `Eye life: ${sentence(shot.eyeLife.trim())}`);
+  }
   for (const participant of shot.participants ?? []) {
     const performance = participant.acting?.trim();
     const eyeLife = participant.eyeLife?.trim();

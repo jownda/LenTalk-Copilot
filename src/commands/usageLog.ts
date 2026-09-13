@@ -9,7 +9,7 @@ export interface UsageLogRecord {
   providerName: string;
   modelId: string;
   modelName: string;
-  kind: 'image' | 'video';
+  kind: 'image' | 'video' | 'audio';
   size: string;
   duration: number;
   referenceCount: number;
@@ -34,7 +34,7 @@ export interface UsageLogSummary {
 export interface QueryUsageRecordsOptions {
   limit?: number;
   offset?: number;
-  kind?: 'image' | 'video';
+  kind?: 'image' | 'video' | 'audio';
 }
 
 /**
@@ -43,7 +43,7 @@ export interface QueryUsageRecordsOptions {
  */
 export function estimateUsageCost(
   model: { pricing?: ModelPricingDefinition } | undefined,
-  options: { kind: 'image' | 'video'; size: string; duration: number }
+  options: { kind: 'image' | 'video' | 'audio'; size: string; duration: number }
 ): number {
   if (!model?.pricing) {
     return 0;

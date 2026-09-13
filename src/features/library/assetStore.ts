@@ -27,6 +27,7 @@ interface AssetLibraryStore extends AssetLibraryState {
   renameLibrary: (libraryId: string, name: string) => void;
   deleteLibrary: (libraryId: string) => void;
   addAssets: (assets: LibraryAsset[]) => void;
+  upsertAssets: (assets: LibraryAsset[]) => void;
   deleteAssets: (assetIds: string[]) => void;
   renameAsset: (assetId: string, name: string) => void;
   setAssetTags: (assetId: string, tags: string[]) => void;
@@ -277,6 +278,14 @@ export const useAssetLibraryStore = create<AssetLibraryStore>((set, get) => ({
   addAssets: (assets) => {
     const state = get();
     updateStore(set, { ...state, assets: [...state.assets, ...assets] });
+  },
+
+  upsertAssets: (assets) => {
+    if (assets.length === 0) return;
+    const state = get();
+    const incoming = new Map(assets.map((asset) => [asset.id, asset]));
+    const retained = state.assets.filter((asset) => !incoming.has(asset.id));
+    updateStore(set, { ...state, assets: [...retained, ...assets] });
   },
 
   deleteAssets: (assetIds) => {

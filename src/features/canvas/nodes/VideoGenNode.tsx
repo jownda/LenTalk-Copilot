@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -19,7 +20,13 @@ import { CANVAS_NODE_TYPES, EXPORT_RESULT_NODE_MIN_HEIGHT, EXPORT_RESULT_NODE_MI
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { canvasAiGateway, graphImageResolver } from '@/features/canvas/application/canvasServices';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
-import { CURRENT_RUNTIME_SESSION_ID } from '@/features/canvas/application/generationErrorReport';
+import {
+  buildGenerationErrorReport,
+  createReferenceImagePlaceholders,
+  CURRENT_RUNTIME_SESSION_ID,
+  getRuntimeDiagnostics,
+  type GenerationDebugContext,
+} from '@/features/canvas/application/generationErrorReport';
 import { mergeMediaReferenceSources } from '@/features/canvas/application/mediaReferenceSources';
 import { recordGenerationOutcome } from '@/features/canvas/application/usageRecording';
 import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
@@ -27,6 +34,7 @@ import { getDefaultVideoModelId, getModelProvider, getVideoModel, getVideoModelP
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
+import { resolveRecommendedApiPriceBadge } from './nodePriceBadge';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
 import { prepareNodeImageFromFile, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
@@ -43,6 +51,7 @@ import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDeb
 import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { getFloatingPanelPosition, type FloatingPanelPosition } from '@/features/canvas/ui/floatingPanelPosition';
 
 type VideoGenNodeProps = { id: string; data: VideoGenNodeData; selected?: boolean; width?: number; height?: number };
 
@@ -341,6 +350,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const promptHighlightRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const modelTriggerRef = useRef<HTMLDivElement>(null);
+  const modelPickerRef = useRef<HTMLDivElement>(null);
+  const [modelPickerPosition, setModelPickerPosition] = useState<FloatingPanelPosition | null>(null);
   const firstFrameInputRef = useRef<HTMLInputElement>(null);
   const lastFrameInputRef = useRef<HTMLInputElement>(null);
   const [promptDraft, setPromptDraft] = useState(() => data.prompt ?? '');
@@ -361,6 +373,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const selectedModel = getVideoModel(data.model) ?? getVideoModel(getDefaultVideoModelId());
   const imageMode = data.imageMode === 'first-last' ? 'first-last' : 'reference';
   const isJimengCli = selectedModel?.providerId === JIMENG_CLI_PROVIDER_ID;
+  const isWanCli = selectedModel?.providerId === 'wan-cli';
   const selectedProfile = selectedModel ? getVideoModelProfile(selectedModel.profileId) : null;
   const [modelPickerProviderId, setModelPickerProviderId] = useState(
     selectedModel?.providerId ?? ''
@@ -438,6 +451,29 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       setModelPickerProviderId(selectedModel.providerId);
     }
   }, [selectedModel?.providerId]);
+
+  useLayoutEffect(() => {
+    if (!showModelPicker || !modelTriggerRef.current || !modelPickerRef.current) return;
+    const updatePosition = () => {
+      const next = getFloatingPanelPosition(modelTriggerRef.current, modelPickerRef.current, {
+        align: 'start',
+        preferredSide: 'below',
+        fallbackSize: { width: 320, height: 340 },
+      });
+      if (next) setModelPickerPosition(next);
+    };
+    updatePosition();
+    const observer = new ResizeObserver(updatePosition);
+    observer.observe(modelTriggerRef.current);
+    observer.observe(modelPickerRef.current);
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [modelPickerProviderId, showModelPicker]);
   // 音频引用标签: 优先用音频节点自己的标题(素材名/文件名), 避免"音频1/音频2"分不清。
   // 默认标题"媒体"没有区分度, 视为未命名, 回退到文件名。
   const audioLabelBySource = useMemo(() => {
@@ -539,6 +575,17 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     ]
   );
 
+  // 推荐平台（如知鸟 AI / 炳火）在 registry 里没注册精确 pricing,
+  // 但 recommendedApis.pricingRange 仍登记了图片/视频/音频三类区间,
+  // 这里消费同一份数据到节点右上角,作为「精确价缺失时」的区间兜底。
+  const recommendedPriceBadge = useMemo(
+    () => price
+      ? null
+      : resolveRecommendedApiPriceBadge(selectedModel?.providerId, customApis, 'video'),
+    [customApis, price, selectedModel?.providerId],
+  );
+  const nodePrice = price ?? recommendedPriceBadge;
+
   useEffect(() => {
     updateNodeInternals(id);
   }, [id, resolvedHeight, resolvedWidth, updateNodeInternals]);
@@ -635,7 +682,11 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   // 浮层: 点击节点外部关闭
   useEffect(() => {
     const handleOutside = (event: MouseEvent) => {
-      if (rootRef.current?.contains(event.target as globalThis.Node)) {
+      const target = event.target as globalThis.Node;
+      if (
+        rootRef.current?.contains(target)
+        || modelPickerRef.current?.contains(target)
+      ) {
         return;
       }
       setShowImagePicker(false);
@@ -820,19 +871,26 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       void showErrorDialog(message, t('common.error'));
       return;
     }
+    if (isWanCli && (resolvedInputAudio.length > 0 || videoReferenceImages.length > 5)) {
+      const message = t(resolvedInputAudio.length > 0 ? 'wanCli.audioUnsupported' : 'wanCli.referenceLimit');
+      setError(message);
+      void showErrorDialog(message, t('common.error'));
+      return;
+    }
     const apiKey = apiKeys[selectedModel.providerId] ?? '';
-    if (!isJimengCli && !apiKey) {
+    if (!isJimengCli && !isWanCli && !apiKey) {
       const message = '请在设置中填写 API Key';
       setError(message);
       void showErrorDialog(message, t('common.error'));
       return;
     }
     const customId = selectedModel.providerId.slice('custom:'.length);
-    const baseUrl = isJimengCli ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
+    const baseUrl = isJimengCli || isWanCli ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
     // 立即创建下游视频节点(生成中状态), 成功后再填充视频地址, 失败时把错误写入节点。
     // 与 AI 图片节点一致: 点击生成即出现结果节点 + 连线, 报错信息显示在节点上。
     // 尺寸采用与图片结果节点相同的紧凑算法, 避免下游节点过大。
     const generationStartedAt = Date.now();
+    const clientJobId = isWanCli ? crypto.randomUUID() : id;
     const compactSize = resolveMinEdgeFittedSize(data.aspectRatio, {
       minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
       minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
@@ -854,7 +912,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         kind: 'video',
         // 作为支持幂等提交的平台的稳定请求键。重试同一个节点时复用，避免
         // 网络超时后重复创建任务或重复扣费。
-        clientJobId: id,
+        clientJobId,
         prompt,
         model: selectedModel.id,
         duration: selectedDuration,
@@ -863,7 +921,14 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         imageMode,
         referenceImages: videoReferenceImages,
         referenceAudio: resolvedInputAudio,
-        extraParams: {},
+        extraParams: {
+          // 炳火专用: reference_videos / skip_review 直接透传到 generateVideo(ai.ts)
+          // 的 extra_params, 后端按平台规则上传换 URL 并写入 body。
+          ...((data.binghuoReferenceVideos && data.binghuoReferenceVideos.length > 0)
+            ? { reference_videos: data.binghuoReferenceVideos.slice(0, 3) }
+            : {}),
+          ...(data.binghuoSkipReview === true ? { skip_review: true } : {}),
+        },
       },
     });
     updateNodeSize(outputId, compactSize.width, compactSize.height);
@@ -872,11 +937,11 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     setJimengCliStatus(isJimengCli ? { status: 'queued' } : null);
     setError(null);
     try {
-      if (!isJimengCli) {
+      if (!isJimengCli && !isWanCli) {
         await canvasAiGateway.setApiKey(selectedModel.providerId, apiKey);
       }
       const videoUrl = await canvasAiGateway.generateVideo({
-        clientJobId: id,
+        clientJobId,
         prompt,
         model: selectedModel.id,
         duration: selectedDuration,
@@ -885,7 +950,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         imageMode,
         referenceImages: videoReferenceImages,
         referenceAudio: resolvedInputAudio,
-        extraParams: {},
+        extraParams: {
+          ...((data.binghuoReferenceVideos && data.binghuoReferenceVideos.length > 0)
+            ? { reference_videos: data.binghuoReferenceVideos.slice(0, 3) }
+            : {}),
+          ...(data.binghuoSkipReview === true ? { skip_review: true } : {}),
+        },
       });
       recordGenerationOutcome({
         nodeId: outputId,
@@ -923,18 +993,61 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         errorMessage: resolved.message,
         durationMs: Date.now() - generationStartedAt,
       });
+      // 视频节点此前从不写 generationDebugContext, "复制错误报告"只会给出一份全空报告,
+      // 排查时看不到模型、参考素材数量与参数。失败路径必须把请求上下文落到节点上。
+      const runtimeDiagnostics = await getRuntimeDiagnostics().catch(() => null);
+      const generationDebugContext: GenerationDebugContext = {
+        sourceType: 'videoGen',
+        providerId: selectedModel.providerId,
+        requestModel: selectedModel.id,
+        requestAspectRatio: data.aspectRatio,
+        prompt,
+        extraParams: {
+          provider_base_url: baseUrl,
+          video_resolution: selectedVideoResolution,
+          image_mode: imageMode,
+        },
+        referenceImageCount: videoReferenceImages.length,
+        referenceImagePlaceholders: createReferenceImagePlaceholders(videoReferenceImages.length),
+        referenceAudioCount: resolvedInputAudio.length,
+        appVersion: runtimeDiagnostics?.appVersion,
+        osName: runtimeDiagnostics?.osName,
+        osVersion: runtimeDiagnostics?.osVersion,
+        osBuild: runtimeDiagnostics?.osBuild,
+        userAgent: runtimeDiagnostics?.userAgent,
+      };
       updateNodeData(outputId, {
         isGenerating: false,
         generationStartedAt: null,
         generationError: resolved.message,
         generationErrorDetails: resolved.details ?? null,
         generationClientSessionId: null,
+        generationDebugContext,
       });
-      void showErrorDialog(resolved.message, t('common.error'), resolved.details);
+      void showErrorDialog(
+        resolved.message,
+        t('common.error'),
+        resolved.details,
+        buildGenerationErrorReport({
+          errorMessage: resolved.message,
+          errorDetails: resolved.details,
+          context: generationDebugContext,
+        }),
+      );
     } finally {
       setIsGenerating(false);
     }
-  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, findNodePosition, firstLastFrameImages.length, flushPromptCommit, id, imageMode, inputText, resolvedInputAudio, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, setLastVideoDuration, t, updateNodeData, updateNodeSize, videoReferenceImages]);
+  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, data.binghuoReferenceVideos, data.binghuoSkipReview, findNodePosition, firstLastFrameImages.length, flushPromptCommit, id, imageMode, inputText, isWanCli, resolvedInputAudio, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, setLastVideoDuration, t, updateNodeData, updateNodeSize, videoReferenceImages]);
+
+  // 炳火高级字段: 仅当当前模型是炳火 API 时显示折叠面板。
+  // 字段名固定 reference_videos(手册 3.3 红字强调: videos / video_urls 部分模型被忽略)。
+  const binghuoReferenceVideos = data.binghuoReferenceVideos ?? [];
+  const binghuoSkipReview = data.binghuoSkipReview === true;
+  const isBinghuoModel =
+    typeof selectedModel?.providerId === 'string'
+    && selectedModel.providerId.startsWith('custom:')
+    && (customApis.find((api) => api.id === selectedModel.providerId.slice('custom:'.length))?.baseUrl ?? '')
+      .includes('7tai.cc');
 
   return (
     <div
@@ -948,7 +1061,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         titleText={title}
         editable
         onTitleChange={(displayName) => updateNodeData(id, { displayName })}
-        rightSlot={price ? <NodePriceBadge label={price.label} title={price.nativeLabel} /> : null}
+        rightSlot={nodePrice ? <NodePriceBadge label={nodePrice.label} title={nodePrice.nativeLabel} /> : null}
       />
       <div className="relative min-h-0 flex-1 rounded-md border border-border-dark bg-bg-dark/60">
         <div className="relative h-full min-h-0">
@@ -1263,7 +1376,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       <div className={`grid gap-1.5 ${imageMode === 'first-last'
         ? (resolutionOptions.length > 0 ? 'grid-cols-[minmax(0,1fr)_58px_72px]' : 'grid-cols-[minmax(0,1fr)_78px]')
         : (resolutionOptions.length > 0 ? 'grid-cols-[minmax(0,1fr)_58px_58px_72px]' : 'grid-cols-[minmax(0,1fr)_72px_78px]')}`}>
-        <div className="relative min-w-0">
+        <div ref={modelTriggerRef} className="relative min-w-0">
           <button
             type="button"
             className="nodrag flex h-8 w-full min-w-0 items-center justify-between gap-1 rounded border border-border-dark bg-bg-dark px-2 text-left text-xs text-text-dark"
@@ -1282,9 +1395,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             </span>
             <ChevronDown className={`h-3.5 w-3.5 shrink-0 transition-transform ${showModelPicker ? 'rotate-180' : ''}`} />
           </button>
-          {showModelPicker && (
+          {showModelPicker && typeof document !== 'undefined' && createPortal(
             <div
-              className="nodrag nowheel absolute left-0 top-[calc(100%+6px)] z-30 w-[320px] max-w-[calc(100vw-32px)] rounded-lg border border-[rgba(255,255,255,0.16)] bg-surface-dark p-3 shadow-xl"
+              ref={modelPickerRef}
+              className="nodrag nowheel fixed z-[160] w-[320px] max-w-[calc(100vw-32px)] rounded-lg border border-[rgba(255,255,255,0.16)] bg-surface-dark p-3 shadow-xl"
+              style={modelPickerPosition ?? undefined}
+              onPointerDown={(event) => event.stopPropagation()}
               onMouseDown={(event) => event.stopPropagation()}
               onWheelCapture={(event) => event.stopPropagation()}
             >
@@ -1347,7 +1463,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                   </section>
                 </div>
               )}
-            </div>
+            </div>,
+            document.body,
           )}
         </div>
         {imageMode !== 'first-last' && (
@@ -1431,12 +1548,66 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           )}
         </div>
       )}
+      {isWanCli && imageMode === 'first-last' && (
+        <span className="text-[11px] text-text-muted">{t('wanCli.frameRatio')}</span>
+      )}
       {selectedProfile && !isJimengCli && (
         <span className={`text-[11px] ${selectedProfile.status === 'verified' ? 'text-text-muted' : 'text-amber-400'}`}>
           {selectedProfile.protocolLabel}
         </span>
       )}
       {error && <span className="line-clamp-2 text-[11px] text-red-400">{error}</span>}
+      {isBinghuoModel && (
+        <details
+          className="nodrag rounded-md border border-border-dark/70 bg-bg-dark/40 px-2 py-1 text-[11px] text-text-muted open:pb-2"
+          onClick={(event) => event.stopPropagation()}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <summary className="nodrag cursor-pointer select-none text-text-dark">{t('node.videoGen.binghuoAdvanced')}</summary>
+          <div className="nodrag mt-2 flex flex-col gap-2">
+            <label className="flex flex-col gap-1">
+              <span className="flex items-center justify-between">
+                <span>{t('node.videoGen.binghuoReferenceVideosLabel')}</span>
+                <span className="text-text-muted">
+                  {t('node.videoGen.binghuoReferenceVideosCount', { count: binghuoReferenceVideos.length })}
+                </span>
+              </span>
+              <textarea
+                className="nodrag min-h-[64px] resize-y rounded-md border border-border-dark/70 bg-bg-dark px-2 py-1 font-mono text-[11px] text-text-dark focus:border-accent/60 focus:outline-none"
+                placeholder="https://…/clip1.mp4&#10;https://…/clip2.mp4"
+                value={binghuoReferenceVideos.join('\n')}
+                spellCheck={false}
+                onChange={(event) => {
+                  const urls = event.target.value
+                    .split(/\r?\n/)
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                    .slice(0, 3);
+                  updateNodeData(id, { binghuoReferenceVideos: urls });
+                }}
+                onClick={(event) => event.stopPropagation()}
+                onMouseDown={(event) => event.stopPropagation()}
+                onKeyDown={(event) => event.stopPropagation()}
+              />
+              <span className="leading-snug text-text-muted/90">{t('node.videoGen.binghuoReferenceVideosHint')}</span>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  className="nodrag h-3.5 w-3.5 accent-accent"
+                  checked={binghuoSkipReview}
+                  onChange={(event) => updateNodeData(id, { binghuoSkipReview: event.target.checked })}
+                  onClick={(event) => event.stopPropagation()}
+                  onMouseDown={(event) => event.stopPropagation()}
+                />
+                <span>{t('node.videoGen.binghuoSkipReviewLabel')}</span>
+              </span>
+              <span className="leading-snug text-text-muted/90">{t('node.videoGen.binghuoSkipReviewHint')}</span>
+            </label>
+          </div>
+        </details>
+      )}
       <button type="button" disabled={isGenerating || !selectedModel || (!promptDraft.trim() && inputText.length === 0)} onClick={() => void handleGenerate()} className="nodrag mt-auto flex h-8 items-center justify-center gap-1.5 rounded-md bg-accent text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-45">
         {isGenerating ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
         {isGenerating ? '生成中…' : '生成视频'}

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ProjectV2 } from "../shared-types";
-import { migrateProject, seedProject } from "./model";
+import { migrateProject, SCHEMA_VERSION, seedProject } from "./model";
 
 describe("project optics migration", () => {
   it("uses a neutral project seed instead of the old Rain Night demo", () => {
@@ -29,7 +29,7 @@ describe("project optics migration", () => {
       scenes: [],
     } as unknown as ProjectV2;
     const migrated = migrateProject(project);
-    expect(migrated.schemaVersion).toBe(3);
+    expect(migrated.schemaVersion).toBe(SCHEMA_VERSION);
     expect(migrated.projectCode).toBe("cully-hill-boys");
     expect(migrated.assets![0]).toMatchObject({
       variantGroupId: "kel",

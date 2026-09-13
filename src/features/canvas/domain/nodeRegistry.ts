@@ -5,6 +5,7 @@ import {
   EXPORT_RESULT_NODE_DEFAULT_WIDTH,
   EXPORT_RESULT_NODE_LAYOUT_HEIGHT,
   type AudioNodeData,
+  type AudioGenNodeData,
   type CinematicStudioNodeData,
   type DirectorDeskNodeData,
   type ImageSize,
@@ -23,8 +24,9 @@ import {
   type SeamlessMosaicNodeData,
 } from './canvasNodes';
 import { DEFAULT_NODE_DISPLAY_NAME } from './nodeDisplay';
-import { getDefaultImageModelId, getImageModel } from '../models';
+import { getAudioModel, getDefaultAudioModelId, getDefaultImageModelId, getImageModel } from '../models';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { createCinematicProjectId } from '@/features/cinematicStudio/app/projectId';
 
 export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music' | 'video' | 'mosaic' | 'clapperboard';
 
@@ -401,18 +403,34 @@ const cinematicStudioNodeDefinition: CanvasNodeDefinition<CinematicStudioNodeDat
   },
   createDefaultData: () => ({
     displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.cinematicStudio],
+    // 每个新建的工作室节点领取一份独立工程 id：打开时不会带上别的节点/上一次的内容。
+    studioProjectId: createCinematicProjectId(),
     lastProjectTitle: null,
     lastProjectDescription: null,
     lastPromptPreview: null,
+    quickStyle: '',
+    quickSynopsis: '',
+    quickChatProvider: '',
+    quickChatModel: '',
+    quickSyncInitialized: false,
+    quickStudioSceneId: '',
+    quickStaging: {},
+    quickSceneAssetIds: [],
+    quickCharacterAssetIds: [],
+    quickPrompt: null,
+    quickReferenceImages: [],
+    imagePromptDraft: '',
+    imagePromptResult: '',
   }),
-  defaultSize: { width: 280, height: 200 },
+  defaultSize: { width: 430, height: 700 },
 };
 
 const promptOptimizerNodeDefinition: CanvasNodeDefinition<PromptOptimizerNodeData> = {
   type: CANVAS_NODE_TYPES.promptOptimizer,
   menuLabelKey: 'node.menu.promptOptimizer',
   menuIcon: 'sparkles',
-  visibleInMenu: true,
+  // 已合并到「提示词工作室」节点，保留注册仅用于兼容旧画布数据。
+  visibleInMenu: false,
   capabilities: {
     toolbar: true,
     promptInput: true,
@@ -477,6 +495,32 @@ const seamlessMosaicNodeDefinition: CanvasNodeDefinition<SeamlessMosaicNodeData>
   defaultSize: { width: 260, height: 200 },
 };
 
+const audioGenNodeDefinition: CanvasNodeDefinition<AudioGenNodeData> = {
+  type: CANVAS_NODE_TYPES.audioGen,
+  menuLabelKey: 'node.menu.aiAudioGeneration',
+  menuIcon: 'music',
+  visibleInMenu: true,
+  capabilities: { toolbar: true, promptInput: false },
+  connectivity: { sourceHandle: true, targetHandle: true, connectMenu: { fromSource: true, fromTarget: false } },
+  createDefaultData: () => {
+    // 与「AI 图片」节点同构:默认选中第一个可用音频模型,模型失效时下拉会提示重选。
+    const modelId = getDefaultAudioModelId();
+    const model = modelId ? getAudioModel(modelId) : undefined;
+    return {
+      displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.audioGen],
+      prompt: '',
+      model: modelId,
+      audioKind: model?.audioKind ?? 'speech',
+      voice: model?.defaultVoice,
+      format: model?.defaultFormat ?? 'mp3',
+      durationSeconds: 5,
+      musicLengthMs: model?.defaultMusicLengthMs ?? 30000,
+      lyrics: '',
+    };
+  },
+  defaultSize: { width: 400, height: 340 },
+};
+
 export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition> = {
   [CANVAS_NODE_TYPES.upload]: uploadNodeDefinition,
   [CANVAS_NODE_TYPES.imageEdit]: imageEditNodeDefinition,
@@ -490,6 +534,7 @@ export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition>
   [CANVAS_NODE_TYPES.panorama]: panoramaNodeDefinition,
   [CANVAS_NODE_TYPES.directorDesk]: directorDeskNodeDefinition,
   [CANVAS_NODE_TYPES.audio]: audioNodeDefinition,
+  [CANVAS_NODE_TYPES.audioGen]: audioGenNodeDefinition,
   [CANVAS_NODE_TYPES.promptOptimizer]: promptOptimizerNodeDefinition,
   [CANVAS_NODE_TYPES.seamlessMosaic]: seamlessMosaicNodeDefinition,
 };

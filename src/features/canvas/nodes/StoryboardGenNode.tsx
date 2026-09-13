@@ -69,6 +69,7 @@ import {
 } from '@/components/ui';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
+import { resolveRecommendedApiPriceBadge } from './nodePriceBadge';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import {
   NODE_CONTROL_CHIP_CLASS,
@@ -784,6 +785,16 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     return lines.join('\n');
   }, [i18n.language, resolvedPriceDisplay, t]);
 
+  // 推荐平台（如知鸟 AI / 炳火）的模型未注册精确 pricing,
+  // 用 recommendedApis.pricingRange.image 区间作为右上角徽章的兜底。
+  const recommendedPriceBadge = useMemo(
+    () => resolvedPriceDisplay
+      ? null
+      : resolveRecommendedApiPriceBadge(selectedModel?.providerId, customApis, 'image'),
+    [customApis, resolvedPriceDisplay, selectedModel?.providerId],
+  );
+  const displayedPriceBadge = resolvedPriceDisplay ?? recommendedPriceBadge;
+
   const supportedAspectRatioValues = useMemo(
     () => selectedModel.aspectRatios.map((item) => item.value),
     [selectedModel.aspectRatios]
@@ -1495,10 +1506,10 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
         iconAdjust={STORYBOARD_GEN_ICON_ADJUST}
         titleAdjust={STORYBOARD_GEN_TITLE_ADJUST}
         rightSlot={
-          resolvedPriceDisplay ? (
+          displayedPriceBadge ? (
             <NodePriceBadge
-              label={resolvedPriceDisplay.label}
-              title={resolvedPriceTooltip}
+              label={displayedPriceBadge.label}
+              title={resolvedPriceTooltip ?? displayedPriceBadge.nativeLabel}
             />
           ) : undefined
         }

@@ -25,7 +25,7 @@ import {
 } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
 import { isTauri } from "@tauri-apps/api/core";
-import { AlignJustify, Film, Keyboard, Layers, Library, Magnet } from "lucide-react";
+import { AlignJustify, Bot, Film, Keyboard, Layers, Library, Magnet } from "lucide-react";
 import "@xyflow/react/dist/style.css";
 
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -73,6 +73,7 @@ import { ImageViewerModal } from "./ui/ImageViewerModal";
 import { VideoFrameExtractDialog } from "./ui/VideoFrameExtractDialog";
 import { ShortcutSettingsDialog } from "./ui/ShortcutSettingsDialog";
 import { AssetLibraryPanel } from "@/features/library/AssetLibraryPanel";
+import { AgentPanel } from "@/features/agent/AgentPanel";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
 import {
   ASSET_DRAG_DATA_TYPE,
@@ -83,6 +84,9 @@ import {
 } from "@/features/library/importAssets";
 import { usePromptLibraryStore, type PromptTemplate } from "@/features/prompts/promptLibraryStore";
 import { UiButton, UiInput, UiModal } from "@/components/ui";
+import type { CinematicAssetLibraryBridge } from "@/features/library/AssetLibraryPanel";
+import { duplicateCinematicProject } from "@/features/cinematicStudio/app/model";
+import { createCinematicProjectId } from "@/features/cinematicStudio/app/projectId";
 
 const DEFAULT_VIEWPORT: Viewport = { x: 0, y: 0, zoom: 1 };
 
@@ -432,7 +436,9 @@ export function Canvas() {
   const [pendingConnectStart, setPendingConnectStart] = useState<PendingConnectStart | null>(null);
   const [previewConnectionVisual, setPreviewConnectionVisual] = useState<PreviewConnectionVisual | null>(null);
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
+  const [cinematicAssetLibrary, setCinematicAssetLibrary] = useState<CinematicAssetLibraryBridge | null>(null);
   const [isVideoExtractOpen, setIsVideoExtractOpen] = useState(false);
+  const [isAgentOpen, setIsAgentOpen] = useState(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   /** 双击框选: 选择矩形(相对画布容器坐标) */
   const [dragSelectRect, setDragSelectRect] = useState<{
@@ -472,6 +478,24 @@ export function Canvas() {
     recoveryMountedRef.current = true;
     return () => {
       recoveryMountedRef.current = false;
+    };
+  }, []);
+
+  // Cinematic Studio reuses the canvas library as its sole asset entry point.
+  useEffect(() => {
+    const openLibrary = () => setIsLibraryOpen(true);
+    const registerCinematicLibrary = (event: Event) => {
+      const detail = (event as CustomEvent<CinematicAssetLibraryBridge>).detail;
+      if (detail?.project && detail?.scene) setCinematicAssetLibrary(detail);
+    };
+    const unregisterCinematicLibrary = () => setCinematicAssetLibrary(null);
+    window.addEventListener("lentalk:open-asset-library", openLibrary);
+    window.addEventListener("lentalk:register-cinematic-asset-library", registerCinematicLibrary);
+    window.addEventListener("lentalk:unregister-cinematic-asset-library", unregisterCinematicLibrary);
+    return () => {
+      window.removeEventListener("lentalk:open-asset-library", openLibrary);
+      window.removeEventListener("lentalk:register-cinematic-asset-library", registerCinematicLibrary);
+      window.removeEventListener("lentalk:unregister-cinematic-asset-library", unregisterCinematicLibrary);
     };
   }, []);
 
@@ -1021,7 +1045,7 @@ export function Canvas() {
             typeof currentData?.generationProviderId === "string"
               ? currentData.generationProviderId
               : (model.split("/")[0] ?? "");
-          if (providerId && !model.startsWith("jimeng-cli/")) {
+          if (providerId && !model.startsWith("jimeng-cli/") && !model.startsWith("wan-cli/")) {
             const providerApiKey = apiKeys[providerId] ?? "";
             if (providerApiKey) await canvasAiGateway.setApiKey(providerId, providerApiKey);
           }
@@ -1204,8 +1228,10 @@ export function Canvas() {
     [setViewportState],
   );
 
-  const handleMoveStart = useCallback(() => {
+  const handleMoveStart = useCallback((event: unknown) => {
     cancelPendingViewportPersist();
+    // 用户主动平移/缩放画布时收起素材库; 程序化 setViewport 的 event 为 null, 不误伤
+    if (event) setIsLibraryOpen(false);
   }, [cancelPendingViewportPersist]);
 
   useEffect(() => {
@@ -1742,6 +1768,10 @@ export function Canvas() {
 
   const handlePaneClick = useCallback(
     (event: ReactMouseEvent) => {
+      // 点击画布区域自动收起素材库侧边栏(面板内部点击不会走到 pane, 不误伤)
+      setIsLibraryOpen(false);
+      setIsAgentOpen(false);
+
       if (suppressNextPaneClickRef.current) {
         suppressNextPaneClickRef.current = false;
         return;
@@ -2242,6 +2272,16 @@ export function Canvas() {
         if ("generationDebugContext" in (data as Record<string, unknown>)) {
           (data as { generationDebugContext?: unknown }).generationDebugContext = undefined;
         }
+        if (sourceNode.type === CANVAS_NODE_TYPES.cinematicStudio) {
+          // 工作室节点各自持有一份工程：复制节点时分配新工程并把内容复制过去，
+          // 让副本能独立编辑，而不是和原节点共享同一份数据。
+          const sourceProjectId = typeof (data as { studioProjectId?: unknown }).studioProjectId === "string"
+            ? (data as { studioProjectId: string }).studioProjectId
+            : "";
+          const nextProjectId = createCinematicProjectId();
+          if (sourceProjectId) void duplicateCinematicProject(sourceProjectId, nextProjectId);
+          (data as { studioProjectId?: string }).studioProjectId = nextProjectId;
+        }
 
         const nextNodeId = addNode(
           sourceNode.type as CanvasNodeType,
@@ -2345,6 +2385,8 @@ export function Canvas() {
 
   const handleNodeDragStart = useCallback(
     (event: ReactMouseEvent, node: CanvasNode) => {
+      // 拖拽画布节点也视为画布区交互, 收起素材库侧边栏
+      setIsLibraryOpen(false);
       if (groupDragFeedbackTimerRef.current !== null) {
         window.clearTimeout(groupDragFeedbackTimerRef.current);
         groupDragFeedbackTimerRef.current = null;
@@ -3054,6 +3096,8 @@ export function Canvas() {
         onNodeDrag={handleNodeDrag}
         onNodeDragStop={handleNodeDragStop}
         onPaneClick={handlePaneClick}
+        // 点击画布上的节点同样收起素材库侧边栏
+        onNodeClick={() => { setIsLibraryOpen(false); setIsAgentOpen(false); }}
         onNodeContextMenu={(event, node) => handleNodeContextMenu(event, node as CanvasNode)}
         onDragOver={handleAssetLibraryDragOver}
         onDrop={handleCanvasDrop}
@@ -3208,6 +3252,15 @@ export function Canvas() {
           <span className="hidden sm:inline">{t("canvas.toolbar.library", "素材库")}</span>
         </button>
         <button
+          type="button"
+          onClick={() => setIsAgentOpen((open) => !open)}
+          className={`flex h-9 items-center gap-1.5 rounded-lg border px-3 text-sm font-medium shadow-lg transition-colors ${isAgentOpen ? "border-accent bg-accent/15 text-accent" : "border-border-dark bg-surface-dark text-text-dark hover:bg-bg-dark"}`}
+          title="AI Agent"
+        >
+          <Bot className="h-4 w-4 text-accent" />
+          <span>AI Agent</span>
+        </button>
+        <button
           onClick={() => setIsVideoExtractOpen(true)}
           className="flex h-9 items-center gap-1.5 rounded-lg border border-border-dark bg-surface-dark px-3 text-sm font-medium text-text-dark shadow-lg transition-colors hover:bg-bg-dark"
           title={t("canvas.toolbar.videoExtract", "视频帧抽取")}
@@ -3287,9 +3340,12 @@ export function Canvas() {
         open={isLibraryOpen}
         onClose={() => setIsLibraryOpen(false)}
         onApplyPrompt={handleApplyPromptTemplate}
+        cinematicAssetLibrary={cinematicAssetLibrary}
       />
 
       <VideoFrameExtractDialog open={isVideoExtractOpen} onClose={() => setIsVideoExtractOpen(false)} />
+
+      <AgentPanel open={isAgentOpen} onClose={() => setIsAgentOpen(false)} />
 
       <ShortcutSettingsDialog open={isShortcutsOpen} onClose={() => setIsShortcutsOpen(false)} />
 

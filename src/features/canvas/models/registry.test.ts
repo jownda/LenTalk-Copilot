@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { listImageModels, listVideoModels } from './registry';
+import { listAudioModels, listImageModels, listVideoModels } from './registry';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { isVideoGenerationModelName, useSettingsStore, type CustomApiProvider } from '@/stores/settingsStore';
 
@@ -40,6 +40,7 @@ describe('listVideoModels', () => {
       apiKey: '',
       models: [],
       videoModels: ['seedance2.0', 'seedance2.5'],
+      audioModels: [],
       chatModels: [],
       createdAt: Date.now(),
       requestMode: 'sync',
@@ -80,6 +81,7 @@ describe('listVideoModels', () => {
       apiKey: '',
       models: [],
       videoModels: ['seedance2.5'],
+      audioModels: [],
       chatModels: [],
       createdAt: Date.now(),
       requestMode: 'sync',
@@ -108,7 +110,8 @@ describe('listVideoModels', () => {
       baseUrl: 'https://api.7tai.cc/v1',
       apiKey: '',
       models: [],
-      videoModels: ['gz-sd720p', 'tj-sp2.5', 'minimax-h3-pro-768p'],
+      videoModels: ['gz-sd720p', 'tj-sp2.5', 'minimax-h3-pro-768p', 'minimax-h3-pro-2k'],
+      audioModels: [],
       chatModels: [],
       createdAt: Date.now(),
       requestMode: 'sync',
@@ -123,7 +126,8 @@ describe('listVideoModels', () => {
       const models = listVideoModels();
       const standard = models.find((model) => model.id.endsWith('/gz-sd720p'));
       const fixed = models.find((model) => model.id.endsWith('/tj-sp2.5'));
-      const minimax = models.find((model) => model.id.endsWith('/minimax-h3-pro-768p'));
+      const minimax768 = models.find((model) => model.id.endsWith('/minimax-h3-pro-768p'));
+      const minimax2k = models.find((model) => model.id.endsWith('/minimax-h3-pro-2k'));
 
       expect(standard?.durationOptions).toEqual(Array.from({ length: 12 }, (_, index) => index + 4));
       expect(standard?.resolutions?.map((option) => option.value)).toEqual(['720P']);
@@ -141,7 +145,20 @@ describe('listVideoModels', () => {
         extraParams: { duration: 30 },
         language: 'zh-CN',
       })?.label).toContain('3.85');
-      expect(minimax?.aspectRatios.map((option) => option.value)).toEqual(['16:9', '9:16']);
+      expect(minimax768?.aspectRatios.map((option) => option.value)).toEqual(['16:9', '9:16']);
+      expect(minimax768?.resolutions?.map((option) => option.value)).toEqual(['768P']);
+      expect(minimax2k?.resolutions?.map((option) => option.value)).toEqual(['2K']);
+      expect(minimax2k?.durationOptions).toEqual(Array.from({ length: 12 }, (_, index) => index + 4));
+      expect(resolveModelPriceDisplay(minimax768!, {
+        resolution: '768P',
+        extraParams: { duration: 10 },
+        language: 'zh-CN',
+      })?.label).toContain('0.50');
+      expect(resolveModelPriceDisplay(minimax2k!, {
+        resolution: '2K',
+        extraParams: { duration: 10 },
+        language: 'zh-CN',
+      })?.label).toContain('0.25');
     } finally {
       useSettingsStore.setState({ customApis: previousCustomApis });
     }
@@ -156,6 +173,7 @@ describe('listVideoModels', () => {
       apiKey: '',
       models: ['bh2.0-720p', 'SD2.5-720p', 'gpt-image-2'],
       videoModels: [],
+      audioModels: [],
       chatModels: [],
       createdAt: Date.now(),
       requestMode: 'sync',
@@ -174,6 +192,59 @@ describe('listVideoModels', () => {
       expect(imageModels.some((model) => model.id.endsWith('/bh2.0-720p'))).toBe(false);
       expect(imageModels.some((model) => model.id.endsWith('/SD2.5-720p'))).toBe(false);
       expect(imageModels.some((model) => model.id.endsWith('/gpt-image-2'))).toBe(true);
+    } finally {
+      useSettingsStore.setState({ customApis: previousCustomApis });
+    }
+  });
+});
+
+describe('listAudioModels(字子动画)', () => {
+  it('按模型名把音频分成 语音合成 / 音效 / 音乐 三类, 且不混进图片或视频列表', () => {
+    const previousCustomApis = useSettingsStore.getState().customApis;
+    const zzdh: CustomApiProvider = {
+      id: '字子动画',
+      name: '字子动画',
+      baseUrl: 'https://www.zizidonghua.com',
+      apiKey: '',
+      models: ['qwen-image-3.0'],
+      videoModels: ['zzdh-Minimax-h3-720p'],
+      audioModels: [
+        'eleven_multilingual_v2',
+        'eleven_text_to_sound_v2',
+        'eleven_music_v1',
+        'indextts2-v1',
+      ],
+      chatModels: [],
+      createdAt: Date.now(),
+      requestMode: 'sync',
+      protocol: 'images',
+      referenceImageField: 'reference_images',
+      referenceImageEncoding: 'auto',
+      imageTransport: 'auto',
+    };
+
+    useSettingsStore.setState({ customApis: [zzdh] });
+    try {
+      const audioModels = listAudioModels();
+      const byModel = (name: string) =>
+        audioModels.find((model) => model.id === `custom:字子动画/${name}`);
+
+      expect(byModel('eleven_multilingual_v2')?.audioKind).toBe('speech');
+      expect(byModel('indextts2-v1')?.audioKind).toBe('speech');
+      expect(byModel('eleven_text_to_sound_v2')?.audioKind).toBe('sound-effects');
+      expect(byModel('eleven_music_v1')?.audioKind).toBe('music');
+
+      // 语音合成才有音色/格式; 音乐才有长度选项。
+      expect(byModel('eleven_multilingual_v2')?.defaultFormat).toBe('mp3');
+      expect(byModel('eleven_music_v1')?.defaultMusicLengthMs).toBe(30000);
+      expect(byModel('eleven_multilingual_v2')?.defaultMusicLengthMs).toBeUndefined();
+
+      // 平台对音频按用量比例计费, 没有可按次展示的固定价 —— 宁可不显示, 也不显示错价。
+      expect(byModel('eleven_multilingual_v2')?.pricing).toBeUndefined();
+
+      // 音频模型不能同时出现在图片/视频下拉里。
+      expect(listImageModels().some((model) => model.id.includes('eleven_'))).toBe(false);
+      expect(listVideoModels().some((model) => model.id.includes('eleven_'))).toBe(false);
     } finally {
       useSettingsStore.setState({ customApis: previousCustomApis });
     }

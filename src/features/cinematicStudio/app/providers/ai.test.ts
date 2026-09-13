@@ -1,8 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { Asset, ProjectV2, SceneV2 } from "../../shared-types";
-import { AI_RESPONSE_TIMEOUT_MS, buildFinalGenerationSource, buildFinalPromptRequest, ChatCompletionInterruptedError, classifyError, collectSceneAssetIds, normalizeContinuityRepairPatch, normalizeSceneDraft, readChatCompletionText, sanitizeFinalPromptResponse, SCENE_DRAFT_JSON_SCHEMA } from "./ai";
+import { AI_RESPONSE_TIMEOUT_MS, assembleHybridFinalPrompt, buildFinalGenerationSource, buildFinalPromptRequest, ChatCompletionInterruptedError, classifyError, collectSceneAssetIds, normalizeContinuityRepairPatch, normalizeSceneDraft, prepareReferenceImageSource, readChatCompletionText, sanitizeFinalPromptResponse, SCENE_DRAFT_JSON_SCHEMA } from "./ai";
+import { buildQuickPromptRequest } from "./quickPromptAgent";
 import { LocalSuggestionProvider } from "../../engine/ai/assistant";
+import { extractFirstPersonPovLock, renderFirstPersonPovLock } from "../../engine/story-supplement";
 
 const assets: Asset[] = [
   { id: "location", kind: "location", name: "车厢", description: "carriage", referencePaths: [], lockLevel: "none", tags: [] },
@@ -30,6 +32,25 @@ const project: ProjectV2 = {
 };
 
 describe("collectSceneAssetIds", () => {
+  it("极简节点 Agent 只使用显式输入，并保留素材引用与表演规则", () => {
+    const request = buildQuickPromptRequest({
+      style: "低饱和雨夜胶片质感",
+      synopsis: "警察在车厢里盯住说谎的乘客，随后压低声音追问。",
+      sceneAssets: [{ id: "scene", name: "车厢", description: "深夜列车车厢", referenceIndex: 1 }],
+      characterAssets: [{ id: "hero", name: "林警官", description: "克制、警觉的中年警察", referenceIndex: 2 }],
+    }, "zh");
+
+    expect(request.system).toContain("CINEDANCE V4");
+    expect(request.system).toContain("ACTING SYSTEM");
+    expect(request.system).toContain("behavior under immediate pressure");
+    // locale 决定成品提示词语言：中文界面要求输出中文成品，英文界面要求英文成品。
+    expect(request.system).toContain("Write in clear, cinematic Chinese.");
+    expect(request.user).toContain("低饱和雨夜胶片质感");
+    expect(request.user).toContain("@车厢 [image1]");
+    expect(request.user).toContain("@林警官 [image2]");
+    expect(request.user).not.toContain("未选择素材");
+  });
+
   it("只解析修复补丁白名单字段，不接受任意项目重写字段", () => {
     const patch = normalizeContinuityRepairPatch({
       patch: {
@@ -79,6 +100,13 @@ describe("collectSceneAssetIds", () => {
     ].join("\n"), { headers: { "Content-Type": "text/event-stream" } });
     expect(await readChatCompletionText(progressStream, (count) => received.push(count))).toBe("第一段第二段");
     expect(received).toEqual([3, 6]);
+
+    const eofWithoutDone = new Response(
+      `data: ${JSON.stringify({ choices: [{ delta: { content: '{"shots":[]}' } }] })}\n`,
+      { headers: { "Content-Type": "text/event-stream" } },
+    );
+    await expect(readChatCompletionText(eofWithoutDone, undefined, { allowUnterminatedEof: true }))
+      .resolves.toBe('{"shots":[]}');
 
     const neverClosedAfterDone = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -151,7 +179,10 @@ describe("collectSceneAssetIds", () => {
     expect(request.user).toContain("不输出任何首帧占位"); // 首帧已从最终导出整体移除
     expect(request.user).toContain("FORMAT MODE 是本次生成的整体执行格式摘要");
     expect(request.user).toContain("两个段落，一次甩切");
+    expect(request.user).toContain("格式模式范围锁（优先级高于上文）：只写生成组织方式、总时长、段数、画幅、速度和镜头连接顺序");
+    expect(request.user).toContain("正向约束范围锁（优先级高于上文）：只写模型容易犯错且必须锁死的事实");
     expect(request.user).toContain("CAMERA 必须先写一段适用于全程的总摄影机描述");
+    expect(request.user).toContain("摄像机范围锁（优先级高于上文）：只写运镜路径、速度/力度、触发事件、停止或落点");
     expect(request.user).toContain("OPTICS 是镜头执行的结构化真源");
     expect(request.user).toContain("第 1 段：……");
     expect(request.user).toContain("STYLE 是导演文档中的本地风格原文");
@@ -168,7 +199,10 @@ describe("collectSceneAssetIds", () => {
     expect(request.system).toContain("silent QA before output");
     expect(request.user).toContain("Output only clear, cinematic-grade English");
     expect(request.user).toContain("STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING");
-    expect(request.user).toContain("attach acting to the corresponding shot and character inside ACTION TIMING");
+    expect(request.user).toContain("the PERFORMANCE section is generated locally per shot and inserted verbatim");
+    expect(request.user).toContain("never write character acting, micro-expression, eye life, or eyeline inside ACTION TIMING");
+    // 动作节奏必须明确禁止复述机位配置，否则模型会把 CAMERA / OPTICS 再抄一遍。
+    expect(request.user).toContain("never open a segment with a camera recital in place of its action");
     expect(request.user).toContain("SCENE MAP AND STAGING is one section");
     expect(request.user).toContain("output one scene-level master map only");
     expect(request.user).toContain("Do not output any first-frame occupancy block");
@@ -281,6 +315,19 @@ describe("collectSceneAssetIds", () => {
 
     expect(source).toContain("OPTICS:\n镜头 1：12° 超长焦；景别：紧凑双人镜头");
     expect(source).not.toContain("过期的 84° 广角光学文本。");
+  });
+
+  it("最终生成始终采用镜头检查器手动选择的相机型号，而不是规划时预填的相机层快照", () => {
+    const manualCameraScene: SceneV2 = {
+      ...scene,
+      shots: [{ ...scene.shots[0], camera: "sony-venice-2" }],
+      directorLayers: { camera: "相机型号：ARRI ALEXA 35（规划时预填的旧快照）。" },
+    };
+
+    const source = buildFinalGenerationSource(project, manualCameraScene, "zh");
+
+    expect(source).toContain("相机型号：SONY VENICE 2");
+    expect(source).not.toContain("ARRI ALEXA 35");
   });
 
   it("最终生成遇到导演文档空间冲突时，以结构化镜头站位作为空间层兜底", () => {
@@ -452,6 +499,121 @@ describe("collectSceneAssetIds", () => {
     expect(result.scene.shots[0].optics).toMatchObject({ lensCharacter: "29-short-tele", fieldOfViewDegrees: 29 });
   });
 
+  it("将第一层表演节拍绑定到第二层镜头，并过滤不存在的节拍 id", () => {
+    const plannedScene: SceneV2 = {
+      ...scene,
+      performancePlan: {
+        id: "performance-plan-1",
+        status: "confirmed",
+        characterPlans: [{ characterId: "hero", objective: "让阿俊承认隐瞒" }],
+        beats: [{ id: "performance-beat-1", order: 1, actorId: "hero", targetCharacterId: "support", action: "手指在烟盒边缘停住，先看见阿俊回避的视线" }],
+        version: 1,
+      },
+    };
+    const result = normalizeSceneDraft(project, plannedScene, {
+      shots: [{
+        label: "确认",
+        time: { startSeconds: 0, endSeconds: 5 },
+        movement: "Dolly",
+        direction: "left-to-right",
+        action: "林警官逼近阿俊",
+        performanceDescription: "林警官的手指停在烟盒边缘，目光先捕捉阿俊回避的眼神。",
+        lightingBehavior: "顶灯在林警官左后上方，靠近时左脸亮部收窄，阿俊身后的车窗反光变亮。",
+        backgroundActivity: "后景乘客错开整理背包和避让过道，靠门的人短暂停住。",
+        participants: [{ characterId: "hero", role: "primary" }, { characterId: "support", role: "target" }],
+        planningMeta: {
+          performanceBeatIds: ["performance-beat-1", "unknown"],
+          shotIntent: "让回避成为可见证据",
+          cameraTrigger: "阿俊移开目光",
+          cameraEndState: "停在两人之间的紧张距离",
+        },
+      }],
+    }, "秒");
+
+    expect(result.scene.shots[0].planningMeta).toEqual({
+      status: "confirmed",
+      performanceBeatIds: ["performance-beat-1"],
+      shotIntent: "让回避成为可见证据",
+      cameraTrigger: "阿俊移开目光",
+      cameraEndState: "停在两人之间的紧张距离",
+    });
+    expect(result.scene.shots[0]).toMatchObject({
+      lightingBehavior: "顶灯在林警官左后上方，靠近时左脸亮部收窄，阿俊身后的车窗反光变亮。",
+      backgroundActivity: "后景乘客错开整理背包和避让过道，靠门的人短暂停住。",
+    });
+  });
+
+  it("将故事梗概里的全程第一人称 POV 升级为跨镜头锁，并排除视角持有者", () => {
+    const ajian: Asset = { id: "ajian", kind: "character", name: "阿健", description: "", referencePaths: [], lockLevel: "none", tags: [] };
+    const rebecca: Asset = { id: "rebecca", kind: "character", name: "Rebecca", description: "", referencePaths: [], lockLevel: "none", tags: [] };
+    const povScene: SceneV2 = {
+      ...scene,
+      logline: "全程阿健第一人称 POV 视角拍摄 Rebecca 全身背影，阿健不出镜。",
+      staging: { ...scene.staging, characterRoster: [ajian.id, rebecca.id] },
+    };
+    const povProject = { ...project, assets: [...assets, ajian, rebecca] };
+    const lock = extractFirstPersonPovLock(povScene.logline);
+    expect(lock).toMatchObject({ operatorName: "阿健", hideOperator: true });
+    expect(renderFirstPersonPovLock(lock!, "zh")).toContain("禁止第三人称、旁观或反打机位");
+
+    const result = normalizeSceneDraft(povProject, povScene, {
+      shots: [{
+        label: "错误的第三人称覆盖镜头",
+        movement: "Crane",
+        cameraBehavior: { description: "摄影机从远处升起，俯瞰阿健与 Rebecca。" },
+        participants: [{ characterId: ajian.id, role: "primary" }],
+        action: "阿健走向 Rebecca",
+        direction: "left-to-right",
+      }],
+    }, "秒");
+
+    expect(result.scene.shots[0].movement).toBe("POV");
+    expect(result.scene.shots[0].participants).toEqual([]);
+    expect(result.scene.shots[0].cameraBehavior?.description).toContain("全程第一人称 POV 锁");
+  });
+
+  it("最终混合整理遇到 POV 锁时透传 canonical 相机与动作节奏，拒绝 AI 第三人称改写", () => {
+    const povSource = [
+      "STYLE:\n写实。",
+      "CAMERA:\n全程第一人称 POV 锁：摄影机即阿健的眼睛；禁止第三人称、旁观或反打机位；阿健绝不出镜，包括身体、脸、影子与倒影。",
+      "ACTION TIMING:\n0:00–0:05 — 镜头 1（相机：全程第一人称 POV 锁：摄影机即阿健的眼睛；POV运镜）：Rebecca移动。",
+      "FORMAT MODE:\n单次生成。",
+    ].join("\n\n");
+    const rewritten = [
+      "摄像机：第三人称环绕阿健和 Rebecca。",
+      "动作节奏：从 Rebecca 背后切到阿健正面。",
+      "格式模式：单次生成。",
+    ].join("\n");
+    const output = assembleHybridFinalPrompt(povSource, rewritten, "zh");
+
+    expect(output).toContain("全程第一人称 POV 锁：摄影机即阿健的眼睛");
+    expect(output).toContain("0:00–0:05 — 镜头 1（相机：全程第一人称 POV 锁");
+    expect(output).not.toContain("第三人称环绕");
+    expect(output).not.toContain("切到阿健正面");
+  });
+
+  it("最终生成的相机段始终透传 canonical（手动改动的型号为准），AI 输出的冲突摄像机/相机段被丢弃", () => {
+    const source = [
+      "STYLE:\n写实。",
+      "CAMERA:\n相机型号：ARRI ALEXA 35（用户手动修正）；相机行为：手持贴身跟随。",
+      "FORMAT MODE:\n单次生成。",
+    ].join("\n\n");
+    const rewritten = [
+      "摄像机：相机型号：SONY VENICE 2；固定机位观察。",
+      "相机：相机型号：RED KOMODO。",
+      "动作节奏：\n0:00–0:02：人物移动。",
+      "格式模式：\n单次生成。",
+    ].join("\n");
+    const output = assembleHybridFinalPrompt(source, rewritten, "zh");
+
+    expect(output).toContain("相机型号：ARRI ALEXA 35（用户手动修正）；相机行为：手持贴身跟随。");
+    expect(output).not.toContain("SONY VENICE 2");
+    expect(output).not.toContain("RED KOMODO");
+    // 相机段只保留一份，不再出现“相机 + 摄像机”两个标题并存
+    expect(output.match(/相机：/g)?.length).toBe(1);
+    expect(output).not.toContain("摄像机：");
+  });
+
   it("复杂镜头按可见事件保留超过八个节拍，不因固定数量被截断", () => {
     const beats = Array.from({ length: 13 }, (_, index) => ({
       order: index + 1,
@@ -473,6 +635,8 @@ describe("collectSceneAssetIds", () => {
     expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"activeReferences"');
     expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"firstFrame"');
     expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"actionTiming"');
+    expect(SCENE_DRAFT_JSON_SCHEMA).toContain('"lightingBehavior"');
+    expect(SCENE_DRAFT_JSON_SCHEMA).toContain('"backgroundActivity"');
     expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"sceneContext"');
     expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"actingObjectives"');
     expect(SCENE_DRAFT_JSON_SCHEMA).not.toContain('"firstFrameLock"');
@@ -487,5 +651,54 @@ describe("collectSceneAssetIds", () => {
     expect(SCENE_DRAFT_JSON_SCHEMA).toContain('"macro"');
     expect(SCENE_DRAFT_JSON_SCHEMA).toContain('"emotionArc"');
     expect(SCENE_DRAFT_JSON_SCHEMA).toContain('"startSeconds": number | null');
+  });
+});
+
+describe("prepareReferenceImageSource", () => {
+  it("公网地址直接透传，不重复下载图片", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    try {
+      await expect(prepareReferenceImageSource("https://cdn.example.com/ref.jpg"))
+        .resolves.toBe("https://cdn.example.com/ref.jpg");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("本机文件路径（素材库 sourcePath）转成 data URL，模型才能取到图", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalFileReader = (globalThis as { FileReader?: unknown }).FileReader;
+    const fetchSpy = vi.fn(async () => new Response(new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" })));
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    class FakeFileReader {
+      result: string | null = null;
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      readAsDataURL(): void {
+        this.result = "data:image/png;base64,QUJD";
+        this.onload?.();
+      }
+    }
+    (globalThis as { FileReader?: unknown }).FileReader = FakeFileReader;
+    try {
+      await expect(prepareReferenceImageSource("/Users/job/Pictures/ref.png"))
+        .resolves.toBe("data:image/png;base64,QUJD");
+      expect(fetchSpy).toHaveBeenCalledWith("/Users/job/Pictures/ref.png");
+    } finally {
+      globalThis.fetch = originalFetch;
+      (globalThis as { FileReader?: unknown }).FileReader = originalFileReader;
+    }
+  });
+
+  it("已经是 data URL 时原样返回（无 canvas 环境不做缩放）", async () => {
+    const dataUrl = "data:image/png;base64,QUJD";
+    await expect(prepareReferenceImageSource(dataUrl)).resolves.toBe(dataUrl);
+  });
+
+  it("空地址直接报错，不把空图片发给模型", async () => {
+    await expect(prepareReferenceImageSource("   ")).rejects.toThrow(/为空/);
   });
 });

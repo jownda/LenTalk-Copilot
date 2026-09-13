@@ -109,7 +109,7 @@ interface CanvasState {
     data?: Partial<CanvasNodeData>
   ) => string;
   replaceNodeType: (nodeId: string, type: CanvasNodeType, data?: Partial<CanvasNodeData>) => boolean;
-  addEdge: (source: string, target: string) => string | null;
+  addEdge: (source: string, target: string, sourceHandle?: string, targetHandle?: string) => string | null;
   findNodePosition: (
     sourceNodeId: string,
     newNodeWidth: number,
@@ -396,7 +396,7 @@ function isCompletedGenerationResultNode(node: CanvasNode): boolean {
 
   return (
     node.type === CANVAS_NODE_TYPES.audio &&
-    data.mediaType === 'video' &&
+    (data.mediaType === 'video' || data.mediaType === 'audio') &&
     typeof data.sourcePath === 'string' &&
     data.sourcePath.trim().length > 0
   );
@@ -1292,7 +1292,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     return changed;
   },
 
-  addEdge: (source, target) => {
+  addEdge: (source, target, sourceHandle = 'source', targetHandle = 'target') => {
     const state = get();
     // Check if both nodes exist
     const sourceNode = state.nodes.find((n) => n.id === source);
@@ -1304,7 +1304,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return null;
     }
 
-    const edgeId = `e-${source}-${target}`;
+    const edgeId = sourceHandle === 'source' && targetHandle === 'target'
+      ? `e-${source}-${target}`
+      : `e-${source}-${sourceHandle ?? 'source'}-${target}-${targetHandle ?? 'target'}`;
     // Check if edge already exists
     if (state.edges.some((e) => e.id === edgeId)) {
       return edgeId;
@@ -1314,8 +1316,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       id: edgeId,
       source,
       target,
-      sourceHandle: 'source',
-      targetHandle: 'target',
+      sourceHandle,
+      targetHandle,
       type: 'disconnectableEdge',
     };
 

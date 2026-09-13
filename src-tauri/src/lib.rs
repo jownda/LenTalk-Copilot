@@ -11,6 +11,7 @@ use commands::cinematic_studio;
 use commands::cloud_drive;
 use commands::image;
 use commands::jimeng_cli;
+use commands::wan_cli;
 use commands::project_state;
 use commands::project_archive;
 use commands::system;
@@ -218,6 +219,9 @@ pub fn run() {
             ai_commands::get_generate_image_job,
             ai_commands::generate_image,
             jimeng_cli::generate_jimeng_cli_video,
+            wan_cli::generate_wan_cli_video,
+            wan_cli::wan_cli_status,
+            wan_cli::wan_cli_login,
             jimeng_cli::jimeng_cli_login_start,
             jimeng_cli::jimeng_cli_login_check,
             jimeng_cli::jimeng_cli_logout,

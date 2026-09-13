@@ -4,11 +4,27 @@ import type { CustomApiCapabilities } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
 import { isKnownOpenAiImagesBaseUrl } from '@/features/settings/recommendedApis';
 import { persistImageBinary } from '@/commands/image';
+import { resolveReferenceAssetSource } from '@/commands/referenceAssetSource';
 import {
   createVideoIdempotencyKey,
   getVideoTaskFailureReason,
   resolveRjmVideoApiBaseUrl,
 } from '@/commands/videoApi';
+import {
+  isZzdhBaseUrl,
+  resolveZzdhAspectRatio,
+  resolveZzdhAspectRatioFromSize,
+  resolveZzdhAudioKind,
+  resolveZzdhAudioPath,
+  resolveZzdhGenerationMode,
+  resolveZzdhReferenceRole,
+  resolveZzdhResolutionTier,
+  resolveZzdhVideoDurationRange,
+  resolveZzdhVideoFamily,
+  ZZDH_BASE_DEFAULT_VOICE,
+  ZZDH_DEFAULT_AUDIO_FORMAT,
+  type ZzdhReferenceRole,
+} from '@/commands/zzdhApi';
 
 export interface GenerateRequest {
   prompt: string;
@@ -145,6 +161,20 @@ function createErrorWithDetails(message: string, details?: string): ErrorWithDet
     error.details = details;
   }
   return error;
+}
+
+/**
+ * 网络层错误前置翻译: reqwest 抛的 "error sending request for url" 在 tauri
+ * 上即指向 Rust send() 失败(DNS / TCP / TLS)。炳火 api.7tai.cc 在境外服务器,
+ * 国内直连出现间歇性丢包是已知情况, 对用户直接展示 URL 没有任何可操作的信息。
+ * 命中 transport-level 文案时, 给一句分级提示帮助定位(中文优先, 仅当检测到
+ * 经典的 reqwest / 浏览器 fetch transport 关键词才翻译, 避免污染业务错误)。
+ */
+function translateTransportError(message: string, urlLabel: string): string {
+  const lower = message.toLowerCase();
+  const isTransport = /(error sending request|fetch failed|failed to fetch|request failed|networkerror|connection (refused|reset|timed out)|tls handshake|ssl handshake|dns|getaddrinfo|name resolution)/i.test(lower);
+  if (!isTransport) return message;
+  return `网络连接到 ${urlLabel} 失败(${message})。该平台服务器在境外, 国内访问可能出现间歇性丢包,稍候重试或检查代理/防火墙设置。`;
 }
 
 export async function setApiKey(provider: string, apiKey: string): Promise<void> {
@@ -377,11 +407,24 @@ function buildHttpErrorSummary(status: number, rawResponse: string, url: string)
   return `HTTP ${status}${bodySummary} (${url})`;
 }
 
-function resolveZzdhVideoResolution(value: string | undefined, aspectRatio: string, model: string): string {
+/**
+ * 非 H3 视频模型的 `resolution`(文档「推荐传精确尺寸」如 `1280x720`)。
+ *
+ * 两个硬约束:
+ *   - 文档明确 `resolution` 优先于 `aspect_ratio`, 两者冲突时以 resolution 为准,
+ *     所以这里必须用**最终画幅**推导 —— 否则会出现 resolution=1280x720 与
+ *     aspect_ratio=9:16 互相矛盾、平台按横屏执行的静默错误。
+ *   - 档位写在模型名里时(`zzdh-Minimax-h3-480p` / `doubao-seedance-2-4k` /
+ *     `kling-3.0-omni-720p-*`)文档写明「请求体里的 resolution 不会改档」,
+ *     传了无意义还可能冲突 → 一律不传。
+ */
+function resolveZzdhVideoResolution(
+  value: string | undefined,
+  aspectRatio: string,
+  model: string,
+): string | undefined {
+  if (resolveZzdhResolutionTier(model)) return undefined;
   const requested = value?.trim().toLowerCase() ?? '';
-  // 模型名锁定档位时按官方大写档位交付(720P / 1080P / 2K), 与模型名交付分辨率一致
-  const modelLocked = model.trim().toLowerCase().match(/(?:^|[-_])(480p|540p|720p|1080p|2k)(?:[-_]|$)/)?.[1];
-  if (modelLocked) return modelLocked.toUpperCase();
   if (/^\d+x\d+$/.test(requested)) return requested;
   const dimensions: Record<string, Record<string, string>> = {
     '16:9': { '480p': '854x480', '720p': '1280x720', '1080p': '1920x1080', '2k': '2560x1440' },
@@ -419,16 +462,6 @@ function loadImageDimensions(source: string): Promise<{ width: number; height: n
     }
   });
 }
-
-/** zzdh 官方支持的画幅枚举(文档无 adaptive, 首尾帧必须显式传画幅) */
-const ZZDH_ASPECT_RATIO_VALUES: Array<{ label: string; value: number }> = [
-  { label: '16:9', value: 16 / 9 },
-  { label: '9:16', value: 9 / 16 },
-  { label: '1:1', value: 1 },
-  { label: '4:3', value: 4 / 3 },
-  { label: '3:4', value: 3 / 4 },
-  { label: '21:9', value: 21 / 9 },
-];
 
 interface ProviderJsonResponse {
   ok: boolean;
@@ -516,9 +549,14 @@ export async function requestProviderMultipart(
   };
 }
 
+/**
+ * 取二进制响应(视频内容 / 音频文件)。
+ * `body` 用于 POST 类接口(如 OpenAI 兼容 TTS `/v1/audio/speech`, 请求是 JSON、
+ * 返回是音频字节), 不传时退化为 GET 下载。
+ */
 async function requestProviderBinary(
   url: string,
-  init: { method?: string; headers?: Record<string, string> }
+  init: { method?: string; headers?: Record<string, string>; body?: string }
 ): Promise<ProviderBinaryResponse> {
   if (!isTauri()) {
     const response = await fetch(url, init);
@@ -530,10 +568,19 @@ async function requestProviderBinary(
     };
   }
 
+  let parsedBody: unknown;
+  if (init.body) {
+    try {
+      parsedBody = JSON.parse(init.body);
+    } catch {
+      throw new Error(`Provider request body is not valid JSON (${url})`);
+    }
+  }
   const result = await invoke<{ status: number; body: string; body_base64?: string | null }>('request_provider_json', {
     url,
     method: init.method ?? 'GET',
     headers: init.headers ?? {},
+    body: parsedBody,
     responseEncoding: 'base64',
   });
   const encoded = result.body_base64 ?? '';
@@ -554,34 +601,128 @@ async function persistSub2ApiVideo(bytes: Uint8Array): Promise<string> {
   return URL.createObjectURL(new Blob([bytes], { type: 'video/mp4' }));
 }
 
-/** 把图片宽高映射到 zzdh 支持的画幅标签(取最接近) */
-function resolveZzdhAspectRatioLabel(width: number, height: number): string {
-  if (width <= 0 || height <= 0) return '16:9';
-  const ratio = width / height;
-  let best = ZZDH_ASPECT_RATIO_VALUES[0];
-  let bestDiff = Number.POSITIVE_INFINITY;
-  for (const candidate of ZZDH_ASPECT_RATIO_VALUES) {
-    const diff = Math.abs(candidate.value - ratio);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = candidate;
-    }
-  }
-  return best.label;
-}
-
 /**
- * 首尾帧画幅: zzdh 网关对 H3 默认 16:9 且不自动跟随图片,
- * 必须显式传 aspect_ratio(官方枚举)才能得到正确画幅。
- * 从首帧读取宽高映射到支持画幅, 读不到时回退 UI 选择的画幅。
+ * 首尾帧/图生画幅: zzdh 网关默认 16:9 且不自动跟随图片,
+ * 必须显式传 aspect_ratio(官方枚举只有 16:9 / 9:16 / 1:1)才能得到正确画幅。
+ * 从首帧读取宽高映射到官方画幅, 读不到时回退 UI 选择的画幅。
  */
 async function resolveZzdhFirstLastAspectRatio(
   firstFrameSource: string | undefined,
   fallbackAspectRatio: string
 ): Promise<string> {
   const dimensions = await loadImageDimensions(firstFrameSource ?? '');
-  if (!dimensions) return fallbackAspectRatio;
-  return resolveZzdhAspectRatioLabel(dimensions.width, dimensions.height);
+  if (!dimensions) return resolveZzdhAspectRatio(fallbackAspectRatio);
+  return resolveZzdhAspectRatioFromSize(dimensions.width, dimensions.height);
+}
+
+/**
+ * 提交 H3 视频任务, 失败时可重试一次。
+ *
+ * 平台网关在转换参考素材时偶发同步返回 HTTP 400 `请求转换失败`。官方文档明确
+ * 提交被拒绝的请求不扣费，因此只对这一种错误做一次有界重试。
+ */
+async function submitZzdhVideoTask(
+  submitUrl: string,
+  headers: Record<string, string>,
+  body: string,
+): Promise<{ ok: boolean; status: number; rawResponse: string }> {
+  let last = { ok: false, status: 0, rawResponse: '' };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await requestProviderJson(submitUrl, { method: 'POST', headers, body });
+    const rawResponse = await response.text();
+    last = { ok: response.ok, status: response.status, rawResponse };
+    const retriable = !response.ok && attempt === 0 && rawResponse.includes('请求转换失败');
+    if (!retriable) break;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  return last;
+}
+
+/**
+ * H3 的 mode 解析已收敛到 `@/commands/zzdhApi`(与画幅/role/时长同源), 这里只做转发,
+ * 保持既有调用点与单测的导入路径不变。
+ */
+export { resolveZzdhGenerationMode };
+
+/** 字子动画参考图：H3 只接受公网地址；其它兼容模型可接收内嵌 base64。 */
+export type ZzdhReferenceImage =
+  | { url: string; role: ZzdhReferenceRole }
+  | { base64: string; role: ZzdhReferenceRole };
+
+interface ReferenceAssetUploadConfig {
+  url: string;
+  token: string;
+}
+
+function resolveReferenceAssetUploadConfig(extraParams: GenerateVideoRequest['extra_params']): ReferenceAssetUploadConfig | null {
+  const url = typeof extraParams?.reference_asset_upload_url === 'string'
+    ? extraParams.reference_asset_upload_url.trim().replace(/\/+$/, '')
+    : '';
+  const token = typeof extraParams?.reference_asset_upload_token === 'string'
+    ? extraParams.reference_asset_upload_token.trim()
+    : '';
+  return url && token ? { url, token } : null;
+}
+
+async function uploadPublicReferenceAsset(
+  asset: Exclude<Awaited<ReturnType<typeof resolveReferenceAssetSource>>, { kind: 'url' }>,
+  upload: ReferenceAssetUploadConfig,
+  index: number,
+): Promise<string> {
+  const response = await requestProviderJson(upload.url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${upload.token}`,
+    },
+    body: JSON.stringify({
+      filename: `reference-${index + 1}.${asset.extension}`,
+      content_type: asset.mimeType,
+      data_base64: asset.base64,
+    }),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`参考素材上传失败: 上传服务返回了非 JSON 响应 (${upload.url})`);
+  }
+  if (!response.ok) {
+    throw new Error(`参考素材上传失败: ${buildHttpErrorSummary(response.status, rawResponse, upload.url)}`);
+  }
+  const url = extractBinghuoAssetUrl(payload);
+  if (!url || !/^https?:\/\//i.test(url)) {
+    throw new Error(`参考素材上传失败: 上传服务未返回公网 HTTP(S) URL (${upload.url})`);
+  }
+  return url;
+}
+
+/**
+ * H3 单模型文档限定 `reference_images` 为 `{ url, role }`，且实际网关会将非公网
+ * 地址直接拒绝。通用文档中的 `base64` 兼容项不适用于 H3，因此在本地提交前明确阻止，
+ * 避免向平台发送必然失败的请求；其它模型仍保留通用 `base64` 兼容行为。
+ */
+export async function resolveZzdhReferenceImages(
+  sources: string[],
+  family: ReturnType<typeof resolveZzdhVideoFamily>,
+  imageMode: GenerateVideoRequest['image_mode'],
+  upload?: ReferenceAssetUploadConfig | null,
+): Promise<ZzdhReferenceImage[]> {
+  return await Promise.all(sources.map(async (source, index) => {
+    const asset = await resolveReferenceAssetSource(source, `字子动画参考图片 ${index + 1}`);
+    const role = resolveZzdhReferenceRole(family, imageMode, index);
+    if (asset.kind === 'url') return { url: asset.url, role };
+    if (family === 'minimax-h3') {
+      if (upload) {
+        return { url: await uploadPublicReferenceAsset(asset, upload, index), role };
+      }
+      throw new Error(
+        `字子动画 MiniMax H3 参考图仅支持公网 HTTP(S) URL：第 ${index + 1} 张是本地或内嵌素材。请先在字子动画的平台设置中配置“参考素材上传地址”和“上传令牌”，或上传到可公开访问的图床/CDN 后再生成。`,
+      );
+    }
+    return { base64: asset.base64, role };
+  }));
 }
 
 async function generateZzdhVideo(
@@ -591,53 +732,63 @@ async function generateZzdhVideo(
   headers: Record<string, string>
 ): Promise<string> {
   const isFirstLast = request.image_mode === 'first-last';
-  const isMinimaxH3 = apiModel.trim().toLowerCase().includes('minimax');
+  // 产品线决定 role 语义 / mode 支持 / 时长范围(见 zzdhApi 文档注释)。
+  const family = resolveZzdhVideoFamily(apiModel);
+  const isMinimaxH3 = family === 'minimax-h3';
   const images = request.reference_images?.slice(0, isFirstLast ? 2 : undefined) ?? [];
-  // role 按官方文档判定生成模式: 首尾帧用 first_frame/last_frame;
-  // 参考生必须显式标 reference_image(否则 1~2 张图会被误判为首尾帧)
-  const referenceImages = images.map((url, index) => ({
-    url,
-    ...(isFirstLast
-      ? { role: index === 0 ? 'first_frame' : 'last_frame' }
-      : { role: 'reference_image' }),
-  }));
-  // 画幅: zzdh 网关默认 16:9, 必须显式传 aspect_ratio(官方枚举);
-  // 首尾帧从首帧推导画幅跟随图片, 其它模式用 UI 选择的画幅。
+  // H3 的 `url` 只接受公网 HTTP(S) 地址。本地素材会在此处提前给出可操作提示，避免
+  // 被平台错误当成公网 URL 而触发「reference image must be public」。
+  const referenceImages = await resolveZzdhReferenceImages(
+    images,
+    family,
+    request.image_mode,
+    resolveReferenceAssetUploadConfig(request.extra_params),
+  );
+  // 模式: H3 官方文档要求显式声明(不传会被静默当成参考生)。
+  // H3 专有字段, 其它系列(Kling/seedance/wan)不传。
+  const generationMode = resolveZzdhGenerationMode(request.image_mode, images.length, apiModel);
+  // 画幅: 官方枚举只有 16:9 / 9:16 / 1:1。网关默认 16:9 且不跟随图片 ——
+  // 首尾帧从首帧推导, 其它模式用 UI 选择值(超出枚举的旧值在此收敛)。
   const aspectRatio = isFirstLast
     ? await resolveZzdhFirstLastAspectRatio(images[0], request.aspect_ratio)
-    : request.aspect_ratio;
-  // 分辨率: H3 模型名已锁定交付档位, 官方文档要求不传(传则必须与模型名一致, 否则被拒);
-  // 其它模型(如 Kling)按原逻辑传精确尺寸/档位。
-  const resolution = isMinimaxH3
-    ? undefined
-    : resolveZzdhVideoResolution(request.video_resolution, request.aspect_ratio, apiModel);
-  // H3 时长限制 5~15 秒(官方文档)
-  const duration = isMinimaxH3
-    ? Math.max(5, Math.min(15, Math.round(request.duration)))
+    : resolveZzdhAspectRatio(request.aspect_ratio);
+  // 分辨率: 必须用**最终画幅**推导(文档: resolution 优先于 aspect_ratio);
+  // 模型名锁定档位时不传(文档: 请求体里的 resolution 不会改档)。
+  const resolution = resolveZzdhVideoResolution(request.video_resolution, aspectRatio, apiModel);
+  // 时长: H3 按档位收窄(480P 5~10s, 其余 5~15s); 其它系列文档未给范围, 沿用原样。
+  const durationRange = resolveZzdhVideoDurationRange(apiModel);
+  const duration = durationRange
+    ? Math.max(durationRange.min, Math.min(durationRange.max, Math.round(request.duration)))
     : Math.max(1, Math.round(request.duration));
+  // 参考音频: 文档在模型家族字段表里列出 reference_audios(仅在有音频时发送)。
+  const referenceAudios = (request.reference_audio ?? [])
+    .map((audioUrl) => audioUrl.trim())
+    .filter(Boolean)
+    .map((url) => ({ url }));
   const body = {
     model: apiModel,
     prompt: request.prompt,
     duration,
     aspect_ratio: aspectRatio,
+    ...(isMinimaxH3 ? { mode: generationMode } : {}),
     ...(resolution ? { resolution } : {}),
     ...(referenceImages.length ? { reference_images: referenceImages } : {}),
+    ...(referenceAudios.length ? { reference_audios: referenceAudios } : {}),
   };
   const submitUrl = `${baseUrl}/v8/videos/generations`;
-  const response = await requestProviderJson(submitUrl, {
-    method: 'POST',
+  const { ok: submitOk, status: submitStatus, rawResponse } = await submitZzdhVideoTask(
+    submitUrl,
     headers,
-    body: JSON.stringify(body),
-  });
-  const rawResponse = await response.text();
+    JSON.stringify(body),
+  );
   let payload: unknown;
   try {
     payload = rawResponse ? JSON.parse(rawResponse) : {};
   } catch {
     throw new Error(`字子动画视频请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
   }
-  if (!response.ok) {
-    throw new Error(`字子动画视频请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  if (!submitOk) {
+    throw new Error(`字子动画视频请求失败: ${buildHttpErrorSummary(submitStatus, rawResponse, submitUrl)}`);
   }
   const immediateResult = getVideoResultUrl(payload);
   if (immediateResult) return immediateResult;
@@ -702,14 +853,6 @@ function resolveRjmSeedanceResolution(model: string, requested: string | undefin
     : '720p';
 }
 
-function getDataUrlAsset(source: string): { mimeType: string; extension: string; base64: string } | null {
-  const match = source.trim().match(/^data:([^;,]+)(?:;[^,]*)?;base64,([a-z0-9+/=]+)$/i);
-  if (!match) return null;
-  const mimeType = match[1].toLowerCase();
-  const extension = mimeType.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'bin';
-  return { mimeType, extension, base64: match[2] };
-}
-
 function extractBinghuoAssetUrl(payload: unknown): string | null {
   if (typeof payload === 'string' && /^https?:\/\//i.test(payload.trim())) return payload.trim();
   if (!payload || typeof payload !== 'object') return null;
@@ -728,21 +871,23 @@ function extractBinghuoAssetUrl(payload: unknown): string | null {
   return null;
 }
 
-async function uploadBinghuoReferenceAsset(
+/**
+ * 把参考素材上传到平台换取公网 URL(multipart, 字段名固定 file)。
+ * 炳火 /v1/assets/uploads 与知鸟 /v1/files 是同构流程, 只有端点与文案不同 ——
+ * 合并成同一条链路, 避免两份逻辑各自漂移。
+ */
+async function uploadPlatformReferenceAsset(
   source: string,
   baseUrl: string,
   headers: Record<string, string>,
   index: number,
+  platformLabel: string,
+  uploadPath: string,
 ): Promise<string> {
-  const trimmed = source.trim();
-  if (/^https?:\/\//i.test(trimmed)) return trimmed;
-  const asset = getDataUrlAsset(trimmed);
-  if (!asset) {
-    throw new Error('炳火 API 参考素材必须是公网 URL 或可读取的本地素材');
-  }
-  const uploadUrl = `${baseUrl}/v1/assets/uploads`;
-  // Let multipart set its own boundary. Forwarding JSON's Content-Type would
-  // make the upload body invalid on both desktop and browser runtimes.
+  const asset = await resolveReferenceAssetSource(source, platformLabel);
+  if (asset.kind === 'url') return asset.url;
+  const uploadUrl = `${baseUrl}${uploadPath}`;
+  // multipart 需自行生成 boundary, 转发 JSON 的 Content-Type 会让上传体失效。
   const uploadHeaders = Object.fromEntries(
     Object.entries(headers).filter(([name]) => name.toLowerCase() !== 'content-type'),
   );
@@ -758,16 +903,32 @@ async function uploadBinghuoReferenceAsset(
   try {
     payload = rawResponse ? JSON.parse(rawResponse) : {};
   } catch {
-    throw new Error(`炳火 API 参考素材上传失败: 平台返回了非 JSON 响应 (${uploadUrl})`);
+    throw new Error(`${platformLabel} 参考素材上传失败: 平台返回了非 JSON 响应 (${uploadUrl})`);
   }
   if (!response.ok) {
-    throw new Error(`炳火 API 参考素材上传失败: ${buildHttpErrorSummary(response.status, rawResponse, uploadUrl)}`);
+    throw new Error(`${platformLabel} 参考素材上传失败: ${buildHttpErrorSummary(response.status, rawResponse, uploadUrl)}`);
   }
   const url = extractBinghuoAssetUrl(payload);
   if (!url) {
-    throw new Error(`炳火 API 参考素材上传响应中未找到公网 URL: ${describeVideoResponse(payload)}`);
+    throw new Error(`${platformLabel} 参考素材上传响应中未找到公网 URL: ${describeVideoResponse(payload)}`);
   }
   return url;
+}
+
+async function uploadBinghuoReferenceAsset(
+  source: string,
+  baseUrl: string,
+  headers: Record<string, string>,
+  index: number,
+): Promise<string> {
+  return await uploadPlatformReferenceAsset(
+    source,
+    baseUrl,
+    headers,
+    index,
+    '炳火 API',
+    '/v1/assets/uploads',
+  );
 }
 
 async function generateBinghuoVideo(
@@ -777,14 +938,45 @@ async function generateBinghuoVideo(
   headers: Record<string, string>,
 ): Promise<string> {
   const rawImages = request.reference_images ?? [];
-  const imageSources = await Promise.all(
-    rawImages.slice(0, request.image_mode === 'first-last' ? 2 : 30)
-      .map((source, index) => uploadBinghuoReferenceAsset(source, baseUrl, headers, index)),
-  );
-  const audioSources = await Promise.all(
-    (request.reference_audio ?? []).slice(0, 3)
-      .map((source, index) => uploadBinghuoReferenceAsset(source, baseUrl, headers, imageSources.length + index)),
-  );
+  const isMinimaxH3 = apiModel.trim().toLowerCase().startsWith('minimax-h3-pro-');
+  const imageLimit = request.image_mode === 'first-last' ? 2 : (isMinimaxH3 ? 9 : 30);
+  // 参考视频: 来自 extra_params.reference_videos(URL 列表), 上传换 OSS 后填 reference_videos。
+  // 字段名必须叫 reference_videos(手册 3.3 红字强调: 'videos'/'video_urls' 部分模型被忽略)。
+  const rawReferenceVideos = (() => {
+    const value = request.extra_params?.reference_videos;
+    if (!Array.isArray(value)) return [];
+    return value.filter((v): v is string => typeof v === 'string' && v.trim().length > 0).map((v) => v.trim()).slice(0, 3);
+  })();
+  // 跳过真人审核: 责任声明(手册 3.8), 仅 bh 系模型生效, 显式 true 时下游跳过审核。
+  // 炳火限定为以 'bh2.0-' 开头或等于 'bh2.04K' 的模型 id, 其余模型传了也由平台忽略。
+  const skipReview = request.extra_params?.skip_review === true;
+  let imageSources: string[];
+  let audioSources: string[];
+  let referenceVideoSources: string[];
+  try {
+    imageSources = await Promise.all(
+      rawImages.slice(0, imageLimit)
+        .map((source, index) => uploadBinghuoReferenceAsset(source, baseUrl, headers, index)),
+    );
+    audioSources = await Promise.all(
+      (request.reference_audio ?? []).slice(0, 3)
+        .map((source, index) => uploadBinghuoReferenceAsset(source, baseUrl, headers, imageSources.length + index)),
+    );
+    referenceVideoSources = await Promise.all(
+      rawReferenceVideos
+        .map((source, index) => uploadBinghuoReferenceAsset(
+          source,
+          baseUrl,
+          headers,
+          imageSources.length + audioSources.length + index,
+        )),
+    );
+  } catch (error) {
+    if (error instanceof Error) {
+      error.message = translateTransportError(error.message, '炳火 API 上传端点');
+    }
+    throw error;
+  }
   const body: Record<string, unknown> = {
     model: apiModel,
     prompt: request.prompt,
@@ -800,23 +992,34 @@ async function generateBinghuoVideo(
     body.images = imageSources;
   }
   if (audioSources.length > 0) body.reference_audios = audioSources;
+  if (referenceVideoSources.length > 0) body.reference_videos = referenceVideoSources;
+  if (skipReview) body.skip_review = true;
   if (request.video_resolution?.trim()) body.resolution = request.video_resolution.trim();
 
   const submitUrl = `${baseUrl}/v1/video/generations`;
-  const response = await requestProviderJson(submitUrl, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
-  const rawResponse = await response.text();
+  let submitResponse: ProviderJsonResponse;
+  let submitRaw: string;
+  try {
+    submitResponse = await requestProviderJson(submitUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+    submitRaw = await submitResponse.text();
+  } catch (error) {
+    if (error instanceof Error) {
+      error.message = translateTransportError(error.message, '炳火 API 提交端点');
+    }
+    throw error;
+  }
   let payload: unknown;
   try {
-    payload = rawResponse ? JSON.parse(rawResponse) : {};
+    payload = submitRaw ? JSON.parse(submitRaw) : {};
   } catch {
     throw new Error(`炳火 API 视频请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
   }
-  if (!response.ok) {
-    throw new Error(`炳火 API 视频请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  if (!submitResponse.ok) {
+    throw new Error(`炳火 API 视频请求失败: ${buildHttpErrorSummary(submitResponse.status, submitRaw, submitUrl)}`);
   }
   const immediateResult = getVideoResultUrl(payload);
   if (immediateResult) return immediateResult;
@@ -827,8 +1030,17 @@ async function generateBinghuoVideo(
   const taskUrl = `${baseUrl}/v1/video/generations/${encodeURIComponent(taskId)}`;
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 5000));
-    const taskResponse = await requestProviderJson(taskUrl, { headers });
-    const taskRawResponse = await taskResponse.text();
+    let taskResponse: ProviderJsonResponse;
+    let taskRawResponse: string;
+    try {
+      taskResponse = await requestProviderJson(taskUrl, { headers });
+      taskRawResponse = await taskResponse.text();
+    } catch (error) {
+      if (error instanceof Error) {
+        error.message = translateTransportError(error.message, '炳火 API 轮询端点');
+      }
+      throw error;
+    }
     try {
       payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
     } catch {
@@ -841,7 +1053,8 @@ async function generateBinghuoVideo(
     if (videoUrl) return videoUrl;
     const status = getVideoTaskStatus(payload);
     if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
-      throw new Error(`炳火 API 视频生成失败: ${describeVideoResponse(payload)}`);
+      const reason = getVideoTaskFailureReason(payload);
+      throw new Error(`炳火 API 视频生成失败: ${reason ?? describeVideoResponse(payload)}`);
     }
   }
 }
@@ -860,14 +1073,17 @@ async function generateWgspaiVideo(
   const rawImages = request.reference_images ?? [];
   const imageSources = rawImages.slice(0, request.image_mode === 'first-last' ? 2 : 30);
   const audioSources = (request.reference_audio ?? []).slice(0, 3);
-  const normalizeSource = (source: string, label: string): string => {
-    const trimmed = source.trim();
-    if (/^https?:\/\//i.test(trimmed)) return trimmed;
-    if (getDataUrlAsset(trimmed)) return trimmed;
-    throw new Error(`wgspai API 参考${label}必须是公网 URL 或 base64 图片数据(平台不支持独立上传端点)`);
+  // 平台没有独立上传端点, 本地素材只能读成 data URL 内嵌进请求体。
+  const normalizeSource = async (source: string, label: string): Promise<string> => {
+    const asset = await resolveReferenceAssetSource(source, `wgspai API 参考${label}`);
+    return asset.kind === 'url' ? asset.url : `data:${asset.mimeType};base64,${asset.base64}`;
   };
-  const normalizedImages = imageSources.map((source, index) => normalizeSource(source, `素材 ${index + 1}`));
-  const normalizedAudios = audioSources.map((source, index) => normalizeSource(source, `音频 ${index + 1}`));
+  const normalizedImages = await Promise.all(
+    imageSources.map((source, index) => normalizeSource(source, `素材 ${index + 1}`)),
+  );
+  const normalizedAudios = await Promise.all(
+    audioSources.map((source, index) => normalizeSource(source, `音频 ${index + 1}`)),
+  );
   const body: Record<string, unknown> = {
     model: apiModel,
     prompt: request.prompt,
@@ -925,6 +1141,111 @@ async function generateWgspaiVideo(
     const status = getVideoTaskStatus(payload);
     if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
       throw new Error(`wgspai API 视频生成失败: ${describeVideoResponse(payload)}`);
+    }
+  }
+}
+
+/**
+ * 知鸟 AI(TokenGo 网关)参考素材上传:
+ * 平台生成类参考字段(images / videos / audios)只收公网 URL, 不收原始字节。
+ * 本地素材先 POST /v1/files(multipart, 字段名 file) 换取公网 URL —— 注意该 URL
+ * 24 小时后失效, 因此只在提交前随传随用, 不做长期缓存。
+ */
+export async function uploadZhiniaoReferenceAsset(
+  source: string,
+  baseUrl: string,
+  headers: Record<string, string>,
+  index: number,
+): Promise<string> {
+  return await uploadPlatformReferenceAsset(source, baseUrl, headers, index, '知鸟 AI', '/v1/files');
+}
+
+/** 知鸟 AI 扁平入口的 mode 取值: 无参考=文生视频, 单图=首帧, 双图首尾帧, 多图=参考生视频。 */
+function resolveZhiniaoVideoMode(imageMode: string | undefined, imageCount: number): string {
+  if (imageCount === 0) return 'text-to-video';
+  if (imageMode === 'first-last' && imageCount >= 2) return 'first-last';
+  if (imageCount === 1) return 'first-frame';
+  return 'reference';
+}
+
+/**
+ * 知鸟 AI(TokenGo)视频链路:
+ * - 提交 POST /v1/videos/generations, 全部参数放**顶层**(扁平形状, 不接受 params 信封)
+ * - 轮询 GET /v1/tasks/{task_id}, 终态看 state(success/failed) 或 status(completed/failed)
+ * - 成片 URL 在 result_url / output_url / result.videos[].url, getVideoResultUrl 已覆盖
+ */
+async function generateZhiniaoVideo(
+  request: GenerateVideoRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const maxImages = request.image_mode === 'first-last' ? 2 : 30;
+  const rawImages = (request.reference_images ?? []).slice(0, maxImages);
+  const imageSources = await Promise.all(
+    rawImages.map((source, index) => uploadZhiniaoReferenceAsset(source, baseUrl, headers, index)),
+  );
+  const rawAudios = (request.reference_audio ?? []).slice(0, 10);
+  const audioSources = await Promise.all(
+    rawAudios.map((source, index) =>
+      uploadZhiniaoReferenceAsset(source, baseUrl, headers, imageSources.length + index)),
+  );
+
+  const body: Record<string, unknown> = {
+    model: apiModel,
+    prompt: request.prompt,
+    mode: resolveZhiniaoVideoMode(request.image_mode, imageSources.length),
+    duration: Math.max(1, Math.round(request.duration)),
+    aspect_ratio: request.aspect_ratio,
+    count: 1,
+  };
+  if (imageSources.length > 0) body.images = imageSources;
+  if (audioSources.length > 0) body.audios = audioSources;
+  // 不传则沿用该模型的服务端默认档位(如 seedance-2-5 默认 480p)。
+  if (request.video_resolution?.trim()) body.resolution = request.video_resolution.trim();
+
+  const submitUrl = `${baseUrl}/v1/videos/generations`;
+  const response = await requestProviderJson(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`知鸟 AI 视频请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`知鸟 AI 视频请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  }
+  const immediateResult = getVideoResultUrl(payload);
+  if (immediateResult && !getVideoTaskId(payload)) return immediateResult;
+  const taskId = getVideoTaskId(payload);
+  if (!taskId) {
+    throw new Error(`知鸟 AI 视频响应中未找到任务 ID: ${describeVideoResponse(payload)}`);
+  }
+  // 网关统一的任务查询端点, 与提交路径不同。
+  const taskUrl = `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`;
+  while (true) {
+    // 官方说明: 视频中位 4~40 分钟、p90 55~75 分钟, 轮询间隔 5s 足够且不浪费配额。
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const taskResponse = await requestProviderJson(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    try {
+      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`知鸟 AI 视频查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`知鸟 AI 视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const videoUrl = getVideoResultUrl(payload);
+    if (videoUrl) return videoUrl;
+    const status = getVideoTaskStatus(payload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`知鸟 AI 视频生成失败: ${describeVideoResponse(payload)}`);
     }
   }
 }
@@ -1102,7 +1423,9 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   if (rjmVideoBaseUrl) {
     return await generateSub2ApiVideo(request, rjmVideoBaseUrl, apiModel, headers, true);
   }
-  if (request.extra_params?.video_transport === 'zzdh-v8-video') {
+  // 字子动画: transport 标记或 Base URL 命中都走专有链路(用户自建平台时 id 常是中文,
+  // 只靠 transport 标记在极端情况下会漏, 加域名兜底不改变其它平台的分支顺序)。
+  if (request.extra_params?.video_transport === 'zzdh-v8-video' || isZzdhBaseUrl(baseUrl)) {
     return await generateZzdhVideo(request, baseUrl, apiModel, headers);
   }
   if (request.extra_params?.video_transport === 'sub2api-video') {
@@ -1113,6 +1436,9 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   }
   if (request.extra_params?.video_transport === 'wgspai-video') {
     return await generateWgspaiVideo(request, baseUrl, apiModel, headers);
+  }
+  if (request.extra_params?.video_transport === 'zhiniao-video') {
+    return await generateZhiniaoVideo(request, baseUrl, apiModel, headers);
   }
   const videoImages = request.image_mode === 'first-last'
     ? request.reference_images?.slice(0, 2)
@@ -1187,6 +1513,175 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
       throw new Error(`视频生成失败: ${status}`);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// 音频生成(语音合成 / 音效 / 音乐)
+// ---------------------------------------------------------------------------
+
+export type GenerateAudioKind = 'speech' | 'sound-effects' | 'music';
+
+export interface GenerateAudioRequest {
+  /** 文本内容: 语音合成的台词 / 音效描述 / 音乐描述 */
+  prompt: string;
+  model: string;
+  /** 音频类型; 缺省按模型名推断(见 resolveZzdhAudioKind) */
+  audio_kind?: GenerateAudioKind;
+  /** 音色(语音合成, 可选项) */
+  voice?: string;
+  /** 输出格式(语音合成, 默认 mp3) */
+  format?: string;
+  /** 音效时长(秒) */
+  duration_seconds?: number;
+  /** 音乐时长(毫秒) */
+  music_length_ms?: number;
+  /** 歌词(音乐生成) */
+  lyrics?: string;
+  extra_params?: Record<string, unknown>;
+}
+
+/** 音频响应若是 JSON(部分中转返回 URL 或 data URL), 从中取出可播放地址。 */
+function extractAudioSourceFromJson(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  const direct = getVideoResultUrl(payload);
+  if (direct) return direct;
+  // data:audio/... 不在 getVideoResultUrl 的匹配范围内, 单独扫一遍。
+  let dataAudio: string | null = null;
+  const visit = (value: unknown): void => {
+    if (dataAudio) return;
+    if (typeof value === 'string') {
+      const hit = value.trim().match(/data:audio\/[a-z0-9.+-]+;base64,[^\s"']+/i)?.[0];
+      if (hit) dataAudio = hit;
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    Object.values(value as Record<string, unknown>).forEach(visit);
+  };
+  visit(payload);
+  return dataAudio;
+}
+
+/** 音频字节落盘: 桌面端写成文件(节点用 convertFileSrc 播放), Web 端退化为 Blob URL。 */
+async function persistAudioBytes(bytes: Uint8Array, format: string): Promise<string> {
+  const extension = format.trim().toLowerCase().replace(/[^a-z0-9]/g, '') || ZZDH_DEFAULT_AUDIO_FORMAT;
+  if (isTauri()) {
+    return await persistImageBinary(bytes, extension);
+  }
+  const mime = extension === 'mp3' ? 'audio/mpeg' : `audio/${extension}`;
+  return URL.createObjectURL(new Blob([bytes], { type: mime }));
+}
+
+/** 按音频类型组装请求体(字段名照抄官方模型页示例)。 */
+function buildAudioBody(request: GenerateAudioRequest, apiModel: string, kind: GenerateAudioKind): string {
+  const format = request.format?.trim().toLowerCase() || ZZDH_DEFAULT_AUDIO_FORMAT;
+  const body: Record<string, unknown> = { model: apiModel, input: request.prompt };
+  if (kind === 'speech') {
+    body.voice = request.voice?.trim() || ZZDH_BASE_DEFAULT_VOICE;
+    body.format = format;
+  } else if (kind === 'sound-effects') {
+    body.metadata = {
+      ...(request.duration_seconds ? { duration_seconds: Math.max(1, Math.round(request.duration_seconds)) } : {}),
+      loop: false,
+    };
+  } else {
+    body.metadata = {
+      ...(request.lyrics?.trim() ? { lyrics_text: request.lyrics.trim() } : {}),
+      ...(request.music_length_ms ? { music_length_ms: Math.max(1000, Math.round(request.music_length_ms)) } : {}),
+    };
+  }
+  return JSON.stringify(body);
+}
+
+/**
+ * 字子动画音频链路(官方文档「服务类 API」+ 各模型页):
+ *   - 语音合成 POST /v1/audio/speech         字段 model / input / voice / format
+ *   - 音效     POST /v1/audio/sound-effects  字段 model / input / metadata{duration_seconds, loop}
+ *   - 音乐     POST /v1/audio/music          字段 model / input / metadata{lyrics_text, music_length_ms}
+ * 三个端点都返回音频文件字节, 落盘后交给画布节点播放。
+ */
+async function generateZzdhAudio(
+  request: GenerateAudioRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const kind = request.audio_kind ?? resolveZzdhAudioKind(apiModel) ?? 'speech';
+  const submitUrl = `${baseUrl}${resolveZzdhAudioPath(kind)}`;
+  const response = await requestProviderBinary(submitUrl, {
+    method: 'POST',
+    headers,
+    body: buildAudioBody(request, apiModel, kind),
+  });
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`字子动画音频请求失败: ${buildHttpErrorSummary(response.status, raw, submitUrl)}`);
+  }
+  const jsonSource = extractAudioSourceFromJson(raw);
+  if (jsonSource) return jsonSource;
+  if (!response.bytes.length) {
+    throw new Error(`字子动画音频响应为空 (${submitUrl})`);
+  }
+  const format = request.format?.trim().toLowerCase() || ZZDH_DEFAULT_AUDIO_FORMAT;
+  return await persistAudioBytes(response.bytes, format);
+}
+
+/** 其它平台的兜底链路: OpenAI 兼容 /v1/audio/speech。 */
+async function generateOpenAiCompatAudio(
+  request: GenerateAudioRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const submitUrl = resolveProviderEndpoint(baseUrl, request.extra_params?.audio_submit_path, '/v1/audio/speech');
+  const body = JSON.parse(buildAudioBody(request, apiModel, request.audio_kind ?? 'speech')) as Record<string, unknown>;
+  const response = await requestProviderBinary(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`音频生成请求失败: ${buildHttpErrorSummary(response.status, raw, submitUrl)}`);
+  }
+  const jsonSource = extractAudioSourceFromJson(raw);
+  if (jsonSource) return jsonSource;
+  if (!response.bytes.length) {
+    throw new Error(`音频生成响应为空 (${submitUrl})`);
+  }
+  return await persistAudioBytes(response.bytes, request.format?.trim() || ZZDH_DEFAULT_AUDIO_FORMAT);
+}
+
+/** 音频生成入口: 字子动画走专有端点, 其它平台走 OpenAI 兼容 speech。 */
+export async function generateAudio(request: GenerateAudioRequest): Promise<string> {
+  if (!isCustomModel(request.model)) {
+    throw new Error('音频生成仅支持自定义平台(custom:*)模型');
+  }
+  const providerId = request.model.split('/')[0] ?? '';
+  const apiModel = request.model.split('/').slice(1).join('/').trim();
+  const configuredBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
+    ? request.extra_params.provider_base_url
+    : '';
+  const baseUrl = normalizeVideoProviderBaseUrl(configuredBaseUrl);
+  const apiKey = (useSettingsStore.getState().apiKeys[providerId] ?? '').trim();
+  if (!baseUrl || !apiKey || !apiModel) {
+    throw new Error('请在设置中配置音频模型对应的 Base URL、API Key 和模型名称');
+  }
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  if (request.extra_params?.audio_transport === 'zzdh-openai-audio' || isZzdhBaseUrl(baseUrl)) {
+    return await generateZzdhAudio(request, baseUrl, apiModel, headers);
+  }
+  return await generateOpenAiCompatAudio(request, baseUrl, apiModel, headers);
 }
 
 export async function generateJimengCliVideo(
@@ -1501,9 +1996,14 @@ function buildBrowserImagesRequestBody(
   referenceImages: string[]
 ): Record<string, unknown> {
   const isGptImage = apiModel.toLowerCase().includes('gpt-image');
-  const referenceImageField = request.extra_params?.reference_image_field === 'input_image'
+  const rawReferenceImageField = request.extra_params?.reference_image_field;
+  const referenceImageField = rawReferenceImageField === 'input_image'
     ? 'input_image'
-    : 'image';
+    : rawReferenceImageField === 'images'
+      ? 'images'
+      : rawReferenceImageField === 'reference_images'
+        ? 'reference_images'
+        : 'image';
   const configuredEncoding = typeof request.extra_params?.reference_image_encoding === 'string'
     ? request.extra_params.reference_image_encoding.toLowerCase()
     : 'auto';
@@ -1535,12 +2035,28 @@ function buildBrowserImagesRequestBody(
     if (referenceImageField === 'input_image') {
       const normalized = referenceImages.map(normalizeReferenceImage);
       body.input_image = normalized.length === 1 ? normalized[0] : normalized;
+    } else if (referenceImageField === 'images') {
+      // 知鸟 AI 等平台的参考图字段是 images 纯数组(单图也是数组)。
+      body.images = referenceImages.map(normalizeReferenceImage);
+    } else if (referenceImageField === 'reference_images') {
+      // 字子动画等平台: 参考图是对象数组 [{"url": "..."}](官方模型页字段表)。
+      body.reference_images = referenceImages
+        .map(normalizeReferenceImage)
+        .map((url) => ({ url }));
     } else {
       body.image = normalizeReferenceImage(referenceImages[0]);
       if (referenceImages.length > 1) {
         body.images = referenceImages.map(normalizeReferenceImage);
       }
     }
+  }
+  // 知鸟 AI 等平台把「参考图用途」放在 mode 上: 默认 text-to-image 会忽略参考图,
+  // 有参考图时必须显式声明 image-edit(单图编辑) / multi-reference(多图融合)。
+  const imageGenerationMode = typeof request.extra_params?.image_generation_mode === 'string'
+    ? request.extra_params.image_generation_mode.trim()
+    : '';
+  if (imageGenerationMode) {
+    body.mode = imageGenerationMode;
   }
   return body;
 }
@@ -1895,6 +2411,9 @@ export async function detectProviderCapabilities(
 
   const normalized = normalizeBaseUrl(baseUrl);
   const isKnownOpenAiImages = isKnownOpenAiImagesBaseUrl(normalized);
+  // 知鸟 AI(TokenGo)的参考图字段是 images 纯数组, 与 image / input_image 都不同,
+  // 探测时直接按已知平台判定, 避免把「已知」平台的字段猜错。
+  const isZhiniaoHost = /(?:cuai\.token6688\.com|api\.tokengo\.love)/i.test(normalized);
   const headers: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
   const modelsResponse = await httpFetchWithTimeout(`${normalized}/v1/models`, { method: 'GET', headers });
   if (!modelsResponse.ok) {
@@ -1927,23 +2446,28 @@ export async function detectProviderCapabilities(
       : probeAvailable(responsesStatus) && !probeAvailable(imagesStatus)
         ? 'responses'
         : 'images';
-  const imageReferenceField = isKnownOpenAiImages
-    ? 'image'
-    : hasGptImage
-      ? 'input_image'
-      : 'image';
+  const imageReferenceField = isZhiniaoHost
+    ? 'images'
+    : isKnownOpenAiImages
+      ? 'image'
+      : hasGptImage
+        ? 'input_image'
+        : 'image';
   const capabilities: CustomApiCapabilities = {
     detectedAt: Date.now(),
     detectionSource: 'probe',
     confidence: isKnownOpenAiImages ? 'high' : 'low',
     imageProtocol: imageProtocol as CustomApiCapabilities['imageProtocol'],
     imageReferenceField,
-    imageReferenceEncoding: imageReferenceField === 'input_image' ? 'raw_base64' : 'data_url',
+    imageReferenceEncoding: imageReferenceField === 'input_image'
+      ? 'raw_base64'
+      : imageReferenceField === 'images' ? 'url' : 'data_url',
     imageTransport: isKnownOpenAiImages ? 'generations_json' : 'unknown',
     videoSubmitPath: '/v1/videos/generations',
-    videoQueryPath: '/v1/videos/generations/{taskId}',
-    videoReferenceEncoding: 'data_url',
+    videoQueryPath: isZhiniaoHost ? '/v1/tasks/{taskId}' : '/v1/videos/generations/{taskId}',
+    videoReferenceEncoding: isZhiniaoHost ? 'url' : 'data_url',
     taskProtocol: 'generic',
+    ...(isZhiniaoHost ? { videoTransport: 'zhiniao-video' as const } : {}),
   };
   return {
     capabilities,

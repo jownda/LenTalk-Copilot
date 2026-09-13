@@ -178,6 +178,13 @@ export function buildSceneAssetRegistry(
     }
     for (const id of shot.layout?.characterOrder ?? []) visit(id);
   }
+  // 场景站位里登记的角色（characterRoster / 左右顺序）同属本场资产。
+  // 资产库面板的 sceneUsesAsset() 一直把它们算作「本场景已使用」，编译器这里
+  // 也必须认，否则只在站位里登记、还没分到具体镜头的角色，其参考图、声音锁
+  // 与随身道具都不会出现在参考清单里（点「生成并创建视频」时整块丢失）。
+  // 刻意放在镜头之后访问：既有 [imageN] 编号顺序保持不变，只做末尾追加。
+  for (const id of scene.staging?.characterRoster ?? []) visit(id);
+  for (const id of scene.staging?.characterOrder ?? []) visit(id);
   const orderedAssets = visited.map((id) => byId.get(id)!).filter(Boolean);
   return {
     indexByAssetId: new Map(orderedAssets.map((asset, index) => [asset.id, index + 1])),

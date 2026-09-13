@@ -1,16 +1,21 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Terminal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { buildCustomModelId, isChatCompletionModelName, isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
+import { buildCustomModelId, isAudioModelName, isChatCompletionModelName, isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
 import type { CustomApiCapabilities } from '@/stores/settingsStore';
 import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck, jimengCliLogout } from '@/commands/ai';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { recommendedApis } from '@/features/settings/recommendedApis';
+import {
+  listVisibleRecommendedApis,
+  visibleRecommendedApiIds,
+  type RecommendedApi,
+} from '@/features/settings/recommendedApis';
 import { UiCheckbox, UiModal, UiSelect } from '@/components/ui';
 import { UI_CONTENT_OVERLAY_INSET_CLASS, UI_DIALOG_TRANSITION_MS } from '@/components/ui/motion';
 import { useDialogTransition } from '@/components/ui/useDialogTransition';
 import { listModelProviders } from '@/features/canvas/models';
 import type { SettingsCategory } from '@/features/settings/settingsEvents';
+import { WanCliSettings } from '@/features/settings/WanCliSettings';
 
 const JIMENG_LOGIN_POLL_INTERVAL_MS = 3000;
 const JIMENG_LOGIN_MAX_ATTEMPTS = 200;
@@ -138,14 +143,16 @@ export function SettingsDialog({
     setEnableUpdateDialog,
   } = useSettingsStore();
   const providers = useMemo(() => {
-    const providerOrder = ['kie', 'ppio', 'fal'];
+    const providerOrder = ['zhiniao', 'runninghub', 'modelscope'];
     const providerIndex = new Map(providerOrder.map((id, index) => [id, index]));
-    // 推荐平台列表: 隐藏 KIE / 派欧云(ppio) / fal / GRSAI
-    const hiddenProviderIds = new Set(['kie', 'ppio', 'fal', 'grsai']);
+    // 密钥页只保留 知鸟AI / RunningHub / ModelScope 三个平台卡片, 其余隐藏不渲染。
+    // 隐藏 ≠ 删除: 平台定义与链路仍完整保留在 registry / recommendedApis 中,
+    // 自定义平台按 Base URL 依旧会命中对应链路(isZhiniao / isZzdh / isSub2Api 等)。
+    const visibleProviderIds = new Set(visibleRecommendedApiIds);
     return (
       listModelProviders()
         .filter((provider) => !provider.id.startsWith('custom:'))
-        .filter((provider) => !hiddenProviderIds.has(provider.id))
+        .filter((provider) => visibleProviderIds.has(provider.id))
         .slice()
         .sort((left, right) => {
           const leftIndex = providerIndex.get(left.id) ?? Number.MAX_SAFE_INTEGER;
@@ -154,6 +161,8 @@ export function SettingsDialog({
         })
     );
   }, []);
+  /** 「推荐平台」网格实际渲染的卡片(隐藏条目仍保留配置, 只是不展示)。 */
+  const visibleRecommendedApis = useMemo(() => listVisibleRecommendedApis(), []);
   const [activeCategory, setActiveCategory] = useState<SettingsCategory>(initialCategory);
   const [localApiKeys, setLocalApiKeys] = useState<Record<string, string>>(apiKeys);
   const [localUseUploadFilenameAsNodeTitle, setLocalUseUploadFilenameAsNodeTitle] = useState(
@@ -207,18 +216,21 @@ export function SettingsDialog({
     apiKey: '',
     modelsText: '',
     videoModelsText: '',
+    audioModelsText: '',
     chatModelsText: '',
     requestMode: 'sync' as 'sync' | 'async',
     protocol: 'images' as 'images' | 'responses' | 'chat',
-    referenceImageField: 'image' as 'image' | 'input_image',
+    referenceImageField: 'image' as 'image' | 'input_image' | 'images' | 'reference_images',
     referenceImageEncoding: 'data_url' as 'auto' | 'data_url' | 'raw_base64' | 'url',
     imageTransport: 'auto' as 'auto' | 'generations_json' | 'edits_multipart' | 'apimart_json',
+    referenceAssetUploadUrl: '',
+    referenceAssetUploadToken: '',
     capabilities: undefined as CustomApiCapabilities | undefined,
   });
   const [customApiBusy, setCustomApiBusy] = useState<'idle' | 'testing' | 'fetching'>('idle');
   const [customApiStatus, setCustomApiStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
-  const [modelPickerMediaType, setModelPickerMediaType] = useState<'image' | 'video' | 'chat'>('image');
+  const [modelPickerMediaType, setModelPickerMediaType] = useState<'image' | 'video' | 'audio' | 'chat'>('image');
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [pickedModels, setPickedModels] = useState<string[]>([]);
   const [modelPickerSearch, setModelPickerSearch] = useState('');
@@ -226,7 +238,7 @@ export function SettingsDialog({
   const { shouldRender, isVisible } = useDialogTransition(isOpen, UI_DIALOG_TRANSITION_MS);
 
   /** 一键添加推荐平台(预填到新增表单) */
-  const applyRecommendedApi = useCallback((api: (typeof recommendedApis)[number]) => {
+  const applyRecommendedApi = useCallback((api: RecommendedApi) => {
     setEditingCustomApiId(null);
     setCustomApiDraft({
       name: api.name,
@@ -234,12 +246,15 @@ export function SettingsDialog({
       apiKey: '',
       modelsText: api.models.join('\n'),
       videoModelsText: (api.videoModels ?? []).join('\n'),
+      audioModelsText: (api.audioModels ?? []).join('\n'),
       chatModelsText: (api.chatModels ?? []).join('\n'),
       requestMode: 'sync',
       protocol: api.imageConfig?.protocol ?? 'images',
       referenceImageField: api.imageConfig?.referenceImageField ?? 'image',
       referenceImageEncoding: api.imageConfig?.referenceImageEncoding ?? 'auto',
       imageTransport: api.imageConfig?.imageTransport ?? 'auto',
+      referenceAssetUploadUrl: '',
+      referenceAssetUploadToken: '',
       capabilities: api.videoConfig ? {
         detectedAt: Date.now(),
         detectionSource: 'manual',
@@ -462,7 +477,7 @@ export function SettingsDialog({
 
   /** 验证协议:带 Key 调 /v1/models,检测 OpenAI 兼容 */
   /** 拉取平台模型列表并打开对应媒体类型的模型选择弹窗。 */
-  const handleFetchModels = useCallback(async (mediaType: 'image' | 'video' | 'chat') => {
+  const handleFetchModels = useCallback(async (mediaType: 'image' | 'video' | 'audio' | 'chat') => {
     const baseUrl = customApiDraft.baseUrl.trim().replace(/\/+$/, '');
     if (!baseUrl) {
       setCustomApiStatus({ type: 'err', text: t('settings.customApiTestNeedUrl') });
@@ -482,20 +497,34 @@ export function SettingsDialog({
           .map((model) => model.trim().toLowerCase())
           .filter(Boolean)
       );
+      const audioModelIds = new Set(
+        customApiDraft.audioModelsText
+          .split(/[\n,]/)
+          .map((model) => model.trim().toLowerCase())
+          .filter(Boolean)
+      );
       const targetModels = models.filter(
         (model) => mediaType === 'video'
           ? isVideoGenerationModelName(model)
-          : mediaType === 'chat'
-            ? isChatCompletionModelName(model)
-            : !videoModelIds.has(model.trim().toLowerCase()) && !isVideoGenerationModelName(model) && !isChatCompletionModelName(model)
+          : mediaType === 'audio'
+            ? isAudioModelName(model)
+            : mediaType === 'chat'
+              ? isChatCompletionModelName(model)
+              : !videoModelIds.has(model.trim().toLowerCase())
+                && !audioModelIds.has(model.trim().toLowerCase())
+                && !isVideoGenerationModelName(model)
+                && !isAudioModelName(model)
+                && !isChatCompletionModelName(model)
       );
       setFetchedModels(targetModels);
       const existing = new Set(
         (mediaType === 'video'
           ? customApiDraft.videoModelsText
-          : mediaType === 'chat'
-            ? customApiDraft.chatModelsText
-            : customApiDraft.modelsText)
+          : mediaType === 'audio'
+            ? customApiDraft.audioModelsText
+            : mediaType === 'chat'
+              ? customApiDraft.chatModelsText
+              : customApiDraft.modelsText)
           .split(/[\n,]/)
           .map((model) => model.trim())
           .filter(Boolean)
@@ -517,6 +546,7 @@ export function SettingsDialog({
     customApiDraft.baseUrl,
     customApiDraft.modelsText,
     customApiDraft.videoModelsText,
+    customApiDraft.audioModelsText,
     customApiDraft.chatModelsText,
     t,
   ]);
@@ -534,9 +564,11 @@ export function SettingsDialog({
       ...customApiDraft,
       ...(modelPickerMediaType === 'video'
         ? { videoModelsText: pickedModels.join('\n') }
-        : modelPickerMediaType === 'chat'
-          ? { chatModelsText: pickedModels.join('\n') }
-          : { modelsText: pickedModels.join('\n') }),
+        : modelPickerMediaType === 'audio'
+          ? { audioModelsText: pickedModels.join('\n') }
+          : modelPickerMediaType === 'chat'
+            ? { chatModelsText: pickedModels.join('\n') }
+            : { modelsText: pickedModels.join('\n') }),
     });
     setIsModelPickerOpen(false);
     setCustomApiStatus({ type: 'ok', text: t('settings.customApiModelsApplied', '已应用所选模型') });
@@ -576,7 +608,20 @@ export function SettingsDialog({
           .map((model) => model.trim().toLowerCase())
           .filter(Boolean)
       );
-      const imageModels = models.filter((model) => !videoModelIds.has(model.trim().toLowerCase()) && !isChatCompletionModelName(model));
+      const audioModelIds = new Set(
+        customApiDraft.audioModelsText
+          .split(/[\n,]/)
+          .map((model) => model.trim().toLowerCase())
+          .filter(Boolean)
+      );
+      const imageModels = models.filter(
+        (model) =>
+          !videoModelIds.has(model.trim().toLowerCase())
+          && !audioModelIds.has(model.trim().toLowerCase())
+          && !isVideoGenerationModelName(model)
+          && !isAudioModelName(model)
+          && !isChatCompletionModelName(model)
+      );
       setCustomApiDraft((previous) => {
         // 探测结果优先; 但探测为低置信度 images 默认且用户已手动选择 chat/responses
         // 时保留用户选择(OPTIONS 探测常被网关中间件统一响应, 不足以推翻手动配置)。
@@ -592,7 +637,9 @@ export function SettingsDialog({
           modelsText: imageModels.length > 0 ? imageModels.join('\n') : previous.modelsText,
           // 能力探测只确认协议和编码，不足以证明平台支持任务查询；保持同步默认。
           protocol: keepManualProtocol ? previous.protocol : detectedProtocol,
-          referenceImageField: result.capabilities.imageReferenceField === 'input_image' ? 'input_image' : 'image',
+          referenceImageField: result.capabilities.imageReferenceField === 'input_image'
+            ? 'input_image'
+            : result.capabilities.imageReferenceField === 'images' ? 'images' : 'image',
           referenceImageEncoding: result.capabilities.imageReferenceEncoding === 'raw_base64'
             ? 'raw_base64'
             : result.capabilities.imageReferenceEncoding === 'url' ? 'url' : 'data_url',
@@ -645,7 +692,7 @@ export function SettingsDialog({
     } finally {
       setCustomApiBusy('idle');
     }
-  }, [customApiDraft.apiKey, customApiDraft.baseUrl, customApiDraft.videoModelsText, t]);
+  }, [customApiDraft.apiKey, customApiDraft.baseUrl, customApiDraft.videoModelsText, customApiDraft.audioModelsText, t]);
 
   const startEditCustomApi = useCallback((id: string) => {
     const api = useSettingsStore.getState().customApis.find((item) => item.id === id);
@@ -659,12 +706,15 @@ export function SettingsDialog({
       apiKey: api.apiKey,
       modelsText: api.models.join('\n'),
       videoModelsText: api.videoModels.join('\n'),
+      audioModelsText: (api.audioModels ?? []).join('\n'),
       chatModelsText: (api.chatModels ?? []).join('\n'),
       requestMode: api.requestMode,
       protocol: api.protocol,
       referenceImageField: api.referenceImageField ?? 'image',
       referenceImageEncoding: api.referenceImageEncoding ?? 'auto',
       imageTransport: api.imageTransport ?? 'auto',
+      referenceAssetUploadUrl: api.referenceAssetUploadUrl ?? '',
+      referenceAssetUploadToken: api.referenceAssetUploadToken ?? '',
       capabilities: api.capabilities,
     });
     setShowAddCustomApi(true);
@@ -679,12 +729,15 @@ export function SettingsDialog({
       apiKey: '',
       modelsText: '',
       videoModelsText: '',
+      audioModelsText: '',
       chatModelsText: '',
       requestMode: 'sync',
       protocol: 'images',
       referenceImageField: 'image',
       referenceImageEncoding: 'data_url',
       imageTransport: 'auto',
+      referenceAssetUploadUrl: '',
+      referenceAssetUploadToken: '',
       capabilities: undefined,
     });
   }, []);
@@ -700,21 +753,34 @@ export function SettingsDialog({
       .split(/[\n,]/)
       .map((model) => model.trim())
       .filter(Boolean);
+    // 音频模型：仍按名称启发式过滤，避免把手填的图片模型挪走。
+    const audioModels = customApiDraft.audioModelsText
+      .split(/[\n,]/)
+      .map((model) => model.trim())
+      .filter(Boolean)
+      .filter((model) => isAudioModelName(model));
     const chatModels = customApiDraft.chatModelsText
       .split(/[\n,]/)
       .map((model) => model.trim())
       .filter(Boolean)
       .filter((model) => isChatCompletionModelName(model));
     const videoModelIds = new Set(videoModels.map((model) => model.toLowerCase()));
+    const audioModelIds = new Set(audioModels.map((model) => model.toLowerCase()));
     const chatModelIds = new Set(chatModels.map((model) => model.toLowerCase()));
     const imageModels = models.filter(
       (model) =>
         !videoModelIds.has(model.toLowerCase()) &&
+        !audioModelIds.has(model.toLowerCase()) &&
         !chatModelIds.has(model.toLowerCase()) &&
         !isVideoGenerationModelName(model) &&
+        !isAudioModelName(model) &&
         !isChatCompletionModelName(model)
     );
-    if (!name || !baseUrl || (models.length === 0 && videoModels.length === 0 && chatModels.length === 0)) {
+    if (
+      !name ||
+      !baseUrl ||
+      (models.length === 0 && videoModels.length === 0 && audioModels.length === 0 && chatModels.length === 0)
+    ) {
       return;
     }
     if (editingCustomApiId) {
@@ -724,12 +790,15 @@ export function SettingsDialog({
         apiKey: customApiDraft.apiKey.trim(),
         models: imageModels,
         videoModels,
+        audioModels,
         chatModels,
         requestMode: customApiDraft.requestMode,
         protocol: customApiDraft.protocol,
         referenceImageField: customApiDraft.referenceImageField,
         referenceImageEncoding: customApiDraft.referenceImageEncoding,
         imageTransport: customApiDraft.imageTransport,
+        referenceAssetUploadUrl: customApiDraft.referenceAssetUploadUrl.trim(),
+        referenceAssetUploadToken: customApiDraft.referenceAssetUploadToken.trim(),
         capabilities: customApiDraft.capabilities,
       });
     } else {
@@ -739,12 +808,15 @@ export function SettingsDialog({
         apiKey: customApiDraft.apiKey.trim(),
         models: imageModels,
         videoModels,
+        audioModels,
         chatModels,
         requestMode: customApiDraft.requestMode,
         protocol: customApiDraft.protocol,
         referenceImageField: customApiDraft.referenceImageField,
         referenceImageEncoding: customApiDraft.referenceImageEncoding,
         imageTransport: customApiDraft.imageTransport,
+        referenceAssetUploadUrl: customApiDraft.referenceAssetUploadUrl.trim(),
+        referenceAssetUploadToken: customApiDraft.referenceAssetUploadToken.trim(),
         capabilities: customApiDraft.capabilities,
       });
     }
@@ -1112,8 +1184,8 @@ export function SettingsDialog({
                         );
                       })}
 
-                      {/* 第三方推荐平台(点「添加」预填自定义平台表单) */}
-                      {recommendedApis.map((api) => (
+                      {/* 第三方推荐平台(点「添加」预填自定义平台表单)；隐藏的条目只过滤渲染，配置仍保留 */}
+                      {visibleRecommendedApis.map((api) => (
                         <div
                           key={api.id}
                           className="flex flex-col rounded-md border border-border-dark bg-bg-dark p-3"
@@ -1146,6 +1218,42 @@ export function SettingsDialog({
                               {api.models.slice(0, 3).join(' · ')}
                               {api.models.length > 3 ? ' …' : ''}
                             </p>
+                          )}
+                          {api.pricingRange && (
+                            <div className="mt-2 flex flex-col gap-1 rounded-md bg-bg-dark/60 px-2 py-1.5 text-[10px]">
+                              <div className="flex flex-wrap gap-1">
+                                {api.pricingRange.image && (
+                                  <span
+                                    className="inline-flex items-center gap-1 rounded bg-accent/10 px-1.5 py-0.5 text-accent"
+                                    title="图片价格区间"
+                                  >
+                                    <span className="text-text-muted/70">图</span>
+                                    {api.pricingRange.image}
+                                  </span>
+                                )}
+                                {api.pricingRange.video && (
+                                  <span
+                                    className="inline-flex items-center gap-1 rounded bg-accent/10 px-1.5 py-0.5 text-accent"
+                                    title="视频价格区间"
+                                  >
+                                    <span className="text-text-muted/70">视</span>
+                                    {api.pricingRange.video}
+                                  </span>
+                                )}
+                                {api.pricingRange.audio && (
+                                  <span
+                                    className="inline-flex items-center gap-1 rounded bg-accent/10 px-1.5 py-0.5 text-accent"
+                                    title="音频价格区间"
+                                  >
+                                    <span className="text-text-muted/70">音</span>
+                                    {api.pricingRange.audio}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[9px] leading-tight text-text-muted/50">
+                                平台标价 · 仅供参考，实付以订单为准
+                              </p>
+                            </div>
                           )}
                           <a
                             href={api.pricingUrl ?? api.registerUrl}
@@ -1186,6 +1294,8 @@ export function SettingsDialog({
                     </button>
                   </div>
 
+                  <WanCliSettings />
+
                   {/* 自定义平台(OpenAI 兼容) */}
                   <div ref={customApiSectionRef} className="rounded-lg border border-border-dark bg-bg-dark/60 p-4">
                     <div className="mb-3 flex items-center justify-between">
@@ -1224,7 +1334,8 @@ export function SettingsDialog({
                         onClose={resetCustomApiForm}
                         widthClassName="w-[560px]"
                       >
-                      <div className="space-y-2">
+                      {/* 字段变多后弹窗会超出窗口高度, 这里让表单自身滚动, 避免保存按钮不可达。 */}
+                      <div className="ui-scrollbar max-h-[62vh] space-y-2 overflow-y-auto pr-1">
                         <div className="grid grid-cols-2 gap-2">
                           <label className="block">
                             <span className="mb-1 block text-[11px] text-text-muted">
@@ -1267,6 +1378,38 @@ export function SettingsDialog({
                             className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
                           />
                         </label>
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="block">
+                            <span className="mb-1 block text-[11px] text-text-muted">
+                              {t('settings.customApiReferenceAssetUploadUrl')}
+                            </span>
+                            <input
+                              value={customApiDraft.referenceAssetUploadUrl}
+                              onChange={(event) =>
+                                setCustomApiDraft({ ...customApiDraft, referenceAssetUploadUrl: event.target.value })
+                              }
+                              placeholder="https://assets.example.com/v1/reference-assets"
+                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
+                            />
+                          </label>
+                          <label className="block">
+                            <span className="mb-1 block text-[11px] text-text-muted">
+                              {t('settings.customApiReferenceAssetUploadToken')}
+                            </span>
+                            <input
+                              type="password"
+                              value={customApiDraft.referenceAssetUploadToken}
+                              onChange={(event) =>
+                                setCustomApiDraft({ ...customApiDraft, referenceAssetUploadToken: event.target.value })
+                              }
+                              placeholder={t('settings.customApiReferenceAssetUploadTokenPlaceholder')}
+                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
+                            />
+                          </label>
+                        </div>
+                        <p className="text-[10px] leading-4 text-text-muted">
+                          {t('settings.customApiReferenceAssetUploadHint')}
+                        </p>
                         <label className="block">
                           <span className="mb-1 flex items-center justify-between text-[11px] text-text-muted">
                             <span>{t('settings.customApiVideoModels')}</span>
@@ -1312,6 +1455,30 @@ export function SettingsDialog({
                             }
                             rows={3}
                             placeholder={t('settings.customApiModelsPlaceholder')}
+                            className="ui-scrollbar w-full resize-none rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
+                          />
+                        </label>
+                        <label className="block">
+                          <span className="mb-1 flex items-center justify-between text-[11px] text-text-muted">
+                            <span>{t('settings.customApiAudioModels')}</span>
+                            <button
+                              type="button"
+                              onClick={() => void handleFetchModels('audio')}
+                              disabled={customApiBusy !== 'idle'}
+                              className="rounded-md border border-border-dark px-2 py-0.5 text-[11px] text-text-muted transition-colors hover:border-accent/50 hover:text-text-dark disabled:opacity-50"
+                            >
+                              {customApiBusy === 'fetching'
+                                ? t('settings.customApiFetching', '拉取中…')
+                                : t('settings.customApiFetchModels', '拉取模型')}
+                            </button>
+                          </span>
+                          <textarea
+                            value={customApiDraft.audioModelsText}
+                            onChange={(event) =>
+                              setCustomApiDraft({ ...customApiDraft, audioModelsText: event.target.value })
+                            }
+                            rows={2}
+                            placeholder={t('settings.customApiAudioModelsPlaceholder')}
                             className="ui-scrollbar w-full resize-none rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
                           />
                         </label>
@@ -1384,12 +1551,14 @@ export function SettingsDialog({
                               onChange={(event) =>
                                 setCustomApiDraft({
                                   ...customApiDraft,
-                                  referenceImageField: event.target.value as 'image' | 'input_image',
+                                  referenceImageField: event.target.value as 'image' | 'input_image' | 'images' | 'reference_images',
                                 })
                               }
                               className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
                             >
                               <option value="image">image / images</option>
+                              <option value="images">images（纯数组）</option>
+                              <option value="reference_images">reference_images（对象数组）</option>
                               <option value="input_image">input_image</option>
                             </select>
                           </label>
@@ -1495,9 +1664,11 @@ export function SettingsDialog({
                         'settings.customApiPickModels',
                         modelPickerMediaType === 'video'
                           ? '选择视频模型'
-                          : modelPickerMediaType === 'chat'
-                            ? '选择 Chat 模型'
-                            : '选择图片模型'
+                          : modelPickerMediaType === 'audio'
+                            ? '选择音频模型'
+                            : modelPickerMediaType === 'chat'
+                              ? '选择 Chat 模型'
+                              : '选择图片模型'
                       )}
                       onClose={() => setIsModelPickerOpen(false)}
                       widthClassName="w-[480px]"

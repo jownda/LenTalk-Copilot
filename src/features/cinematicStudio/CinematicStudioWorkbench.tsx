@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react';
 import StudioApp, { type CinematicStudioAppStateSnapshot } from './app/App';
+import type { CinematicStudioQuickSync, CinematicStudioUpstreamText } from './app/quickStudioSync';
 import type { CanvasAudioSource } from './app/components/AssetLibrary';
 import type { CanvasImageSource } from './app/components/DirectorLayersCard';
 import './app/styles.css';
@@ -10,13 +11,19 @@ export interface CinematicStudioWorkbenchProps {
   onSendToVideo?: (payload: { prompt: string; referenceImages: string[]; referenceAudio: string[] }) => void;
   canvasAudioSources?: CanvasAudioSource[];
   canvasImageSources?: CanvasImageSource[];
+  /** 该工作室节点独占的工程 id（每个节点一份独立工程）。 */
+  projectId?: string;
+  /** 与画布极简节点双向同步的风格、剧情与场景站位数据。 */
+  quickSync?: CinematicStudioQuickSync;
+  /** 画布上游接入的文本，在高级编辑的风格 / 故事梗概下方作灰色只读回显（不落工程文件）。 */
+  quickSyncUpstream?: CinematicStudioUpstreamText;
 }
 
 /**
  * 提示词工作室全屏嵌入层。顶层留有 LenTalk 标题栏高度(top-10),
  * 与 3D 导演台保持一致;样式通过 .cinematic-studio-app 作用域隔离。
  */
-export function CinematicStudioWorkbench({ onClose, onStateChange, onSendToVideo, canvasAudioSources, canvasImageSources }: CinematicStudioWorkbenchProps) {
+export function CinematicStudioWorkbench({ onClose, onStateChange, onSendToVideo, canvasAudioSources, canvasImageSources, projectId, quickSync, quickSyncUpstream }: CinematicStudioWorkbenchProps) {
   const latestSnapshot = useRef<CinematicStudioAppStateSnapshot>({});
 
   const handleStateChange = useCallback(
@@ -44,6 +51,14 @@ export function CinematicStudioWorkbench({ onClose, onStateChange, onSendToVideo
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleClose]);
 
+  // 卸载（关闭工作室）时注销画布素材库中的 bridge，
+  // 避免侧边栏持有指向已卸载实例的 stale dispatch（点编辑/新增全部无响应）。
+  useEffect(() => {
+    return () => {
+      window.dispatchEvent(new CustomEvent("lentalk:unregister-cinematic-asset-library"));
+    };
+  }, []);
+
   return (
     <div
       className="cinematic-studio-app fixed inset-x-0 bottom-0 top-10 z-[120] overflow-hidden"
@@ -54,7 +69,7 @@ export function CinematicStudioWorkbench({ onClose, onStateChange, onSendToVideo
       }}
     >
       <main className="cinematic-studio-body">
-        <StudioApp onClose={handleClose} onStateChange={handleStateChange} onSendToVideo={onSendToVideo} canvasAudioSources={canvasAudioSources} canvasImageSources={canvasImageSources} />
+        <StudioApp onClose={handleClose} onStateChange={handleStateChange} onSendToVideo={onSendToVideo} canvasAudioSources={canvasAudioSources} canvasImageSources={canvasImageSources} projectId={projectId} quickSync={quickSync} quickSyncUpstream={quickSyncUpstream} />
       </main>
     </div>
   );

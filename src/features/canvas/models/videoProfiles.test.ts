@@ -61,4 +61,23 @@ describe('resolveVideoModelProfile', () => {
     expect(profile.supportsFirstLast).toBe(true);
     expect(profile.supportsReferenceAudio).toBe(true);
   });
+
+  it('routes 知鸟 AI through the flat videos endpoint with the gateway task poll', () => {
+    const profile = resolveVideoModelProfile('custom:zhiniao/seedance-2-5');
+    expect(profile.id).toBe('zhiniao-video');
+    expect(profile.status).toBe('verified');
+    expect(profile.submitPath).toBe('/v1/videos/generations');
+    // 知鸟的轮询不是「提交路径 + /{taskId}」, 而是网关统一的 /v1/tasks/{task_id}
+    expect(profile.queryPath).toBe('/v1/tasks/{taskId}');
+    expect(profile.referenceImageTarget).toBe('platform-file');
+    expect(profile.supportsReferenceImages).toBe(true);
+    expect(profile.supportsReferenceAudio).toBe(true);
+  });
+
+  it('recognizes the 知鸟 base URL even when the custom platform id differs', () => {
+    expect(resolveVideoModelProfile('custom:my-relay/veo-3.1', 'https://cuai.token6688.com').id)
+      .toBe('zhiniao-video');
+    expect(resolveVideoModelProfile('custom:my-relay/veo-3.1', 'https://api.tokengo.love/v1').id)
+      .toBe('zhiniao-video');
+  });
 });

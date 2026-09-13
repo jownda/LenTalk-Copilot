@@ -58,6 +58,25 @@ describe("compileDirectorSequence final export audit", () => {
     expect(compileDirectorSequence(project, scene, { locale: "zh" })).toContain("镜头执行：");
   });
 
+  it("故事梗概要求全程第一人称 POV 时，在相机与正向约束锁视角，逐镜开头不再复述机位", () => {
+    const ajian: Asset = { id: "ajian", kind: "character", name: "阿健", description: "", descriptionZh: "", referencePaths: [], lockLevel: "none", tags: [] };
+    const rebecca: Asset = { id: "rebecca", kind: "character", name: "Rebecca", description: "", descriptionZh: "", referencePaths: [], lockLevel: "none", tags: [] };
+    const scene = makeScene({
+      logline: "全程阿健第一人称 POV 视角拍摄 Rebecca 全身背影，阿健不出镜。",
+      shots: [{
+        ...makeScene().shots[0], movement: "POV",
+        participants: [{ characterId: rebecca.id, role: "primary" }],
+      }],
+    });
+    const output = compileDirectorSequence({ ...makeProject(scene), assets: [ajian, rebecca] }, scene, { locale: "zh" });
+
+    expect(output).toContain("相机：\n全程第一人称 POV 锁：摄影机即阿健的眼睛；禁止第三人称、旁观或反打机位；阿健绝不出镜，包括身体、脸、影子与倒影。");
+    expect(output).toContain("镜头 1（相机：POV运镜）：");
+    // 机位锁只应出现在相机段与正向约束，逐镜开头不得再抄一遍完整机位配置。
+    expect(output).not.toContain("（相机：全程第一人称 POV 锁");
+    expect(output).toContain("正向约束：\n全程第一人称 POV 锁：摄影机即阿健的眼睛");
+  });
+
   it("将选中的导演风格写入导演文档，并位于光线之后、正向约束之前", () => {
     const scene = makeScene();
     const project = { ...makeProject(scene), styleId: "wong-kar-wai" };
@@ -99,7 +118,7 @@ describe("compileDirectorSequence final export audit", () => {
     expect(output).not.toContain("空间布局：故意越轴");
   });
 
-  it("把摄影设备、空间视线、道具变化和节拍约束带入最终镜头执行", () => {
+  it("把摄影设备、空间视线和节拍内道具操作带入最终镜头执行", () => {
     const actor: Asset = {
       id: "actor-1", kind: "character", name: "林警官", description: "", descriptionZh: "中年男性",
       referencePaths: [], lockLevel: "none", tags: [],
@@ -131,7 +150,8 @@ describe("compileDirectorSequence final export audit", () => {
     expect(output).toContain("相机型号：ARRI ALEXA 35");
     expect(output).toContain("镜头型号：Cooke S7/i Full Frame+");
     expect(output).toContain("视线：盯住红色打火机");
-    expect(output).toContain("道具变化：林警官从桌上拿起打火机并点燃");
+    expect(output).toContain("林警官从桌上拿起打火机并点燃");
+    expect(output).not.toContain("道具变化：");
     expect(output).toContain("目标部位：右手");
     expect(output).toContain("策略：试探");
     expect(output).toContain("潜台词：假装漫不经心");
@@ -272,11 +292,52 @@ describe("compileDirectorSequence final export audit", () => {
     const output = compileDirectorSequence(makeProject(scene), scene, { locale: "en" });
 
     expect(output).toContain("FORMAT MODE");
-    expect(output).toContain("SHOT 1 0:00-0:05:");
+    expect(output).toContain("0:00-0:05 — SHOT 1 (Camera: static camera):");
     expect(output).toContain("SHOT 1: 47° Standard");
     expect(output).not.toContain("35mm");
     expect(output).not.toContain("AI generated scene.");
     expect(output).not.toContain("continuous action without shot blocks.");
+  });
+
+  it("有角色的场景输出独立「表演」段，且表演、现场光、背景活动都不再挤进动作节奏", () => {
+    const actor: Asset = { id: "actor", kind: "character", name: "林警官", description: "", descriptionZh: "", referencePaths: [], lockLevel: "none", tags: [] };
+    const scene = makeScene({
+      shootingMode: "multi-shot",
+      shots: [{
+        ...makeScene().shots[0],
+        id: "shot-perf",
+        participants: [{ characterId: actor.id, role: "primary", position: "画面左侧" }],
+        performanceDescription: "克制，只靠呼吸和手指的微小停顿演戏",
+        backgroundActivity: "后景乘客整理雨伞、让开过道。",
+        lightingBehavior: "顶灯从左上落下",
+      }],
+    });
+    const project = makeProject(scene);
+    project.assets = [actor];
+    const output = compileDirectorSequence(project, scene, { locale: "zh" });
+
+    // 有角色 → 表演段存在，且引用写法与动作节奏一致（@资产名（站位））。
+    expect(output).toContain("表演：\n@林警官（画面左侧）：克制，只靠呼吸和手指的微小停顿演戏。");
+    // 现场光迁往光线段、背景活动迁往场景地图段，动作节奏里都不再出现。
+    expect(output).toContain("镜头 1 光影：顶灯从左上落下");
+    expect(output).toContain("镜头 1 背景活动：后景乘客整理雨伞、让开过道");
+    const execution = output.split("镜头执行：")[1]?.split("\n\n")[0] ?? "";
+    expect(execution).not.toContain("光影：");
+    expect(execution).not.toContain("背景活动：");
+    // 动作本身仍留在动作节奏里，不因表演段的存在被吞掉。
+    expect(execution).toContain("镜头保持：角色保持坐姿。");
+  });
+
+  it("纯景色场景不输出「表演」段", () => {
+    const scene = makeScene({
+      shots: [{ ...makeScene().shots[0], id: "shot-scenery", action: "雾在楼宇之间缓慢流动。" }],
+    });
+    const output = compileDirectorSequence(makeProject(scene), scene, { locale: "zh" });
+
+    expect(output).not.toContain("表演：");
+    expect(output).not.toContain("PERFORMANCE");
+    // 没有角色，动作节奏照常输出动作。
+    expect(output).toContain("镜头保持：雾在楼宇之间缓慢流动。");
   });
 
   it("场景地图和站位不再输出任何首帧；首帧只由动作节奏表达", () => {
@@ -300,7 +361,7 @@ describe("compileDirectorSequence final export audit", () => {
     expect(output).not.toContain("FIRST FRAME");
   });
 
-  it("多镜头在镜头执行中明确输出每个切点，并合并表演与动作", () => {
+  it("多镜头在镜头执行中明确输出每个切点，动作与表演分列", () => {
     const base = makeScene().shots[0];
     const scene = makeScene({
       shootingMode: "multi-shot",
@@ -312,8 +373,10 @@ describe("compileDirectorSequence final export audit", () => {
     const output = compileDirectorSequence(makeProject(scene), scene, { locale: "zh" });
 
     expect(output).toContain("镜头执行：");
-    expect(output).toContain("镜头 1 0:00–0:02：\n镜头保持：克制；角色先停住。");
-    expect(output).toContain("镜头 2 0:02–0:05：动作匹配剪辑进入镜头 2；\n镜头保持：克制；角色转身离开。");
+    expect(output).toContain("0:00–0:02 — 镜头 1（相机：固定机位）：\n镜头保持：角色先停住。");
+    expect(output).toContain("0:02–0:05 — 镜头 2（相机：固定机位）：动作匹配剪辑进入镜头 2；\n镜头保持：角色转身离开。");
+    // 表演词（克制）不再混进动作节奏，已迁往独立的「表演」段。
+    expect(output.split("镜头执行：")[1]?.split("\n\n")[0] ?? "").not.toContain("克制");
     expect(output).not.toContain("角色表演：");
     expect(output).not.toContain("角色站位（从左到右）");
   });
@@ -347,7 +410,11 @@ describe("compileDirectorSequence final export audit", () => {
     project.assets = [actor];
     const output = compileDirectorSequence(project, scene, { locale: "zh" });
 
-    expect(output).toContain("@林警官：克制；手指停在烟灰缸边，压低呼吸；视线先掠过车门，慢眨一次后回到对手；角色保持坐姿。");
+    expect(output).toContain("表演：\n@林警官：克制；手指停在烟灰缸边，压低呼吸；视线先掠过车门，慢眨一次后回到对手。");
+    // 表演不再混进时间轴：动作节奏里只留动作本身。
+    expect(output).toContain("镜头保持：角色保持坐姿。");
+    expect(output.split("镜头执行：")[1]?.split("\n\n")[0] ?? "").not.toContain("克制");
+
   });
 
   it("镜头执行使用 @ 资产引用明确角色目标", () => {
@@ -426,7 +493,10 @@ describe("compileDirectorSequence final export audit", () => {
     const output = compileDirectorSequence(project, scene, { locale: "zh", syntax: "at-mention" });
     const execution = output.split("镜头执行：")[1]?.split("\n\n")[0] ?? "";
 
-    expect(execution).toContain("@char_cb_阿俊_base_v1：阿俊克制讲述，琪琪压住恐惧；阿俊看向车厢深处，琪琪短暂看向公文包。");
+    // 镜头级表演基调 + 逐角色表演整句迁到「表演」段，并按首位出场角色归属。
+    expect(output).toContain("@char_cb_阿俊_base_v1：阿俊克制讲述，琪琪压住恐惧；阿俊看向车厢深处，琪琪短暂看向公文包。");
+    expect(output).toContain("表演：\n@char_cb_阿俊_base_v1：阿俊克制讲述");
+
     expect(execution).toContain("0:00–0:03：@char_cb_阿俊_base_v1：压低声音讲述传说；语速逐渐加快。");
     expect(execution).toContain("0:03–0:05：@char_cb_琪琪_base_v1：把公文包压在胸前；在阿俊开口前先收紧手指。");
     expect(execution.indexOf("@char_cb_阿俊_base_v1：")).toBeLessThan(execution.indexOf("@char_cb_琪琪_base_v1："));
@@ -446,8 +516,10 @@ describe("compileDirectorSequence final export audit", () => {
     });
     const output = compileDirectorSequence(makeProject(scene), scene, { locale: "zh" });
 
-    expect(output).toContain("0:00–0:02：\n镜头保持：克制；先停住。");
-    expect(output).toContain("0:02–0:05：\n镜头保持：克制；再向前走。");
+    expect(output).toContain("0:00–0:02 — 镜头 1（相机：固定机位）：\n镜头保持：先停住。");
+    expect(output).toContain("0:02–0:05 — 镜头 2（相机：固定机位）：\n镜头保持：再向前走。");
+    // 表演词（克制）已迁往「表演」段，动作节奏只留动作本身。
+    expect(output.split("镜头执行：")[1]?.split("\n\n")[0] ?? "").not.toContain("克制");
   });
 
   it("按精确起始时间排序节拍，同时保留越界时间而不静默截断", () => {
@@ -575,6 +647,7 @@ describe("compileDirectorSequence final export audit", () => {
     expect(output).toContain("镜头执行：");
     expect(output).toContain("压住怒气，呼吸逐渐变浅");
     expect(output).toContain("@林警官（center）：压住怒气，呼吸逐渐变浅；先看车门，再回到前方。");
+
     expect(output).toContain("0:00–0:05：@林警官（center）：pauses；擦烟灰的手突然停住；先收紧手指。");
     expect(output).not.toContain("表演评分");
     expect(output).not.toContain("潜台词：");
@@ -637,7 +710,7 @@ describe("compileDirectorSequence final export audit", () => {
     expect(output).not.toContain("镜头检查");
   });
 
-  it("角色全场无台词时活动引用不输出声音锁和声音参考", () => {
+  it("角色全场无台词时仍保留声音锁和声音参考", () => {
     const actor: Asset = {
       id: "actor-1",
       kind: "character",
@@ -671,8 +744,7 @@ describe("compileDirectorSequence final export audit", () => {
     const output = compileDirectorSequence(project, scene, { locale: "zh" });
     expect(output).toContain("@林警官");
     expect(output).not.toContain("表演模板：重心压低");
-    expect(output).not.toContain("声音锁：低沉克制");
-    expect(output).not.toContain("@audio");
+    expect(output).toContain("林警官声音：@林警官 [image1]；声音锁：低沉克制，压力下呼吸加重。；声音参考：@audio1。");
   });
 
   it("角色先出场后开口时，声音锁进入角色声音段", () => {
@@ -794,7 +866,34 @@ describe("compileDirectorSequence final export audit", () => {
     expect(execution).toContain("0:11–0:13：@林警官：向前走出画面。");
   });
 
-  it("时间块按需携带相机行为、物理锚点和关键道具状态", () => {
+  it("为节拍之间和节拍尾部的空档补齐保持状态时间块", () => {
+    const actor: Asset = {
+      id: "actor-gap", kind: "character", name: "林警官", referenceTag: "char_gap_actor_v1", description: "", descriptionZh: "",
+      referencePaths: [], lockLevel: "none", tags: [],
+    };
+    const base = makeScene().shots[0];
+    const scene = makeScene({
+      shootingMode: "long-take",
+      shots: [{
+        ...base,
+        id: "shot-gap",
+        time: { startSeconds: 0, endSeconds: 8 },
+        participants: [{ characterId: actor.id, role: "primary" }],
+        beats: [
+          { id: "beat-1", order: 1, startSeconds: 2, duration: 1, verb: "look", actorId: actor.id, actionText: "抬眼" },
+          { id: "beat-2", order: 2, startSeconds: 5, duration: 1, verb: "walk", actorId: actor.id, actionText: "向前走" },
+        ],
+      }],
+    });
+    const output = compileDirectorSequence({ ...makeProject(scene), assets: [actor] }, scene, { locale: "zh" });
+    const execution = output.split("镜头执行：")[1]?.split("\n\n")[0] ?? "";
+
+    expect(execution).toContain("0:00–0:02：@char_gap_actor_v1：保持当前状态，等待下一动作。");
+    expect(execution).toContain("0:03–0:05：@char_gap_actor_v1：上一动作余韵持续，保持当前姿态与空间关系。");
+    expect(execution).toContain("0:06–0:08：@char_gap_actor_v1：保持当前动作与镜头状态直到本镜头结束。");
+  });
+
+  it("镜头开头先写相机执行，时间块只保留动作、物理锚点和关键道具状态", () => {
     const actor: Asset = {
       id: "actor-1", kind: "character", name: "林警官", description: "", descriptionZh: "",
       referencePaths: [], lockLevel: "none", tags: [],
@@ -808,8 +907,15 @@ describe("compileDirectorSequence final export audit", () => {
       shots: [{
         ...base,
         time: { startSeconds: 0, endSeconds: 5 },
+        movement: "Handheld",
+        framing: "Close-up",
         participants: [{ characterId: actor.id, role: "primary" }],
         cameraBehavior: { handheldQuality: "呼吸造成轻微 settle", focusBehavior: "保持眼睛清晰" },
+        lightingBehavior: "车厢顶灯从画面左后上方落下，镜头侧移时左脸高光退到颧骨，右侧环境光逐渐显出车门纹理",
+        backgroundActivity: "后景乘客各自错开节奏整理雨伞、让开过道，只有一人短暂停在车门旁",
+        planningMeta: {
+          status: "confirmed", performanceBeatIds: [], cameraTrigger: "听见脚步声", cameraEndState: "停在手电筒上",
+        },
         physicsAnchors: [{ kind: "walk", detail: "鞋底与地面保持真实接触" }],
         beats: [{
           id: "beat-1", order: 1, startSeconds: 1.5, duration: 1, verb: "grabs", actorId: actor.id,
@@ -822,7 +928,19 @@ describe("compileDirectorSequence final export audit", () => {
     const output = compileDirectorSequence({ ...makeProject(scene), assets: [actor, prop] }, scene, { locale: "zh" });
     const execution = output.split("镜头执行：")[1]?.split("\n\n")[0] ?? "";
 
-    expect(execution).toContain("相机行为：保持当前机位，手持：呼吸造成轻微 settle，对焦：保持眼睛清晰");
+    expect(execution).toContain("0:00–0:05 — 镜头 1（相机：手持运镜；触发：听见脚步声；落点：停在手电筒上）：");
+    // 景别(FOV/景别在光学段)与机位细节(在相机段)不得在动作节奏里再抄一遍。
+    expect(execution).not.toContain("近景 / 特写");
+    expect(execution).not.toContain("对焦：");
+    expect(execution).not.toContain("手持质感：");
+    expect(execution.indexOf("相机：手持运镜")).toBeLessThan(execution.indexOf("伸手拿起手电筒"));
+    expect(execution).not.toContain("相机行为：");
+    // 现场光与背景人流已分别迁往光线段 / 场景地图段，动作节奏里不再出现。
+    expect(execution).not.toContain("镜头光影：");
+    expect(execution).not.toContain("背景活动：");
+    expect(output).toContain("镜头 1 光影：车厢顶灯从画面左后上方落下，镜头侧移时左脸高光退到颧骨，右侧环境光逐渐显出车门纹理");
+    expect(output).toContain("镜头 1 背景活动：后景乘客各自错开节奏整理雨伞、让开过道，只有一人短暂停在车门旁");
+
     expect(execution).toContain("物理：");
     expect(execution).toContain("关键道具状态：@手电筒，已点亮，右手握持");
     expect(execution).toContain("声音：鞋底摩擦地面");

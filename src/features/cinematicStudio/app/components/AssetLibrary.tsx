@@ -6,14 +6,17 @@
  * 参考图压缩后存入 Asset.referencePaths（P3 SQLite 前暂存 localStorage）。
  */
 import { createPortal } from "react-dom";
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Asset, AssetActingProfile, AssetKind, LockLevel, ProjectV2, SceneV2 } from "../../shared-types";
-import { ImagePlus, Lock, LockKeyhole, Plus, Sparkles, Trash2, X } from "lucide-react";
+import { AudioLines, FolderOpen, CheckCircle2, AlertCircle, ChevronDown, Cpu, ImagePlus, Lock, LockKeyhole, Plus, Sparkles, Trash2, X, Zap } from "lucide-react";
 import type { ProjectAction } from "../store/projectReducer";
 import type { Locale } from "../i18n";
-import { classifyError, fillAssetDetails } from "../providers/ai";
-import { isRemoteConfigured } from "../providers/aiSettings";
+import { classifyError, fillAssetDetails, testAIConnection } from "../providers/ai";
+import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type LenTalkChatModelOption } from "../providers/aiSettings";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { useAssetLibraryStore } from "@/features/library/assetStore";
+import { isCinematicMirrorAsset, pickableAudioAssets } from "@/features/library/cinematicMirror";
+import type { LibraryAsset } from "@/features/library/types";
 
 const TABS: { kind: AssetKind; labelKey: "assetTabCharacter" | "assetTabLocation" | "assetTabProp" }[] = [
   { kind: "character", labelKey: "assetTabCharacter" },
@@ -126,11 +129,16 @@ export default function AssetLibrary({ project, scene, dispatch, locale, t, setN
       {assets.map((asset) => <AssetTile key={asset.id} asset={asset} locale={locale} t={t} activeInCurrentScene={sceneUsesAsset(scene, asset.id)} projectUsageCount={projectUsageCount(project, asset.id)} onClick={() => setEditingId(asset.id)} onDelete={() => { dispatch({ type: "DELETE_ASSET", id: asset.id }); setNotice(t.assetDeleted); }} />)}
     </div>}
     {editing && typeof document !== "undefined" && (() => {
+      const editor = <AssetEditor project={project} scene={scene} asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} canvasAudioSources={canvasAudioSources} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />;
+      // 优先挂到工作室工作台（与工作室联动时保持原有布局）；
+      // 从画布侧边栏打开且工作台未挂载时回退到 body：包装层 relative + z-200 形成堆叠上下文,
+      // 让内部 fixed 弹窗(modal-overlay z-60)盖过素材库侧边栏(z-[140])。
       const host = document.querySelector<HTMLElement>("[data-cinematic-studio]");
-      return host ? createPortal(
-        <AssetEditor project={project} scene={scene} asset={editing} locale={locale} t={t} dispatch={dispatch} setNotice={setNotice} canvasAudioSources={canvasAudioSources} onCreateVariant={(id) => setEditingId(id)} onClose={() => setEditingId(null)} />,
-        host,
-      ) : null;
+      if (host) return createPortal(editor, host);
+      return createPortal(
+        <div className="cinematic-studio-app" data-cinematic-studio-portal style={{ position: "relative", zIndex: 200 }}>{editor}</div>,
+        document.body,
+      );
     })()}
   </section>;
 }
@@ -143,7 +151,7 @@ function AssetTile({ asset, locale, t, activeInCurrentScene, projectUsageCount, 
     : null;
   return <div className="asset-tile" onClick={onClick} title={t.editDetails}>
     <button className="char-delete" title={t.deleteAsset} onClick={(event) => { event.stopPropagation(); onDelete(); }}><X size={12} /></button>
-    <div className="tile-thumb">{thumb ? <img src={thumb} alt={asset.name} /> : <span className="tile-avatar">{asset.name.slice(0, 1)}</span>}</div>
+    <div className="tile-thumb">{thumb ? <img src={resolveImageDisplayUrl(thumb)} alt={asset.name} /> : <span className="tile-avatar">{asset.name.slice(0, 1)}</span>}</div>
     <div className="tile-info">
       <div className="tile-row">
         <div className="tile-name">{asset.name || "…"}</div>
@@ -166,8 +174,48 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
   const [propPickerOpen, setPropPickerOpen] = useState(false);
   const [propPickerMode, setPropPickerMode] = useState<"choices" | "library" | "create">("choices");
   const [aiBusy, setAiBusy] = useState(false);
+  /** AI 填写失败的完整诊断信息（含模型 / 接口 host / 错误类型 / 原始信息） */
+  const [aiFillError, setAiFillError] = useState("");
+  /** AI 填写模型选择：模型来自 LenTalk「设置 → 自定义平台」的 Chat 模型（地址/Key 同源） */
+  const [fillModelOpen, setFillModelOpen] = useState(false);
+  const [fillModelFilter, setFillModelFilter] = useState("");
+  const [fillModelTick, setFillModelTick] = useState(0);
+  const [fillModelKey, setFillModelKey] = useState(() => {
+    const initial = loadAISettings();
+    return initial.provider && initial.model ? `${initial.provider}:${initial.model}` : "";
+  });
+  const fillModelOptions = useMemo(() => listLenTalkChatModels(), [fillModelTick, fillModelOpen]);
+  const fillModelSelected = fillModelOptions.find((option) => `${option.providerId}:${option.model}` === fillModelKey) ?? null;
+  const fillModelLabel = fillModelSelected?.model ?? loadAISettings().model ?? "";
+  const filteredFillModels = fillModelOptions.filter((option) =>
+    `${option.providerName} ${option.model}`.toLowerCase().includes(fillModelFilter.trim().toLowerCase()),
+  );
+  const [fillTestBusy, setFillTestBusy] = useState(false);
+  const [fillTestResult, setFillTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+
+  /** 直接测当前选中模型是否连通（地址/Key 取自 LenTalk 平台配置） */
+  const testFillModel = async () => {
+    setFillTestBusy(true);
+    setFillTestResult(null);
+    const result = await testAIConnection(loadAISettings());
+    setFillTestBusy(false);
+    setFillTestResult(result.ok
+      ? { ok: true, text: t.testOk.replace("{model}", result.model ?? fillModelLabel) }
+      : {
+          ok: false,
+          text: t.testFailed.replace("{error}", result.errorKind === "network"
+            ? t.networkErrorHint
+            : result.errorKind === "gateway-timeout"
+              ? t.aiGatewayTimeout
+              : result.errorKind === "timeout"
+                ? t.aiRequestInterrupted
+                : (result.error ?? "unknown")),
+        });
+  };
   const [variantComposerOpen, setVariantComposerOpen] = useState(false);
   const [variantStateName, setVariantStateName] = useState("");
+  /** 素材库选图器：'ref' = 添加参考图；'prop' = 从素材库图片创建道具；null = 关闭 */
+  const [libraryPicker, setLibraryPicker] = useState<null | "ref" | "prop" | "voice">(null);
   const update = (patch: Partial<Asset>) => dispatch({ type: "UPDATE_ASSET", id: asset.id, patch });
   const attachedPropIds = asset.attachedPropIds ?? [];
   const attachedProps = attachedPropIds.map((id) => (project.assets ?? []).find((candidate) => candidate.id === id && candidate.kind === "prop")).filter((candidate): candidate is Asset => Boolean(candidate));
@@ -234,6 +282,54 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
     setNotice(t.voiceCanvasReplaced.replace("{name}", selected.label));
   };
 
+  // ── 素材库选图：参考图与新建道具均可直接从 LenTalk 素材库挑图 ──────────
+  const libraryAssets = useAssetLibraryStore((state) => state.assets);
+  const hydrateLibrary = useAssetLibraryStore((state) => state.hydrate);
+  useEffect(() => {
+    if (libraryPicker) void hydrateLibrary();
+  }, [libraryPicker, hydrateLibrary]);
+  const libraryImages = useMemo(() => {
+    const existing = new Set(asset.referencePaths ?? []);
+    return libraryAssets
+      .filter((item) => item.mediaType === "image" && !isCinematicMirrorAsset(item) && !existing.has(item.sourcePath))
+      .sort((left, right) => right.createdAt - left.createdAt);
+  }, [asset.referencePaths, libraryAssets]);
+
+  /** 从素材库选一张图追加为该资产的参考图（直接引用素材库路径，不转 dataURL） */
+  const pickLibraryReference = (item: LibraryAsset) => {
+    update({ referencePaths: [...(asset.referencePaths ?? []), item.sourcePath] });
+    setNotice(t.libraryImageAdded);
+    setLibraryPicker(null);
+  };
+
+  /** 从素材库选一段音频作为角色声音音色（同样直接引用素材库路径，不转 dataURL） */
+  const pickLibraryVoice = (item: LibraryAsset) => {
+    update({ voiceClip: item.sourcePath });
+    setNotice(t.voiceLibraryAdded.replace("{name}", item.name || t.voiceClip));
+    setLibraryPicker(null);
+  };
+
+  /** 素材库音频：排除电影资产镜像条目（那些由工程自动同步，手工选择会绕成环）。 */
+  const libraryAudio = useMemo(() => pickableAudioAssets(libraryAssets), [libraryAssets]);
+
+  /** 从素材库图片创建独立道具资产并挂到当前角色（与 uploadPropImage 同构，但不转 dataURL） */
+  const createPropFromLibraryImage = (item: LibraryAsset) => {
+    const id = crypto.randomUUID();
+    dispatch({
+      type: "ADD_ASSET",
+      id,
+      kind: "prop",
+      name: item.name || `${asset.name || t.assetKindCharacter} ${t.assetKindProp}`,
+      referencePaths: [item.sourcePath],
+      propHolderCharacterId: asset.id,
+    });
+    update({ attachedPropIds: [...attachedPropIds, id] });
+    setPropPickerOpen(false);
+    setPropPickerMode("choices");
+    setLibraryPicker(null);
+    setNotice(t.propImageAdded);
+  };
+
   const isBaseCard = (asset.baseAssetId ?? asset.id) === asset.id;
   const activeInCurrentScene = sceneUsesAsset(scene, asset.id);
   const createVariant = () => {
@@ -258,6 +354,7 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
     const hasVoiceReference = asset.kind === "character" && Boolean(asset.voiceClip?.trim());
     if (!(asset.referencePaths ?? []).length && !hasVoiceReference) { setNotice(t.aiFillNeedsReference); return; }
     setAiBusy(true);
+    setAiFillError("");
     setNotice(t.aiFillStarted);
     try {
       const patch = await fillAssetDetails(asset, locale);
@@ -275,12 +372,73 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
           ? t.aiRequestInterrupted
           : message;
       setNotice(`${t.aiFillFailed}${friendly}`);
+      // 保留完整诊断信息在卡片内，避免 toast 一闪而过导致「点了没反应 / 没接通」无从排查
+      const settings = loadAISettings();
+      const host = (() => { try { return new URL(settings.baseUrl).host; } catch { return settings.baseUrl || "—"; } })();
+      setAiFillError([`${t.aiFillFailed}${friendly}`, `模型：${settings.model || "—"}`, `接口：${host}`, `错误类型：${classified.kind}`, `原始信息：${message}`].join("\n"));
     } finally {
       setAiBusy(false);
     }
   };
 
+  const copyFillError = async () => {
+    try {
+      await navigator.clipboard.writeText(aiFillError);
+      setNotice(t.aiErrorCopied);
+    } catch {
+      setNotice(t.aiFillFailed + aiFillError);
+    }
+  };
+
+  /** 选择 AI 填写所用模型：只改「用哪个 Chat 模型」，地址/Key 仍取 LenTalk 平台配置 */
+  const pickFillModel = (option: LenTalkChatModelOption) => {
+    const previous = loadAISettings();
+    const saved = saveAISettings({
+      ...resolveLenTalkChatModel(option.providerId, option.model),
+      reasoningEffort: previous.reasoningEffort,
+    });
+    setFillModelKey(`${option.providerId}:${option.model}`);
+    setFillModelOpen(false);
+    setFillModelFilter("");
+    setFillModelTick((value) => value + 1);
+    setNotice(t.modelSwitched.replace("{model}", saved.model || option.model));
+  };
+
   const lockLevels: [LockLevel, keyof Copy][] = [["none", "lockNone"], ["soft", "lockSoft"], ["strict", "lockStrict"]];
+
+  /**
+   * 素材库选择面板：ref 模式挂在参考图容器内（flex-wrap 换行铺满一行），
+   * prop 模式挂在道具面板内，voice 模式挂在声音音色字段下（只列音频素材）。
+   */
+  const libraryPickerNode = (target: "ref" | "prop" | "voice") => {
+    const isVoice = target === "voice";
+    const items = isVoice ? libraryAudio : libraryImages;
+    return libraryPicker === target && (
+      <div
+        className="asset-prop-picker"
+        style={target === "ref" ? { flexBasis: "100%" } : target === "voice" ? { marginTop: 6 } : undefined}
+      >
+        <button type="button" className="asset-prop-picker-back" onClick={() => setLibraryPicker(null)}>{t.cancel}</button>
+        {items.length === 0 ? <span className="hint-text">{isVoice ? t.voiceLibraryEmpty : t.libraryPickerEmpty}</span> : (
+          <div className="asset-prop-picker-grid" style={{ maxHeight: 220, overflowY: "auto" }}>
+            {items.map((item) => (
+              <button
+                type="button"
+                key={item.id}
+                title={item.name}
+                onClick={() => (isVoice ? pickLibraryVoice(item) : target === "prop" ? createPropFromLibraryImage(item) : pickLibraryReference(item))}
+              >
+                {item.mediaType === "audio"
+                  ? <span><AudioLines size={14} /></span>
+                  : <img src={resolveImageDisplayUrl(item.previewImageUrl || item.sourcePath)} alt={item.name} />}
+                <b>{item.name}</b>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
   return <div className="modal-overlay" onClick={onClose}>
     <div className="modal asset-modal" onClick={(event) => event.stopPropagation()}>
       <div className="modal-head">
@@ -298,16 +456,22 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
         <div className="asset-modal-left">
           {asset.kind === "character" ? <div className="asset-media-split">
             <div className="asset-refs">
-              {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={src} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
+              {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={resolveImageDisplayUrl(src)} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
               <label className="asset-ref-add" title={t.uploadCharacterImages}>
                 {imageBusy ? <span className="spin-dot" /> : <ImagePlus size={18} />}
+                <span>{t.assetUploadShort}</span>
                 <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
               </label>
+              <button type="button" className="asset-ref-add" title={t.assetPickFromLibrary} onClick={() => setLibraryPicker(libraryPicker === "ref" ? null : "ref")}>
+                <FolderOpen size={18} />
+                <span>{t.assetLibraryShort}</span>
+              </button>
+              {libraryPickerNode("ref")}
             </div>
             <div className="asset-prop-panel">
               {attachedProps.length > 0 && <div className="asset-prop-linked-list">
                 {attachedProps.map((prop) => <span className="asset-ref" key={prop.id} title={prop.name}>
-                  {prop.referencePaths?.[0] ? <img src={prop.referencePaths[0]} alt={prop.name} /> : <span className="asset-prop-fallback">{prop.name.slice(0, 1)}</span>}
+                  {prop.referencePaths?.[0] ? <img src={resolveImageDisplayUrl(prop.referencePaths[0])} alt={prop.name} /> : <span className="asset-prop-fallback">{prop.name.slice(0, 1)}</span>}
                   <button title={t.detachProp} onClick={() => detachProp(prop.id)}><X size={10} /></button>
                 </span>)}
               </div>}
@@ -323,7 +487,7 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
                   <button type="button" className="asset-prop-picker-back" onClick={() => setPropPickerMode("choices")}>{t.cancel}</button>
                   {attachableProps.length === 0 ? <span className="hint-text">{t.noPropsToAttach}</span> : <div className="asset-prop-picker-grid">
                     {attachableProps.map((prop) => <button type="button" key={prop.id} onClick={() => attachProp(prop.id)}>
-                      {prop.referencePaths?.[0] ? <img src={prop.referencePaths[0]} alt={prop.name} /> : <span>{prop.name.slice(0, 1)}</span>}
+                      {prop.referencePaths?.[0] ? <img src={resolveImageDisplayUrl(prop.referencePaths[0])} alt={prop.name} /> : <span>{prop.name.slice(0, 1)}</span>}
                       <b>{prop.name}</b>
                     </button>)}
                   </div>}
@@ -335,15 +499,23 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
                     <span>{t.uploadImage}</span>
                     <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadPropImage(event.target.files?.[0])} />
                   </label>
+                  <button type="button" onClick={() => setLibraryPicker(libraryPicker === "prop" ? null : "prop")}>{t.propFromLibraryCreate}</button>
                 </>}
               </div>}
+              {libraryPickerNode("prop")}
             </div>
           </div> : <div className="asset-refs">
-            {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={src} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
+            {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={resolveImageDisplayUrl(src)} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
             <label className="asset-ref-add" title={t.referenceImage}>
               {imageBusy ? <span className="spin-dot" /> : <ImagePlus size={18} />}
+              <span>{t.assetUploadShort}</span>
               <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
             </label>
+            <button type="button" className="asset-ref-add" title={t.assetPickFromLibrary} onClick={() => setLibraryPicker(libraryPicker === "ref" ? null : "ref")}>
+              <FolderOpen size={18} />
+              <span>{t.assetLibraryShort}</span>
+            </button>
+            {libraryPickerNode("ref")}
           </div>}
           <label className="field-label">{t.assetName}<input className="modal-input" value={asset.name} placeholder={t.assetNamePlaceholder} onChange={(event) => update({ name: event.target.value })} /></label>
           <label className="field-label">{t.assetNotes}<textarea className="modal-textarea asset-notes-input" value={locale === "zh" ? (asset.notesZh ?? "") : (asset.notes ?? "")} placeholder={locale === "zh" ? t.assetNotesZhPlaceholder : t.assetNotesPlaceholder} onChange={(event) => update(locale === "zh" ? { notesZh: event.target.value } : { notes: event.target.value })} /></label>
@@ -372,6 +544,15 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
                 <button className="icon-button" title={t.deleteAsset} onClick={() => update({ voiceClip: undefined })}><X size={13} /></button>
               </div>
             ) : null}
+            <button
+              type="button"
+              className="outline-button voice-library-trigger"
+              title={t.voiceFromLibrary}
+              onClick={() => setLibraryPicker(libraryPicker === "voice" ? null : "voice")}
+            >
+              <AudioLines size={13} /> {t.voiceFromLibrary}
+            </button>
+            {libraryPickerNode("voice")}
             {canvasAudioSources.length > 0 ? <div className="voice-canvas-picker">
               <span>{t.voiceCanvasSource}</span>
               <select value="" aria-label={t.voiceCanvasChoose} onChange={(event) => replaceVoiceFromCanvas(event.target.value)}>
@@ -388,7 +569,73 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
 
         {/* 右列：描述 → AI 填写结果 */}
         <div className="asset-modal-right">
-          <button type="button" className="primary-button asset-ai-fill-button" disabled={aiBusy} aria-busy={aiBusy} onClick={() => void aiFillDetails()}>{aiBusy ? <span className="spin-dot" /> : <Sparkles size={14} />} {aiBusy ? t.aiFillStarted : t.aiFillDetails}</button>
+          <div className="asset-ai-fill-row">
+            {/* 左：选择用于 AI 填写的模型（来自 LenTalk 已配置的 Chat 模型） */}
+            <div className="model-picker">
+              <button
+                type="button"
+                className="outline-button model-picker-btn"
+                onClick={() => { setFillModelOpen((value) => !value); setFillModelTick((value) => value + 1); }}
+                title={t.pickModel}
+                aria-expanded={fillModelOpen}
+              >
+                <Cpu size={13} />
+                <span className="model-picker-name">{fillModelLabel || t.modelNotSet}</span>
+                <ChevronDown size={12} />
+              </button>
+              {fillModelOpen && <div className="model-picker-panel" onClick={(event) => event.stopPropagation()}>
+                {fillModelOptions.length === 0 ? (
+                  <div className="model-picker-hint">
+                    <strong>{t.noChatModels}</strong>
+                    <span>{t.noChatModelsHint}</span>
+                  </div>
+                ) : (
+                  <>
+                    <div className="model-picker-meta">{t.modelPickerHint}</div>
+                    <input
+                      className="modal-input model-picker-filter"
+                      value={fillModelFilter}
+                      placeholder={t.modelsFilterPlaceholder}
+                      spellCheck={false}
+                      onChange={(event) => setFillModelFilter(event.target.value)}
+                    />
+                    <div className="model-picker-list">
+                      {filteredFillModels.length === 0 ? <div className="model-picker-hint">{t.modelsEmpty}</div>
+                        : filteredFillModels.map((option) => {
+                          const key = `${option.providerId}:${option.model}`;
+                          const active = key === fillModelKey;
+                          return <button key={key} type="button" className={`model-picker-item ${active ? "active" : ""}`} onClick={() => pickFillModel(option)} title={t.pickModel}>
+                            <span className="model-picker-item-main">
+                              <span className="model-picker-item-model">{option.model}</span>
+                              <span className="model-picker-item-provider">{option.providerName}</span>
+                            </span>
+                            {active && <CheckCircle2 size={12} />}
+                          </button>;
+                        })}
+                    </div>
+                    <div className="model-picker-test">
+                      <button type="button" className="outline-button" disabled={fillTestBusy} onClick={() => void testFillModel()}>
+                        <Zap size={12} /> {fillTestBusy ? t.testingConnection : t.testConnection}
+                      </button>
+                      {fillTestResult && <span className={`model-picker-test-status ${fillTestResult.ok ? "ok" : "error"}`}>
+                        {fillTestResult.ok ? <CheckCircle2 size={12} /> : <AlertCircle size={12} />}
+                        {fillTestResult.text}
+                      </span>}
+                    </div>
+                  </>
+                )}
+              </div>}
+            </div>
+            {/* 右：AI 填写详情 */}
+            <button type="button" className="primary-button asset-ai-fill-button" disabled={aiBusy} aria-busy={aiBusy} onClick={() => void aiFillDetails()}>{aiBusy ? <span className="spin-dot" /> : <Sparkles size={14} />} {aiBusy ? t.aiFillStarted : t.aiFillDetails}</button>
+          </div>
+          {aiFillError && <div className="asset-ai-fill-error" role="alert">
+            <pre className="asset-ai-fill-error-text">{aiFillError}</pre>
+            <div className="asset-ai-fill-error-actions">
+              <button type="button" className="outline-button" onClick={() => void copyFillError()}>{t.copyAiError}</button>
+              <button type="button" className="outline-button" onClick={() => setAiFillError("")}>{t.cancel}</button>
+            </div>
+          </div>}
           <div className="asset-ai-output-label">{t.assetAiOutput}</div>
           {locale === "zh" ? (
             <label className="field-label">{t.assetDescriptionZh}<textarea className="modal-textarea" value={asset.descriptionZh ?? ""} placeholder={t.assetDescriptionZhPlaceholder} onChange={(event) => update({ descriptionZh: event.target.value })} onBlur={() => update({ descriptionZh: appendReferenceMatchLine(asset.descriptionZh) })} /></label>

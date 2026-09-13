@@ -1,4 +1,5 @@
 import type { Edge, Node, XYPosition } from "@xyflow/react";
+import type { SceneStaging } from "@/features/cinematicStudio/shared-types";
 
 export const CANVAS_NODE_TYPES = {
   upload: "uploadNode",
@@ -13,6 +14,7 @@ export const CANVAS_NODE_TYPES = {
   directorDesk: "directorDeskNode",
   cinematicStudio: "cinematicStudioNode",
   audio: "audioNode",
+  audioGen: "audioGenNode",
   promptOptimizer: "promptOptimizerNode",
   seamlessMosaic: "seamlessMosaicNode",
 } as const;
@@ -80,7 +82,24 @@ export interface VideoGenerationRequestData {
   referenceAudio?: string[];
 }
 
-export type PersistedGenerationRequest = ImageGenerationRequestData | VideoGenerationRequestData;
+/** 音频生成请求快照(语音合成 / 音效 / 音乐)。 */
+export interface AudioGenerationRequestData {
+  kind: "audio";
+  clientJobId?: string;
+  prompt: string;
+  model: string;
+  audioKind: "speech" | "sound-effects" | "music";
+  voice?: string;
+  format?: string;
+  durationSeconds?: number;
+  musicLengthMs?: number;
+  lyrics?: string;
+}
+
+export type PersistedGenerationRequest =
+  | ImageGenerationRequestData
+  | VideoGenerationRequestData
+  | AudioGenerationRequestData;
 
 export interface ExportImageNodeData extends NodeImageData {
   resultKind?: ExportImageNodeResultKind;
@@ -151,6 +170,10 @@ export interface VideoGenNodeData extends NodeDisplayData {
   /** 工作室“发送到视频节点”时随节点快照保存，避免宿主状态防抖期间丢失附件。 */
   studioReferenceImages?: string[];
   studioReferenceAudio?: string[];
+  /** 炳火专用: 视频参考 URLs(公开 http/https), 提交时先调 /v1/assets/uploads 换 OSS 再传 reference_videos。最多 3 个。 */
+  binghuoReferenceVideos?: string[];
+  /** 炳火专用: 跳过真人审核(责任声明, 手册 3.8)。仅 bh 系(bh2.0-*, bh2.04K)生效。 */
+  binghuoSkipReview?: boolean;
 }
 
 export interface StoryboardFrameItem {
@@ -238,6 +261,8 @@ export interface DirectorDeskNodeData extends NodeDisplayData {
 
 /** Prompt Studio 节点：双击进入独立提示词工作台。 */
 export interface CinematicStudioNodeData extends NodeDisplayData {
+  /** 本节点独占的工作室工程 id（每个节点一份独立工程，新建即空白模板） */
+  studioProjectId?: string | null;
   /** 最近一次保存的工程标题(仅用于节点预览) */
   lastProjectTitle?: string | null;
   /** 最近一次保存的工程简介(仅用于节点预览) */
@@ -247,6 +272,38 @@ export interface CinematicStudioNodeData extends NodeDisplayData {
   /** 工作室当前提示词对应的附件；下游视频节点通过连线接收。 */
   studioReferenceImages?: string[];
   studioReferenceAudio?: string[];
+  /** 极简模式：风格与故事仅属于当前节点，不会写入高级工作室工程。 */
+  quickStyle?: string;
+  quickSynopsis?: string;
+  /** 极简模式专用的 Chat 模型选择；不改动全局/高级工作台设置。 */
+  quickChatProvider?: string;
+  quickChatModel?: string;
+  /** 首次由简化节点编辑或高级编辑回传后启用双向字段同步。 */
+  quickSyncInitialized?: boolean;
+  /** 高级编辑器中与极简节点双向同步的场景 id。 */
+  quickStudioSceneId?: string;
+  /**
+   * 极简模式与高级编辑器共用的场景站位结构：地点、角色候选/左右顺序、
+   * 站位参考图、轴线、间距和空间锚点都以同一套语义保存。
+   */
+  quickStaging?: SceneStaging;
+  /**
+   * 旧版极简节点的多选素材字段，仅用于兼容已保存的画布。
+   * 新节点一律写入 quickStaging。
+   */
+  quickSceneAssetIds?: string[];
+  quickCharacterAssetIds?: string[];
+  /** 极简模式独立链路最后一次生成的完整提示词与图片引用。 */
+  quickPrompt?: string | null;
+  quickReferenceImages?: string[];
+  /**
+   * 极简链路生成提示词的输出语言。未设置（undefined）表示「跟随画布语言」，
+   * 用户在节点上点过中/英切换后才会固定下来，此后不再随画布语言漂移。
+   */
+  quickPromptLang?: 'zh' | 'en';
+  /** 图片提示词优化区：与视频提示词工作流分开保存。 */
+  imagePromptDraft?: string;
+  imagePromptResult?: string;
   [key: string]: unknown;
 }
 
@@ -313,9 +370,31 @@ export interface AudioNodeData extends NodeDisplayData {
   generationProviderId?: string | null;
   generationModel?: string | null;
   providerBaseUrl?: string | null;
-  /** AI 视频生成完成后保留结果, 撤销时不会恢复为生成中或删除结果。 */
+  /** AI 生成完成后保留结果, 撤销时不会恢复为生成中或删除结果。 */
   generationResultProtected?: boolean;
-  generationRequest?: VideoGenerationRequestData;
+  generationRequest?: PersistedGenerationRequest;
+  [key: string]: unknown;
+}
+
+/**
+ * AI 音频生成节点(语音合成 / 音效 / 音乐)。
+ * 与「媒体节点(audio)」是两件事: 这里只负责提交与参数, 生成结果落到下游媒体节点。
+ */
+export interface AudioGenNodeData extends NodeDisplayData {
+  prompt: string;
+  model: string;
+  /** 音频类型(决定端点与附加参数), 由所选模型决定。 */
+  audioKind?: "speech" | "sound-effects" | "music";
+  /** 音色(语音合成) */
+  voice?: string;
+  /** 输出格式(语音合成) */
+  format?: string;
+  /** 音效时长(秒) */
+  durationSeconds?: number;
+  /** 音乐时长(毫秒) */
+  musicLengthMs?: number;
+  /** 歌词(音乐生成) */
+  lyrics?: string;
   [key: string]: unknown;
 }
 
@@ -327,6 +406,7 @@ export type CanvasNodeData =
   | GroupNodeData
   | ImageEditNodeData
   | VideoGenNodeData
+  | AudioGenNodeData
   | StoryboardSplitNodeData
   | StoryboardGenNodeData
   | PanoramaNodeData
@@ -436,6 +516,12 @@ export function isAudioNode(
   node: CanvasNode | null | undefined,
 ): node is Node<AudioNodeData, typeof CANVAS_NODE_TYPES.audio> {
   return node?.type === CANVAS_NODE_TYPES.audio;
+}
+
+export function isAudioGenNode(
+  node: CanvasNode | null | undefined,
+): node is Node<AudioGenNodeData, typeof CANVAS_NODE_TYPES.audioGen> {
+  return node?.type === CANVAS_NODE_TYPES.audioGen;
 }
 
 export function isSeamlessMosaicNode(

@@ -41,6 +41,12 @@
 
 </div>
 
+> **系统要求**：**Windows 10 1809 及以上** / macOS 10.15 及以上。
+>
+> ⚠️ **Windows 7 / 8 / 8.1 无法运行**，安装包会直接提示并中止安装。原因是两条硬性限制，应用代码无法绕过：
+> 1. Tauri v2 依赖 Microsoft Edge WebView2 运行时，微软自 WebView2 110 / SDK 1.0.1519.0 起不再支持 Win7 与 8/8.1（109 是最后一个支持版本，已停止更新）；
+> 2. Rust 1.78+ 生成的程序依赖 Windows 10 才有的 `bcryptprimitives.dll!ProcessPrng`，在 Win7 上会直接报「无法定位程序输入点 ProcessPrng」，进程连启动阶段都进不去。
+
 应用内会检查 GitHub Releases 的最新正式版本，并在发现更新后直接打开当前系统对应的安装包下载链接。
 
 > macOS 首次打开若提示"无法验证开发者"，请在应用上右键 → 打开 → 仍要打开。

@@ -115,7 +115,7 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
 
   return <div className="staging-editor">
     <button className="staging-card" onClick={() => setOpen(true)}>
-      <span className="staging-card-thumb">{thumb ? <img src={thumb} alt={locationAsset?.name ?? ""} /> : <ImagePlus size={18} />}</span>
+      <span className="staging-card-thumb">{thumb ? <img src={resolveImageDisplayUrl(thumb)} alt={locationAsset?.name ?? ""} /> : <ImagePlus size={18} />}</span>
       <span className="staging-card-info">
         <span className="staging-card-title"><MapPin size={13} /> {t.stagingLock}</span>
         <span className="staging-card-desc">{summary}</span>
@@ -135,7 +135,7 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
           <div className="staging-location-row">
             {locationAsset
               ? <button className="staging-location-card" onClick={() => setPickingLocation(true)}>
-                  {thumb ? <img src={thumb} alt={locationAsset.name} /> : <span className="staging-location-fallback small">{locationAsset.name.slice(0, 1)}</span>}
+                  {thumb ? <img src={resolveImageDisplayUrl(thumb)} alt={locationAsset.name} /> : <span className="staging-location-fallback small">{locationAsset.name.slice(0, 1)}</span>}
                   <b>{locationAsset.name}</b>
                   <span className="staging-location-remove" title={t.deleteAsset} onClick={(event) => { event.stopPropagation(); onChange({ locationAssetId: undefined }); }}><X size={12} /></span>
                 </button>
@@ -177,7 +177,7 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
               : <div className="staging-location-picker-grid">
                   {locationAssets.map((asset: Asset) => (
                     <button key={asset.id} className={asset.id === staging.locationAssetId ? "active" : ""} onClick={() => { onChange({ locationAssetId: asset.id }); setPickingLocation(false); }}>
-                      {asset.referencePaths?.[0] ? <img src={asset.referencePaths[0]} alt={asset.name} /> : <span className="staging-location-fallback">{asset.name.slice(0, 1)}</span>}
+                      {asset.referencePaths?.[0] ? <img src={resolveImageDisplayUrl(asset.referencePaths[0])} alt={asset.name} /> : <span className="staging-location-fallback">{asset.name.slice(0, 1)}</span>}
                       <span>{asset.name}</span>
                     </button>
                   ))}
@@ -218,7 +218,7 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
               : <div className="staging-location-picker-grid">
                   {characterCandidates.map((asset: Asset) => (
                     <button key={asset.id} onClick={() => { addCharacter(asset.id); setPickingCharacter(false); }}>
-                      {asset.referencePaths?.[0] ? <img src={asset.referencePaths[0]} alt={asset.name} /> : <span className="staging-location-fallback">{asset.name.slice(0, 1)}</span>}
+                      {asset.referencePaths?.[0] ? <img src={resolveImageDisplayUrl(asset.referencePaths[0])} alt={asset.name} /> : <span className="staging-location-fallback">{asset.name.slice(0, 1)}</span>}
                       <span>{asset.name}</span>
                     </button>
                   ))}

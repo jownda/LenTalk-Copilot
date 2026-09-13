@@ -7,7 +7,7 @@ import {
   estimateUsageCost,
   type UsageLogRecord,
 } from '@/commands/usageLog';
-import { getImageModel, getVideoModel } from '@/features/canvas/models';
+import { getAudioModel, getImageModel, getVideoModel } from '@/features/canvas/models';
 import { useProjectStore } from '@/stores/projectStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { CURRENT_RUNTIME_SESSION_ID } from './generationErrorReport';
@@ -15,7 +15,7 @@ import { CURRENT_RUNTIME_SESSION_ID } from './generationErrorReport';
 export interface RecordGenerationOutcomeParams {
   /** 结果节点 id(用于在日志中定位) */
   nodeId: string;
-  kind: 'image' | 'video';
+  kind: 'image' | 'video' | 'audio';
   providerId: string;
   /** 完整模型 id, 如 custom:provider/gpt-image-2 */
   modelId: string;
@@ -35,7 +35,9 @@ export function recordGenerationOutcome(params: RecordGenerationOutcomeParams): 
 
   const model = params.kind === 'video'
     ? getVideoModel(params.modelId)
-    : getImageModel(params.modelId);
+    : params.kind === 'audio'
+      ? getAudioModel(params.modelId)
+      : getImageModel(params.modelId);
   const cost = estimateUsageCost(model, {
     kind: params.kind,
     size: params.size ?? '1K',

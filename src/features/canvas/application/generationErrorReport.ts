@@ -1,5 +1,5 @@
 export interface GenerationDebugContext {
-  sourceType: 'imageEdit' | 'storyboardGen' | 'unknown';
+  sourceType: 'imageEdit' | 'storyboardGen' | 'videoGen' | 'audioGen' | 'unknown';
   providerId?: string;
   requestModel?: string;
   requestSize?: string;
@@ -9,6 +9,8 @@ export interface GenerationDebugContext {
   extraParams?: Record<string, unknown>;
   referenceImageCount?: number;
   referenceImagePlaceholders?: string[];
+  /** 音频参考数量。视频链路里参考素材的失败原因常常出在音频上, 必须能看见。 */
+  referenceAudioCount?: number;
   appVersion?: string;
   osName?: string;
   osVersion?: string;
@@ -152,6 +154,9 @@ export function buildGenerationErrorReport(
     sections.push(`- Aspect Ratio: ${context.requestAspectRatio}`);
   }
   sections.push(`- Reference Images: ${context.referenceImageCount ?? 0}`);
+  if (typeof context.referenceAudioCount === 'number') {
+    sections.push(`- Reference Audios: ${context.referenceAudioCount}`);
+  }
   if (Array.isArray(context.referenceImagePlaceholders) && context.referenceImagePlaceholders.length > 0) {
     sections.push(`- Reference Image Placeholders: ${context.referenceImagePlaceholders.join(', ')}`);
   }

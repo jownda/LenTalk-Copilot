@@ -70,6 +70,7 @@ import {
 import { ModelParamsControls } from '@/features/canvas/ui/ModelParamsControls';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
 import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
+import { resolveRecommendedApiPriceBadge } from './nodePriceBadge';
 import { UiButton } from '@/components/ui';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -582,6 +583,18 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     }
     return lines.join('\n');
   }, [i18n.language, resolvedPriceDisplay, t]);
+
+  // 推荐平台（如知鸟 AI / 炳火）的模型未注册精确 pricing,
+  // 用 recommendedApis.pricingRange.image 区间作为右上角徽章的兜底。
+  // 注意: 这里不能改 resolvedPriceDisplay 本身, 否则会污染 tooltip,
+  // 而是单独合成一个轻量 badgeInfo, 仅在显示前判定 null 时顶替。
+  const recommendedPriceBadge = useMemo(
+    () => resolvedPriceDisplay
+      ? null
+      : resolveRecommendedApiPriceBadge(selectedModel?.providerId, customApis, 'image'),
+    [customApis, resolvedPriceDisplay, selectedModel?.providerId],
+  );
+  const displayedPriceBadge = resolvedPriceDisplay ?? recommendedPriceBadge;
 
   const supportedAspectRatioValues = useMemo(
     () => selectedModel.aspectRatios.map((item) => item.value),
@@ -1131,10 +1144,10 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         icon={<Sparkles className="h-4 w-4" />}
         titleText={resolvedTitle}
         rightSlot={
-          resolvedPriceDisplay ? (
+          displayedPriceBadge ? (
             <NodePriceBadge
-              label={resolvedPriceDisplay.label}
-              title={resolvedPriceTooltip}
+              label={displayedPriceBadge.label}
+              title={resolvedPriceTooltip ?? displayedPriceBadge.nativeLabel}
             />
           ) : undefined
         }

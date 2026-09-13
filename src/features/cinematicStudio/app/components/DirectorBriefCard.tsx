@@ -10,15 +10,36 @@
  * 底部保留「导演分镜规划器 / 最终生成」按钮与 AI 错误展示。
  */
 import { useEffect, useState } from "react";
-import type { ActingObjective, ProjectV2, SceneStaging, SceneV2 } from "../../shared-types";
+import type { ProjectV2, SceneStaging, SceneV2 } from "../../shared-types";
 import { Check, ChevronDown, Clapperboard, Copy, Film, Plus, RefreshCw, Sparkles, Trash2, X } from "lucide-react";
 import type { CopyZh, Locale } from "../i18n";
 import type { LenTalkChatModelOption, ReasoningEffort } from "../providers/aiSettings";
 import type { SceneCompileProgress } from "../providers/ai";
 import AudioPlanEditor from "./AudioPlanEditor";
 import StagingEditor from "./StagingEditor";
+import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import type { CanvasImageSource } from "./DirectorLayersCard";
-import { getStyle, localizedStyleBrief, MASTER_STYLES, styleBriefDescription } from "../../engine";
+import { directorIntentRefinementText, getStyle, localizedStyleBrief, MASTER_STYLES, styleBriefDescription } from "../../engine";
+import type { CinematicStudioUpstreamText } from "../quickStudioSync";
+
+/**
+ * 上游接入文本的灰色只读回显。与画布极简节点（CinematicStudioNode）保持同一套规则：
+ * 最多 3 行、超出省略号、hover 看全文，白色输入框里的内容始终是本地手输的原文。
+ * 这份内容不写进工程文件，画布上断开上游后会自动消失。
+ */
+function UpstreamTextEcho({ texts }: { texts?: string[] }) {
+  const lines = (texts ?? []).map((text) => text.trim()).filter(Boolean);
+  if (lines.length === 0) return null;
+  return (
+    <div aria-hidden="true" className="upstream-text-echo">
+      {lines.slice(0, 3).map((text, index) => (
+        <div className="upstream-text-echo-line" key={`upstream-echo-${index}`} title={text}>
+          {text}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 interface DirectorBriefCardProps {
   project: ProjectV2;
@@ -56,14 +77,9 @@ interface DirectorBriefCardProps {
   onSelectChatModel(value: string): void;
   selectedReasoningEffort: ReasoningEffort;
   onSelectReasoningEffort(value: ReasoningEffort): void;
+  /** 画布上游接入的文本，在风格 / 故事梗概输入框下方作灰色只读回显。 */
+  upstreamText?: CinematicStudioUpstreamText;
 }
-
-/** 多行文本 → string[]（按行拆分，过滤空行） */
-const splitLines = (text: string): string[] =>
-  text
-    .split(/\r?\n/)
-    .map((item) => item.trim())
-    .filter(Boolean);
 
 export default function DirectorBriefCard(props: DirectorBriefCardProps) {
   const {
@@ -102,10 +118,10 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
     onSelectChatModel,
     selectedReasoningEffort,
     onSelectReasoningEffort,
+    upstreamText,
   } = props;
   const [pickingCharacter, setPickingCharacter] = useState(false);
   const [audioOpen, setAudioOpen] = useState(false);
-  const [actingObjectivesOpen, setActingObjectivesOpen] = useState(false);
   const [stylePresetOpen, setStylePresetOpen] = useState(false);
   const [busySeconds, setBusySeconds] = useState(0);
   const generationBusy = compileBusy || finalGenerateBusy;
@@ -239,6 +255,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
             rows={2}
             onChange={(event) => onUpdateScene({ logline: event.target.value })}
           />
+          <UpstreamTextEcho texts={upstreamText?.storySynopsis} />
         </div>
         <div className="fields-grid three">
           <label className="field-label">
@@ -313,7 +330,7 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
                   {characterCandidates.map((asset) => (
                     <button key={asset.id} onClick={() => addRosterCharacter(asset.id)}>
                       {asset.referencePaths?.[0] ? (
-                        <img src={asset.referencePaths[0]} alt={asset.name} />
+                        <img src={resolveImageDisplayUrl(asset.referencePaths[0])} alt={asset.name} />
                       ) : (
                         <span className="staging-location-fallback">{asset.name.slice(0, 1)}</span>
                       )}
@@ -369,6 +386,9 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
             {styleOptimizeBusy ? t.aiOptimizingStyle : t.aiOptimizeStyle}
           </button>
         </div>
+        {/* 放在 .style-brief-editor 之外：那张卡里的 AI 按钮是 absolute 定位，
+            灰字块若进容器会把按钮顶到它右下角。 */}
+        <UpstreamTextEcho texts={upstreamText?.styleBrief} />
         <div className="style-preset-row">
           <button
             className="outline-button style-preset-button"
@@ -469,79 +489,21 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
             </button>
           </div>
         </div>
+        {/* AI 生成、用户可编辑的第一层结果。 */}
         <label className="field-label">
-          {t.mustHappen}
+          {t.storyNotes}
           <textarea
             className="modal-textarea"
-            value={(scene.mustHappen ?? []).join("\n")}
-            placeholder={t.mustHappenPlaceholder}
-            onChange={(event) => onUpdateScene({ mustHappen: splitLines(event.target.value) })}
+            value={directorIntentRefinementText(scene, characterAssets)}
+            placeholder={t.storyNotesPlaceholder}
+            rows={6}
+            onChange={(event) => onUpdateScene({ directorIntentRefinement: event.target.value || undefined, directorIntentRefinementSource: "edited" })}
           />
         </label>
-        <label className="field-label">
-          {t.forbidLabel}
-          <textarea
-            className="modal-textarea"
-            value={(scene.forbid ?? []).join("\n")}
-            placeholder={t.forbidPlaceholder}
-            onChange={(event) => onUpdateScene({ forbid: splitLines(event.target.value) })}
-          />
-        </label>
-      </div>
-
-      {/* 对白 + 情绪走向 */}
-      <div className="brief-group">
-        <div className="brief-group-head">
-          <span className="brief-user-badge">{t.userInputAiReference}</span>
-        </div>
-        <div className="fields-grid two">
-          <label className="field-label">
-            {t.dialogue}
-            <textarea
-              className="modal-textarea"
-              value={scene.dialogue ?? ""}
-              placeholder={t.dialoguePlaceholder}
-              onChange={(event) => onUpdateScene({ dialogue: event.target.value || undefined })}
-            />
-          </label>
-          <label className="field-label">
-            {t.emotionArc}
-            <textarea
-              className="modal-textarea"
-              value={scene.emotionArc ?? ""}
-              placeholder={t.emotionArcPlaceholder}
-              onChange={(event) => onUpdateScene({ emotionArc: event.target.value || undefined })}
-            />
-          </label>
-        </div>
-      </div>
-
-      {/* 表演目标（P2）：每参与角色的目的/阻碍/代价/贯穿目标 */}
-      <div className="brief-group">
-        <div className="brief-group-head">
-          <span className="eyebrow">{t.actingObjectives}</span>
-          <span className="brief-user-badge">{t.userInputAiReference}</span>
-          <button
-            type="button"
-            className="brief-audio-toggle"
-            aria-expanded={actingObjectivesOpen}
-            onClick={() => setActingObjectivesOpen((open) => !open)}
-          >
-            <ChevronDown size={14} className={actingObjectivesOpen ? "" : "collapsed"} />
-          </button>
-        </div>
-        {actingObjectivesOpen && (
-          <ActingObjectivesEditor
-            t={t}
-            characters={characterAssets}
-            objectives={scene.actingObjectives ?? []}
-            boundIds={[
-              ...new Set(
-                scene.shots.flatMap((shot) => shot.participants?.map((participant) => participant.characterId) ?? []),
-              ),
-            ]}
-            onChange={(actingObjectives) => onUpdateScene({ actingObjectives })}
-          />
+        {scene.performancePlan && (
+          <div className="brief-hint">
+            {t.performancePlanSummary.replace("{characters}", String(scene.performancePlan.characterPlans.length)).replace("{beats}", String(scene.performancePlan.beats.length))}
+          </div>
         )}
       </div>
 
@@ -645,100 +607,5 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
         )}
       </div>
     </section>
-  );
-}
-
-/** 表演目标编辑器（P2）：按参与角色逐条填写 目的/贯穿目标/阻碍/失败代价 */
-function ActingObjectivesEditor({
-  t,
-  characters,
-  objectives,
-  boundIds,
-  onChange,
-}: {
-  t: CopyZh;
-  characters: { id: string; name: string; referencePaths?: string[] }[];
-  objectives: ActingObjective[];
-  boundIds: string[];
-  onChange(objectives: ActingObjective[]): void;
-}) {
-  const update = (index: number, patch: Partial<ActingObjective>) =>
-    onChange(objectives.map((item, i) => (i === index ? { ...item, ...patch } : item)));
-  const remove = (index: number) => onChange(objectives.filter((_, i) => i !== index));
-  const add = (characterId: string) => {
-    if (objectives.some((item) => item.characterId === characterId)) return;
-    onChange([...objectives, { characterId, objective: "" }]);
-  };
-  const characterIds = [...new Set([...boundIds, ...objectives.map((item) => item.characterId)])];
-
-  return (
-    <div className="acting-objectives">
-      {characterIds.map((characterId) => {
-        const character = characters.find((asset) => asset.id === characterId);
-        const index = objectives.findIndex((item) => item.characterId === characterId);
-        const item = index >= 0 ? objectives[index] : undefined;
-        if (!character) return null;
-        return (
-          <div className="acting-objective-row" key={characterId}>
-            <div className="acting-objective-head">
-              {character.referencePaths?.[0] ? (
-                <img className="acting-objective-avatar" src={character.referencePaths[0]} alt={character.name} />
-              ) : (
-                <span className="acting-objective-avatar fallback">{character.name.slice(0, 1)}</span>
-              )}
-              <b>{character.name}</b>
-              <button className="mini-del" title={t.deleteObjective} onClick={() => (item ? remove(index) : undefined)}>
-                <X size={11} />
-              </button>
-            </div>
-            {item ? (
-              <div className="fields-grid two">
-                <label className="field-label">
-                  {t.objective}
-                  <input
-                    className="modal-input"
-                    value={item.objective ?? ""}
-                    placeholder={t.objectivePlaceholder}
-                    onChange={(event) => update(index, { objective: event.target.value })}
-                  />
-                </label>
-                <label className="field-label">
-                  {t.superObjective}
-                  <input
-                    className="modal-input"
-                    value={item.superObjective ?? ""}
-                    placeholder={t.superObjectivePlaceholder}
-                    onChange={(event) => update(index, { superObjective: event.target.value || undefined })}
-                  />
-                </label>
-                <label className="field-label">
-                  {t.obstacle}
-                  <input
-                    className="modal-input"
-                    value={item.obstacle ?? ""}
-                    placeholder={t.obstaclePlaceholder}
-                    onChange={(event) => update(index, { obstacle: event.target.value || undefined })}
-                  />
-                </label>
-                <label className="field-label">
-                  {t.stakes}
-                  <input
-                    className="modal-input"
-                    value={item.stakes ?? ""}
-                    placeholder={t.stakesPlaceholder}
-                    onChange={(event) => update(index, { stakes: event.target.value || undefined })}
-                  />
-                </label>
-              </div>
-            ) : (
-              <button className="mini-add" onClick={() => add(characterId)}>
-                <Plus size={11} /> {t.addItem}
-              </button>
-            )}
-          </div>
-        );
-      })}
-      {characterIds.length === 0 && <span className="hint-text">{t.noCharacterObjectiveHint}</span>}
-    </div>
   );
 }

@@ -37,6 +37,21 @@ pub struct LibraryAssetRecord {
     pub source_file_name: Option<String>,
     pub tags: Vec<String>,
     pub created_at: i64,
+    // ── 电影工作室镜像字段 ──────────────────────────────────────────────
+    // 电影工作室（提示词工作室）会把角色 / 地点 / 道具资产镜像进素材库，
+    // 前端靠这几个字段把镜像条目还原成电影资产。结构体必须显式声明它们，
+    // 否则 serde 反序列化时会静默丢弃（落库一次就丢一次），
+    // 导致节点上的「场景站位 / 场景角色候选」候选列表在重启后变空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cinematic_asset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cinematic_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cinematic_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cinematic_description_zh: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cinematic_notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

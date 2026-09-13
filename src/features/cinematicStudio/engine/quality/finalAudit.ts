@@ -19,7 +19,7 @@ export interface FinalPromptAuditIssue {
   detailZh: string;
   /** Allows the editor to return to the affected shot instead of leaving an opaque error. */
   shotId?: string;
-  field?: "staging" | "lighting" | "optics" | "acting" | "voice" | "action";
+  field?: "staging" | "lighting" | "optics" | "acting" | "voice" | "action" | "performanceDescription";
   action?: "review-staging" | "review-lighting" | "review-optics" | "review-acting" | "review-voice" | "review-action" | "recompile";
 }
 
@@ -132,6 +132,7 @@ function findWindowLightFactConflict(scene: SceneV2): { black: TextSource & { te
     { label: "lighting key", labelZh: "主光源", text: scene.lightingDirection?.primarySource },
     { label: "lighting direction", labelZh: "光线方向", text: scene.lightingDirection?.direction },
     ...((scene.shots ?? []).flatMap((shot, index) => [
+      { label: `shot ${index + 1} performance`, labelZh: `镜头 ${index + 1} 动作与表演执行`, text: shot.performanceDescription },
       { label: `shot ${index + 1} action`, labelZh: `镜头 ${index + 1} 动作`, text: shot.action },
       { label: `shot ${index + 1} note`, labelZh: `镜头 ${index + 1} 备注`, text: shot.note },
       ...(shot.beats ?? []).flatMap((beat) => [
@@ -163,15 +164,18 @@ export function sceneMaxDurationSeconds(scene: SceneV2): number | undefined {
 }
 
 /**
- * Produce one monotonic scene timeline without mutating project data.
- * Explicit ranges are retained only when all shots are chronological and non-overlapping.
+ * Produce one continuous scene timeline without mutating project data.
+ * Explicit ranges are retained only when they are chronological, non-overlapping,
+ * and contiguous; otherwise the authored shot durations are laid out back-to-back
+ * so an accidental gap can never disappear from the final execution timeline.
  */
 export function normalizeSceneShotTimeline(scene: SceneV2): Map<string, TimeRange> {
   const shots = scene.shots ?? [];
   const hasUsableExplicitTimeline = shots.length > 0 && shots.every((shot, index) => {
     if (!shot.time || shot.time.endSeconds <= shot.time.startSeconds) return false;
     const previous = shots[index - 1]?.time;
-    return !previous || shot.time.startSeconds >= previous.endSeconds;
+    if (!previous) return shot.time.startSeconds === 0;
+    return Math.abs(shot.time.startSeconds - previous.endSeconds) < 0.001;
   });
 
   if (hasUsableExplicitTimeline) {
@@ -223,7 +227,7 @@ export function auditFinalPrompt(scene: SceneV2): FinalPromptAuditResult {
   const hasNonMonotonicTimes = (scene.shots ?? []).some((shot, index, shots) => {
     if (!shot.time || shot.time.endSeconds <= shot.time.startSeconds) return true;
     const previous = shots[index - 1]?.time;
-    return Boolean(previous && shot.time.startSeconds < previous.endSeconds);
+    return Boolean(previous && Math.abs(shot.time.startSeconds - previous.endSeconds) >= 0.001);
   });
   const formatRange = (time: TimeRange | undefined) => time
     ? `${time.startSeconds.toFixed(1)}–${time.endSeconds.toFixed(1)}s`
@@ -347,25 +351,25 @@ export function auditFinalPrompt(scene: SceneV2): FinalPromptAuditResult {
         detailZh: `已将“${outcome}”规范为“${normalized.text}”。`,
       });
     }
-    if (isAbstractPerformance(shot.acting)) {
+    if (isAbstractPerformance(shot.performanceDescription ?? shot.acting)) {
       issues.push({
         code: "FINAL.ABSTRACT_PERFORMANCE",
         severity: "warning",
         detail: `Shot ${shot.label} uses an abstract performance label without a visible action. Add eye line, breath, hand business, pause, or posture.`,
         detailZh: `镜头 ${shot.label} 只有抽象情绪，没有可拍摄行为。请补充眼神、呼吸、手部业务、停顿或姿势。`,
         shotId: shot.id,
-        field: "acting",
+        field: "performanceDescription",
         action: "review-acting",
       });
     }
-    if ((shot.beats ?? []).length === 0 && !shot.action?.trim()) {
+    if ((shot.beats ?? []).length === 0 && !shot.performanceDescription?.trim() && !shot.action?.trim()) {
       issues.push({
         code: "FINAL.ACTION_BEATS_MISSING",
         severity: "warning",
         detail: `Shot ${shot.label} has no action beats or fallback action. Add a visible action before final delivery.`,
         detailZh: `镜头 ${shot.label} 没有动作节拍或备用动作。请先补充可见动作，再进行最终交付。`,
         shotId: shot.id,
-        field: "action",
+        field: "performanceDescription",
         action: "review-action",
       });
     }

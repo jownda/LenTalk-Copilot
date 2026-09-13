@@ -33,6 +33,7 @@ import {
 import { useAssetLibraryStore } from './assetStore';
 import { ASSET_DRAG_DATA_TYPE, assetDragPayload, importFilesToAssets } from './importAssets';
 import { CategoryManagerDialog } from './CategoryManagerDialog';
+import { isCinematicMirrorAsset } from './cinematicMirror';
 import type { AssetMediaType, LibraryAsset } from './types';
 import {
   buildBackupFileName,
@@ -48,6 +49,26 @@ import { CANVAS_NODE_TYPES } from '@/features/canvas/domain/canvasNodes';
 import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import { nodeCatalog } from '@/features/canvas/application/nodeCatalog';
 import { UiButton, UiGhostIconButton, UiInput, UiSelect } from '@/components/ui/primitives';
+import CinematicAssetLibrary, { type CanvasAudioSource as CinematicCanvasAudioSource } from '@/features/cinematicStudio/app/components/AssetLibrary';
+import type { ProjectAction } from '@/features/cinematicStudio/app/store/projectReducer';
+import type { ProjectV2, SceneV2 } from '@/features/cinematicStudio/shared-types';
+import { copy, type CopyZh, type Locale } from '@/features/cinematicStudio/app/i18n';
+import { useCinematicProject } from '@/features/cinematicStudio/app/useCinematicProject';
+import { isAudioNode } from '@/features/canvas/domain/canvasNodes';
+import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
+// 资产库 tab 复用电影工作室组件,其样式类(asset-card/modal-* 等)与主题变量定义在该文件,
+// 工作台未挂载时也必须加载,否则侧边栏内的资产库完全没有样式。
+import '@/features/cinematicStudio/app/styles.css';
+
+export interface CinematicAssetLibraryBridge {
+  project: ProjectV2;
+  scene: SceneV2;
+  dispatch: (action: ProjectAction) => void;
+  locale: 'zh' | 'en';
+  t: import('@/features/cinematicStudio/app/i18n').CopyZh;
+  setNotice: (message: string) => void;
+  canvasAudioSources: CinematicCanvasAudioSource[];
+}
 
 export interface AssetLibraryPanelProps {
   open: boolean;
@@ -57,6 +78,7 @@ export interface AssetLibraryPanelProps {
   anchorTop?: number;
   /** 画布入口传入,提示词「应用」回调(素材库内嵌提示词 tab 时用) */
   onApplyPrompt?: (template: PromptTemplate, mode: 'positive' | 'full') => void;
+  cinematicAssetLibrary?: CinematicAssetLibraryBridge | null;
 }
 
 const PANEL_WIDTH = 360;
@@ -120,7 +142,7 @@ function MediaPreview({ asset }: { asset: LibraryAsset }) {
   );
 }
 
-export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anchorTop, onApplyPrompt }: AssetLibraryPanelProps) => {
+export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anchorTop, onApplyPrompt, cinematicAssetLibrary }: AssetLibraryPanelProps) => {
   const { t } = useTranslation();
   const hydrate = useAssetLibraryStore((state) => state.hydrate);
   const isHydrated = useAssetLibraryStore((state) => state.isHydrated);
@@ -139,6 +161,25 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
   const moveAssetsToCategory = useAssetLibraryStore((state) => state.moveAssetsToCategory);
   const addNode = useCanvasStore((state) => state.addNode);
 
+  const [cinematicNotice, setCinematicNotice] = useState('');
+  useEffect(() => {
+    if (!cinematicNotice) return;
+    const timer = window.setTimeout(() => setCinematicNotice(''), 3200);
+    return () => window.clearTimeout(timer);
+  }, [cinematicNotice]);
+
+  const canvasNodes = useCanvasStore((state) => state.nodes);
+  const fallbackAudioSources = useMemo<CinematicCanvasAudioSource[]>(() => {
+    const sources: CinematicCanvasAudioSource[] = [];
+    for (const node of canvasNodes) {
+      if (!isAudioNode(node) || node.data.mediaType === 'video' || !node.data.sourcePath) continue;
+      const nodeLabel = resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, node.data);
+      const fileName = node.data.sourcePath.split(/[\\/]/).pop()?.trim() ?? '';
+      sources.push({ source: node.data.sourcePath, label: nodeLabel !== '媒体' ? nodeLabel : fileName || '画布音频' });
+    }
+    return sources;
+  }, [canvasNodes]);
+
   const [activeCategoryId, setActiveCategoryId] = useState<string | null>(null);
   const [mediaFilter, setMediaFilter] = useState<MediaFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -151,7 +192,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
   const [backupError, setBackupError] = useState<string | null>(null);
   const [backupNotice, setBackupNotice] = useState<string | null>(null);
   const backupInputRef = useRef<HTMLInputElement>(null);
-  const [activeSection, setActiveSection] = useState<'assets' | 'prompts'>('assets');
+  const [activeSection, setActiveSection] = useState<'assets' | 'prompts' | 'cinematic'>('assets');
   const [showCategoryManager, setShowCategoryManager] = useState(false);
   /** 缩略图卡片尺寸(px, 由滑杆调节) */
   const [thumbSize, setThumbSize] = useState(132);
@@ -170,6 +211,13 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
   const [panelVisible, setPanelVisible] = useState(false);
   /** 侧边面板中「分组」列表折叠/展开 */
   const [categoriesCollapsed, setCategoriesCollapsed] = useState(false);
+
+  // ── 资产库 tab（电影资产）────────────────────────────────────────────
+  // 工作室打开时由 Canvas 持有实时 bridge（与工作室状态联动）；
+  // 未打开时面板通过 useCinematicProject 自持项目状态（共享同一 SQLite/localStorage 持久化通道）。
+  const cinematicBridgeActive = Boolean(cinematicAssetLibrary);
+  const fallbackStudio = useCinematicProject(open && activeSection === 'cinematic' && !cinematicBridgeActive);
+  const [studioLocale] = useState<Locale>(() => (localStorage.getItem('cineprompt-locale') === 'en' ? 'en' : 'zh'));
 
   useEffect(() => {
     if (!open) return;
@@ -224,9 +272,13 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
     () => assets.filter((asset) => asset.libraryId === activeLibraryId),
     [activeLibraryId, assets]
   );
+  const mediaLibraryAssets = useMemo(
+    () => libraryAssets.filter((asset) => !isCinematicMirrorAsset(asset)),
+    [libraryAssets]
+  );
   const visibleAssets = useMemo(() => {
     const query = searchQuery.trim().toLocaleLowerCase();
-    return libraryAssets
+    return mediaLibraryAssets
       .filter((asset) => !activeCategoryId || asset.categoryId === activeCategoryId)
       .filter((asset) => mediaFilter === 'all' || asset.mediaType === mediaFilter)
       .filter((asset) => {
@@ -235,7 +287,21 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
           .some((value) => value.toLocaleLowerCase().includes(query));
       })
       .sort((left, right) => right.createdAt - left.createdAt);
-  }, [activeCategoryId, libraryAssets, mediaFilter, searchQuery]);
+  }, [activeCategoryId, mediaLibraryAssets, mediaFilter, searchQuery]);
+
+  const cinematicProps: CinematicAssetLibraryBridge | null = cinematicAssetLibrary ?? (() => {
+    const scene = fallbackStudio.project.scenes[0];
+    if (!scene) return null;
+    return {
+      project: fallbackStudio.project,
+      scene,
+      dispatch: fallbackStudio.dispatch,
+      locale: studioLocale,
+      t: copy[studioLocale] as CopyZh,
+      setNotice: setCinematicNotice,
+      canvasAudioSources: fallbackAudioSources,
+    };
+  })();
 
   const handleImportFiles = useCallback(async (files: File[]) => {
     if (!currentLibrary || files.length === 0) return;
@@ -379,15 +445,17 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
   /** 子菜单展开方向: 菜单靠近屏幕右缘时向左展开, 否则向右 */
   const moveSubmenuRight = !assetMenu || assetMenu.x + 340 <= window.innerWidth;
 
-  /** 卡片右上角「...」下拉菜单(portal 到 body): 重命名 / 移动到分组(右侧呼出分组列表) / 删除 */
-  const assetMenuNode = assetMenu && assetMenuAsset && (
+  /** 卡片右上角「...」下拉菜单(整体 portal 到 body): 重命名 / 移动到分组(右侧呼出分组列表) / 删除 */
+  // 注意: 遮罩与菜单必须一起 portal 到 body 并置于 z-[200]+。
+  // 侧边栏模式下素材库面板自身是 z-[140] 的 fixed 元素; 若菜单层级低于它,
+  // 菜单会被面板整块盖住(点击「...」看起来"没有任何反应")。
+  const assetMenuNode = assetMenu && assetMenuAsset && createPortal(
     <>
-      <div className="fixed inset-0 z-[120]" onClick={closeAssetMenu} />
-      {createPortal(
-        <div
-          className="fixed z-[121] w-44 overflow-visible rounded-lg border border-[rgba(255,255,255,0.16)] bg-surface-dark py-1 shadow-2xl"
-          style={{ left: assetMenu.x, top: assetMenu.y }}
-        >
+      <div className="fixed inset-0 z-[200]" onClick={closeAssetMenu} />
+      <div
+        className="fixed z-[201] w-44 overflow-visible rounded-lg border border-[rgba(255,255,255,0.16)] bg-surface-dark py-1 shadow-2xl"
+        style={{ left: assetMenu.x, top: assetMenu.y }}
+      >
           <button
             type="button"
             className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-text-dark transition-colors hover:bg-bg-dark"
@@ -418,7 +486,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
               <ChevronRight className={`h-3.5 w-3.5 text-text-muted transition-transform ${moveMenuOpen ? 'rotate-90' : ''}`} />
             </button>
             {moveMenuOpen && (
-              <div className={`ui-scrollbar absolute top-0 z-[122] max-h-60 w-40 overflow-y-auto rounded-lg border border-[rgba(255,255,255,0.16)] bg-surface-dark py-1 shadow-2xl ${moveSubmenuRight ? 'left-full ml-1' : 'right-full mr-1'}`}>
+              <div className={`ui-scrollbar absolute top-0 z-10 max-h-60 w-40 overflow-y-auto rounded-lg border border-[rgba(255,255,255,0.16)] bg-surface-dark py-1 shadow-2xl ${moveSubmenuRight ? 'left-full ml-1' : 'right-full mr-1'}`}>
                 {libraryCategories.length === 0 && (
                   <div className="px-3 py-1.5 text-xs text-text-muted">
                     {t('assetLibrary.noCategories', '暂无分组')}
@@ -461,10 +529,9 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
             <Trash2 className="h-3.5 w-3.5" />
             {t('common.delete', '删除')}
           </button>
-        </div>,
-        document.body
-      )}
-    </>
+      </div>
+    </>,
+    document.body
   );
 
   /** 重命名/新建素材库共用对话框(Tauri 下 window.prompt 不可用) */
@@ -534,6 +601,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
                 </button>
                 <button
                   type="button"
+                  draggable={false}
                   className="absolute right-1.5 top-1.5 z-10 flex h-7 w-7 items-center justify-center rounded-full border border-white/25 bg-black/50 text-white opacity-80 backdrop-blur-sm transition-all hover:border-accent/70 hover:bg-accent/85 hover:opacity-100"
                   title={t('assetLibrary.more', '更多操作')}
                   onClick={(event) => {
@@ -543,7 +611,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
                     setAssetMenu({
                       assetId: asset.id,
                       x: Math.min(rect.left, window.innerWidth - 180),
-                      y: rect.bottom + 4,
+                      y: Math.min(rect.bottom + 4, window.innerHeight - 150),
                     });
                   }}
                 >
@@ -562,6 +630,18 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
           </div>
         </div>
       )}
+    </div>
+  );
+
+  const cinematicAssetGrid = cinematicProps ? (
+    // cinematic-studio-app class 提供工作室主题 CSS 变量(--surface/--text 等),
+    // 侧边栏内嵌时同样需要;组件内部新增/编辑/AI 填写/表演母版全部可用。
+    <div className="cinematic-studio-app ui-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+      <CinematicAssetLibrary {...cinematicProps} />
+    </div>
+  ) : (
+    <div className="ui-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+      <EmptyState label={t('assetLibrary.cinematicLoading', '资产库加载中…')} />
     </div>
   );
 
@@ -713,7 +793,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
   const categoryList = (
     <div className="space-y-1">
       <button type="button" onClick={() => setActiveCategoryId(null)} className={`flex h-9 w-full items-center justify-between rounded-lg px-2.5 text-left text-xs ${activeCategoryId === null ? 'bg-accent/15 text-text-dark' : 'text-text-muted hover:bg-bg-dark'}`}>
-        <span>{t('assetLibrary.all', '全部')}</span><span>{libraryAssets.length}</span>
+        <span>{t('assetLibrary.all', '全部')}</span><span>{mediaLibraryAssets.length}</span>
       </button>
       {libraryCategories
         .filter((category) => !category.parentId)
@@ -728,7 +808,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
                 <Folder className="h-3.5 w-3.5 shrink-0 text-text-muted/60" />
                 <span className="truncate">{category.name}</span>
               </span>
-              <span>{libraryAssets.filter((asset) => asset.categoryId === category.id).length}</span>
+              <span>{mediaLibraryAssets.filter((asset) => asset.categoryId === category.id).length}</span>
             </button>
             {libraryCategories
               .filter((child) => child.parentId === category.id)
@@ -743,7 +823,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
                     <Folder className="h-3 w-3 shrink-0 text-text-muted/40" />
                     <span className="truncate">{child.name}</span>
                   </span>
-                  <span>{libraryAssets.filter((asset) => asset.categoryId === child.id).length}</span>
+                  <span>{mediaLibraryAssets.filter((asset) => asset.categoryId === child.id).length}</span>
                 </button>
               ))}
           </div>
@@ -802,6 +882,13 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
     </div>
   );
 
+  /** 资产库 tab(自持模式)的操作提示: AI 填写/新增/删除等的 setNotice 输出 */
+  const cinematicNoticeNode = activeSection === 'cinematic' && !cinematicBridgeActive && cinematicNotice && (
+    <div className="fixed bottom-6 left-1/2 z-[99] -translate-x-1/2 max-w-[70vw] truncate rounded-lg border border-accent/40 bg-accent/15 px-4 py-2 text-xs text-text-dark shadow-lg">
+      {cinematicNotice}
+    </div>
+  );
+
   if (fullscreen) {
     // 面板顶部:从触发按钮下方呼出(未传入锚点时回退到 TitleBar 下方),不顶到最顶部
     const panelTop = (anchorTop ?? 40) + 8;
@@ -835,6 +922,9 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
             >
               {t('assetLibrary.promptsTab', '提示词库')}
             </button>
+            <button type="button" className={`rounded-md px-3 py-1 text-xs transition-colors ${activeSection === 'cinematic' ? 'bg-accent/20 text-text-dark' : 'text-text-muted hover:text-text-dark'}`} onClick={() => setActiveSection('cinematic')}>
+              {t('assetLibrary.cinematicTab', '资产库')}
+            </button>
           </div>
           <div className="flex items-center gap-1">
             {backupControls}
@@ -855,7 +945,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
               }}
             />
           </div>
-        ) : (
+        ) : activeSection === 'cinematic' ? cinematicAssetGrid : (
           <div className="flex min-h-0 flex-1">
             <aside className="flex w-64 shrink-0 flex-col gap-3 border-r border-border-dark p-3">
               {libraryControls}
@@ -869,6 +959,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
         {activeSection === 'assets' && fileInput}
         {activeSection === 'assets' && backupFileInput}
         {backupStatusNotice}
+        {cinematicNoticeNode}
         {assetMenuNode}
         {renameDialogNode}
         <CategoryManagerDialog
@@ -884,7 +975,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
   return (
     <>
       <aside
-        className={`fixed right-0 top-10 z-[96] flex h-[calc(100%-2.5rem)] flex-col border-l border-border-dark bg-surface-dark shadow-2xl transition-transform duration-200 ease-out ${panelVisible ? 'translate-x-0' : 'translate-x-full'}`}
+        className={`fixed right-0 top-10 z-[140] flex h-[calc(100%-2.5rem)] flex-col border-l border-border-dark bg-surface-dark shadow-2xl transition-transform duration-200 ease-out ${panelVisible ? 'translate-x-0' : 'translate-x-full'}`}
         style={{ width: PANEL_WIDTH }}
         data-asset-library
       >
@@ -902,13 +993,16 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
               >
                 {t('assetLibrary.assetsTab', '图片素材')}
               </button>
-              <button
-                type="button"
-                className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === 'prompts' ? 'bg-accent/20 text-text-dark' : 'text-text-muted hover:text-text-dark'}`}
+            <button
+              type="button"
+              className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === 'prompts' ? 'bg-accent/20 text-text-dark' : 'text-text-muted hover:text-text-dark'}`}
                 onClick={() => setActiveSection('prompts')}
-              >
-                {t('assetLibrary.promptsTab', '提示词库')}
-              </button>
+            >
+              {t('assetLibrary.promptsTab', '提示词库')}
+            </button>
+            <button type="button" className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === 'cinematic' ? 'bg-accent/20 text-text-dark' : 'text-text-muted hover:text-text-dark'}`} onClick={() => setActiveSection('cinematic')}>
+              {t('assetLibrary.cinematicTab', '资产库')}
+            </button>
             </div>
             {backupControls}
             <UiGhostIconButton onClick={onClose} title={t('common.close', '关闭')}><X className="h-4 w-4" /></UiGhostIconButton>
@@ -928,7 +1022,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
               }}
             />
           </div>
-        ) : (
+        ) : activeSection === 'cinematic' ? cinematicAssetGrid : (
           <>
             <div className="space-y-2 border-b border-border-dark p-3">{libraryControls}{sidebarMainRow}{sidebarFilterRow}{thumbSlider}</div>
             <div className="border-b border-border-dark">
@@ -953,6 +1047,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
             {fileInput}
             {backupFileInput}
             {backupStatusNotice}
+            {cinematicNoticeNode}
             {assetMenuNode}
             {renameDialogNode}
             <CategoryManagerDialog

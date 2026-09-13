@@ -11,6 +11,7 @@ export * from "./technical-modules";
 export * from "./style-recipes";
 export * from "./lens-bank";
 export * from "./physics-anchors";
+export * from "./facial-expression";
 
 /**
  * 编译 TechnicalProfile → canonical 技术段（TECHNICAL: / 全局技术：）

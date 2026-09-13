@@ -1,5 +1,6 @@
 import type { NodeTypes } from '@xyflow/react';
 
+import { AudioGenNode } from './AudioGenNode';
 import { AudioNode } from './AudioNode';
 import { CinematicStudioNode } from './CinematicStudioNode';
 import { DirectorDeskNode } from './DirectorDeskNode';
@@ -16,6 +17,7 @@ import { UploadNode } from './UploadNode';
 import { VideoGenNode } from './VideoGenNode';
 
 export const nodeTypes: NodeTypes = {
+  audioGenNode: AudioGenNode,
   audioNode: AudioNode,
   cinematicStudioNode: CinematicStudioNode,
   directorDeskNode: DirectorDeskNode,

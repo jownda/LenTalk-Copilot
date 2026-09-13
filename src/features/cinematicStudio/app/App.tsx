@@ -27,6 +27,7 @@ import {
   FileJson,
   FileText,
   FolderOpen,
+  Library,
   PenLine,
   Plus,
   Save,
@@ -37,13 +38,16 @@ import {
   buildFinalGenerationSource,
   ChatCompletionInterruptedError,
   classifyError,
+  collectSceneAssetIds,
   fillSceneDraft,
   generateFinalPrompt,
   optimizeSceneBrief,
   optimizeStyleDescription,
+  planPerformance,
   type SceneCompileProgress,
   type SceneCompileProgressListener,
 } from "./providers/ai";
+import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import {
   isRemoteConfigured,
   listLenTalkChatModels,
@@ -62,14 +66,23 @@ import {
   saveProjectToDisk,
 } from "./providers/projectStorage";
 import {
-  loadProject,
-  loadProjectFromDatabase,
+  loadProjectById,
+  loadProjectFromDatabaseById,
+  loadSharedAssets,
+  mergeAssetPool,
   migrateProject,
-  persistProject,
-  persistProjectToDatabase,
+  persistProjectById,
+  persistProjectToDatabaseById,
+  persistSharedAssets,
 } from "./model";
+import { isDefaultCinematicProjectId } from "./projectId";
+import { applyQuickStudioSync, quickSyncFromProject, quickSyncScene, type CinematicStudioQuickSync, type CinematicStudioUpstreamText } from "./quickStudioSync";
 import { cameraLabels, copy, framingLabels, type CopyZh, type Locale } from "./i18n";
-import AssetLibrary from "./components/AssetLibrary";
+import {
+  cameraMovementHint,
+  cameraMovementLabel,
+  cameraMovementSelectGroups,
+} from "./cameraMovements";
 import type { CanvasAudioSource } from "./components/AssetLibrary";
 import BeatEditor from "./components/BeatEditor";
 import DirectorBriefCard from "./components/DirectorBriefCard";
@@ -82,8 +95,9 @@ import { projectReducer, type ProjectAction } from "./store/projectReducer";
 import { addVersion, loadHistory, loadHistoryFromDatabase, persistHistoryToDatabase } from "./store/promptHistory";
 import { collectCinematicMediaReferences } from "../mediaReferences";
 import { findReferenceTokens } from "@/features/canvas/application/referenceTokenEditing";
+import { useAssetLibraryStore } from "@/features/library/assetStore";
+import type { LibraryAsset } from "@/features/library/types";
 
-const movements: CameraMovement[] = ["Static", "Handheld", "Steadicam", "Dolly", "Tracking", "Crane", "POV", "OTS"];
 const newId = () => crypto.randomUUID();
 const DIRECTOR_SEQUENCE_TEMPLATE = "pro-sequence" as const;
 const SHOT_PERF_TIPS = ["perf0Tip", "perf1Tip", "perf2Tip", "perf3Tip", "perf4Tip", "perf5Tip"] as const;
@@ -109,6 +123,8 @@ export interface CinematicStudioAppStateSnapshot {
   promptPreview?: string;
   referenceImages?: string[];
   referenceAudio?: string[];
+  /** Compact-node fields mirrored from the active scene in advanced editing. */
+  quickSync?: CinematicStudioQuickSync;
 }
 
 export interface CinematicStudioAppProps {
@@ -117,21 +133,43 @@ export interface CinematicStudioAppProps {
   onSendToVideo?: (payload: { prompt: string; referenceImages: string[]; referenceAudio: string[] }) => void;
   canvasAudioSources?: CanvasAudioSource[];
   canvasImageSources?: CanvasImageSource[];
+  /**
+   * 本实例对应的工程 id（画布上每个工作室节点一份独立工程）。
+   * 缺省时落到历史全局工程，保证旧数据仍可打开。
+   */
+  projectId?: string;
+  /** Values supplied by the compact canvas node before opening the workbench. */
+  quickSync?: CinematicStudioQuickSync;
+  /**
+   * 画布上游接入的文本（风格 / 故事梗概两条口子各一份）。
+   * 只做灰色只读回显，不写进工程文件——上游断联后由画布侧传空数组即可自动消失。
+   */
+  quickSyncUpstream?: CinematicStudioUpstreamText;
 }
 
 export default function App({
   onClose,
   onStateChange,
   onSendToVideo,
-  canvasAudioSources = [],
+  canvasAudioSources: _canvasAudioSources = [],
   canvasImageSources = [],
+  projectId,
+  quickSync,
+  quickSyncUpstream,
 }: CinematicStudioAppProps = {}) {
-  const [project, setProject] = useState<ProjectV2>(loadProject);
+  const [project, setProject] = useState<ProjectV2>(() => {
+    const initial = loadProjectById(projectId);
+    return quickSync ? applyQuickStudioSync(initial, quickSync) : initial;
+  });
   const [projectStorageReady, setProjectStorageReady] = useState(false);
+  /** 全局共享资产库是否已就绪（未就绪前不得写回，避免用空列表覆盖资产库）。 */
+  const [sharedAssetsReady, setSharedAssetsReady] = useState(false);
   const [locale, setLocale] = useState<Locale>(() =>
     localStorage.getItem("cineprompt-locale") === "en" ? "en" : "zh",
   );
-  const [sceneId, setSceneId] = useState(project.scenes[0].id);
+  const [sceneId, setSceneId] = useState(() => quickSync?.sceneId && project.scenes.some((scene) => scene.id === quickSync.sceneId)
+    ? quickSync.sceneId
+    : project.scenes[0].id);
   const [shotId, setShotId] = useState(project.scenes[0]?.shots[0]?.id ?? "");
   const [prompt, setPrompt] = useState(() => project.compiledPrompt ?? "");
   const [notice, setNotice] = useState("");
@@ -152,6 +190,8 @@ export default function App({
   const [, setHistory] = useState<PromptVersion[]>(loadHistory);
   const [aiSettings, setAiSettings] = useState<AISettings>(() => loadAISettings());
   const customApis = useSettingsStore((state) => state.customApis);
+  /** 工作室选中的 Chat 模型（资产卡内切换模型时也要同步顶栏，故订阅 store 选择项） */
+  const cinematicAiSelection = useSettingsStore((state) => state.cinematicAiSelection);
   const chatModels = listLenTalkChatModels();
   /** 手动覆写文本：编辑器内容与最近编译输出不一致时记录（P2.2） */
   const [manualOverride, setManualOverride] = useState<string | null>(null);
@@ -159,6 +199,7 @@ export default function App({
   const [promptScrollTop, setPromptScrollTop] = useState(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const initialProjectRef = useRef(project);
+  const appliedQuickSyncSignature = useRef(quickSync ? JSON.stringify(quickSync) : "");
   const resumeJobRef = useRef<ResumeJob | null>(null);
   const [projectCodeDraft, setProjectCodeDraft] = useState(() => project.projectCode ?? "");
   const scene = project.scenes.find((item) => item.id === sceneId) ?? project.scenes[0];
@@ -166,6 +207,80 @@ export default function App({
   const t: CopyZh = copy[locale] as CopyZh;
   const selectedChatModel = aiSettings.provider && aiSettings.model ? `${aiSettings.provider}:${aiSettings.model}` : "";
   const mediaReferences = useMemo(() => collectCinematicMediaReferences(project, scene), [project, scene]);
+  const assetLibraryHydrated = useAssetLibraryStore((state) => state.isHydrated);
+  const hydrateAssetLibrary = useAssetLibraryStore((state) => state.hydrate);
+
+  useEffect(() => {
+    void hydrateAssetLibrary();
+  }, [hydrateAssetLibrary]);
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent("lentalk:register-cinematic-asset-library", {
+      detail: {
+        project,
+        scene,
+        dispatch,
+        locale,
+        t,
+        setNotice,
+        canvasAudioSources: _canvasAudioSources,
+      },
+    }));
+  }, [project, scene, locale, t, _canvasAudioSources]);
+
+  // The shared canvas library is the single media entry point. Keep a lightweight
+  // mirror of cinematic reference media there while retaining full cinematic
+  // asset records in the project for prompt compilation and scene references.
+  useEffect(() => {
+    // 资产库就绪前（assets 还没并入）绝不动素材库：
+    // 否则空列表会被当成「资产已删除」，把镜像条目整批清掉。
+    if (!assetLibraryHydrated || !sharedAssetsReady) return;
+    const cinematicAssets = project.assets ?? [];
+    if (cinematicAssets.length === 0) return;
+    const state = useAssetLibraryStore.getState();
+    const libraryId = state.activeLibraryId || state.libraries[0]?.id;
+    if (!libraryId) return;
+    const categoryByKind = new Map(
+      state.categories
+        .filter((category) => category.libraryId === libraryId)
+        .map((category) => [category.name, category.id]),
+    );
+    const mirrored: LibraryAsset[] = [];
+    for (const asset of cinematicAssets) {
+      const sources = [...(asset.referencePaths ?? [])];
+      if (asset.kind === "character" && asset.voiceClip?.trim()) sources.push(asset.voiceClip);
+      sources.filter(Boolean).forEach((source, index) => {
+        const mediaType = asset.kind === "character" && index === sources.length - 1 && asset.voiceClip === source
+          ? "audio" as const
+          : "image" as const;
+        const categoryName = asset.kind === "character" ? "角色" : asset.kind === "location" ? "场景" : "道具";
+        mirrored.push({
+          id: `cinematic-${asset.id}-${index}`,
+          libraryId,
+          categoryId: categoryByKind.get(categoryName) ?? null,
+          name: sources.length > 1 ? `${asset.name || "未命名资产"} ${index + 1}` : asset.name || "未命名资产",
+          mediaType,
+          sourcePath: source,
+          previewImageUrl: mediaType === "image" ? source : null,
+          aspectRatio: "1:1",
+          sourceFileName: null,
+          tags: ["电影资产", categoryName],
+          createdAt: 0,
+          cinematicAssetId: asset.id,
+          cinematicKind: asset.kind === "character" || asset.kind === "location" || asset.kind === "prop" ? asset.kind : undefined,
+          cinematicDescription: asset.description,
+          cinematicDescriptionZh: asset.descriptionZh,
+          cinematicNotes: asset.notesZh || asset.notes,
+        });
+      });
+    }
+    const mirroredIds = new Set(mirrored.map((asset) => asset.id));
+    const staleIds = state.assets
+      .filter((asset) => asset.id.startsWith("cinematic-") && !mirroredIds.has(asset.id))
+      .map((asset) => asset.id);
+    if (staleIds.length) state.deleteAssets(staleIds);
+    if (mirrored.length) state.upsertAssets(mirrored);
+  }, [assetLibraryHydrated, project.assets, sharedAssetsReady]);
 
   const clearResume = () => {
     resumeJobRef.current = null;
@@ -252,24 +367,46 @@ export default function App({
   useEffect(() => {
     let active = true;
     void (async () => {
-      const stored = await loadProjectFromDatabase();
+      // 节点工程（场景/镜头等结构）与全局共享资产库并行加载：
+      // 资产库独立于节点，加载时并入、保存时剥离，保证任何节点看到的都是同一份资产。
+      const [stored, shared] = await Promise.all([
+        loadProjectFromDatabaseById(projectId),
+        loadSharedAssets(),
+      ]);
       if (!active) return;
+      const resolvedBase = stored ?? initialProjectRef.current;
+      const resolved = quickSync ? applyQuickStudioSync(resolvedBase, quickSync) : resolvedBase;
+      setProject({ ...resolved, assets: mergeAssetPool(shared, resolved.assets ?? []) });
       if (stored) {
-        setProject(stored);
-        localStorage.removeItem("cineprompt-project");
-        setSceneId(stored.scenes[0]?.id ?? "");
-        setShotId(stored.scenes[0]?.shots[0]?.id ?? "");
-        setPrompt(stored.compiledPrompt ?? "");
-      } else if (isTauri()) {
-        const migrated = await persistProjectToDatabase(initialProjectRef.current);
+        if (isDefaultCinematicProjectId(projectId)) localStorage.removeItem("cineprompt-project");
+        const resolvedScene = quickSyncScene(resolved, quickSync?.sceneId);
+        setSceneId(resolvedScene?.id ?? "");
+        setShotId(resolvedScene?.shots[0]?.id ?? "");
+        setPrompt(resolved.compiledPrompt ?? "");
+      } else if (isTauri() && isDefaultCinematicProjectId(projectId)) {
+        // 仅历史全局工程需要把本地草稿迁移进 SQLite；节点工程没有旧数据可迁。
+        const migrated = await persistProjectToDatabaseById(projectId, initialProjectRef.current);
         if (migrated) localStorage.removeItem("cineprompt-project");
       }
-      if (active) setProjectStorageReady(true);
+      if (!active) return;
+      setSharedAssetsReady(true);
+      setProjectStorageReady(true);
     })();
     return () => {
       active = false;
     };
-  }, []);
+  }, [projectId]);
+
+  /** Apply compact-node edits while the advanced workbench is already open. */
+  useEffect(() => {
+    if (!quickSync || !projectStorageReady) return;
+    const signature = JSON.stringify(quickSync);
+    if (signature === appliedQuickSyncSignature.current) return;
+    appliedQuickSyncSignature.current = signature;
+    setProject((current) => applyQuickStudioSync(current, quickSync));
+    const nextScene = quickSyncScene(project, quickSync.sceneId);
+    if (nextScene) setSceneId(nextScene.id);
+  }, [project, projectStorageReady, quickSync]);
   useEffect(() => {
     let active = true;
     void (async () => {
@@ -289,20 +426,28 @@ export default function App({
   }, []);
   useEffect(() => {
     if (!projectStorageReady) return;
-    void persistProjectToDatabase(project).then((saved) => {
-      if (!saved) persistProject(project);
+    // 资产库独立于节点工程：节点工程落库前剥离 assets（避免每个节点复制一份资产、撑爆存储），
+    // 资产本身的持久化见下方 persistSharedAssets。
+    const payload = isDefaultCinematicProjectId(projectId) ? project : { ...project, assets: [] };
+    void persistProjectToDatabaseById(projectId, payload).then((saved) => {
+      if (!saved) persistProjectById(projectId, payload);
     });
-  }, [project, projectStorageReady]);
+  }, [project, projectId, projectStorageReady]);
+  // 资产库写回：任何节点里对资产的增删改都同步到全局资产库（唯一数据源）。
+  useEffect(() => {
+    if (!sharedAssetsReady) return;
+    void persistSharedAssets(project.assets ?? []);
+  }, [project.assets, sharedAssetsReady]);
   useEffect(() => {
     localStorage.setItem("cineprompt-locale", locale);
   }, [locale]);
   useEffect(() => {
     setProjectCodeDraft(project.projectCode ?? "");
   }, [project.projectCode]);
-  /** LenTalk Chat 配置变更时同步刷新工作室选中的模型（地址/Key 同源） */
+  /** LenTalk Chat 配置变更、或资产卡内切换了填写模型时，同步刷新工作室选中的模型（地址/Key 同源） */
   useEffect(() => {
     setAiSettings(loadAISettings());
-  }, [customApis]);
+  }, [customApis, cinematicAiSelection]);
   const selectChatModel = (value: string) => {
     const separator = value.indexOf(":");
     const providerId = separator >= 0 ? value.slice(0, separator) : "";
@@ -339,6 +484,7 @@ export default function App({
         promptPreview: prompt,
         referenceImages: mediaReferences.referenceImages,
         referenceAudio: mediaReferences.referenceAudio,
+        quickSync: quickSyncFromProject(project, scene.id),
       });
     }, 400);
     return () => window.clearTimeout(timer);
@@ -347,6 +493,10 @@ export default function App({
     mediaReferences.referenceImages,
     onStateChange,
     project.description,
+    project.styleBrief,
+    project.styleBriefEn,
+    project.styleBriefZh,
+    scene,
     project.title,
     prompt,
   ]);
@@ -464,7 +614,16 @@ export default function App({
   const updateScene = (updates: Partial<SceneV2>) =>
     setProject((current) => ({
       ...current,
-      scenes: current.scenes.map((item) => (item.id === scene.id ? { ...item, ...updates } : item)),
+      scenes: current.scenes.map((item) => {
+        if (item.id !== scene.id) return item;
+        const requiresReplan = ["logline", "location", "time", "weather", "duration", "shootingMode", "staging", "directorIntentRefinement"].some((key) => key in updates);
+        return {
+          ...item,
+          ...updates,
+          ...(requiresReplan && item.performancePlan ? { performancePlan: { ...item.performancePlan, status: "stale" as const } } : {}),
+          ...(requiresReplan ? { shots: item.shots.map((shot) => shot.planningMeta ? { ...shot, planningMeta: { ...shot.planningMeta, status: "stale" as const } } : shot) } : {}),
+        };
+      }),
     }));
   const clearGeneratedContent = () => {
     clearResume();
@@ -488,6 +647,10 @@ export default function App({
               dialogue: undefined,
               emotionArc: undefined,
               actingObjectives: undefined,
+              storyNotes: undefined,
+              directorIntentRefinement: undefined,
+              directorIntentRefinementSource: undefined,
+              performancePlan: undefined,
               directorLayers: undefined,
               lockedDirectorLayers: undefined,
               firstFrameLock: undefined,
@@ -613,23 +776,41 @@ export default function App({
     setBriefOptimizeBusy(true);
     try {
       const optimized = await optimizeSceneBrief(project, scene, locale);
+      const optimizedScene: SceneV2 = {
+        ...scene,
+        directorIntentRefinement: optimized || undefined,
+        directorIntentRefinementSource: "ai",
+      };
+      const hasCharacters = collectSceneAssetIds(project, optimizedScene)
+        .some((id) => project.assets?.some((asset) => asset.id === id && asset.kind === "character"));
+      let performancePlan: Awaited<ReturnType<typeof planPerformance>> | undefined;
+      let performancePlanError = "";
+      if (hasCharacters) {
+        try {
+          performancePlan = await planPerformance(project, optimizedScene, locale);
+        } catch (error) {
+          performancePlanError = error instanceof Error ? error.message : String(error);
+        }
+      }
       setProject((current) => ({
         ...current,
         scenes: current.scenes.map((item) =>
           item.id === scene.id
             ? {
                 ...item,
-                mustHappen: optimized.mustHappen,
-                forbid: optimized.forbid,
-                ...(optimized.dialogue ? { dialogue: optimized.dialogue } : {}),
-                ...(optimized.emotionArc ? { emotionArc: optimized.emotionArc } : {}),
-                actingObjectives: optimized.actingObjectives,
+                directorIntentRefinement: optimized || undefined,
+                directorIntentRefinementSource: "ai",
+                performancePlan: performancePlan ?? (item.performancePlan ? { ...item.performancePlan, status: "stale" } : undefined),
+                shots: item.shots.map((shot) => shot.planningMeta ? { ...shot, planningMeta: { ...shot.planningMeta, status: "stale" } } : shot),
               }
             : item,
         ),
-        audioPlan: optimized.audioPlan,
       }));
-      setNotice(t.aiBriefOptimized);
+      setNotice(performancePlanError
+        ? `${t.aiBriefOptimized}${locale === "zh" ? " 表演计划未生成：" : " Performance plan was not generated: "}${performancePlanError}`
+        : locale === "zh"
+          ? "AI 已生成导演意图深化；场景有角色时，表演计划也已同步生成。"
+          : "AI generated the director intent refinement and also generated the performance plan when scene characters are available.");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const classified = classifyError(error);
@@ -874,8 +1055,54 @@ export default function App({
               onSelectChatModel={selectChatModel}
               selectedReasoningEffort={aiSettings.reasoningEffort}
               onSelectReasoningEffort={selectReasoningEffort}
+              upstreamText={quickSyncUpstream}
             />
           </div>
+
+          {scene.performancePlan && (
+            <section className={`card performance-plan-card ${scene.performancePlan.status}`}>
+              <details open>
+                <summary className="performance-plan-head">
+                  <span className="eyebrow">{locale === "zh" ? "表演输入摘要" : "Performance input summary"}</span>
+                  <span className="performance-plan-status">
+                    {scene.performancePlan.status === "stale"
+                      ? (locale === "zh" ? "需要重新规划分镜" : "Storyboard needs replanning")
+                      : (locale === "zh" ? "已供分镜规划使用" : "Ready for storyboard planning")}
+                  </span>
+                </summary>
+                <div className="performance-plan-body">
+                  {scene.performancePlan.emotionArc && (
+                    <p><b>{locale === "zh" ? "情绪弧线" : "Emotion arc"}</b>{scene.performancePlan.emotionArc}</p>
+                  )}
+                  {scene.performancePlan.characterPlans.length > 0 && (
+                    <div className="performance-plan-characters">
+                      {scene.performancePlan.characterPlans.map((plan) => {
+                        const name = project.assets?.find((asset) => asset.id === plan.characterId)?.name ?? plan.characterId;
+                        return (
+                          <p key={plan.characterId}>
+                            <b>{name}</b>{plan.objective}
+                            {plan.obstacle ? ` · ${locale === "zh" ? "阻碍：" : "Obstacle: "}${plan.obstacle}` : ""}
+                            {plan.stakes ? ` · ${locale === "zh" ? "代价：" : "Stakes: "}${plan.stakes}` : ""}
+                          </p>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {scene.performancePlan.beats.length > 0 && (
+                    <ol className="performance-plan-beats">
+                      {scene.performancePlan.beats.map((beat) => (
+                        <li key={beat.id}>
+                          {beat.action}
+                          {beat.dialogue ? ` · ${beat.dialogue}` : ""}
+                          {beat.beatChange ? ` · ${beat.beatChange}` : ""}
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </div>
+              </details>
+            </section>
+          )}
 
           {/* ── 2. 分层导演文档卡（P0.6：本地规则预填各层，可展开编辑 + 锁定）── */}
           <DirectorLayersCard
@@ -1038,30 +1265,25 @@ export default function App({
                       <LabeledSelect
                         label={t.movement}
                         value={shot.movement}
-                        values={movements}
-                        displayValue={(value) => cameraLabels[locale][value]}
+                        groups={cameraMovementSelectGroups(shot.movement, locale)}
+                        displayValue={(value) => cameraMovementLabel(value, locale)}
                         onChange={(value) => updateShot({ movement: value as CameraMovement })}
                       />
                     </div>
+                    {shot.movement && <p className="hint-text">{cameraMovementHint(shot.movement, locale)}</p>}
                   </InspectorSection>
                   <OpticsCameraEditor shot={shot} framing={shot.framing} locale={locale} onUpdate={updateShot} />
                   <InspectorSection>
-                    <div className="fields-grid two">
-                      <label className="field-label">
-                        {t.action}
-                        <textarea
-                          value={shot.action}
-                          onChange={(event) => updateShot({ action: event.target.value })}
-                        />
-                      </label>
-                      <label className="field-label">
-                        {t.acting}
-                        <textarea
-                          value={shot.acting}
-                          onChange={(event) => updateShot({ acting: event.target.value })}
-                        />
-                      </label>
-                    </div>
+                    <label className="field-label">
+                      {locale === "zh" ? "动作、表演与眼神执行" : "Action, performance & eye execution"}
+                      <textarea
+                        className="modal-textarea"
+                        rows={5}
+                        value={shot.performanceDescription ?? [shot.action, shot.acting, shot.eyeLife].filter(Boolean).join("\n")}
+                        placeholder={locale === "zh" ? "用自然语言写清本镜动作、身体反应、呼吸、微表情、眼神与节拍变化…" : "Describe the shot's action, body response, breath, micro-expression, eye life, and beat change in natural language…"}
+                        onChange={(event) => updateShot({ performanceDescription: event.target.value || undefined })}
+                      />
+                    </label>
                   </InspectorSection>
                   <InspectorSection title={t.performance}>
                     <div className="fields-grid two">
@@ -1088,14 +1310,6 @@ export default function App({
                           {t.shotPerformanceLevel} · {t.performanceTargetHint}
                         </p>
                       </div>
-                      <label className="field-label">
-                        {t.shotEyeLife}
-                        <textarea
-                          value={shot.eyeLife ?? ""}
-                          placeholder={t.shotEyeLifePlaceholder}
-                          onChange={(event) => updateShot({ eyeLife: event.target.value || undefined })}
-                        />
-                      </label>
                     </div>
                   </InspectorSection>
                   <InspectorSection>
@@ -1179,18 +1393,14 @@ export default function App({
               onChange={(event) => importProject(event.target.files?.[0])}
             />
           </section>
-          {/* ── 资产库（右侧固定栏）── */}
-          <div id="asset-library-card">
-            <AssetLibrary
-              project={project}
-              scene={scene}
-              dispatch={dispatch}
-              locale={locale}
-              t={t}
-              setNotice={setNotice}
-              canvasAudioSources={canvasAudioSources}
-            />
-          </div>
+          <button
+            type="button"
+            className="outline-button studio-library-button"
+            onClick={() => window.dispatchEvent(new CustomEvent("lentalk:open-asset-library"))}
+            title={locale === "zh" ? "打开画布右侧素材库" : "Open canvas asset library"}
+          >
+            <Library size={15} /> {locale === "zh" ? "打开画布素材库" : "Open canvas library"}
+          </button>
           <section className="card prompt-card">
             <div className="card-head">
               <div className="card-head-title">
@@ -1326,7 +1536,7 @@ export default function App({
                 <X size={15} />
               </button>
               {mediaPreview.kind === "image" ? (
-                <img src={mediaPreview.source} alt="" />
+                <img src={resolveImageDisplayUrl(mediaPreview.source)} alt="" />
               ) : (
                 <audio controls autoPlay src={mediaPreview.source} />
               )}
@@ -1376,7 +1586,7 @@ function PromptMediaOverlay({
           title={token.token}
           onClick={() => onPreview("image", source)}
         >
-          <img src={source} alt={token.token} />
+          <img src={resolveImageDisplayUrl(source)} alt={token.token} />
         </button>,
       );
     } else {
@@ -1416,12 +1626,16 @@ function LabeledSelect({
   label,
   value,
   values,
+  groups,
   onChange,
   displayValue = (item) => item,
 }: {
   label: string;
   value: string;
-  values: readonly string[];
+  /** 平铺选项；与 groups 二选一 */
+  values?: readonly string[];
+  /** 分组选项（optgroup），用于选项较多的枚举（如镜头运动） */
+  groups?: readonly { label: string; values: readonly string[] }[];
   onChange(value: string): void;
   displayValue?(item: string): string;
 }) {
@@ -1430,11 +1644,21 @@ function LabeledSelect({
       {label}
       <span className="select-wrap">
         <select value={value} onChange={(event) => onChange(event.target.value)}>
-          {values.map((item) => (
-            <option key={item} value={item}>
-              {displayValue(item)}
-            </option>
-          ))}
+          {groups
+            ? groups.map((group) => (
+                <optgroup key={group.label} label={group.label}>
+                  {group.values.map((item) => (
+                    <option key={item} value={item}>
+                      {displayValue(item)}
+                    </option>
+                  ))}
+                </optgroup>
+              ))
+            : (values ?? []).map((item) => (
+                <option key={item} value={item}>
+                  {displayValue(item)}
+                </option>
+              ))}
         </select>
         <ChevronDown size={14} />
       </span>

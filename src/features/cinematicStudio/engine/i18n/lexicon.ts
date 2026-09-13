@@ -87,9 +87,14 @@ const ZH: PromptLexicon = {
     "Extreme close-up": "极近特写", "Insert / detail": "细节插入", "Two-shot": "双人镜头", "Tight two-shot": "紧凑双人镜头",
     "Over-the-shoulder": "过肩镜头", "3/4 medium, behind subject": "3/4 中景，人物背后", "Extreme close-up, profile": "极近特写，侧面",
     "Medium wide": "中全景", "Low wide": "低角度全景", "Full": "全身", "Insert": "插入特写",
-    // 镜头运动
+    // 镜头运动（与 app/cameraMovements.ts 的预设库一一对应；新增预设时两处同步）
+    // 注意：POV / OTS / Steadicam 刻意不在此表内，保持原样输出（与「第一人称 POV 锁」等既有术语一致）
     "Static": "静态", "Handheld": "手持", "Dolly": "移轨", "Crane": "升降", "Pan": "摇镜",
     "Tilt": "俯仰", "Push-in": "推近", "Pull-out": "拉远", "Trucking": "横移", "Tracking": "跟拍",
+    "Arc": "弧线环绕", "Orbit": "环绕", "Zoom": "变焦",
+    "Whip-pan": "甩镜", "Dolly zoom": "推拉变焦", "Snap zoom": "急推变焦",
+    "Gimbal": "稳定器", "Drone": "航拍", "Cable cam": "索道", "Vehicle": "车载",
+    "Robot arm": "机械臂", "Snorricam": "贴身固定", "Reverse tracking": "反向跟拍",
     // 状态
     "on-ground": "在地上", "playing": "播放中", "blown-open": "被炸开", "closed": "关闭", "open": "打开",
     "pressed": "已按下", "held": "持有中", "armed": "已武装", "gripped": "被抓住", "freed": "已挣脱",

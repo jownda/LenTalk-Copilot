@@ -1,7 +1,35 @@
 // ─────────────────────────────────────────────────────────────
 // V0.1 兼容模型（保留，迁移时读取旧字段）
 // ─────────────────────────────────────────────────────────────
-export type CameraMovement = "Static" | "Handheld" | "Steadicam" | "Dolly" | "Tracking" | "Crane" | "POV" | "OTS";
+export type CameraMovement =
+  | "Static"
+  | "Handheld"
+  | "Steadicam"
+  | "Dolly"
+  | "Tracking"
+  | "Crane"
+  | "POV"
+  | "OTS"
+  // 扩展预设：下拉选项由 app/cameraMovements.ts 提供（含中英标签与适用场景），
+  // 中文编译词典见 engine/i18n/lexicon.ts 的 values。历史数据里的自由文本仍然兼容。
+  | "Pan"
+  | "Tilt"
+  | "Push-in"
+  | "Pull-out"
+  | "Trucking"
+  | "Arc"
+  | "Orbit"
+  | "Zoom"
+  | "Whip-pan"
+  | "Dolly zoom"
+  | "Snap zoom"
+  | "Gimbal"
+  | "Drone"
+  | "Cable cam"
+  | "Vehicle"
+  | "Robot arm"
+  | "Snorricam"
+  | "Reverse tracking";
 
 export interface PropItem {
   id: string;
@@ -108,6 +136,51 @@ export interface ActingObjective {
   obstacle?: string;
   /** 失败代价：必须让角色害怕 */
   stakes?: string;
+}
+
+/** 第一层 AI 表演计划中的角色场景改写。 */
+export interface CharacterPerformancePlan {
+  characterId: string;
+  objective: string;
+  obstacle?: string;
+  stakes?: string;
+  subtext?: string;
+  sceneActing?: string;
+  eyeLife?: string;
+  performanceLevel?: 0 | 1 | 2 | 3 | 4 | 5;
+}
+
+/** 第一层 AI 表演计划中的预分镜节拍，不直接等同于第二层镜头节拍。 */
+export interface PerformanceBeat {
+  id: string;
+  order: number;
+  startSeconds?: number;
+  duration?: number;
+  actorId?: string;
+  targetCharacterId?: string;
+  action: string;
+  dialogue?: string;
+  reactionBeforeLine?: string;
+  tactic?: string;
+  subtext?: string;
+  beatChange?: string;
+  business?: string;
+  audio?: string;
+  required?: boolean;
+}
+
+/** 第一层的可追溯输出；生成完成即供第二层消费，不要求逐镜人工锁定。 */
+export interface PerformancePlan {
+  id: string;
+  status: "draft" | "confirmed" | "stale";
+  sourceRefinementHash?: string;
+  generatedAt?: string;
+  confirmedAt?: string;
+  emotionArc?: string;
+  characterPlans: CharacterPerformancePlan[];
+  beats: PerformanceBeat[];
+  previsualization?: string;
+  version: number;
 }
 
 /** 资产库条目：图片 + 描述 + 引用规则 → 可复用资产 */
@@ -391,8 +464,16 @@ export interface SceneV02 {
   firstFrameLock?: FirstFrameLock;
   /** 光线方向结构（P1.6）：主光源/方向/曝光优先/高光/禁止 */
   lightingDirection?: LightingDirection;
-  /** 表演目标（P2）：每参与角色的目的/阻碍/代价/贯穿目标 */
+  /** 表演目标（P2）：每参与角色的目的/阻碍/代价/贯穿目标（已并入 storyNotes，保留仅为旧项目兼容） */
   actingObjectives?: ActingObjective[];
+  /** 旧剧情补充字段；读取时迁移到 directorIntentRefinement。 */
+  storyNotes?: string;
+  /** AI 对既有导演简报输入的可编辑深化结果，为表演与分镜规划准备事实。 */
+  directorIntentRefinement?: string;
+  /** 导演意图深化的来源：初始 AI 结果或用户编辑后的版本。 */
+  directorIntentRefinementSource?: "ai" | "edited";
+  /** 第一层表演计划。 */
+  performancePlan?: PerformancePlan;
 }
 
 /** 结构化时间（P1.2：废除解析 "0-8秒" 正则字符串） */
@@ -432,6 +513,8 @@ export interface Optics {
 
 /** 相机：物理操作员行为（P1.2） */
 export interface CameraBehavior {
+  /** 相机行为统一描述：优先于旧的拆分字段，供用户和运镜模板直接填写。 */
+  description?: string;
   height?: string;          // "at hip height" / "at snow level"
   distance?: string;        // "3 to 5 meters from subject"
   angle?: string;           // "slight low angle" / "3/4 angle preferred"
@@ -477,6 +560,20 @@ export interface LightingDirection {
 }
 
 export interface ShotV02 {
+  /** 镜头级动作、表演与眼神统一描述；优先于旧 action / acting / eyeLife 字段。 */
+  performanceDescription?: string;
+  /** 相机移动中主光、环境光与人物受光的可见变化；由分镜规划器生成。 */
+  lightingBehavior?: string;
+  /** 背景层的非同步生活化活动；不与前景人物动作混写。 */
+  backgroundActivity?: string;
+  /** 第二层分镜规划元数据，绑定第一层表演节拍而不要求用户逐镜锁定。 */
+  planningMeta?: {
+    status: "draft" | "confirmed" | "stale";
+    performanceBeatIds: string[];
+    shotIntent?: string;
+    cameraTrigger?: string;
+    cameraEndState?: string;
+  };
   /** 多参与角色（顺序 = 添加顺序，用于身份编号稳定） */
   participants?: ShotParticipant[];
   /** 按时间排列的动作节拍 */

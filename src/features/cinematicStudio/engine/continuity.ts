@@ -86,7 +86,7 @@ const EXIT_CUE_RE = /(?:离开(?:画面|镜头)?|走出(?:画面|镜头)?|退出
 const CROSSING_CUE_RE = /(?:从左到右|从右到左|横穿|穿过画面|越过画面|left\s+to\s+right|right\s+to\s+left|cross(?:es|ing)?\s+(?:the\s+)?frame|move(?:s)?\s+across|walk(?:s)?\s+across)/i;
 
 function shotTextForCharacter(shot: ShotV2, characterId: string, characterName?: string): string {
-  const chunks = [shot.action, shot.note, ...(shot.beats ?? []).flatMap((beat) => {
+  const chunks = [shot.performanceDescription, shot.action, shot.note, ...(shot.beats ?? []).flatMap((beat) => {
     if (beat.actorId !== characterId && !characterName) return [];
     return [beat.verb, beat.actionText, beat.note, beat.cutRule];
   })];
@@ -433,6 +433,7 @@ export function checkSpatial(project: ProjectV2, scene: SceneV2, _options: Conti
 
     // 4. 只有「明确目标 + 明确屏幕侧 + 明确镜头方向」才判断，不从散文猜测空间事实。
     const directionalFields = [
+      { source: "performance description", sourceZh: "动作与表演执行", text: shot.performanceDescription },
       { source: "action", sourceZh: "镜头动作", text: shot.action },
       { source: "note", sourceZh: "镜头备注", text: shot.note },
       ...(shot.beats ?? []).flatMap((beat) => [
@@ -825,7 +826,7 @@ export function checkTechnical(project: ProjectV2, scene: SceneV2, _options: Con
   // P1 相机：手持质感写了数字抖动/随机晃动/稳定器平滑 → warning
   const HANDHELD_DIGITAL_RE = /\b(digital jitter|random shake|gimbal smoothness|gimbal[- ]smooth|digital shake|shaky[ -]?cam)\b/i;
   for (const shot of scene.shots) {
-    const hq = shot.cameraBehavior?.handheldQuality?.trim();
+    const hq = shot.cameraBehavior?.description?.trim() || shot.cameraBehavior?.handheldQuality?.trim();
     if (hq && HANDHELD_DIGITAL_RE.test(hq)) {
       const hit = hq.match(HANDHELD_DIGITAL_RE);
       issues.push({
@@ -869,7 +870,7 @@ export function checkTechnical(project: ProjectV2, scene: SceneV2, _options: Con
   for (const shot of scene.shots) {
     const declared = new Set<LensContentClass>(shot.optics?.lensCharacter ? LENS_CLASSES.get(shot.optics.lensCharacter) ?? [] : []);
     if (declared.size === 0) continue;
-    const text = `${shot.framing} ${shot.lens ?? ""} ${shot.movement} ${shot.action} ${(shot.beats ?? []).map((beat) => `${beat.verb} ${beat.actionText ?? ""}`).join(" ")}`;
+    const text = `${shot.framing} ${shot.lens ?? ""} ${shot.movement} ${shot.performanceDescription ?? ""} ${shot.action} ${(shot.beats ?? []).map((beat) => `${beat.verb} ${beat.actionText ?? ""}`).join(" ")}`;
     const derived = new Set<LensContentClass>();
     for (const cls of Object.keys(CONTENT_SIGNALS) as LensContentClass[]) {
       if (CONTENT_SIGNALS[cls].test(text)) derived.add(cls);
@@ -1159,6 +1160,7 @@ export function checkActing(project: ProjectV2, scene: SceneV2, _options: Contin
   const hasActingInput =
     (scene.actingObjectives ?? []).length > 0 ||
     scene.shots?.some((shot) =>
+      Boolean(shot.performanceDescription?.trim()) ||
       Boolean(shot.eyeLife?.trim()) ||
       shot.performanceLevel != null ||
       shot.beats?.some((beat) => beat.tactic?.trim() || beat.subtext?.trim() || beat.beatChange?.trim() || beat.reactionBeforeLine?.trim()));
@@ -1257,9 +1259,9 @@ export function checkActing(project: ProjectV2, scene: SceneV2, _options: Contin
 
   // 眼部生活：镜头有表演描述但无眼部内容
   for (const shot of scene.shots ?? []) {
-    const hasPerformance = (shot.acting?.trim() ?? "") !== "" || (shot.beats ?? []).some((beat) => beat.actionText?.trim() || beat.tactic?.trim());
+    const hasPerformance = (shot.performanceDescription?.trim() ?? shot.acting?.trim() ?? "") !== "" || (shot.beats ?? []).some((beat) => beat.actionText?.trim() || beat.tactic?.trim());
     const hasEyeLife = Boolean(shot.eyeLife?.trim()) || /眼|扫视|眨眼|瞳光|视线先|目光|eye|blink|saccade|gaze|catchlight/i.test(
-      `${shot.acting ?? ""} ${(shot.beats ?? []).map((beat) => beat.actionText ?? "").join(" ")} ${(shot.beats ?? []).map((beat) => beat.beatChange ?? "").join(" ")}`
+      `${shot.performanceDescription ?? ""} ${shot.acting ?? ""} ${(shot.beats ?? []).map((beat) => beat.actionText ?? "").join(" ")} ${(shot.beats ?? []).map((beat) => beat.beatChange ?? "").join(" ")}`
     );
     if (hasPerformance && !hasEyeLife) {
       issues.push({
@@ -1331,7 +1333,7 @@ export function checkActing(project: ProjectV2, scene: SceneV2, _options: Contin
   // 表演模版外情绪词：indication（面具式表情展示）
   const INDICATION_WORDS = /蹙眉|挑眉|瞪大眼睛|挤眉|咧嘴|做苦脸|grimac|arched brow|mugging|depict|pantomime|make a face|exaggerated face/i;
   for (const shot of scene.shots ?? []) {
-    const actingText = `${shot.acting ?? ""} ${shot.eyeLife ?? ""} ${(shot.beats ?? []).map((beat) => beat.actionText ?? "").join(" ")}`;
+    const actingText = `${shot.performanceDescription ?? ""} ${shot.acting ?? ""} ${shot.eyeLife ?? ""} ${(shot.beats ?? []).map((beat) => beat.actionText ?? "").join(" ")}`;
     if (INDICATION_WORDS.test(actingText) && !/目|眼|扫视|眨眼|瞳光|eye|blink|saccade|gaze|catchlight/i.test(actingText)) {
       issues.push({
         code: "ACTING.INDICATION",
@@ -1350,7 +1352,7 @@ export function checkActing(project: ProjectV2, scene: SceneV2, _options: Contin
     const shot = scene.shots[i];
     const next = scene.shots[i + 1];
     const strongEvent = /崩溃|痛哭|爆炸|枪|倒下|尖叫|震怒|夺门|breakdown|sobbing|explosion|gunshot|collaps|scream|rage|slams/i.test(
-      `${shot.acting ?? ""} ${(shot.beats ?? []).map((beat) => beat.actionText ?? "").join(" ")}`
+      `${shot.performanceDescription ?? ""} ${shot.acting ?? ""} ${(shot.beats ?? []).map((beat) => beat.actionText ?? "").join(" ")}`
     );
     const instantRecover = next.beats?.some((beat) => /恢复正常|若无其事|微笑|从容|镇定|平静|smil|composed|calm|serene|cheerful/i.test(
       `${beat.actionText ?? ""} ${beat.note ?? ""}`
@@ -1396,6 +1398,7 @@ export function checkContext(project: ProjectV2, scene: SceneV2, _options: Conti
     return set;
   };
   const textFields = (shot: SceneV2["shots"][number]) => [
+    shot.performanceDescription,
     shot.action,
     shot.acting,
     shot.note,

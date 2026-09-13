@@ -66,7 +66,7 @@ describe("asset reference naming", () => {
 });
 
 describe("prop changes", () => {
-  it("renders one prop-change description and never exports legacy start/end states", () => {
+  it("merges a legacy prop-change description into action instead of exporting a standalone prop section", () => {
     const prop: Asset = {
       id: "lighter", kind: "prop", name: "打火机", description: "", descriptionZh: "银色打火机",
       referencePaths: [], lockLevel: "none", tags: [],
@@ -84,7 +84,8 @@ describe("prop changes", () => {
     const project = { id: "project", title: "测试", description: "", preset: "custom" as const, scenes: [scene], characters: [], assets: [prop] };
 
     const output = renderShotSection(project, scene, shot, "zh");
-    expect(output).toContain("道具变化：角色拿起打火机并点燃，始终握在右手。");
+    expect(output).toContain("角色拿起打火机并点燃，始终握在右手。");
+    expect(output).not.toContain("道具变化：");
     expect(output).not.toContain("起始状态");
     expect(output).not.toContain("结束状态");
     expect(output).not.toContain("intact");

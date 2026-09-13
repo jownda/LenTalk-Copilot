@@ -8,6 +8,7 @@ import type { LensCharacter, PhysicsAnchorKind, ShotV2 } from "../../shared-type
 import { LENS_BANK, PHYSICS_ANCHORS, lensById } from "../../engine";
 import { ChevronDown, Sparkles } from "lucide-react";
 import { framingLabels, type Locale } from "../i18n";
+import { CAMERA_MOVE_TEMPLATE_GROUPS, CAMERA_MOVE_TEMPLATES } from "../cameraMoveTemplates";
 
 interface OpticsCameraEditorProps {
   shot: ShotV2;
@@ -74,16 +75,16 @@ const DECISION_LABELS: Record<Locale, Record<(typeof DECISION_TREE)[number]["key
   },
 };
 
-const CAMERA_FIELDS: { key: keyof NonNullable<ShotV2["cameraBehavior"]>; zh: string; en: string }[] = [
-  { key: "height", zh: "机位高度", en: "Height" },
-  { key: "distance", zh: "距离", en: "Distance" },
-  { key: "angle", zh: "角度", en: "Angle" },
-  { key: "side", zh: "机位边", en: "Side" },
-  { key: "subjectSize", zh: "画面大小", en: "Subject size" },
-  { key: "screenPlacement", zh: "画面位置", en: "Screen placement" },
-  { key: "focusBehavior", zh: "对焦", en: "Focus" },
-  { key: "depthOfField", zh: "景深", en: "Depth of field" },
-  { key: "handheldQuality", zh: "手持质感", en: "Handheld quality" },
+const LEGACY_CAMERA_FIELDS: { key: keyof NonNullable<ShotV2["cameraBehavior"]>; zh: string; en: string }[] = [
+  { key: "height", zh: "高度", en: "height" },
+  { key: "distance", zh: "距离", en: "distance" },
+  { key: "angle", zh: "角度", en: "angle" },
+  { key: "side", zh: "机位边", en: "side" },
+  { key: "subjectSize", zh: "画面大小", en: "subject size" },
+  { key: "screenPlacement", zh: "画面位置", en: "screen placement" },
+  { key: "focusBehavior", zh: "对焦", en: "focus" },
+  { key: "depthOfField", zh: "景深", en: "depth of field" },
+  { key: "handheldQuality", zh: "手持质感", en: "handheld quality" },
 ];
 
 const PHYSICS_KINDS: PhysicsAnchorKind[] = ["walk", "run", "weapon", "liquid", "particle"];
@@ -98,8 +99,14 @@ const T = {
     fov: "视场角",
     recommended: "推荐",
     current: "当前",
-    cameraBehavior: "相机行为（物理操作员）",
-    handheldHint: "只写物理操作员描述（呼吸 / 微调 / 重量转移），不要 digital jitter / gimbal",
+    cameraBehavior: "相机行为与运镜",
+    cameraBehaviorPlaceholder: "描述机位、距离、构图、对焦、运镜触发与结束状态…",
+    cameraTemplateHint: "点击模板填入后可继续修改；模板仅作 AI 与人工填写参考，不会自动覆盖相机、光学或镜头运动选择。",
+    selectCameraTemplate: "选择运镜模板",
+    commonMoves: "常用运镜",
+    classicMoves: "经典运镜",
+    masterMoves: "大师运镜",
+    handheldHint: "手持请写摄影师呼吸、脚步和重心转移，不要 digital jitter / gimbal",
     physics: "物理锚点",
     physicsHint: "按动作类别勾选，编译输出可观测锚点",
   },
@@ -112,8 +119,14 @@ const T = {
     fov: "FOV",
     recommended: "Recommended",
     current: "Current",
-    cameraBehavior: "Camera behavior (physical operator)",
-    handheldHint: "Physical operator behavior only (breath / micro-settling / weight shift), no digital jitter / gimbal",
+    cameraBehavior: "Camera behavior & movement",
+    cameraBehaviorPlaceholder: "Describe position, framing, focus, movement trigger, and ending state…",
+    cameraTemplateHint: "Click a template to fill, then edit it freely. Templates are references for AI and manual planning; they do not overwrite camera, optics, or movement selections.",
+    selectCameraTemplate: "Choose a movement template",
+    commonMoves: "Common moves",
+    classicMoves: "Classic moves",
+    masterMoves: "Master moves",
+    handheldHint: "For handheld, describe operator breath, footsteps, and weight shift; no digital jitter / gimbal",
     physics: "Physics anchors",
     physicsHint: "Check by action kind; compiler renders observable anchors",
   },
@@ -121,6 +134,7 @@ const T = {
 
 export default function OpticsCameraEditor({ shot, framing, locale, onUpdate }: OpticsCameraEditorProps) {
   const [recommended, setRecommended] = useState<LensCharacter | null>(null);
+  const [cameraTemplateOpen, setCameraTemplateOpen] = useState(false);
   const zh = locale === "zh";
   const L = T[locale];
   const optics = shot.optics ?? {};
@@ -138,8 +152,20 @@ export default function OpticsCameraEditor({ shot, framing, locale, onUpdate }: 
     setRecommended(null);
   };
 
-  const setBehavior = (key: keyof typeof behavior, value: string) => {
-    onUpdate({ cameraBehavior: { ...behavior, [key]: value.trim() || undefined } });
+  const legacyBehaviorText = LEGACY_CAMERA_FIELDS
+    .map((field) => {
+      const value = behavior[field.key]?.trim();
+      return value ? `${zh ? field.zh : field.en}: ${value}` : "";
+    })
+    .filter(Boolean)
+    .join(zh ? "；" : "; ");
+  const behaviorText = behavior.description ?? legacyBehaviorText;
+  const selectedCameraTemplate = CAMERA_MOVE_TEMPLATE_GROUPS
+    .flatMap((group) => CAMERA_MOVE_TEMPLATES[locale][group])
+    .find((template) => template.description === behaviorText);
+
+  const setBehaviorText = (value: string) => {
+    onUpdate({ cameraBehavior: { ...behavior, description: value || undefined } });
   };
 
   const toggleAnchor = (kind: PhysicsAnchorKind) => {
@@ -211,13 +237,55 @@ export default function OpticsCameraEditor({ shot, framing, locale, onUpdate }: 
     </div>}
 
     <div className="sub-label">{L.cameraBehavior}</div>
-    <div className="fields-grid two optics-grid">
-      {CAMERA_FIELDS.map((field) => <label className="field-label" key={field.key}>
-        {zh ? field.zh : field.en}
-        <input className="modal-input" value={behavior[field.key] ?? ""} placeholder={zh ? field.zh : field.en} onChange={(event) => setBehavior(field.key, event.target.value)} />
-      </label>)}
+    <label className="field-label camera-behavior-field">
+      <textarea
+        className="modal-textarea"
+        rows={4}
+        value={behaviorText}
+        placeholder={L.cameraBehaviorPlaceholder}
+        onChange={(event) => setBehaviorText(event.target.value)}
+      />
+    </label>
+    <p className="hint-text">{L.cameraTemplateHint}</p>
+    <div className="camera-template-picker">
+      <button
+        type="button"
+        className="outline-button camera-template-button"
+        aria-expanded={cameraTemplateOpen}
+        onClick={() => setCameraTemplateOpen((open) => !open)}
+      >
+        {selectedCameraTemplate?.label ?? L.selectCameraTemplate}
+        <ChevronDown size={13} className={cameraTemplateOpen ? "open" : ""} />
+      </button>
+      {cameraTemplateOpen && (
+        <div className="camera-template-menu" role="listbox" aria-label={L.selectCameraTemplate}>
+          {CAMERA_MOVE_TEMPLATE_GROUPS.map((group) => (
+            <div className="camera-template-menu-group" key={group}>
+              <span>{group === "common" ? L.commonMoves : group === "classic" ? L.classicMoves : L.masterMoves}</span>
+              <div>
+                {CAMERA_MOVE_TEMPLATES[locale][group].map((template) => (
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={template.description === behaviorText}
+                    className={template.description === behaviorText ? "active" : ""}
+                    key={template.id}
+                    title={template.description}
+                    onClick={() => {
+                      setBehaviorText(template.description);
+                      setCameraTemplateOpen(false);
+                    }}
+                  >
+                    {template.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
-    {behavior.handheldQuality && <p className="hint-text">{L.handheldHint}</p>}
+    {/(?:handheld|手持)/i.test(behaviorText) && <p className="hint-text">{L.handheldHint}</p>}
 
     <label className="check-chip-axis">
       <input

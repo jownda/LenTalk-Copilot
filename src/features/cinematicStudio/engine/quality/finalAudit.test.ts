@@ -24,6 +24,17 @@ describe("final prompt audit", () => {
     expect(auditFinalPrompt(makeScene()).adjustments.find((item) => item.code === "FINAL.TIMELINE_NORMALIZED")?.detail).toContain("->");
   });
 
+  it("将显式镜头时间之间的空档归一为连续时间轴", () => {
+    const scene = makeScene({ shots: [
+      { ...makeScene().shots[0], id: "shot-1", time: { startSeconds: 0, endSeconds: 4 } },
+      { ...makeScene().shots[1], id: "shot-2", time: { startSeconds: 5, endSeconds: 8 } },
+    ] });
+    const timeline = normalizeSceneShotTimeline(scene);
+    expect(timeline.get("shot-1")).toEqual({ startSeconds: 0, endSeconds: 4 });
+    expect(timeline.get("shot-2")).toEqual({ startSeconds: 4, endSeconds: 7 });
+    expect(auditFinalPrompt(scene).issues.map((issue) => issue.code)).toContain("FINAL.TIMELINE_NORMALIZED");
+  });
+
   it("合并长镜头旧分段，并仅阻断真实的超时冲突", () => {
     const scene = makeScene({ shootingMode: "long-take", duration: "8秒" });
     const issues = auditFinalPrompt(scene).issues;

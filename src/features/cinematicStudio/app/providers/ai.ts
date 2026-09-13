@@ -3,19 +3,22 @@
  * 配置了 API Key 时使用远程 OpenAI 兼容 Chat Completions（OpenAI / DeepSeek / Kimi / 通义 / 智谱 / 自定义），
  * 未配置或请求失败时自动回退本地模板建议。
  */
-import { buildDirectorDocumentLayers, compileDirectorSequence, DIRECTOR_LAYERS, DIRECTOR_LAYER_ORDER, getStyle, LocalSuggestionProvider, SHOT_TEMPLATES, localizedStyleBrief } from "../../engine";
+import { buildDirectorDocumentLayers, compileDirectorSequence, DIRECTOR_LAYERS, DIRECTOR_LAYER_ORDER, directorIntentRefinementText, extractFirstPersonPovLock, FINAL_GENERATED_DIRECTOR_LAYER_KEYS, getStyle, LocalSuggestionProvider, renderFirstPersonPovLock, SHOT_TEMPLATES, localizedStyleBrief } from "../../engine";
 import type { AIAssistant, AssetSuggestion, BeatSuggestion, ContinuityRepairIssue, ContinuityRepairPatch, FixSuggestion, SceneSuggestion } from "../../engine";
 import { buildSceneAssetRegistry } from "../../engine/compiler/renderer";
-import { fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, lensById } from "../../engine/presets";
-import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { fovToLegacyFocalLength, legacyFocalLengthToFov, lensByFov, lensById, facialExpressionReferencePrompt } from "../../engine/presets";
+import { imageUrlToDataUrl, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import { listen } from "@tauri-apps/api/event";
 import { auditFinalPrompt, validateDirectorLayers } from "../../engine/quality";
 import type {
-  ActingObjective, ActionBeat, Asset, AssetActingProfile, AssetKind, AudioPlan, CameraBehavior, CameraMovement, CutStyle,
-  LightingDirection, LockLevel, Optics, PhysicsAnchor, ProjectV2, SceneV2, ShotParticipant, ShotV2,
+  ActionBeat, Asset, AssetActingProfile, AssetKind, CameraBehavior, CameraMovement, CutStyle,
+  CharacterPerformancePlan, LightingDirection, LockLevel, Optics, PerformanceBeat, PerformancePlan, PhysicsAnchor, ProjectV2, SceneV2, ShotParticipant, ShotV2,
 } from "../../shared-types";
 import { isRemoteConfigured, loadAISettings, normalizeBaseUrl, openAICompatibleBaseUrl, type AISettings } from "./aiSettings";
 import type { Locale } from "../i18n";
+import { buildQuickPromptRequest, type QuickPromptInput } from "./quickPromptAgent";
+import { cameraMoveTemplateLibrary } from "../cameraMoveTemplates";
+import { cameraMovementVocab, normalizeCameraMovement } from "../cameraMovements";
 
 const localProvider = new LocalSuggestionProvider();
 
@@ -30,9 +33,13 @@ export const SCENE_DRAFT_JSON_SCHEMA = `{
       "lensModel": string | null,
       "camera": string | null,
       "optics": { "lensCharacter": "180-panoramic" | "135-immersive" | "107-ultrawide" | "84-wide" | "63-moderate-wide" | "47-standard" | "29-short-tele" | "18-tele" | "12-long-tele" | "8-supertele" | null, "fieldOfViewDegrees": number | null, "lensOutcome": string[] | null, "antiDriftLock": string | null },
-      "cameraBehavior": { "height": string | null, "distance": string | null, "angle": string | null, "side": string | null, "subjectSize": string | null, "screenPlacement": string | null, "focusBehavior": string | null, "depthOfField": string | null, "handheldQuality": string | null },
+      "cameraBehavior": { "description": string | null, "height": string | null, "distance": string | null, "angle": string | null, "side": string | null, "subjectSize": string | null, "screenPlacement": string | null, "focusBehavior": string | null, "depthOfField": string | null, "handheldQuality": string | null },
       "physicsAnchors": [ { "kind": "walk" | "run" | "weapon" | "liquid" | "particle", "detail": string | null } ],
+      "planningMeta": { "performanceBeatIds": string[], "shotIntent": string | null, "cameraTrigger": string | null, "cameraEndState": string | null },
       "movement": string,
+      "performanceDescription": string,
+      "lightingBehavior": string | null,
+      "backgroundActivity": string | null,
       "action": string,
       "acting": string,
       "performanceLevel": number,
@@ -41,7 +48,6 @@ export const SCENE_DRAFT_JSON_SCHEMA = `{
       "cutStyle": "hard-cut" | "overlap" | "match-cut",
       "participants": [ { "characterId": string, "role": "primary" | "supporting" | "target" | "background", "position": string | null, "entrance": "already-in-frame" | "enters-left" | "enters-right" | null, "facing": string | null, "eyeline": string | null, "torsoFacing": string | null, "anchorDistance": string | null, "acting": string | null, "eyeLife": string | null } ],
       "beats": [ { "order": number, "startSeconds": number | null, "duration": number, "verb": string, "actorId": string | null, "targetCharacterId": string | null, "targetPropId": string | null, "targetBodyPart": string | null, "actionText": string | null, "dialogue": string | null, "propState": string | null, "audio": string | null, "tactic": string | null, "subtext": string | null, "beatChange": string | null, "reactionBeforeLine": string | null, "required": boolean, "forbiddenTargets": string[], "cutRule": string | null, "note": string | null } ],
-      "propChangeDescription": string | null,
       "note": string | null
     }
   ],
@@ -286,7 +292,11 @@ function extractJSON<T>(text: string): T {
 }
 
 /** 从 OpenAI 兼容的普通 JSON 或 SSE 流中提取模型文本。 */
-export async function readChatCompletionText(response: Response, onChunk?: (receivedChars: number) => void): Promise<string> {
+export async function readChatCompletionText(
+  response: Response,
+  onChunk?: (receivedChars: number) => void,
+  options?: { allowUnterminatedEof?: boolean },
+): Promise<string> {
   const extractContent = (value: unknown): string => {
     if (!value || typeof value !== "object") return "";
     const choice = (value as { choices?: unknown[] }).choices?.[0];
@@ -357,6 +367,11 @@ export async function readChatCompletionText(response: Response, onChunk?: (rece
   }
   if (pending) consumeLine(pending);
   if (sawStreamEvent && !completed) {
+    // A number of OpenAI-compatible gateways close a valid SSE response at
+    // EOF without emitting [DONE] or finish_reason. JSON callers validate the
+    // returned payload immediately, so an incomplete object still becomes a
+    // resumable interruption instead of a false successful storyboard.
+    if (content && options?.allowUnterminatedEof) return content;
     // Without [DONE] we cannot distinguish a gateway that omits the marker
     // from a response truncated at EOF. Preserve the partial text so the
     // caller can use the existing continuation flow instead of silently
@@ -409,14 +424,23 @@ async function chatCompletionsJSON(
 ): Promise<unknown> {
   const endpoint = `${openAICompatibleBaseUrl(settings.baseUrl)}/chat/completions`;
   const audioParts = await Promise.all(audioUrls.map((source) => audioSourceToInputPart(source)));
+  // 参考图先转成模型可读取的形式（本机路径 / asset 协议对模型不可见）
+  const imageParts = await Promise.all(imageUrls.map(async (source, index) => {
+    try {
+      return { type: "image_url", image_url: { url: await prepareReferenceImageSource(source) } };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`第 ${index + 1} 张参考图无法读取：${detail}`);
+    }
+  }));
   const messages = [
     { role: "system", content: system },
     {
       role: "user",
-      content: imageUrls.length > 0 || audioParts.length > 0
+      content: imageParts.length > 0 || audioParts.length > 0
         ? [
             { type: "text", text: user },
-            ...imageUrls.map((url) => ({ type: "image_url", image_url: { url } })),
+            ...imageParts,
             ...audioParts,
           ]
         : user,
@@ -465,7 +489,11 @@ async function chatCompletionsJSON(
     throw new Error(`HTTP ${response.status}${raw ? `：${raw.slice(0, 260)}` : ""}`);
   }
   try {
-    const content = await readChatCompletionText(response, (receivedChars) => onProgress?.("streaming", receivedChars));
+    const content = await readChatCompletionText(
+      response,
+      (receivedChars) => onProgress?.("streaming", receivedChars),
+      { allowUnterminatedEof: true },
+    );
     if (!content) throw new Error("响应中没有文本内容");
     onProgress?.("parsing");
     try {
@@ -498,7 +526,11 @@ async function chatCompletionsJSON(
       }
       let resumed: string;
       try {
-        resumed = await readChatCompletionText(resumedResponse, (receivedChars) => onProgress?.("resuming", partialText.length + receivedChars));
+        resumed = await readChatCompletionText(
+          resumedResponse,
+          (receivedChars) => onProgress?.("resuming", partialText.length + receivedChars),
+          { allowUnterminatedEof: true },
+        );
       } catch (resumeError) {
         if (resumeError instanceof ChatCompletionInterruptedError) {
           const merged = mergeContinuationText(partialText, resumeError.partialText);
@@ -539,6 +571,56 @@ function bytesToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
   }
   return btoa(binary);
+}
+
+/** 参考图统一压缩到最长边，避免 4 张原图把请求体撑爆（中转网关普遍有体积上限） */
+const REFERENCE_IMAGE_MAX_EDGE = 1024;
+
+/** data URL 图片按最长边等比缩小后重新编码为 JPEG；无法解码时原样返回 */
+function downscaleImageDataUrl(dataUrl: string, maxEdge: number): Promise<string> {
+  if (typeof document === "undefined" || typeof Image === "undefined" || !dataUrl.startsWith("data:image/")) {
+    return Promise.resolve(dataUrl);
+  }
+  return new Promise((resolve) => {
+    const image = new Image();
+    image.onload = () => {
+      try {
+        const width = image.naturalWidth || image.width;
+        const height = image.naturalHeight || image.height;
+        const scale = width && height ? Math.min(1, maxEdge / Math.max(width, height)) : 1;
+        if (scale >= 1) { resolve(dataUrl); return; }
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
+        const context = canvas.getContext("2d");
+        if (!context) { resolve(dataUrl); return; }
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const scaled = canvas.toDataURL("image/jpeg", 0.86);
+        resolve(scaled.startsWith("data:image/") ? scaled : dataUrl);
+      } catch {
+        resolve(dataUrl);
+      }
+    };
+    image.onerror = () => resolve(dataUrl);
+    image.src = dataUrl;
+  });
+}
+
+/**
+ * 参考图必须转成模型能读取的东西：公网 http(s) 透传，其余（data URL / 本机文件路径 /
+ * file:// / asset:// / 素材库 sourcePath）一律读成 data URL。
+ * 直接把本机路径当 URL 发给模型会导致请求失败——模型无法访问用户本机文件。
+ */
+export async function prepareReferenceImageSource(source: string, maxEdge = REFERENCE_IMAGE_MAX_EDGE): Promise<string> {
+  const trimmed = source.trim();
+  if (!trimmed) throw new Error("参考图地址为空。");
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (trimmed.toLowerCase().startsWith("file://")) {
+    const localPath = decodeURIComponent(trimmed.slice("file://".length)).replace(/^\/([A-Za-z]:[\\/])/, "$1");
+    return await prepareReferenceImageSource(localPath, maxEdge);
+  }
+  const dataUrl = await imageUrlToDataUrl(trimmed);
+  return await downscaleImageDataUrl(dataUrl, maxEdge);
 }
 
 async function audioSourceToInputPart(source: string): Promise<AudioInputPart> {
@@ -678,7 +760,7 @@ function restoreActionTimingSegments(text: string, sourcePrompt: string, locale:
   const headingMatch = /(^|\n)(ACTION TIMING|动作节奏)\s*[:：]\s*\n/i.exec(text);
   if (!headingMatch) return text;
   const bodyStart = headingMatch.index + headingMatch[0].length;
-  const nextHeading = /\n\n(?:活动引用|场景地图(?:和站位)?|首帧(?:与空间走位|与站位)?|格式模式|光学|摄像机|动作节奏|物理|光线|音频|风格|正向约束|负向约束|ACTIVE REFERENCES|SCENE MAP AND STAGING|LOCATION MAP|FIRST FRAME(?: AND SPATIAL BLOCKING)?|FORMAT MODE|OPTICS|CAMERA|ACTION TIMING|PHYSICS|LIGHTING|AUDIO|STYLE|POSITIVE CONSTRAINTS|NEGATIVE CONSTRAINTS)\s*[:：]\s*\n/igu;
+  const nextHeading = /\n\n(?:活动引用|场景地图(?:和站位)?|首帧(?:与空间走位|与站位)?|格式模式|光学|相机|摄像机|动作节奏|物理|光线|音频|风格|正向约束|负向约束|ACTIVE REFERENCES|SCENE MAP AND STAGING|LOCATION MAP|FIRST FRAME(?: AND SPATIAL BLOCKING)?|FORMAT MODE|OPTICS|CAMERA|ACTION TIMING|PHYSICS|LIGHTING|AUDIO|STYLE|POSITIVE CONSTRAINTS|NEGATIVE CONSTRAINTS)\s*[:：]\s*\n/igu;
   nextHeading.lastIndex = bodyStart;
   const nextMatch = nextHeading.exec(text);
   const bodyEnd = nextMatch?.index ?? text.length;
@@ -1311,17 +1393,11 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
   return patch;
 }
 
-/** User-facing brief fields are AI planning reference only and never compile directly into the final prompt. */
-export interface SceneBriefOptimization {
-  mustHappen: string[];
-  forbid: string[];
-  dialogue?: string;
-  emotionArc?: string;
-  actingObjectives: ActingObjective[];
-  audioPlan: AudioPlan;
-}
-
-export async function optimizeSceneBrief(project: ProjectV2, scene: SceneV2, locale: Locale): Promise<SceneBriefOptimization> {
+/**
+ * 简报优化：只生成「导演意图深化」这一段统一文本，
+ * 不生成镜头、导演文档或最终提示词；音频计划不再由 AI 改写，用户在音频计划卡手动维护。
+ */
+export async function optimizeSceneBrief(project: ProjectV2, scene: SceneV2, locale: Locale): Promise<string> {
   const settings = loadAISettings();
   if (!isRemoteConfigured(settings)) {
     throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key，再在「AI编译提示词」左侧选择模型。");
@@ -1330,66 +1406,97 @@ export async function optimizeSceneBrief(project: ProjectV2, scene: SceneV2, loc
   const assets = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
   const characterIds = new Set(collectSceneAssetIds(project, scene).filter((id) => assets.get(id)?.kind === "character"));
   const propIds = new Set(collectSceneAssetIds(project, scene).filter((id) => assets.get(id)?.kind === "prop"));
-  const existing = {
-    mustHappen: scene.mustHappen ?? [],
-    forbid: scene.forbid ?? [],
-    dialogue: scene.dialogue ?? "",
-    emotionArc: scene.emotionArc ?? "",
-    actingObjectives: scene.actingObjectives ?? [],
-    audioPlan: project.audioPlan ?? { score: "none", subtitles: false },
-  };
   const data = await chatJSON(settings, JSON_SYSTEM, [
-    "You optimize the user-reference fields of a cinematic scene brief. Do NOT create a shot list, director layers, final prompt, negative prompt, camera plan, or asset descriptions.",
-    `Return ONLY ${language}. These fields help the later storyboard AI understand intent; none of them is copied directly into the final prompt.`,
-    "Preserve useful user input, fill missing information, and keep every suggestion concrete, concise, and consistent with the current story.",
+    "You generate one director-intent refinement for a cinematic scene brief. Do NOT create a shot list, director layers, final prompt, negative prompt, camera plan, or asset descriptions.",
+    `Return ONLY ${language}. This editable AI result refines the existing brief for the later performance and storyboard planners; it is never copied directly into the final prompt.`,
+    "Use only the supplied existing brief fields and asset references. Preserve useful user facts, fill only the story connections needed downstream, and keep it concrete and concise.",
+    "Cover visible events, dialogue ownership where supplied, emotion progression, and each character's objective/obstacle/stakes where supported. Avoid repeating the logline, style description, or asset appearance facts.",
     "",
     `Scene logline: ${scene.logline?.trim() || "(empty)"}`,
     `Prior context: ${scene.staging?.priorContext?.trim() || "(empty)"}`,
-    `Location and staging: ${scene.location}; ${scene.staging?.anchorDescription?.trim() || "(none)"}`,
+    `Location / time / weather: ${scene.location || "(empty)"}; ${scene.time || "(empty)"}; ${scene.weather || "(empty)"}`,
+    `Staging: ${scene.staging?.anchorDescription?.trim() || "(none)"}`,
     `Duration / shooting mode: ${scene.duration}; ${scene.shootingMode === "multi-shot" ? "multi-shot" : "one continuous long take"}`,
+    `Style description: ${localizedStyleBrief(project, locale).trim() || "(empty)"}`,
     `Available characters: ${[...characterIds].map((id) => `${assets.get(id)?.name ?? id}(${id})`).join(", ") || "(none)"}`,
     `Available props: ${[...propIds].map((id) => `${assets.get(id)?.name ?? id}(${id})`).join(", ") || "(none)"}`,
-    `Current user-reference values: ${JSON.stringify(existing)}`,
+    "Current director intent refinement (may be legacy content):",
+    directorIntentRefinementText(scene, [...assets.values()].map((asset) => ({ id: asset.id, name: asset.name }))).trim() || "(empty)",
     "",
     "Return exactly this JSON schema:",
-    '{ "mustHappen": string[], "forbid": string[], "dialogue": string, "emotionArc": string, "actingObjectives": [{ "characterId": string, "objective": string, "superObjective": string | null, "obstacle": string | null, "stakes": string | null }], "audioPlan": { "diegeticMusic": string[], "sfx": string[], "score": "none" | "original-score", "subtitles": boolean, "musicSourcePropId": string | null } }',
-    "Rules: mustHappen and forbid each contain at most 6 visible, story-relevant items. dialogue contains only lines intended for this scene. emotionArc describes a concise, camera-readable progression. actingObjectives use only available character IDs and give each active character a playable objective; omit inactive characters. Audio is planning reference only: use score none when no music is justified, and musicSourcePropId only when it is one of the available prop IDs.",
+    '{ "directorIntentRefinement": string }',
   ].join("\n"));
   const value = (data ?? {}) as Record<string, unknown>;
-  const objectives: ActingObjective[] = [];
-  for (const raw of Array.isArray(value.actingObjectives) ? value.actingObjectives : []) {
+  const result = asString(value.directorIntentRefinement);
+  if (!result) {
+    throw new Error("AI 未返回有效的导演意图深化内容。");
+  }
+  return result.trim();
+}
+
+function stableTextHash(value: string): string {
+  let hash = 5381;
+  for (let index = 0; index < value.length; index += 1) hash = (hash * 33) ^ value.charCodeAt(index);
+  return (hash >>> 0).toString(36);
+}
+
+/** 第一层：将导演意图深化为可观察、可拆分、可供镜头规划消费的表演计划。 */
+export async function planPerformance(project: ProjectV2, scene: SceneV2, locale: Locale): Promise<PerformancePlan> {
+  const settings = loadAISettings();
+  if (!isRemoteConfigured(settings)) {
+    throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key，再在「AI编译提示词」左侧选择模型。");
+  }
+  const assets = new Map((project.assets ?? []).map((asset) => [asset.id, asset]));
+  const characterIds = collectSceneAssetIds(project, scene).filter((id) => assets.get(id)?.kind === "character");
+  const refinement = directorIntentRefinementText(scene, [...assets.values()].map((asset) => ({ id: asset.id, name: asset.name }))).trim();
+  const language = locale === "zh" ? "Simplified Chinese (中文)" : "English";
+  const characterReference = characterIds.map((id) => {
+    const character = assets.get(id)!;
+    const master = locale === "zh"
+      ? character.actingProfile?.masterProfileZh || character.actingProfile?.masterProfile
+      : character.actingProfile?.masterProfile || character.actingProfile?.masterProfileZh;
+    return `${character.name}(${id}) | acting master: ${(master || "(none)").trim()} | target level: ${character.actingProfile?.performanceTarget ?? 4}`;
+  }).join("\n");
+  const data = await chatJSON(settings, JSON_SYSTEM, [
+    "You are the first-layer performance planner for a cinematic AI video prompt studio.",
+    `Return ONLY ${language}. Turn the director-intent refinement into an observable performance plan that the later storyboard planner can execute. Do not write camera directions, a final prompt, or a shot list.`,
+    "Apply these acting rules: every inner pressure must become visible behavior; articulate objective, obstacle, stakes, tactic and subtext; show reactions before dialogue ends; use purposeful hand business and eye life; every beat needs a visible change; describe stable mid-action states rather than starts/begins transitions; stagger group reactions instead of making a group react in unison.",
+    "FACIAL EXPRESSION REFERENCE (auxiliary lookup, never a replacement for the acting system): when the scene already establishes a matching emotional trigger, select only the closest mouth/eye/face/head cues below and rewrite them for this character's objective, obstacle, tactic, body and shot. Do not paste a whole row, stack incompatible emotions, or invent extra gestures. If no cue is needed, omit it.",
+    facialExpressionReferencePrompt(),
+    "Character sceneActing and eyeLife must be natural, detailed, camera-readable language. Beats are previsualization beats, not final shots: each beat is one observable event or response and must not repeat the whole scene acting paragraph.",
+    "DIRECTOR INTENT REFINEMENT:", refinement || "(empty)",
+    "EXISTING BRIEF CONTEXT:",
+    `Logline: ${scene.logline?.trim() || "(empty)"}`,
+    `Location / time / weather: ${scene.location || "(empty)"}; ${scene.time || "(empty)"}; ${scene.weather || "(empty)"}`,
+    `Prior context: ${scene.staging?.priorContext?.trim() || "(empty)"}`,
+    `Staging: ${scene.staging?.anchorDescription?.trim() || "(empty)"}`,
+    `Duration / shooting mode: ${scene.duration}; ${scene.shootingMode === "multi-shot" ? "multi-shot" : "long take"}`,
+    "AVAILABLE CHARACTERS (only use these IDs):", characterReference || "(none)",
+    "Return exactly this JSON schema:",
+    '{ "emotionArc": string | null, "characterPlans": [{ "characterId": string, "objective": string, "obstacle": string | null, "stakes": string | null, "subtext": string | null, "sceneActing": string | null, "eyeLife": string | null, "performanceLevel": number | null }], "beats": [{ "order": number, "startSeconds": number | null, "duration": number | null, "actorId": string | null, "targetCharacterId": string | null, "action": string, "dialogue": string | null, "reactionBeforeLine": string | null, "tactic": string | null, "subtext": string | null, "beatChange": string | null, "business": string | null, "audio": string | null, "required": boolean }], "previsualization": string | null }',
+  ].join("\n"));
+  const value = (data ?? {}) as Record<string, unknown>;
+  const validCharacters = new Set(characterIds);
+  const characterPlans: CharacterPerformancePlan[] = (Array.isArray(value.characterPlans) ? value.characterPlans : []).flatMap((raw) => {
     const item = (raw ?? {}) as Record<string, unknown>;
     const characterId = asString(item.characterId);
     const objective = asString(item.objective);
-    if (!characterIds.has(characterId) || !objective) continue;
-    const superObjective = asString(item.superObjective, undefined);
-    const obstacle = asString(item.obstacle, undefined);
-    const stakes = asString(item.stakes, undefined);
-    objectives.push({
-      characterId,
-      objective,
-      ...(superObjective ? { superObjective } : {}),
-      ...(obstacle ? { obstacle } : {}),
-      ...(stakes ? { stakes } : {}),
-    });
-  }
-  const audioRaw = (value.audioPlan ?? {}) as Record<string, unknown>;
-  const sourcePropId = asString(audioRaw.musicSourcePropId, undefined);
-  const score = asString(audioRaw.score, "none");
-  return {
-    mustHappen: asStringArray(value.mustHappen).slice(0, 6),
-    forbid: asStringArray(value.forbid).slice(0, 6),
-    dialogue: asString(value.dialogue, undefined),
-    emotionArc: asString(value.emotionArc, undefined),
-    actingObjectives: objectives,
-    audioPlan: {
-      diegeticMusic: asStringArray(audioRaw.diegeticMusic).slice(0, 6),
-      sfx: asStringArray(audioRaw.sfx).slice(0, 8),
-      score: score === "original-score" ? "original-score" : "none",
-      subtitles: audioRaw.subtitles === true,
-      ...(sourcePropId && propIds.has(sourcePropId) ? { musicSourcePropId: sourcePropId } : {}),
-    },
-  };
+    if (!validCharacters.has(characterId) || !objective) return [];
+    const level = Math.max(0, Math.min(5, Math.round(asNumber(item.performanceLevel, 4)))) as CharacterPerformancePlan["performanceLevel"];
+    return [{ characterId, objective, obstacle: asString(item.obstacle, undefined), stakes: asString(item.stakes, undefined), subtext: asString(item.subtext, undefined), sceneActing: asString(item.sceneActing, undefined), eyeLife: asString(item.eyeLife, undefined), performanceLevel: level }];
+  });
+  const beats: PerformanceBeat[] = (Array.isArray(value.beats) ? value.beats : []).flatMap((raw, index) => {
+    const item = (raw ?? {}) as Record<string, unknown>;
+    const action = asString(item.action);
+    const actorId = asString(item.actorId, undefined);
+    const targetCharacterId = asString(item.targetCharacterId, undefined);
+    if (!action || (actorId && !validCharacters.has(actorId)) || (targetCharacterId && !validCharacters.has(targetCharacterId))) return [];
+    const start = asNumber(item.startSeconds, Number.NaN);
+    const duration = asNumber(item.duration, Number.NaN);
+    return [{ id: crypto.randomUUID(), order: Math.max(1, Math.round(asNumber(item.order, index + 1))), ...(Number.isFinite(start) ? { startSeconds: Math.max(0, start) } : {}), ...(Number.isFinite(duration) && duration > 0 ? { duration } : {}), ...(actorId ? { actorId } : {}), ...(targetCharacterId ? { targetCharacterId } : {}), action, dialogue: asString(item.dialogue, undefined), reactionBeforeLine: asString(item.reactionBeforeLine, undefined), tactic: asString(item.tactic, undefined), subtext: asString(item.subtext, undefined), beatChange: asString(item.beatChange, undefined), business: asString(item.business, undefined), audio: asString(item.audio, undefined), required: item.required === true }];
+  }).sort((a, b) => a.order - b.order).map((beat, index) => ({ ...beat, order: index + 1 }));
+  if (characterPlans.length === 0 && beats.length === 0) throw new Error("AI 未返回有效的表演计划。");
+  return { id: crypto.randomUUID(), status: "confirmed", sourceRefinementHash: stableTextHash(refinement), generatedAt: new Date().toISOString(), confirmedAt: new Date().toISOString(), emotionArc: asString(value.emotionArc, undefined), characterPlans, beats, previsualization: asString(value.previsualization, undefined), version: (scene.performancePlan?.version ?? 0) + 1 };
 }
 
 /** 风格描述专用优化：只返回一段可执行的视觉风格语言，不改动其他导演简报字段。 */
@@ -1445,7 +1552,11 @@ interface GeneratedShotResult {
   optics?: unknown;
   cameraBehavior?: unknown;
   physicsAnchors?: unknown;
+  planningMeta?: unknown;
   movement?: unknown;
+  performanceDescription?: unknown;
+  lightingBehavior?: unknown;
+  backgroundActivity?: unknown;
   action?: unknown;
   acting?: unknown;
   performanceLevel?: unknown;
@@ -1500,6 +1611,7 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
   const locale = t?.locale ?? "zh";
   const durationLimit = Number(scene.duration.match(/(\d+(?:\.\d+)?)/)?.[1]) || 15;
   const isLongTake = scene.shootingMode !== "multi-shot";
+  const viewpointLock = extractFirstPersonPovLock(scene.logline);
 
   const compact = (value: string, limit: number) => {
     const text = value.replace(/\s+/g, " ").trim();
@@ -1526,12 +1638,40 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     })
     .filter(Boolean)
     .join(" | ");
+  const performancePlanSummary = (() => {
+    const plan = scene.performancePlan;
+    if (!plan) return "(none)";
+    const characterPlans = plan.characterPlans.map((item) => [
+      `${byId.get(item.characterId)?.name ?? item.characterId}(${item.characterId})`,
+      `objective: ${compact(item.objective, 180)}`,
+      item.obstacle ? `obstacle: ${compact(item.obstacle, 120)}` : "",
+      item.stakes ? `stakes: ${compact(item.stakes, 120)}` : "",
+      item.subtext ? `subtext: ${compact(item.subtext, 120)}` : "",
+      item.sceneActing ? `acting: ${compact(item.sceneActing, 260)}` : "",
+      item.eyeLife ? `eyes: ${compact(item.eyeLife, 120)}` : "",
+    ].filter(Boolean).join("; ")).join("\n");
+    const beats = plan.beats.map((item) => [
+      `${item.id} #${item.order}`,
+      item.actorId ? `actor: ${item.actorId}` : "",
+      item.targetCharacterId ? `target: ${item.targetCharacterId}` : "",
+      `action: ${compact(item.action, 320)}`,
+      item.dialogue ? `dialogue: ${compact(item.dialogue, 120)}` : "",
+      item.reactionBeforeLine ? `reaction: ${compact(item.reactionBeforeLine, 120)}` : "",
+      item.beatChange ? `change: ${compact(item.beatChange, 120)}` : "",
+    ].filter(Boolean).join("; ")).join("\n");
+    return [
+      `status: ${plan.status}; emotion arc: ${compact(plan.emotionArc ?? "(none)", 240)}`,
+      characterPlans ? `CHARACTER PLANS:\n${characterPlans}` : "",
+      beats ? `PREVIS BEATS:\n${beats}` : "",
+      plan.previsualization ? `PREVISUALIZATION: ${compact(plan.previsualization, 240)}` : "",
+    ].filter(Boolean).join("\n");
+  })();
 
   const vocabLines = [
     "Available camera IDs: arri-alexa-35, arri-alexa-mini-lf, red-v-raptor, sony-venice-2, bmd-ursa-cine, canon-c300-iii, panasonic-s1h, kinefinity-mavo-edge, apple-iphone-15-pro, sony-dsc-w830, canon-ixus-130, fujifilm-finepix-f30",
     "Available lensModel IDs: arri-master-prime, zeiss-supreme-prime, zeiss-cp4, cooke-s7i, leica-summicron-c, angenieux-optimo, canon-cne, sigma-cine-ff, cooke-panchro, helios-44-2",
     "framing: pick one clear shot size: Extreme wide / establishing, Wide, Full shot, Medium full / cowboy, Medium, Medium close-up, Close-up, Big close-up, Extreme close-up, Insert / detail, Two-shot, Tight two-shot, Over-the-shoulder, or 3/4 medium behind subject (free English framing phrases are also allowed)",
-    "movement: pick from Static, Handheld, Steadicam, Dolly, Tracking, Crane, POV, OTS",
+    `movement: pick exactly one structured value from ${cameraMovementVocab()}`,
     "direction: \"left-to-right\" or \"right-to-left\"; cutStyle: \"hard-cut\" | \"overlap\" | \"match-cut\"",
   ];
 
@@ -1555,16 +1695,14 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     `Current time (当前场景时间，仅限本场景): ${scene.time?.trim() || "(empty)"}`,
     `Current weather (当前场景天气，仅限本场景): ${scene.weather?.trim() || "(empty)"}`,
     `Current duration (当前场景时长): ${scene.duration?.trim() || "(empty)"}`,
-    `Must happen (user reference only): ${JSON.stringify(scene.mustHappen ?? [])}`,
-    `Forbid (user reference only): ${JSON.stringify(scene.forbid ?? [])}`,
-    `Scene dialogue (user reference only): ${scene.dialogue?.trim() || "(empty)"}`,
+    `Global viewpoint lock (跨镜头摄影机硬约束): ${viewpointLock ? renderFirstPersonPovLock(viewpointLock, locale) : "(none)"}`,
+    `Director intent refinement (导演意图深化; editable AI result for performance and storyboard planning): ${directorIntentRefinementText(scene, assets.map((asset) => ({ id: asset.id, name: asset.name }))).trim() || "(empty)"}`,
+    `Performance plan from layer 1 (must be consumed before inventing a new performance beat):\n${performancePlanSummary}`,
     `Spatial anchor (空间锚点): ${scene.staging?.anchorDescription?.trim() || "(empty)"}`,
     `Staging reference image (站位参考图): ${scene.staging?.stagingReferenceImage?.trim() ? "provided; use it only for character positions, screen axis, spacing, left-to-right order and spatial anchors" : "(none)"}`,
     `Scene character roster (本场可用角色，不等于每镜出场角色): ${rosterIds.length > 0 ? assetSummary(rosterIds) : "(none)"}`,
     `Character order (左到右站位, left-to-right): ${orderIds.length > 0 ? assetSummary(orderIds) : "(none/empty)"}`,
-    `Performance objectives (表演目标, per character): ${JSON.stringify(scene.actingObjectives ?? [])}`,
     `Axis direction: ${scene.staging?.axisDirection ?? "left-to-right"}; Spacing: ${scene.staging?.spacing?.trim() || "(default)"}`,
-    `Scene emotion arc: ${scene.emotionArc?.trim() || "(not set)"}`,
     `User audio plan (AI reference only; do not return or overwrite the audio plan card, and do not copy it directly into the final prompt): ${JSON.stringify(project.audioPlan ?? { score: "none", subtitles: false })}`,
     "",
     `LOCATION ASSET: ${locationAsset ? `${locationAsset.name}(${locationAsset.id}) — ${compact(locationAsset.description?.trim() || locationAsset.descriptionZh?.trim() || "", 240)}` : "(none)"}`,
@@ -1576,18 +1714,24 @@ export async function fillSceneDraft(project: ProjectV2, scene: SceneV2, t?: { s
     "",
     "STORYBOARD RULES:",
     `Output language: ${locale === "zh" ? "Chinese" : "English"}. Keep all free-text shot fields in this language.`,
+    "STORY SYNOPSIS LOCK (故事梗概硬锁): The Logline is the authoritative plot. Shots and beats must reproduce exactly the story events written in the Logline, in exactly the same order. Never add events, never drop events, never reorder, merge, split, or reinterpret the plot; never resolve a story event off-screen that the synopsis states on-screen. Performance, camera, lighting, and background activity serve the synopsis events and must not replace, extend, or contradict them. If the synopsis lists events A then B then C, the beat sequence must cover A, then B, then C — nothing else.",
     "Only the structured shots are the execution plan. Do not return scene context, active references, location map, first frame, format mode, audio, style, positive/negative constraints, acting objectives, asset descriptions, voice locks, or directorLayers; those are either retained from user data or generated locally from the resulting shots and asset library.",
     isLongTake
       ? `Shooting mode is LONG TAKE. Return EXACTLY ONE shot, starting at 0 and ending no later than ${durationLimit}s. Put the complete story progression into continuous beats inside that one shot, splitting by observable events rather than a fixed beat count; do not merge or omit events to fit a limit. Do not create cut points, alternate camera setups, or additional shot entries.`
       : `Shooting mode is MULTI-SHOT. Select 1-8 shots only when the story rhythm needs a new viewpoint. Slow, observational, or dialogue-led scenes normally use 1-3 shots; do not add coverage just to fill a template. Use more shots only for a clear change of information, action, or emotional beat.`,
     `Timeline hard limit: all shots are sequential; shot 1 starts at 0; shot N starts where shot N-1 ends; beat startSeconds values are absolute scene times and must stay inside their shot window; the final endSeconds MUST be less than or equal to ${durationLimit}s. Never exceed the user's ${durationLimit}${seconds} limit. Duration label uses "${seconds}" suffix.`,
-    "Every shot needs action, acting, framing, optics.lensCharacter, optics.fieldOfViewDegrees, movement, direction, and participants (only existing character IDs). Framing and optics are a linked pair: Extreme wide / establishing normally uses 135-immersive; Wide uses 84-wide; Full shot and Medium full use 63-moderate-wide or 47-standard; Medium uses 47-standard; Medium close-up and Close-up use 29-short-tele; Big close-up, Extreme close-up, and Insert / detail use 18-tele; Tight two-shot may use 12-long-tele; distant observation uses 8-supertele. Never return a close framing with a broad environmental lens or a wide framing with a portrait telephoto unless the user explicitly asks for that contrast. Participants are shot-local: add only people visible in frame or required to perform, speak, or receive an on-screen action in that exact shot. Do not copy the scene roster into every shot. Every beat actor and targetCharacterId MUST be listed in that same shot's participants. Local normalization supplies safe defaults when a field is not specified.",
-    "Performance (P2): the CHARACTER ACTING MASTERS block is an AI-only reference. It is the character's identity and behavioral baseline, not text to paste into the prompt. Use the matching master profile to understand who the character is, then write the character performing on top of that baseline in this exact shot's moment. Do not copy, concatenate, or paraphrase the master line by line. Present characters only: write an acting paragraph only for characters in that shot's participants; no character in frame means no paragraph for that character. Keep the constant core (identity, vocal profile, signature tics, eye life, emotional through-line) and never contradict the master. Re-express it for this shot's posture, action, beat, emotional pressure, and time of day. Transform behaviors that cannot physically happen instead of deleting them: preserve the same engine while changing its outlet. For each participant, write acting as one flowing paragraph in the character's register, with no bullets, headers, dial labels, or abstract emotion-only wording; use observable face, body, breath, voice, gaze, timing, distance, and reaction. If the pipeline uses asset references, begin the paragraph with that character's reference tag. Set performanceLevel (0-5, 4 default whenever the acting master profile is strong) and eyeLife (micro glances / blink quality / eye glint / eyes leading the turn). Never copy the master profile into ACTIVE REFERENCES, directorLayers, or any separate CHARACTER ACTING section; only its shot-specific, observable adaptation belongs in the corresponding participant and beat. Do not use wardrobe, camera, color, or abstract emotion labels. Fill the beats' P2 fields: tactic (press / charm / provoke...), subtext (true intent opposite to the line), beatChange (visible shift: pause / posture / tempo / eye-line cut), reactionBeforeLine (reaction starting before the other speaker finishes). Every visible action must have its real performer in actorId; a listener or reacting character must get a separate beat with that character's actorId. Use targetCharacterId only for the person being watched, addressed, or reacted to. Never assign a listener's prop action, eye movement, hand movement, or body reaction to the speaker.",
-    "Photography (P1): prefer observable lens character over focal-length-only strings. Per shot set optics.lensCharacter from the 10 presets (180-panoramic / 135-immersive / 107-ultrawide / 84-wide / 63-moderate-wide / 47-standard / 29-short-tele / 18-tele / 12-long-tele / 8-supertele) with optics.fieldOfViewDegrees 8-180 matching the preset. The 12° long-tele preset is approximately a 200mm full-frame equivalent and is valid for tight portrait or two-person coverage from a distant camera position. Add lensOutcome + antiDriftLock when the look must stay locked. Set cameraBehavior as physical operator behavior (height / distance / angle / side / subjectSize / screenPlacement / focusBehavior / depthOfField / handheldQuality). Add physicsAnchors for walk / run / weapon / liquid / particle. Per participant set torsoFacing when the body turns away from the eyeline, and anchorDistance when a landmark anchors the scene.",
-    "State, not transition: write mid-action states (jaw clenched, strides lengthening), never transition chains (starts to... / begins to...). Groups react in staggered waves with different intensities, never in unison.",
+    viewpointLock
+      ? `NON-NEGOTIABLE VIEWPOINT LOCK: ${renderFirstPersonPovLock(viewpointLock, locale)} Every returned shot MUST use movement "POV". Never list the viewpoint holder as a participant, actor, target, visible reflection, shadow, or body part.`
+      : "",
+    "Every shot needs planningMeta, performanceDescription, lightingBehavior, backgroundActivity, framing, optics.lensCharacter, optics.fieldOfViewDegrees, movement, direction, and participants (only existing character IDs). Bind every story-bearing shot to one or more layer-1 performanceBeatIds. An explicit environment or transition-only shot may use an empty list. planningMeta.shotIntent states the new dramatic information in this shot; cameraTrigger identifies the observed event which begins the move, and cameraEndState states where the camera settles or holds. performanceDescription is the primary shot-level execution source: write one detailed natural-language paragraph that unifies visible action, body posture, breath, hand business, micro-expression, gaze/eye life, response timing, and beat change. Derive it from the Director intent refinement, PERFORMANCE PLAN and matching CHARACTER ACTING MASTERS; reuse their concrete performance intent without copying their prose. It must describe observable states, not abstract emotion labels, and it must include eye life whenever a face is visible. lightingBehavior separately states the actual key light, its direction relative to the subject and camera, and the visible change in face/environment exposure while the camera or subject moves; never make light follow a face. backgroundActivity separately states independent, staggered background life, with only a few people allowed to hold still briefly. action, acting, and eyeLife are legacy compatibility fields: keep them concise and consistent with performanceDescription, but never let them omit or contradict it. Framing and optics are a linked pair: Extreme wide / establishing normally uses 135-immersive; Wide uses 84-wide; Full shot and Medium full use 63-moderate-wide or 47-standard; Medium uses 47-standard; Medium close-up and Close-up use 29-short-tele; Big close-up, Extreme close-up, and Insert / detail use 18-tele; Tight two-shot may use 12-long-tele; distant observation uses 8-supertele. Never return a close framing with a broad environmental lens or a wide framing with a portrait telephoto unless the user explicitly asks for that contrast. Participants are shot-local: add only people visible in frame or required to perform, speak, or receive an on-screen action in that exact shot. Do not copy the scene roster into every shot. Every beat actor and targetCharacterId MUST be listed in that same shot's participants. Local normalization supplies safe defaults when a field is not specified.",
+    "Performance (P2): the CHARACTER ACTING MASTERS block is an AI-only reference. It is the character's identity and behavioral baseline, not text to paste into the prompt. Use the matching master profile to understand who the character is, then write the character performing on top of that baseline in this exact shot's moment. Do not copy, concatenate, or paraphrase the master line by line. Present characters only: write an acting paragraph only for characters in that shot's participants; no character in frame means no paragraph for that character. Keep the constant core (identity, vocal profile, signature tics, eye life, emotional through-line) and never contradict the master. Re-express it for this shot's posture, action, beat, emotional pressure, and time of day. Transform behaviors that cannot physically happen instead of deleting them: preserve the same engine while changing its outlet. The unified performanceDescription is the shot-level baseline and must contain this full result as one flowing paragraph, with no bullets, headers, dial labels, camera, color, wardrobe, or abstract emotion-only wording. Beats are its time-coded expansion: each beat must add only its actor, time, dialogue, target, tactic, or a visible change not already stated in the baseline. Never repeat the full performanceDescription inside beat.actionText. Set performanceLevel (0-5, 4 default whenever the acting master profile is strong). Never copy the master profile into ACTIVE REFERENCES, directorLayers, or any separate CHARACTER ACTING section; only its shot-specific, observable adaptation belongs in the corresponding participant and beat. Fill the beats' P2 fields: tactic (press / charm / provoke...), subtext (true intent opposite to the line), beatChange (visible shift: pause / posture / tempo / eye-line cut), reactionBeforeLine (reaction starting before the other speaker finishes). Every visible action must have its real performer in actorId; a listener or reacting character must get a separate beat with that character's actorId. Use targetCharacterId only for the person being watched, addressed, or reacted to. Never assign a listener's prop action, eye movement, hand movement, or body reaction to the speaker.",
+    "Expression guardrail: facial cues support the acting objective and never become a catalogue of poses. Keep one stable physical baseline per character, then change at most one primary facial cue and one supporting body cue per beat unless the story event justifies a larger reaction. Eyes lead the thought, breath and jaw carry pressure, and head movement follows; use a restrained hold when no new information arrives. Never add random waving, repeated nodding, symmetrical hand motions, or a smile/cry that contradicts the established tactic and stakes.",
+    "Photography (P1): the camera is the audience's eye: plan it as a virtual flying operator that stays physically close to the characters, not as a detached description of what is in frame. Prefer observable lens character over focal-length-only strings. Per shot set optics.lensCharacter from the 10 presets (180-panoramic / 135-immersive / 107-ultrawide / 84-wide / 63-moderate-wide / 47-standard / 29-short-tele / 18-tele / 12-long-tele / 8-supertele) with optics.fieldOfViewDegrees 8-180 matching the preset. The 12° long-tele preset is approximately a 200mm full-frame equivalent and is valid for tight portrait or two-person coverage from a distant camera position. Add lensOutcome + antiDriftLock when the look must stay locked. cameraBehavior.description is mandatory: write one concise but complete physical-operator paragraph. State start and end position in relation to subject(s), ground, landmark and camera-to-subject distance; the exact trajectory using only needed axes (advance/retreat, lateral move, orbit, rise/descent, yaw, pitch); the event that motivates the move; speed and inertia including acceleration, overshoot or settle; focus target and any justified brief focus lag after a fast move; and any plausible brief foreground occlusion by a person or object. Preserve breathing, weight transfer and a slight lead or lag relative to the actor, never digital jitter or gimbal smoothness. Do not force focus loss or occlusion into quiet shots: use them only when action and path make them physically plausible. Before writing a new description, choose the closest camera-movement template below and copy its description exactly whenever it serves the scene. Write an original description only when no template fits; never combine unrelated templates just to use one. The legacy split cameraBehavior fields remain accepted only for compatibility. Add physicsAnchors for walk / run / weapon / liquid / particle. Per participant set torsoFacing when the body turns away from the eyeline, and anchorDistance when a landmark anchors the scene.",
+    `CAMERA MOVEMENT TEMPLATE LIBRARY (reuse exact description when suitable):\n${cameraMoveTemplateLibrary(locale)}`,
+    "State, not transition: write mid-action states (jaw clenched, strides lengthening), never transition chains (starts to... / begins to...). Groups react in staggered waves with different intensities, never in unison. Background people are an independent life layer: give them staggered, practical tasks or reactions that do not mirror the leads; only a small number may pause briefly.",
     "Dialogue: write only scripted lines for this scene; when a character speaks, everyone else stays quiet. For an intentional silence, hold 1 second of quiet before and after the line; for an immediate interruption, start the line within 0.3 seconds.",
     "Beats: create 1-8 ordered beats per shot by default (start order at 1), but use more than 8 whenever the shot contains more than 8 distinct visible events; never merge events or omit them just to meet a count. One beat represents one observable event, subject change, or reaction, with a physically clear performer and target. Each beat has verb + actorId + targetCharacterId/targetPropId (only existing IDs) when applicable, actionText in the scene language, optional dialogue (include dialogue text in the same language as the scene), optional propState for a critical prop state in this beat, optional audio for a non-dialogue sound in this beat, optional required flag, and optional cutRule. When an event has a precise cue or must overlap another event, set startSeconds to its absolute scene time in seconds; omit it when ordinary sequential timing is sufficient. Keep duration as the event length. Do not return stateBefore or stateAfter. If a supporting character visibly tightens a grip, changes eyeline, shifts posture, reacts before dialogue, enters, exits, or performs a separate prop action, create a separate beat for that supporting character instead of burying the action in the lead character's beat text. Dense multi-character shots should preserve each person's readable reaction and exit timing as separate beats.",
-    "Prop changes: return one natural-language propChangeDescription for each shot. Describe only visible prop use, contact, movement, or change in the scene language. Do not plan or return starting/ending prop states; those fields are legacy and ignored.",
+    "Props: encode every visible prop use, contact, movement, or state change in its relevant beat with targetPropId and actionText. Do not return a separate propChangeDescription or starting/ending prop-state fields.",
     "Macro decisions: return only macro.emotionArc when the current scene needs a concise, camera-readable progression, and macro.lightingDirection when the lighting direction cannot be determined from the scene/location data. Omit a macro field when it is already clear or not needed. Do not use macro fields to restate shot actions or asset facts.",
     "",
     "Return ONLY a JSON object matching this schema. Put the shots array first in the object and return no other keys:",
@@ -1622,27 +1766,47 @@ export async function generateFinalPrompt(sourcePrompt: string, locale: Locale, 
 }
 
 /**
+ * 画布「提示词工作室」极简模式的独立生成链路。
+ * 不读取高级工作室项目，也不会触发分镜/导演层编译；输入仅来自节点本身。
+ */
+export async function generateQuickPrompt(input: QuickPromptInput, locale: Locale, selectedSettings?: AISettings): Promise<string> {
+  const settings = selectedSettings ?? loadAISettings();
+  if (!isRemoteConfigured(settings)) {
+    throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key。");
+  }
+  const request = buildQuickPromptRequest(input, locale);
+  return chatCompletionsTextRaw(settings, request.system, request.user);
+}
+
+/**
  * Hybrid final delivery: sections that are already compiler-generated
- * (STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING, OPTICS, PHYSICS,
+ * (STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING, OPTICS, CAMERA, PHYSICS,
  * LIGHTING, AUDIO, constraints) are passed through verbatim with localized
- * headings. Only the three sections that genuinely need composition (CAMERA,
- * ACTION TIMING, FORMAT MODE) are sent to the model, so input and output
- * tokens drop by roughly half and the generation finishes much faster.
+ * headings. CAMERA is verbatim on purpose: the director-document 相机 layer is
+ * user-editable, so recomposing it with AI would overwrite manually corrected
+ * camera models and reintroduce duplicate/conflicting 相机 vs 摄像机 sections.
+ * Only the two sections that genuinely need composition (ACTION TIMING,
+ * FORMAT MODE) are sent to the model, so input and output tokens drop and
+ * the generation finishes much faster.
  */
 export function buildHybridFinalPromptRequest(sourcePrompt: string, locale: Locale): { system: string; user: string } {
   const zh = locale === "zh";
+  const viewpointLock = extractFirstPersonPovLock(sourcePrompt);
   const languageRule = zh
     ? "只用清晰、电影级的中文输出。即使规范源包含英文，也必须将其忠实转换为自然、直接、可拍摄、可执行的中文提示词；避免翻译腔、空泛形容词和散文化抒情。"
     : "Output only clear, cinematic-grade English. Even if the canonical source contains Chinese, faithfully convert it into natural, direct, shootable, executable English; avoid literal translation, vague adjectives, and poetic prose.";
   const headingsRule = zh
-    ? "只输出以下三个非空类别，必须使用这些中文标题，并严格按此顺序：摄像机、动作节奏、格式模式。"
-    : "Output only the following three non-empty categories, using exactly these English headings and this order: CAMERA, ACTION TIMING, FORMAT MODE.";
+    ? "只输出以下两个非空类别，必须使用这些中文标题，并严格按此顺序：动作节奏、格式模式。"
+    : "Output only the following two non-empty categories, using exactly these English headings and this order: ACTION TIMING, FORMAT MODE.";
   const scopeRule = zh
-    ? "其余类别（风格、活动引用、场景地图和站位、光学、物理、光线、音频、正向约束、负向约束）已由本地确定生成，会原样插入最终提示词。不要输出这些标题或任何其他标题，也不要重复、改写或解释它们的内容。"
-    : "All other categories (STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING, OPTICS, PHYSICS, LIGHTING, AUDIO, POSITIVE CONSTRAINTS, NEGATIVE CONSTRAINTS) are already finalized locally and are inserted verbatim. Do not output those headings, any other heading, or repeat, rewrite, or explain their content.";
+    ? "其余类别（风格、活动引用、场景地图和站位、光学、相机、表演、物理、光线、音频、正向约束、负向约束）已由本地确定生成，会原样插入最终提示词。不要输出这些标题或任何其他标题，也不要重复、改写或解释它们的内容。"
+    : "All other categories (STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING, OPTICS, CAMERA, PERFORMANCE, PHYSICS, LIGHTING, AUDIO, POSITIVE CONSTRAINTS, NEGATIVE CONSTRAINTS) are already finalized locally and are inserted verbatim. Do not output those headings, any other heading, or repeat, rewrite, or explain their content.";
   const sourceRule = zh
     ? "不得发明、删除、重新解释或矛盾任何事实。不得添加前情、故事梗概、用户备注、AI 说明、警告或诊断。"
     : "Do not invent, remove, reinterpret, or contradict any fact. Do not add prior context, story summaries, user notes, AI instructions, warnings, scores, or diagnostics.";
+  const viewpointRule = viewpointLock
+    ? `VIEWPOINT LOCK IS NON-NEGOTIABLE: ${renderFirstPersonPovLock(viewpointLock, locale)} Preserve it verbatim in CAMERA and in FORMAT MODE. Inside ACTION TIMING reflect it only as the POV movement itself (opening move, trigger, end state) and never as a repeated viewpoint recital. Do not introduce third-person, reverse, observer, aerial, or cutaway coverage.`
+    : "";
   const opticsRule = zh
     ? "ACTIVE REFERENCES 与 OPTICS 是结构化真源。逐镜保留其中的景别、FOV、镜头语言和可观测光学结果；不得因为风格、内容类别或你自己的判断替换、归一化或补写另一种镜头。"
     : "ACTIVE REFERENCES and OPTICS are the structured source of truth. Preserve every shot's framing, FOV, lens character, and observable optical outcome; never replace, normalize, or add a different lens because of style, content class, or your own judgment.";
@@ -1650,23 +1814,29 @@ export function buildHybridFinalPromptRequest(sourcePrompt: string, locale: Loca
     ? "每一个 @资产名、匹配的 [imageN] 和 @audioN 都是不透明的 Seedance 平台引用，必须原样照抄：不得翻译、删除、改名、归一化或编造。只要活动引用中该资产带有 [imageN]，动作节奏中每次重复出现的 @资产名都必须紧跟同一个 [imageN]，绝不输出裸 @资产名。同一 @资产名与 [imageN] 的复用是要求，不是重复。资产外观与道具描述只出现在活动引用中。"
     : "Every @asset_tag, matching [imageN], and @audioN token is an opaque Seedance platform reference. Copy each one exactly as supplied: never translate, delete, rename, normalize, or invent one. Whenever an asset has a matching [imageN] in ACTIVE REFERENCES, every repeated @asset_tag occurrence in ACTION TIMING must keep the same [imageN] immediately after the tag; never emit a bare version of that @asset_tag. Reusing the same @asset_tag and [imageN] is required and is not an accidental duplication. Keep each asset's appearance and prop description exclusively in ACTIVE REFERENCES.";
   const actingRule = zh
-    ? "角色表演只能写在动作节奏中对应镜头和人物之后；不要新增 CHARACTER ACTING 或其他表演标题。表演母版是仅供 AI 理解角色的参考：不得照抄，只写本镜人物在表演母版基础上的可观测表演。"
-    : "Attach acting to the corresponding shot and character inside ACTION TIMING. Acting master profiles are AI-only references: never paste them; write only each character's shot-specific, observable adaptation on top of the master.";
-  /* The following three rules intentionally mirror buildFinalPromptRequest;
+    ? "表演基调由本地「表演」段逐镜生成并原样插入，动作节奏中不得再写角色表演、微表情、眼神或视线；不要新增 CHARACTER ACTING 或其他表演标题。表演母版是仅供 AI 理解角色的参考：不得照抄。"
+    : "The PERFORMANCE section is generated locally per shot and inserted verbatim; never write character acting, micro-expression, eye life, or eyeline inside ACTION TIMING, and never add a CHARACTER ACTING or other acting heading. Acting master profiles are AI-only references: never paste them.";
+  /* These scope rules intentionally mirror buildFinalPromptRequest;
    * keep them in sync if the full-prompt rules change. */
-  const cameraRule = zh
-    ? "CAMERA 必须先写一段适用于全程的总摄影机描述，再按镜头段落分别展开，不能直接从第 1 段开始。总描述先锁定全程共用的摄影机语法：是否手持、整体稳定性或晃动质感、统一的倾斜/荷兰角、轴线、机位高度与距离，以及贯穿全程的观察或跟随原则；只有源中明确的信息才能写入，不得臆造导演风格或摄影机行为。总描述之后按“第 1 段：……”“第 2 段：……”逐段写出该段的实际摄影机行为，包括起始状态、运动方向、速度/力度、何时停止或保持不动、如何承接上一段和如何进入下一段。必须把甩镜上摇、甩镜下摇、急推变焦、停机观察等明确动作保留为可执行的摄影机动作及其触发事件，不得笼统改写成“镜头跟随”或“快速移动”。全程统一的摄影机规则只在总描述中说明；段落中只补充该段的变化和执行结果。CAMERA 只写摄影机位置、运动、方向、稳定性和与事件的响应，不重复 OPTICS 的焦段/FOV/景深，也不复制 ACTION TIMING 的完整动作与表演；但可用一句话说明摄影机正在捕捉哪个关键事件。参考格式：全程手持，略带倾斜形成轻度荷兰角。第 1 段：特写人物醒来并在甩沙后快速甩镜上摇冲向破窗。第 2 段：甩镜顺势冲入对窗口人群的硬急推变焦；随后保持不动观察搜寻，最后快速甩镜下摇离开窗口。"
-    : "CAMERA must begin with one overall camera-language paragraph that applies across the entire generation, then expand segment by segment; do not begin directly with shot 1. The overall paragraph first locks the shared camera grammar: handheld or mounted operation, overall stability or shake quality, a consistent tilt / Dutch angle, screen axis, camera height and distance, and the rule for observing or following throughout. Include only information established by the source; never invent a director style or camera behavior. After the overall paragraph, write separate lines labeled 'SHOT 1: ...', 'SHOT 2: ...', and so on. For each segment, state the actual camera behavior, starting state, movement direction, speed / force, when it stops or holds, how it inherits the previous segment, and how it enters the next one. Preserve explicit actions such as a whip pan up, whip pan down, hard push-zoom, or locked-off observation as executable camera actions with their trigger events; do not flatten them into 'the camera follows' or 'moves quickly'. State shared camera rules once in the overall paragraph; use segment lines only for changes and execution results. CAMERA covers camera position, movement, direction, stability, and response to events. Do not repeat OPTICS focal length / FOV / depth of field or copy the full ACTION TIMING action and acting; one short phrase may identify the key event being captured. Example: full-take handheld operation with a slight tilt creating a mild Dutch angle. SHOT 1: a close-up of the figure waking and shaking off sand, followed by a fast whip pan upward toward the broken window. SHOT 2: the whip pan flows directly into a hard push-zoom on the people at the window; hold still while they search, then finish with a fast whip pan downward away from the window.";
+  const photographicRealityRule = zh
+    ? "逐镜保留源中相机与动作节奏的摄影真实性：摄影机是贴近人物飞行的观众视线。相机段必须明确起止相对位置、离地高度、离人物距离，以及前进、后退、侧移、环绕、升降、偏航、俯仰中实际发生的运动轨迹、速度、加减速、惯性和停稳。保留合理的呼吸感、略微提前或滞后人物的跟随、短暂前景遮挡，以及快速运镜后短暂失焦再合焦；这些只在源中存在或路径物理合理时使用，不能每镜机械添加。动作节奏只写随时间变化的动作和运镜三项（起手运镜、触发、落点），不再复述机位配置、光影或背景活动。保留光线段和镜头光影中已给出的主光源、方向及人物走位/相机移动造成的脸部和环境亮暗变化，禁止把光写成永远跟随人脸。保留背景活动为非同步、独立的生活化行为，少数人可短暂停住。"
+    : "Preserve the photographic reality established in the source CAMERA and ACTION TIMING. The camera is the close, flying audience viewpoint. Each camera segment must state relative start/end position, height above ground, subject distance, and the actual advance, retreat, lateral, orbit, rise/descent, yaw, and pitch path that occurs, with speed, acceleration/deceleration, inertia and settle. Preserve justified breathing, a slight lead or lag behind performers, brief foreground occlusion, and a brief defocus/reacquisition after a fast move, but use these only when supplied by the source or physically plausible, never as a generic effect. Inside ACTION TIMING state only the time-varying action plus the three camera cues (opening move, trigger, end state); never restate the camera configuration, lighting, or background activity. Preserve the key-light source, direction, and the face/environment exposure changes caused by blocking or camera movement; never make lighting follow a face. Preserve background activity as independent, asynchronous lived behavior; only a few people may pause briefly.";
   const formatModeRule = zh
     ? "格式模式是本次生成的整体执行格式摘要，必须完整承接源中已确定的格式事实，不得只写“单一连续长镜头”或“受控多镜头序列”。按源内容明确写出：生成方式（单次生成或其他明确方式）、段数、总时长及各段时长分配（如 4 秒 / 4 秒）、画幅（如 16:9）、速度（实时、慢动作或其他已指定速度）、段间连接方式和连接动作、现场声/配乐范围、每句台词属于哪个角色或对象、字幕与画面帧限制。多段格式必须说明每一段如何结束、下一段如何开始，以及甩切、whip cut、甩镜上摇/下摇、推拉变焦等连接的方向、发生段落和连续因果；不要把明确的甩切泛化成“快速剪辑”。“单次生成”表示整段内容一次生成，不等于只能有一个镜头。各段时长必须与镜头时间轴一致；未在源中确定的时长、画幅、速度、转场、声音或对白归属不得臆造。格式模式只总结生成和段落组织方式，不重复光学、摄像机、动作节奏的具体执行细节。示例：单次生成，两个段落，一次甩切，总长约 8 秒（4 秒 / 4 秒），画幅 16:9。实时速度。快速甩镜上摇结束第 1 段并顺势冲入急推变焦开启第 2 段；快速甩镜下摇结束第 2 段。仅现场音，无配乐；台词只属于提卡；干净的纯画面帧。"
     : "FORMAT MODE is the overall execution-format summary for this generation. It must carry forward every format fact established in the source, rather than outputting only 'SINGLE CONTINUOUS TAKE' or 'CONTROLLED MULTI-SHOT SEQUENCE'. When supported by the source, state: generation mode (single generation or another explicit mode), segment count, total duration and per-segment allocation (for example, 4 seconds / 4 seconds), aspect ratio (for example, 16:9), speed (real time, slow motion, or another specified speed), the connection between segments and its physical transition, the diegetic-sound / score scope, which character or object owns each line, and subtitle / clean-frame limits. For multi-segment formats, explain how each segment ends and the next begins. Preserve the direction, segment placement, and causal continuity of whip cuts, whip pans up/down, push-ins, zooms, and other stated transitions; do not flatten an explicit whip cut into 'fast editing'. 'Single generation' means one generated output for the whole piece, not a single shot. Segment durations must agree with the shot timeline. Never invent an unprovided duration, aspect ratio, speed, transition, sound rule, or dialogue ownership. FORMAT MODE summarizes generation and segment organization only; do not repeat the detailed OPTICS, CAMERA, or ACTION TIMING instructions. Example: single generation, two segments, one whip cut, approximately 8 seconds total (4 seconds / 4 seconds), 16:9. Real time. A fast whip pan upward ends segment 1 and flows directly into a rapid push-zoom that opens segment 2; a fast whip pan downward ends segment 2. Diegetic sound only, no score; the line belongs only to Tika; clean picture frames.";
+  const formatModeScopeRule = zh
+    ? "格式模式范围锁（优先级高于上文）：只写生成组织方式、总时长、段数、画幅、速度和镜头连接顺序。不得重复人物动作、表演、微表情、对白、声音、道具状态、光线或详细运镜；这些内容只属于动作节奏、音频、物理、光线、相机或表演。"
+    : "FORMAT MODE scope lock (higher priority than broader wording above): write only generation organization, total duration, segment count, aspect ratio, speed, and the order of camera connections. Do not repeat character action, acting, micro-expression, dialogue, sound, prop state, lighting, or detailed camera execution; those belong in ACTION TIMING, AUDIO, PHYSICS, LIGHTING, CAMERA, or PERFORMANCE.";
   const actionTimingRule = zh
-    ? "动作节奏必须按镜头段分组输出，不能把所有镜头的时间块合并成一条平面时间线。多镜头序列先分别写“第 1 段（起止时间）：”“第 2 段（起止时间）：”等段落标题，再在每个段落标题下写该段自己的时间块；段落标题必须保留，即使某段只有一个事件。每个时间块必须保留精确时间（如 0:01.5–0:02.5），只写一个事件的主体位置、动作和该拍结果，并在相关时写入相机行为、关键道具状态、物理锚点和音频/对白；显式起始时间必须按场景绝对时间保留，并允许表达非连续或重叠事件。时间块中的人物和道具目标必须保留源中的 @ 资产引用及其对应 [imageN]，同一资产重复出现时复用同一个图片编号，不得输出裸的 @资产名。长镜头中只写一个连续段落；多镜头序列中每个切点都要保留源里的切换依据，没有依据不得输出切点。"
-    : "ACTION TIMING must remain grouped by shot segment; never flatten all shot events into one timeline. For a multi-shot sequence, first write separate segment headings such as 'SHOT 1 (start to end):' and 'SHOT 2 (start to end):', then place only that segment's time blocks beneath its heading. Keep every segment heading even when it contains one event. Each time block must preserve its precise time (for example, 0:01.5 to 0:02.5), state one event's subject position, action, and outcome, and include camera behavior, critical prop state, physics anchors, and audio/dialogue when relevant. Preserve explicit absolute start times, including non-contiguous or overlapping events. Every character or prop @ asset reference inside a time block must retain its matching [imageN] token; reuse the same image number for repeated references and never emit a bare @asset tag. A long take gets one continuous segment group. In multi-shot sequences, keep the stated cut reason on every cut and never emit a cut without one.";
+    ? "动作节奏必须按镜头段分组输出，不能把所有镜头的时间块合并成一条平面时间线。多镜头序列先分别写“第 1 段（起止时间）：”“第 2 段（起止时间）：”等段落标题，再在每个段落标题下写该段自己的时间块；段落标题必须保留，即使某段只有一个事件。动作节奏只描述动作节奏本身：相机型号、POV 锁、机位高度/距离/角度/机位边、画面大小/画面位置、对焦、景深与手持质感已由相机段逐镜写明，景别与 FOV 已由光学段逐镜写明，现场光影已迁至光线段、背景人流已迁至场景地图段、表演基调已迁至表演段——这些都不属于动作节奏，不得在此复述，也不得用每个镜头开头的机位复述代替动作描述。镜头若要交代随时间变化的运镜，只写三项：起手运镜、触发事件、落点。每个时间块必须保留精确时间（如 0:01.5–0:02.5），只写一个事件的主体位置、动作和该拍结果，并在相关时写入关键道具状态、物理锚点和音频/对白；它只补充该镜头“动作、表演与眼神执行”总述中尚未表达的时序、执行者或变化，禁止逐句重复总述。显式起始时间必须按场景绝对时间保留，并允许表达非连续或重叠事件。时间块中的人物和道具目标必须保留源中的 @ 资产引用及其对应 [imageN]，同一资产重复出现时复用同一个图片编号，不得输出裸的 @资产名。长镜头中只写一个连续段落；多镜头序列中每个切点都要保留源里的切换依据，没有依据不得输出切点。动作节奏只做语言组织：剧情事件的集合、执行者与先后顺序必须与规范源完全一致，不得增加、删除、合并、拆分或重排剧情事件，也不得用概括句替换源中明确列出的具体事件。"
+    : "ACTION TIMING must remain grouped by shot segment; never flatten all shot events into one timeline. For a multi-shot sequence, first write separate segment headings such as 'SHOT 1 (start to end):' and 'SHOT 2 (start to end):', then place only that segment's time blocks beneath its heading. Keep every segment heading even when it contains one event. ACTION TIMING describes action rhythm only: camera model, POV lock, height/distance/angle/camera side, subject size/screen placement, focus, depth of field and handheld quality are already stated per shot in CAMERA; framing and FOV in OPTICS; on-set lighting in LIGHTING; background crowd activity in SCENE MAP AND STAGING; performance baseline in PERFORMANCE. Never repeat any of them here, and never open a segment with a camera recital in place of its action. When a shot needs a time-varying camera cue, state only the opening move, the trigger, and the end state. Each time block must preserve its precise time (for example, 0:01.5 to 0:02.5), state one event's subject position, action, and outcome, and include critical prop state, physics anchors, and audio/dialogue when relevant. It supplements only timing, performer, or visible change not already stated in the shot-level action/performance/eye-execution description; never repeat that description sentence by sentence. Preserve explicit absolute start times, including non-contiguous or overlapping events. Every character or prop @ asset reference inside a time block must retain its matching [imageN] token; reuse the same image number for repeated references and never emit a bare @asset tag. A long take gets one continuous segment group. In multi-shot sequences, keep the stated cut reason on every cut and never emit a cut without one. ACTION TIMING only reorganizes wording: the set of story events, their performers, and their order must match the canonical source exactly; never add, drop, merge, split, or reorder story events, and never replace a listed concrete event with a summary sentence.";
   const contextSections = [
     "ACTIVE REFERENCES",
+    "SCENE MAP AND STAGING",
     "OPTICS",
     "CAMERA",
+    "PERFORMANCE",
+    "LIGHTING",
     "FORMAT MODE",
     "ACTION TIMING",
     "AUDIO",
@@ -1681,19 +1851,21 @@ export function buildHybridFinalPromptRequest(sourcePrompt: string, locale: Loca
       + "Your job is to convert the provided canonical scene sections into clean, production-ready, high-budget cinematic video prompt sections that work on the first generation as often as possible. "
       + "Use simple direct words; avoid abstract poetic language when it weakens control; prefer concrete physical instructions, visible actions, measurable positions, explicit timing, camera-readable behavior, and observable visual outcomes. "
       + (zh
-        ? "Return only the three requested sections in clear, cinematic-grade Chinese, with no commentary, markdown fence, rationale, audit note, or greeting."
-        : "Return only the three requested sections in clear, cinematic-grade English, with no commentary, markdown fence, rationale, audit note, or greeting."),
+        ? "Return only the two requested sections in clear, cinematic-grade Chinese, with no commentary, markdown fence, rationale, audit note, or greeting."
+        : "Return only the two requested sections in clear, cinematic-grade English, with no commentary, markdown fence, rationale, audit note, or greeting."),
     user: [
       languageRule,
       headingsRule,
       scopeRule,
       sourceRule,
+      viewpointRule,
       opticsRule,
       assetRule,
       actingRule,
-      cameraRule,
+      photographicRealityRule,
       actionTimingRule,
       formatModeRule,
+      formatModeScopeRule,
       "",
       "CANONICAL SECTIONS (source of truth):",
       contextSections,
@@ -1702,7 +1874,7 @@ export function buildHybridFinalPromptRequest(sourcePrompt: string, locale: Loca
 }
 
 const HYBRID_SECTION_KEYS = [
-  "style", "activeReferences", "locationMap", "optics", "camera",
+  "style", "activeReferences", "locationMap", "optics", "camera", "performance",
   "actionTiming", "formatMode", "physics", "lighting", "audio",
   "positiveConstraints", "negativeLocks",
 ] as const;
@@ -1714,7 +1886,10 @@ const HYBRID_ZH_HEADINGS: Record<HybridSectionKey, string> = {
   activeReferences: "活动引用",
   locationMap: "场景地图和站位",
   optics: "光学",
-  camera: "摄像机",
+  // 与导演文档层名（DIRECTOR_LAYERS.camera.zh = "相机"）和质量词典保持一致；
+  // “摄像机”只作为提取别名，不再作为最终输出标题，避免同名两段并存。
+  camera: "相机",
+  performance: "表演",
   actionTiming: "动作节奏",
   formatMode: "格式模式",
   physics: "物理",
@@ -1724,7 +1899,12 @@ const HYBRID_ZH_HEADINGS: Record<HybridSectionKey, string> = {
   negativeLocks: "负向约束",
 };
 
-const HYBRID_AI_COMPOSED_KEYS: ReadonlySet<HybridSectionKey> = new Set(["camera", "actionTiming", "formatMode"]);
+/** 各段的历史别名：提取 canonical / AI 文本时兼容旧标题写法。 */
+const HYBRID_ZH_HEADING_ALIASES: Partial<Record<HybridSectionKey, string[]>> = {
+  camera: ["摄像机"],
+};
+
+const HYBRID_AI_COMPOSED_KEYS: ReadonlySet<HybridSectionKey> = new Set(["actionTiming", "formatMode"]);
 
 function hybridCanonicalBody(sourcePrompt: string, key: HybridSectionKey): string {
   if (key === "actionTiming") {
@@ -1732,24 +1912,30 @@ function hybridCanonicalBody(sourcePrompt: string, key: HybridSectionKey): strin
   }
   const entry = FINAL_SOURCE_SECTIONS.find((section) => section.key === key);
   if (!entry) return "";
-  return extractSectionAny(sourcePrompt, [entry.heading, HYBRID_ZH_HEADINGS[key]]);
+  return extractSectionAny(sourcePrompt, [entry.heading, HYBRID_ZH_HEADINGS[key], ...(HYBRID_ZH_HEADING_ALIASES[key] ?? [])]);
 }
 
 function hybridAiBody(aiText: string, key: HybridSectionKey, locale: Locale): string {
   const entry = FINAL_SOURCE_SECTIONS.find((section) => section.key === key);
   if (!entry) return "";
   const candidates = locale === "zh"
-    ? [HYBRID_ZH_HEADINGS[key], entry.heading]
-    : [entry.heading, HYBRID_ZH_HEADINGS[key]];
+    ? [HYBRID_ZH_HEADINGS[key], ...(HYBRID_ZH_HEADING_ALIASES[key] ?? []), entry.heading]
+    : [entry.heading, HYBRID_ZH_HEADINGS[key], ...(HYBRID_ZH_HEADING_ALIASES[key] ?? [])];
   return extractSectionAny(aiText, candidates);
 }
 
 /** 本地透传确定段落 + AI 补写的三段，按固定类别顺序拼成最终提示词。 */
 export function assembleHybridFinalPrompt(sourcePrompt: string, aiText: string, locale: Locale): string {
   const sections: string[] = [];
+  const viewpointLock = extractFirstPersonPovLock(sourcePrompt);
   for (const key of HYBRID_SECTION_KEYS) {
     const composed = HYBRID_AI_COMPOSED_KEYS.has(key);
-    const body = composed
+    // POV is a cross-shot invariant. Do not let the prose-composition pass
+    // rewrite canonical ACTION TIMING and accidentally introduce a third-person
+    // or reverse-angle shot. CAMERA is always canonical: the director-document
+    // 相机 layer is user-editable, and the manual model correction must win.
+    const viewpointSensitive = viewpointLock && key === "actionTiming";
+    const body = composed && !viewpointSensitive
       ? hybridAiBody(aiText, key, locale) || hybridCanonicalBody(sourcePrompt, key)
       : hybridCanonicalBody(sourcePrompt, key);
     if (!body.trim()) continue;
@@ -1762,12 +1948,13 @@ export function assembleHybridFinalPrompt(sourcePrompt: string, aiText: string, 
 
 export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): { system: string; user: string } {
   const zh = locale === "zh";
+  const viewpointLock = extractFirstPersonPovLock(sourcePrompt);
   const languageRule = zh
     ? "只用清晰、电影级的中文输出。即使规范源包含英文，也必须将其忠实转换为自然、直接、可拍摄、可执行的中文提示词；避免翻译腔、空泛形容词和散文化抒情。"
     : "Output only clear, cinematic-grade English. Even if the canonical source contains Chinese, faithfully convert it into natural, direct, shootable, executable English; avoid literal translation, vague adjectives, and poetic prose.";
   const headingsRule = zh
-    ? "只输出以下非空类别，必须使用这些中文标题，并严格按此顺序：风格、活动引用、场景地图和站位、光学、摄像机、动作节奏、格式模式、物理、光线、音频、正向约束。仅当源中存在时才输出：负向约束。"
-    : "Output only the following non-empty categories, using exactly these English headings and this order: STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING, OPTICS, CAMERA, ACTION TIMING, FORMAT MODE, PHYSICS, LIGHTING, AUDIO, POSITIVE CONSTRAINTS. Output NEGATIVE CONSTRAINTS only when present in the source.";
+    ? "只输出以下非空类别，必须使用这些中文标题，并严格按此顺序：风格、活动引用、场景地图和站位、光学、摄像机、表演、动作节奏、格式模式、物理、光线、音频、正向约束。仅当源中存在时才输出：负向约束。"
+    : "Output only the following non-empty categories, using exactly these English headings and this order: STYLE, ACTIVE REFERENCES, SCENE MAP AND STAGING, OPTICS, CAMERA, PERFORMANCE, ACTION TIMING, FORMAT MODE, PHYSICS, LIGHTING, AUDIO, POSITIVE CONSTRAINTS. Output NEGATIVE CONSTRAINTS only when present in the source.";
   /* The previous style-writing instructions are retained below only as history;
    * final STYLE text is now copied from the local director document. */
   /* const legacyStyleRule = zh
@@ -1778,20 +1965,32 @@ export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): {
     ? "风格锁放在所有类别最前，先输出 STYLE 再输出其他类别。STYLE 是导演文档中的本地风格原文，必须逐字复制规范源 STYLE 段的正文，不得翻译、改写、润色、压缩、补充、删除或重新解释；保留原有标点、比例、数值和句序。不得让 AI 重新生成风格，也不得把风格预设名称或风格描述改写成另一段文字。STYLE 不得重复 ACTIVE REFERENCES、OPTICS、CAMERA、ACTION TIMING 或 LIGHTING；其他类别中的信息仍按各自类别输出。"
     : "Style lock comes first: output STYLE before every other category. STYLE is the local style text from the director document: copy the STYLE body from the canonical source character-for-character. Do not translate, rewrite, polish, shorten, expand, delete, or reinterpret it; preserve its punctuation, ratios, numbers, and sentence order. Do not regenerate the style with AI or turn a preset name or style description into different wording. Do not repeat ACTIVE REFERENCES, OPTICS, CAMERA, ACTION TIMING, or LIGHTING inside STYLE; other information remains in its own category.";
   const actingPlacementRule = zh
-    ? "角色表演只能写在 ACTION TIMING 中对应镜头和人物之后；不要新增 CHARACTER ACTING 标题。"
-    : "Important: attach acting to the corresponding shot and character inside ACTION TIMING; do not add a separate CHARACTER ACTING heading.";
+    ? "表演基调由本地「表演」段逐镜生成并原样插入，ACTION TIMING 中不得再写角色表演、微表情、眼神或视线；不要新增 CHARACTER ACTING 或其他表演标题。"
+    : "Important: the PERFORMANCE section is generated locally per shot and inserted verbatim; never write character acting, micro-expression, eye life, or eyeline inside ACTION TIMING, and do not add a separate CHARACTER ACTING heading.";
+  const viewpointRule = viewpointLock
+    ? `VIEWPOINT LOCK IS NON-NEGOTIABLE: ${renderFirstPersonPovLock(viewpointLock, locale)} Preserve it in CAMERA and in FORMAT MODE. Inside ACTION TIMING reflect it only as the POV movement itself (opening move, trigger, end state), never as a repeated viewpoint recital. Do not introduce third-person, reverse, observer, aerial, or cutaway coverage.`
+    : "";
   const locationMapRule = zh
     ? "场景地图和站位合并为同一段：只输出一份场景级空间总图（地点几何、材质与主要地标、总体 180° 轴与屏幕方向、站位参考图所定义的左到右排序和间距、全场共用的空间锚点、主光方向及总体景深关系；可保留相机相对空间的总体基准，但不得写成某一镜头的构图或运动）。不输出任何首帧占位、首帧锁定或首帧参考图，首帧信息不得出现在任何类别中。场景地图不得复述活动引用中的场景描述，也不得输出“镜头 1/第 1 段”等逐镜人物位置覆盖、逐镜镜头路径、人物入画、表演或时间线；这些信息只属于 ACTION TIMING。"
-    : "SCENE MAP AND STAGING is one section: output one scene-level master map only (location geometry, materials and main landmarks; the overall 180-degree axis and screen direction; the left-to-right order and spacing established by the staging reference; shared spatial anchors; key-light direction; and overall depth relationships; it may retain a global camera-to-space baseline, but never present it as a shot composition or movement). Do not output any first-frame occupancy block, first-frame lock, or first-frame reference images, and do not introduce first-frame information in any other category. Do not repeat the scene description from ACTIVE REFERENCES, and never output per-shot position overrides, per-shot camera paths, entrances, acting, or timing under this section; those facts belong only in ACTION TIMING.";
+    : "SCENE MAP AND STAGING is one section: output one scene-level master map only (location geometry, materials and main landmarks; the overall 180-degree axis and screen direction; the left-to-right order and spacing established by the staging reference; shared spatial anchors; key-light direction; and overall depth relationships; it may retain a global camera-to-space baseline, but never present it as a shot composition or movement). Do not output any first-frame occupancy block, first-frame lock, or first-frame reference images, and do not introduce first-frame information in any other category. Do not repeat the scene description from ACTIVE REFERENCES, and never output per-shot position overrides, per-shot camera paths, entrances, acting, or timing under this section; performance belongs in PERFORMANCE and the remaining facts belong only in ACTION TIMING.";
   const formatModeRule = zh
     ? "FORMAT MODE 是本次生成的整体执行格式摘要，必须完整承接源中已确定的格式事实，不得只写“单一连续长镜头”或“受控多镜头序列”。按源内容明确写出：生成方式（单次生成或其他明确方式）、段数、总时长及各段时长分配（如 4 秒 / 4 秒）、画幅（如 16:9）、速度（实时、慢动作或其他已指定速度）、段间连接方式和连接动作、现场声/配乐范围、每句台词属于哪个角色或对象、字幕与画面帧限制。多段格式必须说明每一段如何结束、下一段如何开始，以及甩切、whip cut、甩镜上摇/下摇、推拉变焦等连接的方向、发生段落和连续因果；不要把明确的甩切泛化成“快速剪辑”。“单次生成”表示整段内容一次生成，不等于只能有一个镜头。各段时长必须与镜头时间轴一致；未在源中确定的时长、画幅、速度、转场、声音或对白归属不得臆造。格式模式只总结生成和段落组织方式，不重复 OPTICS、CAMERA、ACTION TIMING 的具体执行细节。示例：单次生成，两个段落，一次甩切，总长约 8 秒（4 秒 / 4 秒），画幅 16:9。实时速度。快速甩镜上摇结束第 1 段并顺势冲入急推变焦开启第 2 段；快速甩镜下摇结束第 2 段。仅现场音，无配乐；台词只属于提卡；干净的纯画面帧。"
     : "FORMAT MODE is the overall execution-format summary for this generation. It must carry forward every format fact established in the source, rather than outputting only ‘SINGLE CONTINUOUS TAKE’ or ‘CONTROLLED MULTI-SHOT SEQUENCE’. When supported by the source, state: generation mode (single generation or another explicit mode), segment count, total duration and per-segment allocation (for example, 4 seconds / 4 seconds), aspect ratio (for example, 16:9), speed (real time, slow motion, or another specified speed), the connection between segments and its physical transition, the diegetic-sound / score scope, which character or object owns each line, and subtitle / clean-frame limits. For multi-segment formats, explain how each segment ends and the next begins. Preserve the direction, segment placement, and causal continuity of whip cuts, whip pans up/down, push-ins, zooms, and other stated transitions; do not flatten an explicit whip cut into ‘fast editing’. ‘Single generation’ means one generated output for the whole piece, not a single shot. Segment durations must agree with the shot timeline. Never invent an unprovided duration, aspect ratio, speed, transition, sound rule, or dialogue ownership. FORMAT MODE summarizes generation and segment organization only; do not repeat the detailed OPTICS, CAMERA, or ACTION TIMING instructions. Example: single generation, two segments, one whip cut, approximately 8 seconds total (4 seconds / 4 seconds), 16:9. Real time. A fast whip pan upward ends segment 1 and flows directly into a rapid push-zoom that opens segment 2; a fast whip pan downward ends segment 2. Diegetic sound only, no score; the line belongs only to Tika; clean picture frames.";
   const cameraRule = zh
     ? "CAMERA 必须先写一段适用于全程的总摄影机描述，再按镜头段落分别展开，不能直接从第 1 段开始。总描述先锁定全程共用的摄影机语法：是否手持、整体稳定性或晃动质感、统一的倾斜/荷兰角、轴线、机位高度与距离，以及贯穿全程的观察或跟随原则；只有源中明确的信息才能写入，不得臆造导演风格或摄影机行为。总描述之后按“第 1 段：……”“第 2 段：……”逐段写出该段的实际摄影机行为，包括起始状态、运动方向、速度/力度、何时停止或保持不动、如何承接上一段和如何进入下一段。必须把甩镜上摇、甩镜下摇、急推变焦、停机观察等明确动作保留为可执行的摄影机动作及其触发事件，不得笼统改写成“镜头跟随”或“快速移动”。全程统一的摄影机规则只在总描述中说明；段落中只补充该段的变化和执行结果。CAMERA 只写摄影机位置、运动、方向、稳定性和与事件的响应，不重复 OPTICS 的焦段/FOV/景深，也不复制 ACTION TIMING 的完整动作与表演；但可用一句话说明摄影机正在捕捉哪个关键事件。参考格式：全程手持，略带倾斜形成轻度荷兰角。第 1 段：特写人物醒来并在甩沙后快速甩镜上摇冲向破窗。第 2 段：甩镜顺势冲入对窗口人群的硬急推变焦；随后保持不动观察搜寻，最后快速甩镜下摇离开窗口。"
     : "CAMERA must begin with one overall camera-language paragraph that applies across the entire generation, then expand segment by segment; do not begin directly with shot 1. The overall paragraph first locks the shared camera grammar: handheld or mounted operation, overall stability or shake quality, a consistent tilt / Dutch angle, screen axis, camera height and distance, and the rule for observing or following throughout. Include only information established by the source; never invent a director style or camera behavior. After the overall paragraph, write separate lines labeled ‘SHOT 1: ...’, ‘SHOT 2: ...’, and so on. For each segment, state the actual camera behavior, starting state, movement direction, speed / force, when it stops or holds, how it inherits the previous segment, and how it enters the next one. Preserve explicit actions such as a whip pan up, whip pan down, hard push-zoom, or locked-off observation as executable camera actions with their trigger events; do not flatten them into ‘the camera follows’ or ‘moves quickly’. State shared camera rules once in the overall paragraph; use segment lines only for changes and execution results. CAMERA covers camera position, movement, direction, stability, and response to events. Do not repeat OPTICS focal length / FOV / depth of field or copy the full ACTION TIMING action and acting; one short phrase may identify the key event being captured. Example: full-take handheld operation with a slight tilt creating a mild Dutch angle. SHOT 1: a close-up of the figure waking and shaking off sand, followed by a fast whip pan upward toward the broken window. SHOT 2: the whip pan flows directly into a hard push-zoom on the people at the window; hold still while they search, then finish with a fast whip pan downward away from the window.";
+  const cameraScopeRule = zh
+    ? "摄像机范围锁（优先级高于上文）：只写运镜路径、速度/力度、触发事件、停止或落点，以及必要的机位响应。不得重复人物动作、表演、微表情、对白、道具、光线或完整镜头叙事。"
+    : "CAMERA scope lock (higher priority than broader wording above): write only the camera path, speed/force, trigger event, stop or end state, and necessary camera response. Do not repeat character action, acting, micro-expression, dialogue, props, lighting, or the full shot narrative.";
+  const formatModeScopeRule = zh
+    ? "格式模式范围锁（优先级高于上文）：只写生成组织方式、总时长、段数、画幅、速度和镜头连接顺序。不得重复人物动作、表演、微表情、对白、声音、道具状态、光线或详细运镜；这些内容只属于动作节奏、音频、物理、光线、相机或表演。"
+    : "FORMAT MODE scope lock (higher priority than broader wording above): write only generation organization, total duration, segment count, aspect ratio, speed, and the order of camera connections. Do not repeat character action, acting, micro-expression, dialogue, sound, prop state, lighting, or detailed camera execution; those belong in ACTION TIMING, AUDIO, PHYSICS, LIGHTING, CAMERA, or PERFORMANCE.";
+  const positiveConstraintsRule = zh
+    ? "正向约束范围锁（优先级高于上文）：只写模型容易犯错且必须锁死的事实，包括角色身份、角色/道具数量、空间左右关系、对白归属、关键景别、POV 和禁止混淆项。不要在此重复动作过程、表演、微表情、声音、光线或运镜；每条约束只锁一个事实。"
+    : "POSITIVE CONSTRAINTS scope lock (higher priority than broader wording above): write only error-prone facts that must be locked, including character identity, character/prop counts, left-right spatial relationships, dialogue ownership, critical framing, POV, and forbidden confusions. Do not repeat action process, acting, micro-expression, sound, lighting, or camera movement here; each constraint should lock one fact.";
   const actionTimingRule = zh
-    ? "动作节奏必须按镜头段分组输出，不能把所有镜头的时间块合并成一条平面时间线。多镜头序列先分别写“第 1 段（起止时间）：”“第 2 段（起止时间）：”等段落标题，再在每个段落标题下写该段自己的时间块；段落标题必须保留，即使某段只有一个事件。每个时间块必须保留精确时间（如 0:01.5–0:02.5），只写一个事件的主体位置、动作和该拍结果，并在相关时写入相机行为、关键道具状态、物理锚点和音频/对白；显式起始时间必须按场景绝对时间保留，并允许表达非连续或重叠事件。时间块中的人物和道具目标必须保留源中的 @ 资产引用及其对应 [imageN]，同一资产重复出现时复用同一个图片编号，不得输出裸的 @资产名。长镜头中只写一个连续段落；多镜头序列中每个切点都要保留源里的切换依据，没有依据不得输出切点。"
-    : "ACTION TIMING must remain grouped by shot segment; never flatten all shot events into one timeline. For a multi-shot sequence, first write separate segment headings such as ‘SHOT 1 (start to end):’ and ‘SHOT 2 (start to end):’, then place only that segment's time blocks beneath its heading. Keep every segment heading even when it contains one event. Each time block must preserve its precise time (for example, 0:01.5 to 0:02.5), state one event's subject position, action, and outcome, and include camera behavior, critical prop state, physics anchors, and audio/dialogue when relevant. Preserve explicit absolute start times, including non-contiguous or overlapping events. Every character or prop @ asset reference inside a time block must retain its matching [imageN] token; reuse the same image number for repeated references and never emit a bare @asset tag. A long take gets one continuous segment group. In multi-shot sequences, keep the stated cut reason on every cut and never emit a cut without one.";
+    ? "动作节奏必须按镜头段分组输出，不能把所有镜头的时间块合并成一条平面时间线。多镜头序列先分别写“第 1 段（起止时间）：”“第 2 段（起止时间）：”等段落标题，再在每个段落标题下写该段自己的时间块；段落标题必须保留，即使某段只有一个事件。动作节奏只描述动作节奏本身：相机型号、POV 锁、机位高度/距离/角度/机位边、画面大小/画面位置、对焦、景深与手持质感已由相机段逐镜写明，景别与 FOV 已由光学段逐镜写明，现场光影已迁至光线段、背景人流已迁至场景地图段、表演基调已迁至表演段——这些都不属于动作节奏，不得在此复述，也不得用每个镜头开头的机位复述代替动作描述。镜头若要交代随时间变化的运镜，只写三项：起手运镜、触发事件、落点。每个时间块必须保留精确时间（如 0:01.5–0:02.5），只写一个事件的主体位置、动作和该拍结果，并在相关时写入关键道具状态、物理锚点和音频/对白；它只补充该镜头“动作、表演与眼神执行”总述中尚未表达的时序、执行者或变化，禁止逐句重复总述。显式起始时间必须按场景绝对时间保留，并允许表达非连续或重叠事件。时间块中的人物和道具目标必须保留源中的 @ 资产引用及其对应 [imageN]，同一资产重复出现时复用同一个图片编号，不得输出裸的 @资产名。长镜头中只写一个连续段落；多镜头序列中每个切点都要保留源里的切换依据，没有依据不得输出切点。动作节奏只做语言组织：剧情事件的集合、执行者与先后顺序必须与规范源完全一致，不得增加、删除、合并、拆分或重排剧情事件，也不得用概括句替换源中明确列出的具体事件。"
+    : "ACTION TIMING must remain grouped by shot segment; never flatten all shot events into one timeline. For a multi-shot sequence, first write separate segment headings such as 'SHOT 1 (start to end):' and 'SHOT 2 (start to end):', then place only that segment's time blocks beneath its heading. Keep every segment heading even when it contains one event. ACTION TIMING describes action rhythm only: camera model, POV lock, height/distance/angle/camera side, subject size/screen placement, focus, depth of field and handheld quality are already stated per shot in CAMERA; framing and FOV in OPTICS; on-set lighting in LIGHTING; background crowd activity in SCENE MAP AND STAGING; performance baseline in PERFORMANCE. Never repeat any of them here, and never open a segment with a camera recital in place of its action. When a shot needs a time-varying camera cue, state only the opening move, the trigger, and the end state. Each time block must preserve its precise time (for example, 0:01.5 to 0:02.5), state one event's subject position, action, and outcome, and include critical prop state, physics anchors, and audio/dialogue when relevant. It supplements only timing, performer, or visible change not already stated in the shot-level action/performance/eye-execution description; never repeat that description sentence by sentence. Preserve explicit absolute start times, including non-contiguous or overlapping events. Every character or prop @ asset reference inside a time block must retain its matching [imageN] token; reuse the same image number for repeated references and never emit a bare @asset tag. A long take gets one continuous segment group. In multi-shot sequences, keep the stated cut reason on every cut and never emit a cut without one. ACTION TIMING only reorganizes wording: the set of story events, their performers, and their order must match the canonical source exactly; never add, drop, merge, split, or reorder story events, and never replace a listed concrete event with a summary sentence.";
   return {
     system: "You are CINEDANCE V4, an elite AI film prompt director for Seedance 2.0 and Higgsfield Seedance. "
       + "Your job is to convert the provided canonical scene input into a clean, production-ready, high-budget cinematic video prompt that works on the first generation as often as possible. "
@@ -1812,7 +2011,11 @@ export function buildFinalPromptRequest(sourcePrompt: string, locale: Locale): {
       styleRule,
       locationMapRule,
       formatModeRule,
+      formatModeScopeRule,
+      positiveConstraintsRule,
       cameraRule,
+      cameraScopeRule,
+      viewpointRule,
       actingPlacementRule,
       actionTimingRule,
       "",
@@ -1828,6 +2031,7 @@ const FINAL_SOURCE_SECTIONS = [
   { key: "locationMap", heading: "SCENE MAP AND STAGING" },
   { key: "optics", heading: "OPTICS" },
   { key: "camera", heading: "CAMERA" },
+  { key: "performance", heading: "PERFORMANCE" },
   { key: "actionTiming", heading: "ACTION TIMING" },
   { key: "formatMode", heading: "FORMAT MODE" },
   { key: "physics", heading: "PHYSICS" },
@@ -1839,7 +2043,7 @@ const FINAL_SOURCE_SECTIONS = [
 
 const PROMPT_SECTION_HEADINGS = [
   ...FINAL_SOURCE_SECTIONS.map((section) => section.heading),
-  "SHOT EXECUTION", "活动引用", "场景地图和站位", "场景地图", "首帧与空间走位", "首帧与站位", "格式模式", "光学", "摄像机", "动作节奏", "镜头执行", "物理", "光线", "音频", "风格", "正向约束", "负向约束",
+  "SHOT EXECUTION", "PERFORMANCE", "表演", "活动引用", "场景地图和站位", "场景地图", "首帧与空间走位", "首帧与站位", "格式模式", "光学", "相机", "摄像机", "动作节奏", "镜头执行", "物理", "光线", "音频", "风格", "正向约束", "负向约束",
 ];
 
 function extractPromptSection(source: string, heading: string): string {
@@ -1938,8 +2142,11 @@ export function buildFinalGenerationSource(project: ProjectV2, scene: SceneV2, l
     let body: string;
     if (section.key === "actionTiming") {
       body = extractPromptSection(canonicalSequence, locale === "zh" ? "镜头执行" : "SHOT EXECUTION");
-    } else if (section.key === "activeReferences" || section.key === "optics") {
-      // These sections are executable data, not editable director prose.
+    } else if (FINAL_GENERATED_DIRECTOR_LAYER_KEYS.has(section.key as typeof DIRECTOR_LAYER_ORDER[number])) {
+      // These sections are executable data rebuilt from the current structured
+      // shots, not editable director prose. CAMERA must stay here: the camera
+      // model is selected on the shot inspector (shot.camera), and reusing the
+      // planning-time snapshot would silently drop later manual model changes.
       const layer = labelsByKey.get(section.key as typeof DIRECTOR_LAYER_ORDER[number]);
       body = extractPromptSection(canonicalSequence, layer?.[locale] ?? section.heading);
     } else {
@@ -1961,6 +2168,11 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
   const obj = (data ?? {}) as Record<string, unknown>;
   const assets = project.assets ?? [];
   const characterIds = new Set(assets.filter((asset) => asset.kind === "character").map((asset) => asset.id));
+  const viewpointLock = extractFirstPersonPovLock(scene.logline);
+  const characterIdForName = (name?: string) => name
+    ? assets.find((asset) => asset.kind === "character" && asset.name.trim().toLocaleLowerCase() === name.trim().toLocaleLowerCase())?.id
+    : undefined;
+  const viewpointHolderId = characterIdForName(viewpointLock?.operatorName);
   const propIds = new Set(assets.filter((asset) => asset.kind === "prop").map((asset) => asset.id));
   const orderIds = [...(scene.staging?.characterOrder ?? [])].filter((id) => characterIds.has(id));
   const macro = obj.macro && typeof obj.macro === "object" && !Array.isArray(obj.macro)
@@ -1983,7 +2195,7 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     if (antiDriftLock) result.antiDriftLock = antiDriftLock;
     return Object.keys(result).length > 0 ? result : undefined;
   };
-  const CAMERA_BEHAVIOR_KEYS = ["height", "distance", "angle", "side", "subjectSize", "screenPlacement", "focusBehavior", "depthOfField", "handheldQuality"] as const;
+  const CAMERA_BEHAVIOR_KEYS = ["description", "height", "distance", "angle", "side", "subjectSize", "screenPlacement", "focusBehavior", "depthOfField", "handheldQuality"] as const;
   const normalizeCameraBehavior = (raw: unknown): CameraBehavior | undefined => {
     const part = (raw ?? {}) as Record<string, unknown>;
     const result: CameraBehavior = {};
@@ -2040,7 +2252,7 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     for (const rawPartial of rawParticipants.slice(0, 12)) {
       const partial = (rawPartial ?? {}) as Record<string, unknown>;
       const characterId = asString(partial.characterId);
-      if (!characterIds.has(characterId) || participants.some((participant) => participant.characterId === characterId)) continue;
+      if (!characterIds.has(characterId) || (viewpointLock?.hideOperator && characterId === viewpointHolderId) || participants.some((participant) => participant.characterId === characterId)) continue;
       const role = asString(partial.role, "supporting");
       participants.push({
         characterId,
@@ -2102,7 +2314,7 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
       });
     }
 
-    const movement = asString(raw.movement, "Static") as CameraMovement;
+    const movement = (viewpointLock ? "POV" : normalizeCameraMovement(asString(raw.movement, "Static")) ?? "Static") as CameraMovement;
     const cutStyle = asString(raw.cutStyle, scene.cutStyleDefault ?? "hard-cut") as CutStyle;
     const framing = asString(raw.framing, "Medium close-up");
     const legacyLens = asString(raw.lens, undefined);
@@ -2136,11 +2348,27 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     const lens = framingLensMismatch && recommendedLens
       ? fovToLegacyFocalLength(recommendedLens.fov)
       : legacyLens || fovToLegacyFocalLength(effectiveFov);
-    const shotCameraBehavior = normalizeCameraBehavior(raw.cameraBehavior);
+    const rawCameraBehavior = normalizeCameraBehavior(raw.cameraBehavior);
+    const shotCameraBehavior = viewpointLock
+      ? {
+        ...rawCameraBehavior,
+        description: [renderFirstPersonPovLock(viewpointLock, locale), rawCameraBehavior?.description].filter(Boolean).join(locale === "zh" ? " " : " "),
+      }
+      : rawCameraBehavior;
     const shotPhysicsAnchors = normalizePhysicsAnchors(raw.physicsAnchors);
     const direction = asString(raw.direction, "left-to-right") as ShotV2["direction"];
     const index = shots.length + 1;
     const label = asString(raw.label, String(index).padStart(2, "0"));
+    const performanceDescription = asString(raw.performanceDescription, undefined);
+    const rawPlanningMeta = raw.planningMeta && typeof raw.planningMeta === "object" && !Array.isArray(raw.planningMeta)
+      ? raw.planningMeta as Record<string, unknown>
+      : {};
+    const planBeats = scene.performancePlan?.beats ?? [];
+    const validPlanBeatIds = new Set(planBeats.map((beat) => beat.id));
+    const requestedPlanBeatIds = asStringArray(rawPlanningMeta.performanceBeatIds).filter((id) => validPlanBeatIds.has(id));
+    const matchedPlanBeatIds = requestedPlanBeatIds.length > 0
+      ? requestedPlanBeatIds
+      : planBeats.filter((beat) => !beat.actorId || participantIds.has(beat.actorId)).map((beat) => beat.id).slice(0, 4);
     shots.push({
       id: newId(),
       label,
@@ -2154,8 +2382,18 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
       ...(shotCameraBehavior ? { cameraBehavior: shotCameraBehavior } : {}),
       ...(shotPhysicsAnchors ? { physicsAnchors: shotPhysicsAnchors } : {}),
       movement,
-      action: asString(raw.action, "Continue the scene naturally."),
-      acting: asString(raw.acting, "Natural, restrained performance."),
+      ...(performanceDescription ? { performanceDescription } : {}),
+      ...(asString(raw.lightingBehavior, undefined) ? { lightingBehavior: asString(raw.lightingBehavior) } : {}),
+      ...(asString(raw.backgroundActivity, undefined) ? { backgroundActivity: asString(raw.backgroundActivity) } : {}),
+      planningMeta: {
+        status: "confirmed",
+        performanceBeatIds: matchedPlanBeatIds,
+        shotIntent: asString(rawPlanningMeta.shotIntent, performanceDescription || asString(raw.action, undefined)),
+        cameraTrigger: asString(rawPlanningMeta.cameraTrigger, undefined),
+        cameraEndState: asString(rawPlanningMeta.cameraEndState, undefined),
+      },
+      action: asString(raw.action, performanceDescription || "Continue the scene naturally."),
+      acting: asString(raw.acting, performanceDescription || "Natural, restrained performance."),
       ...(typeof raw.performanceLevel === "number" && Number.isFinite(raw.performanceLevel) ? { performanceLevel: Math.max(0, Math.min(5, Math.round(raw.performanceLevel))) as 0 | 1 | 2 | 3 | 4 | 5 } : {}),
       ...(asString(raw.eyeLife) ? { eyeLife: asString(raw.eyeLife) } : {}),
       direction,
@@ -2192,3 +2430,6 @@ export function normalizeSceneDraft(project: ProjectV2, scene: SceneV2, data: un
     directorLayers,
   };
 }
+
+/** 第二层分镜运镜规划的语义化入口；保留旧名称兼容已有调用和项目测试。 */
+export const planSceneShots = fillSceneDraft;

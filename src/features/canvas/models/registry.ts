@@ -1,4 +1,6 @@
 import type {
+  AudioModelDefinition,
+  AudioModelKind,
   ImageModelDefinition,
   ImageModelRuntimeContext,
   ModelProviderDefinition,
@@ -8,6 +10,7 @@ import type {
 import {
   buildCustomModelId,
   buildCustomProviderId,
+  isAudioModelName,
   isVideoGenerationModelName,
   useSettingsStore,
 } from '@/stores/settingsStore';
@@ -15,6 +18,15 @@ import { isWindowsDesktopRuntime } from '@/platform/runtime';
 import { createPointsOnlyPricing } from '@/features/canvas/pricing';
 import { resolveVideoModelProfile } from './videoProfiles';
 import { isRjmVideoApiBaseUrl } from '@/commands/videoApi';
+import {
+  isZzdhProvider,
+  resolveZzdhAudioKind,
+  resolveZzdhResolutionTier,
+  resolveZzdhVideoDurationRange,
+  ZZDH_ASPECT_RATIOS,
+  ZZDH_VIDEO_DURATION_OPTIONS,
+} from '@/commands/zzdhApi';
+import { WAN_CLI_PROVIDER_ID, wanCliProvider, wanCliVideoModels } from './wanCli';
 
 const providerModules = import.meta.glob<{ provider: ModelProviderDefinition }>(
   './providers/*.ts',
@@ -133,27 +145,50 @@ export function listVideoModels(): VideoModelDefinition[] {
         || api.baseUrl.trim().toLowerCase().includes('api.7tai.cc')
         || api.id.trim().toLowerCase() === 'wgspai'
         || api.baseUrl.trim().toLowerCase().includes('api.wgspai.cn');
+      const isZhiniao = api.id.trim().toLowerCase() === 'zhiniao'
+        || api.baseUrl.trim().toLowerCase().includes('cuai.token6688.com')
+        || api.baseUrl.trim().toLowerCase().includes('api.tokengo.love');
       const binghuoOptions = isBinghuo ? resolveBinghuoVideoOptions(model) : undefined;
+      const zhiniaoOptions = isZhiniao ? resolveZhiniaoVideoOptions(model) : undefined;
       const sub2ApiDuration = normalizedModel === 'seedance2.5'
         ? 30
         : normalizedModel === 'seedance2.0'
           ? 15
           : undefined;
       const isSub2ApiSeedance = isSub2Api && sub2ApiDuration !== undefined;
-      const modelResolution = model.trim().match(/(?:^|[-_])(480p|720p|1080p|2k)(?:[-_]|$)/i)?.[1]?.toLowerCase();
+      // 字子动画: 档位写在模型名里(zddh-Minimax-h3-480p / doubao-seedance-2-4k),
+      // UI 只提供该档位一个选项; 档位不在模型名里时按文档给 720p/1080p 两档。
+      const zzdhTier = isZzdh ? resolveZzdhResolutionTier(model) : null;
+      const zzdhDurationRange = isZzdh ? resolveZzdhVideoDurationRange(model) : null;
+      const zzdhDurationOptions = isZzdh
+        ? (zzdhDurationRange
+          ? Array.from(
+            { length: zzdhDurationRange.max - zzdhDurationRange.min + 1 },
+            (_, index) => zzdhDurationRange.min + index,
+          )
+          : ZZDH_VIDEO_DURATION_OPTIONS)
+        : undefined;
       const resolutionValues = isSub2ApiSeedance
         ? normalizedModel === 'seedance2.5'
           ? ['480p', '720p']
           : ['480p', '720p', '1080p', '4k']
         : isZzdh
-          ? (modelResolution ? [modelResolution] : ['720p', '1080p'])
-          : binghuoOptions?.resolutionValues;
+          ? (zzdhTier ? [zzdhTier] : ['720p', '1080p'])
+          : (zhiniaoOptions?.resolutionValues.length
+            ? zhiniaoOptions.resolutionValues
+            : binghuoOptions?.resolutionValues);
+      // 字子动画画幅枚举只有 16:9 / 9:16 / 1:1(官方文档), 不要放 21:9 等超纲值。
       const aspectRatios = isSub2ApiSeedance
         ? ['16:9', '9:16']
-        : (binghuoOptions?.aspectRatios ?? CUSTOM_ASPECT_RATIOS);
+        : isZzdh
+          ? [...ZZDH_ASPECT_RATIOS]
+          : (zhiniaoOptions?.aspectRatios ?? binghuoOptions?.aspectRatios ?? CUSTOM_ASPECT_RATIOS);
       const durationOptions = sub2ApiDuration !== undefined
         ? [sub2ApiDuration]
-        : (binghuoOptions?.durationOptions ?? Array.from({ length: 30 }, (_, index) => index + 1));
+        : (zhiniaoOptions?.durationOptions
+          ?? binghuoOptions?.durationOptions
+          ?? zzdhDurationOptions
+          ?? Array.from({ length: 30 }, (_, index) => index + 1));
       const displayModelName = normalizedModel === 'seedance2.5'
         ? 'Seedance 2.5'
         : normalizedModel === 'seedance2.0'
@@ -169,7 +204,12 @@ export function listVideoModels(): VideoModelDefinition[] {
         aspectRatios: aspectRatios.map((value) => ({ value, label: value })),
         defaultAspectRatio: '16:9',
         durationOptions,
-        defaultDuration: sub2ApiDuration ?? binghuoOptions?.durationOptions[0] ?? 5,
+        defaultDuration: sub2ApiDuration
+          ?? (zhiniaoOptions
+            ? (zhiniaoOptions.durationOptions.includes(5) ? 5 : zhiniaoOptions.durationOptions[0])
+            : undefined)
+          ?? binghuoOptions?.durationOptions[0]
+          ?? 5,
         ...(resolutionValues ? {
           resolutions: resolutionValues.map((value) => ({
             value,
@@ -177,7 +217,7 @@ export function listVideoModels(): VideoModelDefinition[] {
           })),
           defaultResolution: resolutionValues.includes('720p') ? '720p' : resolutionValues[0],
         } : {}),
-          pricing: resolveCustomVideoPricing(api.name, model, isBinghuo),
+          pricing: resolveCustomVideoPricing(api.name, api.baseUrl, model, isBinghuo),
         profileId: profile.id,
         profileStatus: profile.status,
         profileLabel: profile.protocolLabel,
@@ -186,7 +226,7 @@ export function listVideoModels(): VideoModelDefinition[] {
     })
   );
 
-  return [...customVideoModels, ...buildJimengCliVideoModels()];
+  return [...customVideoModels, ...buildJimengCliVideoModels(), ...wanCliVideoModels];
 }
 
 export function getVideoModel(modelId: string): VideoModelDefinition | undefined {
@@ -195,6 +235,60 @@ export function getVideoModel(modelId: string): VideoModelDefinition | undefined
 
 export function getDefaultVideoModelId(): string {
   return listVideoModels()[0]?.id ?? '';
+}
+
+/**
+ * 音频生成模型(语音合成 / 音效 / 音乐)。
+ *
+ * 之前 `audioModels` 只是个配置分桶(`buildCustomImageModels` 里把它排除掉),
+ * 没有任何运行期消费方 —— 这里把它变成真正的模型定义, 供音频节点下拉使用。
+ * 字子动画按模型名判定端点(见 resolveZzdhAudioKind), 其它平台默认走 speech。
+ *
+ * 定价: 平台对音频按字符用量计费(quota_type=0 / model_ratio), 没有可按次展示的
+ * 固定价, 因此不提供 pricing —— 界面上不显示价格, 而不是显示一个错误数字。
+ */
+function buildCustomAudioModels(): AudioModelDefinition[] {
+  return useSettingsStore.getState().customApis.flatMap((api) =>
+    Array.from(new Set([
+      ...(api.audioModels ?? []),
+      ...api.models.filter(isAudioModelName),
+    ])).map((model) => {
+      const modelId = buildCustomModelId(api.id, model);
+      const isZzdh = isZzdhProvider(api.id, api.baseUrl);
+      const audioKind: AudioModelKind = isZzdh
+        ? (resolveZzdhAudioKind(model) ?? 'speech')
+        : 'speech';
+      return {
+        id: modelId,
+        mediaType: 'audio' as const,
+        displayName: `${api.name} · ${model}`,
+        providerId: buildCustomProviderId(api.id),
+        description: `${api.name} · ${model}`,
+        expectedDurationMs: audioKind === 'music' ? 180000 : 45000,
+        audioKind,
+        ...(audioKind === 'speech' ? {
+          formatOptions: ['mp3', 'wav', 'pcm', 'opus'],
+          defaultFormat: 'mp3',
+        } : {}),
+        ...(audioKind === 'music' ? {
+          musicLengthOptionsMs: [15000, 30000, 60000, 120000],
+          defaultMusicLengthMs: 30000,
+        } : {}),
+      };
+    })
+  );
+}
+
+export function listAudioModels(): AudioModelDefinition[] {
+  return buildCustomAudioModels();
+}
+
+export function getAudioModel(modelId: string): AudioModelDefinition | undefined {
+  return listAudioModels().find((model) => model.id === modelId);
+}
+
+export function getDefaultAudioModelId(): string {
+  return listAudioModels()[0]?.id ?? '';
 }
 
 function buildJimengCliVideoModels(): VideoModelDefinition[] {
@@ -252,6 +346,7 @@ export function resolveImageModelResolution(
 }
 
 export function getModelProvider(providerId: string): ModelProviderDefinition {
+  if (providerId === WAN_CLI_PROVIDER_ID) return wanCliProvider;
   if (providerId === JIMENG_CLI_PROVIDER_ID) {
     return JIMENG_CLI_PROVIDER;
   }
@@ -292,6 +387,70 @@ const CUSTOM_RESOLUTIONS: ResolutionOption[] = [
   { value: '4K', label: '4K' },
 ];
 
+/**
+ * 知鸟 AI(TokenGo)视频模型的档位清单, 直接取自平台 GET /v1/logical-models 的
+ * param_schema(enum)。平台会按模型校验 duration / resolution, 传枚举外的值会被拒,
+ * 所以这里按模型族给出真实可选值, 而不是统一放开 1~30 秒。
+ */
+function resolveZhiniaoVideoOptions(model: string): {
+  aspectRatios: string[];
+  durationOptions: number[];
+  resolutionValues: string[];
+} {
+  const normalized = model.trim().toLowerCase();
+  const DEFAULT_ASPECTS = ['16:9', '9:16', '1:1'];
+  if (normalized.includes('seedance')) {
+    return {
+      aspectRatios: ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'],
+      durationOptions: [4, 5, 6, 8, 10, 12, 15, 20, 25, 30],
+      resolutionValues: ['480p', '720p', '1080p'],
+    };
+  }
+  if (normalized.startsWith('veo')) {
+    return {
+      aspectRatios: ['16:9', '9:16'],
+      durationOptions: [8],
+      resolutionValues: ['720p', '1080p'],
+    };
+  }
+  if (normalized.startsWith('sora')) {
+    return {
+      aspectRatios: ['16:9', '9:16'],
+      durationOptions: [4, 8, 12],
+      resolutionValues: [],
+    };
+  }
+  if (normalized.startsWith('kling')) {
+    return {
+      aspectRatios: ['16:9', '9:16', '1:1'],
+      durationOptions: [5, 10, 15],
+      resolutionValues: ['720p', '1080p', '4k'],
+    };
+  }
+  if (normalized.startsWith('minimax')) {
+    return {
+      aspectRatios: ['16:9', '9:16', '21:9', '4:3', '1:1', '3:4'],
+      durationOptions: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+      resolutionValues: ['768p', '2k'],
+    };
+  }
+  if (normalized.startsWith('wan-3') || normalized.startsWith('wan3')) {
+    return {
+      aspectRatios: ['16:9', '9:16', '3:4', '4:3', '1:1'],
+      durationOptions: [5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30],
+      resolutionValues: ['480p', '720p', '1080p'],
+    };
+  }
+  if (normalized.startsWith('pixverse') || normalized.startsWith('vidu') || normalized.startsWith('happyhorse')) {
+    return { aspectRatios: DEFAULT_ASPECTS, durationOptions: [5, 8, 10, 15], resolutionValues: ['720p', '1080p'] };
+  }
+  return {
+    aspectRatios: DEFAULT_ASPECTS,
+    durationOptions: [5, 8, 10, 15, 20, 30],
+    resolutionValues: ['720p', '1080p'],
+  };
+}
+
 function resolveBinghuoVideoOptions(model: string): {
   aspectRatios: string[];
   durationOptions: number[];
@@ -327,7 +486,9 @@ function resolveBinghuoVideoOptions(model: string): {
   }
   const resolution = normalized.includes('4k')
     ? '4K'
-    : normalized.includes('1080p')
+    : normalized.includes('2k')
+      ? '2K'
+      : normalized.includes('1080p')
       ? '1080P'
       : normalized.includes('768p')
         ? '768P'
@@ -337,11 +498,24 @@ function resolveBinghuoVideoOptions(model: string): {
   return { aspectRatios, durationOptions, resolutionValues: [resolution] };
 }
 
+/**
+ * 字子动画视频按秒计价(来源: 平台 /api/pricing, `price_display_unit=second`)。
+ * 2026-09-12 同步: H3 五档 + Kling Omni + doubao-seedance 全系 + wan3.0 + happyhorse。
+ */
 const ZZDH_VIDEO_PRICE_PER_SECOND: Record<string, number> = {
   'zzdh-minimax-h3-480p': 0.06,
   'zzdh-minimax-h3-720p': 0.09,
   'zzdh-minimax-h3-1080p': 0.12,
   'zzdh-minimax-h3-2k': 0.16,
+  'zzdh-minimax-h3-4k': 0.24,
+  'happyhorse-1.0-t2v-720p': 1.08,
+  'happyhorse-1.0-t2v-1080p': 1.92,
+  'happyhorse-1.0-i2v-720p': 1.08,
+  'happyhorse-1.0-i2v-1080p': 1.92,
+  'happyhorse-1.0-r2v-720p': 1.08,
+  'happyhorse-1.0-r2v-1080p': 1.92,
+  'happyhorse-1.0-video-edit-720p': 1.08,
+  'happyhorse-1.0-video-edit-1080p': 1.92,
   'kling-v3-omni': 0.8,
   'kling-3.0-omni-720p-noref-mute': 0.51,
   'kling-3.0-omni-720p-noref-audio': 0.68,
@@ -387,37 +561,116 @@ const BINGHUO_VIDEO_PRICES: Record<string, BinghuoVideoPrice> = {
   'gz-sd2.5-480p': { type: 'per-second', amount: 0.46 },
   'gz-sd2.5-720p': { type: 'per-second', amount: 0.92 },
   'gz-sd2.5-1080p': { type: 'per-second', amount: 2.2 },
-  'sd2.5-720p-ch2': { type: 'per-second', amount: 0.55 },
+  // 2026-09-11 价格表同步
+  'sd2.5-720p-ch2': { type: 'per-second', amount: 0.69 },
+  'sd2.5-720p-ch3': { type: 'per-second', amount: 0.59 },
   'rd2.5-480p': { type: 'per-second', amount: 0.425 },
-  'rd2.5-720p': { type: 'per-second', amount: 0.58 },
-  'rd2.0-480p': { type: 'per-second', amount: 0.485 },
+  'rd2.5-720p': { type: 'per-second', amount: 0.95 },
+  'rd2.0-480p': { type: 'per-second', amount: 0.28 },
+  'rd2.0-480pfast': { type: 'per-second', amount: 0.3 },
   'rd2.0-720p': { type: 'per-second', amount: 0.58 },
   'rd2.0-1080p': { type: 'per-second', amount: 1.39 },
   'sdvip720p': { type: 'per-second', amount: 0.39 },
   'sdvip1080p': { type: 'per-second', amount: 0.68 },
   'sdvip4k': { type: 'per-second', amount: 3.85 },
-  'sd2.5-480p': { type: 'per-second', amount: 0.4 },
+  'sd2.5-480p': { type: 'per-second', amount: 0.58 },
   'sd2.5-720p': { type: 'per-second', amount: 0.85 },
+  'sd2.5-1080p': { type: 'per-second', amount: 1.59 },
+  'sd2.5-backup': { type: 'per-second', amount: 0.65 },
+  'sd2.5-cf-720p': { type: 'per-second', amount: 0.46 },
+  'sd2.5-480p-ch1': { type: 'per-second', amount: 0.42 },
   'wan3.0-480p': { type: 'per-second', amount: 0.25 },
   'wan3.0-720p': { type: 'per-second', amount: 0.4 },
   'wan3.0-1080p': { type: 'per-second', amount: 0.7 },
   'tj-wan3.0-1080p': { type: 'per-second', amount: 0.36 },
-  'tj-wan3.0-720p': { type: 'per-second', amount: 0.29 },
-  'tj-wan3-720p': { type: 'per-second', amount: 0.29 },
+  'tj-wan3.0-720p': { type: 'per-second', amount: 0.31 },
+  'tj-wan3-720p': { type: 'per-second', amount: 0.31 },
   'minimax-h3-pro-768p': { type: 'per-second', amount: 0.05 },
-  'minimax-h3-pro-2k': { type: 'per-run', amount: 2.5 },
+  'minimax-h3-pro-2k': { type: 'per-run', amount: 0.25 },
+  'minimax-h3-4k': { type: 'per-second', amount: 0.36 },
+  'hailuo-h3-2k': { type: 'per-run', amount: 2.8 },
   'sp2.5-720p': { type: 'per-run', amount: 4.9, durationThreshold: 15, thresholdAmount: 6.1 },
-  'sd2.5-720p-ch1': { type: 'per-run', amount: 2.68 },
+  'sp2.5-720p-15s': { type: 'per-run', amount: 4.9 },
+  'sp2.5-720p-30s': { type: 'per-run', amount: 6.1 },
+  'sd2.5-720p-ch1': { type: 'per-run', amount: 2.5 },
   'tj-sp2.5': { type: 'per-run', amount: 3.85 },
   'sd2-vip720p': { type: 'per-run', amount: 3.55 },
-  'quanneng2.0': { type: 'per-run', amount: 5.8 },
-  'sdquan-2-miao': { type: 'per-run', amount: 6.5 },
-  'sd2-福利': { type: 'per-run', amount: 3.25 },
+  'quanneng2.0': { type: 'per-run', amount: 5.9 },
+  'quanneng2.0-9tu': { type: 'per-run', amount: 1.58 },
+  'b-quannengship2.0': { type: 'per-run', amount: 6.35 },
+  'sdquan-2-miao': { type: 'per-second', amount: 0.38 },
+  'sd2-福利': { type: 'per-run', amount: 0.35 },
   'sd2-fast福利': { type: 'per-run', amount: 2.85 },
   'sd2.0-720p': { type: 'per-run', amount: 1.5 },
+  'sd2.0-480p': { type: 'per-run', amount: 1.99 },
+  'sd2.0-720p-fast': { type: 'per-run', amount: 4.65 },
+  'kuaile1.1': { type: 'per-second', amount: 0.18 },
+  'wanneng1.1': { type: 'per-second', amount: 0.18 },
+  'me-kuaile1.0': { type: 'per-run', amount: 1.85 },
+  'kuaile1.0': { type: 'per-run', amount: 1.85 },
+  'grok-imagine-video': { type: 'per-run', amount: 1.5 },
+  'grok-imagine-video-1.5-preview': { type: 'per-run', amount: 1.5 },
+  'bh2.0-720p': { type: 'per-second', amount: 0.49 },
+  'bh2.0-480p': { type: 'per-second', amount: 0.39 },
+  'bh2.0-1080p': { type: 'per-second', amount: 0.69 },
+  'bh2.0-fast-480p': { type: 'per-second', amount: 0.29 },
+  'bh2.0-fast-720p': { type: 'per-second', amount: 0.34 },
+  'bh2.0-mini-480p': { type: 'per-second', amount: 0.28 },
+  'bh2.0-mini-720p': { type: 'per-second', amount: 0.38 },
+  'bh2.0-4k': { type: 'per-second', amount: 3.68 },
+  'bh2.04k': { type: 'per-second', amount: 3.68 },
 };
 
-function resolveCustomVideoPricing(apiName: string, model: string, isBinghuo: boolean) {
+/** 炳火图片模型按张计价（全分辨率同价，2026-09-11 价格表）。 */
+const BINGHUO_IMAGE_PRICES: Record<string, number> = {
+  'image4k': 0.18,
+  'image2k4k': 0.11,
+  'image2-high': 0.13,
+  'image2': 0.035,
+  'gemini-3-pro-image-preview': 0.15,
+  'gemini-3.1-flash-image-preview': 0.15,
+  'by-image1k': 0.03,
+  'by-image2k4k': 0.15,
+  'cf-image4k': 0.06,
+};
+
+/** 字子动画图片按次计价(来源: 平台 /api/pricing, `price_display_unit=call`)。 */
+const ZZDH_IMAGE_PRICES: Record<string, number> = {
+  'qwen-image-2.0': 0.24,
+  'qwen-image-2.0-pro': 0.6,
+  'qwen-image-3.0': 0.21,
+  'qwen-image-3.0-pro-1k': 0.3,
+  'qwen-image-3.0-pro-2k': 0.6,
+  'qwen-image-edit-max': 0.6,
+  'qwen-image-max': 0.6,
+  'z-image-turbo': 0.12,
+  'zimage': 1,
+  'wan2.6-image': 0.24,
+  'wan2.7-image': 0.24,
+};
+
+function resolveCustomImagePricing(apiId: string, apiBaseUrl: string, model: string) {
+  const normalizedApiId = apiId.trim().toLowerCase();
+  const isBinghuo = normalizedApiId === 'binghuo'
+    || apiBaseUrl.trim().toLowerCase().includes('api.7tai.cc');
+  if (isBinghuo) {
+    const amount = BINGHUO_IMAGE_PRICES[model.trim().toLowerCase()];
+    if (amount == null) return undefined;
+    return {
+      quote: () => ({ amount, currency: 'CNY' as const }),
+    };
+  }
+  if (isZzdhProvider('', apiBaseUrl)) {
+    const amount = ZZDH_IMAGE_PRICES[model.trim().toLowerCase()];
+    if (amount == null) return undefined;
+    return {
+      quote: () => ({ amount, currency: 'CNY' as const }),
+    };
+  }
+  return undefined;
+}
+
+function resolveCustomVideoPricing(apiName: string, apiBaseUrl: string, model: string, isBinghuo: boolean) {
   const normalizedApiName = apiName.trim().toLowerCase();
   const normalized = model.trim().toLowerCase();
   if (isBinghuo) {
@@ -436,7 +689,7 @@ function resolveCustomVideoPricing(apiName: string, model: string, isBinghuo: bo
       };
     }
   }
-  if (normalizedApiName === '字子动画' || normalizedApiName === '字字动画' || normalizedApiName === 'zizidonghua') {
+  if (normalizedApiName === '字子动画' || normalizedApiName === '字字动画' || isZzdhProvider('', apiBaseUrl)) {
     const perSecond = ZZDH_VIDEO_PRICE_PER_SECOND[normalized];
     if (perSecond != null) {
       return {
@@ -466,12 +719,16 @@ function buildCustomImageModels(): ImageModelDefinition[] {
       api.models
         .filter((model) => {
           const normalizedModel = model.trim().toLowerCase();
-          return !isVideoGenerationModelName(model) && !api.videoModels.some(
-            (videoModel) => videoModel.trim().toLowerCase() === normalizedModel
-          );
+          return !isVideoGenerationModelName(model)
+            && !isAudioModelName(model)
+            && !api.videoModels.some((videoModel) => videoModel.trim().toLowerCase() === normalizedModel)
+            && !(api.audioModels ?? []).some((audioModel) => audioModel.trim().toLowerCase() === normalizedModel);
         })
         .map((model) => {
         const modelId = buildCustomModelId(api.id, model);
+        // 字子动画图片: 官方画幅枚举同为 16:9 / 9:16 / 1:1, 参考图字段 reference_images。
+        const isZzdhImageApi = isZzdhProvider(api.id, api.baseUrl);
+        const imageAspectRatios = isZzdhImageApi ? [...ZZDH_ASPECT_RATIOS] : CUSTOM_ASPECT_RATIOS;
         return {
           id: modelId,
           mediaType: 'image',
@@ -482,8 +739,11 @@ function buildCustomImageModels(): ImageModelDefinition[] {
           expectedDurationMs: 60000,
           defaultAspectRatio: '1:1',
           defaultResolution: '1K',
-          aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
+          aspectRatios: imageAspectRatios.map((value) => ({ value, label: value })),
           resolutions: CUSTOM_RESOLUTIONS,
+          ...(resolveCustomImagePricing(api.id, api.baseUrl, model)
+            ? { pricing: resolveCustomImagePricing(api.id, api.baseUrl, model) }
+            : {}),
           resolveRequest: ({ referenceImageCount }) => ({
             requestModel: modelId,
             modeLabel: referenceImageCount > 0 ? '编辑模式' : '生成模式',

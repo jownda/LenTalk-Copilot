@@ -29,6 +29,12 @@ export interface LibraryAsset {
   sourceFileName?: string | null;
   tags: string[];
   createdAt: number;
+  /** Optional link to a cinematic-studio asset mirrored into the shared library. */
+  cinematicAssetId?: string;
+  cinematicKind?: 'character' | 'location' | 'prop';
+  cinematicDescription?: string;
+  cinematicDescriptionZh?: string;
+  cinematicNotes?: string;
 }
 
 export interface AssetLibraryState {

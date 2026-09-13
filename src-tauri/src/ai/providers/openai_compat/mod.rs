@@ -423,6 +423,25 @@ impl OpenAICompatibleProvider {
                 } else {
                     json!(normalized)
                 };
+            } else if reference_image_field == "images" {
+                // 知鸟 AI 等平台把参考图定义为 images 数组, 单图也必须是数组。
+                let encoded_images = images
+                    .into_iter()
+                    .map(|image| Self::encode_reference_image(image, reference_image_encoding))
+                    .collect::<Vec<_>>();
+                body["images"] = json!(encoded_images);
+            } else if reference_image_field == "reference_images" {
+                // 字子动画等平台按文档要求参考图是对象数组: [{"url": "..."}]。
+                let encoded_images = images
+                    .into_iter()
+                    .map(|image| Self::encode_reference_image(image, reference_image_encoding))
+                    .collect::<Vec<_>>();
+                body["reference_images"] = json!(
+                    encoded_images
+                        .into_iter()
+                        .map(|url| json!({ "url": url }))
+                        .collect::<Vec<_>>()
+                );
             } else {
                 // image 保持单图兼容；多图使用 images 数组，确保所有上游图片都送达平台。
                 let encoded_images = images
@@ -543,6 +562,7 @@ impl OpenAICompatibleProvider {
             .and_then(|value| value.as_str())
         {
             Some("input_image") => "input_image",
+            Some("images") => "images",
             Some("image") => "image",
             // 兼容旧调用: 未传配置时沿用 GPT Image 的原有 input_image 行为。
             _ if api_model.to_ascii_lowercase().contains("gpt-image") => "input_image",
@@ -567,6 +587,26 @@ impl OpenAICompatibleProvider {
         }
     }
 
+    /// 生成模式(mode): 知鸟 AI(TokenGo)等平台把「参考图语义」放在这个 model 参数上,
+    /// 默认 text-to-image 会**忽略**随请求送来的参考图, 因此有参考图时必须显式声明
+    /// image-edit(单图编辑) / multi-reference(多图融合)。
+    fn resolve_image_mode(extra_params: &Option<HashMap<String, Value>>) -> Option<String> {
+        extra_params
+            .as_ref()
+            .and_then(|params| params.get("image_generation_mode"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    /// 把 mode 合并进已构造好的请求体; 未配置该参数时原样不动。
+    fn apply_image_mode(body: &mut Value, extra_params: &Option<HashMap<String, Value>>) {
+        if let Some(mode) = Self::resolve_image_mode(extra_params) {
+            body["mode"] = json!(mode);
+        }
+    }
+
     fn encode_reference_image(image: String, encoding: &str) -> String {
         if encoding != "raw_base64" {
             return image;
@@ -578,7 +618,10 @@ impl OpenAICompatibleProvider {
     }
 
     fn alternate_reference_image_field(reference_image_field: &str) -> &'static str {
-        if reference_image_field == "input_image" {
+        if reference_image_field == "input_image" || reference_image_field == "images" {
+            "image"
+        } else if reference_image_field == "reference_images" {
+            // 字子动画文档写明老字段 image 会自动对齐, 兜底回退到 image。
             "image"
         } else {
             "input_image"
@@ -1228,7 +1271,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 .send()
                 .await?
         } else {
-            let body = if image_transport == "apimart_json" {
+            let mut body = if image_transport == "apimart_json" {
                 Self::build_apimart_request_body(
                     api_model,
                     &request.prompt,
@@ -1247,6 +1290,7 @@ impl AIProvider for OpenAICompatibleProvider {
                     reference_image_encoding,
                 )?
             };
+            Self::apply_image_mode(&mut body, &request.extra_params);
             client.post(&endpoint)
                 .bearer_auth(&api_key)
                 .header("Accept-Encoding", "identity")
@@ -1274,7 +1318,7 @@ impl AIProvider for OpenAICompatibleProvider {
             && status == reqwest::StatusCode::NOT_FOUND
             && body_text.to_ascii_lowercase().contains("not found")
         {
-            let fallback_body = Self::build_request_body(
+            let mut fallback_body = Self::build_request_body(
                 api_model,
                 &request.prompt,
                 &request.size,
@@ -1283,6 +1327,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 "input_image",
                 "raw_base64",
             )?;
+            Self::apply_image_mode(&mut fallback_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] WGSPAI gpt-image Responses 404, falling back to /v1/images/generations"
             );
@@ -1303,7 +1348,7 @@ impl AIProvider for OpenAICompatibleProvider {
             reference_image_count,
         ) {
             let alternate_field = Self::alternate_reference_image_field(reference_image_field);
-            let alternate_body = Self::build_request_body(
+            let mut alternate_body = Self::build_request_body(
                 api_model,
                 &request.prompt,
                 &request.size,
@@ -1312,6 +1357,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 alternate_field,
                 Self::resolve_reference_image_encoding(&request.extra_params, alternate_field),
             )?;
+            Self::apply_image_mode(&mut alternate_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] retrying with reference_image_field: {}",
                 alternate_field
@@ -1478,7 +1524,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 .send()
                 .await?
         } else {
-            let body = if image_transport == "apimart_json" {
+            let mut body = if image_transport == "apimart_json" {
                 Self::build_apimart_request_body(
                     api_model,
                     &request.prompt,
@@ -1497,6 +1543,7 @@ impl AIProvider for OpenAICompatibleProvider {
                     reference_image_encoding,
                 )?
             };
+            Self::apply_image_mode(&mut body, &request.extra_params);
             client.post(&endpoint)
                 .bearer_auth(&api_key)
                 .header("Accept-Encoding", "identity")
@@ -1511,7 +1558,7 @@ impl AIProvider for OpenAICompatibleProvider {
             && status == reqwest::StatusCode::NOT_FOUND
             && body_text.to_ascii_lowercase().contains("not found")
         {
-            let fallback_body = Self::build_request_body(
+            let mut fallback_body = Self::build_request_body(
                 api_model,
                 &request.prompt,
                 &request.size,
@@ -1520,6 +1567,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 "input_image",
                 "raw_base64",
             )?;
+            Self::apply_image_mode(&mut fallback_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] async: WGSPAI gpt-image Responses 404, falling back to /v1/images/generations"
             );
@@ -1540,7 +1588,7 @@ impl AIProvider for OpenAICompatibleProvider {
             reference_image_count,
         ) {
             let alternate_field = Self::alternate_reference_image_field(reference_image_field);
-            let alternate_body = Self::build_request_body(
+            let mut alternate_body = Self::build_request_body(
                 api_model,
                 &request.prompt,
                 &request.size,
@@ -1549,6 +1597,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 alternate_field,
                 Self::resolve_reference_image_encoding(&request.extra_params, alternate_field),
             )?;
+            Self::apply_image_mode(&mut alternate_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] async retrying with reference_image_field: {}",
                 alternate_field

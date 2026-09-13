@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { SlidersHorizontal, Zap } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -21,6 +21,7 @@ import {
 } from '@/components/ui';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { openSettingsDialog } from '@/features/settings/settingsEvents';
+import { getFloatingPanelPosition } from '@/features/canvas/ui/floatingPanelPosition';
 
 interface ModelParamsControlsProps {
   imageModels: ImageModelDefinition[];
@@ -368,29 +369,67 @@ export const ModelParamsControls = memo(({
     if (!triggerElement) {
       return null;
     }
-    const rect = triggerElement.getBoundingClientRect();
-    const anchorWidth = typeof baseWidth === 'number' && baseWidth > 0 ? baseWidth : rect.width;
-    return {
-      left: align === 'center' ? rect.left + anchorWidth / 2 : rect.left,
-      top: rect.top - 8,
-    };
+    const anchorWidth = typeof baseWidth === 'number' && baseWidth > 0 ? baseWidth : undefined;
+    if (anchorWidth && align === 'center') {
+      const rect = triggerElement.getBoundingClientRect();
+      const virtualTrigger = {
+        getBoundingClientRect: () => new DOMRect(rect.left, rect.top, anchorWidth, rect.height),
+      } as HTMLElement;
+      return getFloatingPanelPosition(virtualTrigger, null, {
+        align,
+        preferredSide: 'above',
+        fallbackSize: { width: 420, height: 380 },
+      });
+    }
+    return getFloatingPanelPosition(triggerElement, null, {
+      align,
+      preferredSide: 'above',
+      fallbackSize: { width: 420, height: 380 },
+    });
   };
 
-  const buildPanelStyle = (
-    anchor: PanelAnchor | null,
-    align: 'center' | 'start'
-  ): React.CSSProperties | undefined => {
+  const buildPanelStyle = (anchor: PanelAnchor | null): React.CSSProperties | undefined => {
     if (!anchor) {
       return undefined;
     }
 
-    const xTransform = align === 'center' ? 'translateX(-50%) ' : '';
     return {
       left: anchor.left,
       top: anchor.top,
-      transform: `${xTransform}translateY(-100%)`,
     };
   };
+
+  useLayoutEffect(() => {
+    if (!renderPanel) return;
+    const config = renderPanel === 'model'
+      ? { trigger: modelTriggerRef.current, panel: modelPanelRef.current, align: modelPanelAlign, setAnchor: setModelPanelAnchor }
+      : renderPanel === 'params'
+        ? { trigger: paramsTriggerRef.current, panel: paramsPanelRef.current, align: paramsPanelAlign, setAnchor: setParamsPanelAnchor }
+        : { trigger: otherParamsTriggerRef.current, panel: otherParamsPanelRef.current, align: 'center' as const, setAnchor: setOtherParamsPanelAnchor };
+    if (!config.trigger || !config.panel) return;
+
+    const updatePosition = () => {
+      const next = getFloatingPanelPosition(config.trigger, config.panel, {
+        align: config.align,
+        preferredSide: 'above',
+        fallbackSize: { width: 420, height: 380 },
+      });
+      if (!next) return;
+      config.setAnchor((current) => current?.left === next.left && current.top === next.top ? current : next);
+    };
+
+    updatePosition();
+    const observer = new ResizeObserver(updatePosition);
+    observer.observe(config.trigger);
+    observer.observe(config.panel);
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [modelPanelAlign, paramsPanelAlign, renderPanel]);
 
   return (
     <div ref={containerRef} className="flex items-center gap-1">
@@ -478,9 +517,9 @@ export const ModelParamsControls = memo(({
       {typeof document !== 'undefined' && renderPanel === 'model' && createPortal(
         <div
           ref={modelPanelRef}
-          className={`fixed z-[80] transition-opacity duration-200 ease-out ${isPanelVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
+          className={`fixed z-[160] transition-opacity duration-200 ease-out ${isPanelVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
             }`}
-          style={buildPanelStyle(modelPanelAnchor, modelPanelAlign)}
+          style={buildPanelStyle(modelPanelAnchor)}
         >
           <UiPanel className={modelPanelClassName}>
             <div className="ui-scrollbar max-h-[340px] space-y-4 overflow-y-auto p-1">
@@ -559,9 +598,9 @@ export const ModelParamsControls = memo(({
       {typeof document !== 'undefined' && renderPanel === 'params' && createPortal(
         <div
           ref={paramsPanelRef}
-          className={`fixed z-[80] transition-opacity duration-200 ease-out ${isPanelVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
+          className={`fixed z-[160] transition-opacity duration-200 ease-out ${isPanelVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
             }`}
-          style={buildPanelStyle(paramsPanelAnchor, paramsPanelAlign)}
+          style={buildPanelStyle(paramsPanelAnchor)}
         >
           <UiPanel className={paramsPanelClassName}>
             <div>
@@ -726,9 +765,9 @@ export const ModelParamsControls = memo(({
       {typeof document !== 'undefined' && renderPanel === 'otherParams' && createPortal(
         <div
           ref={otherParamsPanelRef}
-          className={`fixed z-[80] transition-opacity duration-200 ease-out ${isPanelVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
+          className={`fixed z-[160] transition-opacity duration-200 ease-out ${isPanelVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
             }`}
-          style={buildPanelStyle(otherParamsPanelAnchor, 'center')}
+          style={buildPanelStyle(otherParamsPanelAnchor)}
         >
           <UiPanel className={OTHER_PARAMS_PANEL_CLASS_NAME}>
             <div className="space-y-3">

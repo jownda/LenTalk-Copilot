@@ -81,6 +81,7 @@ export default function BeatEditor({ project, shot, t, onUpdate }: BeatEditorPro
   const actorOptions = characterAssets.filter((asset) => participants.includes(asset.id));
 
   return <div className="beat-editor">
+    <p className="hint-text">节拍只补充镜头总述中的时间、执行角色、对白和新的可见变化；不要重复整段动作、表演与眼神描述。 / Beats add timing, actor, dialogue, and new visible changes only; do not repeat the full shot description.</p>
     <div className="beat-list">
       {beats.length === 0 && <span className="hint-text">{t.noDesc}</span>}
       {[...beats].sort((a, b) => a.order - b.order).map((beat, index) => (

@@ -57,6 +57,26 @@ export interface GenerateVideoPayload {
   extraParams?: Record<string, unknown>;
 }
 
+export type GenerateAudioKind = 'speech' | 'sound-effects' | 'music';
+
+export interface GenerateAudioPayload {
+  prompt: string;
+  model: string;
+  /** 音频类型; 缺省由适配层按模型名推断 */
+  audioKind?: GenerateAudioKind;
+  /** 音色(语音合成) */
+  voice?: string;
+  /** 输出格式(语音合成), 默认 mp3 */
+  format?: string;
+  /** 音效时长(秒) */
+  durationSeconds?: number;
+  /** 音乐时长(毫秒) */
+  musicLengthMs?: number;
+  /** 歌词(音乐生成) */
+  lyrics?: string;
+  extraParams?: Record<string, unknown>;
+}
+
 export type VideoReferenceSourceKind = 'public-url' | 'data-url' | 'local-file' | 'platform-file';
 
 export interface VideoReferenceResource {
@@ -92,6 +112,7 @@ export interface AiGateway {
     error?: string | null;
   }>;
   generateVideo: (payload: GenerateVideoPayload) => Promise<string>;
+  generateAudio: (payload: GenerateAudioPayload) => Promise<string>;
 }
 
 export interface ImageSplitGateway {

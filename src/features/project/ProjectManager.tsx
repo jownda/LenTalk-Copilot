@@ -9,7 +9,6 @@ import {
   Trash2,
   Library,
   Boxes,
-  Clapperboard,
   ArrowUpToLine,
   CloudUpload,
   ArrowDownToLine,
@@ -23,7 +22,6 @@ import { UiButton, UiSelect } from "@/components/ui/primitives";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import { AssetLibraryPanel } from "@/features/library/AssetLibraryPanel";
 import { ThreeDDirectorDesk } from "@/features/threeDDirector/ThreeDDirectorDesk";
-import { CinematicStudioWorkbench } from "@/features/cinematicStudio/CinematicStudioWorkbench";
 import { RenameDialog } from "./RenameDialog";
 import { CloudDriveUploadDialog } from "./CloudDriveUploadDialog";
 import {
@@ -50,7 +48,6 @@ export function ProjectManager() {
   /** 素材库按钮底部视口 Y,素材库面板从此处下方平滑呼出(不顶到最顶部) */
   const [libraryAnchorTop, setLibraryAnchorTop] = useState(0);
   const [show3DDirector, setShow3DDirector] = useState(false);
-  const [showCinematicStudio, setShowCinematicStudio] = useState(false);
   const [openProjectMenuId, setOpenProjectMenuId] = useState<string | null>(null);
   const [projectActionNotice, setProjectActionNotice] = useState<string | null>(null);
   const [busyProjectActionId, setBusyProjectActionId] = useState<string | null>(null);
@@ -290,10 +287,6 @@ export function ProjectManager() {
               <Boxes className="w-5 h-5" />
               3D导演台
             </UiButton>
-            <UiButton type="button" variant="muted" onClick={() => setShowCinematicStudio(true)} className="gap-2">
-              <Clapperboard className="w-5 h-5" />
-              电影提示词工作室
-            </UiButton>
             <UiButton
               type="button"
               variant="muted"
@@ -501,8 +494,6 @@ export function ProjectManager() {
       />
 
       {show3DDirector && <ThreeDDirectorDesk onClose={() => setShow3DDirector(false)} />}
-
-      {showCinematicStudio && <CinematicStudioWorkbench onClose={() => setShowCinematicStudio(false)} />}
     </div>
   );
 }

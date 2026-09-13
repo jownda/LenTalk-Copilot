@@ -34,14 +34,15 @@ export interface CustomApiCapabilities {
   detectionSource: 'probe' | 'manual';
   confidence: 'low' | 'high';
   imageProtocol: 'images' | 'responses' | 'chat' | 'unknown';
-  imageReferenceField: 'image' | 'input_image' | 'image_urls' | 'unknown';
+  /** 参考图字段: image / input_image 为常见 OpenAI 兼容写法, images 为纯数组写法(知鸟 AI)。 */
+  imageReferenceField: 'image' | 'input_image' | 'image_urls' | 'images' | 'unknown';
   imageReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
   imageTransport: 'generations_json' | 'edits_multipart' | 'apimart_json' | 'unknown';
   videoSubmitPath: string;
   videoQueryPath: string;
   videoReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
   taskProtocol: 'generic' | 'unknown';
-  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video';
+  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'zhiniao-video';
 }
 
 /** 即梦 CLI 是本地命令行工具，不使用 OpenAI 兼容平台的 API Key 配置。 */
@@ -75,6 +76,9 @@ export function isVideoGenerationModelName(model: string): boolean {
     /(?:^|[-_.])tj-(?:wan3|sp2)(?:[-_.]|\d|$)/,
     /(?:^|[-_.])quanneng(?:[-_.]|\d|$)/,
     /(?:^|[-_.])video(?:[-_.]|\d|$)/,
+    // 视频任务后缀是通用写法(t2v 文生 / i2v 图生 / r2v 参考生 / kf2v 首尾帧 / videoedit 改视频)。
+    // 字子动画的 wan2.x、happyhorse 系列只靠这些后缀区分于同名的图片/文本模型。
+    /(?:^|[-_.])(?:t2v|i2v|r2v|kf2v|flf2v|videoedit)(?:[-_.]|\d|$)/,
     /(?:^|[-_.])hailuo(?:[-_.]|\d|$)/,
     /(?:^|[-_.])kling(?:[-_.]|\d|$)/,
     /(?:^|[-_.])runway(?:[-_.]|\d|$)/,
@@ -89,11 +93,29 @@ export function isVideoGenerationModelName(model: string): boolean {
   ].some((marker) => marker.test(value));
 }
 
-/** 自定义 AI 平台(OpenAI 兼容),参考 Infinite Canvas 的 API 设置写法 */
-/** Classify a model id as a chat-completion LLM (excludes image/video generators). */
-export function isChatCompletionModelName(model: string): boolean {
+/** 音频模型(语音合成 / 音色克隆 / 音乐生成)也必须单独归类，避免拉取结果污染图片模型。 */
+export function isAudioModelName(model: string): boolean {
   const value = model.trim().toLowerCase();
   if (!value || isVideoGenerationModelName(value)) {
+    return false;
+  }
+  return [
+    // 语音合成 / 克隆 / 音频与音乐生成：tts-1-hd、speech-2.8、voice-clone、music、suno...
+    // eleven_* 是 ElevenLabs 全家桶(TTS/music/sound-effects), indextts 是国内 TTS,
+    // 名字里没有 tts/speech 边界, 必须显式列出, 否则保存平台时会被启发式丢掉。
+    /(?:^|[-_./])(?:tts|speech|voice|voiceclone|audio|music|suno|mureka|whisper|asr|elevenlabs|eleven|vocoder|cosyvoice|indextts|sound)(?:[-_./]|\d|$)/,
+    /(?:^|[-_./])ace[-_]?step(?:[-_./]|\d|$)/,
+    /(?:^|[-_./])fish[-_]?audio(?:[-_./]|\d|$)/,
+    // gpt-4o-audio-preview / qwen-audio 这类「模型名+audio」写法
+    /(?:gpt-\d+o?|qwen\d?|doubao|step)[-_]?audio/,
+  ].some((marker) => marker.test(value));
+}
+
+/** 自定义 AI 平台(OpenAI 兼容),参考 Infinite Canvas 的 API 设置写法 */
+/** Classify a model id as a chat-completion LLM (excludes image/video/audio generators). */
+export function isChatCompletionModelName(model: string): boolean {
+  const value = model.trim().toLowerCase();
+  if (!value || isVideoGenerationModelName(value) || isAudioModelName(value)) {
     return false;
   }
   const imageMarker =
@@ -114,6 +136,8 @@ export interface CustomApiProvider {
   models: string[];
   /** 视频生成模型：与图像模型分开，避免在图片节点中误选。 */
   videoModels: string[];
+  /** 音频模型（语音合成 / 音色克隆 / 音乐生成）：与图片模型分开，避免下拉里混入 TTS。 */
+  audioModels: string[];
   /** Chat LLM models for text tasks. */
   chatModels: string[];
   createdAt: number;
@@ -121,12 +145,16 @@ export interface CustomApiProvider {
   requestMode: 'sync' | 'async';
   /** 接口协议: images=/v1/images/generations; responses=/v1/responses; chat=/v1/chat/completions(gpt-image 中转平台常用) */
   protocol: 'images' | 'responses' | 'chat';
-  /** Images 协议的参考图字段: 大多数中转平台用 image, 原生 GPT Image 用 input_image。 */
-  referenceImageField: 'image' | 'input_image';
+  /** Images 协议的参考图字段: 大多数中转平台用 image, 原生 GPT Image 用 input_image, 知鸟 AI 用 images(纯数组), 字子动画用 reference_images(对象数组)。 */
+  referenceImageField: 'image' | 'input_image' | 'images' | 'reference_images';
   /** 参考图编码: auto 按字段选择, 也可显式指定纯 Base64 / data URL / URL。 */
   referenceImageEncoding: 'auto' | 'data_url' | 'raw_base64' | 'url';
   /** Images 协议的图生图传输方式。auto 使用平台/模型专用适配，默认保持 generations JSON。 */
   imageTransport: 'auto' | 'generations_json' | 'edits_multipart' | 'apimart_json';
+  /** 需要公网参考素材的视频模型可使用的上传接口完整 URL。 */
+  referenceAssetUploadUrl?: string;
+  /** 参考素材上传接口的 Bearer 令牌，仅保存在本机设置。 */
+  referenceAssetUploadToken?: string;
   capabilities?: CustomApiCapabilities;
 }
 
@@ -381,7 +409,7 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
     detectionSource: value.detectionSource === 'manual' ? 'manual' : 'probe',
     confidence: value.confidence === 'high' ? 'high' : 'low',
     imageProtocol: protocol === 'responses' || protocol === 'images' || protocol === 'chat' ? protocol : 'unknown',
-    imageReferenceField: field === 'input_image' || field === 'image' || field === 'image_urls' ? field : 'unknown',
+    imageReferenceField: field === 'input_image' || field === 'image' || field === 'image_urls' || field === 'images' ? field : 'unknown',
     imageReferenceEncoding: imageEncoding === 'data_url' || imageEncoding === 'raw_base64' || imageEncoding === 'url' || imageEncoding === 'multipart'
       ? imageEncoding
       : 'unknown',
@@ -394,7 +422,7 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
       ? videoEncoding
       : 'unknown',
     taskProtocol: taskProtocol === 'unknown' ? 'unknown' : 'generic',
-    ...(videoTransport === 'sub2api-video' || videoTransport === 'zzdh-v8-video' || videoTransport === 'binghuo-video'
+    ...(videoTransport === 'sub2api-video' || videoTransport === 'zzdh-v8-video' || videoTransport === 'binghuo-video' || videoTransport === 'zhiniao-video'
       ? { videoTransport }
       : {}),
   };
@@ -421,9 +449,20 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
       const chatModels = Array.isArray(item.chatModels)
         ? item.chatModels.map((model) => String(model).trim()).filter(Boolean)
         : [];
+      const audioModels = Array.from(new Set([
+        ...(Array.isArray(item.audioModels)
+          ? item.audioModels.map((model) => String(model).trim()).filter(Boolean)
+          : []),
+        ...configuredModels.filter(isAudioModelName),
+      ]));
       const videoModelIds = new Set(videoModels.map((model) => model.toLowerCase()));
+      const audioModelIds = new Set(audioModels.map((model) => model.toLowerCase()));
       const models = configuredModels.filter(
-        (model) => !videoModelIds.has(model.toLowerCase()) && !isVideoGenerationModelName(model)
+        (model) =>
+          !videoModelIds.has(model.toLowerCase())
+          && !audioModelIds.has(model.toLowerCase())
+          && !isVideoGenerationModelName(model)
+          && !isAudioModelName(model)
       );
 
       return {
@@ -433,6 +472,7 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         apiKey: normalizeApiKey(String(item.apiKey ?? '')),
         models,
         videoModels,
+        audioModels,
         chatModels,
         createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
         // Older builds silently assigned async to every custom platform even
@@ -446,7 +486,13 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
               ? ('chat' as const)
               : ('images' as const),
         referenceImageField:
-          item.referenceImageField === 'input_image' ? ('input_image' as const) : ('image' as const),
+          item.referenceImageField === 'input_image'
+            ? ('input_image' as const)
+            : item.referenceImageField === 'images'
+              ? ('images' as const)
+              : item.referenceImageField === 'reference_images'
+                ? ('reference_images' as const)
+                : ('image' as const),
         referenceImageEncoding:
           item.referenceImageEncoding === 'raw_base64' || item.referenceImageEncoding === 'url' || item.referenceImageEncoding === 'data_url'
             ? (item.referenceImageEncoding as 'raw_base64' | 'url' | 'data_url')
@@ -457,6 +503,8 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
           || item.imageTransport === 'apimart_json'
             ? (item.imageTransport as 'generations_json' | 'edits_multipart' | 'apimart_json')
             : ('auto' as const),
+        referenceAssetUploadUrl: String(item.referenceAssetUploadUrl ?? '').trim().replace(/\/+$/, '') || undefined,
+        referenceAssetUploadToken: String(item.referenceAssetUploadToken ?? '').trim() || undefined,
         capabilities: normalizeCustomApiCapabilities(item.capabilities),
       };
     })

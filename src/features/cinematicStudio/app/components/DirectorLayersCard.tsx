@@ -357,6 +357,9 @@ export default function DirectorLayersCard({
                   {isOpen && layer.key === "activeReferences" && (
                     <div className="director-generated-layer-text">{text || t.directorLayerEmpty}</div>
                   )}
+                  {isOpen && (layer.key === "optics" || layer.key === "camera") && (
+                    <div className="director-generated-layer-text">{text || t.directorLayerEmpty}</div>
+                  )}
                 </div>
               );
             })}

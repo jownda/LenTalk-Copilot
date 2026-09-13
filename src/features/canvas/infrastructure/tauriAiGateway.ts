@@ -1,10 +1,12 @@
 import {
+  generateAudio,
   generateImage,
   generateJimengCliVideo,
   generateVideo,
   getGenerateImageJob,
   setApiKey,
   submitGenerateImageJob,
+  uploadZhiniaoReferenceAsset,
 } from '@/commands/ai';
 import {
   createCompactImageDataUrl,
@@ -14,8 +16,11 @@ import { useSettingsStore } from '@/stores/settingsStore';
 import { JIMENG_CLI_PROVIDER_ID, resolveVideoModelProfile } from '@/features/canvas/models';
 import { toVideoGenerationRequest } from '@/features/canvas/application/videoGeneration';
 import { isRjmVideoApiBaseUrl } from '@/commands/videoApi';
+import { isZzdhProvider } from '@/commands/zzdhApi';
 
-import type { AiGateway, GenerateImagePayload, GenerateVideoPayload } from '../application/ports';
+import type { AiGateway, GenerateAudioPayload, GenerateImagePayload, GenerateVideoPayload } from '../application/ports';
+import { generateWanCliVideo } from '@/commands/wanCli';
+import { useWanCliStore } from '@/stores/wanCliStore';
 
 function mergeNegativePrompt(
   payload: GenerateImagePayload
@@ -35,6 +40,71 @@ function withAspectRatioRequirement(prompt: string, aspectRatio: string): string
     return prompt;
   }
   return `${prompt.trim()}\n\n[Required image aspect ratio: ${match[1]}:${match[2]}. Compose for this exact frame without borders or empty padding.]`;
+}
+
+/** 站点根地址: 去掉结尾斜杠与 /v1 后缀, 避免拼出 /v1/v1/... */
+function toSiteRootBaseUrl(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/+$/, '').replace(/\/v1$/i, '').replace(/\/+$/, '');
+}
+
+function isZhiniaoProviderId(providerId: string): boolean {
+  return providerId.trim().replace(/^custom:/i, '').toLowerCase() === 'zhiniao';
+}
+
+function isZhiniaoBaseUrl(baseUrl: string): boolean {
+  return /(?:cuai\.token6688\.com|api\.tokengo\.love)/i.test(baseUrl);
+}
+
+/**
+ * 知鸟 AI(TokenGo)的生成类参考字段只收公网 URL, 不收 data URL / 原始字节。
+ * 本地素材先走 POST /v1/files 换取公网 URL 再提交; 已是 http(s) 的原样透传。
+ * 上传失败**必须显式报错**: 原样回退 data URL 会被上游直接关闭连接(只表现为
+ * "Network error: error sending request"), 完全看不出是参考图不合规导致的。
+ */
+async function resolveZhiniaoImageReferences(
+  referenceImages: string[] | undefined,
+  providerId: string
+): Promise<string[] | undefined> {
+  if (!referenceImages?.length) return referenceImages;
+  const store = useSettingsStore.getState();
+  const customApi = store.customApis.find((api) => `custom:${api.id}` === providerId);
+  const baseUrl = toSiteRootBaseUrl(customApi?.baseUrl ?? '');
+  if (!customApi || (!isZhiniaoProviderId(providerId) && !isZhiniaoBaseUrl(baseUrl))) {
+    return referenceImages;
+  }
+  const apiKey = (store.apiKeys[providerId] ?? '').trim();
+  if (!baseUrl || !apiKey) return referenceImages;
+  const headers = { Authorization: `Bearer ${apiKey}` };
+  return await Promise.all(
+    referenceImages.map(async (source, index) => {
+      if (/^https?:\/\//i.test(source.trim())) return source;
+      try {
+        return await uploadZhiniaoReferenceAsset(source, baseUrl, headers, index);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`知鸟 AI 参考图上传失败(第 ${index + 1} 张): ${reason}`);
+      }
+    })
+  );
+}
+
+/**
+ * 知鸟 AI 把「参考图的用途」放在 model 参数 mode 上, 默认 text-to-image 会**忽略**
+ * 随请求送来的参考图。有参考图时必须显式声明, 否则会静默退化成纯文生图:
+ * 单图 = image-edit(基于已有图片编辑), 多图 = multi-reference(多图融合生成)。
+ */
+export function withZhiniaoImageMode<
+  T extends { model: string; extraParams?: Record<string, unknown>; referenceImages?: string[] }
+>(payload: T): T {
+  const usableReferences = (payload.referenceImages ?? []).filter((item) => item?.trim());
+  if (usableReferences.length === 0) return payload;
+  const extraParams: Record<string, unknown> = { ...(payload.extraParams ?? {}) };
+  if (extraParams.image_generation_mode != null) return payload;
+  const providerId = payload.model.split('/')[0]?.replace(/^custom:/i, '') ?? '';
+  const baseUrl = typeof extraParams.provider_base_url === 'string' ? extraParams.provider_base_url : '';
+  if (!isZhiniaoProviderId(providerId) && !isZhiniaoBaseUrl(baseUrl)) return payload;
+  extraParams.image_generation_mode = usableReferences.length > 1 ? 'multi-reference' : 'image-edit';
+  return { ...payload, extraParams };
 }
 
 /**
@@ -70,7 +140,11 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
   );
   const referenceImageField = extraParams.reference_image_field === 'input_image'
     ? 'input_image'
-    : customApi?.referenceImageField ?? 'image';
+    : extraParams.reference_image_field === 'images'
+      ? 'images'
+      : extraParams.reference_image_field === 'reference_images'
+        ? 'reference_images'
+        : customApi?.referenceImageField ?? 'image';
   const referenceImageEncoding = typeof extraParams.reference_image_encoding === 'string'
     ? extraParams.reference_image_encoding
     : customApi?.referenceImageEncoding ?? 'auto';
@@ -86,6 +160,12 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
   extraParams.protocol = protocol;
   if (customApi?.baseUrl) {
     extraParams.provider_base_url = customApi.baseUrl;
+  }
+  if (customApi?.referenceAssetUploadUrl) {
+    extraParams.reference_asset_upload_url = customApi.referenceAssetUploadUrl;
+  }
+  if (customApi?.referenceAssetUploadToken) {
+    extraParams.reference_asset_upload_token = customApi.referenceAssetUploadToken;
   }
   if (customApi?.capabilities?.confidence === 'high' && customApi.capabilities.videoSubmitPath) {
     extraParams.video_submit_path = customApi.capabilities.videoSubmitPath;
@@ -103,8 +183,16 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
     extraParams.video_reference_encoding = customApi.capabilities.videoReferenceEncoding;
   }
   const providerBaseUrl = customApi?.baseUrl?.trim().toLowerCase() ?? '';
-  if (providerId === 'zizidonghua' || providerBaseUrl.includes('zizidonghua.com')) {
+  // 字子动画: 图片/视频/音频三条链路都走专有协议(见 @/commands/zzdhApi)。
+  // 判据同时看平台 id(可能是中文「字子动画」)与 Base URL。
+  if (isZzdhProvider(providerId, providerBaseUrl)) {
     extraParams.video_transport = 'zzdh-v8-video';
+    extraParams.audio_transport = 'zzdh-openai-audio';
+    // 参考图字段: 官方模型页是 reference_images 对象数组。通用 'image' 写法平台虽会
+    // 自动对齐, 这里仍统一升级成文档原生字段; 用户显式选过 images / input_image 则保留。
+    if (referenceImageField === 'image') {
+      extraParams.reference_image_field = 'reference_images';
+    }
   }
   if (providerId === 'sub2api-video' || isRjmVideoApiBaseUrl(providerBaseUrl)) {
     extraParams.video_transport = 'sub2api-video';
@@ -114,6 +202,9 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
   }
   if (providerId === 'wgspai' || providerBaseUrl.includes('api.wgspai.cn')) {
     extraParams.video_transport = 'wgspai-video';
+  }
+  if (providerId === 'zhiniao' || providerBaseUrl.includes('cuai.token6688.com') || providerBaseUrl.includes('api.tokengo.love')) {
+    extraParams.video_transport = 'zhiniao-video';
   }
   if (extraParams.reference_image_field == null) {
     extraParams.reference_image_field = referenceImageField;
@@ -189,6 +280,37 @@ async function normalizeReferenceUrls(
   );
 }
 
+/**
+ * 平台侧是**远端**去下载参考图的: 本机/内网地址(loopback、私网段、.local 等)
+ * 远端一定取不到, 实测提交后异步失败 `invalid reference image: upstream returned HTTP 502`。
+ * 这类地址必须先在本地读成 data URL 再交出, 不能当公网 URL 直传。
+ */
+export function isPubliclyReachableHttpUrl(source: string): boolean {
+  let host: string;
+  try {
+    host = new URL(source).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (!host) return false;
+  if (host === 'localhost' || host.endsWith('.localhost')) return false;
+  if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan')) return false;
+  if (host.startsWith('[') || host.includes(':')) {
+    // IPv6: 环回 / 唯一本地地址(fc00::/7) / 链路本地(fe80::/10)
+    const bare = host.replace(/^\[|\]$/g, '');
+    if (bare === '::1' || bare === '::') return false;
+    if (/^f[cd]/i.test(bare) || /^fe[89ab]/i.test(bare)) return false;
+  }
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    const [a, b] = host.split('.').map(Number);
+    if (a === 0 || a === 127 || a === 10) return false;
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 169 && b === 254) return false;
+  }
+  return true;
+}
+
 /** 视频参考图默认使用 OpenAI Video API 可接受的 URL / Data URL。 */
 async function normalizeVideoReferenceImages(
   imageUrls: string[] | undefined,
@@ -215,7 +337,8 @@ async function normalizeVideoReferenceImages(
       // 官方文档: 素材支持公网 HTTP(S) URL 或 data: Base64。
       // 公网 URL 且路径带图片扩展名 → 直接无损透传(官方最清晰方式);
       // 无扩展名的签名 URL 可能被上游拒绝(Kling 文档), 才压缩成 data URL 兜底。
-      if (/\.(jpe?g|png|webp|gif|bmp|heic)(\?|#|$)/i.test(source)) {
+      if (isPubliclyReachableHttpUrl(source)
+        && /\.(jpe?g|png|webp|gif|bmp|heic)(\?|#|$)/i.test(source)) {
         return source;
       }
       try {
@@ -265,11 +388,16 @@ export const tauriAiGateway: AiGateway = {
   generateImage: async (payload: GenerateImagePayload) => {
     // 显式同步通道(等价 Infinite-Canvas /api/generate): 强制 request_mode=sync,
     // 后端走 generate_image 直出, 不创建异步任务, 避免 poll 不收敛导致的永久转圈。
-    const injected = injectCustomApiRequestMode(payload, 'sync');
+    const injected = withZhiniaoImageMode(injectCustomApiRequestMode(payload, 'sync'));
     // 图片直传: http URL 透传。本地多张大图为自定义中转压缩到安全请求体大小。
     const normalizedReferenceImages = await normalizeReferenceUrls(injected.referenceImages, {
       compactCustomImages: injected.model.startsWith('custom:'),
     });
+    // 知鸟 AI 只收公网 URL, 本地参考图先上传 /v1/files 换 URL。
+    const referenceImages = await resolveZhiniaoImageReferences(
+      normalizedReferenceImages,
+      injected.model.split('/')[0] ?? ''
+    );
     const mergedExtraParams = mergeNegativePrompt(injected);
 
     return await generateImage({
@@ -281,18 +409,22 @@ export const tauriAiGateway: AiGateway = {
       model: payload.model,
       size: payload.size,
       aspect_ratio: payload.aspectRatio,
-      reference_images: normalizedReferenceImages,
+      reference_images: referenceImages,
       extra_params: mergedExtraParams,
     });
   },
   submitGenerateImageJob: async (payload: GenerateImagePayload) => {
     // 只有平台明确配置 requestMode=async 时才进入任务轮询；普通 OpenAI
     // 兼容接口走同步提交，避免猜测不存在的查询端点导致永久 pending。
-    const injected = injectCustomApiRequestMode(payload);
+    const injected = withZhiniaoImageMode(injectCustomApiRequestMode(payload));
     // 图片直传: http URL 透传。本地多张大图为自定义中转压缩到安全请求体大小。
     const normalizedReferenceImages = await normalizeReferenceUrls(injected.referenceImages, {
       compactCustomImages: injected.model.startsWith('custom:'),
     });
+    const referenceImages = await resolveZhiniaoImageReferences(
+      normalizedReferenceImages,
+      injected.model.split('/')[0] ?? ''
+    );
     const mergedExtraParams = mergeNegativePrompt(injected);
     return await submitGenerateImageJob({
       prompt: localizeReferenceTokens(
@@ -303,12 +435,26 @@ export const tauriAiGateway: AiGateway = {
       model: payload.model,
       size: payload.size,
       aspect_ratio: payload.aspectRatio,
-      reference_images: normalizedReferenceImages,
+      reference_images: referenceImages,
       extra_params: mergedExtraParams,
     });
   },
   getGenerateImageJob,
   generateVideo: async (payload: GenerateVideoPayload) => {
+    if (payload.model.startsWith('wan-cli/')) {
+      return generateWanCliVideo({
+        client_job_id: payload.clientJobId,
+        executable: useWanCliStore.getState().executable,
+        prompt: payload.prompt,
+        model_version: payload.model.slice('wan-cli/'.length),
+        duration: payload.duration,
+        aspect_ratio: payload.aspectRatio,
+        video_resolution: payload.videoResolution,
+        image_mode: payload.imageMode,
+        reference_images: await normalizeReferenceUrls(payload.referenceImages),
+        reference_audio: payload.referenceAudio,
+      });
+    }
     if (payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`)) {
       const referenceImages = await normalizeReferenceUrls(payload.referenceImages);
       const referenceAudio = payload.referenceAudio
@@ -366,6 +512,26 @@ export const tauriAiGateway: AiGateway = {
       image_mode: payload.imageMode,
       reference_images: referenceImages,
       reference_audio: referenceAudio,
+      extra_params: injected.extraParams,
+    });
+  },
+  /**
+   * 音频生成(语音合成 / 音效 / 音乐)。
+   * 音频接口是**同步**返回音频文件字节, 没有异步任务轮询;
+   * 字子动画走 /v1/audio/speech | /v1/audio/sound-effects | /v1/audio/music,
+   * 其它平台退化为 OpenAI 兼容 /v1/audio/speech。
+   */
+  generateAudio: async (payload: GenerateAudioPayload) => {
+    const injected = injectCustomApiRequestMode(payload);
+    return await generateAudio({
+      prompt: payload.prompt,
+      model: injected.model,
+      audio_kind: payload.audioKind,
+      voice: payload.voice,
+      format: payload.format,
+      duration_seconds: payload.durationSeconds,
+      music_length_ms: payload.musicLengthMs,
+      lyrics: payload.lyrics,
       extra_params: injected.extraParams,
     });
   },

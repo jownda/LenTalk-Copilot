@@ -80,3 +80,27 @@ export interface VideoModelDefinition {
   profileLabel?: string;
   profileUnavailableReason?: string;
 }
+
+/** 音频生成类型: 语音合成 / 音效 / 音乐(对应平台三个端点)。 */
+export type AudioModelKind = 'speech' | 'sound-effects' | 'music';
+
+export interface AudioModelDefinition {
+  id: string;
+  mediaType: 'audio';
+  displayName: string;
+  providerId: string;
+  description: string;
+  expectedDurationMs?: number;
+  /** 端点类型(决定提交路径与请求体字段)。 */
+  audioKind: AudioModelKind;
+  /** 音色候选(语音合成); 平台可选项时留空。 */
+  voiceOptions?: string[];
+  defaultVoice?: string;
+  /** 输出格式候选(语音合成)。 */
+  formatOptions?: string[];
+  defaultFormat?: string;
+  /** 音乐时长候选(毫秒)。 */
+  musicLengthOptionsMs?: number[];
+  defaultMusicLengthMs?: number;
+  pricing?: ModelPricingDefinition;
+}
