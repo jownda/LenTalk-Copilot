@@ -24,7 +24,7 @@ import {
   type SeamlessMosaicNodeData,
 } from './canvasNodes';
 import { DEFAULT_NODE_DISPLAY_NAME } from './nodeDisplay';
-import { getAudioModel, getDefaultAudioModelId, getDefaultImageModelId, getImageModel } from '../models';
+import { getAudioModel, getDefaultAudioModelId, getDefaultImageModelId, getDefaultVideoModelId, getImageModel } from '../models';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { createCinematicProjectId } from '@/features/cinematicStudio/app/projectId';
 
@@ -120,6 +120,7 @@ const imageEditNodeDefinition: CanvasNodeDefinition<ImageEditNodeData> = {
       requestAspectRatio: AUTO_REQUEST_ASPECT_RATIO,
       prompt: '',
       model: defaultModelId,
+      customPrice: useSettingsStore.getState().customModelPrices[defaultModelId] ?? null,
       size: '2K' as ImageSize,
       extraParams: {},
       isGenerating: false,
@@ -136,15 +137,19 @@ const videoGenNodeDefinition: CanvasNodeDefinition<VideoGenNodeData> = {
   visibleInMenu: true,
   capabilities: { toolbar: true, promptInput: false },
   connectivity: { sourceHandle: true, targetHandle: true, connectMenu: { fromSource: true, fromTarget: false } },
-  createDefaultData: () => ({
-    displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.videoGen],
-    prompt: '',
-    model: '',
-    duration: useSettingsStore.getState().lastVideoDuration,
-    aspectRatio: '16:9',
-    resolution: '720p',
-    imageMode: 'reference',
-  }),
+  createDefaultData: () => {
+    const model = getDefaultVideoModelId();
+    return {
+      displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.videoGen],
+      prompt: '',
+      model,
+      customPrice: useSettingsStore.getState().customModelPrices[model] ?? null,
+      duration: useSettingsStore.getState().lastVideoDuration,
+      aspectRatio: '16:9',
+      resolution: '720p',
+      imageMode: 'reference',
+    };
+  },
   defaultSize: { width: 420, height: 360 },
 };
 

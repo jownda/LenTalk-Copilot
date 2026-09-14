@@ -451,6 +451,8 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const addEdge = useCanvasStore((state) => state.addEdge);
   const apiKeys = useSettingsStore((state) => state.apiKeys);
   const customApis = useSettingsStore((state) => state.customApis);
+  const customModelPrices = useSettingsStore((state) => state.customModelPrices);
+  const setCustomModelPrice = useSettingsStore((state) => state.setCustomModelPrice);
   const grsaiNanoBananaProModel = useSettingsStore((state) => state.grsaiNanoBananaProModel);
   const showNodePrice = useSettingsStore((state) => state.showNodePrice);
   const priceDisplayCurrencyMode = useSettingsStore((state) => state.priceDisplayCurrencyMode);
@@ -595,6 +597,22 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     [customApis, resolvedPriceDisplay, selectedModel?.providerId],
   );
   const displayedPriceBadge = resolvedPriceDisplay ?? recommendedPriceBadge;
+  const customPrice = data.customPrice !== undefined
+    ? (typeof data.customPrice === 'string' ? data.customPrice.trim() : '')
+    : (customModelPrices[selectedModel.id] ?? '');
+  const priceBadgeLabel = customPrice || displayedPriceBadge?.label || '[无价格]';
+
+  const handlePriceChange = useCallback((value: string | null) => {
+    updateNodeData(id, { customPrice: value });
+    setCustomModelPrice(selectedModel.id, value);
+  }, [id, selectedModel.id, setCustomModelPrice, updateNodeData]);
+
+  useEffect(() => {
+    const legacyPrice = typeof data.customPrice === 'string' ? data.customPrice.trim() : '';
+    if (legacyPrice && !customModelPrices[selectedModel.id]) {
+      setCustomModelPrice(selectedModel.id, legacyPrice);
+    }
+  }, [customModelPrices, data.customPrice, selectedModel.id, setCustomModelPrice]);
 
   const supportedAspectRatioValues = useMemo(
     () => selectedModel.aspectRatios.map((item) => item.value),
@@ -1144,10 +1162,13 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         icon={<Sparkles className="h-4 w-4" />}
         titleText={resolvedTitle}
         rightSlot={
-          displayedPriceBadge ? (
+          showNodePrice ? (
             <NodePriceBadge
-              label={displayedPriceBadge.label}
-              title={resolvedPriceTooltip ?? displayedPriceBadge.nativeLabel}
+              label={priceBadgeLabel}
+              customPrice={customPrice || null}
+              editable
+              onPriceChange={handlePriceChange}
+              title={resolvedPriceTooltip ?? displayedPriceBadge?.nativeLabel}
             />
           ) : undefined
         }
@@ -1266,7 +1287,10 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
           selectedAspectRatio={selectedAspectRatio}
           aspectRatioOptions={aspectRatioOptions}
           onModelChange={(modelId) => {
-            updateNodeData(id, { model: modelId });
+            updateNodeData(id, {
+              model: modelId,
+              customPrice: customModelPrices[modelId] ?? null,
+            });
           }}
           onResolutionChange={(resolution) => {
             updateNodeData(id, { size: resolution as ImageSize });

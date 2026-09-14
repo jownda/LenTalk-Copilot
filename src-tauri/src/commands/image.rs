@@ -1126,7 +1126,12 @@ fn normalize_extension(raw_ext: &str) -> String {
 }
 
 fn extension_from_mime(mime: &str) -> String {
-    let normalized = mime.trim().to_ascii_lowercase();
+    let normalized = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
     match normalized.as_str() {
         "image/png" => "png".to_string(),
         "image/jpeg" => "jpg".to_string(),
@@ -1135,6 +1140,12 @@ fn extension_from_mime(mime: &str) -> String {
         "image/gif" => "gif".to_string(),
         "image/bmp" => "bmp".to_string(),
         "image/avif" => "avif".to_string(),
+        "video/mp4" | "application/mp4" => "mp4".to_string(),
+        "video/webm" => "webm".to_string(),
+        "video/quicktime" => "mov".to_string(),
+        "video/x-msvideo" => "avi".to_string(),
+        "video/x-matroska" => "mkv".to_string(),
+        "video/mpeg" => "mpeg".to_string(),
         _ => "png".to_string(),
     }
 }
@@ -1570,7 +1581,7 @@ pub async fn save_image_source_to_downloads(
 pub async fn save_image_source_to_path(source: String, target_path: String) -> Result<String, String> {
     let trimmed_source = source.trim();
     if trimmed_source.is_empty() {
-        return Err("Image source is empty".to_string());
+        return Err("Media source is empty".to_string());
     }
 
     let trimmed_target = target_path.trim();
@@ -1588,7 +1599,7 @@ pub async fn save_image_source_to_path(source: String, target_path: String) -> R
     }
 
     std::fs::write(&output_path, bytes)
-        .map_err(|e| format!("Failed to save image to target path: {}", e))?;
+        .map_err(|e| format!("Failed to save media to target path: {}", e))?;
 
     Ok(output_path.to_string_lossy().to_string())
 }

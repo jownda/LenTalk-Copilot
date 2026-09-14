@@ -332,6 +332,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
   const apiKeys = useSettingsStore((state) => state.apiKeys);
   const customApis = useSettingsStore((state) => state.customApis);
+  const customModelPrices = useSettingsStore((state) => state.customModelPrices);
+  const setCustomModelPrice = useSettingsStore((state) => state.setCustomModelPrice);
   const showNodePrice = useSettingsStore((state) => state.showNodePrice);
   const priceDisplayCurrencyMode = useSettingsStore((state) => state.priceDisplayCurrencyMode);
   const usdToCnyRate = useSettingsStore((state) => state.usdToCnyRate);
@@ -585,6 +587,24 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     [customApis, price, selectedModel?.providerId],
   );
   const nodePrice = price ?? recommendedPriceBadge;
+  const customPrice = data.customPrice !== undefined
+    ? (typeof data.customPrice === 'string' ? data.customPrice.trim() : '')
+    : (selectedModel ? customModelPrices[selectedModel.id] ?? '' : '');
+  const priceBadgeLabel = customPrice || nodePrice?.label || '[无价格]';
+
+  const handlePriceChange = useCallback((value: string | null) => {
+    if (!selectedModel) return;
+    updateNodeData(id, { customPrice: value });
+    setCustomModelPrice(selectedModel.id, value);
+  }, [id, selectedModel, setCustomModelPrice, updateNodeData]);
+
+  useEffect(() => {
+    if (!selectedModel) return;
+    const legacyPrice = typeof data.customPrice === 'string' ? data.customPrice.trim() : '';
+    if (legacyPrice && !customModelPrices[selectedModel.id]) {
+      setCustomModelPrice(selectedModel.id, legacyPrice);
+    }
+  }, [customModelPrices, data.customPrice, selectedModel, setCustomModelPrice]);
 
   useEffect(() => {
     updateNodeInternals(id);
@@ -1061,7 +1081,15 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         titleText={title}
         editable
         onTitleChange={(displayName) => updateNodeData(id, { displayName })}
-        rightSlot={nodePrice ? <NodePriceBadge label={nodePrice.label} title={nodePrice.nativeLabel} /> : null}
+        rightSlot={showNodePrice ? (
+          <NodePriceBadge
+            label={priceBadgeLabel}
+            customPrice={customPrice || null}
+            editable
+            onPriceChange={handlePriceChange}
+            title={nodePrice?.nativeLabel}
+          />
+        ) : null}
       />
       <div className="relative min-h-0 flex-1 rounded-md border border-border-dark bg-bg-dark/60">
         <div className="relative h-full min-h-0">
@@ -1451,7 +1479,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                               }`}
                             onClick={(event) => {
                               event.stopPropagation();
-                              updateNodeData(id, { model: model.id });
+                              updateNodeData(id, {
+                                model: model.id,
+                                customPrice: customModelPrices[model.id] ?? null,
+                              });
                               setShowModelPicker(false);
                             }}
                           >

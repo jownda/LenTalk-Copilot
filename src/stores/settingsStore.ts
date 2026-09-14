@@ -206,6 +206,8 @@ interface SettingsState {
   lastImageModelId: string | null;
   /** 最近一次选择的视频生成时长；AI 视频和即梦 CLI 新节点共用。 */
   lastVideoDuration: number;
+  /** 用户为 AI 图片/视频模型设置的价格覆盖，key 为模型唯一 ID。 */
+  customModelPrices: Record<string, string>;
   /** 已实际成功生成过的模型，供拉取模型列表标记为可用。 */
   usableModelIds: string[];
   setProviderApiKey: (providerId: string, key: string) => void;
@@ -238,6 +240,7 @@ interface SettingsState {
   setEnableUpdateDialog: (enabled: boolean) => void;
   setLastImageModelId: (modelId: string | null) => void;
   setLastVideoDuration: (duration: number) => void;
+  setCustomModelPrice: (modelId: string, price: string | null) => void;
   markModelAvailable: (modelId: string) => void;
 }
 
@@ -381,6 +384,24 @@ function normalizeUsableModelIds(input: unknown): string[] {
       .map((modelId) => modelId.trim())
       .filter(Boolean)
   )).slice(-500);
+}
+
+function normalizeCustomModelPrices(input: unknown): Record<string, string> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return {};
+  }
+
+  return Object.entries(input as Record<string, unknown>).reduce<Record<string, string>>(
+    (result, [modelId, price]) => {
+      const normalizedModelId = modelId.trim();
+      const normalizedPrice = typeof price === 'string' ? price.trim() : '';
+      if (normalizedModelId && normalizedPrice) {
+        result[normalizedModelId] = normalizedPrice;
+      }
+      return result;
+    },
+    {},
+  );
 }
 
 function normalizeJimengCliSettings(input: unknown): JimengCliSettings {
@@ -575,6 +596,7 @@ export const useSettingsStore = create<SettingsState>()(
       enableUpdateDialog: true,
       lastImageModelId: null,
       lastVideoDuration: 5,
+      customModelPrices: {},
       usableModelIds: [],
       setProviderApiKey: (providerId, key) =>
         set((state) => ({
@@ -679,6 +701,20 @@ export const useSettingsStore = create<SettingsState>()(
       setEnableUpdateDialog: (enabled) => set({ enableUpdateDialog: enabled }),
       setLastImageModelId: (modelId) => set({ lastImageModelId: modelId }),
       setLastVideoDuration: (duration) => set({ lastVideoDuration: normalizeVideoDuration(duration) }),
+      setCustomModelPrice: (modelId, price) => {
+        const normalizedModelId = modelId.trim();
+        if (!normalizedModelId) return;
+        const normalizedPrice = typeof price === 'string' ? price.trim() : '';
+        set((state) => {
+          const customModelPrices = { ...state.customModelPrices };
+          if (normalizedPrice) {
+            customModelPrices[normalizedModelId] = normalizedPrice;
+          } else {
+            delete customModelPrices[normalizedModelId];
+          }
+          return { customModelPrices };
+        });
+      },
       markModelAvailable: (modelId) => {
         const normalizedModelId = modelId.trim();
         if (!normalizedModelId) return;
@@ -690,7 +726,7 @@ export const useSettingsStore = create<SettingsState>()(
     {
       name: SETTINGS_STORAGE_KEY,
       storage: createJSONStorage(() => settingsStorage),
-      version: 17,
+      version: 18,
       onRehydrateStorage: () => {
         return (_state, error) => {
           if (error) {
@@ -715,6 +751,7 @@ export const useSettingsStore = create<SettingsState>()(
           enableUpdateDialog?: boolean;
           lastImageModelId?: string | null;
           lastVideoDuration?: number | string | null;
+          customModelPrices?: unknown;
           usableModelIds?: unknown;
           enableStoryboardGenGridPreviewShortcut?: boolean;
           showStoryboardGenAdvancedRatioControls?: boolean;
@@ -750,6 +787,7 @@ export const useSettingsStore = create<SettingsState>()(
             enableUpdateDialog: state.enableUpdateDialog ?? true,
             lastImageModelId: typeof state.lastImageModelId === 'string' && state.lastImageModelId ? state.lastImageModelId : null,
             lastVideoDuration: normalizeVideoDuration(state.lastVideoDuration),
+            customModelPrices: normalizeCustomModelPrices(state.customModelPrices),
             usableModelIds: normalizeUsableModelIds(state.usableModelIds),
             enableStoryboardGenGridPreviewShortcut:
               state.enableStoryboardGenGridPreviewShortcut ?? false,
@@ -782,6 +820,7 @@ export const useSettingsStore = create<SettingsState>()(
           enableUpdateDialog: state.enableUpdateDialog ?? true,
           lastImageModelId: typeof state.lastImageModelId === 'string' && state.lastImageModelId ? state.lastImageModelId : null,
           lastVideoDuration: normalizeVideoDuration(state.lastVideoDuration),
+          customModelPrices: normalizeCustomModelPrices(state.customModelPrices),
           usableModelIds: normalizeUsableModelIds(state.usableModelIds),
           enableStoryboardGenGridPreviewShortcut:
             state.enableStoryboardGenGridPreviewShortcut ?? false,

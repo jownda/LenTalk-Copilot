@@ -1,8 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NodeToolbar as ReactFlowNodeToolbar } from '@xyflow/react';
-import { getCurrentWindow } from '@tauri-apps/api/window';
-import { Copy, Crop, Download, FolderOpen, Library, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Trash2, Unlink2 } from 'lucide-react';
-import { save } from '@tauri-apps/plugin-dialog';
+import { Copy, Crop, Download, Library, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Trash2, Unlink2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import {
@@ -21,16 +19,12 @@ import { canvasEventBus } from '@/features/canvas/application/canvasServices';
 import { getNodeToolPlugins } from '@/features/canvas/tools';
 import type { ToolIconKey } from '@/features/canvas/tools';
 import { UiChipButton, UiPanel, UiModal } from '@/components/ui';
-import {
-  saveImageSourceToDirectory,
-  saveImageSourceToPath,
-} from '@/commands/image';
-import { isWindowsDesktopRuntime } from '@/platform/runtime';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useCanvasStore } from '@/stores/canvasStore';
-import { UI_POPOVER_TRANSITION_MS } from '@/components/ui/motion';
 import { sanitizeStoryboardText } from '@/features/canvas/application/storyboardText';
 import { buildGenerationErrorReport } from '@/features/canvas/application/generationErrorReport';
+import { showErrorDialog } from '@/features/canvas/application/errorDialog';
+import { saveMediaSourceWithDialog } from '@/features/canvas/application/mediaDownload';
 import { importVideoUrlToAsset } from '@/features/library/importAssets';
 import { useAssetLibraryStore } from '@/features/library/assetStore';
 import {
@@ -104,7 +98,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const ungroupNode = useCanvasStore((state) => state.ungroupNode);
   const canReupload = isUploadNode(node) && Boolean(node.data.imageUrl);
   const canReuploadMedia = isAudioNode(node) && Boolean(node.data.sourcePath);
-  const downloadPresetPaths = useSettingsStore((state) => state.downloadPresetPaths);
   const libraries = useAssetLibraryStore((state) => state.libraries);
   const categories = useAssetLibraryStore((state) => state.categories);
   const activeLibraryId = useAssetLibraryStore((state) => state.activeLibraryId);
@@ -112,16 +105,12 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const ignoreAtTagWhenCopyingAndGenerating = useSettingsStore(
     (state) => state.ignoreAtTagWhenCopyingAndGenerating
   );
-  const [downloadMenu, setDownloadMenu] = useState<{ x: number; y: number } | null>(null);
-  const [isDownloadMenuVisible, setIsDownloadMenuVisible] = useState(false);
   const [isLibraryDialogOpen, setIsLibraryDialogOpen] = useState(false);
   const [isSavingToLibrary, setIsSavingToLibrary] = useState(false);
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
-  const downloadMenuRef = useRef<HTMLDivElement | null>(null);
   const copyTextFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyErrorFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const downloadMenuCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const imageSource = useMemo(() => {
     if (isUploadNode(node) || isImageEditNode(node) || isExportImageNode(node)) {
       return node.data.imageUrl || node.data.previewImageUrl || null;
@@ -133,6 +122,27 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     : null;
   const downloadSource = imageSource || videoSource;
   const canHandleMedia = Boolean(downloadSource);
+  const handleDownloadMedia = useCallback(async () => {
+    if (!downloadSource) {
+      return;
+    }
+
+    const mediaType = videoSource ? 'video' : 'image';
+    try {
+      await saveMediaSourceWithDialog({
+        source: downloadSource,
+        nodeId: node.id,
+        mediaType,
+      });
+    } catch (error) {
+      console.error('Failed to save media from node toolbar', error);
+      void showErrorDialog(
+        mediaType === 'video' ? '视频下载失败' : '图片下载失败',
+        '下载失败',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }, [downloadSource, node.id, videoSource]);
   const libraryCategories = useMemo(
     () => categories.filter((category) => category.libraryId === (activeLibraryId || libraries[0]?.id)),
     [activeLibraryId, categories, libraries]
@@ -164,17 +174,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     [generationError, generationErrorDetails, node.data, t]
   );
 
-  const closeDownloadMenu = useCallback(() => {
-    setIsDownloadMenuVisible(false);
-    if (downloadMenuCloseTimerRef.current) {
-      clearTimeout(downloadMenuCloseTimerRef.current);
-    }
-    downloadMenuCloseTimerRef.current = setTimeout(() => {
-      setDownloadMenu(null);
-      downloadMenuCloseTimerRef.current = null;
-    }, UI_POPOVER_TRANSITION_MS);
-  }, []);
-
   const resolveToolLabel = useCallback((toolType: NodeToolType) => {
     if (toolType === NODE_TOOL_TYPES.crop) {
       return t('tool.crop');
@@ -195,50 +194,12 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   }, [t]);
 
   useEffect(() => {
-    if (!downloadMenu) {
-      return;
-    }
-
-    const onPointerDown = (event: PointerEvent) => {
-      const menuElement = downloadMenuRef.current;
-      if (!menuElement) {
-        closeDownloadMenu();
-        return;
-      }
-      if (menuElement.contains(event.target as Node)) {
-        return;
-      }
-      closeDownloadMenu();
-    };
-
-    window.addEventListener('pointerdown', onPointerDown, true);
-    return () => {
-      window.removeEventListener('pointerdown', onPointerDown, true);
-    };
-  }, [closeDownloadMenu, downloadMenu]);
-
-  useEffect(() => {
-    if (!downloadMenu) {
-      return;
-    }
-    const frameId = requestAnimationFrame(() => {
-      setIsDownloadMenuVisible(true);
-    });
-    return () => {
-      cancelAnimationFrame(frameId);
-    };
-  }, [downloadMenu]);
-
-  useEffect(() => {
     return () => {
       if (copyTextFeedbackTimerRef.current) {
         clearTimeout(copyTextFeedbackTimerRef.current);
       }
       if (copyErrorFeedbackTimerRef.current) {
         clearTimeout(copyErrorFeedbackTimerRef.current);
-      }
-      if (downloadMenuCloseTimerRef.current) {
-        clearTimeout(downloadMenuCloseTimerRef.current);
       }
     };
   }, []);
@@ -331,52 +292,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       generationRetryRequested: true,
     });
   }, [canRetryGeneration, generationError, generationErrorDetails, node, node.id, t, updateNodeData]);
-
-  const handleDownloadSaveAs = useCallback(async () => {
-    if (!downloadSource) {
-      return;
-    }
-
-    try {
-      const extension = videoSource ? 'mp4' : 'png';
-      const defaultPath = `node-${node.id}.${extension}`;
-      const isWindows = isWindowsDesktopRuntime();
-      // Windows 原生文件框会以当前聚焦窗口作为父窗口，从而稳定显示在主窗口前。
-      if (isWindows) {
-        await getCurrentWindow().setFocus();
-      }
-
-      const selectedPath = await save(isWindows
-        ? {
-          title: videoSource ? '保存视频' : '保存图片',
-          defaultPath,
-          filters: [{ name: videoSource ? 'MP4 视频' : 'PNG 图片', extensions: [extension] }],
-        }
-        : { defaultPath });
-      if (!selectedPath || Array.isArray(selectedPath)) {
-        return;
-      }
-      await saveImageSourceToPath(downloadSource, selectedPath);
-      closeDownloadMenu();
-    } catch (error) {
-      console.error('Failed to save image with save-as', error);
-    }
-  }, [closeDownloadMenu, downloadSource, node.id, videoSource]);
-
-  const handleDownloadToPreset = useCallback(
-    async (targetDir: string) => {
-      if (!downloadSource) {
-        return;
-      }
-      try {
-        await saveImageSourceToDirectory(downloadSource, targetDir, `node-${node.id}`);
-        closeDownloadMenu();
-      } catch (error) {
-        console.error('Failed to save image to preset dir', error);
-      }
-    },
-    [closeDownloadMenu, downloadSource, node.id]
-  );
 
   const handleAddVideoToLibrary = useCallback(async (categoryId: string | null) => {
     if (!videoSource || isSavingToLibrary) {
@@ -513,15 +428,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
             onClick={(event) => {
               event.stopPropagation();
-              if (downloadPresetPaths.length === 0) {
-                void handleDownloadSaveAs();
-                return;
-              }
-              setDownloadMenu({
-                x: event.clientX,
-                y: event.clientY,
-              });
-              setIsDownloadMenuVisible(false);
+              void handleDownloadMedia();
             }}
           >
             <Download className="h-3.5 w-3.5" />
@@ -550,7 +457,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
               onClick={(event) => {
                 event.stopPropagation();
-                closeDownloadMenu();
                 canvasEventBus.publish('group-node/rename', { nodeId: node.id });
               }}
             >
@@ -562,7 +468,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS} hover:!border-amber-400/60 hover:!bg-amber-500/20 hover:!text-amber-200`}
               onClick={(event) => {
                 event.stopPropagation();
-                closeDownloadMenu();
                 ungroupNode(node.id);
               }}
             >
@@ -576,7 +481,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} border-red-500/45 bg-red-500/15 px-2.5 text-xs text-red-300 hover:bg-red-500/25`}
           onClick={(event) => {
             event.stopPropagation();
-            closeDownloadMenu();
             deleteNode(node.id);
           }}
         >
@@ -585,47 +489,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
         </UiChipButton>
       </UiPanel>
 
-      {!isImageEdit && downloadMenu && (
-        <div
-          ref={downloadMenuRef}
-          className={`fixed z-[120] min-w-[280px] rounded-xl border border-[rgba(255,255,255,0.18)] bg-surface-dark/95 p-2 shadow-2xl backdrop-blur-sm transition-opacity duration-150 ${isDownloadMenuVisible ? 'opacity-100' : 'opacity-0'}`}
-          style={{ left: `${downloadMenu.x}px`, top: `${downloadMenu.y}px` }}
-        >
-          <button
-            type="button"
-            className="flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
-            onClick={() => {
-              void handleDownloadSaveAs();
-            }}
-          >
-            <Download className="h-4 w-4" />
-            {t('nodeToolbar.saveAs')}
-          </button>
-
-          {downloadPresetPaths.length > 0 ? (
-            <div className="mt-1 space-y-1 border-t border-[rgba(255,255,255,0.1)] pt-2">
-              {downloadPresetPaths.map((path) => (
-                <button
-                  key={path}
-                  type="button"
-                  className="flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-left text-xs text-text-dark transition-colors hover:bg-bg-dark"
-                  onClick={() => {
-                    void handleDownloadToPreset(path);
-                  }}
-                  title={path}
-                >
-                  <FolderOpen className="h-3.5 w-3.5 shrink-0 text-text-muted" />
-                  <span className="truncate">{path}</span>
-                </button>
-              ))}
-            </div>
-          ) : (
-            <div className="mt-1 border-t border-[rgba(255,255,255,0.1)] px-2.5 pt-2 text-xs text-text-muted">
-              {t('nodeToolbar.noDownloadPresetPathsHint')}
-            </div>
-          )}
-        </div>
-      )}
       {!isImageEdit && (
         <UiModal
           isOpen={isLibraryDialogOpen}

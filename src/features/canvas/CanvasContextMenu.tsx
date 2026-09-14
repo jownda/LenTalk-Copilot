@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ClipboardPaste, Copy, Library, Trash2 } from "lucide-react";
+import { ClipboardPaste, Copy, Download, Library, Trash2 } from "lucide-react";
 
 interface AssetCategoryOption {
   id: string;
@@ -9,6 +9,8 @@ interface AssetCategoryOption {
 interface CanvasContextMenuProps {
   position: { x: number; y: number };
   imageUrl?: string | null;
+  downloadUrl?: string | null;
+  downloadMediaType?: "image" | "video" | null;
   nodeId?: string | null;
   canPaste: boolean;
   categories: AssetCategoryOption[];
@@ -17,12 +19,15 @@ interface CanvasContextMenuProps {
   onCopyNode: (nodeId: string) => void;
   onPaste: () => void;
   onAddImageToLibrary: (imageUrl: string, categoryId: string) => void;
+  onDownloadMedia: (url: string, mediaType: "image" | "video") => void;
   onClose: () => void;
 }
 
 export function CanvasContextMenu({
   position,
   imageUrl,
+  downloadUrl,
+  downloadMediaType,
   nodeId,
   canPaste,
   categories,
@@ -31,6 +36,7 @@ export function CanvasContextMenu({
   onCopyNode,
   onPaste,
   onAddImageToLibrary,
+  onDownloadMedia,
   onClose,
 }: CanvasContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
@@ -98,6 +104,17 @@ export function CanvasContextMenu({
 
       {(nodeId || (!imageUrl && failedNodeCount > 0)) && <div className="my-1 border-t border-border-dark/70" />}
 
+      {downloadUrl && downloadMediaType && (
+        <button
+          type="button"
+          onClick={() => onDownloadMedia(downloadUrl, downloadMediaType)}
+          className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
+        >
+          <Download className="h-4 w-4 text-accent" />
+          <span>下载{downloadMediaType === "video" ? "视频" : "图片"}</span>
+        </button>
+      )}
+
       {imageUrl ? (
         isCategoryPickerOpen ? (
           <div className="max-h-[224px] overflow-y-auto">
@@ -123,7 +140,7 @@ export function CanvasContextMenu({
             <span>添加到素材库</span>
           </button>
         )
-      ) : (
+      ) : !downloadUrl ? (
         <button
           type="button"
           disabled={failedNodeCount === 0}
@@ -134,7 +151,7 @@ export function CanvasContextMenu({
           <span>清理失败节点</span>
           {failedNodeCount > 0 && <span className="ml-auto text-xs text-text-muted">{failedNodeCount}</span>}
         </button>
-      )}
+      ) : null}
     </div>
   );
 }

@@ -37,6 +37,8 @@ export type ImageSize = (typeof IMAGE_SIZES)[number];
 
 export interface NodeDisplayData {
   displayName?: string;
+  /** 用户在 AI 图片/视频节点上手动覆盖的价格显示文本。 */
+  customPrice?: string | null;
   [key: string]: unknown;
 }
 

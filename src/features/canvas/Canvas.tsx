@@ -70,6 +70,7 @@ import { CanvasContextMenu } from "./CanvasContextMenu";
 import { SelectedNodeOverlay } from "./ui/SelectedNodeOverlay";
 import { NodeToolDialog } from "./ui/NodeToolDialog";
 import { ImageViewerModal } from "./ui/ImageViewerModal";
+import { saveMediaSourceWithDialog } from "./application/mediaDownload";
 import { VideoFrameExtractDialog } from "./ui/VideoFrameExtractDialog";
 import { ShortcutSettingsDialog } from "./ui/ShortcutSettingsDialog";
 import { AssetLibraryPanel } from "@/features/library/AssetLibraryPanel";
@@ -159,6 +160,25 @@ function resolveContextMenuImageUrl(node: CanvasNode): string | null {
     candidates.find((imageUrl): imageUrl is string => typeof imageUrl === "string" && imageUrl.trim().length > 0) ??
     null
   );
+}
+
+function resolveContextMenuMedia(node: CanvasNode): { url: string; mediaType: "image" | "video" } | null {
+  const data = node.data as {
+    imageUrl?: unknown;
+    outputImageUrl?: unknown;
+    inputImageUrl?: unknown;
+    sourcePath?: unknown;
+    mediaType?: unknown;
+  };
+  if (node.type === CANVAS_NODE_TYPES.audio && data.mediaType === "video") {
+    return typeof data.sourcePath === "string" && data.sourcePath.trim()
+      ? { url: data.sourcePath.trim(), mediaType: "video" }
+      : null;
+  }
+  const url = [data.imageUrl, data.outputImageUrl, data.inputImageUrl].find(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
+  return url ? { url: url.trim(), mediaType: "image" } : null;
 }
 
 function resolveCanvasNodeAbsolutePosition(nodeId: string, nodeMap: Map<string, CanvasNode>): { x: number; y: number } {
@@ -428,6 +448,8 @@ export function Canvas() {
     position: { x: number; y: number };
     flowPosition: { x: number; y: number };
     imageUrl: string | null;
+    downloadUrl: string | null;
+    downloadMediaType: "image" | "video" | null;
     nodeId: string | null;
   } | null>(null);
   const [menuPosition, setMenuPosition] = useState({ x: 0, y: 0 });
@@ -1804,6 +1826,8 @@ export function Canvas() {
       setMenuAllowedTypes(undefined);
       setPendingConnectStart(null);
       setPreviewConnectionVisual(null);
+      const contextNode = nodeId ? nodes.find((node) => node.id === nodeId) : null;
+      const contextMedia = contextNode ? resolveContextMenuMedia(contextNode) : null;
       setCanvasContextMenu({
         position: {
           x: event.clientX - containerRect.left,
@@ -1811,10 +1835,12 @@ export function Canvas() {
         },
         flowPosition: reactFlowInstance.screenToFlowPosition({ x: event.clientX, y: event.clientY }),
         imageUrl,
+        downloadUrl: contextMedia?.url ?? null,
+        downloadMediaType: contextMedia?.mediaType ?? null,
         nodeId,
       });
     },
-    [reactFlowInstance],
+    [nodes, reactFlowInstance],
   );
 
   const handleCanvasContextMenu = useCallback(
@@ -1862,6 +1888,27 @@ export function Canvas() {
     );
     setCanvasContextMenu(null);
   }, [canvasContextMenu]);
+
+  const handleContextDownloadMedia = useCallback(
+    (url: string, mediaType: "image" | "video") => {
+      const context = canvasContextMenu;
+      if (!context) return;
+      setCanvasContextMenu(null);
+      void saveMediaSourceWithDialog({
+        source: url,
+        nodeId: context.nodeId ?? "canvas-media",
+        mediaType,
+      }).catch((error) => {
+        console.error("Failed to save media from context menu", error);
+        void showErrorDialog(
+          mediaType === "video" ? "视频下载失败" : "图片下载失败",
+          "下载失败",
+          error instanceof Error ? error.message : String(error),
+        );
+      });
+    },
+    [canvasContextMenu],
+  );
 
   const handleAddImageToLibrary = useCallback(async (imageUrl: string, categoryId: string) => {
     setCanvasContextMenu(null);
@@ -3313,6 +3360,8 @@ export function Canvas() {
         <CanvasContextMenu
           position={canvasContextMenu.position}
           imageUrl={canvasContextMenu.imageUrl}
+          downloadUrl={canvasContextMenu.downloadUrl}
+          downloadMediaType={canvasContextMenu.downloadMediaType}
           nodeId={canvasContextMenu.nodeId}
           canPaste={Boolean(copiedSnapshotRef.current?.nodes.length)}
           categories={activeAssetLibraryCategories}
@@ -3321,6 +3370,7 @@ export function Canvas() {
           onCopyNode={handleContextCopyNode}
           onPaste={handleContextPaste}
           onAddImageToLibrary={handleAddImageToLibrary}
+          onDownloadMedia={handleContextDownloadMedia}
           onClose={() => setCanvasContextMenu(null)}
         />
       )}
