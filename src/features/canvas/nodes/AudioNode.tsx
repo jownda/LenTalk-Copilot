@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -9,6 +9,7 @@ import { CANVAS_NODE_TYPES, type AudioNodeData } from '@/features/canvas/domain/
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
+import { MediaDimensionsLabel, type MediaDimensions } from '@/features/canvas/ui/MediaDimensions';
 import { canvasEventBus } from '@/features/canvas/application/canvasServices';
 import { prepareNodeImage, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import {
@@ -68,6 +69,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const [isUploading, setIsUploading] = useState(false);
   const [isVideoViewerOpen, setIsVideoViewerOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const [videoDimensions, setVideoDimensions] = useState<MediaDimensions | null>(null);
 
   const resolvedTitle = useMemo(
     () => resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, data),
@@ -83,6 +85,17 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     typeof data.generationStartedAt === 'number' ? data.generationStartedAt : null;
   const generationDurationMs =
     typeof data.generationDurationMs === 'number' ? data.generationDurationMs : 180000;
+
+  useEffect(() => {
+    setVideoDimensions(null);
+  }, [mediaSrc]);
+
+  const handleVideoMetadata = useCallback((event: SyntheticEvent<HTMLVideoElement>) => {
+    const video = event.currentTarget;
+    if (video.videoWidth > 0 && video.videoHeight > 0) {
+      setVideoDimensions({ width: video.videoWidth, height: video.videoHeight });
+    }
+  }, []);
 
   // 生成中: 定时刷新以驱动模拟进度条(与 AI 图片结果节点一致)
   useEffect(() => {
@@ -350,6 +363,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                 preload="metadata"
                 poster={data.previewImageUrl ? resolveImageDisplayUrl(data.previewImageUrl) : undefined}
                 className="nodrag h-full w-full object-contain"
+                onLoadedMetadata={handleVideoMetadata}
                 onLoadedData={() => void handleAutoCaptureThumbnail()}
                 onDoubleClick={(event) => {
                   event.stopPropagation();
@@ -357,6 +371,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                 }}
               />
             </div>
+            <MediaDimensionsLabel dimensions={videoDimensions} />
             {/* 底部操作行 */}
             <div className="mt-1.5 flex shrink-0 items-center gap-2">
                 <button

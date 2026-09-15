@@ -197,6 +197,7 @@ pub fn run() {
             asset_library::load_asset_library_state,
             asset_library::save_asset_library_state,
             asset_library::persist_library_asset_binary,
+            asset_library::persist_library_asset_binary_chunk,
             asset_library::persist_library_asset_file,
             asset_library::extract_video_thumbnail,
             cinematic_studio::project_save,

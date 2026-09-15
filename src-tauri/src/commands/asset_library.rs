@@ -277,6 +277,54 @@ pub fn persist_library_asset_binary(
     Ok(path.to_string_lossy().to_string())
 }
 
+/// 分块写入备份资产。每个分块单独经过 IPC，避免大视频一次性序列化成巨大数组。
+#[tauri::command]
+pub fn persist_library_asset_binary_chunk(
+    app: AppHandle,
+    bytes: Vec<u8>,
+    file_id: String,
+    extension: String,
+    chunk_index: u32,
+    is_last: bool,
+) -> Result<Option<String>, String> {
+    if bytes.is_empty() {
+        return Err("Asset chunk is empty".to_string());
+    }
+    let safe_id: String = file_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(80)
+        .collect();
+    if safe_id.is_empty() {
+        return Err("Asset chunk file id is empty".to_string());
+    }
+
+    let directory = app_data_dir(&app)?.join("library-assets");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("Failed to create asset directory: {error}"))?;
+    let path = directory.join(format!("backup-{}.{}", safe_id, safe_extension(&extension)));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    if chunk_index == 0 {
+        options.truncate(true);
+    } else {
+        options.append(true);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("Failed to open backup asset file: {error}"))?;
+    use std::io::Write;
+    file.write_all(&bytes)
+        .map_err(|error| format!("Failed to write backup asset chunk: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("Failed to flush backup asset chunk: {error}"))?;
+    if is_last {
+        Ok(Some(path.to_string_lossy().to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// 从用户在原生文件选择器中选中的本地路径复制媒体文件，避免大文件经 IPC 转成字节数组。
 #[tauri::command]
 pub fn persist_library_asset_file(

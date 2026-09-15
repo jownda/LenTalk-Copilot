@@ -345,11 +345,23 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
     setBackupError(null);
     setBackupNotice(null);
     try {
-      const summary = await importLibraryBackupZip(file);
+      const summary = await importLibraryBackupZip(file, (progress) => {
+        if (progress.phase === 'reading') {
+          setBackupNotice('正在读取备份文件…');
+          return;
+        }
+        if (progress.phase === 'restoring') {
+          const total = Math.max(1, progress.total);
+          setBackupNotice(`正在恢复素材文件（${Math.min(progress.current + 1, total)}/${total}）…`);
+          return;
+        }
+        setBackupNotice('正在保存素材库…');
+      });
       setBackupNotice(
-        t('assetLibrary.importDone', '导入成功(素材 {{assets}} 个 / 提示词库 {{libs}} 个),即将刷新…', {
+        t('assetLibrary.importDone', '导入成功(素材 {{assets}} 个 / 提示词库 {{libs}} 个){{failed}},即将刷新…', {
           assets: summary.assetCount,
           libs: summary.promptCount,
+          failed: summary.failedAssetFiles > 0 ? `，${summary.failedAssetFiles} 个文件恢复失败` : '',
         })
       );
       // 数据已写入 localStorage,刷新页面让各 store 重新 hydrate

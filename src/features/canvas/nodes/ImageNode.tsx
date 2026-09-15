@@ -30,6 +30,7 @@ import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
+import { MediaDimensionsLabel, useImageDimensions } from '@/features/canvas/ui/MediaDimensions';
 import { useCanvasStore } from '@/stores/canvasStore';
 
 type ImageNodeProps = NodeProps & {
@@ -146,11 +147,12 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
     if (!data.imageUrl) return null;
     return resolveImageDisplayUrl(data.imageUrl);
   }, [data.imageUrl]);
+  const imageDimensions = useImageDimensions(originalImageUrl || imageSource);
 
   return (
     <div
       className={`
-        group relative overflow-visible rounded-[var(--node-radius)] border bg-surface-dark/85 p-0 transition-colors duration-150
+        group relative flex flex-col overflow-visible rounded-[var(--node-radius)] border bg-surface-dark/85 p-0 transition-colors duration-150
         ${hasGenerationError
           ? (selected
             ? 'border-red-400 shadow-[0_0_0_1px_rgba(248,113,113,0.42)]'
@@ -174,7 +176,7 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
       />
 
       <div
-        className={`relative h-full w-full overflow-hidden rounded-[var(--node-radius)] ${hasGenerationError ? 'bg-[rgba(127,29,29,0.2)]' : 'bg-bg-dark'}`}
+        className={`relative min-h-0 flex-1 w-full overflow-hidden rounded-[var(--node-radius)] ${hasGenerationError ? 'bg-[rgba(127,29,29,0.2)]' : 'bg-bg-dark'}`}
       >
         {data.imageUrl ? (
           <CanvasNodeImage
@@ -216,6 +218,7 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
           </div>
         )}
       </div>
+      <MediaDimensionsLabel dimensions={imageDimensions} />
 
       <Handle
         type="target"

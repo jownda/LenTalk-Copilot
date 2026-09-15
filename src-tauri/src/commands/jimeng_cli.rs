@@ -5,6 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use base64::Engine;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -17,6 +20,13 @@ static JIMENG_CLI_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLI_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const JIMENG_CLI_MAX_REFERENCE_IMAGES: usize = 9;
+
+/// Windows: 阻止控制台子进程弹出终端窗口。
+/// 即梦 CLI 一次任务会反复调用（提交 + 每 3 秒 query_result + queue_count），
+/// 不设置该标志时每个子进程都会闪出一个黑窗口，关闭窗口等于杀掉子进程导致命令失败。
+/// macOS 无此机制，保持原有行为。
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Deserialize)]
 pub struct GenerateJimengCliVideoRequest {
@@ -439,6 +449,12 @@ fn run_cli(executable: &str, arguments: &[String]) -> Result<String, String> {
     }
     #[cfg(not(target_os = "windows"))]
     command.args(arguments);
+    #[cfg(target_os = "windows")]
+    {
+        // 子进程不再弹出终端窗口；同时确保 stdio 全部被管道接管，
+        // 避免 CLI 因无控制台而尝试分配新的控制台窗口。
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

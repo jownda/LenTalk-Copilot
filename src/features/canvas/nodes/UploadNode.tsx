@@ -42,6 +42,7 @@ import {
   shouldUseOriginalImageByZoom,
 } from '@/features/canvas/application/imageData';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
+import { MediaDimensionsLabel, useImageDimensions } from '@/features/canvas/ui/MediaDimensions';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 
@@ -329,6 +330,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
       : data.previewImageUrl || data.imageUrl;
     return picked ? resolveImageDisplayUrl(picked) : null;
   }, [data.imageUrl, data.previewImageUrl, transientPreviewUrl, zoom]);
+  const imageDimensions = useImageDimensions(data.imageUrl ? resolveImageDisplayUrl(data.imageUrl) : imageSource);
 
   useEffect(() => {
     updateNodeInternals(id);
@@ -337,7 +339,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
   return (
     <div
       className={`
-        group relative overflow-visible rounded-[var(--node-radius)] border bg-surface-dark/85 p-0 transition-colors duration-150
+        group relative flex flex-col overflow-visible rounded-[var(--node-radius)] border bg-surface-dark/85 p-0 transition-colors duration-150
         ${selected
           ? 'border-accent shadow-[0_0_0_1px_rgba(59,130,246,0.32)]'
           : 'border-[rgba(15,23,42,0.22)] hover:border-[rgba(15,23,42,0.34)] dark:border-[rgba(255,255,255,0.22)] dark:hover:border-[rgba(255,255,255,0.34)]'}
@@ -358,7 +360,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
 
       {data.imageUrl || transientPreviewUrl ? (
         <div
-          className="block h-full w-full overflow-hidden rounded-[var(--node-radius)] bg-bg-dark"
+          className="block min-h-0 h-full w-full flex-1 overflow-hidden rounded-[var(--node-radius)] bg-bg-dark"
         >
           <CanvasNodeImage
             src={imageSource ?? ''}
@@ -378,6 +380,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
           </div>
         </label>
       )}
+      <MediaDimensionsLabel dimensions={imageDimensions} />
       <input
         ref={inputRef}
         type="file"

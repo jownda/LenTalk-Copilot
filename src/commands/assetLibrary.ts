@@ -20,6 +20,23 @@ export async function persistLibraryAssetBinary(
   });
 }
 
+/** 分块持久化备份素材，避免大视频通过一次 IPC 调用传输。 */
+export async function persistLibraryAssetBinaryChunk(
+  bytes: Uint8Array,
+  fileId: string,
+  extension: string,
+  chunkIndex: number,
+  isLast: boolean,
+): Promise<string | null> {
+  return await invoke<string | null>('persist_library_asset_binary_chunk', {
+    bytes: Array.from(bytes),
+    fileId,
+    extension,
+    chunkIndex,
+    isLast,
+  });
+}
+
 /** 直接复制本地媒体文件，避免视频内容经 Tauri IPC 传输。 */
 export async function persistLibraryAssetFile(
   sourcePath: string,

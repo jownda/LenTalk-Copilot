@@ -482,11 +482,7 @@ interface ProviderBinaryResponse {
   text(): Promise<string>;
 }
 
-/**
- * Desktop provider requests must use Rust's native HTTP client. A number of
- * custom video gateways do not enable CORS, so WebView fetch is only retained
- * for the browser-only build.
- */
+/** Generic JSON provider requests use Rust's native desktop HTTP client. */
 export async function requestProviderJson(
   url: string,
   init: { method?: string; headers?: Record<string, string>; body?: string }
@@ -516,6 +512,33 @@ export async function requestProviderJson(
   };
 }
 
+function decodeBase64Bytes(value: string): Uint8Array {
+  const binary = atob(value);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+/** Upload a reference asset through the WebView fetch transport. */
+async function requestProviderMultipartViaWebView(
+  url: string,
+  init: {
+    headers?: Record<string, string>;
+    fieldName: string;
+    filename: string;
+    contentType: string;
+    bodyBase64: string;
+  },
+): Promise<ProviderJsonResponse> {
+  const bytes = decodeBase64Bytes(init.bodyBase64);
+  const form = new FormData();
+  form.append(init.fieldName, new Blob([bytes], { type: init.contentType }), init.filename);
+  const response = await fetch(url, { method: 'POST', headers: init.headers, body: form });
+  return {
+    ok: response.ok,
+    status: response.status,
+    text: () => response.text(),
+  };
+}
+
 /** Upload a reference asset through the native client or browser fetch. */
 export async function requestProviderMultipart(
   url: string,
@@ -528,31 +551,48 @@ export async function requestProviderMultipart(
   }
 ): Promise<ProviderJsonResponse> {
   if (!isTauri()) {
-    const binary = atob(init.bodyBase64);
-    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-    const form = new FormData();
-    form.append(init.fieldName, new Blob([bytes], { type: init.contentType }), init.filename);
-    const response = await fetch(url, { method: 'POST', headers: init.headers, body: form });
-    return {
-      ok: response.ok,
-      status: response.status,
-      text: () => response.text(),
-    };
+    return await requestProviderMultipartViaWebView(url, init);
   }
 
-  const result = await invoke<{ status: number; body: string }>('request_provider_multipart', {
-    url,
-    headers: init.headers ?? {},
-    fieldName: init.fieldName,
-    filename: init.filename,
-    contentType: init.contentType,
-    bodyBase64: init.bodyBase64,
-  });
-  return {
-    ok: result.status >= 200 && result.status < 300,
-    status: result.status,
-    text: async () => result.body,
-  };
+  // Windows' native TLS/DNS path can fail before the provider returns an HTTP
+  // response (for example, with "error sending request"). The WebView uses
+  // the same network path as the working browser/macOS flow, so try it first
+  // on Windows. Only a rejected fetch is eligible for fallback; an HTTP error
+  // must be returned as-is so the caller does not submit the upload twice.
+  let webViewError: unknown;
+  if (isWindowsDesktopRuntime()) {
+    try {
+      return await requestProviderMultipartViaWebView(url, init);
+    } catch (error) {
+      webViewError = error;
+    }
+  }
+
+  try {
+    const result = await invoke<{ status: number; body: string }>('request_provider_multipart', {
+      url,
+      headers: init.headers ?? {},
+      fieldName: init.fieldName,
+      filename: init.filename,
+      contentType: init.contentType,
+      bodyBase64: init.bodyBase64,
+    });
+    return {
+      ok: result.status >= 200 && result.status < 300,
+      status: result.status,
+      text: async () => result.body,
+    };
+  } catch (nativeError) {
+    if (webViewError) {
+      const describe = (error: unknown): string =>
+        error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Provider multipart request failed via WebView (${describe(webViewError)}); `
+        + `native fallback failed (${describe(nativeError)})`,
+      );
+    }
+    throw nativeError;
+  }
 }
 
 /**
