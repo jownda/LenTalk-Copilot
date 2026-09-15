@@ -16,6 +16,7 @@ import { useSettingsStore } from '@/stores/settingsStore';
 import { JIMENG_CLI_PROVIDER_ID, resolveVideoModelProfile } from '@/features/canvas/models';
 import { toVideoGenerationRequest } from '@/features/canvas/application/videoGeneration';
 import { isRjmVideoApiBaseUrl } from '@/commands/videoApi';
+import { isZhenjianProvider } from '@/commands/zhenjianApi';
 import { isZzdhProvider } from '@/commands/zzdhApi';
 
 import type { AiGateway, GenerateAudioPayload, GenerateImagePayload, GenerateVideoPayload } from '../application/ports';
@@ -183,6 +184,13 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
     extraParams.video_reference_encoding = customApi.capabilities.videoReferenceEncoding;
   }
   const providerBaseUrl = customApi?.baseUrl?.trim().toLowerCase() ?? '';
+  // 帧间 API 是异步任务协议，图片和视频都必须由前端专有链路提交、轮询并
+  // 携带 Bearer 下载结果。按 Base URL 兜底，用户手动新增或改平台名称也能命中。
+  if (isZhenjianProvider(providerId, providerBaseUrl)) {
+    extraParams.request_mode = 'async';
+    extraParams.image_transport = 'zhenjian-task-api';
+    extraParams.video_transport = 'zhenjian-task-api';
+  }
   // 字子动画: 图片/视频/音频三条链路都走专有协议(见 @/commands/zzdhApi)。
   // 判据同时看平台 id(可能是中文「字子动画」)与 Base URL。
   if (isZzdhProvider(providerId, providerBaseUrl)) {
@@ -388,7 +396,16 @@ export const tauriAiGateway: AiGateway = {
   generateImage: async (payload: GenerateImagePayload) => {
     // 显式同步通道(等价 Infinite-Canvas /api/generate): 强制 request_mode=sync,
     // 后端走 generate_image 直出, 不创建异步任务, 避免 poll 不收敛导致的永久转圈。
-    const injected = withZhiniaoImageMode(injectCustomApiRequestMode(payload, 'sync'));
+    const providerId = payload.model.split('/')[0]?.replace(/^custom:/i, '') ?? '';
+    const providerBaseUrl = typeof payload.extraParams?.provider_base_url === 'string'
+      ? payload.extraParams.provider_base_url
+      : useSettingsStore.getState().customApis.find((api) => api.id === providerId)?.baseUrl ?? '';
+    const injected = withZhiniaoImageMode(
+      injectCustomApiRequestMode(
+        payload,
+        isZhenjianProvider(providerId, providerBaseUrl) ? 'async' : 'sync',
+      ),
+    );
     // 图片直传: http URL 透传。本地多张大图为自定义中转压缩到安全请求体大小。
     const normalizedReferenceImages = await normalizeReferenceUrls(injected.referenceImages, {
       compactCustomImages: injected.model.startsWith('custom:'),

@@ -31,6 +31,44 @@ describe('isVideoGenerationModelName', () => {
 });
 
 describe('listVideoModels', () => {
+  it('uses synced official prices for custom image/video models', () => {
+    const previousCustomApis = useSettingsStore.getState().customApis;
+    const frame = {
+      id: 'zhenjian',
+      name: '帧间 API',
+      baseUrl: 'https://www.zhenjian.work',
+      apiKey: '',
+      models: ['image-model'],
+      videoModels: ['video-model'],
+      audioModels: [],
+      chatModels: [],
+      modelPrices: { 'image-model': 0.24, 'video-model': 1.5 },
+      createdAt: Date.now(),
+      requestMode: 'sync' as const,
+      protocol: 'images' as const,
+      referenceImageField: 'image' as const,
+      referenceImageEncoding: 'auto' as const,
+      imageTransport: 'generations_json' as const,
+    } satisfies CustomApiProvider;
+
+    useSettingsStore.setState({ customApis: [frame] });
+    try {
+      const image = listImageModels().find((model) => model.id.endsWith('/image-model'));
+      const video = listVideoModels().find((model) => model.id.endsWith('/video-model'));
+      expect(resolveModelPriceDisplay(image!, {
+        resolution: '1K',
+        language: 'zh-CN',
+      })?.label).toContain('0.24');
+      expect(resolveModelPriceDisplay(video!, {
+        resolution: '720p',
+        extraParams: { duration: 5 },
+        language: 'zh-CN',
+      })?.label).toContain('1.50');
+    } finally {
+      useSettingsStore.setState({ customApis: previousCustomApis });
+    }
+  });
+
   it('locks Sub2API Seedance durations, resolution, and aspect ratios', () => {
     const previousCustomApis = useSettingsStore.getState().customApis;
     const sub2Api: CustomApiProvider = {

@@ -45,7 +45,7 @@ export interface RecommendedVideoConfig {
   submitPath: string;
   queryPath: string;
   referenceEncoding: 'data_url' | 'raw_base64' | 'url';
-  transport: 'sub2api-video' | 'binghuo-video' | 'zhiniao-video';
+  transport: 'sub2api-video' | 'binghuo-video' | 'zhiniao-video' | 'zhenjian-task-api';
 }
 
 /** 已确认的 OpenAI Images 平台不通过 OPTIONS 猜测协议。 */
@@ -610,6 +610,35 @@ export const recommendedApis: RecommendedApi[] = [
       'black-forest-labs/FLUX.2-klein-9B',
     ],
   },
+  {
+    id: 'zhenjian',
+    name: '帧间 API',
+    baseUrl: 'https://www.zhenjian.work',
+    registerUrl: 'https://www.zhenjian.work/',
+    pricingUrl: 'https://www.zhenjian.work/api-docs',
+    summary: '图片 / 视频统一异步任务 API，按官方模型列表动态选择模型',
+    advantages: [
+      '图片生成与编辑分别走 /v1/images/generations、/v1/images/edits',
+      '视频走 /v1/videos，统一轮询 /v1/tasks/{task_id}',
+      '参考图片、视频、音频先上传 /v1/assets，再提交 asset id',
+      '结果下载自动携带 API Key 并落地到桌面端文件',
+    ],
+    // 平台模型经常动态变化，不在客户端硬编码模型名称；添加后点击“拉取模型”即可选择。
+    models: [],
+    videoModels: [],
+    imageConfig: {
+      protocol: 'images',
+      referenceImageField: 'image',
+      referenceImageEncoding: 'auto',
+      imageTransport: 'generations_json',
+    },
+    videoConfig: {
+      submitPath: '/v1/videos',
+      queryPath: '/v1/tasks/{taskId}',
+      referenceEncoding: 'data_url',
+      transport: 'zhenjian-task-api',
+    },
+  },
 ];
 
 /**
@@ -623,7 +652,7 @@ export const recommendedApis: RecommendedApi[] = [
  *   `videoProfiles.ts`、`tauriAiGateway.ts`、`commands/ai.ts`），与推荐列表无关，
  *   因此在「自定义平台」里手工新增同名/同 Base URL 的平台依旧会命中对应链路。
  */
-export const visibleRecommendedApiIds: readonly string[] = ['zhiniao', 'runninghub', 'modelscope'];
+export const visibleRecommendedApiIds: readonly string[] = ['zhiniao', 'zhenjian', 'runninghub', 'modelscope'];
 
 /** 按白名单过滤出需要在设置界面展示的推荐平台（隐藏 ≠ 删除配置）。 */
 export function listVisibleRecommendedApis(

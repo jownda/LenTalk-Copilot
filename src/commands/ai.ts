@@ -25,6 +25,12 @@ import {
   ZZDH_DEFAULT_AUDIO_FORMAT,
   type ZzdhReferenceRole,
 } from '@/commands/zzdhApi';
+import {
+  generateZhenjianImage,
+  generateZhenjianVideo,
+  extractZhenjianModels,
+  isZhenjianProvider,
+} from '@/commands/zhenjianApi';
 
 export interface GenerateRequest {
   prompt: string;
@@ -1419,6 +1425,9 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
     throw new Error('请在设置中配置视频模型对应的 Base URL、API Key 和模型名称');
   }
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  if (request.extra_params?.video_transport === 'zhenjian-task-api' || isZhenjianProvider(providerId, baseUrl)) {
+    return await generateZhenjianVideo(request);
+  }
   const rjmVideoBaseUrl = resolveRjmVideoApiBaseUrl(baseUrl);
   if (rjmVideoBaseUrl) {
     return await generateSub2ApiVideo(request, rjmVideoBaseUrl, apiModel, headers, true);
@@ -2174,6 +2183,14 @@ export async function generateImage(request: GenerateRequest): Promise<string> {
   });
 
   assertWindowsModelSupported(request);
+  const imageProviderId = request.model.split('/')[0] ?? '';
+  const imageBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
+    ? request.extra_params.provider_base_url
+    : '';
+  if (request.extra_params?.image_transport === 'zhenjian-task-api'
+    || isZhenjianProvider(imageProviderId, imageBaseUrl)) {
+    return await generateZhenjianImage(request);
+  }
   if (shouldUseWebviewGeneration(request)) {
     // 浏览器降级:直接请求 OpenAI 兼容文生图接口
     return await browserGenerateImage(request);
@@ -2228,6 +2245,30 @@ export async function submitGenerateImageJob(request: GenerateRequest): Promise<
   });
 
   assertWindowsModelSupported(request);
+  const imageProviderId = request.model.split('/')[0] ?? '';
+  const imageBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
+    ? request.extra_params.provider_base_url
+    : '';
+  if (request.extra_params?.image_transport === 'zhenjian-task-api'
+    || isZhenjianProvider(imageProviderId, imageBaseUrl)) {
+    const jobId = crypto.randomUUID();
+    browserGenerationJobs.set(jobId, {
+      job_id: jobId,
+      status: 'running',
+      result: null,
+      error: null,
+    });
+    void generateZhenjianImage(request).then(
+      (result) => browserGenerationJobs.set(jobId, { job_id: jobId, status: 'succeeded', result, error: null }),
+      (error) => browserGenerationJobs.set(jobId, {
+        job_id: jobId,
+        status: 'failed',
+        result: null,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return jobId;
+  }
   if (shouldUseWebviewGeneration(request)) {
     // 浏览器降级:同步发起生成,结果存内存 job map(与 Rust 异步任务语义一致)
     const jobId = crypto.randomUUID();
@@ -2288,6 +2329,7 @@ export interface ProviderConnectionResult {
   count?: number;
   status?: number;
   capabilities?: CustomApiCapabilities;
+  modelPrices?: Record<string, number>;
 }
 
 function normalizeBaseUrl(baseUrl: string): string {
@@ -2314,22 +2356,37 @@ async function httpFetchWithTimeout(url: string, init: RequestInit, timeoutMs = 
 }
 
 /** 从 OpenAI 兼容 /v1/models 响应中提取模型 id 列表 */
+function parseProviderPayload(raw: string): unknown {
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
 function extractModelsFromPayload(payload: unknown): string[] {
   if (!payload || typeof payload !== 'object') {
     return [];
   }
-  const data = (payload as { data?: unknown }).data;
-  if (!Array.isArray(data)) {
-    return [];
-  }
-  return data
-    .map((item) => {
-      if (item && typeof item === 'object' && typeof (item as { id?: unknown }).id === 'string') {
-        return (item as { id: string }).id;
+  const output = new Set<string>();
+  const visit = (value: unknown, allowDirect = false): void => {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, true));
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    for (const key of ['id', 'model', 'model_id', 'modelId', 'name']) {
+      const candidate = record[key];
+      if (typeof candidate === 'string' && candidate.trim() && (allowDirect || key !== 'name')) {
+        output.add(candidate.trim());
+        break;
       }
-      return '';
-    })
-    .filter((id) => id.length > 0);
+    }
+    for (const key of ['data', 'models', 'items', 'results']) visit(record[key], true);
+  };
+  visit(payload);
+  return [...output];
 }
 
 /** 仅验证自定义平台 Base URL 是否可达(不需要 Key) */
@@ -2360,6 +2417,24 @@ export async function testProviderConnection(
   baseUrl: string,
   apiKey: string
 ): Promise<ProviderConnectionResult> {
+  if (isZhenjianProvider('', baseUrl)) {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const response = await requestProviderJson(`${normalized}/v1/models`, {
+      method: 'GET',
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    });
+    const raw = await response.text();
+    if (!response.ok) throw new Error(`帧间 API /v1/models 返回 HTTP ${response.status}`);
+    const parsed = extractZhenjianModels(parseProviderPayload(raw));
+    return {
+      ok: true,
+      protocol: 'zhenjian-task-api',
+      models: parsed.models,
+      count: parsed.models.length,
+      status: response.status,
+      modelPrices: parsed.prices,
+    };
+  }
   if (shouldUseWebviewProviderRequests()) {
     // 浏览器降级:直接请求 /v1/models(受 CORS 限制,失败时给出友好提示)
     const url = `${normalizeBaseUrl(baseUrl)}/v1/models`;
@@ -2401,7 +2476,48 @@ export async function testProviderConnection(
 export async function detectProviderCapabilities(
   baseUrl: string,
   apiKey: string
-): Promise<{ capabilities: CustomApiCapabilities; models: string[]; endpoints: Record<string, unknown> }> {
+): Promise<{
+  capabilities: CustomApiCapabilities;
+  models: string[];
+  endpoints: Record<string, unknown>;
+  modelPrices?: Record<string, number>;
+}> {
+  if (isZhenjianProvider('', baseUrl)) {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const response = await requestProviderJson(`${normalized}/v1/models`, {
+      method: 'GET',
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    });
+    const raw = await response.text();
+    if (!response.ok) throw new Error(`/v1/models 返回 HTTP ${response.status}`);
+    const parsed = extractZhenjianModels(parseProviderPayload(raw));
+    return {
+      capabilities: {
+        detectedAt: Date.now(),
+        detectionSource: 'probe',
+        confidence: 'high',
+        imageProtocol: 'images',
+        imageReferenceField: 'images',
+        imageReferenceEncoding: 'multipart',
+        imageTransport: 'generations_json',
+        videoSubmitPath: '/v1/videos',
+        videoQueryPath: '/v1/tasks/{taskId}',
+        videoReferenceEncoding: 'multipart',
+        taskProtocol: 'generic',
+        videoTransport: 'zhenjian-task-api',
+      },
+      models: parsed.models,
+      modelPrices: parsed.prices,
+      endpoints: {
+        models: { path: '/v1/models', status: response.status },
+        images: { path: '/v1/images/generations' },
+        edits: { path: '/v1/images/edits' },
+        videos: { path: '/v1/videos' },
+        tasks: { path: '/v1/tasks/{taskId}' },
+        assets: { path: '/v1/assets' },
+      },
+    };
+  }
   if (!shouldUseWebviewProviderRequests()) {
     return await invoke<{ capabilities: CustomApiCapabilities; models: string[]; endpoints: Record<string, unknown> }>(
       'detect_provider_capabilities',
@@ -2485,7 +2601,18 @@ export async function detectProviderCapabilities(
 export async function fetchProviderModels(
   baseUrl: string,
   apiKey: string
-): Promise<{ models: string[]; count: number }> {
+): Promise<{ models: string[]; count: number; prices?: Record<string, number> }> {
+  if (isZhenjianProvider('', baseUrl)) {
+    const normalized = normalizeBaseUrl(baseUrl);
+    const response = await requestProviderJson(`${normalized}/v1/models`, {
+      method: 'GET',
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    });
+    const raw = await response.text();
+    if (!response.ok) throw new Error(`帧间 API /v1/models 返回 HTTP ${response.status}`);
+    const parsed = extractZhenjianModels(parseProviderPayload(raw));
+    return { models: parsed.models, count: parsed.models.length, prices: parsed.prices };
+  }
   if (shouldUseWebviewProviderRequests()) {
     // 浏览器降级:直接请求 /v1/models(受 CORS 限制,失败时给出友好提示)
     const url = `${normalizeBaseUrl(baseUrl)}/v1/models`;

@@ -650,6 +650,13 @@ const ZZDH_IMAGE_PRICES: Record<string, number> = {
 };
 
 function resolveCustomImagePricing(apiId: string, apiBaseUrl: string, model: string) {
+  const officialAmount = resolveOfficialModelPrice(
+    useSettingsStore.getState().customApis.find((api) => api.id === apiId)?.modelPrices,
+    model,
+  );
+  if (officialAmount != null) {
+    return { quote: () => ({ amount: officialAmount, currency: 'CNY' as const }) };
+  }
   const normalizedApiId = apiId.trim().toLowerCase();
   const isBinghuo = normalizedApiId === 'binghuo'
     || apiBaseUrl.trim().toLowerCase().includes('api.7tai.cc');
@@ -671,6 +678,15 @@ function resolveCustomImagePricing(apiId: string, apiBaseUrl: string, model: str
 }
 
 function resolveCustomVideoPricing(apiName: string, apiBaseUrl: string, model: string, isBinghuo: boolean) {
+  const customApi = useSettingsStore.getState().customApis.find((api) =>
+    api.name.trim().toLowerCase() === apiName.trim().toLowerCase()
+    || api.baseUrl.trim().toLowerCase() === apiBaseUrl.trim().toLowerCase());
+  const officialAmount = resolveOfficialModelPrice(customApi?.modelPrices, model);
+  if (officialAmount != null) {
+    return {
+      quote: () => ({ amount: officialAmount, currency: 'CNY' as const }),
+    };
+  }
   const normalizedApiName = apiName.trim().toLowerCase();
   const normalized = model.trim().toLowerCase();
   if (isBinghuo) {
@@ -702,6 +718,17 @@ function resolveCustomVideoPricing(apiName: string, apiBaseUrl: string, model: s
     return undefined;
   }
   return undefined;
+}
+
+function resolveOfficialModelPrice(
+  prices: Record<string, number> | undefined,
+  model: string,
+): number | undefined {
+  if (!prices) return undefined;
+  const normalizedModel = model.trim().toLowerCase();
+  const entry = Object.entries(prices).find(([modelId]) => modelId.trim().toLowerCase() === normalizedModel);
+  if (!entry || !Number.isFinite(entry[1]) || entry[1] < 0) return undefined;
+  return entry[1];
 }
 
 function buildCustomProviders(): ModelProviderDefinition[] {

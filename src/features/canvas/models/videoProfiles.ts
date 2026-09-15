@@ -1,7 +1,8 @@
 import { wanCliVideoProfile } from './wanCli';
 import { isZzdhProvider, ZZDH_VIDEO_QUERY_PATH, ZZDH_VIDEO_SUBMIT_PATH } from '@/commands/zzdhApi';
+import { isZhenjianProvider } from '@/commands/zhenjianApi';
 
-export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'jimeng-cli' | 'wan-cli';
+export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'jimeng-cli' | 'wan-cli';
 export type VideoProfileStatus = 'verified' | 'pending-adaptation';
 export type VideoReferenceTarget = 'data-url' | 'public-url' | 'platform-file';
 
@@ -134,6 +135,18 @@ const ZHINIAO_VIDEO_PROFILE: VideoModelProfile = {
   supportsReferenceAudio: true,
 };
 
+const ZHENJIAN_TASK_PROFILE: VideoModelProfile = {
+  id: 'zhenjian-task-api',
+  status: 'verified',
+  protocolLabel: '帧间 API 异步任务 / 已验证',
+  submitPath: '/v1/videos',
+  queryPath: '/v1/tasks/{taskId}',
+  referenceImageTarget: 'platform-file',
+  supportsReferenceImages: true,
+  supportsFirstLast: true,
+  supportsReferenceAudio: true,
+};
+
 function isZhiniaoVideoProvider(provider: string, providerBaseUrl?: string): boolean {
   const baseUrl = providerBaseUrl?.trim().toLowerCase() ?? '';
   return provider === 'custom:zhiniao'
@@ -148,6 +161,7 @@ export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: stri
   // 即梦 CLI 是本地命令, seedance 系列由 CLI 自行校验, 不套用平台协议适配状态
   if (provider === 'jimeng-cli') return JIMENG_CLI_VIDEO_PROFILE;
   if (isZhiniaoVideoProvider(provider, providerBaseUrl)) return ZHINIAO_VIDEO_PROFILE;
+  if (isZhenjianProvider(provider, providerBaseUrl)) return ZHENJIAN_TASK_PROFILE;
   if (/^(?:https?:\/\/)?(?:video|sub2api)\.rjm\.us\.ci(?:[/:]|$)/i.test(providerBaseUrl?.trim() ?? '')
     || provider === 'custom:sub2api-video') {
     return SUB2API_VIDEO_PROFILE;
@@ -172,6 +186,7 @@ export function getVideoModelProfile(profileId?: string): VideoModelProfile {
     'binghuo-video': BINGHUO_VIDEO_PROFILE,
     'wgspai-video': WGSPAI_VIDEO_PROFILE,
     'zhiniao-video': ZHINIAO_VIDEO_PROFILE,
+    'zhenjian-task-api': ZHENJIAN_TASK_PROFILE,
     'jimeng-cli': JIMENG_CLI_VIDEO_PROFILE,
   };
   return profiles[profileId as VideoProfileId] ?? OPENAI_VIDEO_PROFILE;

@@ -134,12 +134,13 @@ describe('isKnownOpenAiImagesBaseUrl', () => {
   });
 });
 
-describe('推荐平台可见白名单(密钥页只展示知鸟AI / RunningHub / ModelScope)', () => {
-  it('界面只渲染这三个平台, 顺序与白名单一致', () => {
+describe('推荐平台可见白名单(密钥页展示内置推荐平台)', () => {
+  it('界面只渲染白名单平台, 顺序与白名单一致', () => {
     expect(listVisibleRecommendedApis().map((api) => api.id)).toEqual([
       'zhiniao',
       'runninghub',
       'modelscope',
+      'zhenjian',
     ]);
   });
 

@@ -42,7 +42,7 @@ export interface CustomApiCapabilities {
   videoQueryPath: string;
   videoReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
   taskProtocol: 'generic' | 'unknown';
-  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'zhiniao-video';
+  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'zhiniao-video' | 'zhenjian-task-api';
 }
 
 /** 即梦 CLI 是本地命令行工具，不使用 OpenAI 兼容平台的 API Key 配置。 */
@@ -155,6 +155,8 @@ export interface CustomApiProvider {
   referenceAssetUploadUrl?: string;
   /** 参考素材上传接口的 Bearer 令牌，仅保存在本机设置。 */
   referenceAssetUploadToken?: string;
+  /** 平台同步的官方模型价格，单位为 CNY 元；用户手动价格保存在 customModelPrices 中并优先显示。 */
+  modelPrices?: Record<string, number>;
   capabilities?: CustomApiCapabilities;
 }
 
@@ -404,6 +406,21 @@ function normalizeCustomModelPrices(input: unknown): Record<string, string> {
   );
 }
 
+function normalizeOfficialModelPrices(input: unknown): Record<string, number> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  return Object.entries(input as Record<string, unknown>).reduce<Record<string, number>>(
+    (result, [modelId, price]) => {
+      const normalizedModelId = modelId.trim();
+      const numericPrice = typeof price === 'number' ? price : Number(price);
+      if (normalizedModelId && Number.isFinite(numericPrice) && numericPrice >= 0) {
+        result[normalizedModelId] = numericPrice;
+      }
+      return result;
+    },
+    {},
+  );
+}
+
 function normalizeJimengCliSettings(input: unknown): JimengCliSettings {
   const executable =
     input && typeof input === 'object' && 'executable' in input
@@ -443,7 +460,7 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
       ? videoEncoding
       : 'unknown',
     taskProtocol: taskProtocol === 'unknown' ? 'unknown' : 'generic',
-    ...(videoTransport === 'sub2api-video' || videoTransport === 'zzdh-v8-video' || videoTransport === 'binghuo-video' || videoTransport === 'zhiniao-video'
+    ...(videoTransport === 'sub2api-video' || videoTransport === 'zzdh-v8-video' || videoTransport === 'binghuo-video' || videoTransport === 'zhiniao-video' || videoTransport === 'zhenjian-task-api'
       ? { videoTransport }
       : {}),
   };
@@ -526,6 +543,7 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
             : ('auto' as const),
         referenceAssetUploadUrl: String(item.referenceAssetUploadUrl ?? '').trim().replace(/\/+$/, '') || undefined,
         referenceAssetUploadToken: String(item.referenceAssetUploadToken ?? '').trim() || undefined,
+        modelPrices: normalizeOfficialModelPrices(item.modelPrices),
         capabilities: normalizeCustomApiCapabilities(item.capabilities),
       };
     })

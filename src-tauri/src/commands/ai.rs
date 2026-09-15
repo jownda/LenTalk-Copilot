@@ -608,6 +608,7 @@ pub async fn request_provider_multipart(
     filename: String,
     content_type: String,
     body_base64: String,
+    fields: Option<HashMap<String, String>>,
 ) -> Result<ProviderHttpResponseDto, String> {
     let parsed_url = reqwest::Url::parse(url.trim())
         .map_err(|error| format!("Invalid provider URL: {}", error))?;
@@ -618,7 +619,10 @@ pub async fn request_provider_multipart(
         .file_name(filename)
         .mime_str(&content_type)
         .map_err(|error| format!("Invalid multipart content type: {}", error))?;
-    let form = reqwest::multipart::Form::new().part(field_name, part);
+    let mut form = reqwest::multipart::Form::new().part(field_name, part);
+    for (key, value) in fields.unwrap_or_default() {
+        form = form.text(key, value);
+    }
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(15 * 60))

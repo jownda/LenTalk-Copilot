@@ -16,6 +16,7 @@ import { useDialogTransition } from '@/components/ui/useDialogTransition';
 import { listModelProviders } from '@/features/canvas/models';
 import type { SettingsCategory } from '@/features/settings/settingsEvents';
 import { WanCliSettings } from '@/features/settings/WanCliSettings';
+import { isZhenjianProvider } from '@/commands/zhenjianApi';
 
 const JIMENG_LOGIN_POLL_INTERVAL_MS = 3000;
 const JIMENG_LOGIN_MAX_ATTEMPTS = 200;
@@ -143,9 +144,9 @@ export function SettingsDialog({
     setEnableUpdateDialog,
   } = useSettingsStore();
   const providers = useMemo(() => {
-    const providerOrder = ['zhiniao', 'runninghub', 'modelscope'];
+    const providerOrder = ['zhiniao', 'zhenjian', 'runninghub', 'modelscope'];
     const providerIndex = new Map(providerOrder.map((id, index) => [id, index]));
-    // 密钥页只保留 知鸟AI / RunningHub / ModelScope 三个平台卡片, 其余隐藏不渲染。
+    // 密钥页展示内置推荐平台，帧间 API 也在这里提供专有链路配置。
     // 隐藏 ≠ 删除: 平台定义与链路仍完整保留在 registry / recommendedApis 中,
     // 自定义平台按 Base URL 依旧会命中对应链路(isZhiniao / isZzdh / isSub2Api 等)。
     const visibleProviderIds = new Set(visibleRecommendedApiIds);
@@ -225,6 +226,7 @@ export function SettingsDialog({
     imageTransport: 'auto' as 'auto' | 'generations_json' | 'edits_multipart' | 'apimart_json',
     referenceAssetUploadUrl: '',
     referenceAssetUploadToken: '',
+    modelPrices: {} as Record<string, number>,
     capabilities: undefined as CustomApiCapabilities | undefined,
   });
   const [customApiBusy, setCustomApiBusy] = useState<'idle' | 'testing' | 'fetching'>('idle');
@@ -255,6 +257,7 @@ export function SettingsDialog({
       imageTransport: api.imageConfig?.imageTransport ?? 'auto',
       referenceAssetUploadUrl: '',
       referenceAssetUploadToken: '',
+      modelPrices: {},
       capabilities: api.videoConfig ? {
         detectedAt: Date.now(),
         detectionSource: 'manual',
@@ -486,7 +489,23 @@ export function SettingsDialog({
     setCustomApiBusy('fetching');
     setCustomApiStatus(null);
     try {
-      const { models } = await fetchProviderModels(baseUrl, customApiDraft.apiKey.trim());
+      const { models, prices } = await fetchProviderModels(baseUrl, customApiDraft.apiKey.trim());
+      if (prices && Object.keys(prices).length > 0) {
+        setCustomApiDraft((previous) => ({
+          ...previous,
+          modelPrices: { ...previous.modelPrices, ...prices },
+        }));
+        // 编辑已保存的平台时立即落库，避免用户拉取模型后未再次点击“保存”
+        // 导致节点注册表仍看不到官方价格。
+        if (editingCustomApiId) {
+          const currentApi = useSettingsStore.getState().customApis.find(
+            (api) => api.id === editingCustomApiId,
+          );
+          updateCustomApi(editingCustomApiId, {
+            modelPrices: { ...(currentApi?.modelPrices ?? {}), ...prices },
+          });
+        }
+      }
       if (models.length === 0) {
         setCustomApiStatus({ type: 'err', text: t('settings.customApiNoModels', '未从平台拉取到模型') });
         return;
@@ -503,8 +522,11 @@ export function SettingsDialog({
           .map((model) => model.trim().toLowerCase())
           .filter(Boolean)
       );
+      const isZhenjian = isZhenjianProvider('', baseUrl);
       const targetModels = models.filter(
-        (model) => mediaType === 'video'
+        (model) => isZhenjian && (mediaType === 'image' || mediaType === 'video')
+          ? true
+          : mediaType === 'video'
           ? isVideoGenerationModelName(model)
           : mediaType === 'audio'
             ? isAudioModelName(model)
@@ -548,6 +570,8 @@ export function SettingsDialog({
     customApiDraft.videoModelsText,
     customApiDraft.audioModelsText,
     customApiDraft.chatModelsText,
+    editingCustomApiId,
+    updateCustomApi,
     t,
   ]);
 
@@ -614,11 +638,12 @@ export function SettingsDialog({
           .map((model) => model.trim().toLowerCase())
           .filter(Boolean)
       );
+      const isZhenjian = isZhenjianProvider('', baseUrl);
       const imageModels = models.filter(
         (model) =>
-          !videoModelIds.has(model.trim().toLowerCase())
+          (isZhenjian || !videoModelIds.has(model.trim().toLowerCase()))
           && !audioModelIds.has(model.trim().toLowerCase())
-          && !isVideoGenerationModelName(model)
+          && (isZhenjian || !isVideoGenerationModelName(model))
           && !isAudioModelName(model)
           && !isChatCompletionModelName(model)
       );
@@ -649,6 +674,9 @@ export function SettingsDialog({
             ? result.capabilities.imageTransport
             : previous.imageTransport,
           capabilities: result.capabilities,
+          modelPrices: result.modelPrices
+            ? { ...previous.modelPrices, ...result.modelPrices }
+            : previous.modelPrices,
         };
       });
       const encodingLabel = result.capabilities.imageReferenceEncoding === 'raw_base64'
@@ -715,6 +743,7 @@ export function SettingsDialog({
       imageTransport: api.imageTransport ?? 'auto',
       referenceAssetUploadUrl: api.referenceAssetUploadUrl ?? '',
       referenceAssetUploadToken: api.referenceAssetUploadToken ?? '',
+      modelPrices: api.modelPrices ?? {},
       capabilities: api.capabilities,
     });
     setShowAddCustomApi(true);
@@ -738,6 +767,7 @@ export function SettingsDialog({
       imageTransport: 'auto',
       referenceAssetUploadUrl: '',
       referenceAssetUploadToken: '',
+      modelPrices: {},
       capabilities: undefined,
     });
   }, []);
@@ -799,6 +829,7 @@ export function SettingsDialog({
         imageTransport: customApiDraft.imageTransport,
         referenceAssetUploadUrl: customApiDraft.referenceAssetUploadUrl.trim(),
         referenceAssetUploadToken: customApiDraft.referenceAssetUploadToken.trim(),
+        modelPrices: customApiDraft.modelPrices,
         capabilities: customApiDraft.capabilities,
       });
     } else {
@@ -817,6 +848,7 @@ export function SettingsDialog({
         imageTransport: customApiDraft.imageTransport,
         referenceAssetUploadUrl: customApiDraft.referenceAssetUploadUrl.trim(),
         referenceAssetUploadToken: customApiDraft.referenceAssetUploadToken.trim(),
+        modelPrices: customApiDraft.modelPrices,
         capabilities: customApiDraft.capabilities,
       });
     }
