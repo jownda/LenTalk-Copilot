@@ -24,7 +24,9 @@ import {
   type SeamlessMosaicNodeData,
 } from './canvasNodes';
 import { DEFAULT_NODE_DISPLAY_NAME } from './nodeDisplay';
-import { getAudioModel, getDefaultAudioModelId, getDefaultImageModelId, getDefaultVideoModelId, getImageModel } from '../models';
+import { getAudioModel, getDefaultAudioModelId, getDefaultImageModelId, getDefaultVideoModelId, getImageModel, getVideoModel } from '../models';
+import { resolveVideoNodeModelId, resolveVideoNodeParams } from './videoNodeDefaults';
+import { resolveImageNodeModelId, resolveImageNodeParams } from './imageNodeDefaults';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { createCinematicProjectId } from '@/features/cinematicStudio/app/projectId';
 
@@ -101,27 +103,34 @@ const imageEditNodeDefinition: CanvasNodeDefinition<ImageEditNodeData> = {
     },
   },
   createDefaultData: () => {
-    // 默认选中「上一次使用的模型」;模型失效或未配置密钥时回退到默认模型
-    let defaultModelId = getDefaultImageModelId();
-    const lastModelId = useSettingsStore.getState().lastImageModelId;
-    if (lastModelId) {
-      const resolved = getImageModel(lastModelId);
-      const keys = useSettingsStore.getState().apiKeys;
-      if (resolved.id === lastModelId && Boolean((keys[resolved.providerId] ?? '').trim())) {
-        defaultModelId = lastModelId;
-      }
-    }
+    // 记住上次使用的模型与参数: 新建节点直接沿用, 不用每次重新选择。
+    // 记忆值可能对当前模型/平台无效, 由 resolve* 统一回退。
+    const settings = useSettingsStore.getState();
+    const modelId = resolveImageNodeModelId(
+      settings.lastImageModelId,
+      (candidateId) => {
+        // 除模型存在外, 还要求平台已配置密钥, 否则节点建出来就无法生成。
+        const resolved = getImageModel(candidateId);
+        return resolved.id === candidateId
+          && Boolean((settings.apiKeys[resolved.providerId] ?? '').trim());
+      },
+      getDefaultImageModelId()
+    );
+    const { size, aspectRatio } = resolveImageNodeParams(getImageModel(modelId), {
+      size: settings.lastImageSize,
+      aspectRatio: settings.lastImageAspectRatio,
+    });
     return {
       displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.imageEdit],
       imageUrl: null,
       previewImageUrl: null,
       aspectRatio: DEFAULT_ASPECT_RATIO,
       isSizeManuallyAdjusted: false,
-      requestAspectRatio: AUTO_REQUEST_ASPECT_RATIO,
+      requestAspectRatio: aspectRatio,
       prompt: '',
-      model: defaultModelId,
-      customPrice: useSettingsStore.getState().customModelPrices[defaultModelId] ?? null,
-      size: '2K' as ImageSize,
+      model: modelId,
+      customPrice: settings.customModelPrices[modelId] ?? null,
+      size: size as ImageSize,
       extraParams: {},
       isGenerating: false,
       generationStartedAt: null,
@@ -138,15 +147,26 @@ const videoGenNodeDefinition: CanvasNodeDefinition<VideoGenNodeData> = {
   capabilities: { toolbar: true, promptInput: false },
   connectivity: { sourceHandle: true, targetHandle: true, connectMenu: { fromSource: true, fromTarget: false } },
   createDefaultData: () => {
-    const model = getDefaultVideoModelId();
+    // 记住上次使用的模型与参数: 新建节点直接沿用, 不用每次重新选择。
+    // 记忆值可能对当前模型无效(换模型/删平台), 由 resolve* 统一回退。
+    const settings = useSettingsStore.getState();
+    const model = resolveVideoNodeModelId(
+      settings.lastVideoModelId,
+      (modelId) => Boolean(getVideoModel(modelId)),
+      getDefaultVideoModelId()
+    );
+    const { aspectRatio, resolution } = resolveVideoNodeParams(getVideoModel(model), {
+      aspectRatio: settings.lastVideoAspectRatio,
+      resolution: settings.lastVideoResolution,
+    });
     return {
       displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.videoGen],
       prompt: '',
       model,
-      customPrice: useSettingsStore.getState().customModelPrices[model] ?? null,
-      duration: useSettingsStore.getState().lastVideoDuration,
-      aspectRatio: '16:9',
-      resolution: '720p',
+      customPrice: settings.customModelPrices[model] ?? null,
+      duration: settings.lastVideoDuration,
+      aspectRatio,
+      resolution,
       imageMode: 'reference',
     };
   },

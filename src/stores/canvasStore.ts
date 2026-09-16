@@ -42,6 +42,11 @@ import {
   resolveMinEdgeFittedSize,
   resolveSizeInsideTargetBox,
 } from '@/features/canvas/application/imageNodeSizing';
+import {
+  resolveAspectLockedResize,
+  resolveMediaNodeAspectLock,
+  type AspectLockedSize,
+} from '@/features/canvas/application/aspectLockedResize';
 
 export type {
   ActiveToolDialog,
@@ -628,6 +633,91 @@ function isImageAutoResizableType(type: CanvasNodeType): boolean {
     || type === CANVAS_NODE_TYPES.exportImage;
 }
 
+/**
+ * 本次拖拽缩放手势的起始尺寸, 按节点 id 缓存。
+ *
+ * React Flow 的 resize 手柄在 pointerdown 时缓存一次起始尺寸(`startValues`), 之后每帧
+ * 都基于这个固定起点加指针位移算出候选尺寸。等比修正若拿"上一帧已被修正的输出"当基准,
+ * 基准会随每帧输出漂移, 主导轴判定于是在相邻两帧之间反复翻转, 输出尺寸在两个分支之间
+ * 跳变 —— 表现为拖拽"一抖一抖"。这里让基准与手柄同源: 手势第一帧登记, 手势结束时清理。
+ */
+const aspectLockResizeGestureStartSizes = new Map<string, AspectLockedSize>();
+
+/** 取本次手势的起始尺寸; 第一帧用 store 当前尺寸登记(此时尚未被本次手势改写)。 */
+function resolveResizeGestureStartSize(nodeId: string, node: CanvasNode): AspectLockedSize {
+  const cached = aspectLockResizeGestureStartSizes.get(nodeId);
+  if (cached) {
+    return cached;
+  }
+
+  const startSize = getNodeSize(node);
+  aspectLockResizeGestureStartSizes.set(nodeId, startSize);
+  return startSize;
+}
+
+/**
+ * 把用户拖拽产生的自由尺寸修正为媒体比例。
+ *
+ * 图片/视频节点的边框必须与画面同比例, 否则画面会被拉伸或留黑边。这里在尺寸变更
+ * 进入 store 的唯一入口处做等比修正, 因此无论从哪个角拖动、起始比例是否正确,
+ * 结果都会收敛到目标比例。
+ */
+function applyAspectLockedResizeToChanges(
+  changes: NodeChange<CanvasNode>[],
+  nodes: CanvasNode[]
+): NodeChange<CanvasNode>[] {
+  const hasResizingChange = changes.some(
+    (change) => change.type === 'dimensions' && 'resizing' in change
+  );
+  if (!hasResizingChange) {
+    return changes;
+  }
+
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+
+  return changes.map((change) => {
+    if (change.type !== 'dimensions' || !('resizing' in change)) {
+      return change;
+    }
+
+    const node = nodeById.get(change.id);
+    if (!node) {
+      return change;
+    }
+
+    // 结束帧同样使用手势起始尺寸: 基准只有全程恒定, 最后一帧才不会相对前一帧跳变。
+    const previous = resolveResizeGestureStartSize(change.id, node);
+    if (change.resizing === false) {
+      aspectLockResizeGestureStartSizes.delete(change.id);
+    }
+
+    if (!change.dimensions) {
+      return change;
+    }
+
+    const lock = resolveMediaNodeAspectLock(node.type, node.data as Record<string, unknown>);
+    if (!lock) {
+      return change;
+    }
+
+    const locked = resolveAspectLockedResize({
+      previous,
+      next: change.dimensions,
+      ratio: lock.ratio,
+      bounds: lock.bounds,
+    });
+
+    if (locked.width === change.dimensions.width && locked.height === change.dimensions.height) {
+      return change;
+    }
+
+    return {
+      ...change,
+      dimensions: { ...change.dimensions, ...locked },
+    } as NodeChange<CanvasNode>;
+  });
+}
+
 function withManualSizeLock(node: CanvasNode): CanvasNode {
   const nodeData = node.data as CanvasNodeData & { isSizeManuallyAdjusted?: boolean };
   if (nodeData.isSizeManuallyAdjusted) {
@@ -974,8 +1064,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
   onNodesChange: (changes) => {
     set((state) => {
+      const lockedChanges = applyAspectLockedResizeToChanges(changes, state.nodes);
       const resizedNodeIds = new Set(
-        changes
+        lockedChanges
           .filter(
             (change): change is NodeChange<CanvasNode> & { id: string } =>
               change.type === 'dimensions'
@@ -986,7 +1077,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
           .map((change) => change.id)
       );
 
-      let nextNodes = applyNodeChanges<CanvasNode>(changes, state.nodes);
+      let nextNodes = applyNodeChanges<CanvasNode>(lockedChanges, state.nodes);
       if (resizedNodeIds.size > 0) {
         nextNodes = nextNodes.map((node) => {
           if (!resizedNodeIds.has(node.id) || !isImageAutoResizableType(node.type)) {

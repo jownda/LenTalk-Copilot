@@ -17,6 +17,7 @@ import {
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
 import { createPointsOnlyPricing } from '@/features/canvas/pricing';
 import { resolveVideoModelProfile } from './videoProfiles';
+import { resolveImageModelResolutionOptions } from './imageModelCapabilities';
 import { isRjmVideoApiBaseUrl } from '@/commands/videoApi';
 import {
   isZzdhProvider,
@@ -380,12 +381,6 @@ const CUSTOM_ASPECT_RATIOS = [
   '4:3',
   '3:4',
 ] as const;
-
-const CUSTOM_RESOLUTIONS: ResolutionOption[] = [
-  { value: '1K', label: '1K' },
-  { value: '2K', label: '2K' },
-  { value: '4K', label: '4K' },
-];
 
 /**
  * 知鸟 AI(TokenGo)视频模型的档位清单, 直接取自平台 GET /v1/logical-models 的
@@ -756,6 +751,9 @@ function buildCustomImageModels(): ImageModelDefinition[] {
         // 字子动画图片: 官方画幅枚举同为 16:9 / 9:16 / 1:1, 参考图字段 reference_images。
         const isZzdhImageApi = isZzdhProvider(api.id, api.baseUrl);
         const imageAspectRatios = isZzdhImageApi ? [...ZZDH_ASPECT_RATIOS] : CUSTOM_ASPECT_RATIOS;
+        // 档位常被平台写进模型名(qwen-image-3.0-pro-1k / flux-2k / sd-4k), 这类模型
+        // 只能按名字里那一档请求; 读不到档位时才放开 1K/2K/4K 全档位。
+        const resolutions = resolveImageModelResolutionOptions(model);
         return {
           id: modelId,
           mediaType: 'image',
@@ -765,9 +763,9 @@ function buildCustomImageModels(): ImageModelDefinition[] {
           eta: '1min',
           expectedDurationMs: 60000,
           defaultAspectRatio: '1:1',
-          defaultResolution: '1K',
+          defaultResolution: resolutions[0]?.value ?? '1K',
           aspectRatios: imageAspectRatios.map((value) => ({ value, label: value })),
-          resolutions: CUSTOM_RESOLUTIONS,
+          resolutions,
           ...(resolveCustomImagePricing(api.id, api.baseUrl, model)
             ? { pricing: resolveCustomImagePricing(api.id, api.baseUrl, model) }
             : {}),

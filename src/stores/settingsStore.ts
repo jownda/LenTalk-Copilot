@@ -206,8 +206,18 @@ interface SettingsState {
   enableUpdateDialog: boolean;
   /** 最近一次使用的图片生成模型 id(新建 AI 图片节点默认选中) */
   lastImageModelId: string | null;
+  /** 最近一次使用的图片分辨率(新建 AI 图片节点默认选中); 当前模型不支持时回退默认值。 */
+  lastImageSize: string | null;
+  /** 最近一次使用的图片宽高比(新建 AI 图片节点默认选中); `auto` 表示交给模型决定。 */
+  lastImageAspectRatio: string | null;
   /** 最近一次选择的视频生成时长；AI 视频和即梦 CLI 新节点共用。 */
   lastVideoDuration: number;
+  /** 最近一次使用的视频模型 id(新建 AI 视频节点默认选中); 模型已不存在时回退默认模型。 */
+  lastVideoModelId: string | null;
+  /** 最近一次使用的视频宽高比(新建节点默认选中); 当前模型不支持时回退模型默认值。 */
+  lastVideoAspectRatio: string | null;
+  /** 最近一次使用的视频分辨率(新建节点默认选中); 当前模型不支持时回退模型默认值。 */
+  lastVideoResolution: string | null;
   /** 用户为 AI 图片/视频模型设置的价格覆盖，key 为模型唯一 ID。 */
   customModelPrices: Record<string, string>;
   /** 已实际成功生成过的模型，供拉取模型列表标记为可用。 */
@@ -241,7 +251,12 @@ interface SettingsState {
   setAutoCheckAppUpdateOnLaunch: (enabled: boolean) => void;
   setEnableUpdateDialog: (enabled: boolean) => void;
   setLastImageModelId: (modelId: string | null) => void;
+  setLastImageSize: (size: string | null) => void;
+  setLastImageAspectRatio: (aspectRatio: string | null) => void;
   setLastVideoDuration: (duration: number) => void;
+  setLastVideoModelId: (modelId: string | null) => void;
+  setLastVideoAspectRatio: (aspectRatio: string | null) => void;
+  setLastVideoResolution: (resolution: string | null) => void;
   setCustomModelPrice: (modelId: string, price: string | null) => void;
   markModelAvailable: (modelId: string) => void;
 }
@@ -358,6 +373,12 @@ function normalizeCanvasEdgeRoutingMode(
 function normalizeVideoDuration(value: number | string | null | undefined): number {
   const duration = Math.round(Number(value));
   return Number.isFinite(duration) ? Math.min(30, Math.max(1, duration)) : 5;
+}
+
+/** 可空的"上次使用"记忆值(模型 id / 宽高比 / 分辨率): 去空白, 空串归一为 null。 */
+function normalizeOptionalSettingString(value: string | null | undefined): string | null {
+  const trimmed = (value ?? '').trim();
+  return trimmed ? trimmed : null;
 }
 
 function normalizeApiKeys(input: ProviderApiKeys | null | undefined): ProviderApiKeys {
@@ -613,7 +634,12 @@ export const useSettingsStore = create<SettingsState>()(
       autoCheckAppUpdateOnLaunch: true,
       enableUpdateDialog: true,
       lastImageModelId: null,
+      lastImageSize: null,
+      lastImageAspectRatio: null,
       lastVideoDuration: 5,
+      lastVideoModelId: null,
+      lastVideoAspectRatio: null,
+      lastVideoResolution: null,
       customModelPrices: {},
       usableModelIds: [],
       setProviderApiKey: (providerId, key) =>
@@ -717,8 +743,18 @@ export const useSettingsStore = create<SettingsState>()(
       setSnapToGrid: (enabled) => set({ snapToGrid: Boolean(enabled) }),
       setAutoCheckAppUpdateOnLaunch: (enabled) => set({ autoCheckAppUpdateOnLaunch: enabled }),
       setEnableUpdateDialog: (enabled) => set({ enableUpdateDialog: enabled }),
-      setLastImageModelId: (modelId) => set({ lastImageModelId: modelId }),
+      setLastImageModelId: (modelId) =>
+        set({ lastImageModelId: normalizeOptionalSettingString(modelId) }),
+      setLastImageSize: (size) => set({ lastImageSize: normalizeOptionalSettingString(size) }),
+      setLastImageAspectRatio: (aspectRatio) =>
+        set({ lastImageAspectRatio: normalizeOptionalSettingString(aspectRatio) }),
       setLastVideoDuration: (duration) => set({ lastVideoDuration: normalizeVideoDuration(duration) }),
+      setLastVideoModelId: (modelId) =>
+        set({ lastVideoModelId: normalizeOptionalSettingString(modelId) }),
+      setLastVideoAspectRatio: (aspectRatio) =>
+        set({ lastVideoAspectRatio: normalizeOptionalSettingString(aspectRatio) }),
+      setLastVideoResolution: (resolution) =>
+        set({ lastVideoResolution: normalizeOptionalSettingString(resolution) }),
       setCustomModelPrice: (modelId, price) => {
         const normalizedModelId = modelId.trim();
         if (!normalizedModelId) return;
@@ -744,7 +780,7 @@ export const useSettingsStore = create<SettingsState>()(
     {
       name: SETTINGS_STORAGE_KEY,
       storage: createJSONStorage(() => settingsStorage),
-      version: 18,
+      version: 20,
       onRehydrateStorage: () => {
         return (_state, error) => {
           if (error) {
@@ -768,7 +804,12 @@ export const useSettingsStore = create<SettingsState>()(
           autoCheckAppUpdateOnLaunch?: boolean;
           enableUpdateDialog?: boolean;
           lastImageModelId?: string | null;
+          lastImageSize?: string | null;
+          lastImageAspectRatio?: string | null;
           lastVideoDuration?: number | string | null;
+          lastVideoModelId?: string | null;
+          lastVideoAspectRatio?: string | null;
+          lastVideoResolution?: string | null;
           customModelPrices?: unknown;
           usableModelIds?: unknown;
           enableStoryboardGenGridPreviewShortcut?: boolean;
@@ -803,8 +844,13 @@ export const useSettingsStore = create<SettingsState>()(
             canvasEdgeRoutingMode: normalizeCanvasEdgeRoutingMode(state.canvasEdgeRoutingMode),
             autoCheckAppUpdateOnLaunch: state.autoCheckAppUpdateOnLaunch ?? true,
             enableUpdateDialog: state.enableUpdateDialog ?? true,
-            lastImageModelId: typeof state.lastImageModelId === 'string' && state.lastImageModelId ? state.lastImageModelId : null,
+            lastImageModelId: normalizeOptionalSettingString(state.lastImageModelId),
+            lastImageSize: normalizeOptionalSettingString(state.lastImageSize),
+            lastImageAspectRatio: normalizeOptionalSettingString(state.lastImageAspectRatio),
             lastVideoDuration: normalizeVideoDuration(state.lastVideoDuration),
+            lastVideoModelId: normalizeOptionalSettingString(state.lastVideoModelId),
+            lastVideoAspectRatio: normalizeOptionalSettingString(state.lastVideoAspectRatio),
+            lastVideoResolution: normalizeOptionalSettingString(state.lastVideoResolution),
             customModelPrices: normalizeCustomModelPrices(state.customModelPrices),
             usableModelIds: normalizeUsableModelIds(state.usableModelIds),
             enableStoryboardGenGridPreviewShortcut:
@@ -836,8 +882,13 @@ export const useSettingsStore = create<SettingsState>()(
           canvasEdgeRoutingMode: normalizeCanvasEdgeRoutingMode(state.canvasEdgeRoutingMode),
           autoCheckAppUpdateOnLaunch: state.autoCheckAppUpdateOnLaunch ?? true,
           enableUpdateDialog: state.enableUpdateDialog ?? true,
-          lastImageModelId: typeof state.lastImageModelId === 'string' && state.lastImageModelId ? state.lastImageModelId : null,
+          lastImageModelId: normalizeOptionalSettingString(state.lastImageModelId),
+          lastImageSize: normalizeOptionalSettingString(state.lastImageSize),
+          lastImageAspectRatio: normalizeOptionalSettingString(state.lastImageAspectRatio),
           lastVideoDuration: normalizeVideoDuration(state.lastVideoDuration),
+          lastVideoModelId: normalizeOptionalSettingString(state.lastVideoModelId),
+          lastVideoAspectRatio: normalizeOptionalSettingString(state.lastVideoAspectRatio),
+          lastVideoResolution: normalizeOptionalSettingString(state.lastVideoResolution),
           customModelPrices: normalizeCustomModelPrices(state.customModelPrices),
           usableModelIds: normalizeUsableModelIds(state.usableModelIds),
           enableStoryboardGenGridPreviewShortcut:

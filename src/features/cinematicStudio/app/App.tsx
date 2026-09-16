@@ -258,7 +258,9 @@ export default function App({
           id: `cinematic-${asset.id}-${index}`,
           libraryId,
           categoryId: categoryByKind.get(categoryName) ?? null,
-          name: sources.length > 1 ? `${asset.name || "未命名资产"} ${index + 1}` : asset.name || "未命名资产",
+          // 多张参考图仍属于同一个电影资产，名称必须保持与工程资产一致；
+          // 序号只体现在镜像 id / 图片顺序中，不能污染候选和最终提示词里的 @标签。
+          name: asset.name || "未命名资产",
           mediaType,
           sourcePath: source,
           previewImageUrl: mediaType === "image" ? source : null,

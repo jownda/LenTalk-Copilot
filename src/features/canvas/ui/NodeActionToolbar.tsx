@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NodeToolbar as ReactFlowNodeToolbar } from '@xyflow/react';
-import { Copy, Crop, Download, Library, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Trash2, Unlink2 } from 'lucide-react';
+import { Camera, Copy, Crop, Download, Library, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Sparkles, Trash2, Unlink2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import {
@@ -106,6 +106,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     (state) => state.ignoreAtTagWhenCopyingAndGenerating
   );
   const [isLibraryDialogOpen, setIsLibraryDialogOpen] = useState(false);
+  const [isUpscaleDialogOpen, setIsUpscaleDialogOpen] = useState(false);
   const [isSavingToLibrary, setIsSavingToLibrary] = useState(false);
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
@@ -423,17 +424,46 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 {t('nodeToolbar.reupload')}
               </UiChipButton>
             )}
-          <UiChipButton
-            key="image-download"
-            className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
-            onClick={(event) => {
-              event.stopPropagation();
-              void handleDownloadMedia();
-            }}
-          >
-            <Download className="h-3.5 w-3.5" />
-            {t('nodeToolbar.download')}
-          </UiChipButton>
+            <UiChipButton
+              key="image-download"
+              className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                void handleDownloadMedia();
+              }}
+            >
+              <Download className="h-3.5 w-3.5" />
+              {t('nodeToolbar.download')}
+            </UiChipButton>
+            {isGeneratedVideoNode && videoSource && (
+              <UiChipButton
+                key="video-capture-frame"
+                className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  // 截图需要读节点内 <video> 的当前时间点, 由 AudioNode 订阅后执行。
+                  canvasEventBus.publish('media-node/capture-frame', { nodeId: node.id });
+                }}
+              >
+                <Camera className="h-3.5 w-3.5" />
+                {t('nodeToolbar.captureFrame')}
+              </UiChipButton>
+            )}
+            {isGeneratedVideoNode && videoSource && (
+              <UiChipButton
+                key="video-upscale"
+                className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  // 超分把本节点视频交给超分模型放大, 目前只提供入口与参数形态, 尚未接入提交链路。
+                  setIsUpscaleDialogOpen(true);
+                }}
+                title={t('nodeToolbar.upscalePending')}
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                {t('nodeToolbar.upscale')}
+              </UiChipButton>
+            )}
           </>
         )}
         {!isImageEdit && isGeneratedVideoNode && videoSource && (
@@ -531,6 +561,29 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 </div>
               </>
             )}
+          </div>
+        </UiModal>
+      )}
+
+      {!isImageEdit && (
+        <UiModal
+          isOpen={isUpscaleDialogOpen}
+          title={t('nodeToolbar.upscale')}
+          onClose={() => setIsUpscaleDialogOpen(false)}
+          widthClassName="w-[380px]"
+        >
+          <div className="space-y-3">
+            <p className="text-xs leading-relaxed text-text-muted">
+              {t('nodeToolbar.upscaleDesc')}
+            </p>
+            <p className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-2 text-xs leading-relaxed text-amber-200">
+              {t('nodeToolbar.upscalePending')}
+            </p>
+            <ul className="list-disc space-y-1.5 border-t border-white/10 pl-4 pt-2.5 text-xs text-text-muted">
+              <li>{t('nodeToolbar.upscaleTodoModel')}</li>
+              <li>{t('nodeToolbar.upscaleTodoTarget')}</li>
+              <li>{t('nodeToolbar.upscaleTodoTransport')}</li>
+            </ul>
           </div>
         </UiModal>
       )}

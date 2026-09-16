@@ -287,6 +287,8 @@ export function VideoFrameExtractDialog({ open, onClose }: VideoFrameExtractDial
                 src={videoUrl ?? undefined}
                 className="max-h-[320px] w-full"
                 controls
+                draggable={false}
+                onDragStart={(event) => event.preventDefault()}
                 preload="metadata"
                 onLoadedMetadata={handleLoadedMetadata}
                 onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime || 0)}

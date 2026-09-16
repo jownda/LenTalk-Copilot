@@ -4,6 +4,7 @@ pub mod cinematic_studio;
 pub mod cloud_drive;
 pub mod image;
 pub mod jimeng_cli;
+pub mod media_file;
 pub mod wan_cli;
 pub mod project_state;
 pub mod project_archive;

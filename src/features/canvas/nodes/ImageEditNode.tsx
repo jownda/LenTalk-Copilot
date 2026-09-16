@@ -453,6 +453,8 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const customApis = useSettingsStore((state) => state.customApis);
   const customModelPrices = useSettingsStore((state) => state.customModelPrices);
   const setCustomModelPrice = useSettingsStore((state) => state.setCustomModelPrice);
+  const setLastImageSize = useSettingsStore((state) => state.setLastImageSize);
+  const setLastImageAspectRatio = useSettingsStore((state) => state.setLastImageAspectRatio);
   const grsaiNanoBananaProModel = useSettingsStore((state) => state.grsaiNanoBananaProModel);
   const showNodePrice = useSettingsStore((state) => state.showNodePrice);
   const priceDisplayCurrencyMode = useSettingsStore((state) => state.priceDisplayCurrencyMode);
@@ -1294,10 +1296,13 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
           }}
           onResolutionChange={(resolution) => {
             updateNodeData(id, { size: resolution as ImageSize });
+            // 记住本次选择, 新建图片节点默认沿用
+            setLastImageSize(resolution);
           }
           }
           onAspectRatioChange={(aspectRatio) => {
             updateNodeData(id, { requestAspectRatio: aspectRatio });
+            setLastImageAspectRatio(aspectRatio);
           }
           }
           extraParams={data.extraParams}

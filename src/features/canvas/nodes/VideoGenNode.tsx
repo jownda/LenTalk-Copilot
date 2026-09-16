@@ -340,6 +340,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const preferDiscountedPrice = useSettingsStore((state) => state.preferDiscountedPrice);
   const grsaiCreditTierId = useSettingsStore((state) => state.grsaiCreditTierId);
   const setLastVideoDuration = useSettingsStore((state) => state.setLastVideoDuration);
+  const setLastVideoModelId = useSettingsStore((state) => state.setLastVideoModelId);
+  const setLastVideoAspectRatio = useSettingsStore((state) => state.setLastVideoAspectRatio);
+  const setLastVideoResolution = useSettingsStore((state) => state.setLastVideoResolution);
   const [isGenerating, setIsGenerating] = useState(false);
   const [jimengCliStatus, setJimengCliStatus] = useState<JimengCliStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1483,6 +1486,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                                 model: model.id,
                                 customPrice: customModelPrices[model.id] ?? null,
                               });
+                              setLastVideoModelId(model.id);
                               setShowModelPicker(false);
                             }}
                           >
@@ -1502,6 +1506,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           <select className="nodrag h-8 rounded border border-border-dark bg-bg-dark px-1 text-xs text-text-dark" value={data.aspectRatio} onChange={(event) => {
             setShowModelPicker(false);
             updateNodeData(id, { aspectRatio: event.target.value });
+            setLastVideoAspectRatio(event.target.value);
           }}>
             {(selectedModel?.aspectRatios ?? []).map((ratio) => <option key={ratio.value} value={ratio.value}>{ratio.label}</option>)}
           </select>
@@ -1513,6 +1518,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             onChange={(event) => {
               setShowModelPicker(false);
               updateNodeData(id, { resolution: event.target.value });
+              setLastVideoResolution(event.target.value);
             }}
             aria-label="视频分辨率"
           >

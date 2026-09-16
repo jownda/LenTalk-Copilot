@@ -3,15 +3,18 @@ import { createPortal } from 'react-dom';
 import { isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { Handle, Position } from '@xyflow/react';
-import { AlertTriangle, AudioLines, Camera, LoaderCircle, Music2, Upload, Video, X } from 'lucide-react';
+import { AlertTriangle, AudioLines, LoaderCircle, Music2, Upload, Video, X } from 'lucide-react';
 
 import { CANVAS_NODE_TYPES, type AudioNodeData } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
-import { MediaDimensionsLabel, type MediaDimensions } from '@/features/canvas/ui/MediaDimensions';
+import { MediaDimensionsLabel, useHoverIntent, useMediaByteSize, type MediaDimensions } from '@/features/canvas/ui/MediaDimensions';
 import { canvasEventBus } from '@/features/canvas/application/canvasServices';
-import { prepareNodeImage, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
+import { prepareNodeImage, reduceAspectRatio, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
+import { resolveMediaNodeResizeBounds } from '@/features/canvas/application/aspectLockedResize';
+import { captureVideoFrame } from '@/features/canvas/application/videoFrameCapture';
+import { showErrorDialog } from '@/features/canvas/application/errorDialog';
 import {
   extractVideoThumbnail,
   persistLibraryAssetBinary,
@@ -59,13 +62,14 @@ function waitForDecodedVideoFrame(video: HTMLVideoElement, timeoutMs = 5000): Pr
 
 export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const updateNodeDataTransient = useCanvasStore((state) => state.updateNodeDataTransient);
   const addDerivedExportNode = useCanvasStore((state) => state.addDerivedExportNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const viewerVideoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isCapturing, setIsCapturing] = useState(false);
-  const [captureError, setCaptureError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isVideoViewerOpen, setIsVideoViewerOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -77,6 +81,10 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   );
   const isVideo = data.mediaType === 'video';
   const mediaSrc = data.sourcePath ? resolveImageDisplayUrl(data.sourcePath) : null;
+  // 体积标注只跟随视频画面; 音频节点不显示, 传 null 避免无谓的探测请求。
+  const mediaByteSize = useMediaByteSize(isVideo ? data.sourcePath : null);
+  // 尺寸/体积标注改为悬停延迟显示, 避免常驻文字干扰画面。
+  const mediaHover = useHoverIntent();
   const isGenerating = typeof data.isGenerating === 'boolean' ? data.isGenerating : false;
   const generationError =
     typeof data.generationError === 'string' ? data.generationError.trim() : '';
@@ -96,6 +104,21 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       setVideoDimensions({ width: video.videoWidth, height: video.videoHeight });
     }
   }, []);
+
+  // 视频解码出真实尺寸后, 把宽高比写回节点数据: 拖拽缩放据此保持画面比例。
+  // 只是补充元信息, 不参与历史记录, 因此走 transient 写入。
+  useEffect(() => {
+    if (!isVideo || !videoDimensions) {
+      return;
+    }
+
+    const actualAspectRatio = reduceAspectRatio(videoDimensions.width, videoDimensions.height);
+    if (data.aspectRatio === actualAspectRatio) {
+      return;
+    }
+
+    updateNodeDataTransient(id, { aspectRatio: actualAspectRatio });
+  }, [data.aspectRatio, id, isVideo, updateNodeDataTransient, videoDimensions]);
 
   // 生成中: 定时刷新以驱动模拟进度条(与 AI 图片结果节点一致)
   useEffect(() => {
@@ -121,6 +144,43 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isVideoViewerOpen]);
+
+  // Chromium 的媒体控件自带「双击 <video> 进入原生全屏」的默认行为。
+  // 该处理位于 UA shadow DOM 内, 会在事件冒泡到 React root 之前执行, 因此仅靠
+  // JSX 的 onDoubleClick(合成事件, 挂在 root 上) 拦不住 —— 结果是双击同时触发
+  // 原生全屏与下面的自定义查看器, 表现为"全屏播放两层、要关两次"。
+  // 只有在 video 元素自身以捕获阶段注册监听, 才能先于 UA 处理取消默认行为。
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!isVideo || !video) {
+      return;
+    }
+    const blockNativeDoubleClickFullscreen = (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setIsVideoViewerOpen(true);
+    };
+    video.addEventListener('dblclick', blockNativeDoubleClickFullscreen, true);
+    return () => {
+      video.removeEventListener('dblclick', blockNativeDoubleClickFullscreen, true);
+    };
+  }, [isVideo, mediaSrc]);
+
+  // 查看器内的视频本身就是一个"全屏视图", 双击不该再叠一层原生全屏。
+  useEffect(() => {
+    const video = viewerVideoRef.current;
+    if (!isVideoViewerOpen || !video) {
+      return;
+    }
+    const blockNativeDoubleClickFullscreen = (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    video.addEventListener('dblclick', blockNativeDoubleClickFullscreen, true);
+    return () => {
+      video.removeEventListener('dblclick', blockNativeDoubleClickFullscreen, true);
+    };
   }, [isVideoViewerOpen]);
 
   const simulatedProgress = useMemo(() => {
@@ -270,25 +330,18 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   }, [data.previewImageUrl, data.sourcePath, id, isVideo, updateNodeData]);
 
   const handleCaptureFrame = useCallback(async () => {
-    const videoEl = videoRef.current;
-    if (!videoEl) {
+    const source = data.sourcePath;
+    if (!source) {
       return;
     }
     setIsCapturing(true);
-    setCaptureError(null);
     try {
-      await waitForDecodedVideoFrame(videoEl);
-      const width = videoEl.videoWidth;
-      const height = videoEl.videoHeight;
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        throw new Error('canvas 2d context unavailable');
-      }
-      ctx.drawImage(videoEl, 0, 0, width, height);
-      const dataUrl = canvas.toDataURL('image/png');
+      // 抽帧统一走 captureVideoFrame: 远端 CDN 的视频不能直接绘制到 canvas(画布会被污染),
+      // 该函数会回退到 Rust 取字节转同源 blob。取用户当前停留的时间点作为截图画面。
+      const dataUrl = await captureVideoFrame({
+        source,
+        timeSec: videoRef.current?.currentTime ?? 0,
+      });
       const prepared = await prepareNodeImage(dataUrl);
       const createdNodeId = addDerivedExportNode(
         id,
@@ -306,17 +359,28 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       }
     } catch (error) {
       console.warn('[mediaNode] capture frame failed', error);
-      setCaptureError(
+      // 截图结果节点无法创建时, 用全局错误弹窗反馈(按钮已移到节点工具栏, 节点内不再有错误行)。
+      void showErrorDialog(
         error instanceof DOMException && error.name === 'SecurityError'
           ? '视频源未授权跨域截图'
           : error instanceof Error
             ? error.message
-            : '截图失败'
+            : '截图失败',
+        '截图失败'
       );
     } finally {
       setIsCapturing(false);
     }
-  }, [addDerivedExportNode, addEdge, id]);
+  }, [addDerivedExportNode, addEdge, data.sourcePath, id]);
+
+  /** 截图入口已移到节点工具栏(下载旁), 通过事件总线触发, 与 upload-node/reupload 一致。 */
+  useEffect(() => {
+    return canvasEventBus.subscribe('media-node/capture-frame', ({ nodeId }) => {
+      if (nodeId === id) {
+        void handleCaptureFrame();
+      }
+    });
+  }, [handleCaptureFrame, id]);
 
   const dropHandlers = {
     onDragOver: (event: React.DragEvent) => {
@@ -332,7 +396,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
 
   return (
     <div
-      className={`flex h-full w-full flex-col rounded-[var(--node-radius)] border bg-surface-dark/90 p-2 transition-colors duration-150 ${
+      className={`relative flex h-full w-full flex-col rounded-[var(--node-radius)] border bg-surface-dark/90 p-2 transition-colors duration-150 ${
         hasGenerationError
           ? (selected
             ? 'border-red-400 shadow-[0_0_0_1px_rgba(248,113,113,0.42)]'
@@ -342,6 +406,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
           : 'border-[rgba(15,23,42,0.22)] dark:border-[rgba(255,255,255,0.22)]'
       }`}
       {...dropHandlers}
+      {...mediaHover.hoverProps}
     >
       <NodeHeader
         className={NODE_HEADER_FLOATING_POSITION_CLASS}
@@ -356,9 +421,15 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
           <>
             {/* 视频画面顶到上部, 铺满可用空间; 缩略图作为 poster, 单击使用节点内播放器 */}
             <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border border-[rgba(255,255,255,0.1)] bg-black/45">
+              {/* 媒体元素默认 draggable: 不关掉时按住画面拖动会触发浏览器原生拖拽,
+                  生成一个跟随鼠标的拖影, 与 React Flow 的节点拖动争夺同一个指针,
+                  表现为节点粘在鼠标上甩不掉。项目内所有 <img> 都已 draggable={false},
+                  此处补齐 video/audio。 */}
               <video
                 ref={videoRef}
                 controls
+                draggable={false}
+                onDragStart={(event) => event.preventDefault()}
                 src={mediaSrc}
                 preload="metadata"
                 poster={data.previewImageUrl ? resolveImageDisplayUrl(data.previewImageUrl) : undefined}
@@ -366,31 +437,37 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                 onLoadedMetadata={handleVideoMetadata}
                 onLoadedData={() => void handleAutoCaptureThumbnail()}
                 onDoubleClick={(event) => {
+                  // 兜底: 若元素级捕获监听未生效, 这里仍取消原生全屏并打开查看器。
+                  // (捕获阶段拦下时本回调不会执行 —— 事件已被拦截。)
+                  event.preventDefault();
                   event.stopPropagation();
                   setIsVideoViewerOpen(true);
                 }}
               />
+              {/* 截图进行中的轻量反馈: 按钮在节点工具栏, 这里只显示进度 */}
+              {isCapturing && (
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35">
+                  <span className="flex items-center gap-1.5 rounded-full bg-bg-dark/85 px-2.5 py-1 text-[11px] text-text-dark">
+                    <LoaderCircle className="h-3.5 w-3.5 animate-spin text-accent/80" />
+                    截图中…
+                  </span>
+                </div>
+              )}
             </div>
-            <MediaDimensionsLabel dimensions={videoDimensions} />
-            {/* 底部操作行 */}
-            <div className="mt-1.5 flex shrink-0 items-center gap-2">
-                <button
-                  type="button"
-                  disabled={isCapturing}
-                  onClick={() => void handleCaptureFrame()}
-                  className="flex h-7 items-center gap-1.5 rounded-md border border-border-dark bg-bg-dark px-2.5 text-xs text-text-dark transition-colors hover:border-accent/60 hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  <Camera className="h-3.5 w-3.5" />
-                  {isCapturing ? '截图…' : '截图'}
-                </button>
-                {captureError && <span className="text-[11px] text-red-400">{captureError}</span>}
-            </div>
+            <MediaDimensionsLabel
+              dimensions={videoDimensions}
+              fileSize={mediaByteSize}
+              visible={mediaHover.visible}
+            />
           </>
         ) : (
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2.5 rounded-lg border border-[rgba(255,255,255,0.1)] bg-bg-dark/45 p-2">
             <AudioLines className="h-8 w-8 text-accent/70" />
+            {/* 与视频同理: 音频元素默认 draggable, 需关掉原生拖拽。 */}
             <audio
               controls
+              draggable={false}
+              onDragStart={(event) => event.preventDefault()}
               src={mediaSrc}
               preload="metadata"
               className="nodrag w-full max-w-[280px]"
@@ -461,7 +538,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
         position={Position.Right}
         className="!h-2 !w-2 !border-surface-dark !bg-accent"
       />
-      <NodeResizeHandle minWidth={180} minHeight={150} maxWidth={520} maxHeight={400} />
+      <NodeResizeHandle {...resolveMediaNodeResizeBounds(CANVAS_NODE_TYPES.audio, data)} />
       {isVideoViewerOpen && mediaSrc && createPortal(
         <div
           className="fixed inset-0 z-[180] flex items-center justify-center bg-black/90 p-6 backdrop-blur-sm"
@@ -478,8 +555,15 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
             <X className="h-5 w-5" />
           </button>
           <video
+            ref={viewerVideoRef}
             controls
             autoPlay
+            draggable={false}
+            onDragStart={(event) => event.preventDefault()}
+            onDoubleClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
             src={mediaSrc}
             preload="auto"
             className="max-h-full max-w-full rounded-lg object-contain shadow-2xl"

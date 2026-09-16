@@ -11,6 +11,7 @@ use commands::cinematic_studio;
 use commands::cloud_drive;
 use commands::image;
 use commands::jimeng_cli;
+use commands::media_file;
 use commands::wan_cli;
 use commands::project_state;
 use commands::project_archive;
@@ -187,6 +188,8 @@ pub fn run() {
             image::read_storyboard_image_metadata,
             image::embed_storyboard_image_metadata,
             image::load_image,
+            media_file::resolve_media_file_size,
+            media_file::load_media_data_url,
             image::persist_image_source,
             image::persist_image_binary,
             image::save_image_source_to_downloads,

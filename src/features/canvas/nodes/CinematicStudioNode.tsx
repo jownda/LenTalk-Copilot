@@ -56,9 +56,11 @@ type CinematicStudioNodeProps = NodeProps & {
 };
 
 const CINEMATIC_STUDIO_NODE_MIN_WIDTH = 400;
-// 风格/质量 与 故事梗概 的输入框已与「AI 图片提示词」对齐为 h-24 固定高度，
-// 节点需要相应长高，否则 flex 挤压会把输入框压扁。
-const CINEMATIC_STUDIO_NODE_MIN_HEIGHT = 700;
+// 风格/质量与故事梗概的输入框固定为 h-24；AI 图片提示词展开时需要额外空间，
+// 折叠后则允许外框收缩，避免内容已经隐藏但节点仍保留原来的 700px 高度。
+const CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT = 520;
+const CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT = 700;
+const IMAGE_PROMPT_PANEL_HEIGHT_DELTA = 180;
 const QUICK_INPUT_HANDLES = {
   style: 'quick-style-input',
   synopsis: 'quick-synopsis-input',
@@ -80,6 +82,10 @@ function selectedCinematicAssets(ids: string[], assets: LibraryAsset[]): Library
   return ids
     .map((assetId) => assetsByCinematicId.get(assetId) ?? assets.find((asset) => asset.id === assetId))
     .filter((asset): asset is LibraryAsset => Boolean(asset));
+}
+
+function cinematicDisplayName(asset: LibraryAsset, canonicalNames: Map<string, string>): string {
+  return canonicalNames.get(cinematicAssetKey(asset))?.trim() || asset.name.trim() || '未命名素材';
 }
 
 function inputEdgesForHandle(edges: CanvasEdge[], nodeId: string, handleId: string): CanvasEdge[] {
@@ -121,6 +127,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const { i18n } = useTranslation();
   const updateNodeInternals = useUpdateNodeInternals();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
+  const updateNodeSize = useCanvasStore((state) => state.updateNodeSize);
   const { nodes, edges } = useCanvasInputGraph();
   const addEdge = useCanvasStore((state) => state.addEdge);
   const addNode = useCanvasStore((state) => state.addNode);
@@ -137,6 +144,27 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const [activeAssetPicker, setActiveAssetPicker] = useState<'scene' | 'character' | null>(null);
   const [isChatModelPickerOpen, setIsChatModelPickerOpen] = useState(false);
   const [activeChatProviderId, setActiveChatProviderId] = useState('');
+  const [cinematicAssetNames, setCinematicAssetNames] = useState<Map<string, string>>(() => new Map());
+  const [isImagePromptOpen, setIsImagePromptOpen] = useState(false);
+  const expandedHeightRef = useRef(CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT);
+
+  useEffect(() => {
+    if (!assetLibraryHydrated) return;
+    let cancelled = false;
+    void loadSharedAssets().then((assets) => {
+      if (cancelled) return;
+      setCinematicAssetNames(new Map(
+        assets
+          .filter((asset) => asset.id.trim() && asset.name.trim())
+          .map((asset) => [asset.id, asset.name.trim()]),
+      ));
+    }).catch(() => {
+      // 素材库读取失败时继续使用镜像名称，不能阻塞节点操作。
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [assetLibraryHydrated]);
 
   const chatModels = useMemo(() => listLenTalkChatModels(), [customApis]);
   // 与 AI 图片模型面板一致：先按平台区分，再在平台内选择模型。
@@ -159,9 +187,32 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     ? Math.round(width)
     : CINEMATIC_STUDIO_NODE_MIN_WIDTH;
   const resolvedHeight = Math.max(
-    CINEMATIC_STUDIO_NODE_MIN_HEIGHT,
-    typeof height === 'number' && height > 1 ? Math.round(height) : CINEMATIC_STUDIO_NODE_MIN_HEIGHT,
+    isImagePromptOpen ? CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT : CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT,
+    typeof height === 'number' && height > 1
+      ? Math.round(height)
+      : CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT,
   );
+  const currentHeightRef = useRef(resolvedHeight);
+  const currentWidthRef = useRef(resolvedWidth);
+  currentHeightRef.current = resolvedHeight;
+  currentWidthRef.current = resolvedWidth;
+
+  const handleImagePromptOpenChange = useCallback((nextOpen: boolean) => {
+    setIsImagePromptOpen(nextOpen);
+    const currentHeight = currentHeightRef.current;
+    if (nextOpen) {
+      const nextHeight = Math.max(CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT, expandedHeightRef.current);
+      updateNodeSize(id, currentWidthRef.current, nextHeight);
+      return;
+    }
+
+    expandedHeightRef.current = Math.max(CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT, currentHeight);
+    updateNodeSize(
+      id,
+      currentWidthRef.current,
+      Math.max(CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT, expandedHeightRef.current - IMAGE_PROMPT_PANEL_HEIGHT_DELTA),
+    );
+  }, [id, updateNodeSize]);
 
   const displayName = useMemo(
     () => resolveNodeDisplayName(CANVAS_NODE_TYPES.cinematicStudio, data),
@@ -326,10 +377,8 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     const placement = findNodePosition(id, 420, 360);
     const videoNodeId = addNode(CANVAS_NODE_TYPES.videoGen, placement, {
       prompt: nextPrompt,
-      model: '',
-      aspectRatio: '16:9',
-      resolution: '720p',
-      imageMode: 'reference',
+      // 模型 / 宽高比 / 分辨率不再写死: 交给 createDefaultData 沿用「上次使用」的配置
+      // (与 duration 的既有行为一致), 避免工作室发过去的节点还要重新选一遍。
       studioReferenceImages: payload.referenceImages,
       studioReferenceAudio: payload.referenceAudio,
     });
@@ -474,18 +523,16 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     return map;
   }, [libraryAssets]);
 
-  // 提示词里的 @标签用的是素材库镜像条目的显示名（多图资产会带序号后缀）。
-  // 表演母版 / 声音锁 / 站位顺序里的角色名必须与活动引用逐字一致，否则模型会
-  // 把同一个角色当成两个 @标签。取首个同名条目，与 selectedCinematicAssets 同规则。
+  // 所有引用统一使用电影工程资产名称；镜像名称仅作为旧数据的 fallback。
   const cinematicMirrorNames = useMemo(() => {
     const map = new Map<string, string>();
     for (const asset of libraryAssets) {
       if (!asset.sourcePath.trim()) continue;
       const key = cinematicAssetKey(asset);
-      if (!map.has(key)) map.set(key, asset.name);
+      if (!map.has(key)) map.set(key, cinematicDisplayName(asset, cinematicAssetNames));
     }
     return map;
-  }, [libraryAssets]);
+  }, [cinematicAssetNames, libraryAssets]);
 
   const toggleQuickAsset = useCallback((kind: 'scene' | 'character', assetId: string) => {
     const asset = libraryAssets.find((item) => item.id === assetId);
@@ -546,7 +593,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     };
     const libraryAssetToPromptAsset = (asset: LibraryAsset) => toPromptAsset({
       id: asset.id,
-      name: asset.name,
+      name: cinematicDisplayName(asset, cinematicAssetNames),
       description: cinematicAssetDescription(asset),
       source: asset.sourcePath,
       mediaType: asset.mediaType,
@@ -575,7 +622,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       referenceImages: imageSources,
       referenceAudio: audioSources,
     };
-  }, [characterInputMedia, sceneInputMedia, selectedCharacterAssets, selectedCharacterVoiceAssets, selectedSceneAssets]);
+  }, [characterInputMedia, cinematicAssetNames, sceneInputMedia, selectedCharacterAssets, selectedCharacterVoiceAssets, selectedSceneAssets]);
 
   const handleQuickGenerate = useCallback(async (event: React.MouseEvent) => {
     event.stopPropagation();
@@ -600,12 +647,17 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         loadSharedAssets(),
       ]);
       const assets = mergeAssetPool(sharedAssets, storedProject?.assets ?? []);
+      const projectAssetNames = new Map(
+        assets
+          .filter((asset) => asset.name.trim())
+          .map((asset) => [asset.id, asset.name.trim()]),
+      );
       const stagingContext = buildQuickStagingContext({
         assets,
         staging: hasQuickStagingData ? quickStaging : undefined,
         imageSources: quickPromptAssets.referenceImages,
         resolveImageSource: (assetId) => propImageSources.get(assetId),
-        resolveAssetName: (assetId) => cinematicMirrorNames.get(assetId),
+        resolveAssetName: (assetId) => projectAssetNames.get(assetId) ?? cinematicMirrorNames.get(assetId),
       });
       // 素材库镜像里的描述是从工程资产复制过来的，旧数据曾被落库丢过该字段，
       // 退化成一串标签（「场景、电影资产」）。生成前用工程资产的描述兜底，
@@ -615,15 +667,22 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         const description = asset.descriptionZh?.trim() || asset.description?.trim();
         if (description) descriptionByAssetId.set(asset.id, description);
       }
-      const withProjectDescription = (list: QuickPromptAsset[]): QuickPromptAsset[] => list.map((item) => {
-        const description = descriptionByAssetId.get(cinematicAssetIdFromMirrorId(item.id));
-        return description && description !== item.description ? { ...item, description } : item;
+      const withProjectMetadata = (list: QuickPromptAsset[]): QuickPromptAsset[] => list.map((item) => {
+        const assetId = cinematicAssetIdFromMirrorId(item.id);
+        const description = descriptionByAssetId.get(assetId);
+        const name = projectAssetNames.get(assetId);
+        if (!description && !name) return item;
+        return {
+          ...item,
+          ...(name && name !== item.name ? { name } : {}),
+          ...(description && description !== item.description ? { description } : {}),
+        };
       });
       const prompt = await generateQuickPrompt({
         style: effectiveQuickStyle,
         synopsis: effectiveQuickSynopsis,
-        sceneAssets: withProjectDescription(quickPromptAssets.sceneAssets),
-        characterAssets: withProjectDescription(quickPromptAssets.characterAssets),
+        sceneAssets: withProjectMetadata(quickPromptAssets.sceneAssets),
+        characterAssets: withProjectMetadata(quickPromptAssets.characterAssets),
         ...(stagingContext.staging ? { staging: stagingContext.staging } : {}),
         ...(stagingContext.characterProfiles.length ? { characterProfiles: stagingContext.characterProfiles } : {}),
         ...(stagingContext.props.length ? { props: stagingContext.props } : {}),
@@ -808,11 +867,11 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                   </div>
                 ))}
                 {chosen.map((asset) => (
-                  <div key={asset.id} className="group/asset relative h-9 w-9 shrink-0 overflow-hidden rounded border border-white/15 bg-black/30" title={asset.name || '未命名素材'}>
-                    <img className="h-full w-full object-cover" src={resolveImageDisplayUrl(asset.previewImageUrl || asset.sourcePath)} alt={asset.name || '素材'} />
+                  <div key={asset.id} className="group/asset relative h-9 w-9 shrink-0 overflow-hidden rounded border border-white/15 bg-black/30" title={cinematicDisplayName(asset, cinematicAssetNames)}>
+                    <img className="h-full w-full object-cover" src={resolveImageDisplayUrl(asset.previewImageUrl || asset.sourcePath)} alt={cinematicDisplayName(asset, cinematicAssetNames)} />
                     <button
                       type="button"
-                      aria-label={`移除${asset.name || '素材'}`}
+                      aria-label={`移除${cinematicDisplayName(asset, cinematicAssetNames)}`}
                       className="absolute inset-0 flex items-center justify-center bg-black/65 opacity-0 transition-opacity group-hover/asset:opacity-100"
                       onClick={() => toggleQuickAsset(kind, asset.id)}
                     >
@@ -855,10 +914,10 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                           type="button"
                           className={`relative overflow-hidden rounded border text-left transition-colors ${active ? 'border-accent ring-1 ring-accent' : 'border-white/15 hover:border-white/40'}`}
                           onClick={() => toggleQuickAsset(kind, asset.id)}
-                          title={asset.name || '未命名素材'}
+                          title={cinematicDisplayName(asset, cinematicAssetNames)}
                         >
-                          <img className="aspect-square w-full object-cover" src={resolveImageDisplayUrl(asset.previewImageUrl || asset.sourcePath)} alt={asset.name || '素材'} />
-                          <span className="block truncate bg-black/70 px-0.5 py-0.5 text-[8px] text-white">{asset.name || '未命名素材'}</span>
+                          <img className="aspect-square w-full object-cover" src={resolveImageDisplayUrl(asset.previewImageUrl || asset.sourcePath)} alt={cinematicDisplayName(asset, cinematicAssetNames)} />
+                          <span className="block truncate bg-black/70 px-0.5 py-0.5 text-[8px] text-white">{cinematicDisplayName(asset, cinematicAssetNames)}</span>
                           {active ? <span className="absolute right-0.5 top-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-accent text-white"><Check className="h-2.5 w-2.5" /></span> : null}
                         </button>
                       );
@@ -978,7 +1037,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           </button>
         </div>
 
-        <ImagePromptOptimizerPanel nodeId={id} data={data} />
+        <ImagePromptOptimizerPanel nodeId={id} data={data} onOpenChange={handleImagePromptOpenChange} />
       </section>
 
       <Handle
@@ -987,7 +1046,10 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         position={Position.Right}
         className="!h-2 !w-2 !border-surface-dark !bg-accent"
       />
-      <NodeResizeHandle minWidth={CINEMATIC_STUDIO_NODE_MIN_WIDTH} minHeight={CINEMATIC_STUDIO_NODE_MIN_HEIGHT} />
+      <NodeResizeHandle
+        minWidth={CINEMATIC_STUDIO_NODE_MIN_WIDTH}
+        minHeight={isImagePromptOpen ? CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT : CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT}
+      />
 
       {isOpen && typeof document !== 'undefined'
         ? createPortal(

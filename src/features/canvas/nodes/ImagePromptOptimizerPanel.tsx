@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { ScanSearch, Wand2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { ChevronDown, ScanSearch, Wand2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Handle, Position } from "@xyflow/react";
 
@@ -17,6 +17,7 @@ import { useCanvasStore } from "@/stores/canvasStore";
 interface ImagePromptOptimizerPanelProps {
   nodeId: string;
   data: CinematicStudioNodeData;
+  onOpenChange?: (isOpen: boolean) => void;
 }
 
 export const IMAGE_PROMPT_INPUT_HANDLE = "image-prompt-media-input";
@@ -39,7 +40,7 @@ async function toVisionImageSource(source: string): Promise<string> {
   return `data:${mime};base64,${dataUrl}`;
 }
 
-export function ImagePromptOptimizerPanel({ nodeId, data }: ImagePromptOptimizerPanelProps) {
+export function ImagePromptOptimizerPanel({ nodeId, data, onOpenChange }: ImagePromptOptimizerPanelProps) {
   const { t, i18n } = useTranslation();
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const addNode = useCanvasStore((state) => state.addNode);
@@ -49,8 +50,13 @@ export function ImagePromptOptimizerPanel({ nodeId, data }: ImagePromptOptimizer
   const { nodes, edges } = useCanvasInputGraph();
   const libraries = usePromptLibraryStore((state) => state.libraries);
   const [isReversing, setIsReversing] = useState(false);
+  const [isOpen, setIsOpen] = useState(false);
   const [error, setError] = useState("");
   const [selectedPresetId, setSelectedPresetId] = useState("");
+
+  useEffect(() => {
+    onOpenChange?.(isOpen);
+  }, [isOpen, onOpenChange]);
 
   const promptDraft = typeof data.imagePromptDraft === "string" ? data.imagePromptDraft : "";
   const outputLang = i18n.language.startsWith("en") ? "en" : "zh";
@@ -187,14 +193,23 @@ export function ImagePromptOptimizerPanel({ nodeId, data }: ImagePromptOptimizer
         title="输入图片或视频"
         className="!left-[-13px] !top-1/2 !h-2.5 !w-2.5 !-translate-y-1/2 !border-surface-dark !bg-accent"
       />
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <span className="text-[11px] font-medium text-text">{t("node.promptOptimizer.imagePromptTitle")}</span>
+      <button
+        type="button"
+        className="nodrag flex w-full items-center justify-between gap-2 text-left"
+        aria-expanded={isOpen}
+        onClick={() => setIsOpen((current) => !current)}
+      >
+        <span className="flex min-w-0 items-center gap-1 text-[11px] font-medium text-text">
+          <ChevronDown className={`h-3.5 w-3.5 shrink-0 transition-transform ${isOpen ? "rotate-180" : ""}`} />
+          <span className="truncate">{t("node.promptOptimizer.imagePromptTitle")}</span>
+        </span>
         <span className="text-[9px] text-text-muted">
           {t("node.promptOptimizer.imageInput")} {incomingImages.length} · {t("node.promptOptimizer.videoInput")}{" "}
           {incomingVideos.length}
         </span>
-      </div>
+      </button>
 
+      {isOpen ? <div className="mt-2">
       <textarea
         value={promptDraft}
         onChange={(event) => updateNodeData(nodeId, { imagePromptDraft: event.target.value })}
@@ -250,6 +265,7 @@ export function ImagePromptOptimizerPanel({ nodeId, data }: ImagePromptOptimizer
       </div>
 
       {error ? <p className="mt-2 text-[10px] leading-snug text-amber-400">{error}</p> : null}
+      </div> : null}
     </section>
   );
 }

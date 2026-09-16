@@ -30,7 +30,7 @@ import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
-import { MediaDimensionsLabel, useImageDimensions } from '@/features/canvas/ui/MediaDimensions';
+import { MediaDimensionsLabel, useHoverIntent, useImageDimensions, useMediaByteSize } from '@/features/canvas/ui/MediaDimensions';
 import { useCanvasStore } from '@/stores/canvasStore';
 
 type ImageNodeProps = NodeProps & {
@@ -148,6 +148,10 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
     return resolveImageDisplayUrl(data.imageUrl);
   }, [data.imageUrl]);
   const imageDimensions = useImageDimensions(originalImageUrl || imageSource);
+  // 体积要按原始来源探测(asset:// 无法还原成本地路径), 因此这里传入未转换的 imageUrl。
+  const mediaByteSize = useMediaByteSize(data.imageUrl);
+  // 尺寸/体积标注改为悬停延迟显示, 避免常驻文字干扰画面。
+  const mediaHover = useHoverIntent();
 
   return (
     <div
@@ -163,6 +167,7 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
       `}
       style={{ width: resolvedWidth, height: resolvedHeight }}
       onClick={() => setSelectedNode(id)}
+      {...mediaHover.hoverProps}
     >
       <NodeHeader
         className={NODE_HEADER_FLOATING_POSITION_CLASS}
@@ -218,7 +223,11 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
           </div>
         )}
       </div>
-      <MediaDimensionsLabel dimensions={imageDimensions} />
+      <MediaDimensionsLabel
+        dimensions={imageDimensions}
+        fileSize={mediaByteSize}
+        visible={mediaHover.visible}
+      />
 
       <Handle
         type="target"

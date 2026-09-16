@@ -151,6 +151,9 @@ export interface CanvasEventMap {
   'upload-node/reupload': {
     nodeId: string;
   };
+  'media-node/capture-frame': {
+    nodeId: string;
+  };
   'upload-node/paste-image': {
     nodeId: string;
     file: File;

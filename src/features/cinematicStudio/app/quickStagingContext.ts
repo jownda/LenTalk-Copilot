@@ -27,11 +27,7 @@ export interface QuickStagingContextInput {
   imageSources?: readonly string[];
   /** 电影资产 id → 素材库镜像里的首张参考图路径。 */
   resolveImageSource?: (assetId: string) => string | undefined;
-  /**
-   * 电影资产 id → 提示词里的 `@标签`。
-   * 活动引用用的是素材库镜像条目的显示名，表演母版 / 声音锁 / 站位顺序必须与之一致，
-   * 否则模型会把同一角色当成两个 @标签。
-   */
+  /** 电影资产 id → 提示词里的 `@标签`，仅作为旧镜像数据的名称兜底。 */
   resolveAssetName?: (assetId: string) => string | undefined;
 }
 
@@ -67,10 +63,9 @@ export function buildQuickStagingContext(input: QuickStagingContextInput): Quick
   const imageSources = [...(input.imageSources ?? [])];
   const appendedImages: string[] = [];
 
-  /** 提示词里的 @标签以镜像显示名为准，与活动引用保持一致。 */
+  /** 工程资产名称是唯一的 canonical 名称；镜像名称只兼容旧数据。 */
   const nameOf = (assetId: string): string => {
-    const mirrored = resolveAssetName?.(assetId)?.trim();
-    return mirrored || text(byId.get(assetId)?.name) || assetId;
+    return text(byId.get(assetId)?.name) || resolveAssetName?.(assetId)?.trim() || assetId;
   };
 
   /** 复用已有图片序号，没有则续一个新序号（与最终参考图数组顺序一致）。 */

@@ -42,7 +42,7 @@ import {
   shouldUseOriginalImageByZoom,
 } from '@/features/canvas/application/imageData';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
-import { MediaDimensionsLabel, useImageDimensions } from '@/features/canvas/ui/MediaDimensions';
+import { MediaDimensionsLabel, useHoverIntent, useImageDimensions, useMediaByteSize } from '@/features/canvas/ui/MediaDimensions';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 
@@ -331,6 +331,10 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
     return picked ? resolveImageDisplayUrl(picked) : null;
   }, [data.imageUrl, data.previewImageUrl, transientPreviewUrl, zoom]);
   const imageDimensions = useImageDimensions(data.imageUrl ? resolveImageDisplayUrl(data.imageUrl) : imageSource);
+  // 体积按原始来源探测, asset:// / blob: 预览地址无法还原成本地文件。
+  const mediaByteSize = useMediaByteSize(data.imageUrl);
+  // 尺寸/体积标注改为悬停延迟显示, 避免常驻文字干扰画面。
+  const mediaHover = useHoverIntent();
 
   useEffect(() => {
     updateNodeInternals(id);
@@ -349,6 +353,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
       onDoubleClick={handleNodeDoubleClick}
       onDrop={handleDrop}
       onDragOver={handleDragOver}
+      {...mediaHover.hoverProps}
     >
       <NodeHeader
         className={NODE_HEADER_FLOATING_POSITION_CLASS}
@@ -380,7 +385,11 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
           </div>
         </label>
       )}
-      <MediaDimensionsLabel dimensions={imageDimensions} />
+      <MediaDimensionsLabel
+        dimensions={imageDimensions}
+        fileSize={mediaByteSize}
+        visible={mediaHover.visible}
+      />
       <input
         ref={inputRef}
         type="file"

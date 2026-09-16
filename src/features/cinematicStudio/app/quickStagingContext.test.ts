@@ -72,6 +72,27 @@ describe('buildQuickStagingContext', () => {
     ]);
   });
 
+  it('prefers the project asset name over a stale mirrored library name', () => {
+    const assets: Asset[] = [
+      asset({ id: 'hero', kind: 'character', name: '工程角色名' }),
+      asset({ id: 'loc', kind: 'location', name: '工程场景名' }),
+    ];
+
+    const context = buildQuickStagingContext({
+      assets,
+      staging: {
+        locationAssetId: 'loc',
+        characterRoster: ['hero'],
+        characterOrder: ['hero'],
+      },
+      resolveAssetName: (id) => (id === 'hero' ? '旧镜像角色名 1' : '旧镜像场景名 1'),
+    });
+
+    expect(context.staging?.locationName).toBe('工程场景名');
+    expect(context.staging?.characterOrderNames).toEqual(['工程角色名']);
+    expect(context.characterProfiles[0]?.name).toBe('工程角色名');
+  });
+
   it('collects attached props and props whose default holder is the roster character', () => {
     const assets: Asset[] = [
       asset({ id: 'hero', kind: 'character', name: 'HERO', attachedPropIds: ['knife'] }),
