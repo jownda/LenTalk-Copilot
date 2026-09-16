@@ -34,6 +34,7 @@ import { useAssetLibraryStore } from './assetStore';
 import { ASSET_DRAG_DATA_TYPE, assetDragPayload, importFilesToAssets } from './importAssets';
 import { CategoryManagerDialog } from './CategoryManagerDialog';
 import { isCinematicMirrorAsset } from './cinematicMirror';
+import { syncCinematicMirrorAssets } from './cinematicMirrorSync';
 import type { AssetMediaType, LibraryAsset } from './types';
 import {
   buildBackupFileName,
@@ -302,6 +303,21 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
       canvasAudioSources: fallbackAudioSources,
     };
   })();
+
+  // ── 工作室未挂载时的镜像同步 ─────────────────────────────────────────
+  // 这段同步原先只存在于工作室 App 内，于是「没打开工作室 → 在资产库 tab 新建/改资产
+  // → 节点上的 + 里选不到」成为必然。两条写入路径现在共用 cinematicMirrorSync，
+  // 这里只在自持模式下触发；工作室打开时由 App 自己同步，避免双写。
+  useEffect(() => {
+    if (cinematicBridgeActive) return;
+    if (!isHydrated || !fallbackStudio.projectStorageReady) return;
+    syncCinematicMirrorAssets(fallbackStudio.project.assets ?? []);
+  }, [
+    cinematicBridgeActive,
+    isHydrated,
+    fallbackStudio.project.assets,
+    fallbackStudio.projectStorageReady,
+  ]);
 
   const handleImportFiles = useCallback(async (files: File[]) => {
     if (!currentLibrary || files.length === 0) return;

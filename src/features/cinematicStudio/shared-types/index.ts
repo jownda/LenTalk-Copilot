@@ -266,6 +266,12 @@ export interface SceneStaging {
   priorContext?: string;
   /** 本场可供分镜规划器分配的角色，不等同于空间左右顺序。 */
   characterRoster?: string[];
+  /**
+   * 本场可选用的道具。与 characterRoster 平行：极简节点与高级编辑共用同一字段。
+   * 角色随身道具（attachedPropIds / propHolderCharacterId）由角色侧自动收集，
+   * 这里只登记「不挂在某个角色身上」的场景道具。
+   */
+  propRoster?: string[];
   /** 空间锚点：backs against white wall next to red doors */
   anchorDescription?: string;
   /** 左到右角色 ID 排序 */

@@ -66,7 +66,11 @@ const QUICK_INPUT_HANDLES = {
   synopsis: 'quick-synopsis-input',
   sceneAssets: 'quick-scene-assets-input',
   characterAssets: 'quick-character-assets-input',
+  propAssets: 'quick-prop-assets-input',
 } as const;
+
+/** 节点上三个平行的资产候选框：场景站位 / 场景角色候选 / 道具。 */
+type QuickAssetPickerKind = 'scene' | 'character' | 'prop';
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
@@ -141,7 +145,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const [isOpen, setIsOpen] = useState(false);
   const [quickGenerating, setQuickGenerating] = useState(false);
   const [quickError, setQuickError] = useState('');
-  const [activeAssetPicker, setActiveAssetPicker] = useState<'scene' | 'character' | null>(null);
+  const [activeAssetPicker, setActiveAssetPicker] = useState<QuickAssetPickerKind | null>(null);
   const [isChatModelPickerOpen, setIsChatModelPickerOpen] = useState(false);
   const [activeChatProviderId, setActiveChatProviderId] = useState('');
   const [cinematicAssetNames, setCinematicAssetNames] = useState<Map<string, string>>(() => new Map());
@@ -306,6 +310,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const synopsisInputEdges = useMemo(() => inputEdgesForHandle(edges, id, QUICK_INPUT_HANDLES.synopsis), [edges, id]);
   const sceneAssetInputEdges = useMemo(() => inputEdgesForHandle(edges, id, QUICK_INPUT_HANDLES.sceneAssets), [edges, id]);
   const characterAssetInputEdges = useMemo(() => inputEdgesForHandle(edges, id, QUICK_INPUT_HANDLES.characterAssets), [edges, id]);
+  const propAssetInputEdges = useMemo(() => inputEdgesForHandle(edges, id, QUICK_INPUT_HANDLES.propAssets), [edges, id]);
   const upstreamStyleTexts = useMemo(
     () => graphImageResolver.collectInputText(id, nodes, styleInputEdges),
     [id, nodes, styleInputEdges],
@@ -324,6 +329,11 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     audio: graphImageResolver.collectInputAudio(id, nodes, characterAssetInputEdges),
     videos: collectInputVideos(characterAssetInputEdges, nodes),
   }), [id, nodes, characterAssetInputEdges]);
+  const propInputMedia = useMemo(() => ({
+    images: graphImageResolver.collectInputImages(id, nodes, propAssetInputEdges),
+    audio: graphImageResolver.collectInputAudio(id, nodes, propAssetInputEdges),
+    videos: collectInputVideos(propAssetInputEdges, nodes),
+  }), [id, nodes, propAssetInputEdges]);
 
   useEffect(() => {
     updateNodeInternals(id);
@@ -475,6 +485,8 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const characterAssetIds = hasQuickStaging
     ? [...new Set(quickStaging.characterRoster ?? [])]
     : legacyCharacterAssetIds;
+  // 道具是后加的能力：没有历史遗留数组，未点过任何候选框时按空列表处理。
+  const propAssetIds = hasQuickStaging ? [...new Set(quickStaging.propRoster ?? [])] : [];
   const selectedSceneAssets = useMemo(
     () => selectedCinematicAssets(sceneAssetIds, libraryAssets),
     [libraryAssets, sceneAssetIds.join('|')],
@@ -482,6 +494,10 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const selectedCharacterAssets = useMemo(
     () => selectedCinematicAssets(characterAssetIds, libraryAssets),
     [characterAssetIds.join('|'), libraryAssets],
+  );
+  const selectedPropAssets = useMemo(
+    () => selectedCinematicAssets(propAssetIds, libraryAssets),
+    [libraryAssets, propAssetIds.join('|')],
   );
   // 与高级编辑器一致：地点是单一的场景站位资产；场景角色候选由
   // characterRoster 维护。镜像库中的多张参考图仍属于同一电影资产。
@@ -496,6 +512,16 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const characterCandidates = useMemo(
     () => characterAssets.filter((asset) => !characterAssetIds.includes(cinematicAssetKey(asset))),
     [characterAssetIds.join('|'), characterAssets],
+  );
+  // 道具候选与场景 / 角色同源：都从素材库的 cinematic-* 镜像里取图，
+  // 因此「资产库里有图」是进候选的必要条件，与另外两个框完全一致。
+  const propAssets = useMemo(
+    () => cinematicImageAssets(libraryAssets, 'prop'),
+    [libraryAssets],
+  );
+  const propCandidates = useMemo(
+    () => propAssets.filter((asset) => !propAssetIds.includes(cinematicAssetKey(asset))),
+    [propAssetIds.join('|'), propAssets],
   );
   const selectedCharacterVoiceAssets = useMemo(() => {
     const selectedCharacterIds = new Set(characterAssetIds);
@@ -534,7 +560,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     return map;
   }, [cinematicAssetNames, libraryAssets]);
 
-  const toggleQuickAsset = useCallback((kind: 'scene' | 'character', assetId: string) => {
+  const toggleQuickAsset = useCallback((kind: QuickAssetPickerKind, assetId: string) => {
     const asset = libraryAssets.find((item) => item.id === assetId);
     const cinematicId = asset ? cinematicAssetKey(asset) : assetId;
     if (kind === 'scene') {
@@ -546,6 +572,16 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         quickStaging: staging,
         quickSyncInitialized: true,
       });
+      scheduleQuickStudioSync({ staging });
+      return;
+    }
+    if (kind === 'prop') {
+      // 道具只维护 propRoster：它不参与空间左右排序，也不牵动角色候选。
+      const propRoster = propAssetIds.includes(cinematicId)
+        ? propAssetIds.filter((item) => item !== cinematicId)
+        : [...propAssetIds, cinematicId];
+      const staging = { ...quickStaging, propRoster };
+      updateNodeData(id, { quickStaging: staging, quickSyncInitialized: true });
       scheduleQuickStudioSync({ staging });
       return;
     }
@@ -563,7 +599,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     };
     updateNodeData(id, { quickStaging: staging, quickSyncInitialized: true });
     scheduleQuickStudioSync({ staging });
-  }, [characterAssetIds, id, libraryAssets, quickStaging, sceneAssetIds, scheduleQuickStudioSync, updateNodeData]);
+  }, [characterAssetIds, id, libraryAssets, propAssetIds, quickStaging, sceneAssetIds, scheduleQuickStudioSync, updateNodeData]);
 
   const quickPromptAssets = useMemo(() => {
     const imageSources: string[] = [];
@@ -598,9 +634,9 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       source: asset.sourcePath,
       mediaType: asset.mediaType,
     });
-    const upstreamAsset = (kind: 'scene' | 'character', mediaType: QuickPromptAsset['mediaType'], source: string, index: number) => toPromptAsset({
+    const upstreamAsset = (kind: QuickAssetPickerKind, mediaType: QuickPromptAsset['mediaType'], source: string, index: number) => toPromptAsset({
       id: `upstream-${kind}-${mediaType}-${index}-${source}`,
-      name: `${kind === 'scene' ? '场景' : '角色'}${mediaType === 'image' ? '图片' : mediaType === 'audio' ? '音频' : '视频'} ${index + 1}`,
+      name: `${kind === 'scene' ? '场景' : kind === 'character' ? '角色' : '道具'}${mediaType === 'image' ? '图片' : mediaType === 'audio' ? '音频' : '视频'} ${index + 1}`,
       description: `上游接入：${fileLabel(source, '素材')}`,
       source,
       mediaType,
@@ -619,10 +655,16 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         ...characterInputMedia.audio.map((source, index) => upstreamAsset('character', 'audio', source, index)),
         ...characterInputMedia.videos.map((source, index) => upstreamAsset('character', 'video', source, index)),
       ],
+      // 道具接在最后：参考图顺序 = 场景 → 角色 → 道具，与提示词里的引用区块同序。
+      propAssets: [
+        ...propInputMedia.images.map((source, index) => upstreamAsset('prop', 'image', source, index)),
+        ...propInputMedia.audio.map((source, index) => upstreamAsset('prop', 'audio', source, index)),
+        ...propInputMedia.videos.map((source, index) => upstreamAsset('prop', 'video', source, index)),
+      ],
       referenceImages: imageSources,
       referenceAudio: audioSources,
     };
-  }, [characterInputMedia, cinematicAssetNames, sceneInputMedia, selectedCharacterAssets, selectedCharacterVoiceAssets, selectedSceneAssets]);
+  }, [characterInputMedia, cinematicAssetNames, propInputMedia, sceneInputMedia, selectedCharacterAssets, selectedCharacterVoiceAssets, selectedSceneAssets]);
 
   const handleQuickGenerate = useCallback(async (event: React.MouseEvent) => {
     event.stopPropagation();
@@ -685,7 +727,11 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         characterAssets: withProjectMetadata(quickPromptAssets.characterAssets),
         ...(stagingContext.staging ? { staging: stagingContext.staging } : {}),
         ...(stagingContext.characterProfiles.length ? { characterProfiles: stagingContext.characterProfiles } : {}),
-        ...(stagingContext.props.length ? { props: stagingContext.props } : {}),
+        // 道具 = 上游接入的道具媒体（已带 [imageN]）+ 站位里收集到的道具
+        // （角色随身道具 + 道具候选框选中的场景道具）。
+        ...(quickPromptAssets.propAssets.length || stagingContext.props.length
+          ? { props: [...withProjectMetadata(quickPromptAssets.propAssets), ...stagingContext.props] }
+          : {}),
       }, quickPromptLang, selectedSettings);
       // 道具参考图续在场景 / 角色之后，既有 [imageN] 顺序完全不变。
       const referenceImages = [...quickPromptAssets.referenceImages, ...stagingContext.referenceImages];
@@ -828,10 +874,11 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           </div>
         </label>
 
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-3 gap-2">
           {([
             ['scene', '场景站位', '地点', '选择地点资产', QUICK_INPUT_HANDLES.sceneAssets, selectedSceneAssets, locationAssets, sceneInputMedia],
             ['character', '场景角色候选', '角色', '选择角色加入场景角色候选', QUICK_INPUT_HANDLES.characterAssets, selectedCharacterAssets, characterCandidates, characterInputMedia],
+            ['prop', '道具', '道具', '选择道具加入本场', QUICK_INPUT_HANDLES.propAssets, selectedPropAssets, propCandidates, propInputMedia],
           ] as const).map(([kind, label, sourceLabel, pickerLabel, inputHandleId, chosen, availableAssets, connectedMedia]) => (
             <div key={kind} data-quick-popover className="relative rounded border border-[rgba(255,255,255,0.12)] bg-black/15 p-1.5">
               <Handle
@@ -907,7 +954,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                       overflowing the canvas viewport. */}
                   <div className="grid h-56 grid-cols-6 content-start gap-1 overflow-y-auto overscroll-contain pr-0.5">
                     {availableAssets.length ? availableAssets.map((asset) => {
-                      const active = (kind === 'scene' ? sceneAssetIds : characterAssetIds).includes(cinematicAssetKey(asset));
+                      const active = (kind === 'scene' ? sceneAssetIds : kind === 'character' ? characterAssetIds : propAssetIds).includes(cinematicAssetKey(asset));
                       return (
                         <button
                           key={asset.id}
@@ -923,7 +970,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                       );
                     }) : (
                       <p className="col-span-6 py-4 text-center text-[10px] text-text-muted">
-                        {kind === 'character' && characterAssets.length ? '所有角色都已加入场景角色候选' : `资产库「${sourceLabel}」中暂无资产`}
+                        {kind === 'character' && characterAssets.length ? '所有角色都已加入场景角色候选' : kind === 'prop' && propAssets.length ? '所有道具都已加入本场' : `资产库「${sourceLabel}」中暂无资产`}
                       </p>
                     )}
                   </div>

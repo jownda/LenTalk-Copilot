@@ -142,6 +142,16 @@ export function buildQuickStagingContext(input: QuickStagingContextInput): Quick
     };
   });
 
+  // 场景道具：节点 / 高级编辑里直接登记的道具，追加在角色随身道具之后。
+  // 顺序决定 [imageN] 编号，因此必须保持在既有道具之后，避免打乱已生成的提示词。
+  const propRosterIds = dedupe((staging?.propRoster ?? []).filter((id) => byId.get(id)?.kind === 'prop'));
+  for (const propId of propRosterIds) {
+    if (collectedPropIds.has(propId)) continue;
+    collectedPropIds.add(propId);
+    const propAsset = byId.get(propId);
+    if (propAsset) props.push(toPropAsset(propAsset));
+  }
+
   const locationAsset = staging?.locationAssetId ? byId.get(staging.locationAssetId) : undefined;
   const anchorDescription = text(staging?.anchorDescription);
   const spacing = text(staging?.spacing);

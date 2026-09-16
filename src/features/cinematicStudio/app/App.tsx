@@ -96,7 +96,7 @@ import { addVersion, loadHistory, loadHistoryFromDatabase, persistHistoryToDatab
 import { collectCinematicMediaReferences } from "../mediaReferences";
 import { findReferenceTokens } from "@/features/canvas/application/referenceTokenEditing";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
-import type { LibraryAsset } from "@/features/library/types";
+import { syncCinematicMirrorAssets } from "@/features/library/cinematicMirrorSync";
 
 const newId = () => crypto.randomUUID();
 const DIRECTOR_SEQUENCE_TEMPLATE = "pro-sequence" as const;
@@ -231,57 +231,13 @@ export default function App({
   // The shared canvas library is the single media entry point. Keep a lightweight
   // mirror of cinematic reference media there while retaining full cinematic
   // asset records in the project for prompt compilation and scene references.
+  // 实现抽到 cinematicMirrorSync：画布侧边栏「资产库」tab 在工作室未挂载时走
+  // 自持项目模式，那条路径同样需要同步镜像，否则节点候选里看不到这些资产。
   useEffect(() => {
     // 资产库就绪前（assets 还没并入）绝不动素材库：
     // 否则空列表会被当成「资产已删除」，把镜像条目整批清掉。
     if (!assetLibraryHydrated || !sharedAssetsReady) return;
-    const cinematicAssets = project.assets ?? [];
-    if (cinematicAssets.length === 0) return;
-    const state = useAssetLibraryStore.getState();
-    const libraryId = state.activeLibraryId || state.libraries[0]?.id;
-    if (!libraryId) return;
-    const categoryByKind = new Map(
-      state.categories
-        .filter((category) => category.libraryId === libraryId)
-        .map((category) => [category.name, category.id]),
-    );
-    const mirrored: LibraryAsset[] = [];
-    for (const asset of cinematicAssets) {
-      const sources = [...(asset.referencePaths ?? [])];
-      if (asset.kind === "character" && asset.voiceClip?.trim()) sources.push(asset.voiceClip);
-      sources.filter(Boolean).forEach((source, index) => {
-        const mediaType = asset.kind === "character" && index === sources.length - 1 && asset.voiceClip === source
-          ? "audio" as const
-          : "image" as const;
-        const categoryName = asset.kind === "character" ? "角色" : asset.kind === "location" ? "场景" : "道具";
-        mirrored.push({
-          id: `cinematic-${asset.id}-${index}`,
-          libraryId,
-          categoryId: categoryByKind.get(categoryName) ?? null,
-          // 多张参考图仍属于同一个电影资产，名称必须保持与工程资产一致；
-          // 序号只体现在镜像 id / 图片顺序中，不能污染候选和最终提示词里的 @标签。
-          name: asset.name || "未命名资产",
-          mediaType,
-          sourcePath: source,
-          previewImageUrl: mediaType === "image" ? source : null,
-          aspectRatio: "1:1",
-          sourceFileName: null,
-          tags: ["电影资产", categoryName],
-          createdAt: 0,
-          cinematicAssetId: asset.id,
-          cinematicKind: asset.kind === "character" || asset.kind === "location" || asset.kind === "prop" ? asset.kind : undefined,
-          cinematicDescription: asset.description,
-          cinematicDescriptionZh: asset.descriptionZh,
-          cinematicNotes: asset.notesZh || asset.notes,
-        });
-      });
-    }
-    const mirroredIds = new Set(mirrored.map((asset) => asset.id));
-    const staleIds = state.assets
-      .filter((asset) => asset.id.startsWith("cinematic-") && !mirroredIds.has(asset.id))
-      .map((asset) => asset.id);
-    if (staleIds.length) state.deleteAssets(staleIds);
-    if (mirrored.length) state.upsertAssets(mirrored);
+    syncCinematicMirrorAssets(project.assets ?? []);
   }, [assetLibraryHydrated, project.assets, sharedAssetsReady]);
 
   const clearResume = () => {

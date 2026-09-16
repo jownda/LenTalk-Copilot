@@ -24,6 +24,18 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # ── OTA 分发基址(仓库 Settings → Variables 配置) ──────────────────
+      # 留空   → 回落 github 镜像转发(ghfast.top), 即当前默认行为
+      # 轻量云 → 填服务器地址, 如 https://update.example.com 或 http://1.2.3.4:8080
+      # 对象存储 → 到期后只把这个变量改成 COS 域名, 无需再动工作流
+      UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+      # 自建源回传(全空则整步自动跳过, 不影响 github 镜像链路)
+      OTA_SSH_HOST: ${{ secrets.OTA_SSH_HOST }}
+      OTA_SSH_USER: ${{ secrets.OTA_SSH_USER }}
+      OTA_SSH_KEY: ${{ secrets.OTA_SSH_KEY }}
+      OTA_SSH_PORT: ${{ vars.OTA_SSH_PORT }}
+      OTA_REMOTE_DIR: ${{ vars.OTA_REMOTE_DIR }}
     steps:
       - uses: actions/checkout@v5
 
@@ -61,6 +73,7 @@ jobs:
         run: npm run tauri build -- --bundles nsis,msi
 
       - name: Generate updater metadata (windows)
+        id: meta
         shell: bash
         run: |
           set -e
@@ -69,6 +82,12 @@ jobs:
           EXE=$(ls src-tauri/target/release/bundle/nsis/LenTalk_${VERSION_NUM}_*-setup.exe | head -1)
           EXE_NAME=$(basename "$EXE")
           SIG=$(cat "${EXE}.sig")
+          # 资源下载基址: 自建源(轻量云/COS) → <基址>/releases/<tag>; 未配置 → github 镜像前缀转发
+          if [ -n "$UPDATE_BASE_URL" ]; then
+            ASSET_BASE="${UPDATE_BASE_URL%/}/releases/$VERSION"
+          else
+            ASSET_BASE="https://ghfast.top/https://github.com/jownda/LenTalk-Copilot/releases/download/$VERSION"
+          fi
           cat > latest-windows.json <<EOF
           {
             "version": "$VERSION_NUM",
@@ -77,15 +96,40 @@ jobs:
             "platforms": {
               "windows-x86_64-nsis": {
                 "signature": "$SIG",
-                "url": "https://github.com/jownda/LenTalk-Copilot/releases/download/$VERSION/$EXE_NAME"
+                "url": "${ASSET_BASE}/${EXE_NAME}"
               },
               "windows-x86_64": {
                 "signature": "$SIG",
-                "url": "https://github.com/jownda/LenTalk-Copilot/releases/download/$VERSION/$EXE_NAME"
+                "url": "${ASSET_BASE}/${EXE_NAME}"
               }
             }
           }
           EOF
+          echo "资源基址: ${ASSET_BASE}/${EXE_NAME}"
+          echo "exe_path=$EXE" >> "$GITHUB_OUTPUT"
+          echo "asset_base=$ASSET_BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish updater files to self-hosted source
+        if: env.UPDATE_BASE_URL != '' && env.OTA_SSH_HOST != ''
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
+          PORT="${OTA_SSH_PORT:-22}"
+          REMOTE="$OTA_SSH_USER@$OTA_SSH_HOST"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$OTA_SSH_KEY" > ~/.ssh/ota_key
+          chmod 600 ~/.ssh/ota_key
+          ssh -i ~/.ssh/ota_key -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$REMOTE" "mkdir -p '$OTA_REMOTE_DIR/releases/$VERSION'"
+          scp -i ~/.ssh/ota_key -P "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${{ steps.meta.outputs.exe_path }}" \
+            "${{ steps.meta.outputs.exe_path }}.sig" \
+            latest-windows.json \
+            "$REMOTE:$OTA_REMOTE_DIR/releases/$VERSION/"
+          # 顶层清单始终指向"最新", 客户端端点固定读取该路径
+          ssh -i ~/.ssh/ota_key -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$REMOTE" "cp '$OTA_REMOTE_DIR/releases/$VERSION/latest-windows.json' '$OTA_REMOTE_DIR/latest-windows.json'"
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2.5.1
@@ -96,13 +140,21 @@ jobs:
           generate_release_notes: true
           files: |
             src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/wix/*.msi
+            src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/nsis/*.sig
             latest-windows.json
 
   build-macos:
     name: macOS (dmg)
     runs-on: macos-latest
+    env:
+      # 与 build-windows 同一组变量, 两个平台的清单基址始终一致
+      UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+      OTA_SSH_HOST: ${{ secrets.OTA_SSH_HOST }}
+      OTA_SSH_USER: ${{ secrets.OTA_SSH_USER }}
+      OTA_SSH_KEY: ${{ secrets.OTA_SSH_KEY }}
+      OTA_SSH_PORT: ${{ vars.OTA_SSH_PORT }}
+      OTA_REMOTE_DIR: ${{ vars.OTA_REMOTE_DIR }}
     steps:
       - uses: actions/checkout@v5
 
@@ -151,11 +203,18 @@ jobs:
             -imagekey zlib-level=9 "LenTalk_${VERSION_NUM}_aarch64.dmg"
 
       - name: Generate updater metadata (macos)
+        id: meta
         run: |
           set -e
           VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
           VERSION_NUM="${VERSION#v}"
           SIG=$(cat src-tauri/target/release/bundle/macos/LenTalk.app.tar.gz.sig)
+          # 与 Windows 同一套基址规则
+          if [ -n "$UPDATE_BASE_URL" ]; then
+            ASSET_BASE="${UPDATE_BASE_URL%/}/releases/$VERSION"
+          else
+            ASSET_BASE="https://ghfast.top/https://github.com/jownda/LenTalk-Copilot/releases/download/$VERSION"
+          fi
           cat > latest-darwin.json <<EOF
           {
             "version": "$VERSION_NUM",
@@ -164,12 +223,38 @@ jobs:
             "platforms": {
               "darwin-aarch64": {
                 "signature": "$SIG",
-                "url": "https://github.com/jownda/LenTalk-Copilot/releases/download/$VERSION/LenTalk.app.tar.gz"
+                "url": "${ASSET_BASE}/LenTalk.app.tar.gz"
               }
             }
           }
           EOF
           cp latest-darwin.json latest-macos.json
+          echo "资源基址: ${ASSET_BASE}/LenTalk.app.tar.gz"
+          echo "asset_base=$ASSET_BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish updater files to self-hosted source
+        if: env.UPDATE_BASE_URL != '' && env.OTA_SSH_HOST != ''
+        run: |
+          set -e
+          VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
+          PORT="${OTA_SSH_PORT:-22}"
+          REMOTE="$OTA_SSH_USER@$OTA_SSH_HOST"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$OTA_SSH_KEY" > ~/.ssh/ota_key
+          chmod 600 ~/.ssh/ota_key
+          ssh -i ~/.ssh/ota_key -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$REMOTE" "mkdir -p '$OTA_REMOTE_DIR/releases/$VERSION'"
+          scp -i ~/.ssh/ota_key -P "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            latest-darwin.json \
+            latest-macos.json \
+            "$REMOTE:$OTA_REMOTE_DIR/releases/$VERSION/"
+          scp -i ~/.ssh/ota_key -P "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            src-tauri/target/release/bundle/macos/LenTalk.app.tar.gz \
+            src-tauri/target/release/bundle/macos/LenTalk.app.tar.gz.sig \
+            "LenTalk_${VERSION#v}_aarch64.dmg" \
+            "$REMOTE:$OTA_REMOTE_DIR/releases/$VERSION/"
+          ssh -i ~/.ssh/ota_key -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$REMOTE" "cp '$OTA_REMOTE_DIR/releases/$VERSION/latest-darwin.json' '$OTA_REMOTE_DIR/latest-darwin.json' && cp '$OTA_REMOTE_DIR/releases/$VERSION/latest-macos.json' '$OTA_REMOTE_DIR/latest-macos.json'"
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2.5.1
@@ -201,6 +286,7 @@ jobs:
           VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
           mkdir -p metadata
           gh release download "$VERSION" \
+            --repo "${{ github.repository }}" \
             --pattern latest-windows.json \
             --pattern latest-macos.json \
             --dir metadata \
@@ -210,6 +296,7 @@ jobs:
           cp metadata/latest-combined.json metadata/latest-windows.json
           cp metadata/latest-combined.json metadata/latest-macos.json
           gh release upload "$VERSION" \
+            --repo "${{ github.repository }}" \
             metadata/latest-windows.json \
             metadata/latest-macos.json \
             --clobber

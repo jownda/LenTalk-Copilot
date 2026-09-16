@@ -118,6 +118,7 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
                 ...(scene.staging.locationAssetId === action.id ? { locationAssetId: undefined } : {}),
                 characterRoster: (scene.staging.characterRoster ?? []).filter((id) => id !== action.id),
                 characterOrder: (scene.staging.characterOrder ?? []).filter((id) => id !== action.id),
+                propRoster: (scene.staging.propRoster ?? []).filter((id) => id !== action.id),
               }
             : scene.staging,
           shots: (scene.shots ?? []).map((shot) => ({

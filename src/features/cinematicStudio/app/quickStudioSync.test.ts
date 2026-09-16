@@ -88,6 +88,25 @@ describe("compact studio ↔ advanced workbench sync", () => {
 
     expect(next.scenes[0].staging).toEqual({ locationAssetId: undefined });
   });
+
+  it("carries the scene prop roster through the node ↔ workbench round trip", () => {
+    const project: any = {
+      styleBrief: "风格",
+      scenes: [{ id: "scene-a", logline: "梗概", staging: {}, shots: [] }],
+    };
+    // 节点侧在「道具」候选框里选了道具
+    const fromNode = {
+      sceneId: "scene-a",
+      styleBrief: "风格",
+      storySynopsis: "梗概",
+      staging: { locationAssetId: "platform", propRoster: ["knife", "lighter"] },
+    };
+    const inWorkbench = applyQuickStudioSync(project, fromNode);
+    expect(inWorkbench.scenes[0].staging).toEqual(fromNode.staging);
+
+    // 写回节点时 propRoster 必须原样带回，否则节点上的道具选中态会凭空消失。
+    expect(quickSyncFromProject(inWorkbench, "scene-a")).toEqual(fromNode);
+  });
 });
 
 describe("upstream text pass-through", () => {

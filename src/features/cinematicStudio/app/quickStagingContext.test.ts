@@ -163,4 +163,58 @@ describe('buildQuickStagingContext', () => {
     expect(context.props).toEqual([]);
     expect(context.staging?.characterOrderNames).toBeUndefined();
   });
+
+  it('collects the scene prop roster picked on the node', () => {
+    const assets: Asset[] = [
+      asset({ id: 'knife', kind: 'prop', name: '短刀', descriptionZh: '锈迹斑斑' }),
+      asset({ id: 'car', kind: 'prop', name: '旧车', propPositionZh: '停在路边' }),
+    ];
+
+    const context = buildQuickStagingContext({
+      assets,
+      staging: { propRoster: ['knife', 'car'] },
+      locale: 'zh',
+      resolveImageSource: (id) => `${id}.png`,
+    });
+
+    // 没有角色候选也必须能带出道具：这是「道具」候选框的唯一意义。
+    expect(context.props.map((prop) => [prop.id, prop.referenceIndex])).toEqual([['knife', 1], ['car', 2]]);
+    expect(context.referenceImages).toEqual(['knife.png', 'car.png']);
+    expect(context.props[1].description).toContain('位置：停在路边');
+  });
+
+  it('appends the scene prop roster after the attached props without renumbering them', () => {
+    const assets: Asset[] = [
+      asset({ id: 'hero', kind: 'character', name: 'HERO', attachedPropIds: ['lighter'] }),
+      asset({ id: 'lighter', kind: 'prop', name: '打火机' }),
+      asset({ id: 'knife', kind: 'prop', name: '短刀' }),
+    ];
+
+    const context = buildQuickStagingContext({
+      assets,
+      // 打火机既是随身道具又被选进 propRoster：只能出现一次，且必须是随身道具的原序号。
+      staging: { characterRoster: ['hero'], propRoster: ['lighter', 'knife'] },
+      imageSources: ['loc.png', 'hero.png'],
+      resolveImageSource: (id) => `${id}.png`,
+    });
+
+    expect(context.props.map((prop) => [prop.id, prop.referenceIndex])).toEqual([['lighter', 3], ['knife', 4]]);
+    expect(context.referenceImages).toEqual(['lighter.png', 'knife.png']);
+    expect(context.characterProfiles[0]).toMatchObject({ id: 'hero', propIds: ['lighter'] });
+  });
+
+  it('ignores non-prop and unknown ids in the scene prop roster', () => {
+    const assets: Asset[] = [
+      asset({ id: 'loc', kind: 'location', name: '站台' }),
+      asset({ id: 'knife', kind: 'prop', name: '短刀' }),
+    ];
+
+    const context = buildQuickStagingContext({
+      assets,
+      staging: { propRoster: ['loc', 'missing', 'knife'] },
+      locale: 'zh',
+    });
+
+    expect(context.props.map((prop) => prop.id)).toEqual(['knife']);
+  });
 });
