@@ -29,13 +29,14 @@ LenTalk 客户端
 
 三处地址必须严格对齐，这是唯一容易出错的地方：
 
-| 位置 | 值 |
-| --- | --- |
-| 客户端端点（编译进二进制） | `{UPDATE_BASE_URL}/latest-{{target}}.json` |
-| 清单内 `platforms.*.url` | `{UPDATE_BASE_URL}/releases/{tag}/{文件名}` |
-| 服务器磁盘路径 | `{OTA_REMOTE_DIR}/{同名文件}` |
+| 位置 | 值 | 示例 |
+| --- | --- | --- |
+| 客户端端点（**编译进二进制**） | `{UPDATE_BASE_URL}/latest-{{target}}.json` | `http://1.2.3.4/ota/latest-windows.json` |
+| 清单内 `platforms.*.url` | `{UPDATE_BASE_URL}/releases/{tag}/{文件名}` | `http://1.2.3.4/ota/releases/v1.2.14/xxx.exe` |
+| 服务器磁盘（由 nginx alias 映射） | URL 的 `/ota/*` ↔ `{OTA_REMOTE_DIR}/*` | `/ota/latest-windows.json` → `/var/www/lentalk-ota/latest-windows.json` |
 
-`OTA_REMOTE_DIR` 就是 nginx 暴露的那个 web root，二者必须指同一目录。
+注意 `UPDATE_BASE_URL` **带 `/ota` 后缀**，而 `OTA_REMOTE_DIR` 是**不含 `/ota` 的纯磁盘路径**，
+两者靠 `nginx-ota.conf` 里的 `alias` 对接。它们不必同名，但必须指向同一个目录。
 
 ---
 
@@ -76,25 +77,54 @@ cat ota_deploy.pub >> /home/lentalk-ota/.ssh/authorized_keys
 
 ---
 
-## 3. GitHub 侧配置
+## 3. 客户端端点接线（本机执行）
 
-`Settings → Secrets and variables → Actions`：
+拿到服务器地址后，用一条命令写入客户端端点：
+
+```bash
+bash deploy/ota-source/set-endpoint.sh 1.2.3.4            # → http://1.2.3.4/ota
+bash deploy/ota-source/set-endpoint.sh 1.2.3.4:8080       # 自定义端口
+bash deploy/ota-source/set-endpoint.sh https://up.example.com
+bash deploy/ota-source/set-endpoint.sh --show             # 查看当前端点
+bash deploy/ota-source/set-endpoint.sh --clear            # 移除自建源, 恢复纯镜像
+```
+
+脚本会：把自建源插到 `endpoints` **首位**、原样保留 `github.com` 系列镜像作为兜底、
+改完后打印需要填进 GitHub 的变量清单。
+
+> **为什么必须放首位**：Tauri 更新器按数组顺序逐个尝试，**首个返回成功即停止**。
+> 放首位即"优先查自建源，查不到才退到镜像"；若自建源暂时挂掉，客户端会静默回退，不会卡住。
+
+> ⚠️ **端点是编译进安装包的常量**，改完必须**升版本号并发版**才对客户端生效。
+> 已安装的版本永远读的是它自己编译时那份列表——这就是"配好了但老版本不走自建源"的原因。
+
+灰度建议：**留下 `UPDATE_BASE_URL` 为空时，CI 行为与现状完全一致**（走 ghfast.top 镜像），
+所以可以先只做服务器侧与 GitHub 配置，确认无误后再接线发版。
+
+---
+
+## 4. GitHub 侧配置
+
+仓库 `Settings → Secrets and variables → Actions`：
 
 | 类型 | 名称 | 示例值 | 说明 |
 | --- | --- | --- | --- |
 | Variable | `UPDATE_BASE_URL` | `http://1.2.3.4/ota` | **换源总开关**，留空则回落 ghfast.top 镜像 |
-| Variable | `OTA_REMOTE_DIR` | `/var/www/lentalk-ota` | 服务器磁盘路径 |
+| Variable | `OTA_REMOTE_DIR` | `/var/www/lentalk-ota` | 服务器磁盘路径。**不填即用此默认值**，一般无需配置 |
 | Variable | `OTA_SSH_PORT` | `22` | 非 22 时必填 |
 | Secret | `OTA_SSH_HOST` | `1.2.3.4` | 公网 IP 或域名 |
 | Secret | `OTA_SSH_USER` | `lentalk-ota` | 上传账号 |
 | Secret | `OTA_SSH_KEY` | `-----BEGIN OPENSSH...` | 私钥全文 |
 
-`OTA_SSH_HOST` 为空时上传步骤自动跳过，**不会影响原有的 GitHub 镜像链路**，可放心先只配
-`UPDATE_BASE_URL` 做灰度。
+`UPDATE_BASE_URL` 与 `OTA_SSH_HOST` **同时非空**时上传步骤才启用；
+任一为空则整步跳过，**不影响原有 GitHub 镜像链路**。
+
+若只配了一半（例如填了开关与主机，却漏了 `OTA_SSH_USER`），构建会在上传步骤**明确报错并中止**，
+而不是以一个难懂的 ssh 错误收场——这是刻意设计的，避免"CI 显示成功但文件其实没传上去"。
 
 ---
 
-## 4. 发版流程
+## 5. 发版流程
 
 与现状完全一致，无需额外操作：
 
@@ -110,7 +140,7 @@ GitHub Release（作为兜底与历史留档）。
 
 ---
 
-## 5. HTTP 还是 HTTPS
+## 6. HTTP 还是 HTTPS
 
 当前服务器是 **IP 直连 + 80 端口**（无域名），因此走 `http://`，这需要客户端配置：
 
@@ -134,7 +164,7 @@ HTTP 只影响保密性（版本号、IP 可见），不影响完整性。若日
 
 ---
 
-## 6. 到期迁移到 COS
+## 7. 到期迁移到 COS
 
 推荐做法是**让客户端地址永不改变**，只在后端之间漂移：
 
@@ -147,15 +177,15 @@ HTTP 只影响保密性（版本号、IP 可见），不影响完整性。若日
 1. 把 `/var/www/lentalk-ota/` 整目录同步到 COS（`coscmd upload -rs`）
 2. 改 `UPDATE_BASE_URL` 变量
 3. 用 `curl -sI <新地址>/latest-windows.json` 验证可达
-4. 停掉 nginx 片段或保留双跑
-5. 下一版发布即自动走 COS
+4. 本地重新接线：`bash deploy/ota-source/set-endpoint.sh <COS域名>` → 发版
+5. 停掉 nginx 片段或保留双跑
 
 > 提醒：COS 免费额度只含 50GB 标准存储 6 个月，**不含外网下行流量**（0.5 元/GiB 按量）。
 > 按 Windows 包 16MB 计，1 万次更新约 160GiB ≈ 80 元。建议配合 CDN 或保留镜像兜底。
 
 ---
 
-## 7. 常见问题
+## 8. 常见问题
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -163,5 +193,8 @@ HTTP 只影响保密性（版本号、IP 可见），不影响完整性。若日
 | 检查更新报错后仍能更新 | 端点回退生效 | 正常行为，Tauri 遇非 2XX 才试下一个端点 |
 | 有清单但下载 404 | 安装包未上传或 tag 目录名不符 | 比对清单 `url` 与磁盘实际路径 |
 | 签名校验失败 | 清单 `signature` 与包不匹配 | 同一版本的 `.sig` 与包必须成对上传 |
-| 上传步骤被跳过 | `OTA_SSH_HOST` 或 `UPDATE_BASE_URL` 为空 | 补 GitHub 变量/密钥 |
-| 已装 1.2.13 不走自建源 | 端点是编译期写死的 | 必须发 v1.2.14 才能生效 |
+| 上传步骤被跳过 | `UPDATE_BASE_URL` 或 `OTA_SSH_HOST` 为空 | 补 GitHub 变量/密钥 |
+| 构建报"必须配置 OTA_SSH_USER 或 OTA_SSH_KEY" | 自建源开关已开但凭据不全 | 补 Secret；或清空 `UPDATE_BASE_URL` 先回到镜像链路 |
+| 构建报"OTA_REMOTE_DIR 必须是绝对路径" | 变量填了相对路径 | 改为以 `/` 开头的绝对路径 |
+| **CI 全绿但客户端查不到更新** | `OTA_REMOTE_DIR` 与 nginx alias 目录不一致 | 用 `--show` 查端点、比对上表三处地址；这也是给它设默认值的原因 |
+| 已装版本不走自建源 | 端点是编译期写死的 | 必须发一版新号才能生效 |

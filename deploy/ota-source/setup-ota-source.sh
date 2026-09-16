@@ -44,8 +44,25 @@ chmod 644 "$SNIPPET_DST"
 log "已写入 $SNIPPET_DST"
 
 # ── 3. 挂到现有 server 块 ───────────────────────────────────────────────
-# 找承载参考图上传服务的那个配置文件(80 端口的 default_server)
-TARGET_CONF="$(grep -rl --include='*.conf' 'reference-assets' /etc/nginx/ 2>/dev/null | grep -v 'lentalk-ota' | head -1 || true)"
+# 找承载参考图上传服务的那个配置文件(80 端口的 default_server)。
+# 注意: Debian/Ubuntu 的站点文件通常**没有 .conf 后缀**(sites-available/xxx),
+# 所以不能用 --include='*.conf' 过滤, 否则永远匹配不到。
+TARGET_CONF="$(
+  grep -rl 'reference-assets' \
+       /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null \
+    | grep -v 'lentalk-ota' | grep -v '\.bak' | head -1 || true
+)"
+# 退路: 按 80 端口 default_server 找
+if [ -z "$TARGET_CONF" ]; then
+  TARGET_CONF="$(
+    grep -rl '80 default_server' /etc/nginx/sites-enabled 2>/dev/null \
+      | grep -v 'lentalk-ota' | grep -v '\.bak' | head -1 || true
+  )"
+fi
+# sites-enabled 里是符号链接, 解析成真实路径再改, 避免改到链接本身
+if [ -n "$TARGET_CONF" ]; then
+  TARGET_CONF="$(readlink -f "$TARGET_CONF")"
+fi
 
 if [ -z "$TARGET_CONF" ]; then
   warn "未找到含 reference-assets 的 nginx 配置"

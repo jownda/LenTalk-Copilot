@@ -35,7 +35,10 @@ jobs:
       OTA_SSH_USER: ${{ secrets.OTA_SSH_USER }}
       OTA_SSH_KEY: ${{ secrets.OTA_SSH_KEY }}
       OTA_SSH_PORT: ${{ vars.OTA_SSH_PORT }}
-      OTA_REMOTE_DIR: ${{ vars.OTA_REMOTE_DIR }}
+      # 必须与服务器上 nginx alias 的目录一致(见 deploy/ota-source/nginx-ota.conf)。
+      # 给默认值是为了防漏填: 若为空, 文件会被写到 SSH 用户的根目录/家目录, 而 nginx
+      # 从 /var/www/lentalk-ota 读取 → 表现为"CI 全绿但客户端永远查不到更新"这种静默失败。
+      OTA_REMOTE_DIR: ${{ vars.OTA_REMOTE_DIR || '/var/www/lentalk-ota' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -114,6 +117,17 @@ jobs:
         shell: bash
         run: |
           set -e
+          # 自建源"配了一半"比完全不配更危险: 缺 OTA_SSH_USER 会拼出 "@1.2.3.4" 这种非法
+          # 地址, 缺 OTA_SSH_KEY 会让 ssh 退化成交互式认证(CI 中必然挂起)。
+          # 这里统一拦下并给出可操作的报错, 而不是让它以一个难懂的 ssh 报错收场。
+          if [ -z "$OTA_SSH_USER" ] || [ -z "$OTA_SSH_KEY" ]; then
+            echo "::error::自建源已启用(UPDATE_BASE_URL / OTA_SSH_HOST 非空), 但 OTA_SSH_USER 或 OTA_SSH_KEY 未配置"
+            exit 1
+          fi
+          case "$OTA_REMOTE_DIR" in
+            /*) ;;
+            *) echo "::error::OTA_REMOTE_DIR 必须是绝对路径, 当前为 '$OTA_REMOTE_DIR'"; exit 1 ;;
+          esac
           VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
           PORT="${OTA_SSH_PORT:-22}"
           REMOTE="$OTA_SSH_USER@$OTA_SSH_HOST"
@@ -154,7 +168,8 @@ jobs:
       OTA_SSH_USER: ${{ secrets.OTA_SSH_USER }}
       OTA_SSH_KEY: ${{ secrets.OTA_SSH_KEY }}
       OTA_SSH_PORT: ${{ vars.OTA_SSH_PORT }}
-      OTA_REMOTE_DIR: ${{ vars.OTA_REMOTE_DIR }}
+      # 同上: 默认值与 nginx alias 目录保持一致, 防止漏填导致静默失败
+      OTA_REMOTE_DIR: ${{ vars.OTA_REMOTE_DIR || '/var/www/lentalk-ota' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -236,6 +251,15 @@ jobs:
         if: env.UPDATE_BASE_URL != '' && env.OTA_SSH_HOST != ''
         run: |
           set -e
+          # 与 build-windows 同一套前置校验(两处需保持同步)
+          if [ -z "$OTA_SSH_USER" ] || [ -z "$OTA_SSH_KEY" ]; then
+            echo "::error::自建源已启用(UPDATE_BASE_URL / OTA_SSH_HOST 非空), 但 OTA_SSH_USER 或 OTA_SSH_KEY 未配置"
+            exit 1
+          fi
+          case "$OTA_REMOTE_DIR" in
+            /*) ;;
+            *) echo "::error::OTA_REMOTE_DIR 必须是绝对路径, 当前为 '$OTA_REMOTE_DIR'"; exit 1 ;;
+          esac
           VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
           PORT="${OTA_SSH_PORT:-22}"
           REMOTE="$OTA_SSH_USER@$OTA_SSH_HOST"
