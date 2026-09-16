@@ -75,6 +75,10 @@ jobs:
             "notes": "LenTalk $VERSION",
             "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "platforms": {
+              "windows-x86_64-nsis": {
+                "signature": "$SIG",
+                "url": "https://github.com/jownda/LenTalk-Copilot/releases/download/$VERSION/$EXE_NAME"
+              },
               "windows-x86_64": {
                 "signature": "$SIG",
                 "url": "https://github.com/jownda/LenTalk-Copilot/releases/download/$VERSION/$EXE_NAME"
@@ -152,7 +156,7 @@ jobs:
           VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
           VERSION_NUM="${VERSION#v}"
           SIG=$(cat src-tauri/target/release/bundle/macos/LenTalk.app.tar.gz.sig)
-          cat > latest-macos.json <<EOF
+          cat > latest-darwin.json <<EOF
           {
             "version": "$VERSION_NUM",
             "notes": "LenTalk $VERSION",
@@ -165,6 +169,7 @@ jobs:
             }
           }
           EOF
+          cp latest-darwin.json latest-macos.json
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2.5.1
@@ -177,4 +182,34 @@ jobs:
             LenTalk_*_aarch64.dmg
             src-tauri/target/release/bundle/macos/*.tar.gz
             src-tauri/target/release/bundle/macos/*.sig
+            latest-darwin.json
             latest-macos.json
+
+  repair-legacy-updater-manifests:
+    name: Merge updater manifests for older clients
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Merge platform metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
+          mkdir -p metadata
+          gh release download "$VERSION" \
+            --pattern latest-windows.json \
+            --pattern latest-macos.json \
+            --dir metadata \
+            --clobber
+          jq -s '.[0] as $windows | .[1] as $macos | ($windows * $macos) | .platforms = ($windows.platforms * $macos.platforms)' \
+            metadata/latest-windows.json metadata/latest-macos.json > metadata/latest-combined.json
+          cp metadata/latest-combined.json metadata/latest-windows.json
+          cp metadata/latest-combined.json metadata/latest-macos.json
+          gh release upload "$VERSION" \
+            metadata/latest-windows.json \
+            metadata/latest-macos.json \
+            --clobber
