@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { AUTO_REQUEST_ASPECT_RATIO } from '@/features/canvas/domain/canvasNodes';
 import {
   getModelProvider,
+  isApiKeylessProvider,
   type AspectRatioOption,
   type ImageModelDefinition,
   type ResolutionOption,
@@ -210,8 +211,12 @@ export const ModelParamsControls = memo(({
     const uniqueProviderIds = Array.from(new Set(imageModels.map((model) => model.providerId)));
     return uniqueProviderIds
       .map((providerId) => getModelProvider(providerId))
-      // 只展示已配置 API Key 的平台,未配置的不出现在列表
-      .filter((provider) => Boolean((apiKeys[provider.id] ?? '').trim()))
+      // 只展示已配置 API Key 的平台,未配置的不出现在列表。
+      // 本地 CLI(即梦 / 万相)没有密钥可填, 必须放行, 否则它们的模型永远选不到。
+      .filter(
+        (provider) =>
+          isApiKeylessProvider(provider.id) || Boolean((apiKeys[provider.id] ?? '').trim())
+      )
       .sort((left, right) => {
         const leftIndex = providerIndex.get(left.id) ?? Number.MAX_SAFE_INTEGER;
         const rightIndex = providerIndex.get(right.id) ?? Number.MAX_SAFE_INTEGER;
@@ -219,12 +224,12 @@ export const ModelParamsControls = memo(({
       });
   }, [imageModels, apiKeys]);
   const providerModels = useMemo(
-    // 只展示已配置 API Key 的平台模型
+    // 只展示已配置 API Key 的平台模型; 本地 CLI 平台不按密钥过滤。
     () =>
       imageModels.filter(
         (model) =>
           model.providerId === panelProviderId &&
-          Boolean((apiKeys[model.providerId] ?? '').trim())
+          (isApiKeylessProvider(model.providerId) || Boolean((apiKeys[model.providerId] ?? '').trim()))
       ),
     [imageModels, panelProviderId, apiKeys]
   );
@@ -540,7 +545,7 @@ export const ModelParamsControls = memo(({
                         onClick={(event) => {
                           event.stopPropagation();
                           const providerApiKey = (apiKeys[provider.id] ?? '').trim();
-                          if (!providerApiKey) {
+                          if (!providerApiKey && !isApiKeylessProvider(provider.id)) {
                             setOpenPanel(null);
                             setMissingKeyProviderName(provider.label || provider.name);
                             return;

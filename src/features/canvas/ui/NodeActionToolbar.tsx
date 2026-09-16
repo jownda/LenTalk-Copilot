@@ -1,9 +1,13 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NodeToolbar as ReactFlowNodeToolbar } from '@xyflow/react';
-import { Camera, Copy, Crop, Download, Library, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Sparkles, Trash2, Unlink2 } from 'lucide-react';
+import { Camera, Copy, Crop, Download, Library, Maximize2, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Sparkles, Trash2, Unlink2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import {
+  CANVAS_NODE_TYPES,
+  DEFAULT_ASPECT_RATIO,
+  EXPORT_RESULT_NODE_DEFAULT_WIDTH,
+  EXPORT_RESULT_NODE_LAYOUT_HEIGHT,
   NODE_TOOL_TYPES,
   isExportImageNode,
   isGroupNode,
@@ -15,18 +19,27 @@ import {
   type CanvasNode,
   type NodeToolType,
 } from '@/features/canvas/domain/canvasNodes';
-import { canvasEventBus } from '@/features/canvas/application/canvasServices';
+import { canvasAiGateway, canvasEventBus } from '@/features/canvas/application/canvasServices';
 import { getNodeToolPlugins } from '@/features/canvas/tools';
 import type { ToolIconKey } from '@/features/canvas/tools';
-import { UiChipButton, UiPanel, UiModal } from '@/components/ui';
+import { UiChipButton, UiPanel, UiModal, UiButton } from '@/components/ui';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { sanitizeStoryboardText } from '@/features/canvas/application/storyboardText';
-import { buildGenerationErrorReport } from '@/features/canvas/application/generationErrorReport';
+import {
+  buildGenerationErrorReport,
+  CURRENT_RUNTIME_SESSION_ID,
+} from '@/features/canvas/application/generationErrorReport';
 import { showErrorDialog } from '@/features/canvas/application/errorDialog';
 import { saveMediaSourceWithDialog } from '@/features/canvas/application/mediaDownload';
 import { importVideoUrlToAsset } from '@/features/library/importAssets';
 import { useAssetLibraryStore } from '@/features/library/assetStore';
+import {
+  JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID,
+  listImageUpscaleModels,
+  resolveImageModelResolutions,
+  type ImageModelDefinition,
+} from '@/features/canvas/models';
 import {
   NODE_TOOLBAR_ALIGN,
   NODE_TOOLBAR_CLASS,
@@ -96,6 +109,10 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const deleteNode = useCanvasStore((state) => state.deleteNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const ungroupNode = useCanvasStore((state) => state.ungroupNode);
+  const addNode = useCanvasStore((state) => state.addNode);
+  const addEdge = useCanvasStore((state) => state.addEdge);
+  const findNodePosition = useCanvasStore((state) => state.findNodePosition);
+  const apiKeys = useSettingsStore((state) => state.apiKeys);
   const canReupload = isUploadNode(node) && Boolean(node.data.imageUrl);
   const canReuploadMedia = isAudioNode(node) && Boolean(node.data.sourcePath);
   const libraries = useAssetLibraryStore((state) => state.libraries);
@@ -107,6 +124,14 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   );
   const [isLibraryDialogOpen, setIsLibraryDialogOpen] = useState(false);
   const [isUpscaleDialogOpen, setIsUpscaleDialogOpen] = useState(false);
+  const [isImageUpscaleDialogOpen, setIsImageUpscaleDialogOpen] = useState(false);
+  const [imageUpscaleModelId, setImageUpscaleModelId] = useState<string>(
+    JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID
+  );
+  const [imageUpscaleResolution, setImageUpscaleResolution] = useState<string>('');
+  // 「更换模型」列表默认收起: 弹窗只显示当前高清模型, 避免一屏模型铺开。
+  const [isUpscaleModelPickerOpen, setIsUpscaleModelPickerOpen] = useState(false);
+  const [isUpscalingImage, setIsUpscalingImage] = useState(false);
   const [isSavingToLibrary, setIsSavingToLibrary] = useState(false);
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
@@ -123,6 +148,113 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     : null;
   const downloadSource = imageSource || videoSource;
   const canHandleMedia = Boolean(downloadSource);
+  // 「图片高清」只对带图的图片类节点开放(AI 图片节点自己那排按钮走的是另一套渲染)。
+  const canUpscaleImage = !isImageEdit && Boolean(imageSource) && !videoSource;
+  const upscaleModelOptions = useMemo<ImageModelDefinition[]>(
+    () => (isImageUpscaleDialogOpen ? listImageUpscaleModels() : []),
+    [isImageUpscaleDialogOpen]
+  );
+  const selectedUpscaleModel = useMemo(
+    () =>
+      upscaleModelOptions.find((model) => model.id === imageUpscaleModelId)
+      ?? upscaleModelOptions[0]
+      ?? null,
+    [imageUpscaleModelId, upscaleModelOptions]
+  );
+  const upscaleResolutionOptions = useMemo(
+    () => (selectedUpscaleModel ? resolveImageModelResolutions(selectedUpscaleModel) : []),
+    [selectedUpscaleModel]
+  );
+  // 档位随模型变 —— 换模型后原档位可能不被支持, 这里收敛到该模型的首档。
+  const resolvedUpscaleResolution = upscaleResolutionOptions.some(
+    (option) => option.value === imageUpscaleResolution
+  )
+    ? imageUpscaleResolution
+    : (selectedUpscaleModel?.defaultResolution ?? upscaleResolutionOptions[0]?.value ?? '2K');
+  const handleUpscaleImage = useCallback(async () => {
+    if (!imageSource || !selectedUpscaleModel || isUpscalingImage) {
+      return;
+    }
+
+    const isJimengUpscale = selectedUpscaleModel.id === JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID;
+    if (!isJimengUpscale && !(apiKeys[selectedUpscaleModel.providerId] ?? '').trim()) {
+      const message = t('nodeToolbar.imageUpscaleApiKeyMissing');
+      void showErrorDialog(message, t('common.error'));
+      return;
+    }
+
+    setIsUpscalingImage(true);
+    // 超分要保住原图比例: 优先沿用节点自身的画幅, 没有就用默认值。
+    const aspectRatio =
+      typeof node.data.aspectRatio === 'string' && node.data.aspectRatio.trim()
+        ? node.data.aspectRatio
+        : DEFAULT_ASPECT_RATIO;
+    const prompt = isJimengUpscale ? '' : t('nodeToolbar.imageUpscalePrompt');
+    const requestModel = selectedUpscaleModel.resolveRequest({ referenceImageCount: 1 }).requestModel;
+    const newNodeId = addNode(
+      CANVAS_NODE_TYPES.exportImage,
+      findNodePosition(node.id, EXPORT_RESULT_NODE_DEFAULT_WIDTH, EXPORT_RESULT_NODE_LAYOUT_HEIGHT),
+      {
+        isGenerating: true,
+        generationStartedAt: Date.now(),
+        generationDurationMs: selectedUpscaleModel.expectedDurationMs ?? 60000,
+        // 先认领本次运行会话, 避免提交拿到 jobId 前被当成重启残留任务重复提交。
+        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+        generationRequest: {
+          kind: 'image',
+          prompt,
+          model: requestModel,
+          size: resolvedUpscaleResolution,
+          aspectRatio,
+          referenceImages: [imageSource],
+        },
+        resultKind: 'generic',
+        displayName: `${t('nodeToolbar.imageUpscale')} ${resolvedUpscaleResolution}`,
+      }
+    );
+    addEdge(node.id, newNodeId);
+
+    try {
+      const jobId = await canvasAiGateway.submitGenerateImageJob({
+        prompt,
+        model: requestModel,
+        size: resolvedUpscaleResolution,
+        aspectRatio,
+        referenceImages: [imageSource],
+      });
+      updateNodeData(newNodeId, {
+        generationJobId: jobId,
+        generationSourceType: 'imageEdit',
+        generationProviderId: selectedUpscaleModel.providerId,
+        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+      });
+      setIsUpscaleModelPickerOpen(false);
+      setIsImageUpscaleDialogOpen(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      updateNodeData(newNodeId, {
+        isGenerating: false,
+        generationStartedAt: null,
+        generationError: message,
+      });
+      void showErrorDialog(message, t('common.error'));
+    } finally {
+      setIsUpscalingImage(false);
+    }
+  }, [
+    addEdge,
+    addNode,
+    apiKeys,
+    findNodePosition,
+    imageSource,
+    isUpscalingImage,
+    node.data.aspectRatio,
+    node.id,
+    resolvedUpscaleResolution,
+    selectedUpscaleModel,
+    t,
+    updateNodeData,
+  ]);
   const handleDownloadMedia = useCallback(async () => {
     if (!downloadSource) {
       return;
@@ -449,6 +581,21 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 {t('nodeToolbar.captureFrame')}
               </UiChipButton>
             )}
+            {canUpscaleImage && (
+              <UiChipButton
+                key="image-upscale"
+                className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  // 把本节点的图交给所选模型放大, 结果作为新的结果图片节点接入画布。
+                  setIsUpscaleModelPickerOpen(false);
+                  setIsImageUpscaleDialogOpen(true);
+                }}
+              >
+                <Maximize2 className="h-3.5 w-3.5" />
+                {t('nodeToolbar.imageUpscale')}
+              </UiChipButton>
+            )}
             {isGeneratedVideoNode && videoSource && (
               <UiChipButton
                 key="video-upscale"
@@ -584,6 +731,119 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               <li>{t('nodeToolbar.upscaleTodoTarget')}</li>
               <li>{t('nodeToolbar.upscaleTodoTransport')}</li>
             </ul>
+          </div>
+        </UiModal>
+      )}
+
+      {!isImageEdit && (
+        <UiModal
+          isOpen={isImageUpscaleDialogOpen}
+          title={t('nodeToolbar.imageUpscale')}
+          onClose={() => {
+            setIsUpscaleModelPickerOpen(false);
+            setIsImageUpscaleDialogOpen(false);
+          }}
+          widthClassName="w-[420px]"
+        >
+          <div className="space-y-3">
+            <div>
+              <span className="mb-1.5 block text-xs text-text-muted">
+                {t('nodeToolbar.imageUpscaleModel')}
+              </span>
+              <div className="flex items-center gap-2">
+                <span className="flex h-9 min-w-0 flex-1 items-center rounded-lg border border-white/10 bg-bg-dark/50 px-2.5 text-xs text-text-dark">
+                  <span className="min-w-0 truncate">
+                    {selectedUpscaleModel?.displayName ?? t('nodeToolbar.imageUpscaleNoModel')}
+                  </span>
+                </span>
+                <UiButton
+                  type="button"
+                  variant="muted"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => setIsUpscaleModelPickerOpen((open) => !open)}
+                >
+                  {t('nodeToolbar.imageUpscaleChangeModel')}
+                </UiButton>
+              </div>
+              {isUpscaleModelPickerOpen && (
+                <div className="ui-scrollbar mt-2 max-h-52 space-y-1 overflow-y-auto rounded-lg border border-white/10 p-1">
+                  {upscaleModelOptions.map((model) => {
+                    const isActive = model.id === selectedUpscaleModel?.id;
+                    return (
+                      <button
+                        key={model.id}
+                        type="button"
+                        onClick={() => {
+                          setImageUpscaleModelId(model.id);
+                          setIsUpscaleModelPickerOpen(false);
+                        }}
+                        className={`flex h-8 w-full items-center justify-between gap-2 rounded-md px-2 text-left text-xs transition-colors ${
+                          isActive
+                            ? 'bg-accent/20 text-text-dark'
+                            : 'text-text-muted hover:bg-bg-dark'
+                        }`}
+                      >
+                        <span className="min-w-0 truncate">{model.displayName}</span>
+                        <span className="shrink-0 text-[11px] text-text-muted/70">{model.providerId}</span>
+                      </button>
+                    );
+                  })}
+                  {upscaleModelOptions.length === 0 && (
+                    <p className="px-2 py-3 text-center text-xs text-text-muted/60">
+                      {t('nodeToolbar.imageUpscaleNoModel')}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <span className="mb-1.5 block text-xs text-text-muted">
+                {t('nodeToolbar.imageUpscaleResolution')}
+              </span>
+              <div className="flex flex-wrap gap-1.5">
+                {upscaleResolutionOptions.map((option) => {
+                  const isActive = option.value === resolvedUpscaleResolution;
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => setImageUpscaleResolution(option.value)}
+                      className={`h-7 rounded-full border px-3 text-xs transition-colors ${
+                        isActive
+                          ? 'border-accent bg-accent/20 text-text-dark'
+                          : 'border-white/15 bg-bg-dark/60 text-text-muted hover:border-white/30'
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 border-t border-white/10 pt-3">
+              <UiButton
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => setIsImageUpscaleDialogOpen(false)}
+              >
+                {t('common.cancel')}
+              </UiButton>
+              <UiButton
+                type="button"
+                variant="primary"
+                size="sm"
+                disabled={isUpscalingImage || !selectedUpscaleModel}
+                onClick={() => void handleUpscaleImage()}
+              >
+                {isUpscalingImage
+                  ? t('nodeToolbar.imageUpscaleRunning')
+                  : t('canvas.generate')}
+              </UiButton>
+            </div>
           </div>
         </UiModal>
       )}

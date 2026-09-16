@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest';
 
-import { listAudioModels, listImageModels, listVideoModels } from './registry';
+import {
+  JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID,
+  JIMENG_CLI_PROVIDER_ID,
+  getImageModel,
+  isApiKeylessProvider,
+  listAudioModels,
+  listImageModels,
+  listImageUpscaleModels,
+  listVideoModels,
+} from './registry';
+import { JIMENG_CLI_IMAGE_UPSCALE_MODEL } from '@/commands/ai';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { isVideoGenerationModelName, useSettingsStore, type CustomApiProvider } from '@/stores/settingsStore';
 
@@ -283,6 +293,131 @@ describe('listAudioModels(字子动画)', () => {
       // 音频模型不能同时出现在图片/视频下拉里。
       expect(listImageModels().some((model) => model.id.includes('eleven_'))).toBe(false);
       expect(listVideoModels().some((model) => model.id.includes('eleven_'))).toBe(false);
+    } finally {
+      useSettingsStore.setState({ customApis: previousCustomApis });
+    }
+  });
+});
+
+describe('即梦 CLI 图片模型', () => {
+  const jimengModels = () =>
+    listImageModels().filter((model) => model.providerId === JIMENG_CLI_PROVIDER_ID);
+
+  it('在图片列表里注册 9 个版本, 且属于无密钥平台', () => {
+    expect(jimengModels().map((model) => model.id)).toEqual([
+      'jimeng-cli/image-5.0Pro',
+      'jimeng-cli/image-5.0',
+      'jimeng-cli/image-4.7',
+      'jimeng-cli/image-4.6',
+      'jimeng-cli/image-4.5',
+      'jimeng-cli/image-4.1',
+      'jimeng-cli/image-4.0',
+      'jimeng-cli/image-3.1',
+      'jimeng-cli/image-3.0',
+    ]);
+    // 没有 API Key 可填 —— 图片模型选择器要靠它绕过"填过密钥"的过滤。
+    expect(isApiKeylessProvider(JIMENG_CLI_PROVIDER_ID)).toBe(true);
+    expect(isApiKeylessProvider('openai')).toBe(false);
+  });
+
+  it('档位与 CLI 校验一致: 3.x 只有 1K/2K, 4.x~5.0 是 2K/4K, 5.0Pro 多一档 1.5K', () => {
+    const tiersOf = (version: string) =>
+      jimengModels().find((model) => model.id === `jimeng-cli/image-${version}`)!
+        .resolutions.map((option) => option.value);
+
+    expect(tiersOf('3.0')).toEqual(['1K', '2K']);
+    expect(tiersOf('3.1')).toEqual(['1K', '2K']);
+    expect(tiersOf('4.0')).toEqual(['2K', '4K']);
+    expect(tiersOf('4.5')).toEqual(['2K', '4K']);
+    expect(tiersOf('4.7')).toEqual(['2K', '4K']);
+    expect(tiersOf('5.0')).toEqual(['2K', '4K']);
+    expect(tiersOf('5.0Pro')).toEqual(['1.5K', '2K', '4K']);
+  });
+
+  it('画幅用 CLI 的 8 档枚举, 不含自定义平台的 5:4 / 4:5', () => {
+    const model = jimengModels()[0]!;
+    expect(model.aspectRatios.map((option) => option.value)).toEqual([
+      '21:9',
+      '16:9',
+      '3:2',
+      '4:3',
+      '1:1',
+      '3:4',
+      '2:3',
+      '9:16',
+    ]);
+    expect(model.defaultAspectRatio).toBe('1:1');
+    // 默认档位取该版本的首档, 保证默认值一定被 CLI 接受。
+    expect(model.defaultResolution).toBe('1.5K');
+    expect(jimengModels().find((item) => item.id === 'jimeng-cli/image-3.0')?.defaultResolution)
+      .toBe('1K');
+  });
+
+  it('有参考图时走编辑模式, 无参考图走生成模式', () => {
+    const model = jimengModels().find((item) => item.id === 'jimeng-cli/image-5.0')!;
+    expect(model.resolveRequest({ referenceImageCount: 0 })).toEqual({
+      requestModel: 'jimeng-cli/image-5.0',
+      modeLabel: '生成模式',
+    });
+    expect(model.resolveRequest({ referenceImageCount: 2 })).toEqual({
+      requestModel: 'jimeng-cli/image-5.0',
+      modeLabel: '编辑模式',
+    });
+  });
+
+  it('getImageModel 能反查即梦模型, 不会兜底成内置模型', () => {
+    // 回归防护: 即梦模型不参与 imageModelMap 构建, 漏了专门分支时重开工程会解析错。
+    const resolved = getImageModel('jimeng-cli/image-5.0Pro');
+    expect(resolved.id).toBe('jimeng-cli/image-5.0Pro');
+    expect(resolved.providerId).toBe(JIMENG_CLI_PROVIDER_ID);
+    expect(resolved.displayName).toContain('即梦 CLI');
+    expect(resolved.resolutions.map((option) => option.value)).toEqual(['1.5K', '2K', '4K']);
+  });
+});
+
+describe('图片超清', () => {
+  it('超清模型 id 与 commands/ai.ts 的常量保持一致', () => {
+    // 两处字符串必须相等, 否则「图片高清」提交的 job 会落回普通图片链路。
+    expect(JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID).toBe(JIMENG_CLI_IMAGE_UPSCALE_MODEL);
+  });
+
+  it('超清模型不进图片下拉, 但 getImageModel 能解析出定义(记账要用)', () => {
+    expect(listImageModels().some((model) => model.id === JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID))
+      .toBe(false);
+
+    const resolved = getImageModel(JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID);
+    expect(resolved.id).toBe(JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID);
+    expect(resolved.providerId).toBe(JIMENG_CLI_PROVIDER_ID);
+    expect(resolved.resolutions.map((option) => option.value)).toEqual(['2K', '4K', '8K']);
+    // 本机 CLI 不按次计费, 没有定价才不会在用量里算出假费用。
+    expect(resolved.pricing).toBeUndefined();
+  });
+
+  it('候选列表目前只有内置的即梦超清, 中转站模型暂不并入', () => {
+    const previousCustomApis = useSettingsStore.getState().customApis;
+    const relay: CustomApiProvider = {
+      id: 'relay-hub',
+      name: '中转站',
+      baseUrl: 'https://relay.example.com/v1',
+      apiKey: '',
+      models: ['real-esrgan-upscale'],
+      videoModels: [],
+      audioModels: [],
+      chatModels: [],
+      createdAt: Date.now(),
+      requestMode: 'sync',
+      protocol: 'images',
+      referenceImageField: 'image',
+      referenceImageEncoding: 'url',
+      imageTransport: 'generations_json',
+    };
+
+    useSettingsStore.setState({ customApis: [relay] });
+    try {
+      const models = listImageUpscaleModels();
+      // 用户要求先不放中转站模型: 放开时这里会失败, 提醒同步改测试与文案。
+      expect(models.map((model) => model.id)).toEqual([JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID]);
+      expect(models.some((model) => model.id.startsWith('custom:'))).toBe(false);
     } finally {
       useSettingsStore.setState({ customApis: previousCustomApis });
     }

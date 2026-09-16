@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use commands::ai as ai_commands;
 use commands::asset_library;
+use commands::balance;
 use commands::cinematic_studio;
 use commands::cloud_drive;
 use commands::image;
@@ -223,12 +224,17 @@ pub fn run() {
             ai_commands::get_generate_image_job,
             ai_commands::generate_image,
             jimeng_cli::generate_jimeng_cli_video,
+            jimeng_cli::generate_jimeng_cli_image,
+            jimeng_cli::generate_jimeng_cli_image_upscale,
             wan_cli::generate_wan_cli_video,
             wan_cli::wan_cli_status,
             wan_cli::wan_cli_login,
             jimeng_cli::jimeng_cli_login_start,
             jimeng_cli::jimeng_cli_login_check,
             jimeng_cli::jimeng_cli_logout,
+            jimeng_cli::jimeng_cli_credit,
+            wan_cli::wan_cli_credits,
+            balance::query_provider_balance,
             ai_commands::chat_completion,
             ai_commands::list_models,
             project_state::list_project_summaries,

@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use std::os::windows::process::CommandExt;
 
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
@@ -279,13 +279,47 @@ fn run_jimeng_video_task(
     // 先提交并立即返回 submit_id，后续由本函数自行查询并向前端上报状态。
     arguments.push("--poll=0".to_string());
 
+    submit_and_poll_jimeng_task(
+        app,
+        executable,
+        arguments,
+        request.client_job_id.as_deref(),
+        download_dir,
+        JimengArtifactKind::Video,
+    )
+}
+
+/// 产物类型: 视频与图片走同一条提交-轮询链路, 只有落盘文件的扩展名与文案不同。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JimengArtifactKind {
+    Video,
+    Image,
+}
+
+/// 提交即梦 CLI 任务并轮询到终态。
+///
+/// 两者共用同一链路: `--poll=0` 先拿到 submit_id, 再用 `query_result`
+/// 每 3 秒查询一次, 产物被 `--download_dir` 落到本地文件。
+fn submit_and_poll_jimeng_task(
+    app: &AppHandle,
+    executable: &str,
+    arguments: Vec<String>,
+    client_job_id: Option<&str>,
+    download_dir: &Path,
+    artifact: JimengArtifactKind,
+) -> Result<String, String> {
+    let (finder, label): (fn(&Path) -> Option<PathBuf>, &str) = match artifact {
+        JimengArtifactKind::Video => (find_downloaded_video, "视频"),
+        JimengArtifactKind::Image => (find_downloaded_image, "图片"),
+    };
+
     let submission = run_cli(executable, &arguments)?;
     if is_failed(&submission) {
-        return Err(format!("即梦 CLI 视频生成失败: {}", output_summary(&submission)));
+        return Err(format!("即梦 CLI {label}生成失败: {}", output_summary(&submission)));
     }
     // --poll=0 通常只提交任务；保留即时结果分支，兼容 CLI 后端直接返回成品的情况。
     if is_succeeded(&submission) {
-        if let Some(path) = find_downloaded_video(download_dir) {
+        if let Some(path) = finder(download_dir) {
             return Ok(path.to_string_lossy().into_owned());
         }
         if let Some(url) = extract_http_url(&submission) {
@@ -295,14 +329,14 @@ fn run_jimeng_video_task(
     let submit_id = extract_field(&submission, &["submit_id", "submitId"])
         .ok_or_else(|| format!("即梦 CLI 未返回 submit_id: {}", output_summary(&submission)))?;
 
-    emit_task_status(app, request, &submit_id, "queued", queue_count(executable), None);
+    emit_cli_task_status(app, client_job_id, &submit_id, "queued", queue_count(executable), None);
 
     let task_deadline = Instant::now() + CLI_TASK_TIMEOUT;
     loop {
         if Instant::now() >= task_deadline {
-            emit_task_status(
+            emit_cli_task_status(
                 app,
-                request,
+                client_job_id,
                 &submit_id,
                 "failed",
                 queue_count(executable),
@@ -320,20 +354,20 @@ fn run_jimeng_video_task(
         )?;
 
         if is_failed(&query) {
-            emit_task_status(app, request, &submit_id, "failed", queue_count(executable), Some(output_summary(&query)));
-            return Err(format!("即梦 CLI 视频生成失败: {}", output_summary(&query)));
+            emit_cli_task_status(app, client_job_id, &submit_id, "failed", queue_count(executable), Some(output_summary(&query)));
+            return Err(format!("即梦 CLI {label}生成失败: {}", output_summary(&query)));
         }
         if is_succeeded(&query) {
-            if let Some(path) = find_downloaded_video(download_dir) {
-                emit_task_status(app, request, &submit_id, "succeeded", Some(0), None);
+            if let Some(path) = finder(download_dir) {
+                emit_cli_task_status(app, client_job_id, &submit_id, "succeeded", Some(0), None);
                 return Ok(path.to_string_lossy().into_owned());
             }
             if let Some(url) = extract_http_url(&query) {
-                emit_task_status(app, request, &submit_id, "succeeded", Some(0), None);
+                emit_cli_task_status(app, client_job_id, &submit_id, "succeeded", Some(0), None);
                 return Ok(url);
             }
-            emit_task_status(app, request, &submit_id, "failed", Some(0), Some("任务已完成但未找到视频文件".to_string()));
-            return Err("即梦 CLI 已完成任务，但未找到下载的视频文件".to_string());
+            emit_cli_task_status(app, client_job_id, &submit_id, "failed", Some(0), Some(format!("任务已完成但未找到{label}文件")));
+            return Err(format!("即梦 CLI 已完成任务，但未找到下载的{label}文件"));
         }
 
         let status = extract_field(&query, &["gen_status"]).unwrap_or_else(|| "querying".to_string());
@@ -342,7 +376,7 @@ fn run_jimeng_video_task(
             "success" | "succeeded" | "fail" | "failed" => status.as_str(),
             _ => "running",
         };
-        emit_task_status(app, request, &submit_id, normalized_status, queue_count(executable), None);
+        emit_cli_task_status(app, client_job_id, &submit_id, normalized_status, queue_count(executable), None);
 
         thread::sleep(Duration::from_secs(3));
     }
@@ -357,9 +391,10 @@ struct JimengCliTaskStatusEvent {
     message: Option<String>,
 }
 
-fn emit_task_status(
+/// 视频与图片共用同一个事件名, 前端只需监听 `jimeng-cli-status` 一处。
+fn emit_cli_task_status(
     app: &AppHandle,
-    request: &GenerateJimengCliVideoRequest,
+    client_job_id: Option<&str>,
     submit_id: &str,
     status: &str,
     queue_count: Option<usize>,
@@ -368,7 +403,7 @@ fn emit_task_status(
     let _ = app.emit(
         "jimeng-cli-status",
         JimengCliTaskStatusEvent {
-            client_job_id: request.client_job_id.clone(),
+            client_job_id: client_job_id.map(str::to_string),
             submit_id: submit_id.to_string(),
             status: status.to_string(),
             queue_count,
@@ -783,6 +818,18 @@ fn find_downloaded_video(directory: &Path) -> Option<PathBuf> {
     })
 }
 
+fn find_downloaded_image(directory: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(directory).ok()?;
+    entries.flatten().find_map(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            return find_downloaded_image(&path);
+        }
+        let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+        matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp").then_some(path)
+    })
+}
+
 fn extract_http_url(output: &str) -> Option<String> {
     for prefix in ["https://", "http://"] {
         if let Some(index) = output.find(prefix) {
@@ -1116,6 +1163,22 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
         assert!(summary.contains("image_resource_id_list length is 10"));
         assert!(!summary.contains("very long prompt"));
     }
+
+    #[test]
+    fn extract_json_object_skips_surrounding_log_lines() {
+        // `dreamina user_credit` 的输出是纯 JSON, 但这层容错让 CLI 加日志后也不会坏掉。
+        let output = "refreshing token...\n{\n  \"total_credit\": 12608\n}\ndone";
+        assert_eq!(
+            extract_json_object(output),
+            Some("{\n  \"total_credit\": 12608\n}")
+        );
+    }
+
+    #[test]
+    fn extract_json_object_returns_none_without_json() {
+        assert_eq!(extract_json_object("尚未登录, 请先执行 dreamina login"), None);
+        assert_eq!(extract_json_object(""), None);
+    }
 }
 
 /// Clear the local Dreamina CLI OAuth login state.
@@ -1135,4 +1198,415 @@ pub async fn jimeng_cli_logout(executable: String) -> Result<JimengCliLoginCheck
         success: true,
         message: output.trim().to_string(),
     })
+}
+
+/// 即梦 CLI 的账户积分(`dreamina user_credit`)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JimengCliCredit {
+    /// 剩余积分总数。
+    pub total_credit: f64,
+    /// 会员等级(如 maestro), 未登录或字段缺失时为 None。
+    pub vip_level: Option<String>,
+}
+
+/// CLI 输出里除 JSON 外还常夹带日志行, 取第一个 `{` 到最后一个 `}` 之间的部分。
+fn extract_json_object(output: &str) -> Option<&str> {
+    let start = output.find('{')?;
+    let end = output.rfind('}')?;
+    (end > start).then(|| &output[start..=end])
+}
+
+/// 查询即梦 CLI 剩余积分(设置页「即梦 CLI」面板展示)。
+#[tauri::command]
+pub async fn jimeng_cli_credit(executable: String) -> Result<JimengCliCredit, String> {
+    let executable = executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先在「设置 - 密钥 - 即梦 CLI」中填写 CLI 可执行命令".to_string());
+    }
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli(&executable, &["user_credit".to_string()])
+    })
+    .await
+    .map_err(|error| format!("即梦 CLI 积分查询中断: {error}"))??;
+
+    let payload: serde_json::Value =
+        serde_json::from_str(extract_json_object(&output).ok_or_else(|| {
+            // 未登录时 CLI 会直接打印错误文案, 原样带回去比"解析失败"更有用。
+            format!("即梦 CLI 未返回积分信息: {}", output.trim())
+        })?)
+        .map_err(|_| "即梦 CLI 返回的积分信息无法解析".to_string())?;
+
+    let total_credit = payload
+        .get("total_credit")
+        .and_then(|value| match value {
+            serde_json::Value::Number(number) => number.as_f64(),
+            serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
+            _ => None,
+        })
+        .ok_or_else(|| "即梦 CLI 未返回积分字段".to_string())?;
+    let vip_level = payload
+        .get("vip_level")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok(JimengCliCredit {
+        total_credit,
+        vip_level,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 图片: text2image / image2image(生成与编辑) 与 image_upscale(超清)
+// ---------------------------------------------------------------------------
+
+/// 即梦图片支持的画幅枚举(取自 CLI `--help`)。
+/// 注意它不含自定义平台用的 5:4 / 4:5, 传了会被 CLI 以严格校验拒绝。
+const JIMENG_CLI_IMAGE_ASPECT_RATIOS: [&str; 8] =
+    ["21:9", "16:9", "3:2", "4:3", "1:1", "3:4", "2:3", "9:16"];
+
+/// `text2image` 支持的模型版本。
+const JIMENG_CLI_TEXT2IMAGE_VERSIONS: [&str; 9] =
+    ["3.0", "3.1", "4.0", "4.1", "4.5", "4.6", "4.7", "5.0", "5.0Pro"];
+
+/// `image2image` 不支持 3.0 / 3.1(CLI 只列 4.0 及以上)。
+const JIMENG_CLI_IMAGE2IMAGE_VERSIONS: [&str; 7] =
+    ["4.0", "4.1", "4.5", "4.6", "4.7", "5.0", "5.0Pro"];
+
+/// `image_upscale` 的档位枚举。
+const JIMENG_CLI_UPSCALE_RESOLUTIONS: [&str; 3] = ["2k", "4k", "8k"];
+
+/// 与视频一致: 即梦一次最多接受 10 张参考图。
+const JIMENG_CLI_MAX_EDIT_IMAGES: usize = 10;
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateJimengCliImageRequest {
+    pub client_job_id: Option<String>,
+    pub executable: String,
+    pub prompt: String,
+    pub model_version: String,
+    pub resolution_type: String,
+    pub aspect_ratio: Option<String>,
+    pub generate_num: Option<u32>,
+    pub reference_images: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateJimengCliImageUpscaleRequest {
+    pub client_job_id: Option<String>,
+    pub executable: String,
+    pub image: String,
+    pub resolution_type: String,
+}
+
+/// 文生图 / 图生图: 没有参考图走 `text2image`, 有参考图走 `image2image`。
+#[tauri::command]
+pub async fn generate_jimeng_cli_image(
+    app: AppHandle,
+    request: GenerateJimengCliImageRequest,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || generate_image_blocking(&app, request))
+        .await
+        .map_err(|error| format!("即梦 CLI 图片任务执行中断: {error}"))?
+}
+
+/// 图片超清: 对一张已有图片做 2k / 4k / 8k 超分, 产出新文件而不是覆盖原图。
+#[tauri::command]
+pub async fn generate_jimeng_cli_image_upscale(
+    app: AppHandle,
+    request: GenerateJimengCliImageUpscaleRequest,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || upscale_image_blocking(&app, request))
+        .await
+        .map_err(|error| format!("即梦 CLI 图片超清任务执行中断: {error}"))?
+}
+
+/// LenTalk 侧的分辨率档位是大写(1K / 2K / 4K, 5.0Pro 还有 1.5K),
+/// 即梦 CLI 只认小写(`2k` / `1.5k`), 这里统一归一化。
+fn normalize_image_resolution(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn validate_image_request(
+    model_version: &str,
+    resolution_type: &str,
+    aspect_ratio: Option<&str>,
+    reference_count: usize,
+) -> Result<(), String> {
+    let versions: &[&str] = if reference_count > 0 {
+        &JIMENG_CLI_IMAGE2IMAGE_VERSIONS
+    } else {
+        &JIMENG_CLI_TEXT2IMAGE_VERSIONS
+    };
+    let mode_label = if reference_count > 0 { "图生图" } else { "文生图" };
+    if !versions.contains(&model_version) {
+        return Err(format!("即梦 CLI {mode_label}不支持模型版本 {model_version}"));
+    }
+
+    // 每个版本支持的档位不同: 3.x 只有 1k/2k, 4.x~5.0 是 2k/4k, 5.0Pro 多出 1.5k。
+    let supported: &[&str] = match model_version {
+        "3.0" | "3.1" => &["1k", "2k"],
+        "5.0Pro" => &["1.5k", "2k", "4k"],
+        _ => &["2k", "4k"],
+    };
+    if !supported.contains(&resolution_type) {
+        return Err(format!(
+            "{model_version} 不支持 {resolution_type} 分辨率，可选：{}",
+            supported.join("、")
+        ));
+    }
+
+    if let Some(ratio) = aspect_ratio {
+        if !JIMENG_CLI_IMAGE_ASPECT_RATIOS.contains(&ratio) {
+            return Err(format!(
+                "即梦 CLI 不支持画幅 {ratio}，可选：{}",
+                JIMENG_CLI_IMAGE_ASPECT_RATIOS.join("、")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 图片输入来源: data URL、file:// 或本地绝对路径。
+///
+/// 视频只接受 data URL, 但图片节点常直接持有本地文件(素材库导入、已落盘的结果),
+/// 因此图片链路额外接受本地路径。
+fn materialize_images(
+    sources: &[String],
+    directory: &Path,
+    prefix: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    for (index, source) in sources
+        .iter()
+        .map(|source| source.trim())
+        .filter(|source| !source.is_empty())
+        .enumerate()
+    {
+        if source.starts_with("data:") {
+            // materialize_data_urls 会用 prefix-1 命名, 逐张传入时必须带上序号,
+            // 否则第二张会覆盖第一张。
+            let mut materialized = materialize_data_urls(
+                std::slice::from_ref(&source.to_string()),
+                directory,
+                &format!("{prefix}-{}", index + 1),
+            )?;
+            paths.append(&mut materialized);
+            continue;
+        }
+        let path = source_path(source);
+        if path.is_file() {
+            paths.push(path);
+        } else {
+            return Err(format!("即梦 CLI 无法读取参考图片: {source}"));
+        }
+    }
+    Ok(paths)
+}
+
+fn append_image_generation_args(
+    arguments: &mut Vec<String>,
+    command: &str,
+    request: &GenerateJimengCliImageRequest,
+    resolution_type: &str,
+    aspect_ratio: Option<&str>,
+    images: &[PathBuf],
+) {
+    arguments.push(format!("--prompt={}", request.prompt.trim()));
+    arguments.push(format!("--model_version={}", request.model_version));
+    if let Some(ratio) = aspect_ratio {
+        arguments.push(format!("--ratio={ratio}"));
+    }
+    arguments.push(format!("--resolution_type={resolution_type}"));
+    arguments.push(format!(
+        "--generate_num={}",
+        request.generate_num.unwrap_or(1).clamp(1, 10)
+    ));
+
+    if command == "image2image" {
+        for image in images {
+            arguments.push(format!("--images={}", image.display()));
+        }
+    }
+}
+
+fn resolve_image_download_dir(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录: {error}"))?;
+    let output_dir = app_data_dir.join("jimeng-cli/images").join(run_id);
+    fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("无法创建即梦 CLI 图片下载目录: {error}"))?;
+    Ok(output_dir)
+}
+
+fn generate_image_blocking(
+    app: &AppHandle,
+    request: GenerateJimengCliImageRequest,
+) -> Result<String, String> {
+    let executable = request.executable.trim();
+    if executable.is_empty() {
+        return Err("请先在「设置 - 密钥 - 即梦 CLI」中填写 CLI 可执行命令".to_string());
+    }
+    if request.prompt.trim().is_empty() {
+        return Err("即梦 CLI 图片生成需要提示词".to_string());
+    }
+    let resolution_type = normalize_image_resolution(&request.resolution_type);
+    if resolution_type.is_empty() {
+        return Err("即梦 CLI 图片生成需要指定分辨率档位".to_string());
+    }
+
+    let run_id = Uuid::new_v4().to_string();
+    let input_dir = std::env::temp_dir().join(format!("lentalk-jimeng-cli-image-{run_id}"));
+    fs::create_dir_all(&input_dir)
+        .map_err(|error| format!("无法创建即梦 CLI 临时目录: {error}"))?;
+
+    let result = (|| {
+        let images = materialize_images(
+            request.reference_images.as_deref().unwrap_or_default(),
+            &input_dir,
+            "ref",
+        )?;
+        if images.len() > JIMENG_CLI_MAX_EDIT_IMAGES {
+            return Err(format!(
+                "即梦 CLI 最多支持 {JIMENG_CLI_MAX_EDIT_IMAGES} 张参考图片，当前有 {} 张，请删除多余参考图后重试",
+                images.len()
+            ));
+        }
+        let aspect_ratio = request
+            .aspect_ratio
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        validate_image_request(
+            &request.model_version,
+            &resolution_type,
+            aspect_ratio,
+            images.len(),
+        )?;
+
+        let command = if images.is_empty() { "text2image" } else { "image2image" };
+        let download_dir = resolve_image_download_dir(app, &run_id)?;
+        let mut arguments = vec![command.to_string()];
+        append_image_generation_args(
+            &mut arguments,
+            command,
+            &request,
+            &resolution_type,
+            aspect_ratio,
+            &images,
+        );
+        arguments.push("--poll=0".to_string());
+
+        submit_and_poll_jimeng_task(
+            app,
+            executable,
+            arguments,
+            request.client_job_id.as_deref(),
+            &download_dir,
+            JimengArtifactKind::Image,
+        )
+    })();
+
+    let _ = fs::remove_dir_all(&input_dir);
+    result
+}
+
+fn upscale_image_blocking(
+    app: &AppHandle,
+    request: GenerateJimengCliImageUpscaleRequest,
+) -> Result<String, String> {
+    let executable = request.executable.trim();
+    if executable.is_empty() {
+        return Err("请先在「设置 - 密钥 - 即梦 CLI」中填写 CLI 可执行命令".to_string());
+    }
+    let resolution_type = normalize_image_resolution(&request.resolution_type);
+    if !JIMENG_CLI_UPSCALE_RESOLUTIONS.contains(&resolution_type.as_str()) {
+        return Err(format!(
+            "即梦 CLI 图片超清仅支持 {}，当前是 {resolution_type}",
+            JIMENG_CLI_UPSCALE_RESOLUTIONS.join("、")
+        ));
+    }
+
+    let run_id = Uuid::new_v4().to_string();
+    let input_dir = std::env::temp_dir().join(format!("lentalk-jimeng-upscale-{run_id}"));
+    fs::create_dir_all(&input_dir)
+        .map_err(|error| format!("无法创建即梦 CLI 临时目录: {error}"))?;
+
+    let result = (|| {
+        let images = materialize_images(
+            std::slice::from_ref(&request.image),
+            &input_dir,
+            "upscale-source",
+        )?;
+        let source = images
+            .first()
+            .ok_or_else(|| "即梦 CLI 图片超清需要一张图片".to_string())?;
+        let download_dir = resolve_image_download_dir(app, &run_id)?;
+        let arguments = vec![
+            "image_upscale".to_string(),
+            format!("--image={}", source.display()),
+            format!("--resolution_type={resolution_type}"),
+            "--poll=0".to_string(),
+        ];
+
+        submit_and_poll_jimeng_task(
+            app,
+            executable,
+            arguments,
+            request.client_job_id.as_deref(),
+            &download_dir,
+            JimengArtifactKind::Image,
+        )
+    })();
+
+    let _ = fs::remove_dir_all(&input_dir);
+    result
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn text2image_rejects_4k_for_legacy_versions() {
+        let error = validate_image_request("3.0", "4k", None, 0).unwrap_err();
+        assert!(error.contains("不支持 4k"), "实际报错: {error}");
+    }
+
+    #[test]
+    fn text2image_accepts_1k_for_legacy_versions() {
+        assert!(validate_image_request("3.1", "1k", None, 0).is_ok());
+    }
+
+    #[test]
+    fn image2image_rejects_versions_without_edit_support() {
+        let error = validate_image_request("3.0", "2k", None, 1).unwrap_err();
+        assert!(error.contains("图生图"), "实际报错: {error}");
+    }
+
+    #[test]
+    fn pro_version_accepts_1_5k_resolution() {
+        assert!(validate_image_request("5.0Pro", "1.5k", None, 0).is_ok());
+        assert!(validate_image_request("5.0", "1.5k", None, 0).is_err());
+    }
+
+    #[test]
+    fn unsupported_aspect_ratio_is_rejected() {
+        let error = validate_image_request("5.0", "2k", Some("5:4"), 0).unwrap_err();
+        assert!(error.contains("画幅"), "实际报错: {error}");
+    }
+
+    #[test]
+    fn supported_aspect_ratio_passes() {
+        assert!(validate_image_request("5.0", "2k", Some("21:9"), 0).is_ok());
+    }
+
+    #[test]
+    fn normalize_image_resolution_lowercases_tier() {
+        assert_eq!(normalize_image_resolution(" 2K "), "2k");
+        assert_eq!(normalize_image_resolution("1.5K"), "1.5k");
+    }
 }

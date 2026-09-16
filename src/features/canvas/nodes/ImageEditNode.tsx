@@ -55,6 +55,7 @@ import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInpu
 import {
   DEFAULT_IMAGE_MODEL_ID,
   getImageModel,
+  isApiKeylessProvider,
   listImageModels,
   resolveImageModelResolution,
   resolveImageModelResolutions,
@@ -488,6 +489,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const imageModels = listImageModels();
   const selectedModel = getImageModel(data.model ?? DEFAULT_IMAGE_MODEL_ID);
   const providerApiKey = apiKeys[selectedModel.providerId] ?? '';
+  // 即梦 / 万相这类本机 CLI 平台靠可执行文件与登录态工作, 没有可填的密钥 ——
+  // 不能因为 apiKeys 里没有这一项就把生成拦下来。
+  const isKeylessProvider = isApiKeylessProvider(selectedModel.providerId);
   const customApiBaseUrl = useMemo(() => {
     if (!selectedModel.providerId.startsWith('custom:')) {
       return undefined;
@@ -750,7 +754,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
       return;
     }
 
-    if (!providerApiKey) {
+    if (!providerApiKey && !isKeylessProvider) {
       const errorMessage = t('node.imageEdit.apiKeyRequired');
       setError(errorMessage);
       void showErrorDialog(errorMessage, t('common.error'));
@@ -804,7 +808,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     addEdge(id, newNodeId);
 
     try {
-      await canvasAiGateway.setApiKey(selectedModel.providerId, providerApiKey);
+      if (!isKeylessProvider) {
+        await canvasAiGateway.setApiKey(selectedModel.providerId, providerApiKey);
+      }
 
       let resolvedRequestAspectRatio = selectedAspectRatio.value;
       if (resolvedRequestAspectRatio === AUTO_REQUEST_ASPECT_RATIO) {
@@ -932,6 +938,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     flushPromptCommit,
     id,
     incomingImages,
+    isKeylessProvider,
     requestResolution.requestModel,
     selectedAspectRatio.value,
     selectedModel.id,

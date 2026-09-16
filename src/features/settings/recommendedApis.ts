@@ -31,6 +31,15 @@ export interface RecommendedApi {
   imageConfig?: RecommendedImageConfig;
   /** 视频协议的明确配置；用于异步提交、轮询和参考素材适配。 */
   videoConfig?: RecommendedVideoConfig;
+  /**
+   * 余额查询方式，决定「已连接」卡片上能不能显示余额：
+   * - `openai-billing`：One-API / New-API 系中转站，`/v1/dashboard/billing/subscription`；
+   * - `runninghub`：RunningHub 的 `/uc/openapi/accountStatus`（RH 币）。
+   *
+   * **未声明的平台不显示余额** —— 例如 ModelScope 没有额度接口（实测 404），
+   * 宁可不显示，也不要猜一个数字出来。
+   */
+  balanceKind?: 'runninghub' | 'openai-billing';
 }
 
 export interface RecommendedImageConfig {
@@ -67,6 +76,8 @@ export const recommendedApis: RecommendedApi[] = [
     baseUrl: 'https://cuai.token6688.com',
     registerUrl: 'https://cuai.token6688.com/signup?ref=C53QQRYBP563YEPD',
     summary: 'TokenGo 网关: 语言/图片/视频/音频统一 OpenAI 兼容入口, 密钥 sk- 开头',
+    // TokenGo 是 One-API 系网关, 支持标准额度查询接口(实测未授权时返回 401 而非 404)。
+    balanceKind: 'openai-billing',
     advantages: [
       '语言模型统一走 /v1/chat/completions, 换 model 即可切换厂商',
       '视频走 /v1/videos/generations 扁平入参, 轮询 /v1/tasks/{task_id}',
@@ -586,14 +597,41 @@ export const recommendedApis: RecommendedApi[] = [
       transport: 'sub2api-video',
     },
   },
+  // RunningHub 分国际站 / 国内站两条独立预设 —— 两者是**不同的站点与账号体系**,
+  // Base URL 不同、注册链接不同, 用户按网络情况各取所需。链路判定全部按 Base URL,
+  // 两边共用同一套通用协议, 因此不需要额外的专有 profile。
   {
     id: 'runninghub',
-    name: 'RunningHub',
+    name: 'RunningHub 国际版',
     baseUrl: 'https://www.runninghub.ai',
-    registerUrl:
-      'https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=rh-v1331',
-    summary: '覆盖图像、视频和 LLM 的 RunningHub OpenAPI',
-    advantages: ['图像 / 视频 / LLM 全覆盖', 'Seedance 视频模型', 'OpenAPI 工作流'],
+    registerUrl: 'https://www.runninghub.ai?inviteCode=gg6f774v',
+    summary: 'RunningHub 国际站(runninghub.ai): 覆盖图像、视频和 LLM 的 OpenAPI',
+    // RH 币余额走 /uc/openapi/accountStatus(.ai 与 .cn 接口一致)。
+    balanceKind: 'runninghub',
+    advantages: [
+      '国际站 runninghub.ai',
+      '图像 / 视频 / LLM 全覆盖',
+      'Seedance 视频模型',
+      'OpenAPI 工作流',
+      '新用户注册赠 500 RH 币',
+    ],
+    models: ['nano-banana'],
+  },
+  {
+    id: 'runninghub-cn',
+    name: 'RunningHub 国内版',
+    baseUrl: 'https://www.runninghub.cn',
+    registerUrl: 'https://www.runninghub.cn?inviteCode=0cthsuca',
+    summary: 'RunningHub 国内站(runninghub.cn): 覆盖图像、视频和 LLM 的 OpenAPI',
+    // RH 币余额走 /uc/openapi/accountStatus(.ai 与 .cn 接口一致)。
+    balanceKind: 'runninghub',
+    advantages: [
+      '国内站 runninghub.cn, 直连无需代理',
+      '图像 / 视频 / LLM 全覆盖',
+      'Seedance 视频模型',
+      'OpenAPI 工作流',
+      '新用户注册赠 500 RH 币',
+    ],
     models: ['nano-banana'],
   },
   {
@@ -652,7 +690,12 @@ export const recommendedApis: RecommendedApi[] = [
  *   `videoProfiles.ts`、`tauriAiGateway.ts`、`commands/ai.ts`），与推荐列表无关，
  *   因此在「自定义平台」里手工新增同名/同 Base URL 的平台依旧会命中对应链路。
  */
-export const visibleRecommendedApiIds: readonly string[] = ['zhiniao', 'zhenjian', 'runninghub', 'modelscope'];
+export const visibleRecommendedApiIds: readonly string[] = [
+  'zhiniao',
+  'runninghub',
+  'runninghub-cn',
+  'modelscope',
+];
 
 /** 按白名单过滤出需要在设置界面展示的推荐平台（隐藏 ≠ 删除配置）。 */
 export function listVisibleRecommendedApis(
@@ -660,4 +703,38 @@ export function listVisibleRecommendedApis(
 ): RecommendedApi[] {
   const allow = new Set(visibleRecommendedApiIds);
   return all.filter((api) => allow.has(api.id));
+}
+
+/**
+ * 归一化 Base URL 用于「这个推荐平台连上了没」的比较。
+ *
+ * 各家文档给的 baseUrl 带不带 `/v1` 不一致（ModelScope 带、RunningHub 不带），
+ * 用户手填时也常省掉后缀，所以比较前一律：去空白 → 去尾斜杠 → 剥掉 `/v1` → 转小写。
+ * 不这么做的话，同一个平台会因为一个后缀被判成"未连接"，卡片永远不够绿。
+ */
+export function normalizeRecommendedBaseUrl(value: string): string {
+  return value
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/\/v1$/i, '')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+}
+
+/**
+ * 按 Base URL 反查它属于哪个推荐平台。
+ *
+ * 用途：把用户已经配好的自定义平台 / 内置平台映射回推荐卡片，据此渲染
+ * 「已连接」徽章与「移除」按钮，不必再让用户去下面的自定义平台列表里对。
+ * 匹配不到（自己手填的第三方平台）返回 undefined。
+ */
+export function findRecommendedApiByBaseUrl(
+  baseUrl: string,
+  all: readonly RecommendedApi[] = recommendedApis,
+): RecommendedApi | undefined {
+  const target = normalizeRecommendedBaseUrl(baseUrl);
+  if (!target) {
+    return undefined;
+  }
+  return all.find((api) => normalizeRecommendedBaseUrl(api.baseUrl) === target);
 }

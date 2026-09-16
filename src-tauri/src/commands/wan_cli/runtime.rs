@@ -71,12 +71,25 @@ fn command(executable: &str) -> Result<Command, String> {
 }
 
 pub(super) fn error_message(value: &Value) -> String {
+    // 错误码可能是数字(9007)也可能是字符串("9007"), 统一按数字比较。
+    fn code_matches(value: &Value, target: &[u64]) -> bool {
+        let parsed = match value {
+            Value::Number(_) => value.as_u64(),
+            Value::String(text) => text.trim().parse::<u64>().ok(),
+            _ => None,
+        };
+        parsed.is_some_and(|code| target.contains(&code))
+    }
+
     fn has_error_code(value: &Value, target: &[u64]) -> bool {
         match value {
             Value::Object(map) => map.iter().any(|(key, value)|
-                (key == "errorCode" && target.iter().any(|code| value == &Value::from(*code) || value == &Value::from(code.to_string())))
+                (key == "errorCode" && code_matches(value, target))
                     || has_error_code(value, target)),
-            Value::Array(values) => values.iter().any(|value| has_error_code(value, target)),
+            // 数组元素既可能是错误码本身(`"errorCode": ["9007"]`), 也可能是嵌套对象,
+            // 两种都要看 —— 只递归对象会让数组形式的错误码彻底识别不到。
+            Value::Array(values) => values.iter().any(|value|
+                code_matches(value, target) || has_error_code(value, target)),
             _ => false,
         }
     }

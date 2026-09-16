@@ -2,10 +2,18 @@ import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Terminal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { buildCustomModelId, isAudioModelName, isChatCompletionModelName, isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
-import type { CustomApiCapabilities } from '@/stores/settingsStore';
+import type { CustomApiCapabilities, CustomApiProvider } from '@/stores/settingsStore';
 import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck, jimengCliLogout } from '@/commands/ai';
+import {
+  formatProviderBalance,
+  queryJimengCliCredit,
+  queryProviderBalance,
+  type JimengCliCredit,
+  type ProviderBalance,
+} from '@/commands/balance';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import {
+  findRecommendedApiByBaseUrl,
   listVisibleRecommendedApis,
   visibleRecommendedApiIds,
   type RecommendedApi,
@@ -144,7 +152,7 @@ export function SettingsDialog({
     setEnableUpdateDialog,
   } = useSettingsStore();
   const providers = useMemo(() => {
-    const providerOrder = ['zhiniao', 'zhenjian', 'runninghub', 'modelscope'];
+    const providerOrder = ['zhiniao', 'zhenjian', 'runninghub', 'runninghub-cn', 'modelscope'];
     const providerIndex = new Map(providerOrder.map((id, index) => [id, index]));
     // 密钥页展示内置推荐平台，帧间 API 也在这里提供专有链路配置。
     // 隐藏 ≠ 删除: 平台定义与链路仍完整保留在 registry / recommendedApis 中,
@@ -164,6 +172,29 @@ export function SettingsDialog({
   }, []);
   /** 「推荐平台」网格实际渲染的卡片(隐藏条目仍保留配置, 只是不展示)。 */
   const visibleRecommendedApis = useMemo(() => listVisibleRecommendedApis(), []);
+
+  /** 推荐平台 id → 已连接的配置记录（按 Base URL 匹配）。 */
+  const connectedRecommendedApis = useMemo(() => {
+    const map = new Map<string, CustomApiProvider>();
+    for (const customApi of customApis) {
+      const matched = findRecommendedApiByBaseUrl(customApi.baseUrl);
+      if (matched && !map.has(matched.id)) {
+        map.set(matched.id, customApi);
+      }
+    }
+    return map;
+  }, [customApis]);
+  /**
+   * 推荐平台的配置记录仍复用统一的运行时模型注册，但不应在「自定义平台」重复展示。
+   * 仅隐藏当前「推荐平台」实际展示的四个预设；其他推荐预设或手工配置保持可见。
+   */
+  const visibleCustomApis = useMemo(
+    () => customApis.filter((api) => {
+      const recommendedApi = findRecommendedApiByBaseUrl(api.baseUrl);
+      return !recommendedApi || !visibleRecommendedApiIds.includes(recommendedApi.id);
+    }),
+    [customApis],
+  );
   const [activeCategory, setActiveCategory] = useState<SettingsCategory>(initialCategory);
   const [localApiKeys, setLocalApiKeys] = useState<Record<string, string>>(apiKeys);
   const [localUseUploadFilenameAsNodeTitle, setLocalUseUploadFilenameAsNodeTitle] = useState(
@@ -198,12 +229,24 @@ export function SettingsDialog({
   const [localEnableUpdateDialog, setLocalEnableUpdateDialog] = useState(enableUpdateDialog);
   const [checkUpdateStatus, setCheckUpdateStatus] = useState<'' | 'checking' | 'has-update' | 'up-to-date' | 'failed'>('');
   const [revealedApiKeys, setRevealedApiKeys] = useState<Record<string, boolean>>({});
+  // 推荐平台卡片上直接填 Key 的状态(只有正在连接的卡片会用到)。
+  const [connectingRecommendedApiId, setConnectingRecommendedApiId] = useState<string | null>(null);
+  const [recommendedApiKeyDraft, setRecommendedApiKeyDraft] = useState('');
+  const [revealedRecommendedApiKey, setRevealedRecommendedApiKey] = useState(false);
+  const [recommendedApiError, setRecommendedApiError] = useState<string | null>(null);
+  // 已连接推荐平台卡片的余额(按推荐平台 id 缓存; 查不到的平台不会出现在这里)。
+  const [providerBalances, setProviderBalances] = useState<Record<string, ProviderBalance>>({});
+  const [providerBalanceLoading, setProviderBalanceLoading] = useState<Record<string, boolean>>({});
+  // 已经查过的「平台 + Key」组合, 避免 customApis 每次变化都重发请求。
+  const fetchedBalanceKeysRef = useRef<Set<string>>(new Set());
   const [expandedProviderIds, setExpandedProviderIds] = useState<Record<string, boolean>>({});
   const [recommendedApisExpanded, setRecommendedApisExpanded] = useState(false);
   const [showJimengCliSettings, setShowJimengCliSettings] = useState(false);
   const [localJimengCliExecutable, setLocalJimengCliExecutable] = useState(jimengCli.executable);
   const [jimengLoginState, setJimengLoginState] = useState<'idle' | 'opening' | 'polling' | 'success' | 'error'>('idle');
   const [, setJimengLoginInfo] = useState<{ verificationUri: string; userCode: string; deviceCode: string } | null>(null);
+  // 即梦 CLI 剩余积分(dreamina user_credit); 未登录或 CLI 不可用时保持 null。
+  const [jimengCredit, setJimengCredit] = useState<JimengCliCredit | null>(null);
   const [jimengLoginMessage, setJimengLoginMessage] = useState('');
   const jimengLoginTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const jimengLoginCheckingRef = useRef(false);
@@ -239,24 +282,27 @@ export function SettingsDialog({
   const usableModelIds = useSettingsStore((state) => state.usableModelIds);
   const { shouldRender, isVisible } = useDialogTransition(isOpen, UI_DIALOG_TRANSITION_MS);
 
-  /** 一键添加推荐平台(预填到新增表单) */
-  const applyRecommendedApi = useCallback((api: RecommendedApi) => {
-    setEditingCustomApiId(null);
-    setCustomApiDraft({
+  /**
+   * 把推荐平台的预设翻译成一条自定义平台记录。
+   *
+   * 抽成公共函数是因为两条路径共用它：卡片上直接「连接」落库，以及「手动配置」
+   * 预填到下面的表单。两条路径必须产出同一套协议字段，否则同一个平台走两条路
+   * 会得到不同的链路行为。
+   */
+  const buildCustomApiInputFromRecommended = useCallback(
+    (api: RecommendedApi, apiKey: string): Omit<CustomApiProvider, 'id' | 'createdAt'> => ({
       name: api.name,
       baseUrl: api.baseUrl,
-      apiKey: '',
-      modelsText: api.models.join('\n'),
-      videoModelsText: (api.videoModels ?? []).join('\n'),
-      audioModelsText: (api.audioModels ?? []).join('\n'),
-      chatModelsText: (api.chatModels ?? []).join('\n'),
+      apiKey: apiKey.trim(),
+      models: api.models,
+      videoModels: api.videoModels ?? [],
+      audioModels: api.audioModels ?? [],
+      chatModels: api.chatModels ?? [],
       requestMode: 'sync',
       protocol: api.imageConfig?.protocol ?? 'images',
       referenceImageField: api.imageConfig?.referenceImageField ?? 'image',
       referenceImageEncoding: api.imageConfig?.referenceImageEncoding ?? 'auto',
       imageTransport: api.imageConfig?.imageTransport ?? 'auto',
-      referenceAssetUploadUrl: '',
-      referenceAssetUploadToken: '',
       modelPrices: {},
       capabilities: api.videoConfig ? {
         detectedAt: Date.now(),
@@ -272,6 +318,172 @@ export function SettingsDialog({
         taskProtocol: 'generic',
         videoTransport: api.videoConfig.transport,
       } : undefined,
+    }),
+    []
+  );
+
+  /**
+   * 推荐卡片上点「保存」：将预设连接写入统一运行时配置。
+   *
+   * 推荐平台不会出现在下方「自定义平台」列表；该列表只保留用户手工添加的平台。
+   * 已经存在的同 Base URL 条目走更新，避免重复配置。
+   */
+  const connectRecommendedApi = useCallback(
+    (api: RecommendedApi, apiKey: string, existing?: CustomApiProvider) => {
+      const payload = buildCustomApiInputFromRecommended(api, apiKey);
+      if (existing) {
+        updateCustomApi(existing.id, payload);
+      } else {
+        addCustomApi(payload);
+      }
+      setConnectingRecommendedApiId(null);
+      setRecommendedApiKeyDraft('');
+      setRevealedRecommendedApiKey(false);
+      setRecommendedApiError(null);
+    },
+    [addCustomApi, buildCustomApiInputFromRecommended, updateCustomApi]
+  );
+
+  /** 断开推荐平台：移除其运行时配置，推荐预设本身不动。 */
+  const disconnectRecommendedApi = useCallback(
+    (existing: CustomApiProvider) => {
+      removeCustomApi(existing.id);
+      setConnectingRecommendedApiId(null);
+      setRecommendedApiKeyDraft('');
+      setRecommendedApiError(null);
+    },
+    [removeCustomApi]
+  );
+
+  /** 校验后连接：Key 为空只提示、不落库,避免在列表里留下一条没有密钥的空平台。 */
+  const handleConfirmConnectRecommendedApi = useCallback(
+    (api: RecommendedApi, existing?: CustomApiProvider) => {
+      if (!recommendedApiKeyDraft.trim()) {
+        setRecommendedApiError(t('settings.recommendedApisKeyRequired'));
+        return;
+      }
+      connectRecommendedApi(api, recommendedApiKeyDraft, existing);
+    },
+    [connectRecommendedApi, recommendedApiKeyDraft, t]
+  );
+
+  /**
+   * 查询推荐平台的余额（已连接的卡片上展示）。
+   *
+   * 查不到（平台没有额度接口 / Key 失效 / 网络不通）就把结果清掉、不渲染徽章 ——
+   * 余额是顺带信息，显示一个猜出来的数字比不显示更糟。
+   */
+  const refreshRecommendedApiBalance = useCallback(
+    async (api: RecommendedApi, credentials: { baseUrl: string; apiKey: string }) => {
+      if (!api.balanceKind || !credentials.apiKey.trim()) {
+        return;
+      }
+      setProviderBalanceLoading((previous) => ({ ...previous, [api.id]: true }));
+      try {
+        const balance = await queryProviderBalance(
+          api.balanceKind,
+          credentials.baseUrl,
+          credentials.apiKey
+        );
+        setProviderBalances((previous) => ({ ...previous, [api.id]: balance }));
+      } catch {
+        setProviderBalances((previous) => {
+          const next = { ...previous };
+          delete next[api.id];
+          return next;
+        });
+      } finally {
+        setProviderBalanceLoading((previous) => ({ ...previous, [api.id]: false }));
+      }
+    },
+    []
+  );
+
+  /** 查询即梦 CLI 剩余积分（`dreamina user_credit`）；查不到就清空、不显示。 */
+  const refreshJimengCredit = useCallback(async (executable: string) => {
+    try {
+      const credit = await queryJimengCliCredit(executable.trim() || 'dreamina');
+      setJimengCredit(credit);
+    } catch {
+      setJimengCredit(null);
+    }
+  }, []);
+
+  /** 打开密钥页时，给已连接的推荐平台补一次余额，顺手取一次即梦 CLI 积分。 */
+  useEffect(() => {
+    if (!isOpen || activeCategory !== 'providers') {
+      return;
+    }
+    for (const api of visibleRecommendedApis) {
+      const connected = connectedRecommendedApis.get(api.id);
+      if (!api.balanceKind || !connected?.apiKey.trim()) {
+        continue;
+      }
+      // 同一平台换了 Key 要重查, 但只要 Key 没变就不重复请求。
+      const cacheKey = `${api.id}:${connected.apiKey}`;
+      if (fetchedBalanceKeysRef.current.has(cacheKey)) {
+        continue;
+      }
+      fetchedBalanceKeysRef.current.add(cacheKey);
+      void refreshRecommendedApiBalance(api, connected);
+    }
+    // 即梦 CLI 的积分也直接显示在密钥页的卡片上, 不必打开弹窗才看得到。
+    const jimengCacheKey = `jimeng-cli:${jimengCli.executable}`;
+    if (!fetchedBalanceKeysRef.current.has(jimengCacheKey)) {
+      fetchedBalanceKeysRef.current.add(jimengCacheKey);
+      void refreshJimengCredit(jimengCli.executable);
+    }
+  }, [
+    activeCategory,
+    connectedRecommendedApis,
+    isOpen,
+    jimengCli.executable,
+    refreshJimengCredit,
+    refreshRecommendedApiBalance,
+    visibleRecommendedApis,
+  ]);
+
+  /**
+   * 推荐卡片上「手动配置」：把平台送到下面的自定义平台表单,需要改协议 / 模型 / 价格时用。
+   *
+   * 已经连上的平台(传 existing)**直接进「编辑」状态并优先用记录里的字段** —— 尤其 apiKey。
+   * 之前的实现固定 `apiKey: ''` 且总是新建,导致刚在卡片上填过 Key 的用户点一次手动配置
+   * 又要重填一遍,保存下去还会多出一条重复平台。
+   * 没连上时才按预设预填(此时本来就没有 Key 可带)。
+   */
+  const applyRecommendedApi = useCallback((api: RecommendedApi, existing?: CustomApiProvider) => {
+    setEditingCustomApiId(existing?.id ?? null);
+    setCustomApiDraft({
+      name: existing?.name ?? api.name,
+      baseUrl: existing?.baseUrl ?? api.baseUrl,
+      apiKey: existing?.apiKey ?? '',
+      modelsText: (existing?.models ?? api.models).join('\n'),
+      videoModelsText: (existing?.videoModels ?? api.videoModels ?? []).join('\n'),
+      audioModelsText: (existing?.audioModels ?? api.audioModels ?? []).join('\n'),
+      chatModelsText: (existing?.chatModels ?? api.chatModels ?? []).join('\n'),
+      requestMode: existing?.requestMode ?? 'sync',
+      protocol: existing?.protocol ?? api.imageConfig?.protocol ?? 'images',
+      referenceImageField: existing?.referenceImageField ?? api.imageConfig?.referenceImageField ?? 'image',
+      referenceImageEncoding:
+        existing?.referenceImageEncoding ?? api.imageConfig?.referenceImageEncoding ?? 'auto',
+      imageTransport: existing?.imageTransport ?? api.imageConfig?.imageTransport ?? 'auto',
+      referenceAssetUploadUrl: existing?.referenceAssetUploadUrl ?? '',
+      referenceAssetUploadToken: existing?.referenceAssetUploadToken ?? '',
+      modelPrices: existing?.modelPrices ?? {},
+      capabilities: existing?.capabilities ?? (api.videoConfig ? {
+        detectedAt: Date.now(),
+        detectionSource: 'manual',
+        confidence: 'high',
+        imageProtocol: 'unknown',
+        imageReferenceField: 'unknown',
+        imageReferenceEncoding: 'unknown',
+        imageTransport: 'unknown',
+        videoSubmitPath: api.videoConfig.submitPath,
+        videoQueryPath: api.videoConfig.queryPath,
+        videoReferenceEncoding: api.videoConfig.referenceEncoding,
+        taskProtocol: 'generic',
+        videoTransport: api.videoConfig.transport,
+      } : undefined),
     });
     setShowAddCustomApi(true);
     setCustomApiStatus(null);
@@ -298,6 +510,8 @@ export function SettingsDialog({
       if (!result.needAuth) {
         setJimengLoginState('success');
         setJimengLoginMessage(result.message || '已登录即梦账号');
+        // 已登录才有积分可查; 未登录时 CLI 会直接报错, 不浪费一次调用。
+        void refreshJimengCredit(value);
       } else {
         setJimengLoginState('idle');
         setJimengLoginMessage('');
@@ -309,7 +523,7 @@ export function SettingsDialog({
     } finally {
       jimengLoginProbeRef.current = false;
     }
-  }, []);
+  }, [refreshJimengCredit]);
 
   useEffect(() => {
     if (!showJimengCliSettings) {
@@ -388,6 +602,8 @@ export function SettingsDialog({
             stopPolling();
             setJimengLoginState('success');
             setJimengLoginMessage(check.message || '登录成功');
+            // 刚登录进来才拿得到积分, 顺手刷新一次。
+            void refreshJimengCredit(executable);
             return;
           }
           const lower = check.message.toLowerCase();
@@ -435,11 +651,13 @@ export function SettingsDialog({
       setJimengLoginState('error');
       setJimengLoginMessage(error instanceof Error ? error.message : String(error));
     }
-  }, [localJimengCliExecutable]);
+  }, [localJimengCliExecutable, refreshJimengCredit]);
 
     const handleJimengLogout = useCallback(() => {
     setJimengLoginState('idle');
     setJimengLoginInfo(null);
+    // 退出登录后积分不再代表当前账号, 直接清掉。
+    setJimengCredit(null);
     setJimengLoginMessage('已退出登录');
     void jimengCliLogout(localJimengCliExecutable).catch((error) => {
       setJimengLoginState('error');
@@ -860,6 +1078,10 @@ export function SettingsDialog({
       return;
     }
     setLocalApiKeys(apiKeys);
+    // 每次打开设置都收起「推荐平台填 Key」的临时状态，避免上次填一半的内容残留。
+    setConnectingRecommendedApiId(null);
+    setRecommendedApiKeyDraft('');
+    setRecommendedApiError(null);
     setLocalUseUploadFilenameAsNodeTitle(useUploadFilenameAsNodeTitle);
     setLocalStoryboardGenKeepStyleConsistent(storyboardGenKeepStyleConsistent);
     setLocalStoryboardGenDisableTextInImage(storyboardGenDisableTextInImage);
@@ -1216,89 +1438,164 @@ export function SettingsDialog({
                         );
                       })}
 
-                      {/* 第三方推荐平台(点「添加」预填自定义平台表单)；隐藏的条目只过滤渲染，配置仍保留 */}
-                      {visibleRecommendedApis.map((api) => (
-                        <div
-                          key={api.id}
-                          className="flex flex-col rounded-md border border-border-dark bg-bg-dark p-3"
-                        >
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs font-medium text-text-dark">{api.name}</span>
-                            <button
-                              type="button"
-                              onClick={() => applyRecommendedApi(api)}
-                              className="rounded-md bg-accent/15 px-2 py-1 text-[11px] font-medium text-accent transition-colors hover:bg-accent/25"
-                            >
-                              {t('settings.recommendedApisAdd')}
-                            </button>
-                          </div>
-                          <p className="mt-1 text-[11px] text-text-muted">{api.summary}</p>
-                          {api.advantages.length > 0 && (
-                            <div className="mt-2 flex flex-wrap gap-1">
-                              {api.advantages.map((advantage) => (
-                                <span
-                                  key={advantage}
-                                  className="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent"
-                                >
-                                  {advantage}
-                                </span>
-                              ))}
-                            </div>
-                          )}
-                          {api.models.length > 0 && (
-                            <p className="mt-1 truncate text-[10px] text-text-muted/60">
-                              {api.models.slice(0, 3).join(' · ')}
-                              {api.models.length > 3 ? ' …' : ''}
-                            </p>
-                          )}
-                          {api.pricingRange && (
-                            <div className="mt-2 flex flex-col gap-1 rounded-md bg-bg-dark/60 px-2 py-1.5 text-[10px]">
-                              <div className="flex flex-wrap gap-1">
-                                {api.pricingRange.image && (
-                                  <span
-                                    className="inline-flex items-center gap-1 rounded bg-accent/10 px-1.5 py-0.5 text-accent"
-                                    title="图片价格区间"
-                                  >
-                                    <span className="text-text-muted/70">图</span>
-                                    {api.pricingRange.image}
-                                  </span>
-                                )}
-                                {api.pricingRange.video && (
-                                  <span
-                                    className="inline-flex items-center gap-1 rounded bg-accent/10 px-1.5 py-0.5 text-accent"
-                                    title="视频价格区间"
-                                  >
-                                    <span className="text-text-muted/70">视</span>
-                                    {api.pricingRange.video}
-                                  </span>
-                                )}
-                                {api.pricingRange.audio && (
-                                  <span
-                                    className="inline-flex items-center gap-1 rounded bg-accent/10 px-1.5 py-0.5 text-accent"
-                                    title="音频价格区间"
-                                  >
-                                    <span className="text-text-muted/70">音</span>
-                                    {api.pricingRange.audio}
-                                  </span>
-                                )}
-                              </div>
-                              <p className="text-[9px] leading-tight text-text-muted/50">
-                                平台标价 · 仅供参考，实付以订单为准
-                              </p>
-                            </div>
-                          )}
-                          <a
-                            href={api.pricingUrl ?? api.registerUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="mt-1.5 text-[11px] text-accent hover:underline"
+                      {/* 推荐平台卡片：点「添加」直接在卡片里填 API Key 完成接入，
+                          配好即显示绿色「已连接」，不必再跑到下面的自定义平台表单。 */}
+                      {visibleRecommendedApis.map((api) => {
+                        const connected = connectedRecommendedApis.get(api.id);
+                        const hasApiKey = Boolean(connected?.apiKey.trim());
+                        const isConnecting = connectingRecommendedApiId === api.id;
+                        const balance = providerBalances[api.id];
+                        const isBalanceLoading = Boolean(api.balanceKind) && Boolean(providerBalanceLoading[api.id]);
+
+                        return (
+                          <div
+                            key={api.id}
+                            className="flex flex-col rounded-md border border-border-dark bg-bg-dark p-3"
                           >
-                            {api.pricingUrl
-                              ? t('settings.recommendedApisPricing')
-                              : t('settings.recommendedApisRegister')}
-                          </a>
-                        </div>
-                      ))}
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="truncate text-xs font-medium text-text-dark">
+                                {api.name}
+                              </span>
+                              {hasApiKey ? (
+                                /* 「已连接」顺带显示余额(查得到才有); 点一下重新查询。
+                                   查不到的平台(如 ModelScope 没有额度接口)只显示「已连接」。 */
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (connected) {
+                                      void refreshRecommendedApiBalance(api, connected);
+                                    }
+                                  }}
+                                  title={
+                                    balance?.detail ?? t('settings.recommendedApisBalanceHint')
+                                  }
+                                  className="shrink-0 rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25"
+                                >
+                                  {t('settings.recommendedApisConnected')}
+                                  {balance ? ` · ${formatProviderBalance(balance)}` : ''}
+                                  {!balance && isBalanceLoading ? ' · …' : ''}
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setConnectingRecommendedApiId(isConnecting ? null : api.id);
+                                    setRecommendedApiKeyDraft(connected?.apiKey ?? '');
+                                    setRevealedRecommendedApiKey(false);
+                                    setRecommendedApiError(null);
+                                  }}
+                                  className="shrink-0 rounded-md bg-accent/15 px-2 py-1 text-[11px] font-medium text-accent transition-colors hover:bg-accent/25"
+                                >
+                                  {t('settings.recommendedApisAdd')}
+                                </button>
+                              )}
+                            </div>
+                            <p className="mt-1 text-[11px] text-text-muted">{api.summary}</p>
+
+                            {isConnecting && (
+                              <div className="mt-2 space-y-1.5">
+                                <div className="relative">
+                                  <input
+                                    autoFocus
+                                    type={revealedRecommendedApiKey ? 'text' : 'password'}
+                                    value={recommendedApiKeyDraft}
+                                    onChange={(event) => {
+                                      setRecommendedApiKeyDraft(event.target.value);
+                                      setRecommendedApiError(null);
+                                    }}
+                                    onKeyDown={(event) => {
+                                      if (event.key === 'Enter') {
+                                        event.preventDefault();
+                                        handleConfirmConnectRecommendedApi(api, connected);
+                                      }
+                                    }}
+                                    placeholder={t('settings.recommendedApisKeyPlaceholder')}
+                                    className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 pr-9 text-xs text-text-dark placeholder:text-text-muted"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => setRevealedRecommendedApiKey((previous) => !previous)}
+                                    className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 hover:bg-bg-dark"
+                                  >
+                                    {revealedRecommendedApiKey ? (
+                                      <EyeOff className="h-3.5 w-3.5 text-text-muted" />
+                                    ) : (
+                                      <Eye className="h-3.5 w-3.5 text-text-muted" />
+                                    )}
+                                  </button>
+                                </div>
+                                {recommendedApiError && (
+                                  <p className="text-[10px] text-red-400">{recommendedApiError}</p>
+                                )}
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleConfirmConnectRecommendedApi(api, connected)}
+                                    className="rounded-md bg-accent/15 px-2 py-1 text-[11px] font-medium text-accent transition-colors hover:bg-accent/25"
+                                  >
+                                    {t('settings.recommendedApisSave')}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setConnectingRecommendedApiId(null);
+                                      setRecommendedApiKeyDraft('');
+                                      setRecommendedApiError(null);
+                                    }}
+                                    className="rounded-md px-2 py-1 text-[11px] text-text-muted transition-colors hover:bg-bg-dark hover:text-text-dark"
+                                  >
+                                    {t('common.cancel')}
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+
+                            {connected && !isConnecting && (
+                              <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-text-muted">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setConnectingRecommendedApiId(api.id);
+                                    setRecommendedApiKeyDraft(connected.apiKey);
+                                    setRevealedRecommendedApiKey(false);
+                                    setRecommendedApiError(null);
+                                  }}
+                                  className="transition-colors hover:text-text-dark"
+                                >
+                                  {t('settings.recommendedApisChangeKey')}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => applyRecommendedApi(api, connected)}
+                                  className="transition-colors hover:text-text-dark"
+                                >
+                                  {t('settings.recommendedApisManual')}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => disconnectRecommendedApi(connected)}
+                                  className="transition-colors hover:text-red-400"
+                                >
+                                  {t('settings.recommendedApisDisconnect')}
+                                </button>
+                              </div>
+                            )}
+
+                            {/* 卡片数据层字段一律保留 —— 尤其 pricingRange, 节点右上角的
+                                价格徽章还要靠它兜底(nodePriceBadge.ts), 删了会连带丢价格。 */}
+                            <a
+                              href={api.pricingUrl ?? api.registerUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="mt-1.5 text-[11px] text-accent hover:underline"
+                            >
+                              {api.pricingUrl
+                                ? t('settings.recommendedApisPricing')
+                                : t('settings.recommendedApisRegister')}
+                            </a>
+                          </div>
+                        );
+                      })}
                     </div>
                     )}
                   </div>
@@ -1317,7 +1614,16 @@ export function SettingsDialog({
                           <span className="text-sm font-medium text-text-dark">
                             {t('settings.jimengCliTitle')}
                           </span>
-                          <ChevronRight className="h-4 w-4 shrink-0 text-text-muted" />
+                          <span className="flex shrink-0 items-center gap-1.5">
+                            {/* 即梦积分（dreamina user_credit）；未登录 / 查不到就不显示。 */}
+                            {jimengCredit && (
+                              <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent">
+                                {t('settings.jimengCliCredit')}{' '}
+                                {Math.round(jimengCredit.totalCredit)}
+                              </span>
+                            )}
+                            <ChevronRight className="h-4 w-4 shrink-0 text-text-muted" />
+                          </span>
                         </span>
                         <span className="mt-0.5 block text-xs text-text-muted">
                           {t('settings.jimengCliDesc')}
@@ -1349,7 +1655,7 @@ export function SettingsDialog({
                       </button>
                     </div>
 
-                    {customApis.length === 0 && !showAddCustomApi && (
+                    {visibleCustomApis.length === 0 && !showAddCustomApi && (
                       <p className="py-2 text-xs text-text-muted/60">
                         {t('settings.customApiEmpty')}
                       </p>
@@ -1781,47 +2087,49 @@ export function SettingsDialog({
                       </div>
                     </UiModal>
 
-                    {customApis.map((api) => (
-                      <div
-                        key={api.id}
-                        className="mb-2 flex items-center justify-between rounded-md border border-border-dark bg-bg-dark px-3 py-2"
-                      >
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="truncate text-xs font-medium text-text-dark">
+                    {/* 平台卡片一行两个(sm 以上并排, 窄窗回退单列)。
+                        两列后横向空间减半, 因此「名称 / 地址 / 统计」改为竖排各占一行,
+                        比原来「名称 + 地址」挤在同一行更好读。
+                        间距交给父级 gap —— 卡片自身不再带 mb-2, 否则两列时下边距会叠加。 */}
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      {visibleCustomApis.map((api) => (
+                        <div
+                          key={api.id}
+                          className="flex min-w-0 items-center justify-between gap-2 rounded-md border border-border-dark bg-bg-dark px-3 py-2"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <span className="block truncate text-xs font-medium text-text-dark">
                               {api.name}
                             </span>
-                            <span className="truncate text-[10px] text-text-muted/70">
+                            <span className="mt-0.5 block truncate text-[10px] text-text-muted/70">
                               {api.baseUrl}
                             </span>
-                          </div>
-                          <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-text-muted">
-                            <span>
+                            <span className="mt-0.5 block truncate text-[11px] text-text-muted">
                               {api.models.length} {t('settings.customApiModelCount')} ·{' '}
                               {api.apiKey ? t('settings.customApiKeySet') : t('settings.customApiKeyMissing')}
                             </span>
                           </div>
+                          <div className="flex shrink-0 items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => startEditCustomApi(api.id)}
+                              className="rounded p-1 text-text-muted transition-colors hover:bg-bg-dark hover:text-text-dark"
+                              title={t('common.edit')}
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => removeCustomApi(api.id)}
+                              className="rounded p-1 text-text-muted transition-colors hover:bg-bg-dark hover:text-red-400"
+                              title={t('common.delete')}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
                         </div>
-                        <div className="flex shrink-0 items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => startEditCustomApi(api.id)}
-                            className="rounded p-1 text-text-muted transition-colors hover:bg-bg-dark hover:text-text-dark"
-                            title={t('common.edit')}
-                          >
-                            <Pencil className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => removeCustomApi(api.id)}
-                            className="rounded p-1 text-text-muted transition-colors hover:bg-bg-dark hover:text-red-400"
-                            title={t('common.delete')}
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+                      ))}
+                    </div>
                   </div>
                 </div>
 
@@ -1920,6 +2228,21 @@ export function SettingsDialog({
                       {jimengLoginState === 'success' && '✓ '}
                       {jimengLoginMessage}
                     </p>
+                  )}
+
+                  {/* 即梦 CLI 剩余积分(dreamina user_credit); 未登录 / 查不到时整块不渲染。 */}
+                  {jimengCredit && (
+                    <div className="mt-2 flex items-center gap-2 rounded-md bg-accent/10 px-2 py-1.5">
+                      <span className="text-[11px] text-text-muted">
+                        {t('settings.jimengCliCredit')}
+                      </span>
+                      <span className="text-xs font-medium text-text-dark">
+                        {Math.round(jimengCredit.totalCredit)}
+                      </span>
+                      {jimengCredit.vipLevel && (
+                        <span className="text-[10px] text-text-muted">{jimengCredit.vipLevel}</span>
+                      )}
+                    </div>
                   )}
                 </div>
 

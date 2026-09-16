@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod asset_library;
+pub mod balance;
 pub mod cinematic_studio;
 pub mod cloud_drive;
 pub mod image;

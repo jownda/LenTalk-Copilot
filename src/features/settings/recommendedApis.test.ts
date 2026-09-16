@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { isKnownOpenAiImagesBaseUrl, listVisibleRecommendedApis, recommendedApis, visibleRecommendedApiIds } from './recommendedApis';
+import { isKnownOpenAiImagesBaseUrl, findRecommendedApiByBaseUrl, listVisibleRecommendedApis, normalizeRecommendedBaseUrl, recommendedApis, visibleRecommendedApiIds } from './recommendedApis';
 import { isAudioModelName, isVideoGenerationModelName } from '@/stores/settingsStore';
 import { resolveVideoModelProfile } from '@/features/canvas/models/videoProfiles';
 import { isRjmVideoApiBaseUrl } from '@/commands/videoApi';
@@ -139,8 +139,8 @@ describe('推荐平台可见白名单(密钥页展示内置推荐平台)', () =>
     expect(listVisibleRecommendedApis().map((api) => api.id)).toEqual([
       'zhiniao',
       'runninghub',
+      'runninghub-cn',
       'modelscope',
-      'zhenjian',
     ]);
   });
 
@@ -164,6 +164,14 @@ describe('推荐平台可见白名单(密钥页展示内置推荐平台)', () =>
     expect(hiddenIds).toContain('zizidonghua');
     expect(hiddenIds).toContain('sub2api-video');
     expect(hiddenIds).toContain('binghuo');
+    // 帧间 API 按用户要求从界面隐藏, 但它带着 zhenjian-task-api 专属链路 ——
+    // 条目必须留在清单里, 否则手工用同一 Base URL 建的平台会命中不到链路。
+    expect(hiddenIds).toContain('zhenjian');
+  });
+
+  it('帧间 API 不再出现在可见卡片里', () => {
+    expect(visibleRecommendedApiIds).not.toContain('zhenjian');
+    expect(listVisibleRecommendedApis().some((api) => api.id === 'zhenjian')).toBe(false);
   });
 
   it('可见与隐藏条目相加等于完整清单, 没有条目被滤没', () => {
@@ -197,5 +205,104 @@ describe('隐藏推荐卡片不影响自定义平台命中链路', () => {
   it('FHL / 65535 仍被判定为已知 OpenAI Images 平台', () => {
     expect(isKnownOpenAiImagesBaseUrl('https://www.fhl.mom/v1')).toBe(true);
     expect(isKnownOpenAiImagesBaseUrl('https://sub-proxy-us.65535.space/v1')).toBe(true);
+  });
+});
+
+describe('RunningHub 国际版 / 国内版', () => {
+  // 两个站点是独立的站点与账号体系, 拆成两条预设; 链路判定全部按 Base URL,
+  // 因此新增的一条不需要额外的专有 profile。
+  const international = recommendedApis.find((api) => api.id === 'runninghub');
+  const domestic = recommendedApis.find((api) => api.id === 'runninghub-cn');
+
+  it('两条预设分别指向国际站与国内站, 域名不同', () => {
+    expect(international?.baseUrl).toBe('https://www.runninghub.ai');
+    expect(domestic?.baseUrl).toBe('https://www.runninghub.cn');
+  });
+
+  it('注册链接各自带邀请码, 且互不相同', () => {
+    expect(international?.registerUrl).toContain('inviteCode=gg6f774v');
+    expect(domestic?.registerUrl).toContain('inviteCode=0cthsuca');
+    expect(international?.registerUrl).not.toBe(domestic?.registerUrl);
+  });
+
+  it('两条都在可见白名单里(不在白名单的卡片根本不渲染)', () => {
+    expect(visibleRecommendedApiIds).toContain('runninghub');
+    expect(visibleRecommendedApiIds).toContain('runninghub-cn');
+  });
+
+  it('名称可区分, 密钥页不会出现两个同名平台', () => {
+    expect(international?.name).toContain('国际');
+    expect(domestic?.name).toContain('国内');
+    expect(international?.name).not.toBe(domestic?.name);
+  });
+
+  it('预填模型不会被视频/音频启发式抢走(否则保存平台时被静默丢弃)', () => {
+    for (const preset of [international, domestic]) {
+      const models = preset?.models ?? [];
+      expect(models.length).toBeGreaterThan(0);
+      expect(models.filter((model) => isVideoGenerationModelName(model))).toEqual([]);
+      expect(models.filter((model) => isAudioModelName(model))).toEqual([]);
+    }
+  });
+});
+
+describe('推荐平台 Base URL 匹配(卡片「已连接」徽章的判定依据)', () => {
+  it('带不带 /v1 后缀视为同一个平台', () => {
+    expect(normalizeRecommendedBaseUrl('https://api-inference.modelscope.cn/v1')).toBe(
+      normalizeRecommendedBaseUrl('https://api-inference.modelscope.cn'),
+    );
+  });
+
+  it('大小写与结尾斜杠不影响匹配', () => {
+    expect(findRecommendedApiByBaseUrl('HTTPS://WWW.RunningHub.cn/')?.id).toBe('runninghub-cn');
+    expect(findRecommendedApiByBaseUrl('https://www.runninghub.ai/')?.id).toBe('runninghub');
+  });
+
+  it('每个可见推荐平台的 baseUrl 都能反查回它自己', () => {
+    for (const api of listVisibleRecommendedApis()) {
+      expect(findRecommendedApiByBaseUrl(api.baseUrl)?.id).toBe(api.id);
+    }
+  });
+
+  it('自己手填的第三方平台不会被误判成推荐平台', () => {
+    expect(findRecommendedApiByBaseUrl('https://relay.example.com/v1')).toBeUndefined();
+    expect(findRecommendedApiByBaseUrl('   ')).toBeUndefined();
+  });
+
+  it('两个 RunningHub 站点互不串台', () => {
+    expect(findRecommendedApiByBaseUrl('https://www.runninghub.ai')?.id).not.toBe('runninghub-cn');
+    expect(findRecommendedApiByBaseUrl('https://www.runninghub.cn')?.id).not.toBe('runninghub');
+  });
+});
+
+describe('可见推荐平台直接连接后的模型归属', () => {
+  it('预填的图片模型不会被视频/音频启发式抢走(否则连上后列表里看不到)', () => {
+    for (const api of listVisibleRecommendedApis()) {
+      const models = api.models ?? [];
+      expect(
+        models.filter((model) => isVideoGenerationModelName(model)),
+        `${api.id} 的图片模型被当成视频模型`,
+      ).toEqual([]);
+      expect(
+        models.filter((model) => isAudioModelName(model)),
+        `${api.id} 的图片模型被当成音频模型`,
+      ).toEqual([]);
+    }
+  });
+});
+
+describe('推荐平台的余额查询声明', () => {
+  it('只给确实有额度接口的平台声明 balanceKind', () => {
+    const kinds = Object.fromEntries(
+      listVisibleRecommendedApis().map((api) => [api.id, api.balanceKind ?? null]),
+    );
+    expect(kinds).toEqual({
+      // TokenGo 是 One-API 系网关: /v1/dashboard/billing/subscription 存在(未授权时 401 而非 404)。
+      zhiniao: 'openai-billing',
+      runninghub: 'runninghub',
+      'runninghub-cn': 'runninghub',
+      // ModelScope 实测该端点返回 404 —— 声明了只会白发请求且永远查不到余额。
+      modelscope: null,
+    });
   });
 });

@@ -62,6 +62,22 @@ const JIMENG_CLI_PROVIDER: ModelProviderDefinition = {
   name: '即梦 CLI',
   label: '即梦 CLI',
 };
+
+/**
+ * 不使用 API Key 的平台: 本地 CLI(即梦 / 万相)靠可执行文件与各自的登录态工作,
+ * 「密钥」页里没有可填的密钥。
+ *
+ * 图片模型选择器默认按"是否填过密钥"过滤平台, 必须把这类平台排除在过滤之外,
+ * 否则它们的模型永远不会出现在列表里(视频侧不过滤, 所以没暴露这个问题)。
+ */
+const API_KEYLESS_PROVIDER_IDS: ReadonlySet<string> = new Set([
+  JIMENG_CLI_PROVIDER_ID,
+  WAN_CLI_PROVIDER_ID,
+]);
+
+export function isApiKeylessProvider(providerId: string): boolean {
+  return API_KEYLESS_PROVIDER_IDS.has(providerId);
+}
 const JIMENG_CLI_VIDEO_POINTS_PER_SECOND: Record<string, number> = {
   'seedance2.0_vip': 14,
   'seedance2.5': 26,
@@ -92,11 +108,13 @@ const WINDOWS_UNCONFIGURED_IMAGE_MODEL: ImageModelDefinition = {
 const imageModelAliasMap = new Map<string, string>([]);
 
 export function listImageModels(): ImageModelDefinition[] {
+  // 即梦 CLI 在 Windows 上同样有原生制品(见 jimeng_cli.rs 的路径探测), 与视频侧一致放开。
+  const jimengCliModels = buildJimengCliImageModels();
   if (isWindowsDesktopRuntime()) {
-    const customModels = buildCustomImageModels();
-    return customModels.length > 0 ? customModels : [WINDOWS_UNCONFIGURED_IMAGE_MODEL];
+    const available = [...buildCustomImageModels(), ...jimengCliModels];
+    return available.length > 0 ? available : [WINDOWS_UNCONFIGURED_IMAGE_MODEL];
   }
-  return [...imageModels, ...buildCustomImageModels()];
+  return [...imageModels, ...jimengCliModels, ...buildCustomImageModels()];
 }
 
 export function listModelProviders(): ModelProviderDefinition[] {
@@ -111,6 +129,18 @@ export function getImageModel(modelId: string): ImageModelDefinition {
   const custom = buildCustomImageModels().find((model) => model.id === resolvedModelId);
   if (custom) {
     return custom;
+  }
+
+  // 即梦 CLI 图片模型只出现在 listImageModels() 里, 不参与 imageModelMap 的构建 ——
+  // 少了这一步, 重新打开工程时节点上的即梦模型会被兜底成内置模型(档位/画幅全错)。
+  const jimengCli = buildJimengCliImageModels().find((model) => model.id === resolvedModelId);
+  if (jimengCli) {
+    return jimengCli;
+  }
+
+  // 超清任务不是下拉里的可选项, 但必须有定义: 否则记账会按内置模型估价。
+  if (isJimengCliImageUpscaleModel(resolvedModelId)) {
+    return JIMENG_CLI_IMAGE_UPSCALE_MODEL;
   }
 
   if (isWindowsDesktopRuntime()) {
@@ -319,6 +349,122 @@ function buildJimengCliVideoModels(): VideoModelDefinition[] {
       (JIMENG_CLI_VIDEO_POINTS_PER_SECOND[version] ?? 0) * Math.max(1, Number(extraParams?.duration) || 5)
     ),
   }));
+}
+
+/** 即梦图片的画幅枚举(取自 CLI `--help`), 注意不含自定义平台用的 5:4 / 4:5。 */
+const JIMENG_CLI_IMAGE_ASPECT_RATIOS = [
+  '21:9',
+  '16:9',
+  '3:2',
+  '4:3',
+  '1:1',
+  '3:4',
+  '2:3',
+  '9:16',
+] as const;
+
+/**
+ * 即梦图片各版本支持的档位 —— `resolution_type` 会被 CLI 严格校验:
+ * 3.x 只有 1K/2K, 4.x~5.0 是 2K/4K, 5.0Pro 多一档 1.5K。
+ */
+function resolveJimengCliImageResolutions(version: string): string[] {
+  if (version === '3.0' || version === '3.1') {
+    return ['1k', '2k'];
+  }
+  if (version === '5.0Pro') {
+    return ['1.5k', '2k', '4k'];
+  }
+  return ['2k', '4k'];
+}
+
+/**
+ * 即梦 CLI 的图片模型。它走本机 CLI, 没有 API Key, 所以不出现在「密钥」页的
+ * 平台列表里 —— 图片模型选择器要靠 {@link isApiKeylessProvider} 放行。
+ *
+ * 有没有参考图决定走 `text2image` 还是 `image2image`, 由 Rust 侧按参考图数量决定。
+ */
+function buildJimengCliImageModels(): ImageModelDefinition[] {
+  const models = [
+    { version: '5.0Pro', label: '图片 5.0 Pro' },
+    { version: '5.0', label: '图片 5.0' },
+    { version: '4.7', label: '图片 4.7' },
+    { version: '4.6', label: '图片 4.6' },
+    { version: '4.5', label: '图片 4.5' },
+    { version: '4.1', label: '图片 4.1' },
+    { version: '4.0', label: '图片 4.0' },
+    { version: '3.1', label: '图片 3.1' },
+    { version: '3.0', label: '图片 3.0' },
+  ] as const;
+
+  return models.map(({ version, label }) => {
+    const tiers = resolveJimengCliImageResolutions(version);
+    return {
+      id: `${JIMENG_CLI_PROVIDER_ID}/image-${version}`,
+      mediaType: 'image' as const,
+      displayName: `即梦 CLI · ${label}`,
+      providerId: JIMENG_CLI_PROVIDER_ID,
+      description: `即梦 CLI · ${label}`,
+      eta: '1min',
+      expectedDurationMs: 120000,
+      defaultAspectRatio: '1:1',
+      defaultResolution: (tiers[0] ?? '2k').toUpperCase(),
+      aspectRatios: JIMENG_CLI_IMAGE_ASPECT_RATIOS.map((value) => ({ value, label: value })),
+      resolutions: tiers.map((value) => ({ value: value.toUpperCase(), label: value.toUpperCase() })),
+      resolveRequest: ({ referenceImageCount }) => ({
+        requestModel: `${JIMENG_CLI_PROVIDER_ID}/image-${version}`,
+        modeLabel: referenceImageCount > 0 ? '编辑模式' : '生成模式',
+      }),
+    };
+  });
+}
+
+/**
+ * 即梦 CLI 图片超清(image_upscale)的内部模型 id。
+ *
+ * 它不是可选项 —— 图片模型下拉里出现的始终是 `jimeng-cli/image-{版本}`, 这个 id
+ * 只用来让「超清」这次任务在统一 job 通道和用量记账里能被识别出来。因此它必须
+ * 能被 {@link getImageModel} 解析出定义(否则记账会兜底成内置模型、算出假费用),
+ * 但**不能**出现在 {@link listImageModels} 里。
+ */
+export const JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID = 'jimeng-cli/upscale';
+
+const JIMENG_CLI_IMAGE_UPSCALE_RESOLUTIONS = ['2k', '4k', '8k'] as const;
+
+const JIMENG_CLI_IMAGE_UPSCALE_MODEL: ImageModelDefinition = {
+  id: JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID,
+  mediaType: 'image',
+  displayName: '即梦 CLI · 图片超清',
+  providerId: JIMENG_CLI_PROVIDER_ID,
+  description: '把已有图片放大到 2K / 4K / 8K',
+  eta: '1min',
+  expectedDurationMs: 90000,
+  defaultAspectRatio: '1:1',
+  defaultResolution: JIMENG_CLI_IMAGE_UPSCALE_RESOLUTIONS[0].toUpperCase(),
+  aspectRatios: JIMENG_CLI_IMAGE_ASPECT_RATIOS.map((value) => ({ value, label: value })),
+  resolutions: JIMENG_CLI_IMAGE_UPSCALE_RESOLUTIONS.map((value) => ({
+    value: value.toUpperCase(),
+    label: value.toUpperCase(),
+  })),
+  resolveRequest: () => ({
+    requestModel: JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID,
+    modeLabel: '超清',
+  }),
+};
+
+/** 判断一个模型 id 是不是即梦图片超清任务。 */
+export function isJimengCliImageUpscaleModel(modelId: string): boolean {
+  return modelId === JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID;
+}
+
+/**
+ * 「图片高清」可选的模型。
+ *
+ * 目前只有即梦 CLI 超清(本机 CLI, 无需密钥)。**中转站的超分模型暂不并入** ——
+ * 用户明确要求先不放进来; 需要放开时在这里追加即可,「更换模型」按钮已经把
+ * 入口与列表渲染都留好了。
+ */
+export function listImageUpscaleModels(): ImageModelDefinition[] {
+  return [JIMENG_CLI_IMAGE_UPSCALE_MODEL];
 }
 
 export function resolveImageModelResolutions(

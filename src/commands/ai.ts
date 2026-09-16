@@ -68,6 +68,45 @@ interface GenerateJimengCliVideoRequest {
   reference_audio?: string[];
 }
 
+/**
+ * 即梦 CLI 图片生成: 参考图为空时走 `text2image`, 非空时走 `image2image`,
+ * 由 Rust 侧按参考图数量决定, 前端不需要区分。
+ */
+interface GenerateJimengCliImageRequest {
+  client_job_id?: string;
+  executable: string;
+  prompt: string;
+  model_version: string;
+  /** LenTalk 侧是大写档位(1K/2K/4K/1.5K), 下发时归一化为小写。 */
+  resolution_type: string;
+  aspect_ratio?: string;
+  generate_num?: number;
+  reference_images?: string[];
+}
+
+interface GenerateJimengCliImageUpscaleRequest {
+  client_job_id?: string;
+  executable: string;
+  image: string;
+  resolution_type: string;
+}
+
+/**
+ * 即梦 CLI 图片模型 id 前缀(model 形如 `jimeng-cli/image-5.0`)。
+ * 与 `canvas/models/registry.ts` 的 JIMENG_CLI_PROVIDER_ID 保持一致;
+ * 这里不直接 import 是为了避免 commands 层反向依赖 features 层。
+ */
+const JIMENG_CLI_IMAGE_MODEL_PREFIX = 'jimeng-cli/image-';
+
+/**
+ * 即梦 CLI 图片超清(image_upscale)的内部模型 id —— 注意它**不以**上面的
+ * `image-` 前缀开头, 否则会被误判成普通图片模型。
+ *
+ * 与 `canvas/models/registry.ts` 的 JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID 必须一致,
+ * registry.test.ts 里有断言锁住两者相等。
+ */
+export const JIMENG_CLI_IMAGE_UPSCALE_MODEL = 'jimeng-cli/upscale';
+
 export type GenerationJobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'not_found';
 
 export interface GenerationJobStatus {
@@ -1743,6 +1782,128 @@ export async function generateJimengCliVideo(
   return await invoke<string>('generate_jimeng_cli_video', { request });
 }
 
+/** 即梦 CLI 图片生成(文生图 / 图生图), 返回落盘后的本地图片路径或远端 URL。 */
+export async function generateJimengCliImage(
+  request: GenerateJimengCliImageRequest
+): Promise<string> {
+  if (!isTauri()) {
+    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再生成。');
+  }
+
+  return await invoke<string>('generate_jimeng_cli_image', { request });
+}
+
+/** 即梦 CLI 图片超清(2K/4K/8K), 产出新文件而不覆盖原图。 */
+export async function generateJimengCliImageUpscale(
+  request: GenerateJimengCliImageUpscaleRequest
+): Promise<string> {
+  if (!isTauri()) {
+    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再生成。');
+  }
+
+  return await invoke<string>('generate_jimeng_cli_image_upscale', { request });
+}
+
+/**
+ * 即梦 CLI 图片生成的 job 封装。
+ *
+ * CLI 是本地长任务: Rust 侧用 `--poll=0` 提交后自行轮询(最长 30 分钟), 没有可以
+ * 查询的远端任务 id。这里沿用字子动画(zhenjian)的既有做法, 把结果写进内存 job map,
+ * 让 Canvas 那条统一的 job 轮询链路直接消费 —— 图片节点因此不需要为即梦加任何分支。
+ *
+ * 已知取舍: job 状态只存在内存里, 应用重启后无法再查询(CLI 任务本身仍会跑完并落盘)。
+ */
+async function submitJimengCliImageJob(request: GenerateRequest): Promise<string> {
+  const jobId = crypto.randomUUID();
+  browserGenerationJobs.set(jobId, { job_id: jobId, status: 'running', result: null, error: null });
+
+  const modelVersion = request.model.slice(JIMENG_CLI_IMAGE_MODEL_PREFIX.length).trim();
+  const executable = useSettingsStore.getState().jimengCli.executable;
+
+  void (async () => {
+    try {
+      // 参考图可能是远端 CDN 地址: 交给 Rust 统一取字节转 data URL,
+      // 既绕开 webview 的 CORS 限制, 也让 CLI 拿到本地可读的文件。
+      const referenceImages = request.reference_images?.length
+        ? await Promise.all(
+            request.reference_images.map((source) =>
+              invoke<string>('load_media_data_url', { source })
+            )
+          )
+        : undefined;
+
+      const result = await generateJimengCliImage({
+        executable,
+        prompt: request.prompt,
+        model_version: modelVersion,
+        // LenTalk 的 size 就是档位(1K/1.5K/2K/4K), Rust 侧会归一化成 CLI 要的小写。
+        resolution_type: request.size,
+        aspect_ratio: request.aspect_ratio,
+        reference_images: referenceImages,
+      });
+      browserGenerationJobs.set(jobId, { job_id: jobId, status: 'succeeded', result, error: null });
+    } catch (error) {
+      browserGenerationJobs.set(jobId, {
+        job_id: jobId,
+        status: 'failed',
+        result: null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })();
+
+  return jobId;
+}
+
+/**
+ * 即梦 CLI 图片超清(image_upscale)的 job 封装。
+ *
+ * 与图生图共用同一条内存 job 通道 —— 结果节点依旧由 Canvas 统一轮询消费, 所以
+ * 「超清」对画布是透明的: 它只是又一个 `kind: 'image'` 的生成任务。
+ *
+ * 源图取 `reference_images` 的第一张(由调用方把节点自己那张图塞进去)。CLI 需要
+ * 本地可读的文件, 因此这里统一经 Rust 转成 data URL, 顺带绕开 webview 的 CORS。
+ */
+async function submitJimengCliImageUpscaleJob(request: GenerateRequest): Promise<string> {
+  const jobId = crypto.randomUUID();
+  const source = request.reference_images?.[0];
+  if (!source) {
+    // 没有源图就没有超清可言: 直接落一条 failed, 让结果节点显示原因而不是空转。
+    browserGenerationJobs.set(jobId, {
+      job_id: jobId,
+      status: 'failed',
+      result: null,
+      error: '图片超清需要一张源图：请选中带图的结果节点，或先在本节点生成一张图。',
+    });
+    return jobId;
+  }
+
+  browserGenerationJobs.set(jobId, { job_id: jobId, status: 'running', result: null, error: null });
+  const executable = useSettingsStore.getState().jimengCli.executable;
+
+  void (async () => {
+    try {
+      const image = await invoke<string>('load_media_data_url', { source });
+      const result = await generateJimengCliImageUpscale({
+        executable,
+        image,
+        // LenTalk 的 size 就是档位(2K/4K/8K), Rust 侧归一化成 CLI 要的小写。
+        resolution_type: request.size,
+      });
+      browserGenerationJobs.set(jobId, { job_id: jobId, status: 'succeeded', result, error: null });
+    } catch (error) {
+      browserGenerationJobs.set(jobId, {
+        job_id: jobId,
+        status: 'failed',
+        result: null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })();
+
+  return jobId;
+}
+
 export interface JimengCliLoginStartResult {
   needAuth: boolean;
   verificationUri: string | null;
@@ -2283,6 +2444,17 @@ export async function submitGenerateImageJob(request: GenerateRequest): Promise<
     ...sanitizeGenerateRequestForLog(request),
     tauri: isTauri(),
   });
+
+  // 即梦 CLI 图片超清: 源图是本节点已有的图, 不写提示词。必须在普通图片分支之前
+  // 判断, 因为超清 id 也以 `jimeng-cli/` 开头。
+  if (request.model === JIMENG_CLI_IMAGE_UPSCALE_MODEL) {
+    return await submitJimengCliImageUpscaleJob(request);
+  }
+
+  // 即梦 CLI 图片走本机 CLI: Rust 侧自行提交并轮询, 结果经内存 job map 回传。
+  if (request.model.startsWith(JIMENG_CLI_IMAGE_MODEL_PREFIX)) {
+    return await submitJimengCliImageJob(request);
+  }
 
   assertWindowsModelSupported(request);
   const imageProviderId = request.model.split('/')[0] ?? '';

@@ -28,6 +28,13 @@ type AudioNodeProps = {
   selected?: boolean;
 };
 
+/**
+ * 远端视频兜底抽帧的宽度上限。
+ * 节点封面用不到全分辨率, 先限宽再交给 prepareNodeImage, 能显著降低 canvas
+ * 与 dataURL 的内存占用(4K 帧按原尺寸绘制可达数十 MB)。
+ */
+const REMOTE_VIDEO_THUMBNAIL_MAX_WIDTH = 640;
+
 function waitForDecodedVideoFrame(video: HTMLVideoElement, timeoutMs = 5000): Promise<void> {
   if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0) {
     return Promise.resolve();
@@ -314,16 +321,40 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   }, [data.previewImageUrl, id, updateNodeData]);
 
   // 本地桌面视频优先使用系统抽帧，避免 WKWebView 对视频 canvas 截图的限制。
+  // 但 QuickLook 只认本地文件路径(AI 视频节点生成的结果是远端 CDN 地址), 因此再加一级
+  // captureVideoFrame 兜底: 它会先尝试带 crossOrigin 直连, 不行就让 Rust 取回字节转同源
+  // blob 后再抽帧, 既不污染画布也不受 CDN 的 CORS 配置影响。
   useEffect(() => {
-    if (!isVideo || !isTauri() || data.previewImageUrl || !data.sourcePath) {
+    // 存成局部常量: data.sourcePath 是属性访问, 跨 async 边界后 TS 无法保持窄化。
+    const sourcePath = data.sourcePath;
+    if (!isVideo || !isTauri() || data.previewImageUrl || !sourcePath) {
       return;
     }
     let disposed = false;
-    void extractVideoThumbnail(data.sourcePath).then((thumbnail) => {
-      if (!disposed && thumbnail) {
-        updateNodeData(id, { previewImageUrl: thumbnail });
+    const commitThumbnail = (thumbnail: string | null | undefined): boolean => {
+      if (disposed || !thumbnail) {
+        return false;
       }
-    });
+      updateNodeData(id, { previewImageUrl: thumbnail });
+      return true;
+    };
+    void (async () => {
+      const localThumbnail = await extractVideoThumbnail(sourcePath).catch(() => null);
+      if (commitThumbnail(localThumbnail) || disposed) {
+        return;
+      }
+      try {
+        const dataUrl = await captureVideoFrame({
+          source: sourcePath,
+          maxWidth: REMOTE_VIDEO_THUMBNAIL_MAX_WIDTH,
+        });
+        const prepared = await prepareNodeImage(dataUrl);
+        commitThumbnail(prepared.previewImageUrl ?? prepared.imageUrl ?? dataUrl);
+      } catch (error) {
+        // 三级取帧都失败时保持 video 播放器显示, 不打断用户。
+        console.warn('[mediaNode] remote video thumbnail fallback failed', error);
+      }
+    })();
     return () => {
       disposed = true;
     };

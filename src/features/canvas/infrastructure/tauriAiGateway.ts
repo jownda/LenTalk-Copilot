@@ -443,11 +443,18 @@ export const tauriAiGateway: AiGateway = {
       injected.model.split('/')[0] ?? ''
     );
     const mergedExtraParams = mergeNegativePrompt(injected);
+    // 即梦 CLI 的画幅由 `--ratio` 直接决定, 不需要(也不该)往提示词里追加画幅约束;
+    // 其余平台依赖这句英文兜底上游忽略 aspect_ratio 参数的情况。
+    // 这里按整个 provider 前缀判断: 普通图片(`image-*`)与超清(`upscale`)都算。
+    const isJimengCliImage = payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`);
+    const prompt = localizeReferenceTokens(
+      isJimengCliImage
+        ? payload.prompt
+        : withAspectRatioRequirement(payload.prompt, payload.aspectRatio),
+      payload.model
+    );
     return await submitGenerateImageJob({
-      prompt: localizeReferenceTokens(
-        withAspectRatioRequirement(payload.prompt, payload.aspectRatio),
-        payload.model
-      ),
+      prompt,
       negative_prompt: payload.negativePrompt,
       model: payload.model,
       size: payload.size,

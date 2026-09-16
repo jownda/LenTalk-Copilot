@@ -31,6 +31,45 @@ pub async fn wan_cli_status(executable: String) -> Result<WanCliStatus, String> 
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WanCliCredits {
+    /// 当前可用积分。
+    available_count: f64,
+    /// 积分构成(会员额度 / 充值 / 赠送), 前端拼成 tooltip。
+    member_count: Option<f64>,
+    top_up_count: Option<f64>,
+    bonus_count: Option<f64>,
+}
+
+fn json_number(value: Option<&serde_json::Value>) -> Option<f64> {
+    match value? {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// 查询万相 CLI 剩余积分(`wan credits --output json`), 设置页「万相 CLI」面板展示。
+#[tauri::command]
+pub async fn wan_cli_credits(executable: String) -> Result<WanCliCredits, String> {
+    let value = run(&executable, &args(&["credits"]), 30).await?;
+    let available_count = match json_number(value.get("availableCount").or_else(|| value.get("totalCount"))) {
+        Some(number) => number,
+        None => return Err("万相 CLI 未返回积分字段".to_string()),
+    };
+    let amount = value.get("amount");
+    let amount_number = |key: &str| -> Option<f64> {
+        json_number(amount.and_then(|item| item.get(key)))
+    };
+    Ok(WanCliCredits {
+        available_count,
+        member_count: amount_number("member"),
+        top_up_count: amount_number("topUp"),
+        bonus_count: amount_number("bonus"),
+    })
+}
+
 #[tauri::command]
 pub async fn wan_cli_login(executable: String, site: String, access_key: String) -> Result<(), String> {
     if !matches!(site.as_str(), "cn" | "intl") { return Err("万相站点必须为 cn 或 intl".into()); }
