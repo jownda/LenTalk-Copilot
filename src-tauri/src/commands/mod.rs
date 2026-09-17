@@ -10,6 +10,8 @@ pub mod wan_cli;
 pub mod project_state;
 pub mod project_archive;
 pub mod system;
+pub mod template_state;
+pub mod template_sync;
 pub mod update;
 pub mod usage_log;
 
@@ -21,5 +23,7 @@ pub use image::*;
 pub use project_state::*;
 pub use project_archive::*;
 pub use system::*;
+pub use template_state::*;
+pub use template_sync::*;
 pub use update::*;
 pub use usage_log::*;

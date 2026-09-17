@@ -78,7 +78,7 @@ import { AgentPanel } from "@/features/agent/AgentPanel";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
 import {
   ASSET_DRAG_DATA_TYPE,
-  importImageUrlToAsset,
+  importImageUrlToAssetDetailed,
   parseAssetDragPayload,
   PROMPT_DRAG_DATA_TYPE,
   parsePromptDragPayload,
@@ -1918,13 +1918,17 @@ export function Canvas() {
       return;
     }
 
-    const asset = await importImageUrlToAsset(imageUrl, libraryId, categoryId);
+    const { asset, failure } = await importImageUrlToAssetDetailed(imageUrl, libraryId, categoryId);
     if (asset) {
       useAssetLibraryStore.getState().addAssets([asset]);
       return;
     }
 
-    void showErrorDialog("无法将该图片添加到素材库", "添加失败");
+    void showErrorDialog(
+      failure?.reason ? `无法将该图片添加到素材库：${failure.reason}` : "无法将该图片添加到素材库",
+      "添加失败",
+      failure?.details,
+    );
   }, []);
 
   const handleAssetLibraryDragOver = useCallback((event: ReactDragEvent) => {

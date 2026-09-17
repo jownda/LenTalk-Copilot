@@ -50,6 +50,23 @@ export interface JimengCliSettings {
   executable: string;
 }
 
+export type JimengCliAutoInstallState = 'idle' | 'detecting' | 'installing' | 'ready' | 'failed';
+
+/** 即梦 CLI 自动检测/安装的运行时状态（不持久化，每次启动重新检测）。 */
+export interface JimengCliAutoInstallStatus {
+  state: JimengCliAutoInstallState;
+  message: string;
+  resolvedPath: string | null;
+  detectedAt: number;
+}
+
+export const DEFAULT_JIMENG_CLI_AUTO_INSTALL_STATUS: JimengCliAutoInstallStatus = {
+  state: 'idle',
+  message: '',
+  resolvedPath: null,
+  detectedAt: 0,
+};
+
 /** 视频模型必须与图片模型分开注册，避免通用模型拉取结果污染图片节点。 */
 export function isVideoGenerationModelName(model: string): boolean {
   const value = model.trim().toLowerCase();
@@ -181,6 +198,8 @@ interface SettingsState {
   customApis: CustomApiProvider[];
   cinematicAiSelection: CinematicAiSelection;
   jimengCli: JimengCliSettings;
+  /** 即梦 CLI 自动检测/安装状态（运行时内存态，不随设置持久化）。 */
+  jimengCliAutoInstallStatus: JimengCliAutoInstallStatus;
   grsaiNanoBananaProModel: string;
   hideProviderGuidePopover: boolean;
   downloadPresetPaths: string[];
@@ -224,6 +243,7 @@ interface SettingsState {
   usableModelIds: string[];
   setProviderApiKey: (providerId: string, key: string) => void;
   setJimengCliExecutable: (executable: string) => void;
+  setJimengCliAutoInstallStatus: (status: JimengCliAutoInstallStatus) => void;
   addCustomApi: (input: Omit<CustomApiProvider, 'id' | 'createdAt'>) => CustomApiProvider;
   updateCustomApi: (id: string, patch: Partial<Omit<CustomApiProvider, 'id'>>) => void;
   removeCustomApi: (id: string) => void;
@@ -611,6 +631,7 @@ export const useSettingsStore = create<SettingsState>()(
       customApis: [],
       cinematicAiSelection: { provider: '', model: '', reasoningEffort: '' },
       jimengCli: { executable: DEFAULT_JIMENG_CLI_EXECUTABLE },
+      jimengCliAutoInstallStatus: DEFAULT_JIMENG_CLI_AUTO_INSTALL_STATUS,
       grsaiNanoBananaProModel: DEFAULT_GRSAI_NANO_BANANA_PRO_MODEL,
       hideProviderGuidePopover: false,
       downloadPresetPaths: [],
@@ -651,6 +672,7 @@ export const useSettingsStore = create<SettingsState>()(
         })),
       setJimengCliExecutable: (executable) =>
         set({ jimengCli: normalizeJimengCliSettings({ executable }) }),
+      setJimengCliAutoInstallStatus: (status) => set({ jimengCliAutoInstallStatus: status }),
       addCustomApi: (input) => {
         const existingIds = new Set(get().customApis.map((item) => item.id));
         const id = deriveCustomApiId(input.name, existingIds);

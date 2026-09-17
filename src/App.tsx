@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ReactFlowProvider } from '@xyflow/react';
-import { invoke } from '@tauri-apps/api/core';
+import { HashRouter, Route, Routes } from 'react-router-dom';
+import { invoke, isTauri } from '@tauri-apps/api/core';
 import { Canvas } from './features/canvas/Canvas';
 import { TitleBar } from './components/TitleBar';
 import { SettingsDialog } from './components/SettingsDialog';
@@ -11,6 +12,7 @@ import { ProjectManager } from './features/project/ProjectManager';
 import { useThemeStore } from './stores/themeStore';
 import { useProjectStore } from './stores/projectStore';
 import { useSettingsStore } from './stores/settingsStore';
+import { jimengCliDetect, jimengCliInstall } from './commands/ai';
 import {
   checkForUpdate,
   isUpdateVersionSuppressed,
@@ -18,6 +20,9 @@ import {
 } from './features/update/application/checkForUpdate';
 import { subscribeOpenGlobalErrorDialog, type GlobalErrorDialogDetail } from './features/app/errorDialogEvents';
 import { subscribeOpenSettingsDialog, type SettingsCategory } from './features/settings/settingsEvents';
+import { TemplatePage } from './features/templates/TemplatePage';
+import { TemplateDetailPage } from './features/templates/TemplateDetailPage';
+import { TemplateGraphPage } from './features/templates/TemplateGraphPage';
 
 function toRgbCssValue(hexColor: string): string {
   const hex = hexColor.replace('#', '');
@@ -30,7 +35,7 @@ function toRgbCssValue(hexColor: string): string {
   return `${r} ${g} ${b}`;
 }
 
-function App() {
+function AppShell() {
   const { theme } = useThemeStore();
   const uiRadiusPreset = useSettingsStore((state) => state.uiRadiusPreset);
   const themeTonePreset = useSettingsStore((state) => state.themeTonePreset);
@@ -38,6 +43,11 @@ function App() {
   const autoCheckAppUpdateOnLaunch = useSettingsStore((state) => state.autoCheckAppUpdateOnLaunch);
   const enableUpdateDialog = useSettingsStore((state) => state.enableUpdateDialog);
   const setEnableUpdateDialog = useSettingsStore((state) => state.setEnableUpdateDialog);
+  const jimengCliExecutable = useSettingsStore((state) => state.jimengCli.executable);
+  const setJimengCliAutoInstallStatus = useSettingsStore(
+    (state) => state.setJimengCliAutoInstallStatus
+  );
+  const setJimengCliExecutable = useSettingsStore((state) => state.setJimengCliExecutable);
   const [showSettings, setShowSettings] = useState(false);
   const [showBilling, setShowBilling] = useState(false);
   const [settingsInitialCategory, setSettingsInitialCategory] = useState<SettingsCategory>('general');
@@ -138,6 +148,82 @@ function App() {
     };
   }, []);
 
+  // 启动时自动检测即梦 CLI：未安装则在后台静默自动安装（不阻塞 UI、不弹窗），
+  // 安装成功后自动配置 executable（仅当原设置不可用时写入，尊重手动配置）；
+  // 任何失败都不影响主流程，状态在 Settings 弹窗可见，保证"失败不致命"。
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
+    let cancelled = false;
+    setJimengCliAutoInstallStatus({
+      state: 'detecting',
+      message: '',
+      resolvedPath: null,
+      detectedAt: Date.now(),
+    });
+
+    (async () => {
+      try {
+        const result = await jimengCliDetect(jimengCliExecutable);
+        if (cancelled) {
+          return;
+        }
+        if (result.found) {
+          setJimengCliAutoInstallStatus({
+            state: 'ready',
+            message: '',
+            resolvedPath: result.resolvedPath,
+            detectedAt: Date.now(),
+          });
+          return;
+        }
+        // 未检测到：静默后台自动安装。
+        setJimengCliAutoInstallStatus({
+          state: 'detecting',
+          message: '未检测到即梦 CLI，正在后台自动安装…',
+          resolvedPath: null,
+          detectedAt: Date.now(),
+        });
+        const install = await jimengCliInstall();
+        if (cancelled) {
+          return;
+        }
+        if (install.success && install.resolvedPath) {
+          setJimengCliAutoInstallStatus({
+            state: 'ready',
+            message: install.message,
+            resolvedPath: install.resolvedPath,
+            detectedAt: Date.now(),
+          });
+          setJimengCliExecutable(install.resolvedPath);
+        } else {
+          setJimengCliAutoInstallStatus({
+            state: 'failed',
+            message: install.message || '自动安装未完成',
+            resolvedPath: null,
+            detectedAt: Date.now(),
+          });
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setJimengCliAutoInstallStatus({
+          state: 'idle',
+          message: error instanceof Error ? error.message : String(error),
+          resolvedPath: null,
+          detectedAt: Date.now(),
+        });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [jimengCliExecutable, setJimengCliAutoInstallStatus, setJimengCliExecutable]);
+
   useEffect(() => {
     if (!isHydrated) {
       return;
@@ -215,7 +301,14 @@ function App() {
           onBackClick={closeProject}
         />
 
-        <main className="relative min-h-0 min-w-0 flex-1">{currentProjectId ? <Canvas /> : <ProjectManager />}</main>
+        <main className="relative min-h-0 min-w-0 flex-1">
+          <Routes>
+            <Route path="/templates" element={<TemplatePage />} />
+            <Route path="/templates/:templateId/graph" element={<TemplateGraphPage />} />
+            <Route path="/templates/:templateId" element={<TemplateDetailPage />} />
+            <Route path="*" element={currentProjectId ? <Canvas /> : <ProjectManager />} />
+          </Routes>
+        </main>
 
         <SettingsDialog
           isOpen={showSettings}
@@ -241,6 +334,14 @@ function App() {
         />
       </div>
     </ReactFlowProvider>
+  );
+}
+
+function App() {
+  return (
+    <HashRouter>
+      <AppShell />
+    </HashRouter>
   );
 }
 

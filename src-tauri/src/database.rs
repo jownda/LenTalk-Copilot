@@ -96,6 +96,14 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
           history_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_projects_updated_at ON projects(updated_at DESC);
+        CREATE TABLE IF NOT EXISTS templates (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_templates_updated_at ON templates(updated_at DESC);
         CREATE TABLE IF NOT EXISTS project_image_refs (
           project_id TEXT NOT NULL,
           path TEXT NOT NULL,

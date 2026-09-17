@@ -82,6 +82,7 @@ export interface VideoGenerationRequestData {
   imageMode?: "reference" | "first-last";
   referenceImages?: string[];
   referenceAudio?: string[];
+  extraParams?: Record<string, unknown>;
 }
 
 /** 音频生成请求快照(语音合成 / 音效 / 音乐)。 */

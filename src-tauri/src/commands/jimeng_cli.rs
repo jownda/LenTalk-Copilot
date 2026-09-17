@@ -21,6 +21,13 @@ const CLI_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const JIMENG_CLI_MAX_REFERENCE_IMAGES: usize = 9;
 
+/// 即梦 CLI 官方 Windows 安装包下载前缀（与官方安装脚本 `https://jimeng.jianying.com/cli` 同源）。
+/// 仅在用户明确触发「自动安装」时使用；域名为白名单内固定地址，不做任何动态拼接。
+const JIMENG_CLI_DOWNLOAD_BASE: &str =
+    "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp";
+/// 下载后文件必须大于该阈值才认为有效，避免把错误页/极小残片当安装包。
+const JIMENG_CLI_MIN_EXE_BYTES: u64 = 1024 * 1024;
+
 /// Windows: 阻止控制台子进程弹出终端窗口。
 /// 即梦 CLI 一次任务会反复调用（提交 + 每 3 秒 query_result + queue_count），
 /// 不设置该标志时每个子进程都会闪出一个黑窗口，关闭窗口等于杀掉子进程导致命令失败。
@@ -1255,6 +1262,300 @@ pub async fn jimeng_cli_credit(executable: String) -> Result<JimengCliCredit, St
         total_credit,
         vip_level,
     })
+}
+
+// ---------------------------------------------------------------------------
+// 自动检测与自动安装（仅 Windows；失败不致命，只写用户目录）
+// ---------------------------------------------------------------------------
+
+/// 检测结果（内部结构，来源字段供日志/调试使用）。
+struct ExecutableDetection {
+    found: bool,
+    resolved_path: Option<String>,
+    source: String,
+    candidate_paths: Vec<String>,
+}
+
+/// 与 `resolve_executable` 相同的解析顺序（绝对路径 → PATH → 常见安装目录），
+/// 但返回结构化结果而不抛错，供启动自动检测与自动安装后的复检使用。
+/// 保持 `resolve_executable` 现有行为与错误文案不变。
+fn detect_executable(requested: &str) -> ExecutableDetection {
+    let trimmed = requested.trim().trim_matches(['"', '\'']);
+    if trimmed.is_empty() {
+        return ExecutableDetection {
+            found: false,
+            resolved_path: None,
+            source: "none".to_string(),
+            candidate_paths: Vec::new(),
+        };
+    }
+    let expanded = expand_windows_path(trimmed);
+    if Path::new(&expanded).is_absolute() || expanded.contains('/') || expanded.contains('\\') {
+        if Path::new(&expanded).is_file() {
+            return ExecutableDetection {
+                found: true,
+                resolved_path: Some(expanded),
+                source: "settings-absolute".to_string(),
+                candidate_paths: Vec::new(),
+            };
+        }
+        return ExecutableDetection {
+            found: false,
+            resolved_path: None,
+            source: "none".to_string(),
+            candidate_paths: Vec::new(),
+        };
+    }
+    if let Some(found) = find_in_path(&expanded) {
+        return ExecutableDetection {
+            found: true,
+            resolved_path: Some(found),
+            source: "settings-command-path".to_string(),
+            candidate_paths: Vec::new(),
+        };
+    }
+    let candidates = common_locations(&expanded);
+    for candidate in &candidates {
+        if Path::new(candidate).is_file() {
+            return ExecutableDetection {
+                found: true,
+                resolved_path: Some(candidate.clone()),
+                source: "settings-command-common".to_string(),
+                candidate_paths: candidates,
+            };
+        }
+    }
+    ExecutableDetection {
+        found: false,
+        resolved_path: None,
+        source: "none".to_string(),
+        candidate_paths: candidates,
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JimengCliDetectResult {
+    pub found: bool,
+    pub resolved_path: Option<String>,
+    pub source: String,
+    pub candidate_paths: Vec<String>,
+}
+
+/// 检测本机是否安装即梦 CLI。
+/// - executable 为空时按默认命令 `dreamina` 检测；
+/// - 只读探测，不修改任何文件、不写注册表、不启动安装。
+#[tauri::command]
+pub async fn jimeng_cli_detect(executable: Option<String>) -> Result<JimengCliDetectResult, String> {
+    let requested = executable
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let requested = if requested.is_empty() {
+        "dreamina".to_string()
+    } else {
+        requested
+    };
+    let detection = detect_executable(&requested);
+    Ok(JimengCliDetectResult {
+        found: detection.found,
+        resolved_path: detection.resolved_path,
+        source: detection.source,
+        candidate_paths: detection.candidate_paths,
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JimengCliInstallResult {
+    pub success: bool,
+    pub installed: bool,
+    pub resolved_path: Option<String>,
+    pub message: String,
+}
+
+/// 自动安装即梦 CLI（仅 Windows）：
+/// 1. 已安装 → 直接返回 installed=false（不重复安装）；
+/// 2. 下载官方 Windows 安装包到 %USERPROFILE%\bin\dreamina.exe；
+/// 3. 尽力补齐 %USERPROFILE%\.dreamina_cli 下的 SKILL.md / version.json（失败不阻塞）；
+/// 4. 将 %USERPROFILE%\bin 追加到当前用户 PATH（User 级，失败不阻塞）；
+/// 5. 复检；所有失败路径均返回可读 message，不向上抛致命错误。
+#[tauri::command]
+pub async fn jimeng_cli_install() -> Result<JimengCliInstallResult, String> {
+    tokio::task::spawn_blocking(jimeng_cli_install_blocking)
+        .await
+        .map_err(|error| format!("即梦 CLI 自动安装任务中断: {error}"))?
+}
+
+fn jimeng_cli_install_blocking() -> Result<JimengCliInstallResult, String> {
+    let detection = detect_executable("dreamina");
+    if detection.found {
+        return Ok(JimengCliInstallResult {
+            success: true,
+            installed: false,
+            resolved_path: detection.resolved_path,
+            message: "已检测到即梦 CLI，无需重复安装".to_string(),
+        });
+    }
+
+    let home = current_user_home()
+        .ok_or_else(|| "无法定位用户主目录（%USERPROFILE%），请手动安装即梦 CLI".to_string())?;
+    let bin_dir = home.join("bin");
+    let exe_path = bin_dir.join("dreamina.exe");
+    fs::create_dir_all(&bin_dir)
+        .map_err(|error| format!("无法创建安装目录 {}: {error}", bin_dir.display()))?;
+
+    let curl = find_curl().ok_or_else(|| "未找到 curl.exe，请手动安装即梦 CLI".to_string())?;
+
+    let exe_url = format!("{JIMENG_CLI_DOWNLOAD_BASE}/dreamina_cli_windows_amd64.exe");
+    let tmp_path = std::env::temp_dir().join(format!("lentalk-jimeng-install-{}.exe", Uuid::new_v4()));
+    download_with_curl(&curl, &exe_url, &tmp_path).map_err(|error| {
+        let _ = fs::remove_file(&tmp_path);
+        error
+    })?;
+    let size = fs::metadata(&tmp_path).map(|meta| meta.len()).unwrap_or(0);
+    if size < JIMENG_CLI_MIN_EXE_BYTES {
+        let _ = fs::remove_file(&tmp_path);
+        return Ok(JimengCliInstallResult {
+            success: false,
+            installed: false,
+            resolved_path: None,
+            message: format!("下载的即梦 CLI 文件异常（仅 {size} 字节），安装中止，请手动安装"),
+        });
+    }
+    if exe_path.exists() {
+        // 只覆盖本次自动安装写入的目标文件；绝不触碰用户手动配置的其它路径。
+        let _ = fs::remove_file(&exe_path);
+    }
+    fs::rename(&tmp_path, &exe_path)
+        .or_else(|_| fs::copy(&tmp_path, &exe_path).map(|_| ()))
+        .map_err(|error| {
+            let _ = fs::remove_file(&tmp_path);
+            format!("无法写入安装目录 {}: {error}", exe_path.display())
+        })?;
+    let _ = fs::remove_file(&tmp_path);
+
+    let mut warnings: Vec<String> = Vec::new();
+    let dot_dir = home.join(".dreamina_cli");
+    let skill_dir = dot_dir.join("dreamina");
+    let _ = fs::create_dir_all(&skill_dir);
+    if let Err(error) = download_with_curl(
+        &curl,
+        &format!("{JIMENG_CLI_DOWNLOAD_BASE}/SKILL.md"),
+        &skill_dir.join("SKILL.md"),
+    ) {
+        warnings.push(format!("SKILL.md 下载失败: {error}"));
+    }
+    if let Err(error) = download_with_curl(
+        &curl,
+        &format!("{JIMENG_CLI_DOWNLOAD_BASE}/version.json"),
+        &dot_dir.join("version.json"),
+    ) {
+        warnings.push(format!("version.json 下载失败: {error}"));
+    }
+    if let Err(error) = ensure_windows_user_path(&bin_dir) {
+        warnings.push(format!("写入用户 PATH 失败（不影响本软件直接使用）: {error}"));
+    }
+
+    let detection = detect_executable("dreamina");
+    let suffix = if warnings.is_empty() {
+        String::new()
+    } else {
+        format!("（{}）", warnings.join("；"))
+    };
+    match detection.resolved_path {
+        Some(path) => {
+            let message = format!("即梦 CLI 安装完成：{path}{suffix}");
+            Ok(JimengCliInstallResult {
+                success: true,
+                installed: true,
+                resolved_path: Some(path),
+                message,
+            })
+        }
+        None => Ok(JimengCliInstallResult {
+            success: false,
+            installed: false,
+            resolved_path: None,
+            message: format!("安装后仍未检测到即梦 CLI，请手动安装{suffix}"),
+        }),
+    }
+}
+
+/// 定位 curl.exe：优先 Windows 系统自带，其次当前进程 PATH。
+#[cfg(target_os = "windows")]
+fn find_curl() -> Option<PathBuf> {
+    let system_curl = PathBuf::from(r"C:\Windows\System32\curl.exe");
+    if system_curl.is_file() {
+        return Some(system_curl);
+    }
+    find_in_path("curl").map(PathBuf::from)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_curl() -> Option<PathBuf> {
+    find_in_path("curl").map(PathBuf::from)
+}
+
+/// 用 curl.exe 下载文件到目标路径；失败返回可读错误。
+fn download_with_curl(curl: &Path, url: &str, target: &Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建下载目录 {}: {error}", parent.display()))?;
+    }
+    let output = Command::new(curl)
+        .args(["-fsSL", url, "-o"])
+        .arg(target)
+        .output()
+        .map_err(|error| format!("无法启动 curl.exe: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        return Err(if trimmed.is_empty() {
+            "下载失败（HTTP 错误），请稍后重试或手动安装".to_string()
+        } else {
+            format!("下载失败: {trimmed}")
+        });
+    }
+    if !target.is_file() {
+        return Err("下载失败：未生成目标文件".to_string());
+    }
+    Ok(())
+}
+
+/// 将 bin_dir 追加到当前用户 PATH（User 级环境变量，不触碰系统 PATH）。
+/// 失败不致命：返回 Err 由调用方转成提示，不影响已完成的安装。
+#[cfg(target_os = "windows")]
+fn ensure_windows_user_path(bin_dir: &Path) -> Result<(), String> {
+    let dir = bin_dir.to_string_lossy().to_string();
+    let escaped = dir.replace('\'', "''");
+    let script = format!(
+        "$p=[Environment]::GetEnvironmentVariable('Path','User'); \
+         if ($p -and ($p -split ';' -contains '{escaped}')) {{ exit 0 }}; \
+         $new=if ($p) {{ $p.TrimEnd(';') + ';' + '{escaped}' }} else {{ '{escaped}' }}; \
+         [Environment]::SetEnvironmentVariable('Path',$new,'User')"
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("无法启动 powershell.exe: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        Err(if trimmed.is_empty() {
+            "PowerShell 执行失败".to_string()
+        } else {
+            trimmed.to_string()
+        })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_windows_user_path(_bin_dir: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

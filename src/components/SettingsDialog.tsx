@@ -3,7 +3,7 @@ import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Termin
 import { useTranslation } from 'react-i18next';
 import { buildCustomModelId, isAudioModelName, isChatCompletionModelName, isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
 import type { CustomApiCapabilities, CustomApiProvider } from '@/stores/settingsStore';
-import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck, jimengCliLogout } from '@/commands/ai';
+import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck, jimengCliLogout, jimengCliDetect, jimengCliInstall } from '@/commands/ai';
 import {
   formatProviderBalance,
   queryJimengCliCredit,
@@ -113,6 +113,7 @@ export function SettingsDialog({
     apiKeys,
     customApis,
     jimengCli,
+    jimengCliAutoInstallStatus,
     useUploadFilenameAsNodeTitle,
     storyboardGenKeepStyleConsistent,
     storyboardGenDisableTextInImage,
@@ -131,6 +132,7 @@ export function SettingsDialog({
     enableUpdateDialog,
     setProviderApiKey,
     setJimengCliExecutable,
+    setJimengCliAutoInstallStatus,
     addCustomApi,
     updateCustomApi,
     removeCustomApi,
@@ -545,13 +547,35 @@ export function SettingsDialog({
 
   /** 一键登录即梦: 获取设备码 → 自动打开浏览器 → 轮询登录结果 */
   const startJimengLogin = useCallback(async () => {
-    const executable = localJimengCliExecutable.trim() || 'dreamina';
+    let executable = localJimengCliExecutable.trim() || 'dreamina';
     setJimengLoginState('opening');
     setJimengLoginMessage('正在获取授权链接，稍后会自动打开浏览器，通常需要几秒钟，请稍候…');
     setJimengLoginInfo(null);
     if (jimengLoginTimerRef.current) {
       clearInterval(jimengLoginTimerRef.current);
       jimengLoginTimerRef.current = null;
+    }
+    // 前置：检测即梦 CLI，未安装时自动安装；安装失败不致命，仅中止登录并提示手动安装。
+    try {
+      const detect = await jimengCliDetect(executable);
+      if (!detect.found) {
+        setJimengLoginMessage('正在自动安装即梦 CLI，请稍候…（约 1-2 分钟）');
+        const install = await jimengCliInstall();
+        if (!install.success || !install.resolvedPath) {
+          setJimengLoginState('error');
+          setJimengLoginMessage(
+            `未检测到即梦 CLI 且自动安装失败：${install.message || '请手动安装'}`
+          );
+          return;
+        }
+        setJimengCliExecutable(install.resolvedPath);
+        setLocalJimengCliExecutable(install.resolvedPath);
+        executable = install.resolvedPath;
+      }
+    } catch (error) {
+      setJimengLoginState('error');
+      setJimengLoginMessage(error instanceof Error ? error.message : String(error));
+      return;
     }
     try {
       const result = await jimengCliLoginStart(executable);
@@ -651,7 +675,7 @@ export function SettingsDialog({
       setJimengLoginState('error');
       setJimengLoginMessage(error instanceof Error ? error.message : String(error));
     }
-  }, [localJimengCliExecutable, refreshJimengCredit]);
+  }, [localJimengCliExecutable, refreshJimengCredit, setJimengCliExecutable, setLocalJimengCliExecutable]);
 
     const handleJimengLogout = useCallback(() => {
     setJimengLoginState('idle');
@@ -669,6 +693,39 @@ export function SettingsDialog({
     setJimengCliExecutable(localJimengCliExecutable);
     setShowJimengCliSettings(false);
   }, [localJimengCliExecutable, setJimengCliExecutable]);
+
+  /** 自动安装即梦 CLI：失败不致命，只写用户目录；安装成功后自动探测本地登录态。 */
+  const handleAutoInstallJimengCli = useCallback(async () => {
+    if (jimengCliAutoInstallStatus.state === 'installing') {
+      return;
+    }
+    setJimengCliAutoInstallStatus({
+      state: 'installing',
+      message: t('settings.jimengCliAutoInstalling'),
+      resolvedPath: null,
+      detectedAt: Date.now(),
+    });
+    try {
+      const result = await jimengCliInstall();
+      setJimengCliAutoInstallStatus({
+        state: result.success ? 'ready' : 'failed',
+        message: result.message,
+        resolvedPath: result.resolvedPath,
+        detectedAt: Date.now(),
+      });
+      if (result.success) {
+        // 安装成功后 CLI 才可用，重新探测本地登录态。
+        void probeJimengLoginStatus(result.resolvedPath ?? localJimengCliExecutable);
+      }
+    } catch (error) {
+      setJimengCliAutoInstallStatus({
+        state: 'failed',
+        message: error instanceof Error ? error.message : String(error),
+        resolvedPath: null,
+        detectedAt: Date.now(),
+      });
+    }
+  }, [jimengCliAutoInstallStatus.state, setJimengCliAutoInstallStatus, t, probeJimengLoginStatus, localJimengCliExecutable]);
 
   /** 验证链接:仅检查 Base URL 是否可达(不需要 Key) */
   const handleVerifyCustomUrl = useCallback(async () => {
@@ -2171,6 +2228,48 @@ export function SettingsDialog({
             >
               <div className="space-y-4">
                 <p className="text-xs leading-5 text-text-muted">{t('settings.jimengCliDialogDesc')}</p>
+
+                <div className="rounded-md border border-border-dark bg-surface-dark/50 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-medium text-text-dark">
+                        {jimengCliAutoInstallStatus.state === 'ready'
+                          ? t('settings.jimengCliAutoReady')
+                          : jimengCliAutoInstallStatus.state === 'failed'
+                            ? t('settings.jimengCliAutoInstallFailed')
+                            : jimengCliAutoInstallStatus.state === 'installing'
+                              ? t('settings.jimengCliAutoInstalling')
+                              : jimengCliAutoInstallStatus.state === 'detecting'
+                                ? t('settings.jimengCliAutoDetecting')
+                                : t('settings.jimengCliAutoMissing')}
+                      </p>
+                      {jimengCliAutoInstallStatus.resolvedPath && (
+                        <p className="mt-0.5 break-all text-[11px] leading-4 text-text-muted">
+                          {t('settings.jimengCliAutoPath')}: {jimengCliAutoInstallStatus.resolvedPath}
+                        </p>
+                      )}
+                      {jimengCliAutoInstallStatus.message &&
+                        jimengCliAutoInstallStatus.state !== 'ready' && (
+                          <p className="mt-0.5 break-all text-[11px] leading-4 text-text-muted">
+                            {jimengCliAutoInstallStatus.message}
+                          </p>
+                        )}
+                    </div>
+                    {(jimengCliAutoInstallStatus.state === 'failed' ||
+                      jimengCliAutoInstallStatus.state === 'idle') && (
+                      <button
+                        type="button"
+                        onClick={() => void handleAutoInstallJimengCli()}
+                        className="shrink-0 rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {t('settings.jimengCliAutoInstallBtn')}
+                      </button>
+                    )}
+                  </div>
+                  <p className="mt-2 text-[11px] leading-4 text-text-muted">
+                    {t('settings.jimengCliAutoInstallNotice')}
+                  </p>
+                </div>
 
                 <label className="block text-xs font-medium text-text-dark">
                   {t('settings.jimengCliExecutable')}

@@ -9,6 +9,7 @@ export interface MediaDownloadRequest {
   source: string;
   nodeId: string;
   mediaType: 'image' | 'video';
+  fileName?: string;
 }
 
 /** 直接打开保存位置对话框并保存媒体，不经过额外的保存卡片。 */
@@ -16,9 +17,10 @@ export async function saveMediaSourceWithDialog({
   source,
   nodeId,
   mediaType,
+  fileName,
 }: MediaDownloadRequest): Promise<void> {
   const extension = mediaType === 'video' ? 'mp4' : 'png';
-  const defaultPath = `node-${nodeId}.${extension}`;
+  const defaultPath = fileName?.trim() || `node-${nodeId}.${extension}`;
 
   if (!isTauri()) {
     const response = await fetch(source);

@@ -45,42 +45,139 @@ async function persistImageBlobForLibrary(
   return { sourcePath, previewImageUrl, aspectRatio };
 }
 
+export interface ImportImageFailure {
+  /** 面向用户的简短原因（会拼进错误弹窗正文） */
+  reason: string;
+  /** 排查细节: 源地址、HTTP 状态、底层错误信息 */
+  details?: string;
+}
+
+export interface ImportImageOutcome {
+  asset: LibraryAsset | null;
+  failure: ImportImageFailure | null;
+}
+
+function describeImportError(error: unknown): string {
+  if (error instanceof Error) {
+    const detailed = error as Error & { details?: string };
+    return detailed.details ? `${error.message}\n${detailed.details}` : error.message;
+  }
+  return String(error);
+}
+
 /**
  * 从图片 URL 下载为本地素材(画布图片「添加到素材库」用)。
  * 返回 null 表示下载或处理失败。
+ *
+ * 需要知道失败原因时请改用 importImageUrlToAssetDetailed —— 本函数为兼容旧调用点
+ * 仍会静默返回 null。
  */
 export async function importImageUrlToAsset(
   imageUrl: string,
   libraryId: string,
   categoryId: string | null
 ): Promise<LibraryAsset | null> {
+  const { asset } = await importImageUrlToAssetDetailed(imageUrl, libraryId, categoryId);
+  return asset;
+}
+
+/**
+ * 同 importImageUrlToAsset，但会把失败原因一并返回。
+ *
+ * 原实现把真实错误整个吞进 console.warn，用户只看到「无法将该图片添加到素材库」，
+ * 无法区分下面几种完全不同的情况 —— 排查时等于全盲:
+ *   1) 本地源文件已被移动/删除（loadImage 读文件失败）
+ *   2) 远端地址被跨域策略拦截或已过期（fetch 失败）
+ *   3) 数据不是可解码的图片（detectAspectRatio 解码失败）
+ *   4) 字节为空或写盘失败（Rust 侧 persist_library_asset_binary 报错）
+ */
+export async function importImageUrlToAssetDetailed(
+  imageUrl: string,
+  libraryId: string,
+  categoryId: string | null
+): Promise<ImportImageOutcome> {
+  const source = (imageUrl ?? '').trim();
+  if (!source) {
+    return { asset: null, failure: { reason: '图片地址为空' } };
+  }
+
+  const isRemote = /^https?:\/\//i.test(source);
+
+  // 画布结果在桌面端通常是本地路径，先转换为 data URL 才能稳定读取。
+  let normalizedImageUrl: string;
   try {
-    // 画布结果在桌面端通常是本地路径，先转换为 data URL 才能稳定读取。
-    const normalizedImageUrl = await imageUrlToDataUrl(imageUrl);
+    normalizedImageUrl = await imageUrlToDataUrl(source);
+  } catch (error) {
+    return {
+      asset: null,
+      failure: {
+        reason: isRemote ? '无法下载该图片' : '无法读取该图片的本地文件',
+        details: `${
+          isRemote
+            ? '远端地址不可访问，或被跨域策略拦截（常见于平台返回的临时图片链接）'
+            : '本地源文件可能已被移动、删除，或不在应用可读目录内'
+        }\nsource=${source}\n${describeImportError(error)}`,
+      },
+    };
+  }
+
+  try {
     const response = await fetch(normalizedImageUrl);
     if (!response.ok) {
-      return null;
+      return {
+        asset: null,
+        failure: {
+          reason: `读取图片数据失败（HTTP ${response.status}）`,
+          details: `source=${source}`,
+        },
+      };
     }
+
     const blob = await response.blob();
+    if (blob.size === 0) {
+      return {
+        asset: null,
+        failure: { reason: '读到的图片数据为空', details: `source=${source}` },
+      };
+    }
+    if (blob.type && !blob.type.startsWith('image/')) {
+      return {
+        asset: null,
+        failure: {
+          reason: `该节点的内容是 ${blob.type}，不是图片`,
+          details: `source=${source}\n若节点是视频，请用节点工具栏的「添加到素材库」`,
+        },
+      };
+    }
+
     const extension = blob.type.split('/')[1] ?? 'png';
     const fileName = `canvas-image-${Date.now()}.${extension}`;
     const stored = await persistImageBlobForLibrary(blob, extension);
     return {
-      id: createAssetId(),
-      libraryId,
-      categoryId,
-      name: `画布图片 ${new Date().toLocaleTimeString()}`,
-      mediaType: 'image',
-      sourcePath: stored.sourcePath,
-      previewImageUrl: stored.previewImageUrl,
-      aspectRatio: stored.aspectRatio || '1:1',
-      sourceFileName: fileName,
-      tags: [],
-      createdAt: Date.now(),
+      asset: {
+        id: createAssetId(),
+        libraryId,
+        categoryId,
+        name: `画布图片 ${new Date().toLocaleTimeString()}`,
+        mediaType: 'image',
+        sourcePath: stored.sourcePath,
+        previewImageUrl: stored.previewImageUrl,
+        aspectRatio: stored.aspectRatio || '1:1',
+        sourceFileName: fileName,
+        tags: [],
+        createdAt: Date.now(),
+      },
+      failure: null,
     };
   } catch (error) {
-    console.warn('[assetLibrary] import image url failed', imageUrl, error);
-    return null;
+    console.warn('[assetLibrary] import image url failed', source, error);
+    return {
+      asset: null,
+      failure: {
+        reason: '图片数据处理失败',
+        details: `source=${source}\n${describeImportError(error)}`,
+      },
+    };
   }
 }
 

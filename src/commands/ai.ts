@@ -1944,6 +1944,36 @@ export async function jimengCliLogout(executable: string): Promise<JimengCliLogi
   return await invoke<JimengCliLoginCheckResult>('jimeng_cli_logout', { executable });
 }
 
+export interface JimengCliDetectResult {
+  found: boolean;
+  resolvedPath: string | null;
+  source: string;
+  candidatePaths: string[];
+}
+
+export interface JimengCliInstallResult {
+  success: boolean;
+  installed: boolean;
+  resolvedPath: string | null;
+  message: string;
+}
+
+/** 检测本机是否安装即梦 CLI（只读探测，不触发安装） */
+export async function jimengCliDetect(executable?: string): Promise<JimengCliDetectResult> {
+  if (!isTauri()) {
+    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。');
+  }
+  return await invoke<JimengCliDetectResult>('jimeng_cli_detect', { executable: executable ?? '' });
+}
+
+/** 自动安装即梦 CLI（仅 Windows；失败不致命，只写用户目录） */
+export async function jimengCliInstall(): Promise<JimengCliInstallResult> {
+  if (!isTauri()) {
+    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。');
+  }
+  return await invoke<JimengCliInstallResult>('jimeng_cli_install');
+}
+
 function isCustomModel(model: string): boolean {
   return model.startsWith(CUSTOM_API_PROVIDER_PREFIX);
 }

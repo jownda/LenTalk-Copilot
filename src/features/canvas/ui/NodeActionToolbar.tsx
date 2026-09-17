@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NodeToolbar as ReactFlowNodeToolbar } from '@xyflow/react';
-import { Camera, Copy, Crop, Download, Library, Maximize2, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Sparkles, Trash2, Unlink2 } from 'lucide-react';
+import { Camera, Copy, Crop, Download, Library, Maximize2, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Sparkles, Trash2, Unlink2, LayoutTemplate } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import {
@@ -33,6 +33,8 @@ import {
 import { showErrorDialog } from '@/features/canvas/application/errorDialog';
 import { saveMediaSourceWithDialog } from '@/features/canvas/application/mediaDownload';
 import { importVideoUrlToAsset } from '@/features/library/importAssets';
+import { buildTemplateFromCanvas, createTemplateFromCanvas, validateTemplateChain } from '@/features/templates/createTemplate';
+import { UiInput, UiTextArea } from '@/components/ui/primitives';
 import { useAssetLibraryStore } from '@/features/library/assetStore';
 import {
   JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID,
@@ -108,6 +110,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const tools = useMemo(() => getNodeToolPlugins(node), [node]);
   const deleteNode = useCanvasStore((state) => state.deleteNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const canvasNodes = useCanvasStore((state) => state.nodes);
+  const canvasEdges = useCanvasStore((state) => state.edges);
   const ungroupNode = useCanvasStore((state) => state.ungroupNode);
   const addNode = useCanvasStore((state) => state.addNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
@@ -135,6 +139,11 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isSavingToLibrary, setIsSavingToLibrary] = useState(false);
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
+  const [isTemplateDialogOpen, setIsTemplateDialogOpen] = useState(false);
+  const [templateName, setTemplateName] = useState('');
+  const [templateDescription, setTemplateDescription] = useState('');
+  const [isSavingTemplate, setIsSavingTemplate] = useState(false);
+  const [templateNotice, setTemplateNotice] = useState<string | null>(null);
   const copyTextFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyErrorFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const imageSource = useMemo(() => {
@@ -146,6 +155,13 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const videoSource = isGeneratedVideoNode
     ? ((node.data as { sourcePath?: string | null }).sourcePath ?? null)
     : null;
+  const canSaveVideoTemplate = isGeneratedVideoNode
+    && Boolean(videoSource)
+    && Boolean((node.data as { generationModel?: string | null }).generationModel || (node.data as { generationResultProtected?: boolean }).generationResultProtected);
+  const templateDraft = useMemo(() => {
+    if (!canSaveVideoTemplate || !videoSource) return null;
+    try { return validateTemplateChain(buildTemplateFromCanvas(node, canvasNodes, canvasEdges)); } catch { return { valid: false, missing: ['生成链路'] }; }
+  }, [canSaveVideoTemplate, canvasEdges, canvasNodes, node, videoSource]);
   const downloadSource = imageSource || videoSource;
   const canHandleMedia = Boolean(downloadSource);
   // 「图片高清」只对带图的图片类节点开放(AI 图片节点自己那排按钮走的是另一套渲染)。
@@ -448,6 +464,23 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     }
   }, [activeLibraryId, addAssets, isSavingToLibrary, libraries, videoSource]);
 
+  const handleSaveTemplate = useCallback(async () => {
+    if (!templateDraft?.valid || isSavingTemplate) return;
+    setIsSavingTemplate(true);
+    setTemplateNotice(null);
+    try {
+      await createTemplateFromCanvas(node, canvasNodes, canvasEdges, templateName, templateDescription);
+      setTemplateNotice(t('nodeToolbar.templateSaved'));
+      setIsTemplateDialogOpen(false);
+      setTemplateName('');
+      setTemplateDescription('');
+    } catch (error) {
+      setTemplateNotice(error instanceof Error ? error.message : t('nodeToolbar.templateSaveFailed'));
+    } finally {
+      setIsSavingTemplate(false);
+    }
+  }, [canvasEdges, canvasNodes, isSavingTemplate, node, t, templateDescription, templateDraft?.valid, templateName]);
+
   return (
     <ReactFlowNodeToolbar
       nodeId={node.id}
@@ -613,6 +646,25 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             )}
           </>
         )}
+        {!isImageEdit && canSaveVideoTemplate && videoSource && (
+          <>
+            <UiChipButton
+              key="save-video-template"
+              disabled={!templateDraft?.valid || isSavingTemplate}
+              className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+              title={templateDraft?.valid ? t('nodeToolbar.saveAsTemplate') : `${t('nodeToolbar.incompleteChain')}: ${templateDraft?.missing.join('、') ?? ''}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                setTemplateName(node.data.displayName?.trim() || '');
+                setIsTemplateDialogOpen(true);
+              }}
+            >
+              <LayoutTemplate className="h-3.5 w-3.5" />
+              {t('nodeToolbar.saveAsTemplate')}
+            </UiChipButton>
+            {templateNotice && <span className="px-2 text-[11px] text-emerald-300">{templateNotice}</span>}
+          </>
+        )}
         {!isImageEdit && isGeneratedVideoNode && videoSource && (
           <UiChipButton
             key="video-library"
@@ -665,6 +717,25 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           {t('common.delete')}
         </UiChipButton>
       </UiPanel>
+
+      {!isImageEdit && (
+        <UiModal
+          isOpen={isTemplateDialogOpen}
+          title={t('nodeToolbar.saveAsTemplate')}
+          onClose={() => setIsTemplateDialogOpen(false)}
+          widthClassName="w-[420px]"
+          footer={<>
+            <UiButton type="button" variant="ghost" size="sm" onClick={() => setIsTemplateDialogOpen(false)}>{t('common.cancel')}</UiButton>
+            <UiButton type="button" variant="primary" size="sm" disabled={isSavingTemplate || !templateDraft?.valid} onClick={() => void handleSaveTemplate()}>{isSavingTemplate ? t('nodeToolbar.templateSaving') : t('common.confirm')}</UiButton>
+          </>}
+        >
+          <div className="space-y-3">
+            <label className="block text-xs text-text-muted">{t('nodeToolbar.templateName')}<UiInput value={templateName} onChange={(event) => setTemplateName(event.target.value)} className="mt-1.5" /></label>
+            <label className="block text-xs text-text-muted">{t('nodeToolbar.templateDescription')}<UiTextArea value={templateDescription} onChange={(event) => setTemplateDescription(event.target.value)} rows={3} className="mt-1.5" /></label>
+            {!templateDraft?.valid && <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">{t('nodeToolbar.incompleteChain')}: {templateDraft?.missing.join('、')}</p>}
+          </div>
+        </UiModal>
+      )}
 
       {!isImageEdit && (
         <UiModal

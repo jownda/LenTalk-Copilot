@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import {
   Plus,
@@ -13,6 +14,7 @@ import {
   CloudUpload,
   ArrowDownToLine,
   MoreHorizontal,
+  LayoutTemplate,
 } from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
 import { getProjectRecord, type ProjectRecord } from "@/commands/projectState";
@@ -55,6 +57,7 @@ export function ProjectManager() {
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const [isImportingProject, setIsImportingProject] = useState(false);
+  const navigate = useNavigate();
 
   const {
     projects,
@@ -283,6 +286,10 @@ export function ProjectManager() {
             </div>
           </div>
           <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:shrink-0">
+            <UiButton type="button" variant="muted" onClick={() => navigate("/templates")} className="gap-2">
+              <LayoutTemplate className="w-5 h-5" />
+              {t("project.template")}
+            </UiButton>
             <UiButton type="button" variant="muted" onClick={() => setShow3DDirector(true)} className="gap-2">
               <Boxes className="w-5 h-5" />
               3D导演台

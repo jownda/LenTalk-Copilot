@@ -1,7 +1,7 @@
 {
   "name": "storyboard-copilot",
   "private": true,
-  "version": "1.2.17",
+  "version": "1.2.18",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -43,6 +43,7 @@
     "react-image-crop": "^11.0.10",
     "react-konva": "^18.2.10",
     "react-markdown": "^10.1.0",
+    "react-router-dom": "^7.18.4",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
     "three": "^0.185.1",

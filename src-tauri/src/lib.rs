@@ -17,6 +17,8 @@ use commands::wan_cli;
 use commands::project_state;
 use commands::project_archive;
 use commands::system;
+use commands::template_state;
+use commands::template_sync;
 use commands::update;
 use commands::usage_log;
 use tauri::Manager;
@@ -233,6 +235,8 @@ pub fn run() {
             jimeng_cli::jimeng_cli_login_check,
             jimeng_cli::jimeng_cli_logout,
             jimeng_cli::jimeng_cli_credit,
+            jimeng_cli::jimeng_cli_detect,
+            jimeng_cli::jimeng_cli_install,
             wan_cli::wan_cli_credits,
             balance::query_provider_balance,
             ai_commands::chat_completion,
@@ -258,6 +262,12 @@ pub fn run() {
             usage_log::query_usage_records,
             usage_log::query_usage_summary,
             system::get_runtime_system_info,
+            template_state::list_template_records,
+            template_state::get_template_record,
+            template_state::save_template_record,
+            template_state::delete_template_record,
+            template_sync::template_sync_to_share,
+            template_sync::template_sync_from_share,
             update::get_latest_release_info,
         ])
         .run(tauri::generate_context!())

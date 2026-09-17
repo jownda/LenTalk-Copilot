@@ -999,7 +999,25 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         generationError: null,
         generationErrorDetails: null,
         generationClientSessionId: null,
-        generationRequest: undefined,
+        // 保留最终提交快照，模板保存和结果审计需要使用本次编译后的提示词与参数。
+        generationRequest: {
+          kind: 'video',
+          clientJobId,
+          prompt,
+          model: selectedModel.id,
+          duration: selectedDuration,
+          aspectRatio: data.aspectRatio,
+          videoResolution: selectedVideoResolution,
+          imageMode,
+          referenceImages: videoReferenceImages,
+          referenceAudio: resolvedInputAudio,
+          extraParams: {
+            ...((data.binghuoReferenceVideos && data.binghuoReferenceVideos.length > 0)
+              ? { reference_videos: data.binghuoReferenceVideos.slice(0, 3) }
+              : {}),
+            ...(data.binghuoSkipReview === true ? { skip_review: true } : {}),
+          },
+        },
       });
     } catch (generationError) {
       const resolved = resolveErrorContent(generationError, '视频生成失败');

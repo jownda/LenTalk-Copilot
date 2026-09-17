@@ -22,3 +22,4 @@ npm-debug.log*
 # 本地调试产物
 .playwright-cli/
 output/
+.codex-tmp/
