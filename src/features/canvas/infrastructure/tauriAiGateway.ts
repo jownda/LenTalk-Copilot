@@ -3,6 +3,7 @@ import {
   generateImage,
   generateJimengCliVideo,
   generateVideo,
+  upscaleVideo as upscaleVideoCommand,
   getGenerateImageJob,
   setApiKey,
   submitGenerateImageJob,
@@ -19,7 +20,7 @@ import { isRjmVideoApiBaseUrl } from '@/commands/videoApi';
 import { isZhenjianProvider } from '@/commands/zhenjianApi';
 import { isZzdhProvider } from '@/commands/zzdhApi';
 
-import type { AiGateway, GenerateAudioPayload, GenerateImagePayload, GenerateVideoPayload } from '../application/ports';
+import type { AiGateway, GenerateAudioPayload, GenerateImagePayload, GenerateVideoPayload, UpscaleVideoPayload } from '../application/ports';
 import { generateWanCliVideo } from '@/commands/wanCli';
 import { useWanCliStore } from '@/stores/wanCliStore';
 
@@ -537,6 +538,21 @@ export const tauriAiGateway: AiGateway = {
       reference_images: referenceImages,
       reference_audio: referenceAudio,
       extra_params: injected.extraParams,
+    });
+  },
+  upscaleVideo: async (payload: UpscaleVideoPayload) => {
+    const api = useSettingsStore.getState().customApis.find(
+      (item) => item.id === payload.model.split('/')[0]?.replace('custom:', ''),
+    );
+    const providerBaseUrl = typeof payload.extraParams?.provider_base_url === 'string'
+      ? payload.extraParams.provider_base_url
+      : (api?.baseUrl ?? '');
+    return await upscaleVideoCommand({
+      videoSource: payload.videoSource,
+      model: payload.model,
+      tier: payload.tier,
+      bitRate: payload.bitRate,
+      extra_params: { ...payload.extraParams, provider_base_url: providerBaseUrl },
     });
   },
   /**

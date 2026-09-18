@@ -141,6 +141,11 @@
       "renameTitle": "Rename Group",
       "placeholder": "Enter group name"
     },
+    "saveTextPrompt": {
+      "title": "Save to Prompt Library",
+      "name": "Prompt name",
+      "content": "Prompt content"
+    },
     "toolbar": {
       "zoomIn": "Zoom In",
       "zoomOut": "Zoom Out",
@@ -222,7 +227,11 @@
     "captureFrame": "Capture Frame",
     "upscale": "Upscale",
     "upscaleDesc": "Send this node's video to an upscaler and attach the result as a new video node.",
-    "upscalePending": "Not wired up yet - clicking this sends no request.",
+    "videoUpscaleModel": "Upscale model",
+    "videoUpscaleTier": "Target tier",
+    "videoUpscaleRunning": "Upscaling...",
+    "videoUpscaleApiKeyMissing": "No API key for Zhiniao AI yet. Add one in Settings first.",
+    "videoUpscaleUploading": "Uploading source video...",
     "upscaleTodoModel": "Upscale model: provider and model name",
     "upscaleTodoTarget": "Target tier: 2K / 4K or a scale factor",
     "upscaleTodoTransport": "Transport: public URL or inline base64",
@@ -781,6 +790,7 @@
     "classifyNoMatch": "No matching category was found. Create character, scene, or prop categories and use meaningful names or tags.",
     "assetsTab": "Media",
     "promptsTab": "Prompts",
+    "cinematicTab": "Assets",
     "manageCategories": "Manage Groups",
     "manageCategoriesHint": "Create, rename, or delete custom groups",
     "newCategory": "New Group",
@@ -789,12 +799,12 @@
     "addSubCategory": "New Sub-group",
     "subCategoryPrompt": "Sub-group name:",
     "backup": "Backup",
-    "backupHint": "Export library & prompts as a zip backup",
+    "backupHint": "Export library, prompts & asset library as a zip backup",
     "importBackup": "Import",
-    "importBackupHint": "Restore library & prompts from a zip backup",
+    "importBackupHint": "Restore library, prompts & asset library from a zip backup (asset library merges by id, local-only entries are kept)",
     "backupDone": "Backup exported",
     "backupFailed": "Backup failed, please retry",
-    "importDone": "Imported ({{assets}} assets / {{libs}} prompt libraries). Refreshing…",
+    "importDone": "Imported ({{assets}} assets / {{libs}} prompt libraries / {{cinematic}} asset-library entries). Refreshing…",
     "importFailed": "Import failed, please choose a valid backup file"
   },
   "promptLibrary": {
@@ -869,4 +879,3 @@
     "preparing": "Preparing…"
   }
 }
-

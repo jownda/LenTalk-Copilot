@@ -1,10 +1,11 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { remove } from '@tauri-apps/plugin-fs';
 import { CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from '@/stores/settingsStore';
 import type { CustomApiCapabilities } from '@/stores/settingsStore';
 import { isWindowsDesktopRuntime } from '@/platform/runtime';
 import { isKnownOpenAiImagesBaseUrl } from '@/features/settings/recommendedApis';
 import { persistImageBinary } from '@/commands/image';
-import { resolveReferenceAssetSource } from '@/commands/referenceAssetSource';
+import { localPathFromReferenceSource, resolveReferenceAssetSource } from '@/commands/referenceAssetSource';
 import {
   createVideoIdempotencyKey,
   getVideoTaskFailureReason,
@@ -949,7 +950,11 @@ function extractBinghuoAssetUrl(payload: unknown): string | null {
     return null;
   }
   const record = payload as Record<string, unknown>;
-  for (const key of ['url', 'asset_url', 'assetUrl', 'download_url', 'downloadUrl', 'data', 'result', 'asset']) {
+  for (const key of [
+    'url', 'asset_url', 'assetUrl', 'public_url', 'publicUrl', 'cdn_url', 'cdnUrl',
+    'file_url', 'fileUrl', 'web_url', 'webUrl', 'signed_url', 'signedUrl', 'href',
+    'download_url', 'downloadUrl', 'data', 'result', 'asset',
+  ]) {
     const url = extractBinghuoAssetUrl(record[key]);
     if (url) return url;
   }
@@ -976,28 +981,35 @@ async function uploadPlatformReferenceAsset(
   const uploadHeaders = Object.fromEntries(
     Object.entries(headers).filter(([name]) => name.toLowerCase() !== 'content-type'),
   );
-  const response = await requestProviderMultipart(uploadUrl, {
-    headers: uploadHeaders,
-    fieldName: 'file',
-    filename: `reference-${index + 1}.${asset.extension}`,
-    contentType: asset.mimeType,
-    bodyBase64: asset.base64,
-  });
-  const rawResponse = await response.text();
-  let payload: unknown;
-  try {
-    payload = rawResponse ? JSON.parse(rawResponse) : {};
-  } catch {
-    throw new Error(`${platformLabel} 参考素材上传失败: 平台返回了非 JSON 响应 (${uploadUrl})`);
+  const uploadAttempt = (): Promise<ProviderJsonResponse> =>
+    requestProviderMultipart(uploadUrl, {
+      headers: uploadHeaders,
+      fieldName: 'file',
+      filename: `reference-${index + 1}.${asset.extension}`,
+      contentType: asset.mimeType,
+      bodyBase64: asset.base64,
+    });
+  // 网关偶发返回不带公网 URL 的 file 对象(如瞬时限流/风控), 上传本身幂等, 自动重试一次。
+  let lastPayload: unknown = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const response = await uploadAttempt();
+    const rawResponse = await response.text();
+    let payload: unknown;
+    try {
+      payload = rawResponse ? JSON.parse(rawResponse) : {};
+    } catch {
+      throw new Error(`${platformLabel} 参考素材上传失败: 平台返回了非 JSON 响应 (${uploadUrl})`);
+    }
+    if (!response.ok) {
+      throw new Error(`${platformLabel} 参考素材上传失败: ${buildHttpErrorSummary(response.status, rawResponse, uploadUrl)}`);
+    }
+    const url = extractBinghuoAssetUrl(payload);
+    if (url) return url;
+    lastPayload = payload;
   }
-  if (!response.ok) {
-    throw new Error(`${platformLabel} 参考素材上传失败: ${buildHttpErrorSummary(response.status, rawResponse, uploadUrl)}`);
-  }
-  const url = extractBinghuoAssetUrl(payload);
-  if (!url) {
-    throw new Error(`${platformLabel} 参考素材上传响应中未找到公网 URL: ${describeVideoResponse(payload)}`);
-  }
-  return url;
+  throw new Error(
+    `${platformLabel} 参考素材上传响应中未找到公网 URL: ${describeVideoResponse(lastPayload)}`,
+  );
 }
 
 async function uploadBinghuoReferenceAsset(
@@ -1333,6 +1345,190 @@ async function generateZhiniaoVideo(
       throw new Error(`知鸟 AI 视频生成失败: ${describeVideoResponse(payload)}`);
     }
   }
+}
+
+// ================= 知鸟 AI 视频超分（aliyun-video-superres） =================
+
+/**
+ * VERIFY 结果（已用真实知鸟密钥实测通过）：
+ * - VERIFY-1：video_url 字段名正确（网关 source_field=video_url）
+ * - VERIFY-2：resolution 字段名正确，档位取值 720p | 1080p | 4K（非 2K/4K），默认 720p
+ * - VERIFY-3：bit_rate 网关会透传（generation_params 回显）
+ * 计费为按时长×档位倍率（非固定按次），4K 档约为 720p 档的 6 倍。
+ */
+const ZHINIAO_UPSCALE_VERIFY = {
+  // 源视频公网 URL 字段名（已实测确认）
+  videoUrlField: 'video_url',
+  // 档位字段名（已实测确认），取值：720p | 1080p | 4K
+  tierField: 'resolution',
+  // BitRate 字段名（已实测确认，网关透传）
+  bitRateField: 'bit_rate',
+} as const;
+
+export interface UpscaleZhiniaoVideoRequest {
+  /** 源视频公网 URL（本地视频必须已通过 uploadZhiniaoReferenceAsset 换取 URL） */
+  videoUrl: string;
+  /** 平台模型名，如 aliyun-video-superres */
+  model: string;
+  /** 目标档位：720p | 1080p | 4K（已实测，默认 720p） */
+  tier?: string;
+  /** 可选 BitRate（VERIFY-2） */
+  bitRate?: number | string;
+}
+
+/** 知鸟 AI 视频超分提交 + 轮询取片。 */
+export async function upscaleZhiniaoVideo(
+  request: UpscaleZhiniaoVideoRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const body: Record<string, unknown> = {
+    model: apiModel,
+    [ZHINIAO_UPSCALE_VERIFY.videoUrlField]: request.videoUrl,
+  };
+  if (request.tier?.trim()) body[ZHINIAO_UPSCALE_VERIFY.tierField] = request.tier.trim();
+  if (request.bitRate !== undefined) body[ZHINIAO_UPSCALE_VERIFY.bitRateField] = request.bitRate;
+
+  const submitUrl = `${baseUrl}/v1/videos/generations`;
+  const response = await requestProviderJson(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`知鸟 AI 视频超分请求失败: 平台返回了非 JSON 响应 (${submitUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`知鸟 AI 视频超分请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  }
+  const immediateResult = getVideoResultUrl(payload);
+  if (immediateResult && !getVideoTaskId(payload)) return immediateResult;
+
+  const taskId = getVideoTaskId(payload);
+  if (!taskId) {
+    throw new Error(`知鸟 AI 视频超分响应中未找到任务 ID: ${describeVideoResponse(payload)}`);
+  }
+  const taskUrl = `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`;
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const taskResponse = await requestProviderJson(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    try {
+      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`知鸟 AI 视频超分查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`知鸟 AI 视频超分查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const videoUrl = getVideoResultUrl(payload);
+    if (videoUrl) return videoUrl;
+    const status = getVideoTaskStatus(payload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`知鸟 AI 视频超分失败: ${describeVideoResponse(payload)}`);
+    }
+  }
+}
+
+export interface UpscaleVideoRequest {
+  /** 超分源：公网 URL 或本地路径/asset 协议地址 */
+  videoSource: string;
+  /** 完整模型 id（含 provider 前缀），如 custom:zhiniao/aliyun-video-superres */
+  model: string;
+  /** 目标档位：720p | 1080p | 4K（已实测，默认 720p） */
+  tier?: string;
+  /** 可选 BitRate（已实测，网关透传） */
+  bitRate?: number | string;
+  extra_params?: Record<string, unknown>;
+}
+
+/** Rust `normalize_video_cfr` 返回：converted=true 时 outputPath 为 CFR 归一化后的临时文件。 */
+interface VideoCfrResult {
+  outputPath: string;
+  converted: boolean;
+  reason?: string | null;
+}
+
+/**
+ * 解析知鸟 AI 视频超分凭证。
+ * 优先使用 providerId 对应的 Key；若未配置，自动回退到任意 baseUrl 命中知鸟网关
+ * （cuai.token6688.com / api.tokengo.love）且已填 Key 的自定义平台，避免"设置里已填却提示未填"。
+ */
+export function resolveZhiniaoUpscaleCredentials(
+  providerId: string,
+  configuredBaseUrl: string,
+): { baseUrl: string; apiKey: string } | null {
+  const store = useSettingsStore.getState();
+  const directKey = (store.apiKeys[providerId] ?? '').trim();
+  const directBaseUrl = normalizeVideoProviderBaseUrl(configuredBaseUrl);
+  if (directBaseUrl && directKey) {
+    return { baseUrl: directBaseUrl, apiKey: directKey };
+  }
+  for (const api of store.customApis) {
+    const candidateBaseUrl = (api.baseUrl ?? '').trim();
+    if (!/(?:cuai\.token6688\.com|api\.tokengo\.love)/i.test(candidateBaseUrl)) continue;
+    const candidateKey = (store.apiKeys[`custom:${api.id}`] ?? '').trim();
+    if (!candidateKey) continue;
+    return {
+      baseUrl: normalizeVideoProviderBaseUrl(directBaseUrl || candidateBaseUrl),
+      apiKey: candidateKey,
+    };
+  }
+  return null;
+}
+
+export async function upscaleVideo(request: UpscaleVideoRequest): Promise<string> {
+  if (!isCustomModel(request.model)) {
+    throw new Error('视频超分仅支持自定义平台(custom:*)模型');
+  }
+  const providerId = request.model.split('/')[0] ?? '';
+  const apiModel = request.model.split('/').slice(1).join('/').trim();
+  const configuredBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
+    ? request.extra_params.provider_base_url
+    : '';
+  const credentials = resolveZhiniaoUpscaleCredentials(providerId, configuredBaseUrl);
+  const baseUrl = credentials?.baseUrl ?? '';
+  const apiKey = credentials?.apiKey ?? '';
+  if (!baseUrl || !apiKey || !apiModel) {
+    throw new Error('请在设置中配置视频超分模型对应的 Base URL、API Key 和模型名称');
+  }
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+
+  // VFR(可变帧率)源视频直接上传，会被超分服务端按错误时间轴整体拉伸成慢动作
+  //（实测 14.02s/337 帧被拉到 25.02s/600 帧、音画不同步）。本地素材先做 CFR 归一化：
+  // Rust 侧解析视频轨 stts，仅在确认为 VFR 时用 ffmpeg 转 30fps CFR 临时文件；
+  // 公网 URL / CFR / 非 MP4 / 缺 ffmpeg 等场景一律原样透传，不阻塞超分主流程。
+  let uploadSource = request.videoSource;
+  const localVideoPath = localPathFromReferenceSource(request.videoSource);
+  if (localVideoPath && isTauri()) {
+    try {
+      const cfr = await invoke<VideoCfrResult>('normalize_video_cfr', {
+        sourcePath: localVideoPath,
+      });
+      if (cfr.converted && cfr.outputPath) {
+        uploadSource = cfr.outputPath;
+      }
+    } catch (error) {
+      console.warn('[upscaleVideo] CFR 归一化不可用，按原始视频上传:', error);
+    }
+  }
+  const videoUrl = await uploadZhiniaoReferenceAsset(uploadSource, baseUrl, headers, 0);
+  if (uploadSource !== request.videoSource) {
+    // 上传完成，清理 CFR 归一化产生的临时文件（仅删除本次创建的 lentalk-cfr-* 文件）。
+    remove(uploadSource).catch(() => undefined);
+  }
+
+  return await upscaleZhiniaoVideo(
+    { videoUrl, model: apiModel, tier: request.tier, bitRate: request.bitRate },
+    baseUrl,
+    apiModel,
+    headers,
+  );
 }
 
 async function uploadSub2ApiReferenceImage(

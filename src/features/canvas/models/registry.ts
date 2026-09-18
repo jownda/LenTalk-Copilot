@@ -159,10 +159,15 @@ export function getDefaultImageModelId(): string {
   return listImageModels()[0]?.id ?? DEFAULT_IMAGE_MODEL_ID;
 }
 
+// 超分模型只服务“超分”入口，不进入普通视频生成下拉。
+function isVideoUpscaleModelName(model: string): boolean {
+  return model.trim().toLowerCase() === 'aliyun-video-superres';
+}
+
 export function listVideoModels(): VideoModelDefinition[] {
   const customVideoModels: VideoModelDefinition[] = useSettingsStore.getState().customApis.flatMap((api) =>
     Array.from(new Set([
-      ...api.videoModels,
+      ...api.videoModels.filter((model) => !isVideoUpscaleModelName(model)),
       ...api.models.filter(isVideoGenerationModelName),
     ])).map((model) => {
       const modelId = buildCustomModelId(api.id, model);

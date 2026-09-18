@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ClipboardPaste, Copy, Download, Library, Trash2 } from "lucide-react";
+import { ClipboardPaste, Copy, Download, Library, Save, Trash2 } from "lucide-react";
 
 interface AssetCategoryOption {
   id: string;
@@ -12,11 +12,13 @@ interface CanvasContextMenuProps {
   downloadUrl?: string | null;
   downloadMediaType?: "image" | "video" | null;
   nodeId?: string | null;
+  textContent?: string | null;
   canPaste: boolean;
   categories: AssetCategoryOption[];
   failedNodeCount: number;
   onClearFailedNodes: () => void;
   onCopyNode: (nodeId: string) => void;
+  onSaveTextToPrompt: () => void;
   onPaste: () => void;
   onAddImageToLibrary: (imageUrl: string, categoryId: string) => void;
   onDownloadMedia: (url: string, mediaType: "image" | "video") => void;
@@ -29,11 +31,13 @@ export function CanvasContextMenu({
   downloadUrl,
   downloadMediaType,
   nodeId,
+  textContent,
   canPaste,
   categories,
   failedNodeCount,
   onClearFailedNodes,
   onCopyNode,
+  onSaveTextToPrompt,
   onPaste,
   onAddImageToLibrary,
   onDownloadMedia,
@@ -87,6 +91,18 @@ export function CanvasContextMenu({
         >
           <Copy className="h-4 w-4 text-text-muted" />
           <span>复制</span>
+        </button>
+      )}
+
+      {textContent !== null && textContent !== undefined && (
+        <button
+          type="button"
+          disabled={!textContent.trim()}
+          onClick={onSaveTextToPrompt}
+          className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:text-text-muted/50 disabled:hover:bg-transparent"
+        >
+          <Save className="h-4 w-4 text-accent" />
+          <span>保存到提示词库</span>
         </button>
       )}
 

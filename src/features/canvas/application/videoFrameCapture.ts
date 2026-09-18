@@ -22,6 +22,15 @@ import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData'
 const VIDEO_LOAD_TIMEOUT_MS = 20000;
 const VIDEO_SEEK_TIMEOUT_MS = 8000;
 
+/**
+ * 抽首帧时实际使用的时间点。
+ *
+ * 请求 0 秒时不会发生 seek, 而 WebView2 里 `loadeddata` 之后帧往往尚未提交到合成器,
+ * drawImage 会画出一张全透明画布(表现为视频节点没有封面)。探到 0.05s 换取一次真实的
+ * `seeked` —— 它才是"帧已解码并可绘制"的可靠信号。
+ */
+const FIRST_FRAME_CAPTURE_SEC = 0.05;
+
 export interface CaptureVideoFrameRequest {
   /** 节点保存的原始来源(data.sourcePath), 远端地址需要它走 Rust 取字节。 */
   source: string;
@@ -95,7 +104,10 @@ function waitForVideoReady(video: HTMLVideoElement, timeoutMs: number): Promise<
 }
 
 function seekVideo(video: HTMLVideoElement, timeSec: number, timeoutMs: number): Promise<void> {
-  const target = Number.isFinite(timeSec) && timeSec > 0 ? timeSec : 0;
+  // 时长远短于请求时间点时(极短视频)收敛到中点, 否则会 seek 到片尾之外而拿不到帧。
+  const duration = video.duration;
+  const bounded = Number.isFinite(duration) && duration > 0 ? Math.min(timeSec, duration / 2) : timeSec;
+  const target = Number.isFinite(bounded) && bounded > 0 ? bounded : 0;
   if (target === 0 || Math.abs(video.currentTime - target) < 0.01) {
     return Promise.resolve();
   }
@@ -142,7 +154,31 @@ function drawVideoFrame(video: HTMLVideoElement, maxWidth: number): string {
     throw new Error('无法初始化画布');
   }
   context.drawImage(video, 0, 0, width, height);
+  assertFrameHasPixels(context, width, height);
   return canvas.toDataURL('image/png');
+}
+
+/**
+ * 校验画布确实收到了画面。
+ *
+ * 帧尚未提交到合成器时 drawImage 不写入任何像素, 画布保持全透明, toDataURL 出来就是一张
+ * 空白图 —— 早期版本把它当作缩略图存了下来, 表现即"视频节点没有封面"。这里抽样 alpha,
+ * 全透明判定为抽帧失败并抛错, 由调用方换其它路径重试(而不是留下空白封面)。
+ */
+function assertFrameHasPixels(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number
+): void {
+  const pixels = context.getImageData(0, 0, width, height).data;
+  const total = width * height;
+  const stride = Math.max(1, Math.floor(total / 4096));
+  for (let index = 0; index < total; index += stride) {
+    if (pixels[index * 4 + 3] > 8) {
+      return;
+    }
+  }
+  throw new Error('视频帧尚未呈现（空白画布）');
 }
 
 interface FrameSourceRequest {
@@ -203,7 +239,10 @@ export async function captureVideoFrame(request: CaptureVideoFrameRequest): Prom
   if (!trimmed) {
     throw new Error('视频来源为空');
   }
-  const timeSec = request.timeSec ?? 0;
+  const requestedTimeSec = request.timeSec ?? 0;
+  // 0 表示"取首帧"; 但 0 秒不触发 seek, 帧未提交时画布会是全透明的, 因此统一探到
+  // FIRST_FRAME_CAPTURE_SEC, 用一次真实的 seeked 保证画面已可绘制。
+  const timeSec = requestedTimeSec > 0 ? requestedTimeSec : FIRST_FRAME_CAPTURE_SEC;
   const maxWidth = request.maxWidth ?? 0;
 
   // data URL 已经同源, 直接转 blob, 不必经过 Rust。

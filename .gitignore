@@ -7,6 +7,11 @@ dist
 src-tauri/target
 src-tauri/gen
 
+# 随包 ffmpeg 二进制(解压后 79MB):不入库,由 scripts/setup-ffmpeg.mjs(本地)
+# 或 CI 的对应步骤从 bundled-tools Release 资产下载解压到 resources/bin/ffmpeg.exe
+src-tauri/resources/bin/
+src-tauri/resources/*.tar.gz
+
 # Logs
 *.log
 npm-debug.log*

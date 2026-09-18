@@ -21,6 +21,7 @@ use commands::template_state;
 use commands::template_sync;
 use commands::update;
 use commands::usage_log;
+use commands::video_cfr;
 use tauri::Manager;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -193,6 +194,7 @@ pub fn run() {
             image::load_image,
             media_file::resolve_media_file_size,
             media_file::load_media_data_url,
+            video_cfr::normalize_video_cfr,
             image::persist_image_source,
             image::persist_image_binary,
             image::save_image_source_to_downloads,
@@ -205,6 +207,7 @@ pub fn run() {
             asset_library::persist_library_asset_binary,
             asset_library::persist_library_asset_binary_chunk,
             asset_library::persist_library_asset_file,
+            asset_library::write_library_backup,
             asset_library::extract_video_thumbnail,
             cinematic_studio::project_save,
             cinematic_studio::project_load,

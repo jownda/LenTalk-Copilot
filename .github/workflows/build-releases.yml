@@ -65,6 +65,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # 随包 ffmpeg(视频 VFR→CFR 归一化用):压缩包放在 bundled-tools Release 资产上,
+      # 构建前还原到 src-tauri/resources/bin/。主配置不含 resources, 只有
+      # tauri.windows.conf.json 引用它, 因此 macOS job 不需要这一步。
+      - name: Restore bundled ffmpeg
+        run: npm run setup:ffmpeg
+
       - name: Clean stale bundle artifacts
         shell: bash
         run: rm -rf src-tauri/target/release/bundle

@@ -731,10 +731,43 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     promptHighlightRef.current.scrollLeft = promptRef.current.scrollLeft;
   };
 
+  /**
+   * 插入 / 删除引用 token 后，光标与视图必须停在原处。
+   *
+   * 受控 textarea 的 value 一变，浏览器会把选区丢到文末、把视图滚到最后一行；
+   * 原先用 requestAnimationFrame 补救，但那会先让用户看到一帧「字跳到最后一行」，
+   * 且同一批里若再有第二次 value 更新（节点数据回写）会把光标重新冲掉。
+   * 改为：记下操作前的光标与 scrollTop，在 layout 阶段（浏览器绘制前）写回，
+   * 并在用户下一次真实交互之前持续钉住 —— 插入点之外的内容原地不动。
+   */
+  const pendingPromptCaretRef = useRef<{ cursor: number; scrollTop: number | null } | null>(null);
+
+  const clearPendingPromptCaret = useCallback(() => {
+    pendingPromptCaretRef.current = null;
+  }, []);
+
+  useLayoutEffect(() => {
+    const pending = pendingPromptCaretRef.current;
+    const textarea = promptRef.current;
+    if (!pending || !textarea) {
+      return;
+    }
+    textarea.focus();
+    textarea.setSelectionRange(pending.cursor, pending.cursor);
+    // scrollTop 只写回一次：之后用户自己滚动时不再被程序抢回去。
+    if (pending.scrollTop !== null) {
+      textarea.scrollTop = pending.scrollTop;
+      syncPromptHighlightScroll();
+      pending.scrollTop = null;
+    }
+  });
+
   const insertReference = useCallback((item: ReferencePickerItem) => {
     const marker = item.kind === 'image' ? `@图${item.index + 1}` : `@音频${item.index + 1}`;
     let basePrompt = promptDraftRef.current;
-    let baseCursor = pickerCursor ?? basePrompt.length;
+    // 优先用按 @ 时记录的光标；异常路径（没记录到）退回 textarea 当前光标，
+    // 绝不退回「文末」—— 否则引用会凭空插到最后一行，光标也跟着跳到末尾。
+    let baseCursor = pickerCursor ?? promptRef.current?.selectionStart ?? basePrompt.length;
     // 兜底: 光标前(忽略尾部空格)已是 '@' 时先移除, 避免插入后出现 '@@图N'
     const trimmedBefore = basePrompt.slice(0, baseCursor).replace(/\s+$/, '');
     if (trimmedBefore.endsWith('@')) {
@@ -743,6 +776,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       baseCursor = atIndex;
     }
     const { nextText, nextCursor } = insertReferenceToken(basePrompt, baseCursor, marker);
+    pendingPromptCaretRef.current = {
+      cursor: nextCursor,
+      scrollTop: promptRef.current?.scrollTop ?? 0,
+    };
     promptDraftRef.current = nextText;
     setPromptDraft(nextText);
     cancelPromptCommit();
@@ -750,14 +787,11 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     setShowImagePicker(false);
     setPickerCursor(null);
     setPickerActiveIndex(0);
-    requestAnimationFrame(() => {
-      promptRef.current?.focus();
-      promptRef.current?.setSelectionRange(nextCursor, nextCursor);
-      syncPromptHighlightScroll();
-    });
   }, [cancelPromptCommit, id, pickerCursor, updateNodeData]);
 
   const handlePromptKeyDown = useCallback((event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    // 只要用户开始敲键盘，就由浏览器接管光标，不再回钉插入位置。
+    clearPendingPromptCaret();
     if (event.key === 'Backspace' || event.key === 'Delete') {
       const currentPrompt = promptDraftRef.current;
       const selectionStart = event.currentTarget.selectionStart ?? currentPrompt.length;
@@ -774,15 +808,14 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       if (deleteRange) {
         event.preventDefault();
         const { nextText, nextCursor } = removeTextRange(currentPrompt, deleteRange);
+        pendingPromptCaretRef.current = {
+          cursor: nextCursor,
+          scrollTop: promptRef.current?.scrollTop ?? 0,
+        };
         promptDraftRef.current = nextText;
         setPromptDraft(nextText);
         cancelPromptCommit();
         updateNodeData(id, { prompt: nextText });
-        requestAnimationFrame(() => {
-          promptRef.current?.focus();
-          promptRef.current?.setSelectionRange(nextCursor, nextCursor);
-          syncPromptHighlightScroll();
-        });
         return;
       }
     }
@@ -823,7 +856,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       setPickerActiveIndex(0);
       setShowImagePicker(true);
     }
-  }, [cancelPromptCommit, id, insertReference, pickerActiveIndex, referenceInputImages.length, referencePickerItems, showImagePicker, usableInputAudio.length, updateNodeData]);
+  }, [cancelPromptCommit, clearPendingPromptCaret, id, insertReference, pickerActiveIndex, referenceInputImages.length, referencePickerItems, showImagePicker, usableInputAudio.length, updateNodeData]);
 
   const handleFrameFileChange = useCallback(async (
     slot: FrameSlot,
@@ -1139,15 +1172,23 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             ref={promptRef}
             value={promptDraft}
             onChange={(event) => {
+              clearPendingPromptCaret();
               const nextValue = event.target.value;
               promptDraftRef.current = nextValue;
               setPromptDraft(nextValue);
               schedulePromptCommit();
             }}
-            onBlur={flushPromptCommit}
+            onBlur={() => {
+              clearPendingPromptCaret();
+              flushPromptCommit();
+            }}
             onKeyDown={handlePromptKeyDown}
             onScroll={syncPromptHighlightScroll}
-            onMouseDown={(event) => event.stopPropagation()}
+            onMouseDown={(event) => {
+              // 用户自己点选光标位置时不再回钉。
+              clearPendingPromptCaret();
+              event.stopPropagation();
+            }}
             placeholder="描述要生成的视频"
             className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent p-2 text-xs leading-5 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${inputText.length > 0 ? 'pb-20' : ''}`}
             style={{ scrollbarGutter: 'stable' }}

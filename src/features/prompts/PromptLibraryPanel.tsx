@@ -93,6 +93,7 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
   const [isCreating, setIsCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<PromptDraft>(EMPTY_DRAFT);
+  const [draftError, setDraftError] = useState<string | null>(null);
   const [pendingDeletePromptId, setPendingDeletePromptId] = useState<string | null>(null);
   const [pendingBatchDelete, setPendingBatchDelete] = useState(false);
   const [pendingDeleteLibraryId, setPendingDeleteLibraryId] = useState<string | null>(null);
@@ -249,11 +250,17 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
     setIsCreating(true);
     setCreateTargetLibraryId(targetId);
     setDraft({ ...EMPTY_DRAFT, category: activeCategory === 'all' ? 'custom' : activeCategory });
+    setDraftError(null);
   }, [activeCategory, activeLibrary, addLibrary, libraries, t]);
 
   const startEdit = useCallback((template: PromptTemplate) => {
+    const ownerLibraryId =
+      libraries.find((library) => library.items.some((item) => item.id === template.id))?.id
+      ?? activeLibrary?.id
+      ?? null;
     setIsCreating(false);
     setEditingId(template.id);
+    setCreateTargetLibraryId(ownerLibraryId);
     setDraft({
       name: template.name,
       scene: template.scene,
@@ -261,16 +268,23 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
       negative: template.negative,
       category: template.category,
     });
-  }, []);
+    setDraftError(null);
+  }, [activeLibrary, libraries]);
 
   const saveDraft = useCallback(() => {
     const targetLibraryId = createTargetLibraryId ?? activeLibrary?.id ?? null;
     if (!targetLibraryId) {
+      setDraftError(t('promptLibrary.saveNoLibrary', '请先选择一个可编辑的提示词库'));
       return;
     }
     const name = draft.name.trim();
     const positive = draft.positive.trim();
-    if (!name || !positive) {
+    if (!name) {
+      setDraftError(t('promptLibrary.nameRequired', '请输入提示词名称'));
+      return;
+    }
+    if (!positive) {
+      setDraftError(t('promptLibrary.positiveRequired', '请输入正向提示词内容'));
       return;
     }
     if (isCreating) {
@@ -284,7 +298,7 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
       setIsCreating(false);
       setCreateTargetLibraryId(null);
     } else if (editingId) {
-      updateTemplate(activeLibrary.id, editingId, {
+      updateTemplate(targetLibraryId, editingId, {
         name,
         scene: draft.scene.trim(),
         positive,
@@ -295,7 +309,16 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
       setCreateTargetLibraryId(null);
     }
     setDraft(EMPTY_DRAFT);
-  }, [activeLibrary, addTemplate, createTargetLibraryId, draft, editingId, isCreating, updateTemplate]);
+    setDraftError(null);
+  }, [activeLibrary, addTemplate, createTargetLibraryId, draft, editingId, isCreating, t, updateTemplate]);
+
+  const closeDraft = useCallback(() => {
+    setIsCreating(false);
+    setEditingId(null);
+    setCreateTargetLibraryId(null);
+    setDraft(EMPTY_DRAFT);
+    setDraftError(null);
+  }, []);
 
   const handleApply = useCallback((template: PromptTemplate, mode: 'positive' | 'full') => {
     onApply(template, mode);
@@ -704,10 +727,7 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
           <div
             className="absolute inset-0 z-20 flex items-center justify-center bg-black/40 p-4"
             onClick={() => {
-              setIsCreating(false);
-              setEditingId(null);
-              setCreateTargetLibraryId(null);
-              setDraft(EMPTY_DRAFT);
+              closeDraft();
             }}
           >
             <div
@@ -720,12 +740,7 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
                 </span>
                 <UiGhostIconButton
                   title={t('common.cancel', '取消')}
-                  onClick={() => {
-                    setIsCreating(false);
-                    setEditingId(null);
-                    setCreateTargetLibraryId(null);
-                    setDraft(EMPTY_DRAFT);
-                  }}
+                  onClick={closeDraft}
                 >
                   <X className="h-4 w-4" />
                 </UiGhostIconButton>
@@ -735,7 +750,10 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
                   <span className="mb-1 block text-[11px] text-text-muted">{t('promptLibrary.name', '名称')}</span>
                   <UiInput
                     value={draft.name}
-                    onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                    onChange={(event) => {
+                      setDraft({ ...draft, name: event.target.value });
+                      setDraftError(null);
+                    }}
                     placeholder={t('promptLibrary.namePlaceholder', '提示词名称')}
                     className="h-9 rounded-lg text-xs"
                     autoFocus
@@ -755,7 +773,10 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
                   <span className="mb-1 block text-[11px] text-text-muted">{t('promptLibrary.positive', '正向提示词')}</span>
                   <textarea
                     value={draft.positive}
-                    onChange={(event) => setDraft({ ...draft, positive: event.target.value })}
+                    onChange={(event) => {
+                      setDraft({ ...draft, positive: event.target.value });
+                      setDraftError(null);
+                    }}
                     placeholder={t('promptLibrary.positivePlaceholder', '正向提示词内容')}
                     rows={5}
                     className="w-full resize-none rounded-lg border ui-field px-2.5 py-2 text-xs leading-5 text-text-dark outline-none transition-colors placeholder:text-text-muted/70 focus:border-accent"
@@ -789,22 +810,19 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
                 </label>
               </div>
               <div className="mt-4 flex justify-end gap-2">
+                {draftError && <p className="text-[11px] text-red-300" role="alert">{draftError}</p>}
                 <UiButton
                   variant="ghost"
                   size="sm"
-                  onClick={() => {
-                    setIsCreating(false);
-                    setEditingId(null);
-                    setCreateTargetLibraryId(null);
-                    setDraft(EMPTY_DRAFT);
-                  }}
+                  type="button"
+                  onClick={closeDraft}
                 >
                   {t('common.cancel', '取消')}
                 </UiButton>
                 <UiButton
                   variant="primary"
                   size="sm"
-                  disabled={!draft.name.trim() || !draft.positive.trim()}
+                  type="button"
                   onClick={saveDraft}
                 >
                   {t('common.save', '保存')}
@@ -1163,23 +1181,20 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
                 </h2>
               </div>
               <div className="flex items-center gap-2">
-                <UiButton variant="primary" size="sm" onClick={saveDraft}>
+                <UiButton variant="primary" size="sm" type="button" onClick={saveDraft}>
                   <Check className="h-4 w-4" />
                   {t('common.save', '保存')}
                 </UiButton>
                 <UiGhostIconButton
                   title={t('common.cancel', '取消')}
-                  onClick={() => {
-                    setIsCreating(false);
-                    setEditingId(null);
-                    setDraft(EMPTY_DRAFT);
-                  }}
+                  onClick={closeDraft}
                 >
                   <X className="h-4 w-4" />
                 </UiGhostIconButton>
               </div>
             </div>
             <div className="ui-scrollbar flex-1 space-y-3 overflow-y-auto p-4">
+              {draftError && <p className="text-[11px] text-red-300" role="alert">{draftError}</p>}
               <label className="block">
                 <span className="mb-1 block text-[11px] text-text-muted">{t('promptLibrary.name', '名称')}</span>
                 <input

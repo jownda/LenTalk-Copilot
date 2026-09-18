@@ -1,14 +1,17 @@
 // ---------------------------------------------------------------------------
-// 素材库 + 提示词库 备份/导入(zip 格式)
+// 素材库 + 提示词库 + 资产库 备份/导入(zip 格式)
 // 备份内容:素材库(storyboard-asset-library-v2)+ 提示词库(storyboard-prompt-library-v2)
+//          + 资产库(电影资产:角色/地点/道具/风格声音参考)
 // 素材文件以二进制写入 zip,不能只保存 sourcePath(桌面端路径在另一台设备上无效)。
 // ---------------------------------------------------------------------------
 import JSZip from 'jszip';
-import { isTauri } from '@tauri-apps/api/core';
+import { invoke, isTauri } from '@tauri-apps/api/core';
 import { ASSET_LIBRARY_STORAGE_KEY, type AssetLibraryState } from './types';
 import { loadAssetLibraryState, persistLibraryAssetBinaryChunk, saveAssetLibraryState } from '@/commands/assetLibrary';
 import { extensionFromMimeType } from '@/commands/referenceAssetSource';
 import { readFile } from '@tauri-apps/plugin-fs';
+import { loadSharedAssets, persistSharedAssets } from '@/features/cinematicStudio/app/model';
+import type { Asset as CinematicAsset } from '@/features/cinematicStudio/shared-types';
 
 export const PROMPT_LIBRARY_STORAGE_KEY = 'storyboard-prompt-library-v2';
 
@@ -16,6 +19,10 @@ const BACKUP_APP = 'storyboard-copilot';
 const BACKUP_TYPE = 'library-backup';
 const BACKUP_VERSION = 2;
 const ASSET_FILE_PREFIX = 'asset-files/';
+/** 资产库(电影资产)在 zip 中的元数据 / 二进制 / 映射文件名与目录。 */
+const CINEMATIC_ASSETS_FILE = 'cinematic-assets.json';
+const CINEMATIC_FILES_MANIFEST = 'cinematic-files.json';
+const CINEMATIC_FILE_PREFIX = 'cinematic-files/';
 
 interface BackupManifest {
   app: typeof BACKUP_APP;
@@ -39,11 +46,40 @@ interface BackupAssetFilesManifest {
   files: BackupAssetEntry[];
 }
 
+/**
+ * 资产库(电影资产)二进制条目。
+ * 资产的角色参考图存在 `referencePaths[]`,角色声音音色存在 `voiceClip`,
+ * 两者都可能是 data URL、本地绝对路径或远端地址 —— 换机器后本地路径必然失效,
+ * 因此和素材库一样必须把真实字节写进 zip。
+ */
+interface BackupCinematicFileEntry {
+  assetId: string;
+  field: 'referencePaths' | 'voiceClip';
+  /** referencePaths 的下标;voiceClip 恒为 0。 */
+  index: number;
+  path: string;
+  mimeType: string;
+  extension: string;
+}
+
+interface BackupCinematicFilesManifest {
+  files: BackupCinematicFileEntry[];
+}
+
 export interface LibraryBackupImportProgress {
   phase: 'reading' | 'restoring' | 'saving';
   current: number;
   total: number;
   label?: string;
+}
+
+export interface LibraryBackupImportSummary {
+  imported: string[];
+  assetCount: number;
+  promptCount: number;
+  /** 备份中携带并已覆盖写入的资产库条目数(0 = 备份不含资产库)。 */
+  cinematicAssetCount: number;
+  failedAssetFiles: number;
 }
 
 function formatTimestamp(date: Date): string {
@@ -179,14 +215,225 @@ async function readZipTextFile(zip: JSZip, fileName: string): Promise<string | n
   return null;
 }
 
+/** 资产 id 可能来自老数据(含空格/中文),压缩包内只允许安全的目录名。 */
+function cinematicBundleDir(assetId: string): string {
+  const safe = assetId.trim().replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 64);
+  return safe || 'asset';
+}
+
+function cinematicBackupEntryPath(
+  assetId: string,
+  field: BackupCinematicFileEntry['field'],
+  index: number,
+  extension: string,
+): string {
+  const name = field === 'voiceClip' ? 'voice' : `ref-${String(index).padStart(2, '0')}`;
+  return `${CINEMATIC_FILE_PREFIX}${cinematicBundleDir(assetId)}/${name}.${normalizeBackupExtension(extension)}`;
+}
+
+/**
+ * 把资产库(电影资产)写入 zip。
+ * 读不到资产库时**不写 cinematic-assets.json** —— 导入端据此判定「这份备份没带资产库」,
+ * 从而绝不用空数据覆盖用户现有的资产库。
+ */
+async function appendCinematicAssetsToBackup(zip: JSZip): Promise<void> {
+  let assets: CinematicAsset[];
+  try {
+    assets = await loadSharedAssets();
+  } catch (error) {
+    console.warn('[assetLibrary] cinematic asset library unavailable, backup skips it', error);
+    return;
+  }
+
+  zip.file(CINEMATIC_ASSETS_FILE, JSON.stringify({ assets }, null, 2));
+
+  const files: BackupCinematicFileEntry[] = [];
+  for (const asset of assets) {
+    const candidates: Array<{
+      field: BackupCinematicFileEntry['field'];
+      index: number;
+      source: string | null | undefined;
+      fallback: string;
+    }> = [
+      ...(asset.referencePaths ?? []).map((source, index) => ({
+        field: 'referencePaths' as const,
+        index,
+        source,
+        fallback: 'png',
+      })),
+      { field: 'voiceClip' as const, index: 0, source: asset.voiceClip, fallback: 'mp3' },
+    ];
+
+    for (const item of candidates) {
+      const source = item.source?.trim();
+      if (!source) continue;
+      try {
+        const file = await readBackupAssetSource(source, item.fallback);
+        const zipPath = cinematicBackupEntryPath(asset.id, item.field, item.index, file.extension);
+        zip.file(zipPath, file.bytes);
+        files.push({
+          assetId: asset.id,
+          field: item.field,
+          index: item.index,
+          path: zipPath,
+          mimeType: file.mimeType,
+          extension: file.extension,
+        });
+      } catch (error) {
+        console.warn('[assetLibrary] skip unreadable cinematic asset file', asset.id, item.field, item.index, error);
+      }
+    }
+  }
+  zip.file(CINEMATIC_FILES_MANIFEST, JSON.stringify({ files }, null, 2));
+}
+
+/**
+ * 从 zip 恢复资产库(电影资产)。
+ * 返回已覆盖的资产条目数与失败的二进制文件数;备份不含资产库时返回 0 且**不写回**。
+ */
+async function restoreCinematicAssetsFromBackup(
+  zip: JSZip,
+  onProgress?: (progress: LibraryBackupImportProgress) => void,
+): Promise<{ assetCount: number; failedAssetFiles: number }> {
+  const raw = await readZipTextFile(zip, CINEMATIC_ASSETS_FILE);
+  if (!raw) return { assetCount: 0, failedAssetFiles: 0 };
+
+  const parsed = safeJsonParse<{ assets?: unknown }>(raw, {});
+  if (!Array.isArray(parsed.assets)) {
+    throw new Error('备份文件中的资产库数据无效');
+  }
+  const assets = parsed.assets as CinematicAsset[];
+  // 空列表一律不写回:导入一份「资产库为空」的备份时,宁可保留现有资产库。
+  if (assets.length === 0) return { assetCount: 0, failedAssetFiles: 0 };
+
+  const filesRaw = await readZipTextFile(zip, CINEMATIC_FILES_MANIFEST);
+  const manifest = safeJsonParse<BackupCinematicFilesManifest>(filesRaw ?? '{}', { files: [] });
+  const assetsById = new Map(assets.map((asset) => [asset.id, asset]));
+  const entries = Array.isArray(manifest.files)
+    ? manifest.files.filter(
+        (entry) =>
+          entry &&
+          typeof entry.path === 'string' &&
+          typeof entry.assetId === 'string' &&
+          (entry.field === 'referencePaths' || entry.field === 'voiceClip'),
+      )
+    : [];
+
+  let failedAssetFiles = 0;
+  const resolved = new Set<string>();
+  onProgress?.({ phase: 'restoring', current: 0, total: entries.length, label: '准备恢复资产库文件' });
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    onProgress?.({ phase: 'restoring', current: index, total: entries.length, label: entry.path });
+    const asset = assetsById.get(entry.assetId);
+    const file = zip.file(entry.path);
+    if (!asset || !file) {
+      failedAssetFiles += 1;
+      continue;
+    }
+    try {
+      const bytes = await file.async('uint8array');
+      const restoredPath = isTauri()
+        ? await persistBackupAssetBytes(bytes, entry.extension)
+        : dataUrlFromBytes(bytes, entry.mimeType || 'application/octet-stream');
+      if (entry.field === 'voiceClip') {
+        asset.voiceClip = restoredPath;
+      } else {
+        const paths = [...(asset.referencePaths ?? [])];
+        paths[entry.index] = restoredPath;
+        asset.referencePaths = paths;
+      }
+      resolved.add(`${entry.assetId}:${entry.field}:${entry.index}`);
+    } catch (error) {
+      failedAssetFiles += 1;
+      console.warn('[assetLibrary] restore cinematic asset file failed', entry.path, error);
+    }
+    // 让出事件循环,避免大备份导入期间窗口被判定为无响应。
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  // 兼容从浏览器导出的备份:desktop 上仍内嵌的 data URL 必须落成独立文件,
+  // 否则整段 base64 会被写进 SQLite,撑爆资产库记录。
+  if (isTauri()) {
+    const embedded: Array<{ asset: CinematicAsset }> = [];
+    for (const asset of assets) {
+      const hasEmbeddedReference = (asset.referencePaths ?? []).some(
+        (source, index) => source?.trim().startsWith('data:') && !resolved.has(`${asset.id}:referencePaths:${index}`),
+      );
+      const hasEmbeddedVoice =
+        asset.voiceClip?.trim().startsWith('data:') && !resolved.has(`${asset.id}:voiceClip:0`);
+      if (hasEmbeddedReference || hasEmbeddedVoice) embedded.push({ asset });
+    }
+
+    for (const { asset } of embedded) {
+      const paths = [...(asset.referencePaths ?? [])];
+      for (let index = 0; index < paths.length; index += 1) {
+        const source = paths[index]?.trim();
+        if (!source?.startsWith('data:') || resolved.has(`${asset.id}:referencePaths:${index}`)) continue;
+        try {
+          const decoded = decodeDataUrl(source);
+          if (!decoded) {
+            failedAssetFiles += 1;
+            continue;
+          }
+          paths[index] = await persistBackupAssetBytes(decoded.bytes, decoded.extension || 'png');
+        } catch (error) {
+          failedAssetFiles += 1;
+          console.warn('[assetLibrary] restore embedded cinematic reference failed', asset.id, index, error);
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      asset.referencePaths = paths;
+
+      if (asset.voiceClip?.trim().startsWith('data:')) {
+        try {
+          const decoded = decodeDataUrl(asset.voiceClip.trim());
+          if (decoded) {
+            asset.voiceClip = await persistBackupAssetBytes(decoded.bytes, decoded.extension || 'mp3');
+          } else {
+            failedAssetFiles += 1;
+          }
+        } catch (error) {
+          failedAssetFiles += 1;
+          console.warn('[assetLibrary] restore embedded cinematic voice failed', asset.id, error);
+        }
+      }
+    }
+  }
+
+  onProgress?.({ phase: 'saving', current: 0, total: 1, label: '保存资产库' });
+  // 按 id 合并写入:备份里的条目覆盖同 id 的本机条目,本机独有的资产保留。
+  // 「恢复备份」绝不能把用户导出之后新建的角色/地点/道具悄悄删掉。
+  let merged = assets;
+  try {
+    const local = await loadSharedAssets();
+    if (local.length > 0) {
+      const backupById = new Map(assets.map((asset) => [asset.id, asset]));
+      const localIds = new Set(local.map((asset) => asset.id));
+      merged = [
+        ...local.map((asset) => backupById.get(asset.id) ?? asset),
+        ...assets.filter((asset) => !localIds.has(asset.id)),
+      ];
+    }
+  } catch (error) {
+    console.warn('[assetLibrary] local cinematic asset library unreadable, backup replaces it', error);
+    merged = assets;
+  }
+  await persistSharedAssets(merged);
+  return { assetCount: assets.length, failedAssetFiles };
+}
+
 /**
  * 生成素材库备份 zip。
  * 结构:
- *   manifest.json          备份元信息(app/类型/版本/时间)
- *   asset-library.json     素材库元数据
- *   asset-files/...        每个素材的原始文件与预览文件
- *   asset-files.json       二进制文件与资产字段的映射
- *   prompt-library.json    提示词库完整数据
+ *   manifest.json            备份元信息(app/类型/版本/时间)
+ *   asset-library.json       素材库元数据
+ *   asset-files/...          每个素材的原始文件与预览文件
+ *   asset-files.json         二进制文件与资产字段的映射
+ *   prompt-library.json      提示词库完整数据
+ *   cinematic-assets.json    资产库(电影资产:角色/地点/道具/风格声音参考)元数据
+ *   cinematic-files/...      资产的角色参考图与声音音色
+ *   cinematic-files.json     二进制文件与资产字段的映射
  */
 export async function createLibraryBackupZip(): Promise<Blob> {
   const zip = new JSZip();
@@ -242,6 +489,10 @@ export async function createLibraryBackupZip(): Promise<Blob> {
   const promptRaw = localStorage.getItem(PROMPT_LIBRARY_STORAGE_KEY);
   zip.file('prompt-library.json', promptRaw ?? '[]');
 
+  // 资产库(电影资产)是独立于素材库的全局数据源,必须一并打包,
+  // 否则换机器/重装后「资产库」tab 是空的。
+  await appendCinematicAssetsToBackup(zip);
+
   return await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
 }
 
@@ -257,7 +508,7 @@ export function buildBackupFileName(date: Date = new Date()): string {
 export async function importLibraryBackupZip(
   file: File | Blob,
   onProgress?: (progress: LibraryBackupImportProgress) => void,
-): Promise<{ imported: string[]; assetCount: number; promptCount: number; failedAssetFiles: number }> {
+): Promise<LibraryBackupImportSummary> {
   onProgress?.({ phase: 'reading', current: 0, total: 1 });
   // 浏览器/Tauri 直接交给 JSZip 读取 Blob，避免大备份在导入前再复制一份完整
   // ArrayBuffer；只有 Node 测试环境没有完整 Blob 适配时才转换。
@@ -380,10 +631,16 @@ export async function importLibraryBackupZip(
     localStorage.setItem(PROMPT_LIBRARY_STORAGE_KEY, promptRaw);
   }
 
+  // 4) 资产库(电影资产:角色/地点/道具/风格声音参考)
+  // 旧备份没有这一段,restore 返回 0 且不触碰现有资产库。
+  const cinematic = await restoreCinematicAssetsFromBackup(zip, onProgress);
+  failedAssetFiles += cinematic.failedAssetFiles;
+
   return {
-    imported: ['asset-library', 'prompt-library'],
+    imported: ['asset-library', 'prompt-library', 'cinematic-assets'],
     assetCount,
     promptCount,
+    cinematicAssetCount: cinematic.assetCount,
     failedAssetFiles,
   };
 }
@@ -418,8 +675,6 @@ export async function saveBlobWithDialog(blob: Blob, fileName: string): Promise<
   }
 
   const { save } = await import('@tauri-apps/plugin-dialog');
-  const { writeFile } = await import('@tauri-apps/plugin-fs');
-
   const filePath = await save({
     defaultPath: fileName,
     filters: [{ name: 'ZIP 备份', extensions: ['zip'] }],
@@ -427,6 +682,9 @@ export async function saveBlobWithDialog(blob: Blob, fileName: string): Promise<
   if (!filePath) return null; // 用户取消
 
   const bytes = new Uint8Array(await blob.arrayBuffer());
-  await writeFile(filePath, bytes);
+  await invoke<string>('write_library_backup', {
+    bytes: Array.from(bytes),
+    destinationPath: filePath,
+  });
   return filePath;
 }

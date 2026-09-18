@@ -354,7 +354,7 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
     }
   }, [backupBusy, t]);
 
-  /** 从 zip 导入备份(校验后覆盖素材库与提示词库,完成后刷新页面) */
+  /** 从 zip 导入备份(校验后覆盖素材库、提示词库与资产库,完成后刷新页面) */
   const handleImportBackup = useCallback(async (file: File) => {
     if (backupBusy) return;
     setBackupBusy(true);
@@ -374,11 +374,16 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
         setBackupNotice('正在保存素材库…');
       });
       setBackupNotice(
-        t('assetLibrary.importDone', '导入成功(素材 {{assets}} 个 / 提示词库 {{libs}} 个){{failed}},即将刷新…', {
-          assets: summary.assetCount,
-          libs: summary.promptCount,
-          failed: summary.failedAssetFiles > 0 ? `，${summary.failedAssetFiles} 个文件恢复失败` : '',
-        })
+        t(
+          'assetLibrary.importDone',
+          '导入成功(素材 {{assets}} 个 / 提示词库 {{libs}} 个 / 资产库 {{cinematic}} 个){{failed}},即将刷新…',
+          {
+            assets: summary.assetCount,
+            libs: summary.promptCount,
+            cinematic: summary.cinematicAssetCount,
+            failed: summary.failedAssetFiles > 0 ? `，${summary.failedAssetFiles} 个文件恢复失败` : '',
+          }
+        )
       );
       // 数据已写入 localStorage,刷新页面让各 store 重新 hydrate
       window.setTimeout(() => window.location.reload(), 1200);
@@ -677,14 +682,14 @@ export const AssetLibraryPanel = memo(({ open, onClose, fullscreen = false, anch
   const backupControls = (
     <>
       <UiGhostIconButton
-        title={t('assetLibrary.backupHint', '导出素材库和提示词库为 zip 备份文件')}
+        title={t('assetLibrary.backupHint', '导出素材库、提示词库和资产库为 zip 备份文件')}
         onClick={() => void handleExportBackup()}
         disabled={backupBusy}
       >
         <Upload className="h-4 w-4" />
       </UiGhostIconButton>
       <UiGhostIconButton
-        title={t('assetLibrary.importBackupHint', '从 zip 备份文件恢复素材库和提示词库')}
+        title={t('assetLibrary.importBackupHint', '从 zip 备份文件恢复素材库、提示词库和资产库')}
         onClick={() => backupInputRef.current?.click()}
         disabled={backupBusy}
       >

@@ -3,7 +3,18 @@ import { createPortal } from 'react-dom';
 import { isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { Handle, Position } from '@xyflow/react';
-import { AlertTriangle, AudioLines, LoaderCircle, Music2, Upload, Video, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  AudioLines,
+  LoaderCircle,
+  Maximize2,
+  Music2,
+  Pause,
+  Play,
+  Upload,
+  Video,
+  X,
+} from 'lucide-react';
 
 import { CANVAS_NODE_TYPES, type AudioNodeData } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
@@ -35,36 +46,66 @@ type AudioNodeProps = {
  */
 const REMOTE_VIDEO_THUMBNAIL_MAX_WIDTH = 640;
 
-function waitForDecodedVideoFrame(video: HTMLVideoElement, timeoutMs = 5000): Promise<void> {
-  if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0) {
-    return Promise.resolve();
-  }
+/** 已判定为空白(全透明)的缩略图地址缓存, 避免同一会话里反复解码同一张图。 */
+const blankThumbnailCache = new Set<string>();
 
-  return new Promise((resolve, reject) => {
-    const events = ['loadeddata', 'canplay', 'playing', 'seeked'];
-    const cleanup = () => {
-      window.clearTimeout(timeoutId);
-      events.forEach((event) => video.removeEventListener(event, onFrameReady));
-      video.removeEventListener('error', onError);
-    };
-    const onFrameReady = () => {
-      if (video.videoWidth > 0 && video.videoHeight > 0) {
-        cleanup();
-        resolve();
+/**
+ * 判断缩略图是否为空白图。
+ *
+ * 早期版本在视频帧尚未提交到合成器时就抽帧, 全透明画布被当成缩略图存了下来, 又因为内容
+ * 完全一致被引用池复用 —— 表现就是一批视频节点"没有封面"。这里把图读回来采样 alpha 做一次
+ * 判定, 命中即清空重抽。
+ *
+ * 读像素受同源限制: 本地路径经 resolveImageDisplayUrl 转成 asset 协议后同源可读; 若某张图
+ * 跨域而抛 SecurityError, 按"正常"处理, 不影响原有显示。
+ */
+async function isBlankThumbnail(source: string): Promise<boolean> {
+  if (blankThumbnailCache.has(source)) {
+    return true;
+  }
+  return new Promise<boolean>((resolve) => {
+    const image = new Image();
+    image.onload = () => {
+      try {
+        const side = 32;
+        const canvas = document.createElement('canvas');
+        canvas.width = side;
+        canvas.height = side;
+        const context = canvas.getContext('2d');
+        if (!context) {
+          resolve(false);
+          return;
+        }
+        context.drawImage(image, 0, 0, side, side);
+        const pixels = context.getImageData(0, 0, side, side).data;
+        let opaque = 0;
+        for (let index = 3; index < pixels.length; index += 4) {
+          if (pixels[index] > 8) {
+            opaque += 1;
+          }
+        }
+        const blank = opaque === 0;
+        if (blank) {
+          blankThumbnailCache.add(source);
+        }
+        resolve(blank);
+      } catch {
+        // 跨域或解码失败时无法判定, 保持原样。
+        resolve(false);
       }
     };
-    const onError = () => {
-      cleanup();
-      reject(new Error('视频帧无法解码'));
-    };
-    const timeoutId = window.setTimeout(() => {
-      cleanup();
-      reject(new Error('视频帧尚未准备好'));
-    }, timeoutMs);
-    events.forEach((event) => video.addEventListener(event, onFrameReady));
-    video.addEventListener('error', onError);
-    onFrameReady();
+    image.onerror = () => resolve(false);
+    image.src = resolveImageDisplayUrl(source);
   });
+}
+
+/** 秒 -> `m:ss`; 未加载完/非法值(NaN, Infinity)统一显示 0:00。 */
+function formatClock(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return '0:00';
+  }
+  const total = Math.floor(seconds);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 }
 
 export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
@@ -76,11 +117,20 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const viewerVideoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /** 画面上的透明交互层: 承接指针事件并冒泡到节点, 实现"画面任意位置左键拖动节点"。 */
+  const videoSurfaceRef = useRef<HTMLDivElement>(null);
   const [isCapturing, setIsCapturing] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [isVideoViewerOpen, setIsVideoViewerOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [videoDimensions, setVideoDimensions] = useState<MediaDimensions | null>(null);
+  // 播放状态一律由 video 的 play/pause/ended 事件回写, 不做本地乐观更新,
+  // 否则"自动播放被拒"或"源不可用"时按钮会显示成正在播放。
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackTime, setPlaybackTime] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
+  /** 指针是否在画面上: 控制条仅在悬停(或播放中)出现, 其余时间完全让位给拖动。 */
+  const [isVideoHovered, setIsVideoHovered] = useState(false);
 
   const resolvedTitle = useMemo(
     () => resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, data),
@@ -103,6 +153,9 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
 
   useEffect(() => {
     setVideoDimensions(null);
+    setVideoDuration(0);
+    setPlaybackTime(0);
+    setIsPlaying(false);
   }, [mediaSrc]);
 
   const handleVideoMetadata = useCallback((event: SyntheticEvent<HTMLVideoElement>) => {
@@ -110,6 +163,25 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     if (video.videoWidth > 0 && video.videoHeight > 0) {
       setVideoDimensions({ width: video.videoWidth, height: video.videoHeight });
     }
+    // 时长用于控制条进度: 流式/未探测到时长时 duration 为 NaN 或 Infinity, 需挡掉。
+    if (Number.isFinite(video.duration) && video.duration > 0) {
+      setVideoDuration(video.duration);
+    }
+  }, []);
+
+  /** 控制条播放/暂停按钮。播放失败(自动播放策略/源不可用)时保持暂停, 不打断用户。 */
+  const toggleVideoPlayback = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    if (video.paused) {
+      void video.play().catch((error: unknown) => {
+        console.warn('[mediaNode] video play failed', error);
+      });
+      return;
+    }
+    video.pause();
   }, []);
 
   // 视频解码出真实尺寸后, 把宽高比写回节点数据: 拖拽缩放据此保持画面比例。
@@ -144,6 +216,8 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     if (!isVideoViewerOpen) {
       return;
     }
+    // 放大播放器接管播放: 先停掉节点内的播放, 避免两路声音叠在一起。
+    videoRef.current?.pause();
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         setIsVideoViewerOpen(false);
@@ -153,24 +227,27 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isVideoViewerOpen]);
 
-  // Chromium 的媒体控件自带「双击 <video> 进入原生全屏」的默认行为。
-  // 该处理位于 UA shadow DOM 内, 会在事件冒泡到 React root 之前执行, 因此仅靠
-  // JSX 的 onDoubleClick(合成事件, 挂在 root 上) 拦不住 —— 结果是双击同时触发
-  // 原生全屏与下面的自定义查看器, 表现为"全屏播放两层、要关两次"。
-  // 只有在 video 元素自身以捕获阶段注册监听, 才能先于 UA 处理取消默认行为。
+  // 双击画面 = 打开放大播放器。
+  //
+  // 现在画面上的指针事件全部落在覆盖层(videoSurfaceRef)上, <video> 自身是
+  // pointer-events:none, 所以这里监听覆盖层而非 video 元素。
+  // 仍必须挂在**捕获阶段**: React Flow 的"双击缩放"监听挂在 pane(祖先)上且在
+  // 冒泡阶段执行, 早于 React root 的合成事件派发 —— JSX onDoubleClick 拦不住它,
+  // 结果会是"双击既打开播放器又把画布缩放了"。目标元素上的捕获监听先执行, 就地
+  // stopImmediatePropagation 可一并取消 UA 默认行为(原生全屏)与画布缩放。
   useEffect(() => {
-    const video = videoRef.current;
-    if (!isVideo || !video) {
+    const surface = videoSurfaceRef.current;
+    if (!isVideo || !surface) {
       return;
     }
-    const blockNativeDoubleClickFullscreen = (event: MouseEvent) => {
+    const handleDoubleClick = (event: MouseEvent) => {
       event.preventDefault();
       event.stopImmediatePropagation();
       setIsVideoViewerOpen(true);
     };
-    video.addEventListener('dblclick', blockNativeDoubleClickFullscreen, true);
+    surface.addEventListener('dblclick', handleDoubleClick, true);
     return () => {
-      video.removeEventListener('dblclick', blockNativeDoubleClickFullscreen, true);
+      surface.removeEventListener('dblclick', handleDoubleClick, true);
     };
   }, [isVideo, mediaSrc]);
 
@@ -290,35 +367,24 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     });
   }, [handleUploadClick, id]);
 
-  /** 视频截图: 当前帧绘制到 canvas → 生成图片节点到下游(右侧)并连线 */
-  /** 视频加载后自动截首帧作为缩略图(存 previewImageUrl), 生成过则跳过。 */
-  const handleAutoCaptureThumbnail = useCallback(async () => {
-    const videoEl = videoRef.current;
-    if (!videoEl || data.previewImageUrl) {
+  // 历史版本抽帧时视频帧尚未呈现, 在引用池里留下一批全透明"空白封面"(还被多个节点按内容复用)。
+  // 拿到缩略图先做一次空白判定, 命中就清空, 由下面的抽帧流程重新生成(失败也不会再写空白图)。
+  useEffect(() => {
+    const thumbnail = data.previewImageUrl;
+    if (!isVideo || !thumbnail) {
       return;
     }
-    try {
-      await waitForDecodedVideoFrame(videoEl);
-      if (!videoEl.videoWidth || !videoEl.videoHeight) {
-        return;
+    let disposed = false;
+    void (async () => {
+      const blank = await isBlankThumbnail(thumbnail);
+      if (!disposed && blank) {
+        updateNodeData(id, { previewImageUrl: null });
       }
-      const canvas = document.createElement('canvas');
-      canvas.width = videoEl.videoWidth;
-      canvas.height = videoEl.videoHeight;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        return;
-      }
-      ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
-      const dataUrl = canvas.toDataURL('image/png');
-      const prepared = await prepareNodeImage(dataUrl);
-      updateNodeData(id, {
-        previewImageUrl: prepared.previewImageUrl ?? prepared.imageUrl ?? dataUrl,
-      });
-    } catch {
-      // 首帧截图失败时保持 video 播放器显示
-    }
-  }, [data.previewImageUrl, id, updateNodeData]);
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, [data.previewImageUrl, id, isVideo, updateNodeData]);
 
   // 本地桌面视频优先使用系统抽帧，避免 WKWebView 对视频 canvas 截图的限制。
   // 但 QuickLook 只认本地文件路径(AI 视频节点生成的结果是远端 CDN 地址), 因此再加一级
@@ -450,31 +516,35 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       {mediaSrc ? (
         isVideo ? (
           <>
-            {/* 视频画面顶到上部, 铺满可用空间; 缩略图作为 poster, 单击使用节点内播放器 */}
-            <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border border-[rgba(255,255,255,0.1)] bg-black/45">
+            {/* 视频画面顶到上部, 铺满可用空间; 缩略图作为 poster。
+                交互约定: 画面任意位置左键拖拽 = 移动节点; 播放/暂停/进度在底部控制条;
+                双击画面(或点放大按钮) 进放大播放器。 */}
+            <div
+              className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border border-[rgba(255,255,255,0.1)] bg-black/45"
+              onPointerEnter={() => setIsVideoHovered(true)}
+              onPointerLeave={() => setIsVideoHovered(false)}
+            >
               {/* 媒体元素默认 draggable: 不关掉时按住画面拖动会触发浏览器原生拖拽,
                   生成一个跟随鼠标的拖影, 与 React Flow 的节点拖动争夺同一个指针,
                   表现为节点粘在鼠标上甩不掉。项目内所有 <img> 都已 draggable={false},
                   此处补齐 video/audio。 */}
               <video
                 ref={videoRef}
-                controls
                 draggable={false}
                 onDragStart={(event) => event.preventDefault()}
                 src={mediaSrc}
                 preload="metadata"
                 poster={data.previewImageUrl ? resolveImageDisplayUrl(data.previewImageUrl) : undefined}
-                className="nodrag h-full w-full object-contain"
+                className="pointer-events-none h-full w-full object-contain"
                 onLoadedMetadata={handleVideoMetadata}
-                onLoadedData={() => void handleAutoCaptureThumbnail()}
-                onDoubleClick={(event) => {
-                  // 兜底: 若元素级捕获监听未生效, 这里仍取消原生全屏并打开查看器。
-                  // (捕获阶段拦下时本回调不会执行 —— 事件已被拦截。)
-                  event.preventDefault();
-                  event.stopPropagation();
-                  setIsVideoViewerOpen(true);
-                }}
+                onPlay={() => setIsPlaying(true)}
+                onPause={() => setIsPlaying(false)}
+                onEnded={() => setIsPlaying(false)}
+                onTimeUpdate={(event) => setPlaybackTime(event.currentTarget.currentTime)}
               />
+              {/* 透明交互层: 画面上的指针事件落在这里并冒泡到节点, 于是画面任意位置
+                  左键拖拽都能移动节点。刻意不加 nodrag —— 加了就拖不动了。 */}
+              <div ref={videoSurfaceRef} className="absolute inset-0" />
               {/* 截图进行中的轻量反馈: 按钮在节点工具栏, 这里只显示进度 */}
               {isCapturing && (
                 <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35">
@@ -484,6 +554,54 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                   </span>
                 </div>
               )}
+              {/* 播放控制条: 带 nodrag, 在其上的指针不会拖动节点, 因此进度条可正常拖拽。
+                  节点内不再使用原生 controls —— 原生控件会吃掉画面上的指针, 与"任意位置拖动节点"冲突。
+                  仅悬停/播放中出现: 其余时间 opacity-0 + pointer-events-none, 画面整块都能拖。 */}
+              <div
+                className={`nodrag absolute inset-x-0 bottom-0 z-10 flex items-center gap-1.5 bg-gradient-to-t from-black/80 via-black/40 to-transparent px-2 pb-1.5 pt-6 text-white transition-opacity duration-150 ${
+                  isVideoHovered || isPlaying ? 'opacity-100' : 'pointer-events-none opacity-0'
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={toggleVideoPlayback}
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white/20 transition-colors hover:bg-white/40"
+                  title={isPlaying ? '暂停' : '播放'}
+                  aria-label={isPlaying ? '暂停' : '播放'}
+                >
+                  {isPlaying ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={videoDuration > 0 ? videoDuration : 1}
+                  step={0.01}
+                  value={videoDuration > 0 ? Math.min(playbackTime, videoDuration) : 0}
+                  onChange={(event) => {
+                    const video = videoRef.current;
+                    const next = Number(event.target.value);
+                    if (video && Number.isFinite(next)) {
+                      video.currentTime = next;
+                    }
+                    setPlaybackTime(next);
+                  }}
+                  className="h-3 min-w-0 flex-1 cursor-pointer accent-white"
+                  title="播放进度"
+                  aria-label="播放进度"
+                />
+                <span className="shrink-0 text-[10px] tabular-nums text-white/80">
+                  {formatClock(playbackTime)} / {formatClock(videoDuration)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsVideoViewerOpen(true)}
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-white/20 transition-colors hover:bg-white/40"
+                  title="放大播放（双击画面同样可打开）"
+                  aria-label="放大播放"
+                >
+                  <Maximize2 className="h-3 w-3" />
+                </button>
+              </div>
             </div>
             <MediaDimensionsLabel
               dimensions={videoDimensions}

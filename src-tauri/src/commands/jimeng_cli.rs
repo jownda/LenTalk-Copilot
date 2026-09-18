@@ -18,13 +18,18 @@ use uuid::Uuid;
 // return "store unavailable" (especially on Windows Credential Manager).
 static JIMENG_CLI_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLI_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+// 提交带多张参考图的任务时, CLI 需要读取并上传本地文件, 速度受磁盘、网络和
+// 即梦服务端排队影响。提交命令本身不是生成任务, 但 30 秒对 7-9 张图过于激进。
+const CLI_SUBMIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CLI_TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const JIMENG_CLI_MAX_REFERENCE_IMAGES: usize = 9;
 
 /// 即梦 CLI 官方 Windows 安装包下载前缀（与官方安装脚本 `https://jimeng.jianying.com/cli` 同源）。
 /// 仅在用户明确触发「自动安装」时使用；域名为白名单内固定地址，不做任何动态拼接。
 const JIMENG_CLI_DOWNLOAD_BASE: &str =
-    "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp";
+    "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/dreamina_cli_beta";
+const JIMENG_CLI_VERSION_URL: &str =
+    "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/version.json";
 /// 下载后文件必须大于该阈值才认为有效，避免把错误页/极小残片当安装包。
 const JIMENG_CLI_MIN_EXE_BYTES: u64 = 1024 * 1024;
 
@@ -320,7 +325,7 @@ fn submit_and_poll_jimeng_task(
         JimengArtifactKind::Image => (find_downloaded_image, "图片"),
     };
 
-    let submission = run_cli(executable, &arguments)?;
+    let submission = run_cli_with_timeout(executable, &arguments, CLI_SUBMIT_COMMAND_TIMEOUT)?;
     if is_failed(&submission) {
         return Err(format!("即梦 CLI {label}生成失败: {}", output_summary(&submission)));
     }
@@ -470,6 +475,14 @@ fn append_generation_args(
 }
 
 fn run_cli(executable: &str, arguments: &[String]) -> Result<String, String> {
+    run_cli_with_timeout(executable, arguments, CLI_COMMAND_TIMEOUT)
+}
+
+fn run_cli_with_timeout(
+    executable: &str,
+    arguments: &[String],
+    timeout: Duration,
+) -> Result<String, String> {
     let lock = JIMENG_CLI_PROCESS_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -513,10 +526,10 @@ fn run_cli(executable: &str, arguments: &[String]) -> Result<String, String> {
             Ok(Some(_status)) => break child
                 .wait_with_output()
                 .map_err(|error| format!("读取即梦 CLI 输出失败: {error}"))?,
-            Ok(None) if started_at.elapsed() >= CLI_COMMAND_TIMEOUT => {
+            Ok(None) if started_at.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("即梦 CLI 命令超过 {} 秒未返回", CLI_COMMAND_TIMEOUT.as_secs()));
+                return Err(format!("即梦 CLI 命令超过 {} 秒未返回", timeout.as_secs()));
             }
             Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(error) => {
@@ -1147,6 +1160,13 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
     }
 
     #[test]
+    fn official_download_base_matches_install_script() {
+        assert!(JIMENG_CLI_DOWNLOAD_BASE.ends_with("/dreamina_cli_beta"));
+        assert!(JIMENG_CLI_VERSION_URL.ends_with("/version.json"));
+        assert!(!JIMENG_CLI_VERSION_URL.contains("dreamina_cli_beta"));
+    }
+
+    #[test]
     fn output_summary_truncates_chinese_without_panicking() {
         let output = format!("{}车后续输出", "a".repeat(498));
         let summary = output_summary(&output);
@@ -1448,7 +1468,7 @@ fn jimeng_cli_install_blocking() -> Result<JimengCliInstallResult, String> {
     }
     if let Err(error) = download_with_curl(
         &curl,
-        &format!("{JIMENG_CLI_DOWNLOAD_BASE}/version.json"),
+        JIMENG_CLI_VERSION_URL,
         &dot_dir.join("version.json"),
     ) {
         warnings.push(format!("version.json 下载失败: {error}"));

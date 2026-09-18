@@ -1750,6 +1750,10 @@ pub async fn load_image(file_path: String) -> Result<String, String> {
         "audio/flac"
     } else if file_path.ends_with(".webm") {
         "audio/webm"
+    } else if file_path.ends_with(".mp4") {
+        "video/mp4"
+    } else if file_path.ends_with(".mov") {
+        "video/quicktime"
     } else {
         "image/png"
     };

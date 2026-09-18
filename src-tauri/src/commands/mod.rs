@@ -14,6 +14,7 @@ pub mod template_state;
 pub mod template_sync;
 pub mod update;
 pub mod usage_log;
+pub mod video_cfr;
 
 pub use ai::*;
 pub use asset_library::*;
@@ -27,3 +28,4 @@ pub use template_state::*;
 pub use template_sync::*;
 pub use update::*;
 pub use usage_log::*;
+pub use video_cfr::*;

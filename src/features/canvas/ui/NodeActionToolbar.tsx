@@ -24,6 +24,7 @@ import { getNodeToolPlugins } from '@/features/canvas/tools';
 import type { ToolIconKey } from '@/features/canvas/tools';
 import { UiChipButton, UiPanel, UiModal, UiButton } from '@/components/ui';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { resolveZhiniaoUpscaleCredentials } from '@/commands/ai';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { sanitizeStoryboardText } from '@/features/canvas/application/storyboardText';
 import {
@@ -129,6 +130,10 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isLibraryDialogOpen, setIsLibraryDialogOpen] = useState(false);
   const [isUpscaleDialogOpen, setIsUpscaleDialogOpen] = useState(false);
   const [isImageUpscaleDialogOpen, setIsImageUpscaleDialogOpen] = useState(false);
+  const [videoUpscaleTier, setVideoUpscaleTier] = useState<string>('1080p');
+  const [isUpscalingVideo, setIsUpscalingVideo] = useState(false);
+  // 超分模型固定为知鸟 aliyun-video-superres。
+  const VIDEO_UPSCALE_MODEL_ID = 'custom:zhiniao/aliyun-video-superres';
   const [imageUpscaleModelId, setImageUpscaleModelId] = useState<string>(
     JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID
   );
@@ -270,6 +275,74 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     selectedUpscaleModel,
     t,
     updateNodeData,
+  ]);
+  const handleUpscaleVideo = useCallback(async () => {
+    if (!videoSource || isUpscalingVideo) return;
+    const credentials = resolveZhiniaoUpscaleCredentials('custom:zhiniao', '');
+    if (!credentials) {
+      void showErrorDialog(t('nodeToolbar.videoUpscaleApiKeyMissing'), t('common.error'));
+      return;
+    }
+    setIsUpscalingVideo(true);
+    const newNodeId = addNode(
+      CANVAS_NODE_TYPES.audio,
+      findNodePosition(node.id, 360, 240),
+      {
+        displayName: `${t('nodeToolbar.upscale')} ${videoUpscaleTier}`,
+        mediaType: 'video',
+        aspectRatio: typeof node.data.aspectRatio === 'string' && node.data.aspectRatio.trim()
+          ? node.data.aspectRatio
+          : DEFAULT_ASPECT_RATIO,
+        isGenerating: true,
+        generationStartedAt: Date.now(),
+        generationDurationMs: 120000,
+        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+        generationRequest: {
+          kind: 'video-upscale',
+          model: VIDEO_UPSCALE_MODEL_ID,
+          videoSource,
+          tier: videoUpscaleTier,
+        },
+      },
+    );
+    addEdge(node.id, newNodeId);
+    try {
+      const videoUrl = await canvasAiGateway.upscaleVideo({
+        videoSource,
+        model: VIDEO_UPSCALE_MODEL_ID,
+        tier: videoUpscaleTier,
+      });
+      updateNodeData(newNodeId, {
+        sourcePath: videoUrl,
+        generationResultProtected: true,
+        isGenerating: false,
+        generationStartedAt: null,
+        generationError: null,
+        generationClientSessionId: null,
+      });
+      setIsUpscaleDialogOpen(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      updateNodeData(newNodeId, {
+        isGenerating: false,
+        generationStartedAt: null,
+        generationError: message,
+      });
+      void showErrorDialog(message, t('common.error'));
+    } finally {
+      setIsUpscalingVideo(false);
+    }
+  }, [
+    addEdge,
+    addNode,
+    findNodePosition,
+    isUpscalingVideo,
+    node.data.aspectRatio,
+    node.id,
+    t,
+    updateNodeData,
+    videoSource,
+    videoUpscaleTier,
   ]);
   const handleDownloadMedia = useCallback(async () => {
     if (!downloadSource) {
@@ -635,10 +708,10 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
                 onClick={(event) => {
                   event.stopPropagation();
-                  // 超分把本节点视频交给超分模型放大, 目前只提供入口与参数形态, 尚未接入提交链路。
+                  // 将本节点视频交给超分专用链路，结果作为新的视频节点接入画布。
                   setIsUpscaleDialogOpen(true);
                 }}
-                title={t('nodeToolbar.upscalePending')}
+                title={t('nodeToolbar.upscale')}
               >
                 <Sparkles className="h-3.5 w-3.5" />
                 {t('nodeToolbar.upscale')}
@@ -791,17 +864,41 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           widthClassName="w-[380px]"
         >
           <div className="space-y-3">
-            <p className="text-xs leading-relaxed text-text-muted">
-              {t('nodeToolbar.upscaleDesc')}
-            </p>
-            <p className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-2 text-xs leading-relaxed text-amber-200">
-              {t('nodeToolbar.upscalePending')}
-            </p>
-            <ul className="list-disc space-y-1.5 border-t border-white/10 pl-4 pt-2.5 text-xs text-text-muted">
-              <li>{t('nodeToolbar.upscaleTodoModel')}</li>
-              <li>{t('nodeToolbar.upscaleTodoTarget')}</li>
-              <li>{t('nodeToolbar.upscaleTodoTransport')}</li>
-            </ul>
+            <p className="text-xs leading-relaxed text-text-muted">{t('nodeToolbar.upscaleDesc')}</p>
+            <div className="space-y-1">
+              <label className="text-xs text-text-muted">{t('nodeToolbar.videoUpscaleModel')}</label>
+              <div className="rounded-lg border border-white/10 bg-bg-dark/60 px-2.5 py-2 text-xs">
+                aliyun-video-superres（2x）
+              </div>
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs text-text-muted">{t('nodeToolbar.videoUpscaleTier')}</label>
+              <div className="flex gap-2">
+                {['720p', '1080p', '4K'].map((tier) => (
+                  <UiChipButton
+                    key={tier}
+                    className={`h-8 px-3 text-xs ${videoUpscaleTier === tier ? 'ring-1 ring-primary' : ''}`}
+                    onClick={() => setVideoUpscaleTier(tier)}
+                  >
+                    {tier}
+                  </UiChipButton>
+                ))}
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <UiButton type="button" variant="ghost" size="sm" onClick={() => setIsUpscaleDialogOpen(false)}>
+                {t('common.cancel')}
+              </UiButton>
+              <UiButton
+                type="button"
+                variant="primary"
+                size="sm"
+                disabled={isUpscalingVideo || !videoSource}
+                onClick={() => void handleUpscaleVideo()}
+              >
+                {isUpscalingVideo ? t('nodeToolbar.videoUpscaleRunning') : t('canvas.generate')}
+              </UiButton>
+            </div>
           </div>
         </UiModal>
       )}

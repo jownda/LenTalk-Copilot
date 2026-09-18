@@ -7,6 +7,7 @@ import {
   useState,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
 } from 'react';
 import { Handle, Position, useUpdateNodeInternals, type NodeProps } from '@xyflow/react';
@@ -959,6 +960,37 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     promptHighlightRef.current.scrollLeft = promptRef.current.scrollLeft;
   };
 
+  /**
+   * 插入 / 删除引用 token 后，光标与视图必须停在原处。
+   *
+   * 受控 textarea 的 value 一变，浏览器会把选区丢到文末、把视图滚到最后一行；
+   * 原先用 requestAnimationFrame 补救，但那会先让用户看到一帧「字跳到最后一行」，
+   * 且同一批里若再有第二次 value 更新（节点数据回写）会把光标重新冲掉。
+   * 改为：记下操作前的光标与 scrollTop，在 layout 阶段（浏览器绘制前）写回，
+   * 并在用户下一次真实交互之前持续钉住 —— 插入点之外的内容原地不动。
+   */
+  const pendingPromptCaretRef = useRef<{ cursor: number; scrollTop: number | null } | null>(null);
+
+  const clearPendingPromptCaret = useCallback(() => {
+    pendingPromptCaretRef.current = null;
+  }, []);
+
+  useLayoutEffect(() => {
+    const pending = pendingPromptCaretRef.current;
+    const textarea = promptRef.current;
+    if (!pending || !textarea) {
+      return;
+    }
+    textarea.focus();
+    textarea.setSelectionRange(pending.cursor, pending.cursor);
+    // scrollTop 只写回一次：之后用户自己滚动时不再被程序抢回去。
+    if (pending.scrollTop !== null) {
+      textarea.scrollTop = pending.scrollTop;
+      syncPromptHighlightScroll();
+      pending.scrollTop = null;
+    }
+  });
+
   const handlePromptAreaClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
     const referenceElements = event.currentTarget.querySelectorAll<HTMLElement>(
       '[data-reference-image-index]'
@@ -1018,7 +1050,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const insertImageReference = useCallback((imageIndex: number) => {
     const marker = `@图${imageIndex + 1}`;
     let basePrompt = promptDraftRef.current;
-    let baseCursor = pickerCursor ?? basePrompt.length;
+    // 优先用按 @ 时记录的光标；异常路径（没记录到）退回 textarea 当前光标，
+    // 绝不退回「文末」—— 否则引用会凭空插到最后一行，光标也跟着跳到末尾。
+    let baseCursor = pickerCursor ?? promptRef.current?.selectionStart ?? basePrompt.length;
     // 兜底: 光标前(忽略尾部空格)已是 '@' 时先移除, 避免插入后出现 '@@图N'
     const trimmedBefore = basePrompt.slice(0, baseCursor).replace(/\s+$/, '');
     if (trimmedBefore.endsWith('@')) {
@@ -1028,20 +1062,20 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     }
     const { nextText: nextPrompt, nextCursor } = insertReferenceToken(basePrompt, baseCursor, marker);
 
+    pendingPromptCaretRef.current = {
+      cursor: nextCursor,
+      scrollTop: promptRef.current?.scrollTop ?? 0,
+    };
     setPromptDraft(nextPrompt);
     commitPromptDraft(nextPrompt);
     setShowImagePicker(false);
     setPickerCursor(null);
     setPickerActiveIndex(0);
-
-    requestAnimationFrame(() => {
-      promptRef.current?.focus();
-      promptRef.current?.setSelectionRange(nextCursor, nextCursor);
-      syncPromptHighlightScroll();
-    });
   }, [commitPromptDraft, pickerCursor]);
 
   const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    // 只要用户开始敲键盘，就由浏览器接管光标，不再回钉插入位置。
+    clearPendingPromptCaret();
     const currentPrompt = promptDraftRef.current;
     const selectionStart = event.currentTarget.selectionStart ?? currentPrompt.length;
     const selectionEnd = event.currentTarget.selectionEnd ?? selectionStart;
@@ -1096,13 +1130,12 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
       if (deleteRange) {
         event.preventDefault();
         const { nextText, nextCursor } = removeTextRange(currentPrompt, deleteRange);
+        pendingPromptCaretRef.current = {
+          cursor: nextCursor,
+          scrollTop: promptRef.current?.scrollTop ?? 0,
+        };
         setPromptDraft(nextText);
         commitPromptDraft(nextText);
-        requestAnimationFrame(() => {
-          promptRef.current?.focus();
-          promptRef.current?.setSelectionRange(nextCursor, nextCursor);
-          syncPromptHighlightScroll();
-        });
         return;
       }
     }
@@ -1210,6 +1243,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
             ref={promptRef}
             value={promptDraft}
             onChange={(event) => {
+              clearPendingPromptCaret();
               const nextValue = restoreBrokenImageReference(
                 promptDraftRef.current,
                 event.target.value,
@@ -1219,11 +1253,18 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
               setPromptDraft(nextValue);
               schedulePromptCommit();
             }}
-            onBlur={flushPromptCommit}
+            onBlur={() => {
+              clearPendingPromptCaret();
+              flushPromptCommit();
+            }}
             onSelect={(event) => normalizePromptSelection(event.currentTarget)}
             onKeyDown={handlePromptKeyDown}
             onScroll={syncPromptHighlightScroll}
-            onMouseDown={(event) => event.stopPropagation()}
+            onMouseDown={(event) => {
+              // 用户自己点选光标位置时不再回钉。
+              clearPendingPromptCaret();
+              event.stopPropagation();
+            }}
             placeholder={t('node.imageEdit.promptPlaceholder')}
             className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${incomingText.length > 0 ? 'pb-20' : ''}`}
             style={{ scrollbarGutter: 'stable' }}

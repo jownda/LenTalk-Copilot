@@ -42,6 +42,7 @@ import {
   DEFAULT_NODE_WIDTH,
   EXPORT_RESULT_NODE_MIN_HEIGHT,
   EXPORT_RESULT_NODE_MIN_WIDTH,
+  isTextAnnotationNode,
 } from "@/features/canvas/domain/canvasNodes";
 import { resolveMinEdgeFittedSize } from "@/features/canvas/application/imageNodeSizing";
 import { prepareNodeImage, prepareNodeImageFromFile } from "@/features/canvas/application/imageData";
@@ -451,6 +452,11 @@ export function Canvas() {
     downloadUrl: string | null;
     downloadMediaType: "image" | "video" | null;
     nodeId: string | null;
+    textContent: string | null;
+  } | null>(null);
+  const [saveTextPromptDialog, setSaveTextPromptDialog] = useState<{
+    name: string;
+    content: string;
   } | null>(null);
   const [menuPosition, setMenuPosition] = useState({ x: 0, y: 0 });
   const [flowPosition, setFlowPosition] = useState({ x: 0, y: 0 });
@@ -1838,6 +1844,7 @@ export function Canvas() {
         downloadUrl: contextMedia?.url ?? null,
         downloadMediaType: contextMedia?.mediaType ?? null,
         nodeId,
+        textContent: contextNode && isTextAnnotationNode(contextNode) ? contextNode.data.content : null,
       });
     },
     [nodes, reactFlowInstance],
@@ -1909,6 +1916,42 @@ export function Canvas() {
     },
     [canvasContextMenu],
   );
+
+  const handleContextSaveTextToPrompt = useCallback(() => {
+    const context = canvasContextMenu;
+    if (!context || context.textContent === null) {
+      return;
+    }
+    setCanvasContextMenu(null);
+    setSaveTextPromptDialog({ name: "", content: context.textContent });
+  }, [canvasContextMenu]);
+
+  const handleSaveTextPrompt = useCallback(() => {
+    const draft = saveTextPromptDialog;
+    const name = draft?.name.trim() ?? "";
+    const content = draft?.content.trim() ?? "";
+    if (!draft || !name || !content) {
+      return;
+    }
+
+    const promptStore = usePromptLibraryStore.getState();
+    let targetLibrary = promptStore.libraries.find((library) => !library.readonly);
+    if (!targetLibrary) {
+      targetLibrary = promptStore.addLibrary(t("promptLibrary.myLib", "我的提示词")) ?? undefined;
+    }
+    if (!targetLibrary) {
+      return;
+    }
+
+    promptStore.addTemplate(targetLibrary.id, {
+      name,
+      scene: "",
+      positive: content,
+      negative: "",
+      category: "custom",
+    });
+    setSaveTextPromptDialog(null);
+  }, [saveTextPromptDialog, t]);
 
   const handleAddImageToLibrary = useCallback(async (imageUrl: string, categoryId: string) => {
     setCanvasContextMenu(null);
@@ -3367,11 +3410,13 @@ export function Canvas() {
           downloadUrl={canvasContextMenu.downloadUrl}
           downloadMediaType={canvasContextMenu.downloadMediaType}
           nodeId={canvasContextMenu.nodeId}
+          textContent={canvasContextMenu.textContent}
           canPaste={Boolean(copiedSnapshotRef.current?.nodes.length)}
           categories={activeAssetLibraryCategories}
           failedNodeCount={failedGenerationNodeIds.length}
           onClearFailedNodes={handleClearFailedNodes}
           onCopyNode={handleContextCopyNode}
+          onSaveTextToPrompt={handleContextSaveTextToPrompt}
           onPaste={handleContextPaste}
           onAddImageToLibrary={handleAddImageToLibrary}
           onDownloadMedia={handleContextDownloadMedia}
@@ -3402,6 +3447,56 @@ export function Canvas() {
       <AgentPanel open={isAgentOpen} onClose={() => setIsAgentOpen(false)} />
 
       <ShortcutSettingsDialog open={isShortcutsOpen} onClose={() => setIsShortcutsOpen(false)} />
+
+      <UiModal
+        isOpen={Boolean(saveTextPromptDialog)}
+        title={t("canvas.saveTextPrompt.title", "保存到提示词库")}
+        onClose={() => setSaveTextPromptDialog(null)}
+        footer={
+          <>
+            <UiButton variant="muted" size="sm" onClick={() => setSaveTextPromptDialog(null)}>
+              {t("common.cancel")}
+            </UiButton>
+            <UiButton
+              variant="primary"
+              size="sm"
+              disabled={!saveTextPromptDialog?.name.trim() || !saveTextPromptDialog?.content.trim()}
+              onClick={handleSaveTextPrompt}
+            >
+              {t("common.save")}
+            </UiButton>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <label className="block text-xs text-text-muted">
+            {t("canvas.saveTextPrompt.name", "提示词名称")}
+            <UiInput
+              autoFocus
+              value={saveTextPromptDialog?.name ?? ""}
+              placeholder={t("promptLibrary.namePlaceholder", "提示词名称")}
+              onChange={(event) =>
+                setSaveTextPromptDialog((current) => (current ? { ...current, name: event.target.value } : current))
+              }
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && saveTextPromptDialog?.name.trim() && saveTextPromptDialog.content.trim()) {
+                  event.preventDefault();
+                  handleSaveTextPrompt();
+                }
+              }}
+              className="mt-1.5"
+            />
+          </label>
+          <div className="rounded-lg border border-border-dark bg-bg-dark/60 px-3 py-2">
+            <div className="mb-1 text-[11px] text-text-muted">
+              {t("canvas.saveTextPrompt.content", "提示词内容")}
+            </div>
+            <div className="max-h-32 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-text-dark">
+              {saveTextPromptDialog?.content ?? ""}
+            </div>
+          </div>
+        </div>
+      </UiModal>
 
       <UiModal
         isOpen={Boolean(groupNameDialog)}

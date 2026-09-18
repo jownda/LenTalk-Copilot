@@ -57,6 +57,14 @@ export interface GenerateVideoPayload {
   extraParams?: Record<string, unknown>;
 }
 
+export interface UpscaleVideoPayload {
+  /** 超分源：公网 URL 或本地路径 */
+  videoSource: string;
+  model: string;
+  tier?: string;
+  bitRate?: number | string;
+  extraParams?: Record<string, unknown>;
+}
 export type GenerateAudioKind = 'speech' | 'sound-effects' | 'music';
 
 export interface GenerateAudioPayload {
@@ -112,6 +120,8 @@ export interface AiGateway {
     error?: string | null;
   }>;
   generateVideo: (payload: GenerateVideoPayload) => Promise<string>;
+  /** 视频超分：本地视频先上传换 URL，提交后轮询取片。 */
+  upscaleVideo: (payload: UpscaleVideoPayload) => Promise<string>;
   generateAudio: (payload: GenerateAudioPayload) => Promise<string>;
 }
 

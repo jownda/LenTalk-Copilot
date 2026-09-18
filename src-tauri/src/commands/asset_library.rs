@@ -350,13 +350,37 @@ pub fn persist_library_asset_file(
     Ok(destination.to_string_lossy().to_string())
 }
 
+/// 将素材库备份写入用户在原生保存对话框中选择的路径。
+///
+/// 这里不能使用前端 fs 插件的 writeFile：插件的 capability scope 只覆盖
+/// `$HOME` / `$TEMP`，而保存对话框允许用户选择任意本地目录（例如 D 盘）。
+#[tauri::command]
+pub fn write_library_backup(
+    bytes: Vec<u8>,
+    destination_path: String,
+) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("Library backup bytes are empty".to_string());
+    }
+    let destination = PathBuf::from(destination_path.trim());
+    if destination.as_os_str().is_empty() {
+        return Err("Library backup destination is empty".to_string());
+    }
+    std::fs::write(&destination, bytes)
+        .map_err(|error| format!("Failed to write library backup: {error}"))?;
+    Ok(destination.to_string_lossy().to_string())
+}
+
 /**
- * 用系统 QuickLook(qlmanage) 为视频生成首帧缩略图 PNG, 存到视频同目录。
- * WKWebView 禁止无手势 autoplay, 前端 <video> 无法自动出首帧, 只能用系统级工具抽帧。
- * 成功返回缩略图绝对路径, 失败返回 None(调用方回退)。
+ * 为视频生成缩略图 PNG, 存到视频同目录。成功返回缩略图绝对路径, 失败返回 None(调用方回退)。
+ *
+ * macOS 用系统 QuickLook(qlmanage) 抽帧; 其它平台用随包分发的 ffmpeg 抽帧。
+ * 早期版本在非 macOS 平台直接返回 None 交给前端 <video>+canvas 抽帧, 但 WebView2 在
+ * loadeddata 之后画布仍可能是全透明的(帧尚未提交到合成器), 存下来的就是一张空白封面。
  */
 #[tauri::command]
 pub fn extract_video_thumbnail(
+    app: AppHandle,
     video_path: String,
 ) -> Result<Option<String>, String> {
     let source = std::path::Path::new(&video_path);
@@ -372,7 +396,10 @@ pub fn extract_video_thumbnail(
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("/tmp"));
-    let output = parent.join(format!("{file_name}.png"));
+    // macOS 的 qlmanage 只能产出 PNG; 其它平台用 JPEG —— 封面不需要透明通道, 同尺寸下
+    // 体积约为 PNG 的二十分之一(480 宽的 PNG 抽帧图接近 700KB)。
+    let thumbnail_extension = if cfg!(target_os = "macos") { "png" } else { "jpg" };
+    let output = parent.join(format!("{file_name}.{thumbnail_extension}"));
 
     // 已生成过直接返回
     if output.exists() {
@@ -395,9 +422,26 @@ pub fn extract_video_thumbnail(
         Ok(None)
     }
 
+    // 其它平台: 用随包 ffmpeg 抽第 0.1s 的画面(避开部分视频开头的纯色淡入)。
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (&parent, &output);
+        let Some(ffmpeg) = crate::commands::video_cfr::resolve_ffmpeg_path(&app) else {
+            return Ok(None);
+        };
+        // 宽度限制 480: 节点封面用不到全分辨率, 也避免 4K 源抽出上千万像素的 PNG。
+        let status = std::process::Command::new(ffmpeg)
+            .args(["-y", "-hide_banner", "-loglevel", "error"])
+            .args(["-ss", "0.1"])
+            .arg("-i")
+            .arg(&video_path)
+            .args(["-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "4"])
+            .arg(&output)
+            .status()
+            .map_err(|error| format!("Failed to run ffmpeg: {error}"))?;
+
+        if status.success() && output.exists() {
+            return Ok(Some(output.to_string_lossy().to_string()));
+        }
         Ok(None)
     }
 }

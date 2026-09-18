@@ -24,6 +24,7 @@ import {
   cinematicAssetKey,
   cinematicAssetKind,
   cinematicImageAssets,
+  isCinematicMirrorAsset,
 } from '@/features/library/cinematicMirror';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -148,16 +149,39 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const [activeAssetPicker, setActiveAssetPicker] = useState<QuickAssetPickerKind | null>(null);
   const [isChatModelPickerOpen, setIsChatModelPickerOpen] = useState(false);
   const [activeChatProviderId, setActiveChatProviderId] = useState('');
-  const [cinematicAssetNames, setCinematicAssetNames] = useState<Map<string, string>>(() => new Map());
+  const [cinematicDatabaseAssetNames, setCinematicDatabaseAssetNames] = useState<Map<string, string>>(() => new Map());
   const [isImagePromptOpen, setIsImagePromptOpen] = useState(false);
   const expandedHeightRef = useRef(CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT);
+
+  /**
+   * 资产名称权威来源：素材库镜像条目（工程资产名的实时投影）→ DB 共享资产库（兜底）。
+   *
+   * 以前只从 DB 读一次，于是「在资产库改了资产名 → 节点候选 / 已选框仍是旧名」，
+   * 要等节点重新挂载（或素材库重新 hydrate）才刷新，看起来像「要等一会儿才同步」。
+   * 镜像条目随工程资产改动实时重写，拿它当主来源就与资产库改动同帧生效；
+   * DB 名仍保留为镜像尚未生成时的兜底。
+   */
+  const cinematicAssetNames = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const asset of libraryAssets) {
+      if (!asset.sourcePath.trim() || !isCinematicMirrorAsset(asset)) continue;
+      const name = asset.name.trim();
+      if (!name) continue;
+      const key = cinematicAssetKey(asset);
+      if (!map.has(key)) map.set(key, name);
+    }
+    for (const [key, name] of cinematicDatabaseAssetNames) {
+      if (!map.has(key)) map.set(key, name);
+    }
+    return map;
+  }, [cinematicDatabaseAssetNames, libraryAssets]);
 
   useEffect(() => {
     if (!assetLibraryHydrated) return;
     let cancelled = false;
     void loadSharedAssets().then((assets) => {
       if (cancelled) return;
-      setCinematicAssetNames(new Map(
+      setCinematicDatabaseAssetNames(new Map(
         assets
           .filter((asset) => asset.id.trim() && asset.name.trim())
           .map((asset) => [asset.id, asset.name.trim()]),

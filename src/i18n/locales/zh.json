@@ -141,6 +141,11 @@
       "renameTitle": "重命名分组",
       "placeholder": "请输入分组名称"
     },
+    "saveTextPrompt": {
+      "title": "保存到提示词库",
+      "name": "提示词名称",
+      "content": "提示词内容"
+    },
     "toolbar": {
       "zoomIn": "放大",
       "zoomOut": "缩小",
@@ -222,7 +227,11 @@
     "captureFrame": "截图",
     "upscale": "超分",
     "upscaleDesc": "把本节点的视频交给超分模型放大，结果作为新的视频节点接入画布。",
-    "upscalePending": "链路尚未接入：当前点击不会发起任何请求。",
+    "videoUpscaleModel": "超分模型",
+    "videoUpscaleTier": "目标档位",
+    "videoUpscaleRunning": "超分中…",
+    "videoUpscaleApiKeyMissing": "知鸟 AI 还没有填 API Key，请先到设置里填写。",
+    "videoUpscaleUploading": "正在上传源视频…",
     "upscaleTodoModel": "超分模型：所在平台与模型名",
     "upscaleTodoTarget": "目标档位：2K / 4K 或放大倍率",
     "upscaleTodoTransport": "视频送法：公网 URL 或 base64 直传",
@@ -781,6 +790,7 @@
     "classifyNoMatch": "没有找到匹配的分类。请先建立角色、场景或道具分组，并使用有意义的素材名称或标签。",
     "assetsTab": "图片素材",
     "promptsTab": "提示词库",
+    "cinematicTab": "资产库",
     "manageCategories": "管理分组",
     "manageCategoriesHint": "新建分组、重命名或删除自定义分组",
     "newCategory": "新建分组",
@@ -789,12 +799,12 @@
     "addSubCategory": "新建子分组",
     "subCategoryPrompt": "输入子分组名称:",
     "backup": "备份",
-    "backupHint": "导出素材库和提示词库为 zip 备份文件",
+    "backupHint": "导出素材库、提示词库和资产库为 zip 备份文件",
     "importBackup": "导入",
-    "importBackupHint": "从 zip 备份文件恢复素材库和提示词库",
+    "importBackupHint": "从 zip 备份文件恢复素材库、提示词库和资产库（资产库按 id 合并，不删除本机独有的）",
     "backupDone": "备份已导出",
     "backupFailed": "备份失败,请重试",
-    "importDone": "导入成功(素材 {{assets}} 个 / 提示词库 {{libs}} 个),即将刷新…",
+    "importDone": "导入成功(素材 {{assets}} 个 / 提示词库 {{libs}} 个 / 资产库 {{cinematic}} 个),即将刷新…",
     "importFailed": "导入失败,请选择有效的备份文件"
   },
   "promptLibrary": {
@@ -869,4 +879,3 @@
     "preparing": "处理中…"
   }
 }
-

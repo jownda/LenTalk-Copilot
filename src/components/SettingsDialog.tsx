@@ -714,6 +714,10 @@ export function SettingsDialog({
         detectedAt: Date.now(),
       });
       if (result.success) {
+        if (result.resolvedPath) {
+          setJimengCliExecutable(result.resolvedPath);
+          setLocalJimengCliExecutable(result.resolvedPath);
+        }
         // 安装成功后 CLI 才可用，重新探测本地登录态。
         void probeJimengLoginStatus(result.resolvedPath ?? localJimengCliExecutable);
       }
