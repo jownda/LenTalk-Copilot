@@ -25,7 +25,7 @@ import {
 } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
 import { isTauri } from "@tauri-apps/api/core";
-import { AlignJustify, Bot, Film, Keyboard, LayoutTemplate, Library, Magnet } from "lucide-react";
+import { AlignJustify, Bot, Crosshair, Film, Keyboard, LayoutTemplate, Library } from "lucide-react";
 import "@xyflow/react/dist/style.css";
 
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -59,7 +59,12 @@ import {
 } from "@/features/canvas/domain/nodeRegistry";
 import { embedStoryboardImageMetadata } from "@/commands/image";
 import { persistLibraryAssetBinary, persistLibraryAssetFile } from "@/commands/assetLibrary";
-import type { NodeAlignMode } from "@/features/canvas/application/canvasLayout";
+import {
+  ALIGNMENT_GUIDE_SNAP_THRESHOLD,
+  computeDragAlignment,
+  type AlignmentGuide,
+  type NodeAlignMode,
+} from "@/features/canvas/application/canvasLayout";
 import { nodeTypes } from "./nodes";
 import { edgeTypes } from "./edges";
 
@@ -320,6 +325,7 @@ interface DuplicateResult {
 
 const ALT_DRAG_COPY_Z_INDEX = 2000;
 const GENERATION_JOB_POLL_INTERVAL_MS = 1400;
+const CONNECTION_HANDLE_HIT_RADIUS = 18;
 
 interface GenerationStoryboardMetadata {
   gridRows: number;
@@ -461,6 +467,7 @@ export function Canvas() {
   const updateNodeInternals = useUpdateNodeInternals();
 
   const wrapperRef = useRef<HTMLDivElement>(null);
+  const nearbyConnectionHandleRef = useRef<HTMLElement | null>(null);
   const suppressNextPaneClickRef = useRef(false);
   // 框选成功后的 click/dblclick 抑制时间窗(ms 时间戳)。
   // 必须用 ref 而非 effect 闭包变量: setNodes 会触发 store 更新导致 effect 重建, 闭包变量值会丢失。
@@ -493,6 +500,7 @@ export function Canvas() {
   const [menuAllowedTypes, setMenuAllowedTypes] = useState<CanvasNodeType[] | undefined>(undefined);
   const [pendingConnectStart, setPendingConnectStart] = useState<PendingConnectStart | null>(null);
   const [previewConnectionVisual, setPreviewConnectionVisual] = useState<PreviewConnectionVisual | null>(null);
+  const [alignmentGuides, setAlignmentGuides] = useState<AlignmentGuide[]>([]);
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [isTemplateOpen, setIsTemplateOpen] = useState(false);
   const [cinematicAssetLibrary, setCinematicAssetLibrary] = useState<CinematicAssetLibraryBridge | null>(null);
@@ -583,6 +591,95 @@ export function Canvas() {
     moved: boolean;
   } | null>(null);
 
+  const resolveNearbyConnectionHandle = useCallback(
+    (clientX: number, clientY: number): HTMLElement | null => {
+      const wrapper = wrapperRef.current;
+      if (!wrapper) {
+        return null;
+      }
+
+      let nearestHandle: HTMLElement | null = null;
+      let nearestDistance = CONNECTION_HANDLE_HIT_RADIUS;
+      const handles = wrapper.querySelectorAll<HTMLElement>(
+        ".react-flow__handle.connectable.connectablestart",
+      );
+
+      handles.forEach((handle) => {
+        const rect = handle.getBoundingClientRect();
+        const distance = Math.hypot(
+          clientX - (rect.left + rect.width / 2),
+          clientY - (rect.top + rect.height / 2),
+        );
+        if (distance <= nearestDistance) {
+          nearestDistance = distance;
+          nearestHandle = handle;
+        }
+      });
+
+      return nearestHandle;
+    },
+    [],
+  );
+
+  const updateNearbyConnectionHandle = useCallback(
+    (clientX: number, clientY: number) => {
+      const nextHandle = resolveNearbyConnectionHandle(clientX, clientY);
+      const previousHandle = nearbyConnectionHandleRef.current;
+      if (previousHandle !== nextHandle) {
+        previousHandle?.classList.remove("connection-handle-nearby");
+        nextHandle?.classList.add("connection-handle-nearby");
+        nearbyConnectionHandleRef.current = nextHandle;
+      }
+      return nextHandle;
+    },
+    [resolveNearbyConnectionHandle],
+  );
+
+  const handleCanvasMouseMoveCapture = useCallback(
+    (event: ReactMouseEvent) => {
+      updateNearbyConnectionHandle(event.clientX, event.clientY);
+    },
+    [updateNearbyConnectionHandle],
+  );
+
+  const handleCanvasMouseDownCapture = useCallback(
+    (event: ReactMouseEvent) => {
+      if (event.button !== 0) {
+        return;
+      }
+
+      const eventTarget = event.target as Element | null;
+      if (eventTarget?.closest?.(".react-flow__handle")) {
+        return;
+      }
+
+      const handle = updateNearbyConnectionHandle(event.clientX, event.clientY);
+      if (!handle) {
+        return;
+      }
+
+      // React Flow binds its connection start handler to the real Handle
+      // element. Forward a synthetic mousedown so the enlarged nearby zone
+      // follows the same native connection path as an exact Handle click.
+      handle.dispatchEvent(
+        new MouseEvent("mousedown", {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          buttons: 1,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          screenX: event.screenX,
+          screenY: event.screenY,
+          view: window,
+        }),
+      );
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    [updateNearbyConnectionHandle],
+  );
+
   const nodes = useCanvasStore((state) => state.nodes);
   const edges = useCanvasStore((state) => state.edges);
   const history = useCanvasStore((state) => state.history);
@@ -621,8 +718,9 @@ export function Canvas() {
   const closeImageViewer = useCanvasStore((state) => state.closeImageViewer);
   const navigateImageViewer = useCanvasStore((state) => state.navigateImageViewer);
   const apiKeys = useSettingsStore((state) => state.apiKeys);
-  const snapToGrid = useSettingsStore((state) => state.snapToGrid);
-  const setSnapToGrid = useSettingsStore((state) => state.setSnapToGrid);
+  // 保留 settingsStore 的旧字段名以兼容已有配置; 在画布中它现在表示对齐辅助线/智能吸附开关。
+  const alignmentGuidesEnabled = useSettingsStore((state) => state.snapToGrid);
+  const setAlignmentGuidesEnabled = useSettingsStore((state) => state.setSnapToGrid);
   const assetLibraries = useAssetLibraryStore((state) => state.libraries);
   const activeAssetLibraryId = useAssetLibraryStore((state) => state.activeLibraryId);
   const assetCategories = useAssetLibraryStore((state) => state.categories);
@@ -2713,6 +2811,7 @@ export function Canvas() {
 
   const handleNodeDragStart = useCallback(
     (event: ReactMouseEvent, node: CanvasNode) => {
+      setAlignmentGuides([]);
       // 拖拽画布节点也视为画布区交互, 收起素材库/模板侧边栏
       setIsLibraryOpen(false);
       setIsTemplateOpen(false);
@@ -2975,9 +3074,69 @@ export function Canvas() {
     (_event: ReactMouseEvent, node: CanvasNode) => {
       const altCopyState = altDragCopyRef.current;
       if (!altCopyState) {
-        scheduleGroupDragFeedback(node);
+        let feedbackNode = node;
+
+        // 只对顶层节点做实时对齐。组内节点使用 parent-relative 坐标，若直接参与
+        // 计算会把组内位置误当成画布坐标；拖动整个组时则仍可与其他顶层节点对齐。
+        if (alignmentGuidesEnabled && !node.parentId) {
+          const state = useCanvasStore.getState();
+          const nodeMap = new Map(state.nodes.map((item) => [item.id, item] as const));
+          nodeMap.set(node.id, node);
+
+          const movingAbsolute = resolveCanvasNodeAbsolutePosition(node.id, nodeMap);
+          const movingSize = resolveCanvasNodeSize(node);
+          const references = state.nodes
+            .filter((reference) => {
+              return (
+                reference.id !== node.id &&
+                !reference.parentId &&
+                !reference.dragging
+              );
+            })
+            .map((reference) => {
+              const absolute = resolveCanvasNodeAbsolutePosition(reference.id, nodeMap);
+              const size = resolveCanvasNodeSize(reference);
+              return {
+                id: reference.id,
+                x: absolute.x,
+                y: absolute.y,
+                width: size.width,
+                height: size.height,
+              };
+            });
+
+          const alignment = computeDragAlignment(
+            {
+              id: node.id,
+              x: movingAbsolute.x,
+              y: movingAbsolute.y,
+              width: movingSize.width,
+              height: movingSize.height,
+            },
+            references,
+            ALIGNMENT_GUIDE_SNAP_THRESHOLD,
+          );
+          setAlignmentGuides(alignment.guides);
+
+          if (alignment.position.x !== node.position.x || alignment.position.y !== node.position.y) {
+            const alignedChange = {
+              id: node.id,
+              type: "position" as const,
+              position: alignment.position,
+              dragging: true as const,
+            };
+            applyNodesChange([alignedChange]);
+            feedbackNode = { ...node, position: alignment.position };
+          }
+        } else {
+          setAlignmentGuides([]);
+        }
+
+        scheduleGroupDragFeedback(feedbackNode);
         return;
       }
+
+      setAlignmentGuides([]);
 
       const startPosition = altCopyState.startPositions.get(node.id);
       if (!startPosition) {
@@ -3041,11 +3200,12 @@ export function Canvas() {
         applyNodesChange(allChanges);
       }
     },
-    [applyNodesChange, scheduleGroupDragFeedback],
+    [alignmentGuidesEnabled, applyNodesChange, scheduleGroupDragFeedback],
   );
 
   const handleNodeDragStop = useCallback(
     (_event: ReactMouseEvent, node: CanvasNode) => {
+      setAlignmentGuides([]);
       if (groupDragFeedbackTimerRef.current !== null) {
         window.clearTimeout(groupDragFeedbackTimerRef.current);
         groupDragFeedbackTimerRef.current = null;
@@ -3409,8 +3569,44 @@ export function Canvas() {
     [t],
   );
 
+  const alignmentGuideLines = useMemo(() => {
+    const rect = wrapperRef.current?.getBoundingClientRect();
+    if (!rect || alignmentGuides.length === 0) {
+      return [];
+    }
+
+    return alignmentGuides.map((guide, index) => {
+      if (guide.axis === "vertical") {
+        const start = reactFlowInstance.flowToScreenPosition({ x: guide.position, y: guide.start });
+        const end = reactFlowInstance.flowToScreenPosition({ x: guide.position, y: guide.end });
+        return {
+          key: `${guide.axis}-${guide.position}-${index}`,
+          x1: start.x - rect.left,
+          y1: start.y - rect.top,
+          x2: end.x - rect.left,
+          y2: end.y - rect.top,
+        };
+      }
+
+      const start = reactFlowInstance.flowToScreenPosition({ x: guide.start, y: guide.position });
+      const end = reactFlowInstance.flowToScreenPosition({ x: guide.end, y: guide.position });
+      return {
+        key: `${guide.axis}-${guide.position}-${index}`,
+        x1: start.x - rect.left,
+        y1: start.y - rect.top,
+        x2: end.x - rect.left,
+        y2: end.y - rect.top,
+      };
+    });
+  }, [alignmentGuides, reactFlowInstance]);
+
   return (
-    <div ref={wrapperRef} className="relative h-full w-full">
+    <div
+      ref={wrapperRef}
+      className="relative h-full w-full"
+      onMouseMoveCapture={handleCanvasMouseMoveCapture}
+      onMouseDownCapture={handleCanvasMouseDownCapture}
+    >
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -3436,11 +3632,11 @@ export function Canvas() {
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         defaultEdgeOptions={{ type: "disconnectableEdge" }}
+        // 让拖拽中的连接线在距离目标 Handle 36px 内自动吸附。
+        connectionRadius={36}
         defaultViewport={DEFAULT_VIEWPORT}
         minZoom={0.1}
         maxZoom={5}
-        snapToGrid={snapToGrid}
-        snapGrid={[20, 20]}
         // 左/中键拖拽平移画布; 右键按住拖拽 = 框选(自定义实现, 见上方框选 effect),
         // 左键双击第二下按住拖拽的旧框选手势一并保留
         panOnDrag={[0, 1]}
@@ -3470,6 +3666,23 @@ export function Canvas() {
 
         <SelectedNodeOverlay />
       </ReactFlow>
+
+      {alignmentGuideLines.length > 0 && (
+        <svg className="pointer-events-none absolute inset-0 z-30 h-full w-full overflow-visible">
+          {alignmentGuideLines.map((line) => (
+            <line
+              key={line.key}
+              x1={line.x1}
+              y1={line.y1}
+              x2={line.x2}
+              y2={line.y2}
+              stroke="rgba(129, 140, 248, 0.9)"
+              strokeWidth="1.5"
+              strokeDasharray="6 4"
+            />
+          ))}
+        </svg>
+      )}
 
       {isNodePaletteOpen ? (
         <NodePaletteSidebar
@@ -3518,7 +3731,7 @@ export function Canvas() {
             className="flex h-9 w-9 items-center justify-center rounded-lg border border-border-dark bg-surface-dark shadow-lg transition-colors text-text-dark hover:bg-bg-dark"
             title={
               selectedNodeIds.length < 2
-                ? t("canvas.toolbar.alignAll", "一键整理:全部节点对齐到附近节点/组的边缘与中心线,自动防重叠")
+                ? t("canvas.toolbar.alignAll", "一键整理:全部节点对齐到附近节点/组的上下左右边缘,自动防重叠")
                 : t("canvas.toolbar.align", "对齐选中节点")
             }
           >
@@ -3547,13 +3760,17 @@ export function Canvas() {
         </div>
 
         <button
-          onClick={() => setSnapToGrid(!snapToGrid)}
+          onClick={() => setAlignmentGuidesEnabled(!alignmentGuidesEnabled)}
           className={`flex h-9 w-9 items-center justify-center rounded-lg border border-border-dark bg-surface-dark shadow-lg transition-colors ${
-            snapToGrid ? "text-accent ring-1 ring-accent/50" : "text-text-dark hover:bg-bg-dark"
+            alignmentGuidesEnabled ? "text-accent ring-1 ring-accent/50" : "text-text-dark hover:bg-bg-dark"
           }`}
-          title={snapToGrid ? t("canvas.toolbar.snapOff", "关闭网格磁吸") : t("canvas.toolbar.snapOn", "开启网格磁吸")}
+          title={
+            alignmentGuidesEnabled
+              ? t("canvas.toolbar.alignmentGuidesOn", "关闭对齐辅助线")
+              : t("canvas.toolbar.alignmentGuidesOff", "开启对齐辅助线")
+          }
         >
-          <Magnet className="h-4 w-4 text-text-muted" />
+          <Crosshair className="h-4 w-4 text-text-muted" />
         </button>
 
         <button

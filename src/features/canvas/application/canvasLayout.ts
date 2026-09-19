@@ -168,6 +168,132 @@ export interface AlignableItem {
   height: number;
 }
 
+export type AlignmentGuideAxis = 'vertical' | 'horizontal';
+
+export interface AlignmentGuide {
+  axis: AlignmentGuideAxis;
+  position: number;
+  start: number;
+  end: number;
+}
+
+export interface DragAlignmentResult {
+  position: { x: number; y: number };
+  guides: AlignmentGuide[];
+}
+
+/** 拖拽时对齐辅助线的吸附距离(画布坐标)。 */
+export const ALIGNMENT_GUIDE_SNAP_THRESHOLD = 16;
+
+interface AlignmentCandidate {
+  distance: number;
+  target: number;
+  guidePosition: number;
+  start: number;
+  end: number;
+}
+
+/**
+ * 计算单个节点拖拽过程中的实时对齐位置。
+ * 仅比较左/右和上/下四条边，不把中心线或相邻边缘当成对齐线，
+ * 因此辅助线始终会穿过正在拖拽的节点与参考节点。
+ */
+export function computeDragAlignment(
+  moving: AlignableItem,
+  references: AlignableItem[],
+  threshold = ALIGNMENT_GUIDE_SNAP_THRESHOLD
+): DragAlignmentResult {
+  const snap = threshold > 0 ? threshold : ALIGNMENT_GUIDE_SNAP_THRESHOLD;
+  const movingRight = moving.x + moving.width;
+  const movingBottom = moving.y + moving.height;
+  let bestX: AlignmentCandidate | null = null;
+  let bestY: AlignmentCandidate | null = null;
+
+  const consider = (
+    current: AlignmentCandidate | null,
+    candidate: AlignmentCandidate
+  ): AlignmentCandidate | null => {
+    if (candidate.distance > snap) {
+      return current;
+    }
+    return !current || candidate.distance < current.distance ? candidate : current;
+  };
+
+  for (const reference of references) {
+    if (reference.id === moving.id) {
+      continue;
+    }
+
+    const referenceRight = reference.x + reference.width;
+    const referenceBottom = reference.y + reference.height;
+    const xCandidates: AlignmentCandidate[] = [
+      {
+        distance: Math.abs(moving.x - reference.x),
+        target: reference.x,
+        guidePosition: reference.x,
+        start: Math.min(moving.y, reference.y),
+        end: Math.max(movingBottom, referenceBottom),
+      },
+      {
+        distance: Math.abs(movingRight - referenceRight),
+        target: referenceRight - moving.width,
+        guidePosition: referenceRight,
+        start: Math.min(moving.y, reference.y),
+        end: Math.max(movingBottom, referenceBottom),
+      },
+    ];
+    const yCandidates: AlignmentCandidate[] = [
+      {
+        distance: Math.abs(moving.y - reference.y),
+        target: reference.y,
+        guidePosition: reference.y,
+        start: Math.min(moving.x, reference.x),
+        end: Math.max(movingRight, referenceRight),
+      },
+      {
+        distance: Math.abs(movingBottom - referenceBottom),
+        target: referenceBottom - moving.height,
+        guidePosition: referenceBottom,
+        start: Math.min(moving.x, reference.x),
+        end: Math.max(movingRight, referenceRight),
+      },
+    ];
+
+    for (const candidate of xCandidates) {
+      bestX = consider(bestX, candidate);
+    }
+    for (const candidate of yCandidates) {
+      bestY = consider(bestY, candidate);
+    }
+  }
+
+  const guides: AlignmentGuide[] = [];
+  if (bestX) {
+    guides.push({
+      axis: 'vertical',
+      position: bestX.guidePosition,
+      start: bestX.start,
+      end: bestX.end,
+    });
+  }
+  if (bestY) {
+    guides.push({
+      axis: 'horizontal',
+      position: bestY.guidePosition,
+      start: bestY.start,
+      end: bestY.end,
+    });
+  }
+
+  return {
+    position: {
+      x: bestX ? Math.round(bestX.target) : Math.round(moving.x),
+      y: bestY ? Math.round(bestY.target) : Math.round(moving.y),
+    },
+    guides,
+  };
+}
+
 /** 计算选中节点的对齐目标位置(绝对坐标)。等距分布按中心点排序。 */
 export function computeAlignment(
   items: AlignableItem[],
@@ -303,7 +429,7 @@ function resolveNonOverlapAlongX(
   }
 }
 
-/** 智能吸附阈值(px): 与附近节点/组边框边缘或中心线距离小于该值才吸附 */
+/** 智能吸附阈值(px): 与附近节点/组边框上下左右边缘距离小于该值才吸附 */
 export const SMART_SNAP_THRESHOLD = 24;
 
 /**
@@ -318,8 +444,6 @@ interface SnapBox {
   right: number;
   top: number;
   bottom: number;
-  cx: number;
-  cy: number;
   width: number;
   height: number;
 }
@@ -328,7 +452,7 @@ interface SnapBox {
  * 全画布智能对齐 + 防重叠:
  * - 只布局顶层节点(组内子节点随组节点整体移动, 不单独吸附);
  * - 按 y 顺序贪心处理: 先处理的节点作为固定基准(自身不动, 也不被后续节点拉动),
- *   后续节点吸附到「已固定节点/组边框」的边缘或中心线(左/中/右、上/中/下),
+ *   后续节点吸附到「已固定节点/组边框」的四条边(左/右、上/下),
  *   距离小于阈值(SMART_SNAP_THRESHOLD)才吸附;
  * - 保持节点原有上下相对顺序, 对齐后若有纵向重叠则自动下移错开, 保证不叠在一起。
  * 返回 nodeId -> 绝对坐标(与 computeAlignment 的返回值形式一致)。
@@ -355,8 +479,6 @@ export function computeSmartSnapLayout(
       right: left + size.width,
       top,
       bottom: top + size.height,
-      cx: left + size.width / 2,
-      cy: top + size.height / 2,
       width: size.width,
       height: size.height,
     });
@@ -385,17 +507,11 @@ export function computeSmartSnapLayout(
 
     for (const other of fixed) {
       const xCandidates: Array<[number, number]> = [
-        // self.left 对齐 other 的 left / cx / right(右缘贴左缘时留 SNAP_EDGE_GAP 空隙) → 目标 x
+        // self.left 对齐 other 的 left / right(右缘贴左缘时留 SNAP_EDGE_GAP 空隙) → 目标 x
         [other.left, Math.abs(self.left - other.left)],
-        [other.cx - self.width / 2, Math.abs(self.left - other.cx)],
         [other.right + SNAP_EDGE_GAP, Math.abs(self.left - other.right)],
-        // self.cx 对齐 other 的 left / cx / right → 目标 x
-        [other.left - self.width / 2, Math.abs(self.cx - other.left)],
-        [other.cx - self.width / 2, Math.abs(self.cx - other.cx)],
-        [other.right - self.width / 2, Math.abs(self.cx - other.right)],
-        // self.right 对齐 other 的 left(留 SNAP_EDGE_GAP 空隙) / cx / right → 目标 x
+        // self.right 对齐 other 的 left(留 SNAP_EDGE_GAP 空隙) / right → 目标 x
         [other.left - self.width - SNAP_EDGE_GAP, Math.abs(self.right - other.left)],
-        [other.cx - self.width / 2, Math.abs(self.right - other.cx)],
         [other.right - self.width, Math.abs(self.right - other.right)],
       ];
       for (const [target, dist] of xCandidates) {
@@ -406,17 +522,11 @@ export function computeSmartSnapLayout(
       }
 
       const yCandidates: Array<[number, number]> = [
-        // self.top 对齐 other 的 top / cy / bottom(下缘贴上缘时留空隙) → 目标 y
+        // self.top 对齐 other 的 top / bottom(下缘贴上缘时留空隙) → 目标 y
         [other.top, Math.abs(self.top - other.top)],
-        [other.cy - self.height / 2, Math.abs(self.top - other.cy)],
         [other.bottom + SNAP_EDGE_GAP, Math.abs(self.top - other.bottom)],
-        // self.cy 对齐 other 的 top / cy / bottom → 目标 y
-        [other.top - self.height / 2, Math.abs(self.cy - other.top)],
-        [other.cy - self.height / 2, Math.abs(self.cy - other.cy)],
-        [other.bottom - self.height / 2, Math.abs(self.cy - other.bottom)],
-        // self.bottom 对齐 other 的 top(留空隙) / cy / bottom → 目标 y
+        // self.bottom 对齐 other 的 top(留空隙) / bottom → 目标 y
         [other.top - self.height - SNAP_EDGE_GAP, Math.abs(self.bottom - other.top)],
-        [other.cy - self.height / 2, Math.abs(self.bottom - other.cy)],
         [other.bottom - self.height, Math.abs(self.bottom - other.bottom)],
       ];
       for (const [target, dist] of yCandidates) {
@@ -441,8 +551,6 @@ export function computeSmartSnapLayout(
       right: final.x + self.width,
       top: final.y,
       bottom: final.y + self.height,
-      cx: final.x + self.width / 2,
-      cy: final.y + self.height / 2,
       width: self.width,
       height: self.height,
     });

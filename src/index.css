@@ -165,9 +165,37 @@ html[data-platform='macos'] #root {
   border-radius: 8px;
 }
 
-.react-flow__handle {
-  width: 8px;
-  height: 8px;
+/* The canvas-level hit test adds this class before the pointer reaches the dot. */
+.react-flow .react-flow__handle::after {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  display: flex;
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  content: "+";
+  transform: translate(-50%, -50%);
+  border: 1px solid rgb(var(--accent-rgb) / 0.92);
+  border-radius: 9999px;
+  background: rgb(var(--surface-rgb) / 0.96);
+  color: rgb(var(--accent-rgb));
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 100ms ease, transform 100ms ease;
+}
+
+.react-flow .react-flow__handle:hover::after,
+.react-flow .react-flow__handle.connection-handle-nearby::after,
+.react-flow .react-flow__handle.connectingfrom::after,
+.react-flow .react-flow__handle.connectingto::after,
+.react-flow .react-flow__handle.valid::after {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1.04);
 }
 
 /* 所有类型节点使用同一套选中描边，不改变节点自身亮度。 */

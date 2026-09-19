@@ -104,7 +104,7 @@
     "chooseShareFailed": "选择共享盘位置失败",
     "sharePath": "共享盘文件夹",
     "sharePathRequired": "请输入共享盘文件夹路径",
-    "syncHint": "只会在确认的文件夹内写入模板 JSON 和视频备份，不会删除共享盘上的任何文件。",
+    "syncHint": "读取共享盘只导入本地没有的模板，不覆盖本地已有模板；同步只上传共享盘没有的模板，不覆盖共享盘已有模板，也不会删除任何模板。",
     "syncNow": "开始同步",
     "syncing": "同步中…",
     "syncSuccess": "已同步 {{templates}} 个模板、{{files}} 个文件",
@@ -169,9 +169,11 @@
       "groupHint": "框选或按住 ⌘ 多选 2 个以上节点后分组",
       "align": "对齐选中节点",
       "alignHint": "框选或按住 ⌘ 多选 2 个以上节点后对齐",
-      "alignAll": "一键整理:全部节点吸附最近网格并对齐,自动防重叠",
+      "alignAll": "一键整理:全部节点对齐到附近节点/组的上下左右边缘,自动防重叠",
       "snapOn": "开启网格磁吸",
       "snapOff": "关闭网格磁吸",
+      "alignmentGuidesOn": "关闭对齐辅助线",
+      "alignmentGuidesOff": "开启对齐辅助线",
       "shortcuts": "快捷键"
     },
     "shortcuts": {

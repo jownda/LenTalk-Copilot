@@ -115,6 +115,38 @@ fn open_templates(app: &AppHandle) -> Result<(Connection, Vec<TemplateStorageRec
     Ok((conn, records))
 }
 
+/// 读取共享盘中已经存在的模板 ID。
+///
+/// 同步是“只增不改”策略: 只要共享盘已有同一个模板 ID, 本次本地模板就不再
+/// 写入, 即使本地模板名称或内容后来发生了变化也不覆盖共享盘版本。
+fn shared_template_ids(templates_root: &Path) -> Result<HashSet<String>, String> {
+    let mut ids = HashSet::new();
+    if !templates_root.is_dir() {
+        return Ok(ids);
+    }
+    for entry in fs::read_dir(templates_root).map_err(|error| format!("读取共享盘模板目录失败: {error}"))? {
+        let package_dir = entry.map_err(|error| format!("读取共享盘模板目录失败: {error}"))?.path();
+        if !package_dir.is_dir() {
+            continue;
+        }
+        let template_json = package_dir.join("template.json");
+        let Ok(payload_json) = fs::read_to_string(&template_json) else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&payload_json) else {
+            continue;
+        };
+        if let Some(id) = payload.get("id").and_then(Value::as_str) {
+            ids.insert(id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+fn should_import_template(local_ids: &HashSet<String>, template_id: &str) -> bool {
+    !local_ids.contains(template_id)
+}
+
 /// 递归收集 payload 里所有「可搬运的媒体来源」。
 ///
 /// 不能只看 `assets` 数组: 节点数据里的 `previewImageUrl`(缩略图)、
@@ -316,11 +348,21 @@ pub async fn template_sync_to_share(app: AppHandle, shared_root: String) -> Resu
     let templates_root = root.join("templates");
     validate_shared_write_path(&root, &templates_root)?;
     fs::create_dir_all(&templates_root).map_err(|error| format!("创建模板备份目录失败: {error}"))?;
+    let existing_shared_ids = shared_template_ids(&templates_root)?;
+    let mut template_count = 0;
     let mut copied_file_count = 0;
 
     for record in &records {
+        // 共享盘已有同 ID 模板时完全跳过, 不覆盖共享盘现有内容。
+        if existing_shared_ids.contains(&record.id) {
+            continue;
+        }
         let payload: Value = serde_json::from_str(&record.payload_json).map_err(|error| format!("模板 {} 数据无效: {error}", record.id))?;
         let package_dir = templates_root.join(format!("{}-{}", safe_name(&record.name), safe_name(&record.id)));
+        // 兼容旧的/手工创建的目录: 即使 template.json 缺失或损坏, 也不能覆盖已有目录。
+        if package_dir.exists() {
+            continue;
+        }
         let videos_dir = package_dir.join("videos");
         validate_shared_write_path(&root, &package_dir)?;
         validate_shared_write_path(&root, &videos_dir)?;
@@ -359,9 +401,10 @@ pub async fn template_sync_to_share(app: AppHandle, shared_root: String) -> Resu
         if write_template_payload(&root, &manifest_json, &manifest_payload)? {
             copied_file_count += 1;
         }
+        template_count += 1;
     }
 
-    Ok(TemplateSyncResult { template_count: records.len(), copied_file_count })
+    Ok(TemplateSyncResult { template_count, copied_file_count })
 }
 
 #[tauri::command]
@@ -371,6 +414,18 @@ pub fn template_sync_from_share(app: AppHandle, shared_root: String) -> Result<T
     validate_shared_write_path(&root, &templates_root)?;
     if !templates_root.is_dir() { return Ok(TemplateImportResult { imported_count: 0 }); }
     let conn = database::open(&app)?;
+    let mut local_template_ids = HashSet::<String>::new();
+    {
+        let mut statement = conn
+            .prepare("SELECT id FROM templates")
+            .map_err(|error| format!("读取本地模板失败: {error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("读取本地模板失败: {error}"))?;
+        for row in rows {
+            local_template_ids.insert(row.map_err(|error| format!("读取本地模板失败: {error}"))?);
+        }
+    }
     let mut imported_count = 0;
     for entry in fs::read_dir(&templates_root).map_err(|error| format!("读取共享盘模板目录失败: {error}"))? {
         let package_dir = entry.map_err(|error| format!("读取共享盘模板目录失败: {error}"))?.path();
@@ -405,6 +460,10 @@ pub fn template_sync_from_share(app: AppHandle, shared_root: String) -> Result<T
             .and_then(Value::as_str)
             .ok_or_else(|| "共享盘模板缺少 id".to_string())?
             .to_string();
+        // 读取共享盘只做去重导入。本地已有同 ID 模板时保留本地版本, 绝不更新或删除。
+        if !should_import_template(&local_template_ids, &id) {
+            continue;
+        }
         let media_by_name = cache_imported_template_media(&app, &id, &videos_dir)?;
         let local_source_map = source_map
             .into_iter()
@@ -418,8 +477,11 @@ pub fn template_sync_from_share(app: AppHandle, shared_root: String) -> Result<T
         let created_at = payload.get("createdAt").and_then(Value::as_str).and_then(|value| chrono_like_timestamp(value)).unwrap_or(0);
         let updated_at = payload.get("updatedAt").and_then(Value::as_str).and_then(|value| chrono_like_timestamp(value)).unwrap_or(created_at);
         let imported_payload = serde_json::to_string(&payload).map_err(|error| format!("序列化导入模板失败: {error}"))?;
-        conn.execute("INSERT INTO templates (id, name, payload_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET name=excluded.name, payload_json=excluded.payload_json, updated_at=excluded.updated_at", params![id, name, imported_payload, created_at, updated_at]).map_err(|error| format!("导入模板失败: {error}"))?;
-        imported_count += 1;
+        let inserted = conn.execute("INSERT OR IGNORE INTO templates (id, name, payload_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![&id, name, imported_payload, created_at, updated_at]).map_err(|error| format!("导入模板失败: {error}"))?;
+        if inserted > 0 {
+            local_template_ids.insert(id);
+            imported_count += 1;
+        }
     }
     Ok(TemplateImportResult { imported_count })
 }
@@ -431,7 +493,7 @@ fn chrono_like_timestamp(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_share_path, rewrite_import_media_paths, rewrite_media_paths, safe_name, validate_shared_write_path};
+    use super::{normalize_share_path, rewrite_import_media_paths, rewrite_media_paths, safe_name, should_import_template, shared_template_ids, validate_shared_write_path};
     use std::collections::HashMap;
     use std::path::Path;
     use serde_json::json;
@@ -448,6 +510,24 @@ mod tests {
         assert!(validate_shared_write_path(root, Path::new(r"\\server\share\templates\a\template.json")).is_ok());
         assert!(validate_shared_write_path(root, Path::new(r"\\server\share\other\template.json")).is_err());
         assert!(validate_shared_write_path(root, Path::new(r"\\server\share\templates\..\other\template.json")).is_err());
+    }
+
+    #[test]
+    fn shared_template_ids_are_used_for_upload_deduplication() {
+        let dir = std::env::temp_dir().join(format!("lentalk-template-shared-ids-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("existing-package")).unwrap();
+        std::fs::write(
+            dir.join("existing-package").join("template.json"),
+            r#"{"id":"existing-template","name":"已有模板"}"#,
+        )
+        .unwrap();
+
+        let ids = shared_template_ids(&dir).unwrap();
+        assert!(ids.contains("existing-template"));
+        assert!(!should_import_template(&ids, "existing-template"));
+        assert!(should_import_template(&ids, "local-only-template"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

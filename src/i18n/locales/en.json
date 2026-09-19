@@ -104,7 +104,7 @@
     "chooseShareFailed": "Failed to choose shared-drive folder",
     "sharePath": "Shared-drive folder",
     "sharePathRequired": "Enter a shared-drive folder path",
-    "syncHint": "Only template JSON and video backups are written inside the confirmed folder. No shared-drive files are deleted.",
+    "syncHint": "Reading imports only templates missing locally and never overwrites local templates. Sync uploads only templates missing on the shared drive and never overwrites or deletes existing templates.",
     "syncNow": "Sync now",
     "syncing": "Syncing...",
     "syncSuccess": "Synced {{templates}} templates and {{files}} files",
@@ -169,9 +169,11 @@
       "groupHint": "Select 2+ nodes (drag or ⌘) to group",
       "align": "Align selected nodes",
       "alignHint": "Select 2+ nodes (drag or ⌘) to align",
-      "alignAll": "One-click tidy: snap all nodes to nearest grid and prevent overlap",
+      "alignAll": "One-click tidy: align nodes to nearby node/group edges",
       "snapOn": "Enable grid snap",
       "snapOff": "Disable grid snap",
+      "alignmentGuidesOn": "Turn off alignment guides",
+      "alignmentGuidesOff": "Turn on alignment guides",
       "shortcuts": "Shortcuts"
     },
     "shortcuts": {

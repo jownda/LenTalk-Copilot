@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import { CANVAS_NODE_TYPES, type CanvasNode } from '../domain/canvasNodes';
 import {
+  ALIGNMENT_GUIDE_SNAP_THRESHOLD,
+  computeDragAlignment,
   computeSmartSnapLayout,
   SMART_SNAP_THRESHOLD,
   SNAP_EDGE_GAP,
@@ -57,12 +59,11 @@ describe('computeSmartSnapLayout', () => {
     expect(result.get('b')).toEqual({ x: 0, y: 300 + SNAP_EDGE_GAP });
   });
 
-  it('中心线相距 ≤ 阈值时水平居中对齐', () => {
-    // c(0,0,220x200): cx=110; b 宽 100, 放在 x=60 时 b.cx=110 → 与 c.cx 完全对齐(距离 0)
+  it('中心线接近时不进行自动吸附', () => {
+    // c(0,0,220x200): b 宽 100, x=58 时 b.cx=108, 但左右边缘均不接近 c 的边缘
     const nodes = [createNode('c', 0, 0), createNode('b', 58, 500, 100, 100)];
     const result = computeSmartSnapLayout(nodes, SMART_SNAP_THRESHOLD);
-    // b.cx=108 距 c.cx=110 仅 2px → b.x = 110 - 50 = 60
-    expect(result.get('b')).toEqual({ x: 60, y: 500 });
+    expect(result.get('b')).toEqual({ x: 58, y: 500 });
   });
 
   it('距离超过阈值时不吸附', () => {
@@ -118,8 +119,8 @@ describe('computeSmartSnapLayout', () => {
   });
 
   it('吸附后纵向重叠时自动错开(y 方向)', () => {
-    // c 固定; a.left=6 → 吸到 c.left=0; b(宽100) cx 距 c.cx 10px → 吸到 x=60;
-    // a(0..220, 300..500) 与 b(60..160, 320..420) x/y 均重叠 → b 下移错开
+    // c 固定; a.left=6 → 吸到 c.left=0; b 不按中心线吸附, 保持 x=50;
+    // a(0..220, 300..500) 与 b(50..150, 320..420) x/y 均重叠 → b 下移错开
     const nodes = [
       createNode('c', 0, 0),
       createNode('a', 6, 300),
@@ -127,10 +128,55 @@ describe('computeSmartSnapLayout', () => {
     ];
     const result = computeSmartSnapLayout(nodes, SMART_SNAP_THRESHOLD);
     expect(result.get('a')).toEqual({ x: 0, y: 300 });
-    expect(result.get('b')?.x).toBe(60);
+    expect(result.get('b')?.x).toBe(50);
     const aPos = result.get('a') as { x: number; y: number };
     const bPos = result.get('b') as { x: number; y: number };
     // b 在 a 下方且重叠 → b.y ≥ a.bottom + 24 = 500 + 24
     expect(bPos.y).toBeGreaterThanOrEqual(aPos.y + 200 + 24);
+  });
+});
+
+describe('computeDragAlignment', () => {
+  it('接近左边缘时吸附并返回垂直辅助线', () => {
+    const result = computeDragAlignment(
+      { id: 'moving', x: 108, y: 400, width: 100, height: 80 },
+      [{ id: 'reference', x: 100, y: 100, width: 220, height: 200 }],
+      ALIGNMENT_GUIDE_SNAP_THRESHOLD,
+    );
+
+    expect(result.position.x).toBe(100);
+    expect(result.guides).toContainEqual({
+      axis: 'vertical',
+      position: 100,
+      start: 100,
+      end: 480,
+    });
+  });
+
+  it('接近上边缘时吸附并返回水平辅助线', () => {
+    const result = computeDragAlignment(
+      { id: 'moving', x: 500, y: 112, width: 100, height: 80 },
+      [{ id: 'reference', x: 100, y: 100, width: 220, height: 200 }],
+      ALIGNMENT_GUIDE_SNAP_THRESHOLD,
+    );
+
+    expect(result.position.y).toBe(100);
+    expect(result.guides).toContainEqual({
+      axis: 'horizontal',
+      position: 100,
+      start: 100,
+      end: 600,
+    });
+  });
+
+  it('超过吸附阈值时保持原位置且不显示辅助线', () => {
+    const result = computeDragAlignment(
+      { id: 'moving', x: 350, y: 400, width: 100, height: 80 },
+      [{ id: 'reference', x: 100, y: 100, width: 220, height: 200 }],
+      ALIGNMENT_GUIDE_SNAP_THRESHOLD,
+    );
+
+    expect(result.position).toEqual({ x: 350, y: 400 });
+    expect(result.guides).toEqual([]);
   });
 });
