@@ -89,4 +89,27 @@ describe("DefaultGraphImageResolver", () => {
     expect(resolver.collectInputImages(targetId, nodes, edges)).toEqual(["location.png", "character.png"]);
     expect(resolver.collectInputAudio(targetId, nodes, edges)).toEqual(["character-voice.mp3"]);
   });
+
+  it("keeps video inputs separate from audio inputs for motion-control nodes", () => {
+    const targetId = "motion-control";
+    const resolver = new DefaultGraphImageResolver();
+    const nodes = [
+      createNode("source-video", CANVAS_NODE_TYPES.audio, {
+        mediaType: "video",
+        sourcePath: "motion-reference.mp4",
+      }),
+      createNode("source-audio", CANVAS_NODE_TYPES.audio, {
+        mediaType: "audio",
+        sourcePath: "voice.wav",
+      }),
+      createNode(targetId, CANVAS_NODE_TYPES.motionControl, {}),
+    ];
+    const edges = [
+      createEdge("source-video", targetId),
+      createEdge("source-audio", targetId),
+    ];
+
+    expect(resolver.collectInputVideos(targetId, nodes, edges)).toEqual(["motion-reference.mp4"]);
+    expect(resolver.collectInputAudio(targetId, nodes, edges)).toEqual(["voice.wav"]);
+  });
 });

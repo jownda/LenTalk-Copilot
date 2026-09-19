@@ -60,6 +60,33 @@ describe('buildQuickPromptRequest', () => {
     expect(system).toContain('only for a character who actually speaks a line in the synopsis');
   });
 
+  it('keeps audio references out of ACTIVE REFERENCES and places them in voice locks', () => {
+    const { system, user } = buildQuickPromptRequest({
+      style: '电影感',
+      synopsis: '侦探压低声音说：“站住。”',
+      sceneAssets: [{ id: 'loc', name: '站台', mediaType: 'image', referenceIndex: 1 }],
+      characterAssets: [
+        { id: 'hero', name: '侦探', mediaType: 'image', referenceIndex: 2 },
+        { id: 'hero-voice', name: '侦探声音', mediaType: 'audio', referenceIndex: 1, description: '低沉、尾音收紧' },
+      ],
+      props: [{ id: 'radio-voice', name: '现场音频', mediaType: 'audio', referenceIndex: 2 }],
+    }, 'zh');
+
+    const activeStart = user.indexOf('ACTIVE REFERENCES:');
+    const voiceLockStart = user.indexOf('VOICE LOCK REFERENCES (');
+    const activeReferences = user.slice(activeStart, voiceLockStart);
+
+    expect(activeReferences).toContain('@站台 [image1]');
+    expect(activeReferences).toContain('@侦探 [image2]');
+    expect(activeReferences).not.toContain('[audio1]');
+    expect(activeReferences).not.toContain('[audio2]');
+    expect(user).toContain('VOICE LOCK REFERENCES (声音锁参考；音频引用只能放在 AUDIO 中):');
+    expect(user).toContain('@侦探声音 [audio1] (character audio) — 低沉、尾音收紧');
+    expect(user).toContain('@现场音频 [audio2] (prop audio)');
+    expect(system).toContain('Audio @asset tags and [audioN] tokens come only from VOICE LOCK REFERENCES');
+    expect(system).toContain('must not be moved into ACTIVE REFERENCES');
+  });
+
   it('switches the required output language with the locale', () => {
     const input = {
       style: '胶片颗粒',

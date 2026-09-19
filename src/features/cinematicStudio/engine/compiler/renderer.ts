@@ -63,7 +63,7 @@ export function renderPropDefaults(asset: Asset, locale: PromptLocale = "zh", ho
 export type ReferenceSyntax = "asset-id" | "at-mention" | "plain-text";
 
 /** 单条资产 canonical 行（Asset-ID 模板；P2.1 支持三种引用语法，P0.2 双语） */
-export function renderAssetLine(asset: Asset, imageIndex: number | undefined, syntax: ReferenceSyntax = "asset-id", locale: PromptLocale = "zh", holderName?: (id: string) => string, audioIndex?: number): string {
+export function renderAssetLine(asset: Asset, imageIndex: number | undefined, syntax: ReferenceSyntax = "asset-id", locale: PromptLocale = "zh", holderName?: (id: string) => string, audioIndex?: number, audioReferenceName?: string): string {
   const lex = promptLexicon(locale);
   const desc = assetCanonicalDescription(asset, locale) || asset.name.trim();
   const referenceName = asset.referenceTag?.trim() || asset.name.trim() || asset.id;
@@ -87,7 +87,10 @@ export function renderAssetLine(asset: Asset, imageIndex: number | undefined, sy
   if (always.length > 0) parts.push(`${lex.labels.alwaysVisible}: ${always.join(locale === "zh" ? "；" : "; ")}.`);
   const propDefaults = renderPropDefaults(asset, locale, holderName);
   if (propDefaults) parts.push(propDefaults);
-  if (audioIndex && asset.voiceClip?.trim()) parts.push(locale === "zh" ? `声音参考：@audio${audioIndex}。` : `Voice reference: @audio${audioIndex}.`);
+  if (audioIndex && asset.voiceClip?.trim()) {
+    const audioReference = audioReferenceName?.trim() ? `@${audioReferenceName.trim()} [audio${audioIndex}]` : `@audio${audioIndex}`;
+    parts.push(locale === "zh" ? `声音参考：${audioReference}。` : `Voice reference: ${audioReference}.`);
+  }
   return parts.join(" ");
 }
 
@@ -97,6 +100,27 @@ export interface AssetRegistry {
   indexByAssetId: Map<string, number>;
   /** 按引用顺序排列的资产 */
   orderedAssets: Asset[];
+  /** 角色资产 id → 其绑定的音频资产名称。 */
+  audioReferenceNameByAssetId?: ReadonlyMap<string, string>;
+}
+
+function audioReferenceNameByAssetId(project: ProjectV2, assets: Asset[]): Map<string, string> {
+  const audioAssets = (project.assets ?? []).filter((asset) => asset.kind === "audio-reference");
+  const byId = new Map(audioAssets.map((asset) => [asset.id, asset]));
+  const bySource = new Map<string, Asset>();
+  for (const asset of audioAssets) {
+    const source = asset.referencePaths?.[0]?.trim();
+    if (source) bySource.set(source, asset);
+  }
+  const result = new Map<string, string>();
+  for (const asset of assets) {
+    if (asset.kind !== "character" || !asset.voiceClip?.trim()) continue;
+    const linked = (asset.voiceAssetId ? byId.get(asset.voiceAssetId) : undefined)
+      ?? bySource.get(asset.voiceClip.trim());
+    const name = linked?.name.trim() || asset.voiceAssetName?.trim();
+    if (name) result.set(asset.id, name);
+  }
+  return result;
 }
 
 /**
@@ -135,6 +159,7 @@ export function buildAssetRegistry(project: ProjectV2, scene: SceneV2, shot: Sho
   return {
     indexByAssetId: new Map(orderedAssets.map((asset, index) => [asset.id, index + 1])),
     orderedAssets,
+    audioReferenceNameByAssetId: audioReferenceNameByAssetId(project, orderedAssets),
   };
 }
 
@@ -189,6 +214,7 @@ export function buildSceneAssetRegistry(
   return {
     indexByAssetId: new Map(orderedAssets.map((asset, index) => [asset.id, index + 1])),
     orderedAssets,
+    audioReferenceNameByAssetId: audioReferenceNameByAssetId(project, orderedAssets),
   };
 }
 

@@ -139,11 +139,17 @@ export function resolveZzdhAspectRatioFromSize(width: number, height: number): Z
 // 视频档位 / 时长
 // ---------------------------------------------------------------------------
 
-export type ZzdhResolutionTier = '480p' | '540p' | '720p' | '1080p' | '2k' | '4k';
+export type ZzdhResolutionTier = '480p' | '540p' | '720p' | '768p' | '1080p' | '2k' | '4k';
+
+/** 字字动画限时优惠对口型模型名。旧版已保存的平台配置也要能显示它们。 */
+export const ZZDH_LIP_SYNC_MODEL_NAMES = [
+  'zzdh-minimax-h3-限时优惠-对口型-480p',
+  'zzdh-minimax-h3-限时优惠-对口型-768p',
+] as const;
 
 /** 档位写在模型名里(如 zzdh-Minimax-h3-480p、doubao-seedance-2-video-4k)。 */
 export function resolveZzdhResolutionTier(model: string): ZzdhResolutionTier | null {
-  const hit = model.trim().toLowerCase().match(/(?:^|[-_])(480p|540p|720p|1080p|2k|4k)(?:[-_]|$)/);
+  const hit = model.trim().toLowerCase().match(/(?:^|[-_])(480p|540p|720p|768p|1080p|2k|4k)(?:[-_]|$)/);
   return (hit?.[1] as ZzdhResolutionTier | undefined) ?? null;
 }
 
@@ -180,6 +186,14 @@ export function resolveZzdhVideoFamily(model: string): ZzdhVideoFamily {
 /** 名称含 `-video`(或在 `-video-` 段)的模型是视频参考调用, 必须传 reference_videos。 */
 export function isZzdhVideoReferenceModel(model: string): boolean {
   return /(?:^|[-_])video(?:[-_]|$)/.test(model.trim().toLowerCase());
+}
+
+/** 字子动画专用对口型模型，不能出现在普通视频节点里。 */
+export function isZzdhLipSyncModel(model: string): boolean {
+  const normalized = model.trim().toLowerCase();
+  return normalized.includes('对口型')
+    || normalized.includes('lip-sync')
+    || normalized.includes('lipsync');
 }
 
 export type ZzdhReferenceRole = 'first_frame' | 'last_frame' | 'reference_image';

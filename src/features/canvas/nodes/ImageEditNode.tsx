@@ -20,6 +20,8 @@ import {
   CANVAS_NODE_TYPES,
   EXPORT_RESULT_NODE_DEFAULT_WIDTH,
   EXPORT_RESULT_NODE_LAYOUT_HEIGHT,
+  IMAGE_GENERATION_COUNT_MAX,
+  IMAGE_GENERATION_COUNT_MIN,
   type ImageEditNodeData,
   type ImageSize,
 } from '@/features/canvas/domain/canvasNodes';
@@ -406,6 +408,15 @@ function pickClosestAspectRatio(
   return bestValue;
 }
 
+function resolveImageGenerationCount(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return IMAGE_GENERATION_COUNT_MIN;
+  return Math.max(
+    IMAGE_GENERATION_COUNT_MIN,
+    Math.min(IMAGE_GENERATION_COUNT_MAX, Math.round(numeric)),
+  );
+}
+
 function buildAiResultNodeTitle(prompt: string, fallbackTitle: string): string {
   const normalizedPrompt = prompt.trim();
   if (!normalizedPrompt) {
@@ -489,6 +500,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
 
   const imageModels = listImageModels();
   const selectedModel = getImageModel(data.model ?? DEFAULT_IMAGE_MODEL_ID);
+  const imageCount = resolveImageGenerationCount(data.imageCount);
   const providerApiKey = apiKeys[selectedModel.providerId] ?? '';
   // 即梦 / 万相这类本机 CLI 平台靠可执行文件与登录态工作, 没有可填的密钥 ——
   // 不能因为 apiKeys 里没有这一项就把生成拦下来。
@@ -799,8 +811,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
           model: requestResolution.requestModel,
           size: selectedResolution.value,
           aspectRatio: selectedAspectRatio.value,
+          imageCount,
           referenceImages: incomingImages,
-          extraParams: effectiveExtraParams,
+          extraParams: { ...effectiveExtraParams, image_count: imageCount },
         },
         resultKind: 'generic',
         displayName: resultNodeTitle,
@@ -843,6 +856,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
           model: requestResolution.requestModel,
           size: selectedResolution.value,
           aspectRatio: resolvedRequestAspectRatio,
+          imageCount,
           referenceImages: incomingImages,
           extraParams: effectiveExtraParams,
         },
@@ -853,6 +867,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         model: requestResolution.requestModel,
         size: selectedResolution.value,
         aspectRatio: resolvedRequestAspectRatio,
+        imageCount,
         referenceImages: incomingImages,
         extraParams: effectiveExtraParams,
       };
@@ -939,6 +954,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     flushPromptCommit,
     id,
     incomingImages,
+    imageCount,
     isKeylessProvider,
     requestResolution.requestModel,
     selectedAspectRatio.value,
@@ -1336,6 +1352,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
           selectedResolution={selectedResolution}
           selectedAspectRatio={selectedAspectRatio}
           aspectRatioOptions={aspectRatioOptions}
+          imageCount={imageCount}
           onModelChange={(modelId) => {
             updateNodeData(id, {
               model: modelId,
@@ -1352,6 +1369,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
             updateNodeData(id, { requestAspectRatio: aspectRatio });
             setLastImageAspectRatio(aspectRatio);
           }
+          }
+          onImageCountChange={(count) =>
+            updateNodeData(id, { imageCount: resolveImageGenerationCount(count) })
           }
           extraParams={data.extraParams}
           onExtraParamChange={(key, value) =>

@@ -36,6 +36,17 @@ function mergeNegativePrompt(
   return Object.keys(extras).length > 0 ? extras : payload.extraParams;
 }
 
+function mergeImageCount(
+  extraParams: Record<string, unknown> | undefined,
+  imageCount: number | undefined,
+): Record<string, unknown> | undefined {
+  const numeric = typeof imageCount === 'number' && Number.isFinite(imageCount)
+    ? Math.max(1, Math.min(4, Math.round(imageCount)))
+    : undefined;
+  if (numeric == null) return extraParams;
+  return { ...(extraParams ?? {}), image_count: numeric };
+}
+
 function withAspectRatioRequirement(prompt: string, aspectRatio: string): string {
   const match = aspectRatio.trim().match(/^(\d+)\s*:\s*(\d+)$/);
   if (!match || Number(match[1]) <= 0 || Number(match[2]) <= 0) {
@@ -416,7 +427,10 @@ export const tauriAiGateway: AiGateway = {
       normalizedReferenceImages,
       injected.model.split('/')[0] ?? ''
     );
-    const mergedExtraParams = mergeNegativePrompt(injected);
+    const mergedExtraParams = mergeImageCount(
+      mergeNegativePrompt(injected),
+      payload.imageCount,
+    );
 
     return await generateImage({
       prompt: localizeReferenceTokens(
@@ -427,6 +441,7 @@ export const tauriAiGateway: AiGateway = {
       model: payload.model,
       size: payload.size,
       aspect_ratio: payload.aspectRatio,
+      image_count: payload.imageCount,
       reference_images: referenceImages,
       extra_params: mergedExtraParams,
     });
@@ -443,7 +458,10 @@ export const tauriAiGateway: AiGateway = {
       normalizedReferenceImages,
       injected.model.split('/')[0] ?? ''
     );
-    const mergedExtraParams = mergeNegativePrompt(injected);
+    const mergedExtraParams = mergeImageCount(
+      mergeNegativePrompt(injected),
+      payload.imageCount,
+    );
     // 即梦 CLI 的画幅由 `--ratio` 直接决定, 不需要(也不该)往提示词里追加画幅约束;
     // 其余平台依赖这句英文兜底上游忽略 aspect_ratio 参数的情况。
     // 这里按整个 provider 前缀判断: 普通图片(`image-*`)与超清(`upscale`)都算。
@@ -460,6 +478,7 @@ export const tauriAiGateway: AiGateway = {
       model: payload.model,
       size: payload.size,
       aspect_ratio: payload.aspectRatio,
+      image_count: payload.imageCount,
       reference_images: referenceImages,
       extra_params: mergedExtraParams,
     });
@@ -502,7 +521,16 @@ export const tauriAiGateway: AiGateway = {
     }
 
     // 视频语义固定为异步任务(提交+轮询), 不受图片默认 sync 影响
+    const requestedTransport = payload.extraParams?.video_transport;
     const injected = injectCustomApiRequestMode(payload, 'async');
+    // 动作控制 / 对口型是 Kling 专用 endpoint。即使自定义平台之前探测过
+    // 普通视频 transport，也不能覆盖节点显式选择的控制协议。
+    if (requestedTransport === 'kling-control' || requestedTransport === 'zzdh-v8-video') {
+      injected.extraParams = {
+        ...(injected.extraParams ?? {}),
+        video_transport: 'kling-control',
+      };
+    }
     const profile = resolveVideoModelProfile(
       payload.model,
       typeof injected.extraParams?.provider_base_url === 'string'

@@ -72,16 +72,31 @@ fn validate_share_root(value: &str) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// 把任意字符串净化成安全的文件/目录名, 并按 UTF-8 字节预算截断。
+///
+/// **绝不能用 `String::truncate`**: 它按字节切, 切点多字节字符(中文/emoji)中间时会
+/// `assert!(self.is_char_boundary(new_len))` 直接 panic。模板名常直接取用提示词
+/// (动辄数千字节的中文), 第 80 字节很容易落在汉字中间 —— 命令 panic 后 Tauri
+/// 不会回包, 前端 `invoke` 永不 settle, 界面就永久停在「同步中」, 共享盘上连目录
+/// 都建不出来。改成按字符累加、以字节预算为上限, 保证落点始终在字符边界上。
+const SAFE_NAME_MAX_BYTES: usize = 80;
+
 fn safe_name(value: &str) -> String {
-    let mut result = value.trim().chars().map(|character| {
+    let sanitized = value.trim().chars().map(|character| {
         if matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || character.is_control() {
             '_'
         } else {
             character
         }
-    }).collect::<String>();
-    result.truncate(80);
-    let result = result.trim_matches([' ', '.']).to_string();
+    });
+    let mut truncated = String::new();
+    for character in sanitized {
+        if truncated.len() + character.len_utf8() > SAFE_NAME_MAX_BYTES {
+            break;
+        }
+        truncated.push(character);
+    }
+    let result = truncated.trim_matches([' ', '.']).to_string();
     if result.is_empty() { "template".to_string() } else { result }
 }
 
@@ -100,15 +115,35 @@ fn open_templates(app: &AppHandle) -> Result<(Connection, Vec<TemplateStorageRec
     Ok((conn, records))
 }
 
+/// 递归收集 payload 里所有「可搬运的媒体来源」。
+///
+/// 不能只看 `assets` 数组: 节点数据里的 `previewImageUrl`(缩略图)、
+/// `studioReferenceImages` / `studioReferenceAudio` 等字段并不保证出现在
+/// `assets` 里(见 `createTemplate.ts`), 而 `rewrite_media_paths` 会重写整份
+/// payload。漏掉的字段会以「导出机本地绝对路径」原样写进共享盘 template.json,
+/// 换电脑后这些路径不存在 → 图片/缩略图全坏。
+///
+/// 只收「远端 URL」和「本机真实存在的文件」: `data:` 是自包含的内联数据,
+/// `asset:` 需要运行时解析, 两者都搬不动也无需搬运。
 fn asset_sources(payload: &Value) -> Vec<String> {
-    payload.get("assets")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|asset| asset.get("sourcePath").and_then(Value::as_str))
-        .filter(|source| is_remote_source(source) || source_to_local_path(source).is_some())
-        .map(ToString::to_string)
-        .collect()
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+    collect_media_sources(payload, &mut sources, &mut seen);
+    sources
+}
+
+fn collect_media_sources(value: &Value, sources: &mut Vec<String>, seen: &mut HashSet<String>) {
+    match value {
+        Value::String(source) => {
+            let transportable = is_remote_source(source) || source_to_local_path(source).is_some();
+            if transportable && seen.insert(source.clone()) {
+                sources.push(source.clone());
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| collect_media_sources(item, sources, seen)),
+        Value::Object(entries) => entries.values().for_each(|item| collect_media_sources(item, sources, seen)),
+        _ => {}
+    }
 }
 
 fn is_remote_source(source: &str) -> bool {
@@ -396,7 +431,7 @@ fn chrono_like_timestamp(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_share_path, rewrite_import_media_paths, rewrite_media_paths, validate_shared_write_path};
+    use super::{normalize_share_path, rewrite_import_media_paths, rewrite_media_paths, safe_name, validate_shared_write_path};
     use std::collections::HashMap;
     use std::path::Path;
     use serde_json::json;
@@ -413,6 +448,65 @@ mod tests {
         assert!(validate_shared_write_path(root, Path::new(r"\\server\share\templates\a\template.json")).is_ok());
         assert!(validate_shared_write_path(root, Path::new(r"\\server\share\other\template.json")).is_err());
         assert!(validate_shared_write_path(root, Path::new(r"\\server\share\templates\..\other\template.json")).is_err());
+    }
+
+    #[test]
+    fn collects_media_sources_outside_the_assets_array() {
+        // 复现线上问题: 节点数据里的 previewImageUrl 不在 assets 里,
+        // 旧实现只扫 assets → 缩略图不会被拷到共享盘, 换电脑后全坏。
+        let dir = std::env::temp_dir().join("lentalk-template-sync-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let preview = dir.join("preview.png");
+        std::fs::write(&preview, b"stub").unwrap();
+        let preview_text = preview.to_string_lossy().to_string();
+        let payload = json!({
+            "assets": [{ "sourcePath": "https://example.com/cover.mp4" }],
+            "graph": { "nodes": [{ "data": { "previewImageUrl": preview_text } }] },
+        });
+
+        let sources = super::asset_sources(&payload);
+
+        assert!(sources.contains(&"https://example.com/cover.mp4".to_string()));
+        assert!(sources.contains(&preview_text), "节点数据里的本机文件也必须被收集: {sources:?}");
+    }
+
+    #[test]
+    fn media_sources_are_deduplicated_and_skip_untransportable_schemes() {
+        let payload = json!({
+            "assets": [
+                { "sourcePath": "https://example.com/a.png" },
+                { "sourcePath": "https://example.com/a.png" },
+            ],
+            "graph": { "nodes": [{ "data": {
+                "previewImageUrl": "data:image/png;base64,iVBORw0KGgo=",
+                "imageUrl": "asset:library/abc.png",
+            } }] },
+        });
+
+        let sources = super::asset_sources(&payload);
+
+        assert_eq!(sources, vec!["https://example.com/a.png".to_string()]);
+    }
+
+    #[test]
+    fn safe_name_never_cuts_a_multibyte_character() {
+        // 复现线上「一直卡在同步中」: 模板名直接取用提示词(长中文), 旧实现用
+        // String::truncate(80) 按字节切, 第 80 字节落在汉字中间 → panic →
+        // 命令不回包 → 前端 invoke 永不 settle。
+        let name = "SCENE CONTEXT \n13.5秒竖屏9:16真人实景药品广告短片。约50岁男士与藏医视频通话，全流程展示藏九公腰椎贴的使用与承诺。";
+        let result = safe_name(name);
+        assert!(result.len() <= super::SAFE_NAME_MAX_BYTES, "截断后字节数超预算: {}", result.len());
+        assert!(result.is_char_boundary(result.len()), "截断点必须落在字符边界上");
+
+        // 第 80 字节恰好落在字符边界时也必须正常(不能因为贪心提前少截太多)
+        let aligned = "SCENE CONTEXT\n传统藏式药房工坊内部，草药香气与热气弥漫。中景横贯一条长木案，两侧立着满墙药材斗柜。";
+        assert!(!safe_name(aligned).is_empty());
+    }
+
+    #[test]
+    fn safe_name_falls_back_for_blank_and_strips_illegal_characters() {
+        assert_eq!(safe_name("   "), "template");
+        assert_eq!(safe_name(r#"a<b>c:d"e/f\g|h?i*j"#), "a_b_c_d_e_f_g_h_i_j");
     }
 
     #[test]

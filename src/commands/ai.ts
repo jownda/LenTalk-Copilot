@@ -40,6 +40,7 @@ export interface GenerateRequest {
   model: string;
   size: string;
   aspect_ratio: string;
+  image_count?: number;
   reference_images?: string[];
   extra_params?: Record<string, unknown>;
 }
@@ -155,6 +156,7 @@ function sanitizeGenerateRequestForLog(request: GenerateRequest): Record<string,
     model: request.model,
     size: request.size,
     aspect_ratio: request.aspect_ratio,
+    image_count: request.image_count ?? 1,
     reference_images_count: request.reference_images?.length ?? 0,
     reference_images_preview: (request.reference_images ?? []).map((item) =>
       truncateBase64Like(item)
@@ -340,6 +342,7 @@ function getVideoResultUrl(payload: unknown): string | null {
       'outputs',
       'output',
       'results',
+      'task_result',
       'files',
       'task',
       'content',
@@ -735,6 +738,11 @@ export type ZzdhReferenceImage =
   | { url: string; role: ZzdhReferenceRole }
   | { base64: string; role: ZzdhReferenceRole };
 
+/** 字子动画参考视频沿用 reference_videos: [{ url }] 结构。H3 只接受公网 URL。 */
+export type ZzdhReferenceVideo =
+  | { url: string }
+  | { base64: string };
+
 interface ReferenceAssetUploadConfig {
   url: string;
   token: string;
@@ -811,6 +819,26 @@ export async function resolveZzdhReferenceImages(
   }));
 }
 
+export async function resolveZzdhReferenceVideos(
+  sources: string[],
+  family: ReturnType<typeof resolveZzdhVideoFamily>,
+  upload?: ReferenceAssetUploadConfig | null,
+): Promise<ZzdhReferenceVideo[]> {
+  return await Promise.all(sources.map(async (source, index) => {
+    const asset = await resolveReferenceAssetSource(source, `字子动画参考视频 ${index + 1}`);
+    if (asset.kind === 'url') return { url: asset.url };
+    if (family === 'minimax-h3') {
+      if (upload) {
+        return { url: await uploadPublicReferenceAsset(asset, upload, index) };
+      }
+      throw new Error(
+        '字子动画 MiniMax H3 对口型参考视频仅支持公网 HTTP(S) URL：当前素材是本地或内嵌视频。请先在字子动画的平台设置中配置“参考素材上传地址”和“上传令牌”，或上传到可公开访问的图床/CDN 后再生成。',
+      );
+    }
+    return { base64: asset.base64 };
+  }));
+}
+
 async function generateZzdhVideo(
   request: GenerateVideoRequest,
   baseUrl: string,
@@ -830,9 +858,28 @@ async function generateZzdhVideo(
     request.image_mode,
     resolveReferenceAssetUploadConfig(request.extra_params),
   );
+  const rawReferenceVideos = (() => {
+    const value = request.extra_params?.reference_videos;
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter((video): video is string => typeof video === 'string' && video.trim().length > 0)
+      .map((video) => video.trim())
+      .slice(0, 3);
+  })();
+  const referenceVideos = await resolveZzdhReferenceVideos(
+    rawReferenceVideos,
+    family,
+    resolveReferenceAssetUploadConfig(request.extra_params),
+  );
   // 模式: H3 官方文档要求显式声明(不传会被静默当成参考生)。
   // H3 专有字段, 其它系列(Kling/seedance/wan)不传。
-  const generationMode = resolveZzdhGenerationMode(request.image_mode, images.length, apiModel);
+  // 视频+音频对口型没有 reference_images，但仍属于参考生；不能因为图片数为 0
+  // 就把请求误标成纯文生 t2v。
+  const generationMode = resolveZzdhGenerationMode(
+    request.image_mode,
+    images.length + referenceVideos.length,
+    apiModel,
+  );
   // 画幅: 官方枚举只有 16:9 / 9:16 / 1:1。网关默认 16:9 且不跟随图片 ——
   // 首尾帧从首帧推导, 其它模式用 UI 选择值(超出枚举的旧值在此收敛)。
   const aspectRatio = isFirstLast
@@ -859,6 +906,7 @@ async function generateZzdhVideo(
     ...(isMinimaxH3 ? { mode: generationMode } : {}),
     ...(resolution ? { resolution } : {}),
     ...(referenceImages.length ? { reference_images: referenceImages } : {}),
+    ...(referenceVideos.length ? { reference_videos: referenceVideos } : {}),
     ...(referenceAudios.length ? { reference_audios: referenceAudios } : {}),
   };
   const submitUrl = `${baseUrl}/v8/videos/generations`;
@@ -1685,6 +1733,193 @@ async function generateSub2ApiVideo(
   }
 }
 
+type KlingControlMode = 'motion-control' | 'lip-sync';
+
+function readKlingString(extraParams: GenerateVideoRequest['extra_params'], key: string): string {
+  const value = extraParams?.[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+async function resolveKlingControlAsset(
+  source: string,
+  label: string,
+  upload: ReferenceAssetUploadConfig | null,
+  index: number,
+  zhiniaoUpload?: { baseUrl: string; headers: Record<string, string> },
+): Promise<string> {
+  const asset = await resolveReferenceAssetSource(source, label);
+  if (asset.kind === 'url') return asset.url;
+  if (upload) return await uploadPublicReferenceAsset(asset, upload, index);
+  if (zhiniaoUpload) {
+    return await uploadZhiniaoReferenceAsset(source, zhiniaoUpload.baseUrl, zhiniaoUpload.headers, index);
+  }
+  // Kling's gateway accepts data URLs for small inline assets. Keeping this
+  // fallback makes the node usable without a CDN, while the upload setting is
+  // still recommended for large motion videos.
+  return `data:${asset.mimeType};base64,${asset.base64}`;
+}
+
+/**
+ * Kling Motion Control 2.6/3.0 and Advanced Lip Sync are separate APIs from
+ * ordinary text-to-video. The canvas node marks this transport explicitly so
+ * a generic video endpoint can never silently ignore the control inputs.
+ */
+async function generateKlingControlVideo(
+  request: GenerateVideoRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const extraParams = request.extra_params ?? {};
+  const mode: KlingControlMode = extraParams.control_mode === 'lip-sync'
+    ? 'lip-sync'
+    : 'motion-control';
+  const upload = resolveReferenceAssetUploadConfig(extraParams);
+  const zhiniaoUpload = /(?:cuai\.token6688\.com|api\.tokengo\.love)/i.test(baseUrl)
+    ? { baseUrl, headers }
+    : undefined;
+  const imageSource = request.reference_images?.[0] ?? '';
+  const motionVideoSource = readKlingString(extraParams, 'motion_reference_video');
+  const sourceVideo = readKlingString(extraParams, 'source_video');
+  const audioSource = readKlingString(extraParams, 'lip_sync_audio') || request.reference_audio?.[0] || '';
+
+  if (mode === 'motion-control' && (!imageSource || !motionVideoSource)) {
+    throw new Error('Kling Motion Control 需要角色图片和动作参考视频');
+  }
+  if (mode === 'lip-sync' && (!sourceVideo || !audioSource)) {
+    throw new Error('Kling 对口型需要待处理视频和音频');
+  }
+
+  const image = mode === 'motion-control'
+    ? await resolveKlingControlAsset(imageSource, 'Kling 角色图片', upload, 0, zhiniaoUpload)
+    : undefined;
+  const motionVideo = mode === 'motion-control'
+    ? await resolveKlingControlAsset(motionVideoSource, 'Kling 动作参考视频', upload, 1, zhiniaoUpload)
+    : undefined;
+  const sourceVideoUrl = mode === 'lip-sync'
+    ? await resolveKlingControlAsset(sourceVideo, 'Kling 待处理视频', upload, 0, zhiniaoUpload)
+    : undefined;
+  const audio = mode === 'lip-sync'
+    ? await resolveKlingControlAsset(audioSource, 'Kling 对口型音频', upload, 1, zhiniaoUpload)
+    : undefined;
+
+  const klingVersion = /2[._-]?6/i.test(apiModel) ? 'kling-2.6' : 'kling-3.0';
+  // Do not reuse generic video_submit_path/video_query_path injected by a
+  // provider profile (for example Zhiniao's /v1/tasks); Kling control has
+  // its own official endpoints. Custom overrides use Kling-specific keys.
+  const submitPath = readKlingString(extraParams, 'kling_submit_path') || (
+    mode === 'motion-control' ? `/motion-control/${klingVersion}` : '/v1/videos/advanced-lip-sync'
+  );
+  const queryPath = readKlingString(extraParams, 'kling_query_path') || (
+    mode === 'motion-control' ? '/tasks?task_ids={taskId}' : '/v1/videos/advanced-lip-sync/{taskId}'
+  );
+  const resolution = readKlingString(extraParams, 'resolution') || request.video_resolution || '720p';
+  const orientation = readKlingString(extraParams, 'character_orientation') || 'image';
+  const prompt = request.prompt.trim();
+
+  let faceSessionId = readKlingString(extraParams, 'face_session_id');
+  let faceId = readKlingString(extraParams, 'face_id');
+  if (mode === 'lip-sync' && sourceVideoUrl && (!faceSessionId || !faceId)) {
+    const faceResponse = await requestProviderJson(`${baseUrl}/v1/videos/identify-face`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ video_url: sourceVideoUrl }),
+    });
+    const faceRawResponse = await faceResponse.text();
+    let facePayload: unknown;
+    try {
+      facePayload = faceRawResponse ? JSON.parse(faceRawResponse) : {};
+    } catch {
+      throw new Error(`Kling 人脸识别失败：平台返回了非 JSON 响应 (${baseUrl}/v1/videos/identify-face)`);
+    }
+    if (!faceResponse.ok) {
+      throw new Error(`Kling 人脸识别失败: ${buildHttpErrorSummary(faceResponse.status, faceRawResponse, `${baseUrl}/v1/videos/identify-face`)}`);
+    }
+    const faceData = facePayload && typeof facePayload === 'object'
+      ? (facePayload as Record<string, unknown>).data
+      : undefined;
+    const faceRecord = faceData && typeof faceData === 'object' ? faceData as Record<string, unknown> : {};
+    const detectedFaces = Array.isArray(faceRecord.face_data) ? faceRecord.face_data : [];
+    const firstFace = detectedFaces.find((item) => item && typeof item === 'object') as Record<string, unknown> | undefined;
+    faceSessionId = typeof faceRecord.session_id === 'string' ? faceRecord.session_id.trim() : faceSessionId;
+    faceId = typeof firstFace?.face_id === 'string' ? firstFace.face_id.trim() : faceId;
+  }
+
+  const body: Record<string, unknown> = mode === 'motion-control'
+    ? {
+      contents: [
+        ...(prompt ? [{ type: 'prompt', text: prompt }] : []),
+        { type: 'image', url: image },
+        { type: 'video', url: motionVideo },
+      ],
+      settings: {
+        character_orientation: orientation === 'video' ? 'video' : 'image',
+        audio: extraParams.keep_original_audio === false ? 'off' : 'original',
+        resolution: resolution === '1080p' ? '1080p' : '720p',
+      },
+    }
+    : {
+      session_id: faceSessionId,
+      face_choose: [{
+        face_id: faceId,
+        sound_file: audio,
+        sound_start_time: Number(extraParams.sound_start_time) || 0,
+        sound_end_time: Number(extraParams.sound_end_time) || 60000,
+        sound_insert_time: Number(extraParams.sound_insert_time) || 0,
+        sound_volume: Number.isFinite(Number(extraParams.sound_volume)) ? Number(extraParams.sound_volume) : 1,
+        original_audio_volume: Number.isFinite(Number(extraParams.original_audio_volume)) ? Number(extraParams.original_audio_volume) : 1,
+      }],
+    };
+
+  if (mode === 'lip-sync' && (!body.session_id || !faceId)) {
+    throw new Error('Kling 对口型需要先做人脸识别，并提供 session_id 和 face_id');
+  }
+
+  const submitUrl = resolveProviderEndpoint(baseUrl, submitPath, submitPath);
+  const response = await requestProviderJson(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`Kling ${mode === 'motion-control' ? 'Motion Control' : '对口型'}请求失败：平台返回了非 JSON 响应 (${submitUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`Kling ${mode === 'motion-control' ? 'Motion Control' : '对口型'}请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  }
+  const immediateResult = getVideoResultUrl(payload);
+  if (immediateResult && !getVideoTaskId(payload)) return immediateResult;
+  const taskId = getVideoTaskId(payload);
+  if (!taskId) {
+    throw new Error(`Kling 响应中未找到任务 ID: ${describeVideoResponse(payload)}`);
+  }
+
+  const taskUrl = resolveProviderEndpoint(baseUrl, queryPath, '/v1/videos/{taskId}', taskId);
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    const taskResponse = await requestProviderJson(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    try {
+      payload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`Kling 任务查询失败：平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`Kling 任务查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const resultUrl = getVideoResultUrl(payload);
+    if (resultUrl) return resultUrl;
+    const status = getVideoTaskStatus(payload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`Kling ${mode === 'motion-control' ? 'Motion Control' : '对口型'}生成失败: ${getVideoTaskFailureReason(payload) ?? describeVideoResponse(payload)}`);
+    }
+  }
+}
+
 export async function generateVideo(request: GenerateVideoRequest): Promise<string> {
   if (!isCustomModel(request.model)) {
     throw new Error('视频生成仅支持自定义平台(custom:*)模型');
@@ -1700,6 +1935,9 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
     throw new Error('请在设置中配置视频模型对应的 Base URL、API Key 和模型名称');
   }
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  if (request.extra_params?.video_transport === 'kling-control') {
+    return await generateKlingControlVideo(request, baseUrl, apiModel, headers);
+  }
   if (request.extra_params?.video_transport === 'zhenjian-task-api' || isZhenjianProvider(providerId, baseUrl)) {
     return await generateZhenjianVideo(request);
   }
@@ -2035,6 +2273,9 @@ async function submitJimengCliImageJob(request: GenerateRequest): Promise<string
         // LenTalk 的 size 就是档位(1K/1.5K/2K/4K), Rust 侧会归一化成 CLI 要的小写。
         resolution_type: request.size,
         aspect_ratio: request.aspect_ratio,
+        generate_num: typeof request.extra_params?.image_count === 'number'
+          ? Math.max(1, Math.min(10, Math.round(request.extra_params.image_count)))
+          : undefined,
         reference_images: referenceImages,
       });
       browserGenerationJobs.set(jobId, { job_id: jobId, status: 'succeeded', result, error: null });
@@ -2318,6 +2559,7 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
             size: mapRequestedImageSize(apiModel, request.size, request.aspect_ratio),
           }],
           tool_choice: { type: 'image_generation' },
+          n: request.image_count ?? 1,
         }
       : usesChatProtocol
         ? {
@@ -2332,7 +2574,7 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
                 })),
               ],
             }],
-            n: 1,
+            n: request.image_count ?? 1,
             response_format: { type: 'image' },
           }
         : buildBrowserImagesRequestBody(request, apiModel, referenceImages);
@@ -2375,17 +2617,17 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
     }
 
     if (usesResponsesProtocol) {
-      const image = extractBrowserResponsesImage(payload);
-      if (image) {
-        return image;
+      const images = extractBrowserImageResults(payload, 'responses');
+      if (images.length > 0) {
+        return serializeBrowserImageResults(images);
       }
       throw new Error('Responses 响应中未找到图片，请确认该平台模型支持图像生成');
     }
 
     if (usesChatProtocol) {
-      const image = extractBrowserChatImage(payload);
-      if (image) {
-        return image;
+      const images = extractBrowserImageResults(payload, 'chat');
+      if (images.length > 0) {
+        return serializeBrowserImageResults(images);
       }
       throw new Error('Chat Completions 响应中未找到图片，请确认该平台模型支持图像生成');
     }
@@ -2394,16 +2636,15 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
       payload && typeof payload === 'object' && Array.isArray((payload as { data?: unknown }).data)
         ? (payload as { data: unknown[] }).data
         : [];
-    const first = data[0];
-    if (first && typeof first === 'object') {
-      const b64 = (first as { b64_json?: unknown }).b64_json;
-      if (typeof b64 === 'string' && b64) {
-        return `data:image/png;base64,${b64}`;
-      }
-      const url = (first as { url?: unknown }).url;
-      if (typeof url === 'string' && url) {
-        return url;
-      }
+    const images = data.flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const b64 = (item as { b64_json?: unknown }).b64_json;
+      if (typeof b64 === 'string' && b64) return [`data:image/png;base64,${b64}`];
+      const url = (item as { url?: unknown }).url;
+      return typeof url === 'string' && url ? [url] : [];
+    });
+    if (images.length > 0) {
+      return serializeBrowserImageResults(images);
     }
     const errorMessage =
       payload && typeof payload === 'object'
@@ -2454,7 +2695,7 @@ function buildBrowserImagesRequestBody(
     model: apiModel,
     prompt: request.prompt,
     size: mapRequestedImageSize(apiModel, request.size, request.aspect_ratio),
-    n: 1,
+    n: request.image_count ?? 1,
   };
   if (isGptImage) {
     body.output_format = 'png';
@@ -2497,109 +2738,72 @@ function buildBrowserImagesRequestBody(
   return body;
 }
 
-function extractBrowserResponsesImage(payload: unknown): string | null {
-  if (!payload || typeof payload !== 'object') {
-    return null;
-  }
-  const output = (payload as { output?: unknown }).output;
-  if (!Array.isArray(output)) {
-    return null;
-  }
-  for (const item of output) {
-    if (!item || typeof item !== 'object') {
-      continue;
-    }
-    const result = (item as { result?: unknown }).result;
-    if (typeof result === 'string' && result) {
-      return /^(https?:|data:)/.test(result) ? result : `data:image/png;base64,${result}`;
-    }
-    const imageUrl = (item as { image_url?: unknown }).image_url;
-    if (typeof imageUrl === 'string' && imageUrl) {
-      return imageUrl;
-    }
-    const content = (item as { content?: unknown }).content;
-    if (!Array.isArray(content)) {
-      continue;
-    }
-    for (const part of content) {
-      const partImageUrl =
-        part && typeof part === 'object' ? (part as { image_url?: unknown }).image_url : undefined;
-      if (typeof partImageUrl === 'string' && partImageUrl) {
-        return partImageUrl;
-      }
-    }
-  }
-  return null;
+function serializeBrowserImageResults(images: string[]): string {
+  const unique = images.filter((image, index) => image.trim() && images.indexOf(image) === index);
+  return unique.length > 1 ? JSON.stringify(unique) : (unique[0] ?? '');
 }
 
-/** 从 Chat Completions 响应(choices[].message.content)提取图片 URL。 */
-function extractBrowserChatImage(payload: unknown): string | null {
-  if (!payload || typeof payload !== 'object') {
-    return null;
-  }
-  const choices = (payload as { choices?: unknown }).choices;
-  if (!Array.isArray(choices)) {
-    return null;
-  }
-  for (const choice of choices) {
-    if (!choice || typeof choice !== 'object') {
-      continue;
-    }
-    const message = (choice as { message?: unknown }).message;
-    if (!message || typeof message !== 'object') {
-      continue;
-    }
-    const msg = message as { image_url?: unknown; content?: unknown };
-    if (typeof msg.image_url === 'string' && msg.image_url) {
-      return msg.image_url;
-    }
-    const content = msg.content;
-    if (typeof content === 'string') {
-      const url = extractUrlFromText(content);
-      if (url) {
-        return url;
-      }
-      continue;
-    }
-    if (Array.isArray(content)) {
-      for (const part of content) {
-        if (!part || typeof part !== 'object') {
-          continue;
-        }
-        const partImageUrl = (part as { image_url?: unknown }).image_url;
-        if (typeof partImageUrl === 'string' && partImageUrl) {
-          return partImageUrl;
-        }
-        if (partImageUrl && typeof partImageUrl === 'object') {
-          const nestedUrl = (partImageUrl as { url?: unknown }).url;
-          if (typeof nestedUrl === 'string' && nestedUrl) {
-            return nestedUrl;
+function extractBrowserImageResults(payload: unknown, protocol: 'responses' | 'chat'): string[] {
+  const results: string[] = [];
+  const push = (value: unknown, key: string) => {
+    if (typeof value !== 'string' || !value.trim()) return;
+    const normalized = key === 'b64_json'
+      ? `data:image/png;base64,${value}`
+      : key === 'result' && !/^(https?:|data:)/i.test(value)
+        ? `data:image/png;base64,${value}`
+        : value;
+    if (!results.includes(normalized)) results.push(normalized);
+  };
+  if (!payload || typeof payload !== 'object') return results;
+  if (protocol === 'responses') {
+    const output = (payload as { output?: unknown }).output;
+    if (Array.isArray(output)) {
+      for (const item of output) {
+        if (!item || typeof item !== 'object') continue;
+        const record = item as Record<string, unknown>;
+        push(record.result, 'result');
+        push(record.image_url, 'image_url');
+        if (Array.isArray(record.content)) {
+          for (const part of record.content) {
+            if (part && typeof part === 'object') {
+              push((part as Record<string, unknown>).result, 'result');
+              push((part as Record<string, unknown>).image_url, 'image_url');
+            }
           }
         }
-        const text = (part as { text?: unknown }).text;
-        if (typeof text === 'string') {
-          const url = extractUrlFromText(text);
-          if (url) {
-            return url;
+      }
+    }
+  } else {
+    const choices = (payload as { choices?: unknown }).choices;
+    if (Array.isArray(choices)) {
+      for (const choice of choices) {
+        const message = choice && typeof choice === 'object'
+          ? (choice as Record<string, unknown>).message
+          : undefined;
+        if (!message || typeof message !== 'object') continue;
+        const record = message as Record<string, unknown>;
+        push(record.image_url, 'image_url');
+        if (Array.isArray(record.content)) {
+          for (const part of record.content) {
+            if (part && typeof part === 'object') {
+              const partRecord = part as Record<string, unknown>;
+              const imageUrl = partRecord.image_url;
+              if (imageUrl && typeof imageUrl === 'object') {
+                push((imageUrl as Record<string, unknown>).url, 'url');
+              } else {
+                push(imageUrl, 'image_url');
+              }
+              if (typeof partRecord.text === 'string') {
+                const markdownUrl = partRecord.text.match(/https?:\/\/[^\s)\]}"',]+/i)?.[0];
+                if (markdownUrl) push(markdownUrl, 'url');
+              }
+            }
           }
         }
       }
     }
   }
-  return null;
-}
-
-/** 从聊天文本中提取首个 http(s) URL。 */
-function extractUrlFromText(text: string): string | null {
-  const start = text.indexOf('https://');
-  const startFallback = start < 0 ? text.indexOf('http://') : start;
-  if (startFallback < 0) {
-    return null;
-  }
-  const candidate = text.slice(startFallback);
-  const endMatch = candidate.search(/[\s)\]}"',]/);
-  const url = endMatch < 0 ? candidate : candidate.slice(0, endMatch);
-  return url.trim() || null;
+  return results;
 }
 
 export async function generateImage(request: GenerateRequest): Promise<string> {

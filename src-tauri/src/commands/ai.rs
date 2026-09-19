@@ -44,6 +44,7 @@ pub struct GenerateRequestDto {
     pub model: String,
     pub size: String,
     pub aspect_ratio: String,
+    pub image_count: Option<u32>,
     pub reference_images: Option<Vec<String>>,
     pub extra_params: Option<HashMap<String, Value>>,
 }
@@ -756,6 +757,7 @@ pub async fn submit_generate_image_job(
         model: request.model,
         size: request.size,
         aspect_ratio: request.aspect_ratio,
+        image_count: request.image_count,
         reference_images: request.reference_images,
         extra_params: request.extra_params,
     };
@@ -1014,6 +1016,7 @@ pub async fn generate_image(request: GenerateRequestDto) -> Result<String, Strin
         model: request.model,
         size: request.size,
         aspect_ratio: request.aspect_ratio,
+        image_count: request.image_count,
         reference_images: request.reference_images,
         extra_params: request.extra_params,
     };

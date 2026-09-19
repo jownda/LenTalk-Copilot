@@ -24,6 +24,7 @@ import {
   resolveZzdhAudioKind,
   resolveZzdhResolutionTier,
   resolveZzdhVideoDurationRange,
+  ZZDH_LIP_SYNC_MODEL_NAMES,
   ZZDH_ASPECT_RATIOS,
   ZZDH_VIDEO_DURATION_OPTIONS,
 } from '@/commands/zzdhApi';
@@ -167,14 +168,17 @@ function isVideoUpscaleModelName(model: string): boolean {
 export function listVideoModels(): VideoModelDefinition[] {
   const customVideoModels: VideoModelDefinition[] = useSettingsStore.getState().customApis.flatMap((api) =>
     Array.from(new Set([
-      ...api.videoModels.filter((model) => !isVideoUpscaleModelName(model)),
+      ...(
+        isZzdhProvider(api.id, api.baseUrl)
+          ? [...api.videoModels, ...ZZDH_LIP_SYNC_MODEL_NAMES]
+          : api.videoModels
+      ).filter((model) => !isVideoUpscaleModelName(model)),
       ...api.models.filter(isVideoGenerationModelName),
     ])).map((model) => {
       const modelId = buildCustomModelId(api.id, model);
       const profile = resolveVideoModelProfile(modelId, api.baseUrl);
       const normalizedModel = model.trim().toLowerCase();
-      const isZzdh = api.id.trim().toLowerCase() === 'zizidonghua'
-        || api.baseUrl.trim().toLowerCase().includes('zizidonghua.com');
+      const isZzdh = isZzdhProvider(api.id, api.baseUrl);
       const isSub2Api = api.id.trim().toLowerCase() === 'sub2api-video'
         || isRjmVideoApiBaseUrl(api.baseUrl);
       const isBinghuo = api.id.trim().toLowerCase() === 'binghuo'

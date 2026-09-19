@@ -6,6 +6,7 @@ import {
   EXPORT_RESULT_NODE_LAYOUT_HEIGHT,
   type AudioNodeData,
   type AudioGenNodeData,
+  type MotionControlNodeData,
   type CinematicStudioNodeData,
   type DirectorDeskNodeData,
   type ImageSize,
@@ -30,7 +31,7 @@ import { resolveImageNodeModelId, resolveImageNodeParams } from './imageNodeDefa
 import { useSettingsStore } from '@/stores/settingsStore';
 import { createCinematicProjectId } from '@/features/cinematicStudio/app/projectId';
 
-export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music' | 'video' | 'mosaic' | 'clapperboard';
+export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music' | 'video' | 'mosaic' | 'clapperboard' | 'accessibility';
 
 export interface CanvasNodeCapabilities {
   toolbar: boolean;
@@ -127,6 +128,7 @@ const imageEditNodeDefinition: CanvasNodeDefinition<ImageEditNodeData> = {
       aspectRatio: DEFAULT_ASPECT_RATIO,
       isSizeManuallyAdjusted: false,
       requestAspectRatio: aspectRatio,
+      imageCount: 1,
       prompt: '',
       model: modelId,
       customPrice: settings.customModelPrices[modelId] ?? null,
@@ -546,6 +548,39 @@ const audioGenNodeDefinition: CanvasNodeDefinition<AudioGenNodeData> = {
   defaultSize: { width: 400, height: 340 },
 };
 
+const motionControlNodeDefinition: CanvasNodeDefinition<MotionControlNodeData> = {
+  type: CANVAS_NODE_TYPES.motionControl,
+  menuLabelKey: 'node.menu.motionControl',
+  menuIcon: 'accessibility',
+  visibleInMenu: true,
+  capabilities: { toolbar: true, promptInput: false },
+  connectivity: { sourceHandle: true, targetHandle: true, connectMenu: { fromSource: true, fromTarget: false } },
+  createDefaultData: () => ({
+    displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.motionControl],
+    mode: 'motion-control',
+    lipSyncInput: 'image',
+    model: '',
+    prompt: '',
+    resolution: '720p',
+    characterOrientation: 'image',
+    keepOriginalAudio: true,
+    imageSource: null,
+    imagePreviewUrl: null,
+    motionVideoSource: null,
+    motionVideoPreviewUrl: null,
+    inputVideoSource: null,
+    inputVideoPreviewUrl: null,
+    audioSource: null,
+    audioPreviewUrl: null,
+    faceSessionId: '',
+    faceId: '',
+    isGenerating: false,
+    generationError: null,
+    outputVideoUrl: null,
+  }),
+  defaultSize: { width: 420, height: 560 },
+};
+
 export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition> = {
   [CANVAS_NODE_TYPES.upload]: uploadNodeDefinition,
   [CANVAS_NODE_TYPES.imageEdit]: imageEditNodeDefinition,
@@ -560,6 +595,7 @@ export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition>
   [CANVAS_NODE_TYPES.directorDesk]: directorDeskNodeDefinition,
   [CANVAS_NODE_TYPES.audio]: audioNodeDefinition,
   [CANVAS_NODE_TYPES.audioGen]: audioGenNodeDefinition,
+  [CANVAS_NODE_TYPES.motionControl]: motionControlNodeDefinition,
   [CANVAS_NODE_TYPES.promptOptimizer]: promptOptimizerNodeDefinition,
   [CANVAS_NODE_TYPES.seamlessMosaic]: seamlessMosaicNodeDefinition,
 };

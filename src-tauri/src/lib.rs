@@ -13,6 +13,7 @@ use commands::cloud_drive;
 use commands::image;
 use commands::jimeng_cli;
 use commands::media_file;
+use commands::pajuben;
 use commands::wan_cli;
 use commands::project_state;
 use commands::project_archive;
@@ -176,6 +177,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .manage(commands::pajuben::PajubenState::default())
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
             database::load_app_setting,
@@ -195,6 +197,11 @@ pub fn run() {
             media_file::resolve_media_file_size,
             media_file::load_media_data_url,
             video_cfr::normalize_video_cfr,
+            pajuben::pajuben_probe,
+            pajuben::pajuben_run,
+            pajuben::pajuben_cancel,
+            pajuben::pajuben_resolve_output_dir,
+            pajuben::pajuben_read_script,
             image::persist_image_source,
             image::persist_image_binary,
             image::save_image_source_to_downloads,

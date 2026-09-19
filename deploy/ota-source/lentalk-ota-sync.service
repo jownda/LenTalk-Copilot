@@ -1,0 +1,14 @@
+[Unit]
+Description=LenTalk OTA self-hosted source sync
+Documentation=https://github.com/jownda/LenTalk-Copilot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Nice=10
+# 默认 DefaultTimeoutStartSec 只有 90s, 跨境/镜像抖动时一次全量同步可能更久,
+# 被 systemd 半路 kill 会留下半截文件。放宽到 10 分钟。
+TimeoutStartSec=600
+ExecStart=/usr/local/bin/lentalk-ota-sync

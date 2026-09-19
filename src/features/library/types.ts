@@ -31,7 +31,7 @@ export interface LibraryAsset {
   createdAt: number;
   /** Optional link to a cinematic-studio asset mirrored into the shared library. */
   cinematicAssetId?: string;
-  cinematicKind?: 'character' | 'location' | 'prop';
+  cinematicKind?: 'character' | 'location' | 'prop' | 'audio-reference';
   cinematicDescription?: string;
   cinematicDescriptionZh?: string;
   cinematicNotes?: string;

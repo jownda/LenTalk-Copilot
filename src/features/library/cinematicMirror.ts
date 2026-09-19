@@ -8,7 +8,7 @@
  */
 import type { LibraryAsset } from './types';
 
-export type CinematicAssetKind = 'character' | 'location' | 'prop';
+export type CinematicAssetKind = 'character' | 'location' | 'prop' | 'audio-reference';
 
 /** 镜像条目 id 形如 `cinematic-<电影资产 id>-<参考图序号>`。 */
 const MIRROR_ID_PATTERN = /^cinematic-(.+)-\d+$/;
@@ -18,6 +18,7 @@ const KIND_BY_CATEGORY_ID: Record<string, CinematicAssetKind> = {
   'category-characters': 'character',
   'category-scenes': 'location',
   'category-props': 'prop',
+  'category-audio': 'audio-reference',
 };
 
 /** 兜底：镜像时写入的标记标签。 */
@@ -25,6 +26,7 @@ const KIND_BY_TAG: Record<string, CinematicAssetKind> = {
   角色: 'character',
   场景: 'location',
   道具: 'prop',
+  音频: 'audio-reference',
 };
 
 /** 是否为电影工作室镜像进素材库的条目（而非用户自己导入的素材）。 */

@@ -15,6 +15,7 @@ export const CANVAS_NODE_TYPES = {
   cinematicStudio: "cinematicStudioNode",
   audio: "audioNode",
   audioGen: "audioGenNode",
+  motionControl: "motionControlNode",
   promptOptimizer: "promptOptimizerNode",
   seamlessMosaic: "seamlessMosaicNode",
 } as const;
@@ -29,6 +30,9 @@ export const EXPORT_RESULT_NODE_DEFAULT_WIDTH = 192;
 export const EXPORT_RESULT_NODE_LAYOUT_HEIGHT = 144;
 export const EXPORT_RESULT_NODE_MIN_WIDTH = 96;
 export const EXPORT_RESULT_NODE_MIN_HEIGHT = 96;
+/** AI 图片节点允许一次请求的输出数量。 */
+export const IMAGE_GENERATION_COUNT_MIN = 1;
+export const IMAGE_GENERATION_COUNT_MAX = 4;
 
 export const IMAGE_SIZES = ["0.5K", "1K", "2K", "4K"] as const;
 export const IMAGE_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "21:9"] as const;
@@ -67,6 +71,8 @@ export interface ImageGenerationRequestData {
   model: string;
   size: string;
   aspectRatio: string;
+  /** 一次请求期望的输出图片数量；旧项目缺省为 1。 */
+  imageCount?: number;
   referenceImages?: string[];
   extraParams?: Record<string, unknown>;
 }
@@ -153,6 +159,8 @@ export interface ImageEditNodeData extends NodeImageData {
   model: string;
   size: ImageSize;
   requestAspectRatio?: string;
+  /** 一次生成的图片数量；结果会拆成多个结果图片节点。 */
+  imageCount?: number;
   extraParams?: Record<string, unknown>;
   isGenerating?: boolean;
   generationStartedAt?: number | null;
@@ -173,6 +181,14 @@ export interface VideoGenNodeData extends NodeDisplayData {
   /** 工作室“发送到视频节点”时随节点快照保存，避免宿主状态防抖期间丢失附件。 */
   studioReferenceImages?: string[];
   studioReferenceAudio?: string[];
+  /**
+   * 用户在本节点手动移除的引用素材来源。
+   *
+   * 引用有两个入口: 节点自身的 studioReference*，以及上游连进来的提示词工作室/
+   * 素材节点的媒体。只清空 studioReference* 时，上游那份仍会通过
+   * graphImageResolver 流回来并上传给模型，所以被删掉的来源要单独记账。
+   */
+  excludedReferenceSources?: string[];
   /** 炳火专用: 视频参考 URLs(公开 http/https), 提交时先调 /v1/assets/uploads 换 OSS 再传 reference_videos。最多 3 个。 */
   binghuoReferenceVideos?: string[];
   /** 炳火专用: 跳过真人审核(责任声明, 手册 3.8)。仅 bh 系(bh2.0-*, bh2.04K)生效。 */
@@ -401,6 +417,41 @@ export interface AudioGenNodeData extends NodeDisplayData {
   [key: string]: unknown;
 }
 
+export type MotionControlMode = "motion-control" | "lip-sync";
+export type MotionControlOrientation = "image" | "video";
+export type MotionControlLipSyncInput = "image" | "video";
+
+/**
+ * 动作控制 / 对口型节点。
+ *
+ * 这不是普通视频生成节点的别名：动作控制使用角色图 + 动作参考视频，
+ * Kling 对口型使用已有视频 + 音频，字字动画对口型还支持人物图片 + 音频。
+ */
+export interface MotionControlNodeData extends NodeDisplayData {
+  mode: MotionControlMode;
+  /** 字字动画对口型可选择人物图片+音频，或待处理视频+音频。 */
+  lipSyncInput?: MotionControlLipSyncInput;
+  model: string;
+  prompt: string;
+  resolution: "720p" | "1080p";
+  characterOrientation: MotionControlOrientation;
+  keepOriginalAudio: boolean;
+  imageSource?: string | null;
+  imagePreviewUrl?: string | null;
+  motionVideoSource?: string | null;
+  motionVideoPreviewUrl?: string | null;
+  inputVideoSource?: string | null;
+  inputVideoPreviewUrl?: string | null;
+  audioSource?: string | null;
+  audioPreviewUrl?: string | null;
+  faceSessionId?: string;
+  faceId?: string;
+  isGenerating?: boolean;
+  generationError?: string | null;
+  outputVideoUrl?: string | null;
+  [key: string]: unknown;
+}
+
 export type CanvasNodeData =
   | UploadImageNodeData
   | ExportImageNodeData
@@ -416,6 +467,7 @@ export type CanvasNodeData =
   | DirectorDeskNodeData
   | CinematicStudioNodeData
   | AudioNodeData
+  | MotionControlNodeData
   | SeamlessMosaicNodeData;
 
 export type CanvasNode = Node<CanvasNodeData, CanvasNodeType>;
@@ -525,6 +577,12 @@ export function isAudioGenNode(
   node: CanvasNode | null | undefined,
 ): node is Node<AudioGenNodeData, typeof CANVAS_NODE_TYPES.audioGen> {
   return node?.type === CANVAS_NODE_TYPES.audioGen;
+}
+
+export function isMotionControlNode(
+  node: CanvasNode | null | undefined,
+): node is Node<MotionControlNodeData, typeof CANVAS_NODE_TYPES.motionControl> {
+  return node?.type === CANVAS_NODE_TYPES.motionControl;
 }
 
 export function isSeamlessMosaicNode(

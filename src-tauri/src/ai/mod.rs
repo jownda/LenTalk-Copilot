@@ -13,6 +13,7 @@ pub struct GenerateRequest {
     pub model: String,
     pub size: String,
     pub aspect_ratio: String,
+    pub image_count: Option<u32>,
     pub reference_images: Option<Vec<String>>,
     pub extra_params: Option<HashMap<String, serde_json::Value>>,
 }

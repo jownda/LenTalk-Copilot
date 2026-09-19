@@ -68,3 +68,36 @@ describe('isChatCompletionModelName 与音频模型互斥', () => {
     expect(isChatCompletionModelName('deepseek-v4-pro')).toBe(true);
   });
 });
+
+describe('图片模型不被视频厂商前缀抢走（拉取模型的分类回归）', () => {
+  // 这几条实测来自知鸟 AI 的 /v1/models：kling-image-o3 曾被当成视频，
+  // 用户在「图片模型」弹窗里根本选不到它。
+  it.each(['kling-image-o3', 'wan2.7-image', 'grok-imagine-image', 'grok-imagine-image-2.0'])(
+    '%s 是图片而不是视频',
+    (model) => {
+      expect(isVideoGenerationModelName(model)).toBe(false);
+      expect(isAudioModelName(model)).toBe(false);
+      expect(isChatCompletionModelName(model)).toBe(false);
+    }
+  );
+
+  it('带 video / i2v 硬标记时不会被 image 前缀救回来', () => {
+    for (const model of [
+      'doubao-seedance-2-video-720p',
+      'wan2.7-video',
+      'wan2.7-i2v',
+      'happyhorse-1.0-video-edit-1080p',
+      'kling-v3-motion-control',
+      'grok-imagine-video',
+    ]) {
+      expect(isVideoGenerationModelName(model), model).toBe(true);
+    }
+  });
+
+  it('名字里没有 video/t2v 的视频型号也要认出来', () => {
+    // 旧实现把它们留在图片清单里，图片节点下拉会混进视频模型。
+    for (const model of ['happyhorse-1-0', 'happyhorse-1-1', 'omni-flash-1-1', 'viduq3', 'wan-2-6', 'wan-3-0']) {
+      expect(isVideoGenerationModelName(model), model).toBe(true);
+    }
+  });
+});

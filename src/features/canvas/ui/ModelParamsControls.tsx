@@ -3,7 +3,11 @@ import { createPortal } from 'react-dom';
 import { SlidersHorizontal, Zap } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { AUTO_REQUEST_ASPECT_RATIO } from '@/features/canvas/domain/canvasNodes';
+import {
+  AUTO_REQUEST_ASPECT_RATIO,
+  IMAGE_GENERATION_COUNT_MAX,
+  IMAGE_GENERATION_COUNT_MIN,
+} from '@/features/canvas/domain/canvasNodes';
 import {
   getModelProvider,
   isApiKeylessProvider,
@@ -34,6 +38,8 @@ interface ModelParamsControlsProps {
   onModelChange: (modelId: string) => void;
   onResolutionChange: (resolution: string) => void;
   onAspectRatioChange: (aspectRatio: string) => void;
+  imageCount?: number;
+  onImageCountChange?: (count: number) => void;
   extraParams?: Record<string, unknown>;
   onExtraParamChange?: (key: string, value: boolean | number | string) => void;
   showWebSearchToggle?: boolean;
@@ -148,6 +154,8 @@ export const ModelParamsControls = memo(({
   onModelChange,
   onResolutionChange,
   onAspectRatioChange,
+  imageCount = IMAGE_GENERATION_COUNT_MIN,
+  onImageCountChange,
   extraParams,
   onExtraParamChange,
   showWebSearchToggle = false,
@@ -669,6 +677,36 @@ export const ModelParamsControls = memo(({
                 })}
               </div>
             </div>
+
+            {onImageCountChange && (
+              <div className="mt-3">
+                <div className="mb-2 text-xs text-text-muted">{t('modelParams.imageCount')}</div>
+                <div className="grid grid-cols-4 gap-1 rounded-xl border border-[rgba(255,255,255,0.1)] bg-bg-dark/65 p-1">
+                  {Array.from(
+                    { length: IMAGE_GENERATION_COUNT_MAX - IMAGE_GENERATION_COUNT_MIN + 1 },
+                    (_, index) => index + IMAGE_GENERATION_COUNT_MIN,
+                  ).map((count) => {
+                    const active = count === imageCount;
+                    return (
+                      <button
+                        key={count}
+                        type="button"
+                        className={`h-8 rounded-lg text-sm transition-colors ${active
+                          ? 'bg-surface-dark text-text-dark'
+                          : 'text-text-muted hover:bg-bg-dark'
+                          }`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onImageCountChange(count);
+                        }}
+                      >
+                        {t('modelParams.imageCountOption', { count })}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             {panelExtraParamSchema.length > 0 && (
               <div className="mt-3">

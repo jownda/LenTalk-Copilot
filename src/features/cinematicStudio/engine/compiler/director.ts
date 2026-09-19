@@ -384,6 +384,14 @@ function renderDialogueSoundLayer(project: ProjectV2, scene: SceneV2, locale: Pr
   // 场景内有声音配置的角色必须保留声音锁，即使本镜头暂时没有对白；
   // @audioN 仍按全量清单位置编号，保证声音参考不会因对白顺序漂移。
   const allVoiceCharacterIds = sceneVoiceCharacterIds(project, scene);
+  const audioAssets = (project.assets ?? []).filter((candidate) => candidate.kind === "audio-reference");
+  const audioAssetsById = new Map(audioAssets.map((candidate) => [candidate.id, candidate]));
+  const audioAssetsBySource = new Map(
+    audioAssets.flatMap((candidate) => {
+      const source = candidate.referencePaths?.[0]?.trim();
+      return source ? [[source, candidate] as const] : [];
+    }),
+  );
   const voiceEventsByCharacter = new Map<string, typeof voiceEvents>(allVoiceCharacterIds.map((id) => [id, []]));
   for (const event of voiceEvents) {
     voiceEventsByCharacter.get(event.characterId)?.push(event);
@@ -402,7 +410,16 @@ function renderDialogueSoundLayer(project: ProjectV2, scene: SceneV2, locale: Pr
       ? (asset.actingProfile?.voicePromptZh?.trim() || asset.actingProfile?.voicePrompt?.trim() || "")
       : (asset.actingProfile?.voicePrompt?.trim() || asset.actingProfile?.voicePromptZh?.trim() || "");
     const audioIndex = allVoiceCharacterIds.indexOf(characterId);
-    const voiceReference = asset.voiceClip?.trim() && audioIndex >= 0 ? `@audio${audioIndex + 1}` : "";
+    const voiceAsset = asset.voiceClip?.trim()
+      ? (asset.voiceAssetId ? audioAssetsById.get(asset.voiceAssetId) : undefined)
+        ?? audioAssetsBySource.get(asset.voiceClip.trim())
+      : undefined;
+    const voiceName = voiceAsset?.name?.trim() || asset.voiceAssetName?.trim();
+    const voiceReference = asset.voiceClip?.trim() && audioIndex >= 0
+      ? voiceName
+        ? `@${voiceName} [audio${audioIndex + 1}]`
+        : `@audio${audioIndex + 1}`
+      : "";
     if (characterEvents.length === 0 && !voicePrompt && !voiceReference) continue;
     const label = zh ? `${asset.name.trim() || asset.id}声音` : `${asset.name.trim() || asset.id} VOICE`;
     const linesForCharacter = [

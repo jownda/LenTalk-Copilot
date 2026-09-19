@@ -1,6 +1,6 @@
 /**
  * 资产库卡片（P0.1）
- * 角色 / 地点 / 道具三个分类 Tab。
+ * 角色 / 地点 / 道具 / 音频四个分类 Tab。
  * 每条资产：名称、英文 canonical 描述（可从中文一键翻译草稿）、用途/忽略复选框、
  * 锁定级别（未锁定/建议锁定/强锁定）、独特标记与始终可见 token。
  * 参考图压缩后存入 Asset.referencePaths（P3 SQLite 前暂存 localStorage）。
@@ -18,10 +18,11 @@ import { useAssetLibraryStore } from "@/features/library/assetStore";
 import { isCinematicMirrorAsset, pickableAudioAssets } from "@/features/library/cinematicMirror";
 import type { LibraryAsset } from "@/features/library/types";
 
-const TABS: { kind: AssetKind; labelKey: "assetTabCharacter" | "assetTabLocation" | "assetTabProp" }[] = [
+const TABS: { kind: AssetKind; labelKey: "assetTabCharacter" | "assetTabLocation" | "assetTabProp" | "assetTabAudio" }[] = [
   { kind: "character", labelKey: "assetTabCharacter" },
   { kind: "location", labelKey: "assetTabLocation" },
   { kind: "prop", labelKey: "assetTabProp" },
+  { kind: "audio-reference", labelKey: "assetTabAudio" },
 ];
 
 const REFERENCE_MATCH_LINE = "与参考图 100% 一致。";
@@ -65,6 +66,15 @@ function compressImage(file: File, maxEdge = 720, quality = 0.82): Promise<strin
     };
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("image load failed")); };
     img.src = url;
+  });
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error ?? new Error("file read failed"));
+    reader.readAsDataURL(file);
   });
 }
 
@@ -151,7 +161,7 @@ function AssetTile({ asset, locale, t, activeInCurrentScene, projectUsageCount, 
     : null;
   return <div className="asset-tile" onClick={onClick} title={t.editDetails}>
     <button className="char-delete" title={t.deleteAsset} onClick={(event) => { event.stopPropagation(); onDelete(); }}><X size={12} /></button>
-    <div className="tile-thumb">{thumb ? <img src={resolveImageDisplayUrl(thumb)} alt={asset.name} /> : <span className="tile-avatar">{asset.name.slice(0, 1)}</span>}</div>
+    <div className="tile-thumb">{asset.kind === "audio-reference" ? <span className="tile-avatar"><AudioLines size={22} /></span> : thumb ? <img src={resolveImageDisplayUrl(thumb)} alt={asset.name} /> : <span className="tile-avatar">{asset.name.slice(0, 1)}</span>}</div>
     <div className="tile-info">
       <div className="tile-row">
         <div className="tile-name">{asset.name || "…"}</div>
@@ -170,6 +180,7 @@ function AssetTile({ asset, locale, t, activeInCurrentScene, projectUsageCount, 
 
 function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, canvasAudioSources, onCreateVariant, onClose }: { project: ProjectV2; scene: SceneV2; asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; canvasAudioSources: CanvasAudioSource[]; onCreateVariant(id: string): void; onClose(): void }) {
   const [imageBusy, setImageBusy] = useState(false);
+  const [audioBusy, setAudioBusy] = useState(false);
   const [propImageBusy, setPropImageBusy] = useState(false);
   const [propPickerOpen, setPropPickerOpen] = useState(false);
   const [propPickerMode, setPropPickerMode] = useState<"choices" | "library" | "create">("choices");
@@ -214,8 +225,8 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
   };
   const [variantComposerOpen, setVariantComposerOpen] = useState(false);
   const [variantStateName, setVariantStateName] = useState("");
-  /** 素材库选图器：'ref' = 添加参考图；'prop' = 从素材库图片创建道具；null = 关闭 */
-  const [libraryPicker, setLibraryPicker] = useState<null | "ref" | "prop" | "voice">(null);
+  /** 素材库选择器：ref = 添加图片；prop = 从图片创建道具；audio = 添加音频资产；voice = 绑定角色声音。 */
+  const [libraryPicker, setLibraryPicker] = useState<null | "ref" | "prop" | "audio" | "voice">(null);
   const update = (patch: Partial<Asset>) => dispatch({ type: "UPDATE_ASSET", id: asset.id, patch });
   const attachedPropIds = asset.attachedPropIds ?? [];
   const attachedProps = attachedPropIds.map((id) => (project.assets ?? []).find((candidate) => candidate.id === id && candidate.kind === "prop")).filter((candidate): candidate is Asset => Boolean(candidate));
@@ -230,6 +241,15 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
 
   const uploadReference = async (file?: File) => {
     if (!file) return;
+    if (asset.kind === "audio-reference") {
+      setAudioBusy(true);
+      try {
+        const dataUrl = await readFileAsDataUrl(file);
+        update({ referencePaths: [dataUrl] });
+        setNotice(t.audioUploaded);
+      } catch { setNotice(t.uploadFailed); } finally { setAudioBusy(false); }
+      return;
+    }
     setImageBusy(true);
     try {
       const dataUrl = await compressImage(file);
@@ -278,7 +298,7 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
   const replaceVoiceFromCanvas = (source: string) => {
     const selected = canvasAudioSources.find((item) => item.source === source);
     if (!selected) return;
-    update({ voiceClip: selected.source });
+    update({ voiceClip: selected.source, voiceAssetId: undefined, voiceAssetName: selected.label || undefined });
     setNotice(t.voiceCanvasReplaced.replace("{name}", selected.label));
   };
 
@@ -304,8 +324,27 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
 
   /** 从素材库选一段音频作为角色声音音色（同样直接引用素材库路径，不转 dataURL） */
   const pickLibraryVoice = (item: LibraryAsset) => {
-    update({ voiceClip: item.sourcePath });
+    update({ voiceClip: item.sourcePath, voiceAssetId: undefined, voiceAssetName: item.name || undefined });
     setNotice(t.voiceLibraryAdded.replace("{name}", item.name || t.voiceClip));
+    setLibraryPicker(null);
+  };
+
+  const pickLibraryAudio = (item: LibraryAsset) => {
+    update({ referencePaths: [item.sourcePath] });
+    setNotice(t.voiceLibraryAdded.replace("{name}", item.name || t.assetKindAudioRef));
+    setLibraryPicker(null);
+  };
+
+  const cinematicAudioAssets = useMemo(
+    () => (project.assets ?? []).filter((item) => item.kind === "audio-reference" && Boolean(item.referencePaths?.[0]?.trim())),
+    [project.assets],
+  );
+
+  const pickCinematicVoice = (item: Asset) => {
+    const source = item.referencePaths?.[0]?.trim();
+    if (!source) return;
+    update({ voiceClip: source, voiceAssetId: item.id, voiceAssetName: item.name || undefined });
+    setNotice(t.voiceLibraryAdded.replace("{name}", item.name || t.assetKindAudioRef));
     setLibraryPicker(null);
   };
 
@@ -410,23 +449,34 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
    * 素材库选择面板：ref 模式挂在参考图容器内（flex-wrap 换行铺满一行），
    * prop 模式挂在道具面板内，voice 模式挂在声音音色字段下（只列音频素材）。
    */
-  const libraryPickerNode = (target: "ref" | "prop" | "voice") => {
+  const libraryPickerNode = (target: "ref" | "prop" | "audio" | "voice") => {
     const isVoice = target === "voice";
-    const items = isVoice ? libraryAudio : libraryImages;
+    const items = isVoice || target === "audio" ? libraryAudio : libraryImages;
     return libraryPicker === target && (
       <div
         className="asset-prop-picker"
-        style={target === "ref" ? { flexBasis: "100%" } : target === "voice" ? { marginTop: 6 } : undefined}
+        style={target === "ref" ? { flexBasis: "100%" } : target === "voice" || target === "audio" ? { marginTop: 6 } : undefined}
       >
         <button type="button" className="asset-prop-picker-back" onClick={() => setLibraryPicker(null)}>{t.cancel}</button>
-        {items.length === 0 ? <span className="hint-text">{isVoice ? t.voiceLibraryEmpty : t.libraryPickerEmpty}</span> : (
+        {isVoice && cinematicAudioAssets.length > 0 && <>
+          <div className="hint-text">{t.assetKindAudioRef}</div>
+          <div className="asset-prop-picker-grid" style={{ maxHeight: 180, overflowY: "auto" }}>
+            {cinematicAudioAssets.map((item) => (
+              <button type="button" key={item.id} title={item.name} onClick={() => pickCinematicVoice(item)}>
+                <span><AudioLines size={14} /></span>
+                <b>{item.name}</b>
+              </button>
+            ))}
+          </div>
+        </>}
+        {items.length === 0 && (!isVoice || cinematicAudioAssets.length === 0) ? <span className="hint-text">{isVoice || target === "audio" ? t.voiceLibraryEmpty : t.libraryPickerEmpty}</span> : (
           <div className="asset-prop-picker-grid" style={{ maxHeight: 220, overflowY: "auto" }}>
             {items.map((item) => (
               <button
                 type="button"
                 key={item.id}
                 title={item.name}
-                onClick={() => (isVoice ? pickLibraryVoice(item) : target === "prop" ? createPropFromLibraryImage(item) : pickLibraryReference(item))}
+                onClick={() => (isVoice ? pickLibraryVoice(item) : target === "audio" ? pickLibraryAudio(item) : target === "prop" ? createPropFromLibraryImage(item) : pickLibraryReference(item))}
               >
                 {item.mediaType === "audio"
                   ? <span><AudioLines size={14} /></span>
@@ -454,7 +504,22 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
       <div className="asset-modal-grid">
         {/* 左列：用户填写的基础信息 */}
         <div className="asset-modal-left">
-          {asset.kind === "character" ? <div className="asset-media-split">
+          {asset.kind === "audio-reference" ? <div className="asset-refs">
+            {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref voice-clip" key={index}>
+              <audio controls src={resolveImageDisplayUrl(src)} preload="none" />
+              <button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button>
+            </span>)}
+            <label className="asset-ref-add" title={t.voiceUploadHint}>
+              {audioBusy ? <span className="spin-dot" /> : <AudioLines size={18} />}
+              <span>{t.assetUploadShort}</span>
+              <input className="hidden" type="file" accept="audio/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
+            </label>
+            <button type="button" className="asset-ref-add" title={t.assetPickFromLibrary} onClick={() => setLibraryPicker(libraryPicker === "audio" ? null : "audio")}>
+              <FolderOpen size={18} />
+              <span>{t.assetLibraryShort}</span>
+            </button>
+            {libraryPickerNode("audio")}
+          </div> : asset.kind === "character" ? <div className="asset-media-split">
             <div className="asset-refs">
               {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={resolveImageDisplayUrl(src)} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
               <label className="asset-ref-add" title={t.uploadCharacterImages}>
@@ -536,12 +601,12 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
             <label className="field-label">{t.propDefaultState}<input className="modal-input" value={locale === "zh" ? (asset.propDefaultStateZh ?? "") : (asset.propDefaultState ?? "")} placeholder={t.propDefaultStatePlaceholder} onChange={(event) => update(locale === "zh" ? { propDefaultStateZh: event.target.value } : { propDefaultState: event.target.value })} /></label>
             <span className="hint-text">{t.propDefaultsHint}</span>
           </div>}
-          {/* 角色声音参考会在最终提示词的活动引用中按 @audioN 输出。 */}
+          {/* 角色声音参考会在最终提示词的活动引用中按资产名 + @audioN 输出。 */}
           {asset.kind === "character" && <div className="field-label">{t.voiceClip}
             {asset.voiceClip ? (
               <div className="voice-clip">
                 <audio controls src={resolveImageDisplayUrl(asset.voiceClip)} preload="none" />
-                <button className="icon-button" title={t.deleteAsset} onClick={() => update({ voiceClip: undefined })}><X size={13} /></button>
+                <button className="icon-button" title={t.deleteAsset} onClick={() => update({ voiceClip: undefined, voiceAssetId: undefined, voiceAssetName: undefined })}><X size={13} /></button>
               </div>
             ) : null}
             <button

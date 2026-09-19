@@ -20,6 +20,7 @@ export const DEFAULT_NODE_DISPLAY_NAME: Record<CanvasNodeType, string> = {
   [CANVAS_NODE_TYPES.promptOptimizer]: '提示词优化',
   [CANVAS_NODE_TYPES.audio]: '媒体',
   [CANVAS_NODE_TYPES.audioGen]: 'AI 音频',
+  [CANVAS_NODE_TYPES.motionControl]: '动作控制 / 对口型',
   [CANVAS_NODE_TYPES.seamlessMosaic]: '无缝拼图',
 };
 

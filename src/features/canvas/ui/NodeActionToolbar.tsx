@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NodeToolbar as ReactFlowNodeToolbar } from '@xyflow/react';
-import { Camera, Copy, Crop, Download, Library, Maximize2, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Sparkles, Trash2, Unlink2, LayoutTemplate } from 'lucide-react';
+import { Camera, Copy, Crop, Download, FileText, Library, Maximize2, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Sparkles, Trash2, Unlink2, LayoutTemplate } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import {
@@ -36,6 +36,7 @@ import { saveMediaSourceWithDialog } from '@/features/canvas/application/mediaDo
 import { importVideoUrlToAsset } from '@/features/library/importAssets';
 import { buildTemplateFromCanvas, createTemplateFromCanvas, validateTemplateChain } from '@/features/templates/createTemplate';
 import { UiInput, UiTextArea } from '@/components/ui/primitives';
+import { PajubenQuickExtractDialog } from '@/features/pajuben/PajubenQuickExtractDialog';
 import { useAssetLibraryStore } from '@/features/library/assetStore';
 import {
   JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID,
@@ -104,7 +105,8 @@ const TOOLBAR_NEUTRAL_BUTTON_CLASS =
 export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const { t, i18n } = useTranslation();
   const isImageEdit = isImageEditNode(node);
-  const isGeneratedVideoNode = isAudioNode(node) && node.data.mediaType === 'video';
+  // AI 生成视频与本地上传视频最终都落在同一个媒体节点，统一开放视频工具栏。
+  const isVideoMediaNode = isAudioNode(node) && node.data.mediaType === 'video';
   const isStoryboardGen = isStoryboardGenNode(node);
   const isStoryboardSplit = isStoryboardSplitNode(node);
   const canCopyStoryboardText = isStoryboardGen || isStoryboardSplit;
@@ -143,6 +145,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isUpscalingImage, setIsUpscalingImage] = useState(false);
   const [isSavingToLibrary, setIsSavingToLibrary] = useState(false);
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
+  // 「扒视频」：从视频节点直接跑一次最精简的扒剧本，结果落成右侧文本节点
+  const [isScriptDialogOpen, setIsScriptDialogOpen] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
   const [isTemplateDialogOpen, setIsTemplateDialogOpen] = useState(false);
   const [templateName, setTemplateName] = useState('');
@@ -157,10 +161,10 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     }
     return null;
   }, [node]);
-  const videoSource = isGeneratedVideoNode
+  const videoSource = isVideoMediaNode
     ? ((node.data as { sourcePath?: string | null }).sourcePath ?? null)
     : null;
-  const canSaveVideoTemplate = isGeneratedVideoNode
+  const canSaveVideoTemplate = isVideoMediaNode
     && Boolean(videoSource)
     && Boolean((node.data as { generationModel?: string | null }).generationModel || (node.data as { generationResultProtected?: boolean }).generationResultProtected);
   const templateDraft = useMemo(() => {
@@ -370,17 +374,17 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     [activeLibraryId, categories, libraries]
   );
   const generationError =
-    (isExportImageNode(node) || isGeneratedVideoNode)
+    (isExportImageNode(node) || isVideoMediaNode)
     && typeof (node.data as { generationError?: unknown }).generationError === 'string'
       ? ((node.data as { generationError?: string }).generationError ?? '').trim()
       : '';
   const generationErrorDetails =
-    (isExportImageNode(node) || isGeneratedVideoNode)
+    (isExportImageNode(node) || isVideoMediaNode)
     && typeof (node.data as { generationErrorDetails?: unknown }).generationErrorDetails === 'string'
       ? ((node.data as { generationErrorDetails?: string }).generationErrorDetails ?? '').trim()
       : '';
   const canCopyGenerationError =
-    (isExportImageNode(node) || isGeneratedVideoNode) && generationError.length > 0;
+    (isExportImageNode(node) || isVideoMediaNode) && generationError.length > 0;
   const canRetryGeneration = canCopyGenerationError
     && Boolean((node.data as { generationRequest?: unknown }).generationRequest);
   const encodingRetryAvailable = Boolean(
@@ -673,7 +677,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               <Download className="h-3.5 w-3.5" />
               {t('nodeToolbar.download')}
             </UiChipButton>
-            {isGeneratedVideoNode && videoSource && (
+            {isVideoMediaNode && videoSource && (
               <UiChipButton
                 key="video-capture-frame"
                 className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
@@ -685,6 +689,21 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               >
                 <Camera className="h-3.5 w-3.5" />
                 {t('nodeToolbar.captureFrame')}
+              </UiChipButton>
+            )}
+            {isVideoMediaNode && videoSource && (
+              <UiChipButton
+                key="video-extract-script"
+                className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  // 一键扒剧本: 弹窗里只选模型, 扒完把剧本落成右侧文本节点。
+                  setIsScriptDialogOpen(true);
+                }}
+                title={t('pajuben.quickTitle', '扒视频')}
+              >
+                <FileText className="h-3.5 w-3.5" />
+                {t('pajuben.quickTitle', '扒视频')}
               </UiChipButton>
             )}
             {canUpscaleImage && (
@@ -702,7 +721,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 {t('nodeToolbar.imageUpscale')}
               </UiChipButton>
             )}
-            {isGeneratedVideoNode && videoSource && (
+            {isVideoMediaNode && videoSource && (
               <UiChipButton
                 key="video-upscale"
                 className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
@@ -738,7 +757,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             {templateNotice && <span className="px-2 text-[11px] text-emerald-300">{templateNotice}</span>}
           </>
         )}
-        {!isImageEdit && isGeneratedVideoNode && videoSource && (
+        {!isImageEdit && isVideoMediaNode && videoSource && (
           <UiChipButton
             key="video-library"
             className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
@@ -790,6 +809,10 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           {t('common.delete')}
         </UiChipButton>
       </UiPanel>
+
+      {!isImageEdit && isScriptDialogOpen && (
+        <PajubenQuickExtractDialog node={node} onClose={() => setIsScriptDialogOpen(false)} />
+      )}
 
       {!isImageEdit && (
         <UiModal

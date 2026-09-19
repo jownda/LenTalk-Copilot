@@ -31,6 +31,7 @@ const SAFE_DATA_KEYS = [
   "displayName", "prompt", "content", "quickStyle", "quickSynopsis", "quickStaging",
   "quickStudioSceneId", "model", "imageMode", "aspectRatio", "resolution", "sourcePath",
   "mediaType", "imageUrl", "outputImageUrl", "inputImageUrl", "studioReferenceImages", "studioReferenceAudio",
+  "excludedReferenceSources",
 ] as const;
 
 function summarizeData(data: CanvasNodeData): Record<string, unknown> {

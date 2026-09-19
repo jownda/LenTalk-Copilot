@@ -15,6 +15,7 @@ import {
   ArrowDownToLine,
   MoreHorizontal,
   LayoutTemplate,
+  Clapperboard,
 } from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
 import { getProjectRecord, type ProjectRecord } from "@/commands/projectState";
@@ -23,6 +24,7 @@ import { UI_CONTENT_OVERLAY_INSET_CLASS } from "@/components/ui/motion";
 import { UiButton, UiSelect } from "@/components/ui/primitives";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import { AssetLibraryPanel } from "@/features/library/AssetLibraryPanel";
+import { PajubenStudio } from "@/features/pajuben/PajubenStudio";
 import { ThreeDDirectorDesk } from "@/features/threeDDirector/ThreeDDirectorDesk";
 import { RenameDialog } from "./RenameDialog";
 import { CloudDriveUploadDialog } from "./CloudDriveUploadDialog";
@@ -50,6 +52,8 @@ export function ProjectManager() {
   /** 素材库按钮底部视口 Y,素材库面板从此处下方平滑呼出(不顶到最顶部) */
   const [libraryAnchorTop, setLibraryAnchorTop] = useState(0);
   const [show3DDirector, setShow3DDirector] = useState(false);
+  /** 扒剧本工作台（短剧视频 → 拉片剧本） */
+  const [showPajuben, setShowPajuben] = useState(false);
   const [openProjectMenuId, setOpenProjectMenuId] = useState<string | null>(null);
   const [projectActionNotice, setProjectActionNotice] = useState<string | null>(null);
   const [busyProjectActionId, setBusyProjectActionId] = useState<string | null>(null);
@@ -231,6 +235,8 @@ export function ProjectManager() {
           target.closest("[data-asset-library]") ||
           target.closest(".director-desk-app") ||
           target.closest(".cinematic-studio-app") ||
+          // 扒剧本工作台自带关闭按钮，工作台内双击不应当被理解成「新建项目」
+          target.closest("[data-pajuben-studio]") ||
           target.closest("button, select, input, a, textarea")
         ) {
           return;
@@ -286,6 +292,10 @@ export function ProjectManager() {
             </div>
           </div>
           <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:shrink-0">
+            <UiButton type="button" variant="muted" onClick={() => setShowPajuben(true)} className="gap-2">
+              <Clapperboard className="w-5 h-5" />
+              {t("project.pajuben", "扒剧本")}
+            </UiButton>
             <UiButton type="button" variant="muted" onClick={() => navigate("/templates")} className="gap-2">
               <LayoutTemplate className="w-5 h-5" />
               {t("project.template")}
@@ -501,6 +511,7 @@ export function ProjectManager() {
       />
 
       {show3DDirector && <ThreeDDirectorDesk onClose={() => setShow3DDirector(false)} />}
+      {showPajuben && <PajubenStudio onClose={() => setShowPajuben(false)} />}
     </div>
   );
 }

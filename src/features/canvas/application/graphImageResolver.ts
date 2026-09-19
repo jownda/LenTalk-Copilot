@@ -40,6 +40,15 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
     return [...new Set(audioSources)];
   }
 
+  collectInputVideos(nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]): string[] {
+    const nodeById = new Map(nodes.map((node) => [node.id, node]));
+    const sourceNodeIds = edges.filter((edge) => edge.target === nodeId).map((edge) => edge.source);
+
+    return [...new Set(sourceNodeIds
+      .map((sourceId) => nodeById.get(sourceId))
+      .flatMap((node) => this.extractVideos(node, nodeById)))];
+  }
+
   collectInputText(nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]): string[] {
     const nodeById = new Map(nodes.map((node) => [node.id, node]));
     const sourceNodeIds = edges.filter((edge) => edge.target === nodeId).map((edge) => edge.source);
@@ -116,6 +125,23 @@ export class DefaultGraphImageResolver implements GraphImageResolver {
 
     if (isCinematicStudioNode(node)) {
       return Array.isArray(node.data.studioReferenceAudio) ? node.data.studioReferenceAudio.filter(Boolean) : [];
+    }
+
+    return [];
+  }
+
+  private extractVideos(node: CanvasNode | undefined, nodeById: Map<string, CanvasNode>): string[] {
+    if (!node) {
+      return [];
+    }
+
+    if (isGroupNode(node)) {
+      const children = Array.from(nodeById.values()).filter((item) => item.parentId === node.id);
+      return children.flatMap((child) => this.extractVideos(child, nodeById));
+    }
+
+    if (isAudioNode(node) && node.data.mediaType === 'video' && node.data.sourcePath) {
+      return [node.data.sourcePath];
     }
 
     return [];

@@ -12,7 +12,8 @@ export class CanvasNodeFactory implements NodeFactory {
   createNode(
     type: CanvasNodeType,
     position: XYPosition,
-    data: Partial<CanvasNodeData> = {}
+    data: Partial<CanvasNodeData> = {},
+    size?: { width: number; height: number }
   ): CanvasNode {
     const definition = this.nodeCatalog.getDefinition(type);
     const nodeData = {
@@ -20,13 +21,17 @@ export class CanvasNodeFactory implements NodeFactory {
       ...data,
     } as CanvasNodeData;
 
+    // 显式尺寸优先于节点类型的默认尺寸：文本节点在菜单里新建时是紧凑尺寸，
+    // 但「扒视频」落下来的剧本节点需要更大一块版面。
+    const resolvedSize = size ?? definition.defaultSize;
+
     return {
       id: this.idGenerator.next(),
       type,
       position,
       data: nodeData,
-      ...(definition.defaultSize
-        ? { style: { width: definition.defaultSize.width, height: definition.defaultSize.height } }
+      ...(resolvedSize
+        ? { style: { width: resolvedSize.width, height: resolvedSize.height } }
         : {}),
     };
   }

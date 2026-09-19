@@ -255,6 +255,12 @@ export async function captureVideoFrame(request: CaptureVideoFrameRequest): Prom
     }
   }
 
+  // 本地播放失败后的同源回退会传入 Blob URL。不要给它设置 crossOrigin，
+  // 否则部分 WebView 会把本来同源的 Blob 当成跨域源处理。
+  if (trimmed.startsWith('blob:')) {
+    return await captureFromVideoSource({ src: trimmed, crossOrigin: false, timeSec, maxWidth });
+  }
+
   const attempts: Array<() => Promise<string>> = [
     () =>
       captureFromVideoSource({

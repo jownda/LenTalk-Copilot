@@ -101,8 +101,8 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
         assets: (state.assets ?? [])
           .filter((asset) => asset.id !== action.id)
           .map((asset) => asset.attachedPropIds?.includes(action.id)
-            ? { ...asset, attachedPropIds: asset.attachedPropIds.filter((id) => id !== action.id) }
-            : asset),
+            ? { ...asset, attachedPropIds: asset.attachedPropIds.filter((id) => id !== action.id), ...(asset.voiceAssetId === action.id ? { voiceAssetId: undefined, voiceAssetName: undefined } : {}) }
+            : asset.voiceAssetId === action.id ? { ...asset, voiceAssetId: undefined, voiceAssetName: undefined } : asset),
         // 删除资产时同步清理风格配方绑定
         technicalProfile: {
           ...(state.technicalProfile ?? {}),

@@ -69,6 +69,7 @@ export function renderAssetSection(registry: AssetRegistry, syntax: ReferenceSyn
     locale,
     holderName,
     asset.voiceClip?.trim() ? ++audioIndex : undefined,
+    registry.audioReferenceNameByAssetId?.get(asset.id),
   ));
   return `${heading}:\n${assetLines.join("\n")}`;
 }

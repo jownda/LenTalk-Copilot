@@ -29,6 +29,7 @@ const CATEGORIES: AssetCategory[] = [
   { id: 'category-characters', libraryId: LIBRARY_ID, name: '角色', createdAt: 0 },
   { id: 'category-scenes', libraryId: LIBRARY_ID, name: '场景', createdAt: 0 },
   { id: 'category-props', libraryId: LIBRARY_ID, name: '道具', createdAt: 0 },
+  { id: 'category-audio', libraryId: LIBRARY_ID, name: '音频', createdAt: 0 },
 ];
 
 const CONTEXT = { libraryId: LIBRARY_ID, categories: CATEGORIES };
@@ -89,6 +90,20 @@ describe('buildCinematicMirrorAssets', () => {
     expect(mirrored.every((asset) => asset.cinematicKind === 'character')).toBe(true);
     expect(mirrored.every((asset) => asset.categoryId === 'category-characters')).toBe(true);
     expect(mirrored.every((asset) => asset.mediaType === 'image')).toBe(true);
+  });
+
+  it('mirrors audio reference assets as named audio entries', () => {
+    const mirrored = buildCinematicMirrorAssets(
+      [cinematicAsset({ id: 'voice-1', kind: 'audio-reference', name: '藏医声音', referencePaths: ['/voice.mp3'] })],
+      CONTEXT,
+    );
+    expect(mirrored).toMatchObject([{
+      id: 'cinematic-voice-1-0',
+      name: '藏医声音',
+      mediaType: 'audio',
+      categoryId: 'category-audio',
+      cinematicKind: 'audio-reference',
+    }]);
   });
 
   it('appends the character voice clip as an audio entry', () => {

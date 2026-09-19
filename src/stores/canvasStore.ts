@@ -111,7 +111,9 @@ interface CanvasState {
   addNode: (
     type: CanvasNodeType,
     position: { x: number; y: number; parentId?: string; groupResize?: { id: string; width: number; height: number } },
-    data?: Partial<CanvasNodeData>
+    data?: Partial<CanvasNodeData>,
+    /** 显式初始尺寸；省略则用节点类型注册的 defaultSize。 */
+    size?: { width: number; height: number }
   ) => string;
   replaceNodeType: (nodeId: string, type: CanvasNodeType, data?: Partial<CanvasNodeData>) => boolean;
   addEdge: (source: string, target: string, sourceHandle?: string, targetHandle?: string) => string | null;
@@ -267,7 +269,24 @@ function applyCinematicStudioPromptToTarget(
     }
 
     if (node.type === CANVAS_NODE_TYPES.videoGen) {
-      return { ...node, data: { ...node.data, prompt, studioReferenceImages: referenceImages, studioReferenceAudio: referenceAudio } } as CanvasNode;
+      // 工作室重新推送引用素材时, 把这些来源从「已移除」名单里摘掉 —— 否则
+      // 用户重新发送后素材会被自己的删除记录继续挡住, 看起来像没生效。
+      const excluded = Array.isArray((node.data as { excludedReferenceSources?: unknown }).excludedReferenceSources)
+        ? (node.data as { excludedReferenceSources: unknown[] }).excludedReferenceSources.filter((value): value is string => typeof value === 'string')
+        : [];
+      const nextExcluded = excluded.filter(
+        (source) => !referenceImages.includes(source) && !referenceAudio.includes(source)
+      );
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          prompt,
+          studioReferenceImages: referenceImages,
+          studioReferenceAudio: referenceAudio,
+          ...(nextExcluded.length !== excluded.length ? { excludedReferenceSources: nextExcluded } : {}),
+        },
+      } as CanvasNode;
     }
 
     return { ...node, data: { ...node.data, content: prompt } } as CanvasNode;
@@ -1288,10 +1307,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     }
   },
 
-  addNode: (type, position, data = {}) => {
+  addNode: (type, position, data = {}, size) => {
     const state = get();
     const nodePosition = { x: position.x, y: position.y };
-    const newNode = canvasNodeFactory.createNode(type, nodePosition, data);
+    const newNode = canvasNodeFactory.createNode(type, nodePosition, data, size);
     if (position.parentId) {
       newNode.parentId = position.parentId;
     }

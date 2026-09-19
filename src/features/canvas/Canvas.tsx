@@ -25,7 +25,7 @@ import {
 } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
 import { isTauri } from "@tauri-apps/api/core";
-import { AlignJustify, Bot, Film, Keyboard, Layers, Library, Magnet } from "lucide-react";
+import { AlignJustify, Bot, Film, Keyboard, LayoutTemplate, Library, Magnet } from "lucide-react";
 import "@xyflow/react/dist/style.css";
 
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -87,10 +87,34 @@ import {
 import { usePromptLibraryStore, type PromptTemplate } from "@/features/prompts/promptLibraryStore";
 import { UiButton, UiInput, UiModal } from "@/components/ui";
 import type { CinematicAssetLibraryBridge } from "@/features/library/AssetLibraryPanel";
+import { TemplateSidebar } from "@/features/templates/TemplateSidebar";
+import { TEMPLATE_DRAG_DATA_TYPE, parseTemplateDragPayload } from "@/features/templates/templateDrag";
+import { resolveTemplatePlacement } from "@/features/templates/placeGraph";
+import { browserTemplateRepository } from "@/features/templates/storage/templateRepository";
+import { ensureTemplateGraph } from "@/features/templates/types";
 import { duplicateCinematicProject } from "@/features/cinematicStudio/app/model";
 import { createCinematicProjectId } from "@/features/cinematicStudio/app/projectId";
 
 const DEFAULT_VIEWPORT: Viewport = { x: 0, y: 0, zoom: 1 };
+
+/** 兼容供应商返回的 JSON 图片数组；旧任务仍然直接返回单个图片源。 */
+function parseImageResultSources(result: string): string[] {
+  const trimmed = result.trim();
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        const sources = parsed.filter(
+          (value): value is string => typeof value === 'string' && value.trim().length > 0,
+        );
+        if (sources.length > 0) return sources;
+      }
+    } catch {
+      // 不是数组结果时按旧版单图源继续处理。
+    }
+  }
+  return [trimmed];
+}
 
 type LocalUploadMediaType = 'image' | 'video' | 'audio';
 
@@ -442,6 +466,12 @@ export function Canvas() {
   // 必须用 ref 而非 effect 闭包变量: setNodes 会触发 store 更新导致 effect 重建, 闭包变量值会丢失。
   const suppressClickUntilRef = useRef(0);
   const suppressNextEdgeClickRef = useRef(false);
+  // 右键框选期间要吞掉随之而来的 contextmenu，否则一拖就跳出画布右键菜单。
+  // Windows 的 contextmenu 在 mouseup 之后派发，正好被 pointerup 里置的时间窗挡住。
+  const suppressContextMenuUntilRef = useRef(0);
+  // macOS 的 contextmenu 在按下瞬间就派发，只能先压住，等 pointerup 判定「没拖动」
+  // 再用这个回调把菜单补弹一次（详见框选 effect 里的注释）。
+  const canvasContextMenuRef = useRef<((event: MouseEvent | ReactMouseEvent) => void) | null>(null);
 
   const [showNodeMenu, setShowNodeMenu] = useState(false);
   const [isNodePaletteOpen, setIsNodePaletteOpen] = useState(true);
@@ -464,6 +494,7 @@ export function Canvas() {
   const [pendingConnectStart, setPendingConnectStart] = useState<PendingConnectStart | null>(null);
   const [previewConnectionVisual, setPreviewConnectionVisual] = useState<PreviewConnectionVisual | null>(null);
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
+  const [isTemplateOpen, setIsTemplateOpen] = useState(false);
   const [cinematicAssetLibrary, setCinematicAssetLibrary] = useState<CinematicAssetLibraryBridge | null>(null);
   const [isVideoExtractOpen, setIsVideoExtractOpen] = useState(false);
   const [isAgentOpen, setIsAgentOpen] = useState(false);
@@ -564,6 +595,8 @@ export function Canvas() {
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const updateNodeDataTransient = useCanvasStore((state) => state.updateNodeDataTransient);
   const addNode = useCanvasStore((state) => state.addNode);
+  const addEdge = useCanvasStore((state) => state.addEdge);
+  const findNodePosition = useCanvasStore((state) => state.findNodePosition);
   const replaceNodeType = useCanvasStore((state) => state.replaceNodeType);
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const selectedNodeId = useCanvasStore((state) => state.selectedNodeId);
@@ -637,6 +670,16 @@ export function Canvas() {
     },
     [persistCanvasSnapshot],
   );
+
+  /** 打开模板侧边栏: 先把当前画布快照落盘(取消未触发的延迟保存), 画布本身不离开 */
+  const handleOpenTemplates = useCallback(() => {
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    persistCanvasSnapshot();
+    setIsTemplateOpen(true);
+  }, [persistCanvasSnapshot]);
 
   useEffect(() => {
     const unsubscribeOpen = canvasEventBus.subscribe("tool-dialog/open", (payload) => {
@@ -744,6 +787,7 @@ export function Canvas() {
                   model?: unknown;
                   size?: unknown;
                   aspectRatio?: unknown;
+                  imageCount?: unknown;
                   referenceImages?: unknown;
                   extraParams?: unknown;
                 }
@@ -803,6 +847,9 @@ export function Canvas() {
                   size: typeof generationRequest.size === "string" ? generationRequest.size : "1K",
                   aspectRatio:
                     typeof generationRequest.aspectRatio === "string" ? generationRequest.aspectRatio : "1:1",
+                  imageCount: typeof generationRequest.imageCount === "number"
+                    ? generationRequest.imageCount
+                    : undefined,
                   referenceImages: Array.isArray(generationRequest.referenceImages)
                     ? generationRequest.referenceImages.filter((value): value is string => typeof value === "string")
                     : [],
@@ -848,7 +895,8 @@ export function Canvas() {
             }
 
             if (status.status === "succeeded" && typeof status.result === "string" && status.result.trim()) {
-              const resultSource = status.result;
+              const resultSources = parseImageResultSources(status.result);
+              const resultSource = resultSources[0];
               recordGenerationOutcome({
                 nodeId: pendingNode.id,
                 kind: "image",
@@ -887,6 +935,57 @@ export function Canvas() {
                 generationRequest: undefined,
               });
               requestAnimationFrame(() => updateNodeInternals(pendingNode.id));
+
+              // 多图结果拆成多个结果节点，保持每个节点只有一张图，
+              // 这样下游引用、下载和后续编辑仍与单图结果完全一致。
+              if (resultSources.length > 1) {
+                const sourceNodeId = useCanvasStore.getState().edges.find(
+                  (edge) => edge.target === pendingNode.id,
+                )?.source;
+                if (sourceNodeId) {
+                  const baseTitle =
+                    typeof (currentData as { displayName?: unknown }).displayName === 'string'
+                      ? String((currentData as { displayName?: unknown }).displayName)
+                      : '结果图片';
+                  resultSources.slice(1).forEach((source, index) => {
+                    const extraNodeId = addNode(
+                      CANVAS_NODE_TYPES.exportImage,
+                      findNodePosition(
+                        sourceNodeId,
+                        EXPORT_RESULT_NODE_MIN_WIDTH,
+                        EXPORT_RESULT_NODE_MIN_HEIGHT,
+                      ),
+                      {
+                        imageUrl: source,
+                        previewImageUrl: source,
+                        aspectRatio: typeof currentData.aspectRatio === 'string'
+                          ? currentData.aspectRatio
+                          : '1:1',
+                        generationResultProtected: true,
+                        resultKind: 'generic',
+                        displayName: `${baseTitle} (${index + 2})`,
+                      },
+                    );
+                    addEdge(sourceNodeId, extraNodeId);
+                    requestAnimationFrame(() => updateNodeInternals(extraNodeId));
+                    void prepareNodeImage(source).then((prepared) => {
+                      const latest = useCanvasStore.getState().nodes.find((node) => node.id === extraNodeId);
+                      if (!latest || (latest.data as Record<string, unknown>).imageUrl !== source) return;
+                      updateNodeDataTransient(extraNodeId, {
+                        imageUrl: prepared.imageUrl,
+                        previewImageUrl: prepared.previewImageUrl,
+                        aspectRatio: prepared.aspectRatio,
+                      });
+                      requestAnimationFrame(() => updateNodeInternals(extraNodeId));
+                    }).catch((error) => {
+                      console.warn('[GenerationJob] extra image persistence failed after result display', {
+                        nodeId: extraNodeId,
+                        error,
+                      });
+                    });
+                  });
+                }
+              }
 
               // The immediate source keeps the canvas responsive. Replace it
               // with the durable local image and preview once preparation has
@@ -969,7 +1068,16 @@ export function Canvas() {
         }
       })();
     }
-  }, [apiKeys, processingRevision, updateNodeData, updateNodeDataTransient, updateNodeInternals]);
+  }, [
+    addEdge,
+    addNode,
+    apiKeys,
+    findNodePosition,
+    processingRevision,
+    updateNodeData,
+    updateNodeDataTransient,
+    updateNodeInternals,
+  ]);
 
   // Video generation currently uses provider-specific HTTP flows without a
   // shared task-status command. A restart leaves the request available for
@@ -1258,8 +1366,11 @@ export function Canvas() {
 
   const handleMoveStart = useCallback((event: unknown) => {
     cancelPendingViewportPersist();
-    // 用户主动平移/缩放画布时收起素材库; 程序化 setViewport 的 event 为 null, 不误伤
-    if (event) setIsLibraryOpen(false);
+    // 用户主动平移/缩放画布时收起素材库/模板栏; 程序化 setViewport 的 event 为 null, 不误伤
+    if (event) {
+      setIsLibraryOpen(false);
+      setIsTemplateOpen(false);
+    }
   }, [cancelPendingViewportPersist]);
 
   useEffect(() => {
@@ -1453,7 +1564,11 @@ export function Canvas() {
     [alignNodes, scheduleCanvasPersist, selectedNodeIds],
   );
 
-  // 双击第二下按住左键拖拽 = 框选节点(左键拖拽留给平移, 所以框选改为双击手势)
+  // 框选节点，两个手势并存：
+  //   1) 右键按住拖拽（主手势）—— 右键已从 panOnDrag 里摘掉，不再平移画布；
+  //   2) 左键双击第二下按住拖拽（旧手势，左键单击拖拽仍留给平移）。
+  // 判定「没拖动」时放行给原有逻辑：左键那次交给双击打开节点菜单，
+  // 右键那次交给 contextmenu（或手动补弹，见下）。
   useEffect(() => {
     const wrapper = wrapperRef.current;
     if (!wrapper) {
@@ -1462,7 +1577,16 @@ export function Canvas() {
     let lastDownAt = 0;
     let lastDownPos = { x: 0, y: 0 };
     let selecting = false;
+    /** 本次框选由哪个键触发：2=右键（按下即进入），0=左键（双击第二下）。 */
+    let selectButton = -1;
     let startScreen = { x: 0, y: 0 };
+    /** 是否已越过拖动阈值——没越过就还只是一次普通点击。 */
+    let moved = false;
+    /**
+     * 右键按下期间 contextmenu 已被压住（macOS 会在按下瞬间派发）。
+     * 记下来，等 pointerup 判定「确实没拖动」再手动补弹一次菜单。
+     */
+    let rightMenuSuppressed = false;
 
     const isBlankPaneTarget = (target: EventTarget | null) => {
       const el = target as HTMLElement | null;
@@ -1480,10 +1604,29 @@ export function Canvas() {
       return true;
     };
 
+    const beginSelection = (pos: { x: number; y: number }, button: number) => {
+      selecting = true;
+      selectButton = button;
+      moved = false;
+      startScreen = pos;
+    };
+
     const handlePointerDown = (event: PointerEvent) => {
-      if (event.button !== 0 || !isBlankPaneTarget(event.target)) {
+      if (!isBlankPaneTarget(event.target)) {
         return;
       }
+
+      // 右键按住 = 框选。这里**不能** preventDefault：还没拖动的右键必须让
+      // 右键菜单照常弹出（该不该弹由 pointerup 判定）。
+      if (event.button === 2) {
+        beginSelection({ x: event.clientX, y: event.clientY }, 2);
+        return;
+      }
+
+      if (event.button !== 0) {
+        return;
+      }
+
       const now = performance.now();
       const pos = { x: event.clientX, y: event.clientY };
       const isDoubleClick = now - lastDownAt < 320 && Math.hypot(pos.x - lastDownPos.x, pos.y - lastDownPos.y) < 10;
@@ -1493,22 +1636,15 @@ export function Canvas() {
         return;
       }
       // 双击第二下按住: 进入框选, 捕获阶段拦截阻止 React Flow 的 pan(pointerdown) 与 d3-drag 平移(mousedown)
-      selecting = true;
-      startScreen = pos;
-      const wrapperRect = wrapper.getBoundingClientRect();
-      setDragSelectRect({
-        left: pos.x - wrapperRect.left,
-        top: pos.y - wrapperRect.top,
-        width: 0,
-        height: 0,
-      });
+      beginSelection(pos, 0);
       event.stopPropagation();
       event.preventDefault();
     };
 
-    // React Flow 的 pan 由 d3-drag 绑定在 pane 的 mousedown 驱动, 必须额外拦截 mousedown
+    // React Flow 的 pan 由 d3-drag 绑定在 pane 的 mousedown 驱动, 必须额外拦截 mousedown。
+    // 右键已经不在 panOnDrag 里了, d3-drag 不会再响应它, 所以只拦左键双击那一次。
     const handleMouseDown = (event: MouseEvent) => {
-      if (selecting && event.button === 0) {
+      if (selecting && selectButton === 0 && event.button === 0) {
         event.stopPropagation();
         event.preventDefault();
       }
@@ -1518,6 +1654,12 @@ export function Canvas() {
       if (!selecting) {
         return;
       }
+      const distance = Math.hypot(event.clientX - startScreen.x, event.clientY - startScreen.y);
+      // 未越过阈值：可能只是「点一下弹菜单」，先不画框也不吞事件
+      if (!moved && distance < 4) {
+        return;
+      }
+      moved = true;
       const wrapperRect = wrapper.getBoundingClientRect();
       setDragSelectRect({
         left: Math.min(startScreen.x, event.clientX) - wrapperRect.left,
@@ -1533,15 +1675,34 @@ export function Canvas() {
       if (!selecting) {
         return;
       }
+      const button = selectButton;
+      const didMove = moved;
       selecting = false;
+      selectButton = -1;
+      moved = false;
+
       const endScreen = { x: event.clientX, y: event.clientY };
       const width = Math.abs(endScreen.x - startScreen.x);
       const height = Math.abs(endScreen.y - startScreen.y);
       setDragSelectRect(null);
-      // 几乎没拖动 → 视为普通双击(不框选), 放行后续 click 打开节点菜单
-      if (width < 5 && height < 5) {
+
+      // 几乎没拖动 → 视为普通点击(不框选)，放行后续逻辑打开菜单
+      if (!didMove || (width < 5 && height < 5)) {
+        if (button === 2 && rightMenuSuppressed) {
+          // macOS 路径：菜单在按下时被压住了，这里补弹一次，
+          // 否则「右键点空白 = 弹菜单」这个既有行为就丢了。
+          rightMenuSuppressed = false;
+          const synthetic = {
+            clientX: startScreen.x,
+            clientY: startScreen.y,
+            preventDefault: () => {},
+            stopPropagation: () => {},
+          } as unknown as MouseEvent;
+          canvasContextMenuRef.current?.(synthetic);
+        }
         return;
       }
+
       const rect = {
         x: Math.min(startScreen.x, endScreen.x),
         y: Math.min(startScreen.y, endScreen.y),
@@ -1573,9 +1734,16 @@ export function Canvas() {
       reactFlowInstance.setNodes((nds) =>
         nds.map((node) => ({ ...node, selected: selectedByNode.get(node.id) ?? false })),
       );
-      // 框选成功: 在时间窗口内拦截松开后的 click/dblclick,
-      // 阻止 React Flow 的 Pane.onClick 调用 resetSelectedElements 取消框选结果
-      suppressClickUntilRef.current = performance.now() + 600;
+      if (button === 0) {
+        // 框选成功: 在时间窗口内拦截松开后的 click/dblclick,
+        // 阻止 React Flow 的 Pane.onClick 调用 resetSelectedElements 取消框选结果。
+        // 右键不产生 click, 这里不设窗口 —— 否则会把用户紧接着的一次左键点击一起吞掉。
+        suppressClickUntilRef.current = performance.now() + 600;
+      } else {
+        // 右键框选结束后紧跟的 contextmenu 要吞掉（Windows 在 mouseup 之后派发）
+        suppressContextMenuUntilRef.current = performance.now() + 600;
+        rightMenuSuppressed = false;
+      }
       event.stopPropagation();
       event.preventDefault();
     };
@@ -1590,6 +1758,23 @@ export function Canvas() {
       }
     };
 
+    // 右键框选进行中 / 刚结束时的 contextmenu 一律压住：
+    //  - 进行中(macOS 在按下瞬间派发)：先记下来，pointerup 判定没拖动再补弹；
+    //  - 刚结束(Windows 在 mouseup 之后派发)：时间窗内直接吞掉。
+    const handleContextMenuCapture = (event: MouseEvent) => {
+      if (selecting && selectButton === 2) {
+        rightMenuSuppressed = true;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      if (performance.now() < suppressContextMenuUntilRef.current) {
+        suppressContextMenuUntilRef.current = 0;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    };
+
     // document 捕获阶段拦截: 早于 React(root 委托) 与 d3-drag(pane bubble), 才能阻止平移
     document.addEventListener("pointerdown", handlePointerDown, true);
     document.addEventListener("mousedown", handleMouseDown, true);
@@ -1597,6 +1782,7 @@ export function Canvas() {
     window.addEventListener("pointerup", handlePointerUp, true);
     document.addEventListener("click", handleClickCapture, true);
     document.addEventListener("dblclick", handleClickCapture, true);
+    document.addEventListener("contextmenu", handleContextMenuCapture, true);
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown, true);
       document.removeEventListener("mousedown", handleMouseDown, true);
@@ -1604,6 +1790,7 @@ export function Canvas() {
       window.removeEventListener("pointerup", handlePointerUp, true);
       document.removeEventListener("click", handleClickCapture, true);
       document.removeEventListener("dblclick", handleClickCapture, true);
+      document.removeEventListener("contextmenu", handleContextMenuCapture, true);
     };
   }, [nodes, reactFlowInstance]);
 
@@ -1729,7 +1916,7 @@ export function Canvas() {
           return;
         }
         event.preventDefault();
-        setGroupNameDialog({ nodeIds: selectedNodeIds, name: "", mode: "create" });
+        handleGroupSelected();
         return;
       }
 
@@ -1763,6 +1950,7 @@ export function Canvas() {
     deleteNode,
     deleteNodes,
     groupNodes,
+    handleGroupSelected,
     undo,
     redo,
     scheduleCanvasPersist,
@@ -1796,8 +1984,9 @@ export function Canvas() {
 
   const handlePaneClick = useCallback(
     (event: ReactMouseEvent) => {
-      // 点击画布区域自动收起素材库侧边栏(面板内部点击不会走到 pane, 不误伤)
+      // 点击画布区域自动收起素材库/模板侧边栏(面板内部点击不会走到 pane, 不误伤)
       setIsLibraryOpen(false);
+      setIsTemplateOpen(false);
       setIsAgentOpen(false);
 
       if (suppressNextPaneClickRef.current) {
@@ -1854,6 +2043,12 @@ export function Canvas() {
     (event: MouseEvent | ReactMouseEvent) => openCanvasContextMenu(event, null),
     [openCanvasContextMenu],
   );
+
+  // 框选 effect 声明在上面，拿不到这个 useCallback，所以用 ref 转一手：
+  // macOS 上右键菜单在按下瞬间被压住，需要在这里回放一次。
+  useEffect(() => {
+    canvasContextMenuRef.current = handleCanvasContextMenu;
+  }, [handleCanvasContextMenu]);
 
   const handleNodeContextMenu = useCallback(
     (event: ReactMouseEvent, node: CanvasNode) => {
@@ -1977,10 +2172,11 @@ export function Canvas() {
   const handleAssetLibraryDragOver = useCallback((event: ReactDragEvent) => {
     const types = event.dataTransfer.types;
     const hasAssetDrag = types.includes(ASSET_DRAG_DATA_TYPE) || types.includes(PROMPT_DRAG_DATA_TYPE);
+    const hasTemplateDrag = types.includes(TEMPLATE_DRAG_DATA_TYPE);
     const hasNodeDrag = types.includes(CANVAS_NODE_DRAG_DATA_TYPE);
     // 系统文件拖入: dragOver 阶段 files 不可读(浏览器安全限制), 只能靠 types 里的 'Files'
     const hasFiles = types.includes("Files");
-    if (hasAssetDrag || hasNodeDrag || hasFiles) {
+    if (hasAssetDrag || hasTemplateDrag || hasNodeDrag || hasFiles) {
       event.preventDefault();
       event.dataTransfer.dropEffect = "copy";
     }
@@ -2023,6 +2219,44 @@ export function Canvas() {
   const handleAssetLibraryDrop = useCallback(
     (event: ReactDragEvent) => {
       const types = event.dataTransfer.types;
+
+      // 模板拖拽 → 把模板保存的整套节点链路落到画布
+      if (types.includes(TEMPLATE_DRAG_DATA_TYPE)) {
+        const templateId = parseTemplateDragPayload(event.dataTransfer.getData(TEMPLATE_DRAG_DATA_TYPE));
+        if (!templateId) return;
+        event.preventDefault();
+        const basePosition = reactFlowInstance.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+        void (async () => {
+          try {
+            const record = await browserTemplateRepository.get(templateId);
+            if (!record) return;
+            // 模板 graph 存的是保存时的绝对坐标, 必须先归一到左上角再平移到落点
+            const placement = resolveTemplatePlacement(ensureTemplateGraph(record).graph, basePosition);
+            if (placement.nodes.length === 0) return;
+
+            // 节点 id 由 addNode 内部重新生成(uuid), 因此同模板可重复拖入, 只需记录新旧映射。
+            const idMap = new Map<string, string>();
+            for (const node of placement.nodes) {
+              const newId = addNode(node.type, node.position, node.data);
+              idMap.set(node.templateNodeId, newId);
+            }
+            for (const edge of placement.edges) {
+              const source = idMap.get(edge.source);
+              const target = idMap.get(edge.target);
+              if (!source || !target) continue;
+              addEdge(source, target, edge.sourceHandle ?? undefined, edge.targetHandle ?? undefined);
+            }
+            const focusId = (placement.outputTemplateNodeId ? idMap.get(placement.outputTemplateNodeId) : undefined)
+              ?? (placement.videoTemplateNodeId ? idMap.get(placement.videoTemplateNodeId) : undefined)
+              ?? placement.nodes.map((node) => idMap.get(node.templateNodeId)).find(Boolean);
+            if (focusId) setSelectedNode(focusId);
+            scheduleCanvasPersist(0);
+          } catch (error) {
+            console.warn("[template] drop failed", error);
+          }
+        })();
+        return;
+      }
 
       // 提示词拖拽 → 创建 AI 图片节点
       if (types.includes(PROMPT_DRAG_DATA_TYPE)) {
@@ -2087,7 +2321,7 @@ export function Canvas() {
       setSelectedNode(nodeId);
       scheduleCanvasPersist(0);
     },
-    [addNode, reactFlowInstance, scheduleCanvasPersist, setSelectedNode],
+    [addEdge, addNode, reactFlowInstance, scheduleCanvasPersist, setSelectedNode],
   );
 
   // 从系统文件管理器拖入本地文件 → 按类型创建图片或媒体节点。
@@ -2479,8 +2713,9 @@ export function Canvas() {
 
   const handleNodeDragStart = useCallback(
     (event: ReactMouseEvent, node: CanvasNode) => {
-      // 拖拽画布节点也视为画布区交互, 收起素材库侧边栏
+      // 拖拽画布节点也视为画布区交互, 收起素材库/模板侧边栏
       setIsLibraryOpen(false);
+      setIsTemplateOpen(false);
       if (groupDragFeedbackTimerRef.current !== null) {
         window.clearTimeout(groupDragFeedbackTimerRef.current);
         groupDragFeedbackTimerRef.current = null;
@@ -3190,8 +3425,8 @@ export function Canvas() {
         onNodeDrag={handleNodeDrag}
         onNodeDragStop={handleNodeDragStop}
         onPaneClick={handlePaneClick}
-        // 点击画布上的节点同样收起素材库侧边栏
-        onNodeClick={() => { setIsLibraryOpen(false); setIsAgentOpen(false); }}
+        // 点击画布上的节点同样收起素材库/模板侧边栏
+        onNodeClick={() => { setIsLibraryOpen(false); setIsTemplateOpen(false); setIsAgentOpen(false); }}
         onNodeContextMenu={(event, node) => handleNodeContextMenu(event, node as CanvasNode)}
         onDragOver={handleAssetLibraryDragOver}
         onDrop={handleCanvasDrop}
@@ -3206,8 +3441,9 @@ export function Canvas() {
         maxZoom={5}
         snapToGrid={snapToGrid}
         snapGrid={[20, 20]}
-        // 左/中/右键拖拽均可平移画布; 框选改用「双击第二下按住拖拽」(自定义实现)
-        panOnDrag={[0, 1, 2]}
+        // 左/中键拖拽平移画布; 右键按住拖拽 = 框选(自定义实现, 见上方框选 effect),
+        // 左键双击第二下按住拖拽的旧框选手势一并保留
+        panOnDrag={[0, 1]}
         // 拖拽阈值: 移动超过 4px 才算拖动, 避免单击(想进入编辑)时轻微手抖被误判成拖动
         nodeDragThreshold={4}
         // 禁用空格临时平移(默认 Space 会让光标随按键重复闪烁)
@@ -3321,21 +3557,13 @@ export function Canvas() {
         </button>
 
         <button
-          onClick={handleGroupSelected}
-          disabled={selectedNodeIds.length < 2}
-          className={`flex h-9 items-center gap-1.5 rounded-lg border px-3 text-sm font-medium shadow-lg transition-colors ${
-            selectedNodeIds.length < 2
-              ? "cursor-not-allowed border-border-dark bg-surface-dark/70 text-text-muted/50"
-              : "border-border-dark bg-surface-dark text-text-dark hover:bg-bg-dark"
-          }`}
-          title={
-            selectedNodeIds.length < 2
-              ? t("canvas.toolbar.groupHint", "框选或按住 ⌘ 多选 2 个以上节点后分组")
-              : t("canvas.toolbar.group", "将选中节点合并为分组（⌘G）")
-          }
+          type="button"
+          onClick={handleOpenTemplates}
+          className="flex h-9 items-center gap-1.5 rounded-lg border border-border-dark bg-surface-dark px-3 text-sm font-medium text-text-dark shadow-lg transition-colors hover:bg-bg-dark"
+          title={t("canvas.toolbar.templates", "模板")}
         >
-          <Layers className="h-4 w-4 text-text-muted" />
-          <span className="hidden sm:inline">{t("canvas.toolbar.group", "分组")}</span>
+          <LayoutTemplate className="h-4 w-4 text-text-muted" />
+          <span className="hidden sm:inline">{t("canvas.toolbar.templates", "模板")}</span>
         </button>
         <button
           onClick={() => setIsLibraryOpen(true)}
@@ -3441,6 +3669,8 @@ export function Canvas() {
         onApplyPrompt={handleApplyPromptTemplate}
         cinematicAssetLibrary={cinematicAssetLibrary}
       />
+
+      <TemplateSidebar open={isTemplateOpen} onClose={() => setIsTemplateOpen(false)} />
 
       <VideoFrameExtractDialog open={isVideoExtractOpen} onClose={() => setIsVideoExtractOpen(false)} />
 

@@ -120,11 +120,20 @@ function renderCharacterProfiles(profiles: QuickPromptCharacterProfile[], propBy
 export function buildQuickPromptRequest(input: QuickPromptInput, locale: Locale): { system: string; user: string } {
   const outputLanguage = locale === "zh" ? "clear, cinematic Chinese" : "clear cinematic English";
   const props = input.props ?? [];
-  const references = [
-    ...input.sceneAssets.map((asset) => renderAsset(asset, "scene")),
-    ...input.characterAssets.map((asset) => renderAsset(asset, "character")),
-    ...props.map((asset) => renderAsset(asset, "prop")),
+  const allReferenceAssets = [
+    ...input.sceneAssets.map((asset) => ({ asset, kind: "scene" as const })),
+    ...input.characterAssets.map((asset) => ({ asset, kind: "character" as const })),
+    ...props.map((asset) => ({ asset, kind: "prop" as const })),
   ];
+  // ACTIVE REFERENCES is the visual-reference block. Audio references are voice locks:
+  // keeping them separate prevents the video model from treating a voice clip as an image.
+  const references = allReferenceAssets
+    .filter(({ asset }) => asset.mediaType !== "audio")
+    .map(({ asset, kind }) => renderAsset(asset, kind));
+  const voiceReferences = allReferenceAssets
+    .filter(({ asset }) => asset.mediaType === "audio")
+    .map(({ asset, kind }) => renderAsset(asset, kind));
+  const visualProps = props.filter((asset) => asset.mediaType !== "audio");
   const propByName = new Map(props.map((prop) => [prop.id, prop.name]));
   const stagingLines = input.staging ? renderStaging(input.staging) : [];
   const profileLines = renderCharacterProfiles(input.characterProfiles ?? [], propByName);
@@ -142,6 +151,14 @@ export function buildQuickPromptRequest(input: QuickPromptInput, locale: Locale)
     references.length > 0 ? references.join("\n") : "(No visual reference selected; do not invent one.)",
   ];
 
+  if (voiceReferences.length > 0) {
+    userBlocks.push(
+      "",
+      "VOICE LOCK REFERENCES (声音锁参考；音频引用只能放在 AUDIO 中):",
+      voiceReferences.join("\n"),
+    );
+  }
+
   if (stagingLines.length > 0) {
     userBlocks.push("", "SCENE STAGING (场景站位，空间契约；不是输出段落):", stagingLines.join("\n"));
   }
@@ -152,11 +169,11 @@ export function buildQuickPromptRequest(input: QuickPromptInput, locale: Locale)
       profileLines.join("\n"),
     );
   }
-  if (props.length > 0) {
+  if (visualProps.length > 0) {
     userBlocks.push(
       "",
       "PROP ASSETS (道具；只在该道具被故事梗概用到时才写进提示词):",
-      props.map((prop) => renderAsset(prop, "prop")).join("\n"),
+      visualProps.map((prop) => renderAsset(prop, "prop")).join("\n"),
     );
   }
 
@@ -175,12 +192,12 @@ export function buildQuickPromptRequest(input: QuickPromptInput, locale: Locale)
       "Put spatial facts before aesthetic prose. State first-frame occupancy, screen-left/right placement, body orientation, gaze direction, landmark proximity, distance and required hand/prop states whenever the brief makes them relevant. Required subjects must be visible in the first frame; use a short positive lock and a local no-failure lock only when it prevents a specific risk.",
       "Select optics and camera only from story needs. State the camera side, framing, lens outcome, movement, trigger, stop point and response to action when relevant. Keep multi-shot continuity stable and include a cut only when the story supplies a reason. Preserve physical cause and effect, contact, weight, momentum, materials, weather and light direction; never allow floaty motion, arbitrary coverage or flat front light.",
       "Build ACTION TIMING as physically achievable chronological time blocks when a duration or sequence is supplied. Each block describes one visible event with subject position, action, camera response, critical prop state, physics and audio where relevant. Dialogue contains only supplied quoted lines: no ad-libs, narration, subtitles, captions or unrequested offscreen voices.",
-      "SCENE STAGING, CHARACTER PROFILES, and PROP ASSETS are planning context, never output text. Reference them strictly by the story synopsis: bring in a roster character only when the synopsis events actually involve them; keep a character out when the synopsis never places them on screen; use a prop only when the synopsis implies it is visible, carried, or used; apply the spatial anchor, left-to-right order, spacing, and axis to the blocking you write. Reference tags and [imageN]/[audioN] tokens come only from ACTIVE REFERENCES.",
+      "SCENE STAGING, CHARACTER PROFILES, and PROP ASSETS are planning context, never output text. Reference them strictly by the story synopsis: bring in a roster character only when the synopsis events actually involve them; keep a character out when the synopsis never places them on screen; use a prop only when the synopsis implies it is visible, carried, or used; apply the spatial anchor, left-to-right order, spacing, and axis to the blocking you write. Visual @asset tags and [imageN] tokens come only from ACTIVE REFERENCES. Audio @asset tags and [audioN] tokens come only from VOICE LOCK REFERENCES, and must be used only in AUDIO for a character who actually speaks.",
       "An ACTING MASTER is an AI-only identity and behavioural baseline for one character: use it to understand who the character is, then write that character's performance for this story moment. Never paste, quote, paraphrase line by line, or expose it as a section, and never output a CHARACTER ACTING heading.",
       "A VOICE LOCK is a per-character vocal formula. Paste it verbatim into AUDIO only for a character who actually speaks a line in the synopsis; omit it for a character who stays silent, and never invent a voice lock for a character who has none.",
       "For every active character, follow ACTING SYSTEM: write behavior under immediate pressure, never emotion labels. Give a playable objective directed at a partner, a concrete obstacle or stake, changing action-verb tactics, and two to four visible beats when scene duration supports them. Show thought before words, listening/reaction before a reply, assessment pauses, purposeful physical business, motivated changes in distance and status through the body. Preserve subtext through behavior, not explanation.",
       "Make performance observable: use gaze targets, natural micro-saccades, state-appropriate blinks and live catchlights; eyes lead the thought. Tie posture, center of gravity, breath, tempo, physical habits and speech rhythm to the scene pressure. Use stable playable states rather than vague transition chains. Ensemble reactions must travel in staggered waves, never synchronized; do not put wardrobe, camera, color or generic emotion labels inside performance instructions.",
-      "Keep every @asset tag and every [imageN] or [audioN] token exactly as received. A [video input] is an upstream video reference: use it as scene context without inventing a new asset token. Reference descriptions belong in ACTIVE REFERENCES; do not contradict or rename them. Before returning, silently verify active references, first frame, spatial logic, gaze, camera side, optics, lighting, physics, timing, dialogue hygiene, continuity, prompt density and acting specificity; fix every failure before output.",
+      "Keep every @asset tag and every [imageN] or [audioN] token exactly as received. A [video input] is an upstream video reference: use it as scene context without inventing a new asset token. Visual reference descriptions belong in ACTIVE REFERENCES; voice reference descriptions belong in VOICE LOCK REFERENCES and must not be moved into ACTIVE REFERENCES. Do not contradict or rename them. Before returning, silently verify active references, voice locks, first frame, spatial logic, gaze, camera side, optics, lighting, physics, timing, dialogue hygiene, continuity, prompt density and acting specificity; fix every failure before output.",
     ].join(" "),
     user: userBlocks.join("\n"),
   };

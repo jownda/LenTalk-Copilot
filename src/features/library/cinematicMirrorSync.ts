@@ -26,11 +26,12 @@ export const CINEMATIC_MIRROR_ID_PREFIX = 'cinematic-';
  */
 export const CINEMATIC_MIRROR_TAG = '电影资产';
 
-/** 资产类别 → 素材库内置分类名。非 character / location 的类别（含风格、音频参考）归入「道具」。 */
+/** 资产类别 → 素材库内置分类名。 */
 const CATEGORY_NAME_BY_KIND: Record<string, string> = {
   character: '角色',
   location: '场景',
   prop: '道具',
+  'audio-reference': '音频',
 };
 
 export interface CinematicMirrorContext {
@@ -56,6 +57,7 @@ export function buildCinematicMirrorAssets(
 
   const mirrored: LibraryAsset[] = [];
   for (const asset of cinematicAssets) {
+    const isAudioReference = asset.kind === 'audio-reference';
     const sources = [...(asset.referencePaths ?? [])];
     if (asset.kind === 'character' && asset.voiceClip?.trim()) sources.push(asset.voiceClip);
 
@@ -71,15 +73,15 @@ export function buildCinematicMirrorAssets(
         // 多张参考图仍属于同一个电影资产，名称必须与工程资产一致；
         // 序号只体现在条目 id 与图片顺序上，不能污染候选和最终提示词里的 @标签。
         name: asset.name || '未命名资产',
-        mediaType: isVoiceClip ? 'audio' : 'image',
+        mediaType: isVoiceClip || isAudioReference ? 'audio' : 'image',
         sourcePath: source,
-        previewImageUrl: isVoiceClip ? null : source,
-        aspectRatio: '1:1',
+        previewImageUrl: isVoiceClip || isAudioReference ? null : source,
+        aspectRatio: isVoiceClip || isAudioReference ? null : '1:1',
         sourceFileName: null,
         tags: [CINEMATIC_MIRROR_TAG, categoryName],
         createdAt: 0,
         cinematicAssetId: asset.id,
-        cinematicKind: asset.kind === 'character' || asset.kind === 'location' || asset.kind === 'prop'
+        cinematicKind: asset.kind === 'character' || asset.kind === 'location' || asset.kind === 'prop' || asset.kind === 'audio-reference'
           ? asset.kind
           : undefined,
         cinematicDescription: asset.description,

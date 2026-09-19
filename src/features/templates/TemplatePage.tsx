@@ -7,7 +7,7 @@ import { isTauri } from '@tauri-apps/api/core';
 import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import { browserTemplateRepository } from './storage/templateRepository';
 import { templateCoverSource, templateIsBroken, type Template } from './types';
-import { DEFAULT_TEMPLATE_SHARE_ROOT, loadTemplateShareRoot, saveTemplateShareRoot, syncTemplatesFromShare, syncTemplatesToShare } from '@/commands/templateSync';
+import { DEFAULT_TEMPLATE_SHARE_ROOT, TemplateSyncTimeoutError, loadTemplateShareRoot, saveTemplateShareRoot, syncTemplatesFromShare, syncTemplatesToShare } from '@/commands/templateSync';
 
 type TemplateSort = 'updatedAt' | 'name';
 
@@ -165,6 +165,12 @@ export function TemplatePage() {
     setNotice(t('templatePage.copySuccess'));
   };
 
+  /** 同步类报错的统一文案：超时单独提示（多数是 Rust 侧命令异常，不是共享盘的问题）。 */
+  const describeSyncError = (error: unknown) => {
+    if (error instanceof TemplateSyncTimeoutError) return t('templatePage.syncTimeout');
+    return error instanceof Error ? error.message : t('templatePage.syncFailed');
+  };
+
   const handleSync = async () => {
     if (syncing) return;
     setSyncing(true);
@@ -177,7 +183,7 @@ export function TemplatePage() {
       setShareDialogOpen(false);
       setNotice(t('templatePage.syncSuccess', { templates: result.templateCount, files: result.copiedFileCount }));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : t('templatePage.syncFailed'));
+      setNotice(describeSyncError(error));
     } finally {
       setSyncing(false);
     }
@@ -209,7 +215,7 @@ export function TemplatePage() {
       await refresh();
       setNotice(t('templatePage.importSuccess', { count: result.importedCount }));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : t('templatePage.syncFailed'));
+      setNotice(describeSyncError(error));
     } finally {
       setSyncing(false);
     }

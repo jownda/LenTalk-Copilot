@@ -176,16 +176,40 @@ export function SettingsDialog({
   const visibleRecommendedApis = useMemo(() => listVisibleRecommendedApis(), []);
 
   /** 推荐平台 id → 已连接的配置记录（按 Base URL 匹配）。 */
+  /**
+   * 同一个推荐平台历史上可能连着不止一条记录（重复「保存」会生成 `知鸟ai-23oa`
+   * 这种带后缀的 id），而且第一条往往是空壳。
+   * 取「模型最多、其次最新」的那条作为卡片代表：否则点「手动配置」会去编辑
+   * 一条没有模型的旧记录，用户改完发现「没有效果」。
+   */
+  const pickPrimaryRecommendedMirror = useCallback((candidates: CustomApiProvider[]) => {
+    const score = (api: CustomApiProvider) =>
+      api.models.length + api.videoModels.length + api.audioModels.length + api.chatModels.length;
+    return candidates.reduce((best, item) => {
+      const diff = score(item) - score(best);
+      if (diff !== 0) {
+        return diff > 0 ? item : best;
+      }
+      return item.createdAt > best.createdAt ? item : best;
+    });
+  }, []);
+
   const connectedRecommendedApis = useMemo(() => {
-    const map = new Map<string, CustomApiProvider>();
+    const buckets = new Map<string, CustomApiProvider[]>();
     for (const customApi of customApis) {
       const matched = findRecommendedApiByBaseUrl(customApi.baseUrl);
-      if (matched && !map.has(matched.id)) {
-        map.set(matched.id, customApi);
+      if (!matched) continue;
+      const bucket = buckets.get(matched.id);
+      if (bucket) {
+        bucket.push(customApi);
+      } else {
+        buckets.set(matched.id, [customApi]);
       }
     }
-    return map;
-  }, [customApis]);
+    return new Map(
+      Array.from(buckets, ([id, list]) => [id, pickPrimaryRecommendedMirror(list)] as const)
+    );
+  }, [customApis, pickPrimaryRecommendedMirror]);
   /**
    * 推荐平台的配置记录仍复用统一的运行时模型注册，但不应在「自定义平台」重复展示。
    * 仅隐藏当前「推荐平台」实际展示的四个预设；其他推荐预设或手工配置保持可见。
@@ -346,15 +370,26 @@ export function SettingsDialog({
     [addCustomApi, buildCustomApiInputFromRecommended, updateCustomApi]
   );
 
-  /** 断开推荐平台：移除其运行时配置，推荐预设本身不动。 */
+  /**
+   * 断开推荐平台：移除其运行时配置，推荐预设本身不动。
+   *
+   * 同一个 baseUrl 的重复记录一起清掉 —— 「断开」的语义是整个平台断开，
+   * 只删一条会留下无法在界面里删除的残留（自定义平台列表里它被隐藏）。
+   */
   const disconnectRecommendedApi = useCallback(
     (existing: CustomApiProvider) => {
-      removeCustomApi(existing.id);
+      const recommended = findRecommendedApiByBaseUrl(existing.baseUrl);
+      const targets = recommended
+        ? customApis.filter(
+            (api) => findRecommendedApiByBaseUrl(api.baseUrl)?.id === recommended.id
+          )
+        : [existing];
+      for (const target of targets) removeCustomApi(target.id);
       setConnectingRecommendedApiId(null);
       setRecommendedApiKeyDraft('');
       setRecommendedApiError(null);
     },
-    [removeCustomApi]
+    [customApis, removeCustomApi]
   );
 
   /** 校验后连接：Key 为空只提示、不落库,避免在列表里留下一条没有密钥的空平台。 */
@@ -863,19 +898,43 @@ export function SettingsDialog({
   }, []);
 
   const confirmPickedModels = useCallback(() => {
-    setCustomApiDraft({
-      ...customApiDraft,
-      ...(modelPickerMediaType === 'video'
-        ? { videoModelsText: pickedModels.join('\n') }
+    const field =
+      modelPickerMediaType === 'video'
+        ? 'videoModels'
         : modelPickerMediaType === 'audio'
-          ? { audioModelsText: pickedModels.join('\n') }
+          ? 'audioModels'
           : modelPickerMediaType === 'chat'
-            ? { chatModelsText: pickedModels.join('\n') }
-            : { modelsText: pickedModels.join('\n') }),
-    });
+            ? 'chatModels'
+            : 'models';
+    const textField =
+      modelPickerMediaType === 'video'
+        ? 'videoModelsText'
+        : modelPickerMediaType === 'audio'
+          ? 'audioModelsText'
+          : modelPickerMediaType === 'chat'
+            ? 'chatModelsText'
+            : 'modelsText';
+    setCustomApiDraft((previous) => ({ ...previous, [textField]: pickedModels.join('\n') }));
     setIsModelPickerOpen(false);
-    setCustomApiStatus({ type: 'ok', text: t('settings.customApiModelsApplied', '已应用所选模型') });
-  }, [customApiDraft, modelPickerMediaType, pickedModels, t]);
+    // 编辑已保存的平台时立即落库：这类平台的卡片由「推荐平台」接管展示，
+    // 光改表单看不出任何变化，用户会以为「选了模型没效果」。
+    // 与上面「拉取模型」顺手写价格是同一套做法。
+    if (editingCustomApiId) {
+      updateCustomApi(editingCustomApiId, { [field]: pickedModels });
+      setCustomApiStatus({
+        type: 'ok',
+        text: t('settings.customApiModelsAppliedSaved', {
+          count: pickedModels.length,
+          defaultValue: '已保存所选模型（{{count}} 个）',
+        }),
+      });
+    } else {
+      setCustomApiStatus({
+        type: 'ok',
+        text: t('settings.customApiModelsApplied', '已应用所选模型（点「保存」落库）'),
+      });
+    }
+  }, [editingCustomApiId, modelPickerMediaType, pickedModels, t, updateCustomApi]);
 
   const filteredFetchedModels = useMemo(() => {
     const keyword = modelPickerSearch.trim().toLowerCase();
@@ -904,28 +963,8 @@ export function SettingsDialog({
     setCustomApiStatus(null);
     try {
       const result = await detectProviderCapabilities(baseUrl, apiKey);
-      const models = result.models ?? [];
-      const videoModelIds = new Set(
-        customApiDraft.videoModelsText
-          .split(/[\n,]/)
-          .map((model) => model.trim().toLowerCase())
-          .filter(Boolean)
-      );
-      const audioModelIds = new Set(
-        customApiDraft.audioModelsText
-          .split(/[\n,]/)
-          .map((model) => model.trim().toLowerCase())
-          .filter(Boolean)
-      );
-      const isZhenjian = isZhenjianProvider('', baseUrl);
-      const imageModels = models.filter(
-        (model) =>
-          (isZhenjian || !videoModelIds.has(model.trim().toLowerCase()))
-          && !audioModelIds.has(model.trim().toLowerCase())
-          && (isZhenjian || !isVideoGenerationModelName(model))
-          && !isAudioModelName(model)
-          && !isChatCompletionModelName(model)
-      );
+      // 「验证协议」只做协议探测：不写模型清单（那是「拉取模型」的职责），
+      // 否则用户手填/手选的模型会被一次探测悄悄覆盖掉。
       setCustomApiDraft((previous) => {
         // 探测结果优先; 但探测为低置信度 images 默认且用户已手动选择 chat/responses
         // 时保留用户选择(OPTIONS 探测常被网关中间件统一响应, 不足以推翻手动配置)。
@@ -938,7 +977,6 @@ export function SettingsDialog({
           && (previous.protocol === 'chat' || previous.protocol === 'responses');
         return {
           ...previous,
-          modelsText: imageModels.length > 0 ? imageModels.join('\n') : previous.modelsText,
           // 能力探测只确认协议和编码，不足以证明平台支持任务查询；保持同步默认。
           protocol: keepManualProtocol ? previous.protocol : detectedProtocol,
           referenceImageField: result.capabilities.imageReferenceField === 'input_image'
@@ -983,7 +1021,6 @@ export function SettingsDialog({
       setCustomApiStatus({
         type: 'ok',
         text: t('settings.customApiTestOk', {
-          count: models.length,
           protocol: protocolLabel,
           field: result.capabilities.imageReferenceField,
           encoding: encodingLabel,
@@ -999,7 +1036,7 @@ export function SettingsDialog({
     } finally {
       setCustomApiBusy('idle');
     }
-  }, [customApiDraft.apiKey, customApiDraft.baseUrl, customApiDraft.videoModelsText, customApiDraft.audioModelsText, t]);
+  }, [customApiDraft.apiKey, customApiDraft.baseUrl, t]);
 
   const startEditCustomApi = useCallback((id: string) => {
     const api = useSettingsStore.getState().customApis.find((item) => item.id === id);
@@ -1085,11 +1122,29 @@ export function SettingsDialog({
         !isAudioModelName(model) &&
         !isChatCompletionModelName(model)
     );
+    // 不满足条件时以前是静默 return，用户点了「新增平台」看起来毫无反应。
+    // 现在把缺什么直接说出来。
+    if (!name) {
+      setCustomApiStatus({ type: 'err', text: t('settings.customApiErrNeedName', '请先填写平台名称') });
+      return;
+    }
+    if (!baseUrl) {
+      setCustomApiStatus({
+        type: 'err',
+        text: t('settings.customApiErrNeedUrl', '请先填写接口地址（Base URL）'),
+      });
+      return;
+    }
     if (
-      !name ||
-      !baseUrl ||
-      (models.length === 0 && videoModels.length === 0 && audioModels.length === 0 && chatModels.length === 0)
+      models.length === 0 &&
+      videoModels.length === 0 &&
+      audioModels.length === 0 &&
+      chatModels.length === 0
     ) {
+      setCustomApiStatus({
+        type: 'err',
+        text: t('settings.customApiErrNeedModel', '请先填入或拉取至少一个模型'),
+      });
       return;
     }
     if (editingCustomApiId) {
@@ -1132,7 +1187,7 @@ export function SettingsDialog({
       });
     }
     resetCustomApiForm();
-  }, [addCustomApi, customApiDraft, editingCustomApiId, resetCustomApiForm, updateCustomApi]);
+  }, [addCustomApi, customApiDraft, editingCustomApiId, resetCustomApiForm, t, updateCustomApi]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -1551,6 +1606,20 @@ export function SettingsDialog({
                                 </button>
                               )}
                             </div>
+                            {/* 已连接时把已登记的四类模型数量摊开：这类平台的记录不会出现在
+                                下面的自定义平台列表里，「手动配置 → 拉取模型 → 应用所选」之后
+                                只有这里能看出到底存进去了什么。 */}
+                            {connected && hasApiKey && (
+                              <p className="mt-1 text-[11px] text-text-muted/80">
+                                {t('settings.recommendedApisModelsSummary', {
+                                  image: connected.models.length,
+                                  video: connected.videoModels.length,
+                                  audio: connected.audioModels.length,
+                                  chat: connected.chatModels.length,
+                                  defaultValue: '图片 {{image}} · 视频 {{video}} · 音频 {{audio}} · Chat {{chat}}',
+                                })}
+                              </p>
+                            )}
                             <p className="mt-1 text-[11px] text-text-muted">{api.summary}</p>
 
                             {isConnecting && (
@@ -1905,108 +1974,9 @@ export function SettingsDialog({
                             className="ui-scrollbar w-full resize-none rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark placeholder:text-text-muted"
                           />
                         </label>
-                        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                          <label className="block">
-                            <span className="mb-1 block text-[11px] text-text-muted">请求模式</span>
-                            <select
-                              value={customApiDraft.requestMode}
-                              onChange={(event) =>
-                                setCustomApiDraft({
-                                  ...customApiDraft,
-                                  requestMode: event.target.value as 'sync' | 'async',
-                                })
-                              }
-                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
-                            >
-                              <option value="sync">同步返回</option>
-                              <option value="async">异步轮询</option>
-                            </select>
-                          </label>
-                          <label className="block">
-                            <span className="mb-1 block text-[11px] text-text-muted">
-                              {t('settings.customApiProtocol', '图片协议')}
-                            </span>
-                            <select
-                              value={customApiDraft.protocol}
-                              onChange={(event) =>
-                                setCustomApiDraft({
-                                  ...customApiDraft,
-                                  protocol: event.target.value as 'images' | 'responses' | 'chat',
-                                })
-                              }
-                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
-                            >
-                              <option value="images">/v1/images/generations</option>
-                              <option value="responses">/v1/responses</option>
-                              <option value="chat">/v1/chat/completions</option>
-                            </select>
-                          </label>
-                          <label className="block">
-                            <span className="mb-1 block text-[11px] text-text-muted">
-                              {t('settings.customApiReferenceField', '参考图字段')}
-                            </span>
-                            <select
-                              value={customApiDraft.referenceImageField}
-                              onChange={(event) =>
-                                setCustomApiDraft({
-                                  ...customApiDraft,
-                                  referenceImageField: event.target.value as 'image' | 'input_image' | 'images' | 'reference_images',
-                                })
-                              }
-                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
-                            >
-                              <option value="image">image / images</option>
-                              <option value="images">images（纯数组）</option>
-                              <option value="reference_images">reference_images（对象数组）</option>
-                              <option value="input_image">input_image</option>
-                            </select>
-                          </label>
-                          <label className="block">
-                            <span className="mb-1 block text-[11px] text-text-muted">
-                              {t('settings.customApiReferenceEncoding', '参考图编码')}
-                            </span>
-                            <select
-                              value={customApiDraft.referenceImageEncoding}
-                              onChange={(event) =>
-                                setCustomApiDraft({
-                                  ...customApiDraft,
-                                  referenceImageEncoding: event.target.value as 'auto' | 'data_url' | 'raw_base64' | 'url',
-                                })
-                              }
-                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
-                            >
-                              <option value="auto">{t('settings.customApiReferenceEncodingAuto', '自动')}</option>
-                              <option value="data_url">Data URL</option>
-                              <option value="raw_base64">Base64</option>
-                              <option value="url">URL</option>
-                            </select>
-                          </label>
-                          <label className="block">
-                            <span className="mb-1 block text-[11px] text-text-muted">图生图适配器</span>
-                            <select
-                              value={customApiDraft.imageTransport}
-                              onChange={(event) =>
-                                setCustomApiDraft({
-                                  ...customApiDraft,
-                                  imageTransport: event.target.value as 'auto' | 'generations_json' | 'edits_multipart' | 'apimart_json',
-                                })
-                              }
-                              className="w-full rounded border border-border-dark bg-surface-dark px-2.5 py-1.5 text-xs text-text-dark"
-                            >
-                              <option value="auto">自动（带参考图时用 edits）</option>
-                              <option value="generations_json">/v1/images/generations JSON</option>
-                              <option value="edits_multipart">/v1/images/edits 上传图片</option>
-                              <option value="apimart_json">APIMart image_urls</option>
-                            </select>
-                          </label>
-                        </div>
-                        <p className="text-[10px] leading-4 text-text-muted">
-                          {t(
-                            'settings.customApiProbeHint',
-                            '验证协议只使用 /v1/models 和 OPTIONS 等非计费探测，会自动填写图片协议、参考图字段、编码和图生图适配器；同步/异步无法安全探测，请手动选择。'
-                          )}
-                        </p>
-                        {/* 连接验证只检查服务可达性和模型列表; 请求协议与参考图编码按上方配置发送。 */}
+                        {/* 请求模式 / 图片协议 / 参考图字段 / 参考图编码 / 图生图适配器
+                            一律不再暴露：这几项由「验证协议」的探测结果自动决定，
+                            放出来只会让用户误配。值仍随表单提交（draft 里保留默认值）。 */}
                         <div className="flex flex-wrap items-center gap-2 pt-0.5">
                           <button
                             type="button"

@@ -133,17 +133,21 @@ dreamina session create --name=xx  # 新建会话
 
 > `_vip` 结尾 = VIP 权益模型，需要账号开通对应权益；普通账号建议用不带 `_vip` 的模型。
 
-### 4.2 四种生成模式（按输入自动选择）
+### 4.2 生成模式与节点映射
 
 | 模式 | 输入 | 对应 CLI 子命令 |
 |---|---|---|
 | 文生视频 | 仅提示词 | `text2video` |
-| 图生视频 | 1 张参考图 | `image2video` |
+| 参考生视频（LenTalk 节点“参考模式”） | 1 张或多张参考图 / 图+音频 | `multimodal2video` |
 | 首尾帧 | 2 张图（首帧+尾帧） | `frames2video` |
-| 多模态 | 多图 / 图+音频 | `multimodal2video` |
+| 图生视频（兼容旧调用） | 1 张图片 | `image2video` |
+| 多帧视频（CLI 能力，当前节点未接入） | 2–20 张图片 | `multiframe2video` |
 
 - 首尾帧模式：画幅由首帧图片决定（不传 ratio，跟随首帧）；
-- 多模态模式：**纯音频参考（无图）时，必须选 Seedance 2.5**；
+- 参考模式：显式传入节点选择的 `--ratio`，参考图只作为画面参考，不会被当作首帧；
+- 图生视频：画幅由输入图片决定，不传 `--ratio`；
+- 多模态模式支持图片、视频和音频混合输入；LenTalk 当前节点接入图片和音频；**纯音频参考（无图）时，必须选 Seedance 2.5**；
+- `--ratio` 画幅控制需要使用支持该参数的新版 CLI（官方 v1.4.18 起明确支持）；
 - 视频生成是异步任务：节点提交后会轮询排队状态（节点上会显示排队位置），完成后自动下载视频到画布。
 
 ---
@@ -166,6 +170,7 @@ dreamina session create --name=xx  # 新建会话
 | 图生视频 | `dreamina image2video --image=xx.png --prompt="..." --poll=60` |
 | 首尾帧视频 | `dreamina frames2video --first=a.png --last=b.png --prompt="..." --poll=60` |
 | 多模态视频 | `dreamina multimodal2video --image=1.png --image=2.png --audio=a.mp3 --prompt="..." --model_version=seedance2.5` |
+| 多帧视频 | `dreamina multiframe2video --images=a.png,b.png --prompt="..." --video_resolution=720p` |
 | 查任务结果 | `dreamina query_result --submit_id=xxx --download_dir=./out` |
 | 查看任务历史 | `dreamina list_task --limit=100` |
 

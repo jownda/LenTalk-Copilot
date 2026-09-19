@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { resolveZzdhGenerationMode, resolveZzdhReferenceImages } from './ai';
+import { resolveZzdhGenerationMode, resolveZzdhReferenceImages, resolveZzdhReferenceVideos } from './ai';
+import { isZzdhLipSyncModel, resolveZzdhResolutionTier } from './zzdhApi';
 
 /**
  * 字子动画 H3 的 mode 是官方文档明确要求的字段:
@@ -23,6 +24,22 @@ describe('resolveZzdhGenerationMode', () => {
   it('无参考素材 → t2v(纯文生)', () => {
     expect(resolveZzdhGenerationMode('reference', 0)).toBe('t2v');
     expect(resolveZzdhGenerationMode(undefined, 0)).toBe('t2v');
+  });
+
+  it('视频参考也要走参考生，而不是被误判成纯文生', () => {
+    expect(resolveZzdhGenerationMode(undefined, 1, 'zzdh-minimax-h3-限时优惠-对口型-768p')).toBe('ref2v');
+  });
+});
+
+describe('isZzdhLipSyncModel', () => {
+  it('识别字子动画对口型模型并排除普通视频模型', () => {
+    expect(isZzdhLipSyncModel('custom:zizidonghua/zzdh-minimax-h3-限时优惠-对口型-480p')).toBe(true);
+    expect(isZzdhLipSyncModel('custom:zizidonghua/zzdh-minimax-h3-限时优惠-对口型-768p')).toBe(true);
+    expect(isZzdhLipSyncModel('custom:zizidonghua/zzdh-minimax-h3-限时优惠-文生-480p')).toBe(false);
+  });
+
+  it('识别 768p 对口型档位', () => {
+    expect(resolveZzdhResolutionTier('zzdh-minimax-h3-限时优惠-对口型-768p')).toBe('768p');
   });
 });
 
@@ -53,5 +70,21 @@ describe('resolveZzdhReferenceImages', () => {
     )).resolves.toEqual([
       { base64: 'iVBORw0KGgo=', role: 'first_frame' },
     ]);
+  });
+});
+
+describe('resolveZzdhReferenceVideos', () => {
+  it('把公网视频 URL 转成 reference_videos 对象', async () => {
+    await expect(resolveZzdhReferenceVideos(
+      ['https://cdn.example.com/source.mp4'],
+      'minimax-h3',
+    )).resolves.toEqual([{ url: 'https://cdn.example.com/source.mp4' }]);
+  });
+
+  it('H3 在提交前拒绝本地视频，避免平台返回不可操作的公网 URL 错误', async () => {
+    await expect(resolveZzdhReferenceVideos(
+      ['data:video/mp4;base64,AAAA'],
+      'minimax-h3',
+    )).rejects.toThrow(/对口型参考视频仅支持公网 HTTP\(S\) URL/);
   });
 });

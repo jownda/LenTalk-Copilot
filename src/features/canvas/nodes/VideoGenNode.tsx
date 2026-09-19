@@ -13,7 +13,7 @@ import {
 import { createPortal } from 'react-dom';
 import { listen } from '@tauri-apps/api/event';
 import { Handle, Position, useUpdateNodeInternals } from '@xyflow/react';
-import { AudioLines, ChevronDown, Clapperboard, ImagePlus, LoaderCircle, Plus, Sparkles, Trash2 } from 'lucide-react';
+import { AudioLines, ChevronDown, Clapperboard, ImagePlus, LoaderCircle, Plus, Sparkles, Trash2, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { CANVAS_NODE_TYPES, EXPORT_RESULT_NODE_MIN_HEIGHT, EXPORT_RESULT_NODE_MIN_WIDTH, type VideoGenNodeData } from '@/features/canvas/domain/canvasNodes';
@@ -28,9 +28,10 @@ import {
   type GenerationDebugContext,
 } from '@/features/canvas/application/generationErrorReport';
 import { mergeMediaReferenceSources } from '@/features/canvas/application/mediaReferenceSources';
+import { filterExcludedReferences } from '@/features/canvas/application/referenceExclusions';
 import { recordGenerationOutcome } from '@/features/canvas/application/usageRecording';
 import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
-import { getDefaultVideoModelId, getModelProvider, getVideoModel, getVideoModelProfile, JIMENG_CLI_PROVIDER_ID, listVideoModels } from '@/features/canvas/models';
+import { getDefaultVideoModelId, getModelProvider, getVideoModelProfile, JIMENG_CLI_PROVIDER_ID, listVideoModels } from '@/features/canvas/models';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
@@ -52,6 +53,7 @@ import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInpu
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { getFloatingPanelPosition, type FloatingPanelPosition } from '@/features/canvas/ui/floatingPanelPosition';
+import { isZzdhLipSyncModel } from '@/commands/zzdhApi';
 
 type VideoGenNodeProps = { id: string; data: VideoGenNodeData; selected?: boolean; width?: number; height?: number };
 
@@ -73,6 +75,18 @@ interface ReferencePickerItem {
   index: number;
   label: string;
   source: string;
+}
+
+/** 输入框下方展示的一条「已引用素材」缩略图。 */
+interface ReferenceTile {
+  key: string;
+  kind: 'image' | 'audio';
+  source: string;
+  /** 与该素材在提示词里的引用序号一致(图N / 音频N) */
+  label: string;
+  displayUrl: string | null;
+  /** false = 当前模型不会使用它(即梦忽略工作室音频), 仅展示以便删除 */
+  used: boolean;
 }
 
 type FrameSlot = 'first' | 'last';
@@ -374,12 +388,22 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       updateNodeData,
     });
 
-  const models = listVideoModels();
-  const selectedModel = getVideoModel(data.model) ?? getVideoModel(getDefaultVideoModelId());
+  const models = useMemo(
+    () => listVideoModels().filter((model) => !isZzdhLipSyncModel(model.id)),
+    [customApis],
+  );
+  const selectedModel = models.find((model) => model.id === data.model)
+    ?? models.find((model) => model.id === getDefaultVideoModelId())
+    ?? models[0];
   const imageMode = data.imageMode === 'first-last' ? 'first-last' : 'reference';
   const isJimengCli = selectedModel?.providerId === JIMENG_CLI_PROVIDER_ID;
   const isWanCli = selectedModel?.providerId === 'wan-cli';
   const selectedProfile = selectedModel ? getVideoModelProfile(selectedModel.profileId) : null;
+  useEffect(() => {
+    if (isZzdhLipSyncModel(data.model) && selectedModel && data.model !== selectedModel.id) {
+      updateNodeData(id, { model: selectedModel.id });
+    }
+  }, [data.model, id, selectedModel, updateNodeData]);
   const [modelPickerProviderId, setModelPickerProviderId] = useState(
     selectedModel?.providerId ?? ''
   );
@@ -423,17 +447,34 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       : [],
     [data.studioReferenceAudio]
   );
+  // 用户在本节点手动移除过的来源要一直剔除: 其中一部分来自上游连线, 只清空
+  // studioReference* 是删不掉的(上游会把同一份素材再喂回来)。
+  const excludedReferenceSources = useMemo(
+    () => Array.isArray(data.excludedReferenceSources)
+      ? data.excludedReferenceSources.filter((value): value is string => typeof value === 'string' && value.length > 0)
+      : [],
+    [data.excludedReferenceSources]
+  );
+  const excludedReferenceSourceSet = useMemo(() => new Set(excludedReferenceSources), [excludedReferenceSources]);
+  const inputImagesFiltered = useMemo(
+    () => filterExcludedReferences(inputImages, excludedReferenceSources),
+    [excludedReferenceSources, inputImages]
+  );
+  const inputAudioFiltered = useMemo(
+    () => filterExcludedReferences(inputAudio, excludedReferenceSources),
+    [excludedReferenceSources, inputAudio]
+  );
   const resolvedInputImages = useMemo(
-    () => mergeMediaReferenceSources(directReferenceImages, inputImages),
-    [directReferenceImages, inputImages]
+    () => mergeMediaReferenceSources(directReferenceImages, inputImagesFiltered),
+    [directReferenceImages, inputImagesFiltered]
   );
   const resolvedInputAudio = useMemo(
-    () => mergeMediaReferenceSources(directReferenceAudio, inputAudio),
-    [directReferenceAudio, inputAudio]
+    () => mergeMediaReferenceSources(directReferenceAudio, inputAudioFiltered),
+    [directReferenceAudio, inputAudioFiltered]
   );
   // 即梦 CLI 只接受通过画布连接进来的本地音频节点；工作室快照仅供
   // 其他支持直接音频附件的模型使用。
-  const usableInputAudio = isJimengCli ? inputAudio : resolvedInputAudio;
+  const usableInputAudio = isJimengCli ? inputAudioFiltered : resolvedInputAudio;
   // 文本引用预览现在按行渲染(每行一个上游文本), 不再需要合并字符串
   // 首尾帧与上游参考图是两种互斥输入方式。首尾帧只使用节点内上传的两张图。
   const referenceInputImages = useMemo(
@@ -539,17 +580,80 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     ],
     [inputImageItems, resolveAudioLabel, usableInputAudio]
   );
-  const removeStudioAudio = useCallback((source: string) => {
-    const nextDirectAudio = directReferenceAudio.filter((item) => item !== source);
-    const nextUsableAudio = isJimengCli
-      ? inputAudio
-      : mergeMediaReferenceSources(nextDirectAudio, inputAudio);
-    const nextPrompt = remapAudioReferenceTokens(promptDraftRef.current, usableInputAudio, nextUsableAudio);
-    promptDraftRef.current = nextPrompt;
-    setPromptDraft(nextPrompt);
-    cancelPromptCommit();
-    updateNodeData(id, { studioReferenceAudio: nextDirectAudio, prompt: nextPrompt });
-  }, [cancelPromptCommit, directReferenceAudio, id, inputAudio, isJimengCli, usableInputAudio, updateNodeData]);
+  /**
+   * 移除一条引用素材。两个来源都要处理:
+   * - 节点自身附件(studioReference*)→ 从数组里摘掉;
+   * - 上游连线喂进来的(如提示词工作室的 studioReference*)→ 记进
+   *   excludedReferenceSources, 否则上游会把同一份素材再喂回来。
+   * 图片 token 由监听 referenceInputImages 的 effect 自动重映射;
+   * 音频没有对应 effect, 这里同步处理 @音频N。
+   */
+  const removeReferenceTile = useCallback((tile: ReferenceTile) => {
+    const nextExcluded = excludedReferenceSourceSet.has(tile.source)
+      ? excludedReferenceSources
+      : [...excludedReferenceSources, tile.source];
+    const nextExcludedSet = new Set(nextExcluded);
+    const nextDirectImages = directReferenceImages.filter((item) => item !== tile.source);
+    const nextDirectAudio = directReferenceAudio.filter((item) => item !== tile.source);
+
+    const patch: Partial<VideoGenNodeData> = { excludedReferenceSources: nextExcluded };
+    if (nextDirectImages.length !== directReferenceImages.length) {
+      patch.studioReferenceImages = nextDirectImages;
+    }
+    if (tile.kind === 'audio') {
+      const nextUsableAudio = isJimengCli
+        ? inputAudio.filter((item) => !nextExcludedSet.has(item))
+        : mergeMediaReferenceSources(nextDirectAudio, inputAudio.filter((item) => !nextExcludedSet.has(item)));
+      const nextPrompt = remapAudioReferenceTokens(promptDraftRef.current, usableInputAudio, nextUsableAudio);
+      promptDraftRef.current = nextPrompt;
+      setPromptDraft(nextPrompt);
+      cancelPromptCommit();
+      patch.prompt = nextPrompt;
+      if (nextDirectAudio.length !== directReferenceAudio.length) {
+        patch.studioReferenceAudio = nextDirectAudio;
+      }
+    }
+    updateNodeData(id, patch);
+  }, [cancelPromptCommit, directReferenceAudio, directReferenceImages, excludedReferenceSourceSet, excludedReferenceSources, id, inputAudio, isJimengCli, usableInputAudio, updateNodeData]);
+  /** 输入框下方要显示的「实际会随请求上传的引用素材」清单。 */
+  const referenceTiles = useMemo<ReferenceTile[]>(() => {
+    const tiles: ReferenceTile[] = referenceInputImages.map((source, index) => ({
+      key: `image-${source}`,
+      kind: 'image' as const,
+      source,
+      label: `图${index + 1}`,
+      displayUrl: inputImageDisplayUrls[index] ?? null,
+      used: true,
+    }));
+    usableInputAudio.forEach((source, index) => {
+      tiles.push({
+        key: `audio-${source}`,
+        kind: 'audio' as const,
+        source,
+        label: `音频${index + 1}`,
+        displayUrl: null,
+        used: true,
+      });
+    });
+    // 即梦不读工作室音频, 但这些素材仍留在节点上, 要让用户看得见并能删掉。
+    if (isJimengCli) {
+      const usedSources = new Set(usableInputAudio);
+      directReferenceAudio.forEach((source, index) => {
+        if (usedSources.has(source)) {
+          return;
+        }
+        tiles.push({
+          key: `audio-${source}`,
+          kind: 'audio' as const,
+          source,
+          label: resolveAudioLabel(source, index),
+          displayUrl: null,
+          used: false,
+        });
+      });
+    }
+    return tiles;
+  }, [directReferenceAudio, inputImageDisplayUrls, isJimengCli, referenceInputImages, resolveAudioLabel, usableInputAudio]);
   const title = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.videoGen, data), [data]);
   const resolvedWidth = Math.max(VIDEO_GEN_NODE_MIN_WIDTH, Math.round(width ?? VIDEO_GEN_NODE_DEFAULT_WIDTH));
   const resolvedHeight = Math.max(VIDEO_GEN_NODE_MIN_HEIGHT, Math.round(height ?? VIDEO_GEN_NODE_DEFAULT_HEIGHT));
@@ -927,8 +1031,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       void showErrorDialog(message, t('common.error'));
       return;
     }
-    if (isWanCli && (resolvedInputAudio.length > 0 || videoReferenceImages.length > 5)) {
-      const message = t(resolvedInputAudio.length > 0 ? 'wanCli.audioUnsupported' : 'wanCli.referenceLimit');
+    if (isWanCli && (usableInputAudio.length > 0 || videoReferenceImages.length > 5)) {
+      const message = t(usableInputAudio.length > 0 ? 'wanCli.audioUnsupported' : 'wanCli.referenceLimit');
       setError(message);
       void showErrorDialog(message, t('common.error'));
       return;
@@ -976,7 +1080,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         videoResolution: selectedVideoResolution,
         imageMode,
         referenceImages: videoReferenceImages,
-        referenceAudio: resolvedInputAudio,
+        referenceAudio: usableInputAudio,
         extraParams: {
           // 炳火专用: reference_videos / skip_review 直接透传到 generateVideo(ai.ts)
           // 的 extra_params, 后端按平台规则上传换 URL 并写入 body。
@@ -1005,7 +1109,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         videoResolution: selectedVideoResolution,
         imageMode,
         referenceImages: videoReferenceImages,
-        referenceAudio: resolvedInputAudio,
+        referenceAudio: usableInputAudio,
         extraParams: {
           ...((data.binghuoReferenceVideos && data.binghuoReferenceVideos.length > 0)
             ? { reference_videos: data.binghuoReferenceVideos.slice(0, 3) }
@@ -1043,7 +1147,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           videoResolution: selectedVideoResolution,
           imageMode,
           referenceImages: videoReferenceImages,
-          referenceAudio: resolvedInputAudio,
+          referenceAudio: usableInputAudio,
           extraParams: {
             ...((data.binghuoReferenceVideos && data.binghuoReferenceVideos.length > 0)
               ? { reference_videos: data.binghuoReferenceVideos.slice(0, 3) }
@@ -1083,7 +1187,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         },
         referenceImageCount: videoReferenceImages.length,
         referenceImagePlaceholders: createReferenceImagePlaceholders(videoReferenceImages.length),
-        referenceAudioCount: resolvedInputAudio.length,
+        referenceAudioCount: usableInputAudio.length,
         appVersion: runtimeDiagnostics?.appVersion,
         osName: runtimeDiagnostics?.osName,
         osVersion: runtimeDiagnostics?.osVersion,
@@ -1111,7 +1215,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     } finally {
       setIsGenerating(false);
     }
-  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, data.binghuoReferenceVideos, data.binghuoSkipReview, findNodePosition, firstLastFrameImages.length, flushPromptCommit, id, imageMode, inputText, isWanCli, resolvedInputAudio, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, setLastVideoDuration, t, updateNodeData, updateNodeSize, videoReferenceImages]);
+  }, [addEdge, addNode, apiKeys, customApis, data.aspectRatio, data.binghuoReferenceVideos, data.binghuoSkipReview, findNodePosition, firstLastFrameImages.length, flushPromptCommit, id, imageMode, inputText, isWanCli, selectedDuration, selectedModel, selectedProfile, selectedVideoResolution, setLastVideoDuration, t, usableInputAudio, updateNodeData, updateNodeSize, videoReferenceImages]);
 
   // 炳火高级字段: 仅当当前模型是炳火 API 时显示折叠面板。
   // 字段名固定 reference_videos(手册 3.3 红字强调: videos / video_urls 部分模型被忽略)。
@@ -1157,7 +1261,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
               {renderPromptWithHighlights(
                 promptDraft,
                 referenceInputImages.length,
-                resolvedInputAudio.length,
+                usableInputAudio.length,
                 inputImageDisplayUrls,
                 usableInputAudio,
                 resolveAudioLabel,
@@ -1251,31 +1355,51 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           </div>
         )}
       </div>
-      {directReferenceAudio.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1 text-[11px] text-text-muted">
-          <AudioLines className="h-3.5 w-3.5 text-accent" />
-          <span>{isJimengCli ? '工作室音频（即梦不使用）' : '工作室音频'}</span>
-          {directReferenceAudio.map((source, index) => (
-            <button
-              key={`${source}-${index}`}
-              type="button"
-              className="nodrag inline-flex max-w-[150px] items-center gap-1 rounded border border-border-dark px-1.5 py-0.5 text-[10px] text-text-dark hover:border-accent"
-              title="移除这段工作室音频引用"
-              onClick={(event) => {
-                event.stopPropagation();
-                removeStudioAudio(source);
-              }}
+      {referenceTiles.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5" data-video-reference-strip>
+          <span className="text-[11px] text-text-muted">
+            {t('node.videoGen.referenceAssets', '引用素材')}
+          </span>
+          {referenceTiles.map((tile) => (
+            <div
+              key={tile.key}
+              className={`nodrag group/ref relative h-9 w-9 shrink-0 overflow-hidden rounded border ${tile.used
+                ? 'border-border-dark bg-black/40'
+                : 'border-dashed border-border-dark/70 opacity-60'
+                }`}
+              title={tile.used ? tile.label : `${tile.label} · ${t('node.videoGen.ignoredByJimeng', '即梦不使用')}`}
             >
-              <span className="truncate">{resolveAudioLabel(source, index)}</span>
-              <Trash2 className="h-3 w-3 shrink-0" />
-            </button>
+              {tile.kind === 'image' && tile.displayUrl ? (
+                <CanvasNodeImage
+                  src={tile.displayUrl}
+                  alt={tile.label}
+                  disableViewer
+                  draggable={false}
+                  className="pointer-events-none h-full w-full object-cover"
+                />
+              ) : (
+                <span className="flex h-full w-full items-center justify-center text-accent">
+                  <AudioLines className="h-4 w-4" aria-hidden="true" />
+                </span>
+              )}
+              <span className="pointer-events-none absolute bottom-0 left-0 right-0 bg-black/65 text-center text-[9px] leading-[11px] text-white">
+                {tile.label}
+              </span>
+              <button
+                type="button"
+                className="nodrag absolute right-0 top-0 flex h-4 w-4 items-center justify-center rounded-bl bg-black/70 text-white opacity-70 transition-opacity hover:bg-red-700/90 hover:opacity-100 group-hover/ref:opacity-100"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  removeReferenceTile(tile);
+                }}
+                onMouseDown={(event) => event.stopPropagation()}
+                title={t('node.videoGen.removeReferenceAsset', '移除该引用素材(不再上传给模型)')}
+                aria-label={t('node.videoGen.removeReferenceAsset', '移除该引用素材(不再上传给模型)')}
+              >
+                <X className="h-3 w-3" aria-hidden="true" />
+              </button>
+            </div>
           ))}
-        </div>
-      )}
-      {usableInputAudio.length > 0 && (
-        <div className="flex items-center gap-1 text-[11px] text-text-muted">
-          <AudioLines className="h-3.5 w-3.5 text-accent" />
-          <span>已连接 {usableInputAudio.length} 段音频</span>
         </div>
       )}
       <div className="flex items-center gap-1" role="group" aria-label={t('node.videoGen.imageMode')}>

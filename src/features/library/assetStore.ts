@@ -17,6 +17,7 @@ const BUILTIN_CATEGORY_DEFINITIONS = [
   { key: 'characters', name: '角色' },
   { key: 'scenes', name: '场景' },
   { key: 'props', name: '道具' },
+  { key: 'audio', name: '音频' },
 ] as const;
 
 interface AssetLibraryStore extends AssetLibraryState {

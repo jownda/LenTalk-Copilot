@@ -212,6 +212,10 @@ export interface Asset {
   forbiddenConfusions?: string[];
   /** 声音音色（角色）：上传音频 dataURL（mp3/wav/m4a…），配音/音色参考 */
   voiceClip?: string;
+  /** 角色声音来自资产库中的音频参考资产时，保存其稳定 id，便于提示词显示资产名称。 */
+  voiceAssetId?: string;
+  /** 兼容直接从普通素材库/画布音频选择的声音显示名。 */
+  voiceAssetName?: string;
   /** 角色表演母版 + 声音锁（仅角色；P2/P5） */
   actingProfile?: AssetActingProfile;
   /** 角色随身/关联道具；角色进入场景引用时，这些道具会一并进入活动引用。 */

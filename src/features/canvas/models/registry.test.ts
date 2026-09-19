@@ -246,6 +246,37 @@ describe('listVideoModels', () => {
   });
 });
 
+describe('字字动画对口型模型', () => {
+  it('旧版平台配置即使没保存这两个模型，也会在动作控制节点候选中补出', () => {
+    const previousCustomApis = useSettingsStore.getState().customApis;
+    const zzdh: CustomApiProvider = {
+      id: '字字动画',
+      name: '字字动画',
+      baseUrl: 'https://www.zizidonghua.com',
+      apiKey: '',
+      models: [],
+      videoModels: ['zzdh-Minimax-h3-720p'],
+      audioModels: [],
+      chatModels: [],
+      createdAt: Date.now(),
+      requestMode: 'async',
+      protocol: 'images',
+      referenceImageField: 'reference_images',
+      referenceImageEncoding: 'url',
+      imageTransport: 'generations_json',
+    };
+
+    useSettingsStore.setState({ customApis: [zzdh] });
+    try {
+      const ids = listVideoModels().map((model) => model.id);
+      expect(ids).toContain('custom:字字动画/zzdh-minimax-h3-限时优惠-对口型-480p');
+      expect(ids).toContain('custom:字字动画/zzdh-minimax-h3-限时优惠-对口型-768p');
+    } finally {
+      useSettingsStore.setState({ customApis: previousCustomApis });
+    }
+  });
+});
+
 describe('listAudioModels(字子动画)', () => {
   it('按模型名把音频分成 语音合成 / 音效 / 音乐 三类, 且不混进图片或视频列表', () => {
     const previousCustomApis = useSettingsStore.getState().customApis;

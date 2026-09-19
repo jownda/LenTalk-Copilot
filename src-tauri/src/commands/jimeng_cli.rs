@@ -252,7 +252,12 @@ fn resolve_video_command(
     if images.is_empty() && audio.is_empty() {
         return Ok("text2video");
     }
-    if images.len() == 1 && audio.is_empty() {
+
+    // LenTalk 的「参考模式」必须保持为参考生视频。即梦的 image2video
+    // 语义是图生视频，会把唯一一张图片当作首帧，并按图片原比例推断画幅，
+    // 从而让节点里选择的 9:16 被 4:3 等图片比例覆盖。只有显式传入
+    // 非参考模式的旧调用才保留 image2video 兼容行为。
+    if image_mode != Some("reference") && images.len() == 1 && audio.is_empty() {
         return Ok("image2video");
     }
     Ok("multimodal2video")
@@ -320,9 +325,9 @@ fn submit_and_poll_jimeng_task(
     download_dir: &Path,
     artifact: JimengArtifactKind,
 ) -> Result<String, String> {
-    let (finder, label): (fn(&Path) -> Option<PathBuf>, &str) = match artifact {
-        JimengArtifactKind::Video => (find_downloaded_video, "视频"),
-        JimengArtifactKind::Image => (find_downloaded_image, "图片"),
+    let label = match artifact {
+        JimengArtifactKind::Video => "视频",
+        JimengArtifactKind::Image => "图片",
     };
 
     let submission = run_cli_with_timeout(executable, &arguments, CLI_SUBMIT_COMMAND_TIMEOUT)?;
@@ -331,8 +336,8 @@ fn submit_and_poll_jimeng_task(
     }
     // --poll=0 通常只提交任务；保留即时结果分支，兼容 CLI 后端直接返回成品的情况。
     if is_succeeded(&submission) {
-        if let Some(path) = finder(download_dir) {
-            return Ok(path.to_string_lossy().into_owned());
+        if let Some(result) = find_downloaded_artifact(download_dir, artifact) {
+            return Ok(result);
         }
         if let Some(url) = extract_http_url(&submission) {
             return Ok(url);
@@ -370,9 +375,9 @@ fn submit_and_poll_jimeng_task(
             return Err(format!("即梦 CLI {label}生成失败: {}", output_summary(&query)));
         }
         if is_succeeded(&query) {
-            if let Some(path) = finder(download_dir) {
+            if let Some(result) = find_downloaded_artifact(download_dir, artifact) {
                 emit_cli_task_status(app, client_job_id, &submit_id, "succeeded", Some(0), None);
-                return Ok(path.to_string_lossy().into_owned());
+                return Ok(result);
             }
             if let Some(url) = extract_http_url(&query) {
                 emit_cli_task_status(app, client_job_id, &submit_id, "succeeded", Some(0), None);
@@ -448,8 +453,9 @@ fn append_generation_args(
     arguments.push(format!("--duration={}", request.duration));
     arguments.push(format!("--video_resolution={video_resolution}"));
 
-    // 即梦 CLI 对 image2video / frames2video 都从输入首图推断画幅；首尾帧传
-    // --ratio 会触发 CLI 的严格校验，且可能与首帧实际比例不一致。
+    // 首尾帧模式的画幅由首帧图片决定，传 --ratio 会触发 CLI 的严格校验，
+    // 且可能与首帧实际比例不一致。参考模式走 multimodal2video，必须显式
+    // 传节点选中的 ratio，避免 CLI 按参考图比例生成。
     if command != "image2video" && command != "frames2video" {
         arguments.push(format!("--ratio={}", request.aspect_ratio));
     }
@@ -838,16 +844,50 @@ fn find_downloaded_video(directory: &Path) -> Option<PathBuf> {
     })
 }
 
-fn find_downloaded_image(directory: &Path) -> Option<PathBuf> {
-    let entries = fs::read_dir(directory).ok()?;
-    entries.flatten().find_map(|entry| {
+fn find_downloaded_images(directory: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Ok(entries) = fs::read_dir(directory) else {
+        return paths;
+    };
+    for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            return find_downloaded_image(&path);
+            paths.extend(find_downloaded_images(&path));
+            continue;
         }
-        let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
-        matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp").then_some(path)
-    })
+        let Some(extension) = path.extension() else {
+            continue;
+        };
+        let extension = extension.to_string_lossy().to_ascii_lowercase();
+        if matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+            paths.push(path);
+        }
+    }
+    paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    paths
+}
+
+fn find_downloaded_artifact(directory: &Path, artifact: JimengArtifactKind) -> Option<String> {
+    match artifact {
+        JimengArtifactKind::Video => find_downloaded_video(directory)
+            .map(|path| path.to_string_lossy().into_owned()),
+        JimengArtifactKind::Image => {
+            let paths = find_downloaded_images(directory);
+            if paths.is_empty() {
+                return None;
+            }
+            if paths.len() == 1 {
+                return Some(paths[0].to_string_lossy().into_owned());
+            }
+            serde_json::to_string(
+                &paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .ok()
+        }
+    }
 }
 
 fn extract_http_url(output: &str) -> Option<String> {
@@ -1890,6 +1930,68 @@ fn upscale_image_blocking(
 #[cfg(test)]
 mod image_tests {
     use super::*;
+
+    fn video_request(image_mode: Option<&str>) -> GenerateJimengCliVideoRequest {
+        GenerateJimengCliVideoRequest {
+            client_job_id: None,
+            executable: "dreamina".to_string(),
+            prompt: "让画面中的主体向前移动".to_string(),
+            model_version: "seedance2.5".to_string(),
+            duration: 5,
+            aspect_ratio: "9:16".to_string(),
+            video_resolution: Some("720p".to_string()),
+            image_mode: image_mode.map(str::to_string),
+            reference_images: None,
+            reference_audio: None,
+        }
+    }
+
+    #[test]
+    fn reference_mode_single_image_is_not_treated_as_first_frame() {
+        let images = vec![PathBuf::from("reference.png")];
+        assert_eq!(
+            resolve_video_command(Some("reference"), &images, &[]).unwrap(),
+            "multimodal2video"
+        );
+    }
+
+    #[test]
+    fn reference_mode_passes_selected_ratio_to_multimodal_cli() {
+        let request = video_request(Some("reference"));
+        let images = vec![PathBuf::from("reference.png")];
+        let mut arguments = Vec::new();
+        append_generation_args(
+            &mut arguments,
+            "multimodal2video",
+            &request,
+            "720p",
+            &images,
+            &[],
+        );
+
+        assert!(arguments.iter().any(|argument| argument == "--ratio=9:16"));
+        assert!(arguments.iter().any(|argument| argument == "--image=reference.png"));
+        assert!(!arguments.iter().any(|argument| argument.starts_with("--first=")));
+    }
+
+    #[test]
+    fn first_last_mode_keeps_frame_semantics_and_does_not_pass_ratio() {
+        let request = video_request(Some("first-last"));
+        let images = vec![PathBuf::from("first.png"), PathBuf::from("last.png")];
+        let mut arguments = Vec::new();
+        append_generation_args(
+            &mut arguments,
+            "frames2video",
+            &request,
+            "720p",
+            &images,
+            &[],
+        );
+
+        assert!(!arguments.iter().any(|argument| argument.starts_with("--ratio=")));
+        assert!(arguments.iter().any(|argument| argument == "--first=first.png"));
+        assert!(arguments.iter().any(|argument| argument == "--last=last.png"));
+    }
 
     #[test]
     fn text2image_rejects_4k_for_legacy_versions() {

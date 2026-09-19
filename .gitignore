@@ -12,6 +12,14 @@ src-tauri/gen
 src-tauri/resources/bin/
 src-tauri/resources/*.tar.gz
 
+# 扒剧本引擎的随包运行时(约 210MB):嵌入式 Python + 人物识别依赖
+# (numpy/opencv-headless/Pillow)。同样不入库,由 scripts/setup-pajuben.mjs
+# 从公开源(PyPI / npmmirror / OpenCV Zoo)还原到 resources/pajuben/。
+# 注意:face_runtime/licenses/ 是分发 ONNX 模型的合规要求,必须入库,故不忽略。
+src-tauri/resources/pajuben/runtime/
+src-tauri/resources/pajuben/face_runtime/models/
+src-tauri/resources/pajuben-*.tar.gz
+
 # Logs
 *.log
 npm-debug.log*
@@ -28,3 +36,7 @@ npm-debug.log*
 .playwright-cli/
 output/
 .codex-tmp/
+
+# 本机构建临时目录:setup-ffmpeg / setup-pajuben 的离线缓存会落在这里(约 100MB+),
+# 一旦被 git add -A 带进提交,Git Data API 推送会因大文件直接失败。
+.build-tmp/

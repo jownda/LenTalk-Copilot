@@ -103,6 +103,12 @@ fn default_state() -> AssetLibraryStateRecord {
                 name: "道具".to_string(),
                 created_at: 0,
             },
+            AssetCategoryRecord {
+                id: "category-audio".to_string(),
+                library_id: library.id.clone(),
+                name: "音频".to_string(),
+                created_at: 0,
+            },
         ],
         libraries: vec![library],
         assets: Vec::new(),

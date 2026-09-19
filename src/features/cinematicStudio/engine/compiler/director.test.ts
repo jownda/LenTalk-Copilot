@@ -965,4 +965,23 @@ describe("compileDirectorSequence final export audit", () => {
     expect(references).not.toContain("声音锁");
     expect(references).not.toContain("@audio1");
   });
+
+  it("角色绑定资产库音频时，在提示词中显示音频资产名称", () => {
+    const actor: Asset = {
+      id: "actor-named-voice", kind: "character", name: "藏医", referenceTag: "char_tibetan_doctor_v1",
+      description: "elderly Tibetan doctor", descriptionZh: "藏医", referencePaths: [], lockLevel: "none", tags: [],
+      voiceClip: "voice.mp3", voiceAssetId: "voice-asset-1",
+    };
+    const voice: Asset = {
+      id: "voice-asset-1", kind: "audio-reference", name: "藏医低沉男声", description: "", referencePaths: ["voice.mp3"], lockLevel: "none", tags: [],
+    };
+    const scene = makeScene({ shots: [{
+      ...makeScene().shots[0],
+      participants: [{ characterId: actor.id, role: "primary" }],
+      beats: [{ id: "beat-1", order: 1, verb: "speaks", actorId: actor.id, dialogue: "你来。" }],
+    }] });
+    const output = compileDirectorSequence({ ...makeProject(scene), assets: [actor, voice] }, scene, { locale: "zh" });
+
+    expect(output).toContain("声音参考：@藏医低沉男声 [audio1]。");
+  });
 });

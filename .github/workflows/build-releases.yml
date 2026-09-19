@@ -29,16 +29,13 @@ jobs:
       # 留空   → 回落 github 镜像转发(ghfast.top), 即当前默认行为
       # 轻量云 → 填服务器地址, 如 https://update.example.com 或 http://1.2.3.4:8080
       # 对象存储 → 到期后只把这个变量改成 COS 域名, 无需再动工作流
+      #
+      # 注意: 这个变量只决定"清单里的 url 指向哪里", CI 本身不再向服务器推任何文件。
+      # 自建源的产物由服务器自己的 lentalk-ota-sync.timer 主动从 GitHub Release 拉取。
+      # 原因: runner 在美国 Azure 机房, 跨境 scp 实测只有 6~9 KB/s, 40MB 要传 77 分钟,
+      # 且会直接失败(v1.2.19 的 macOS 就是栽在这一步, 导致 Release 里连 darwin 资产都没有)。
+      # 详见《LenTalk-OTA-发布慢-根因与修复方案.md》。因此本工作流不再需要任何 SSH 凭据。
       UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
-      # 自建源回传(全空则整步自动跳过, 不影响 github 镜像链路)
-      OTA_SSH_HOST: ${{ secrets.OTA_SSH_HOST }}
-      OTA_SSH_USER: ${{ secrets.OTA_SSH_USER }}
-      OTA_SSH_KEY: ${{ secrets.OTA_SSH_KEY }}
-      OTA_SSH_PORT: ${{ vars.OTA_SSH_PORT }}
-      # 必须与服务器上 nginx alias 的目录一致(见 deploy/ota-source/nginx-ota.conf)。
-      # 给默认值是为了防漏填: 若为空, 文件会被写到 SSH 用户的根目录/家目录, 而 nginx
-      # 从 /var/www/lentalk-ota 读取 → 表现为"CI 全绿但客户端永远查不到更新"这种静默失败。
-      OTA_REMOTE_DIR: ${{ vars.OTA_REMOTE_DIR || '/var/www/lentalk-ota' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -70,6 +67,12 @@ jobs:
       # tauri.windows.conf.json 引用它, 因此 macOS job 不需要这一步。
       - name: Restore bundled ffmpeg
         run: npm run setup:ffmpeg
+
+      # 扒剧本引擎的随包运行时(嵌入式 Python + numpy/opencv/Pillow + ONNX 模型,
+      # 约 250MB):同样不入库, 构建前从公开源(PyPI / npmmirror / OpenCV Zoo)
+      # 还原。仅 Windows 随包, macOS job 不需要这一步。
+      - name: Restore bundled pajuben runtime
+        run: npm run setup:pajuben
 
       - name: Clean stale bundle artifacts
         shell: bash
@@ -118,38 +121,13 @@ jobs:
           echo "exe_path=$EXE" >> "$GITHUB_OUTPUT"
           echo "asset_base=$ASSET_BASE" >> "$GITHUB_OUTPUT"
 
-      - name: Publish updater files to self-hosted source
-        if: env.UPDATE_BASE_URL != '' && env.OTA_SSH_HOST != ''
-        shell: bash
-        run: |
-          set -e
-          # 自建源"配了一半"比完全不配更危险: 缺 OTA_SSH_USER 会拼出 "@1.2.3.4" 这种非法
-          # 地址, 缺 OTA_SSH_KEY 会让 ssh 退化成交互式认证(CI 中必然挂起)。
-          # 这里统一拦下并给出可操作的报错, 而不是让它以一个难懂的 ssh 报错收场。
-          if [ -z "$OTA_SSH_USER" ] || [ -z "$OTA_SSH_KEY" ]; then
-            echo "::error::自建源已启用(UPDATE_BASE_URL / OTA_SSH_HOST 非空), 但 OTA_SSH_USER 或 OTA_SSH_KEY 未配置"
-            exit 1
-          fi
-          case "$OTA_REMOTE_DIR" in
-            /*) ;;
-            *) echo "::error::OTA_REMOTE_DIR 必须是绝对路径, 当前为 '$OTA_REMOTE_DIR'"; exit 1 ;;
-          esac
-          VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
-          PORT="${OTA_SSH_PORT:-22}"
-          REMOTE="$OTA_SSH_USER@$OTA_SSH_HOST"
-          mkdir -p ~/.ssh
-          printf '%s\n' "$OTA_SSH_KEY" > ~/.ssh/ota_key
-          chmod 600 ~/.ssh/ota_key
-          ssh -i ~/.ssh/ota_key -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "$REMOTE" "mkdir -p '$OTA_REMOTE_DIR/releases/$VERSION'"
-          scp -i ~/.ssh/ota_key -P "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "${{ steps.meta.outputs.exe_path }}" \
-            "${{ steps.meta.outputs.exe_path }}.sig" \
-            latest-windows.json \
-            "$REMOTE:$OTA_REMOTE_DIR/releases/$VERSION/"
-          # 顶层清单始终指向"最新", 客户端端点固定读取该路径
-          ssh -i ~/.ssh/ota_key -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "$REMOTE" "cp '$OTA_REMOTE_DIR/releases/$VERSION/latest-windows.json' '$OTA_REMOTE_DIR/latest-windows.json'"
+      # ── 自建源同步已移到服务器侧 ────────────────────────────────────────
+      # 原先这里用 scp 把 exe/sig/清单跨境推给腾讯云, 实测只有 6~9 KB/s,
+      # 37MB 要传 12 分钟以上, 且会直接失败(v1.2.19 的 macOS job 卡了 2858s 后挂掉,
+      # 连带后面的 Release 步骤被 skip → Release 里连 darwin 资产都没有)。
+      # 现在由服务器上的 lentalk-ota-sync.timer 主动从本 Release 拉取(实测 20MB 约 30 秒,
+      # 全平台 37MB 约 52 秒)。服务器侧细节见 OTA-RUNBOOK.md。
+      # 保险丝: 老客户端仍有 ghfast.top 等镜像端点兜底, 自建源不可用时不会断供。
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2.5.1
@@ -169,13 +147,8 @@ jobs:
     runs-on: macos-latest
     env:
       # 与 build-windows 同一组变量, 两个平台的清单基址始终一致
+      # (同样只影响清单里的 url; 自建源产物由服务器主动拉取, 见 build-windows 的说明)
       UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
-      OTA_SSH_HOST: ${{ secrets.OTA_SSH_HOST }}
-      OTA_SSH_USER: ${{ secrets.OTA_SSH_USER }}
-      OTA_SSH_KEY: ${{ secrets.OTA_SSH_KEY }}
-      OTA_SSH_PORT: ${{ vars.OTA_SSH_PORT }}
-      # 同上: 默认值与 nginx alias 目录保持一致, 防止漏填导致静默失败
-      OTA_REMOTE_DIR: ${{ vars.OTA_REMOTE_DIR || '/var/www/lentalk-ota' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -253,38 +226,11 @@ jobs:
           echo "资源基址: ${ASSET_BASE}/LenTalk.app.tar.gz"
           echo "asset_base=$ASSET_BASE" >> "$GITHUB_OUTPUT"
 
-      - name: Publish updater files to self-hosted source
-        if: env.UPDATE_BASE_URL != '' && env.OTA_SSH_HOST != ''
-        run: |
-          set -e
-          # 与 build-windows 同一套前置校验(两处需保持同步)
-          if [ -z "$OTA_SSH_USER" ] || [ -z "$OTA_SSH_KEY" ]; then
-            echo "::error::自建源已启用(UPDATE_BASE_URL / OTA_SSH_HOST 非空), 但 OTA_SSH_USER 或 OTA_SSH_KEY 未配置"
-            exit 1
-          fi
-          case "$OTA_REMOTE_DIR" in
-            /*) ;;
-            *) echo "::error::OTA_REMOTE_DIR 必须是绝对路径, 当前为 '$OTA_REMOTE_DIR'"; exit 1 ;;
-          esac
-          VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
-          PORT="${OTA_SSH_PORT:-22}"
-          REMOTE="$OTA_SSH_USER@$OTA_SSH_HOST"
-          mkdir -p ~/.ssh
-          printf '%s\n' "$OTA_SSH_KEY" > ~/.ssh/ota_key
-          chmod 600 ~/.ssh/ota_key
-          ssh -i ~/.ssh/ota_key -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "$REMOTE" "mkdir -p '$OTA_REMOTE_DIR/releases/$VERSION'"
-          scp -i ~/.ssh/ota_key -P "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            latest-darwin.json \
-            latest-macos.json \
-            "$REMOTE:$OTA_REMOTE_DIR/releases/$VERSION/"
-          scp -i ~/.ssh/ota_key -P "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            src-tauri/target/release/bundle/macos/LenTalk.app.tar.gz \
-            src-tauri/target/release/bundle/macos/LenTalk.app.tar.gz.sig \
-            "LenTalk_${VERSION#v}_aarch64.dmg" \
-            "$REMOTE:$OTA_REMOTE_DIR/releases/$VERSION/"
-          ssh -i ~/.ssh/ota_key -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "$REMOTE" "cp '$OTA_REMOTE_DIR/releases/$VERSION/latest-darwin.json' '$OTA_REMOTE_DIR/latest-darwin.json' && cp '$OTA_REMOTE_DIR/releases/$VERSION/latest-macos.json' '$OTA_REMOTE_DIR/latest-macos.json'"
+      # ── 自建源同步已移到服务器侧(同 build-windows) ──────────────────────
+      # 这一步原本是整个工作流最慢也最脆的地方: 把 .app.tar.gz(20MB) + dmg(20MB)
+      # 跨境 scp 给腾讯云, 实测 6~9 KB/s。v1.2.19 就是在这里跑了 2858 秒后失败,
+      # 导致紧随其后的 Release 步骤被 skip —— darwin 资产至今没进 GitHub Release。
+      # 现在改由服务器的 lentalk-ota-sync.timer 主动拉取。
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2.5.1

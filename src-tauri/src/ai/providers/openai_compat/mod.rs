@@ -365,6 +365,40 @@ impl OpenAICompatibleProvider {
         Ok((base_url, api_key))
     }
 
+    fn resolve_image_count(request: &GenerateRequest) -> u32 {
+        request
+            .image_count
+            .or_else(|| {
+                request
+                    .extra_params
+                    .as_ref()
+                    .and_then(|params| params.get("image_count"))
+                    .and_then(Value::as_u64)
+                    .map(|value| value as u32)
+            })
+            .unwrap_or(1)
+            .clamp(1, 10)
+    }
+
+    fn apply_image_count(body: &mut Value, image_count: u32) {
+        body["n"] = json!(image_count);
+    }
+
+    fn serialize_image_sources(images: Vec<String>) -> Result<String, AIError> {
+        let mut unique: Vec<String> = Vec::new();
+        for image in images {
+            if !image.trim().is_empty() && !unique.iter().any(|item| item == &image) {
+                unique.push(image);
+            }
+        }
+        match unique.len() {
+            0 => Err(AIError::TaskFailed("响应中未找到图片数据".to_string())),
+            1 => Ok(unique.remove(0)),
+            _ => serde_json::to_string(&unique)
+                .map_err(|error| AIError::TaskFailed(format!("图片结果序列化失败: {error}"))),
+        }
+    }
+
     /// 构造 /v1/images/generations 请求体。
     /// 自定义中转平台通常使用 image，原生 GPT Image API 使用 input_image。
     fn build_request_body(
@@ -525,6 +559,7 @@ impl OpenAICompatibleProvider {
         resolution: &str,
         aspect_ratio: &str,
         reference_images: Option<&Vec<String>>,
+        image_count: u32,
     ) -> Result<Form, AIError> {
         let mut form = Form::new()
             .text("model", api_model.to_string())
@@ -540,7 +575,7 @@ impl OpenAICompatibleProvider {
                     Self::map_requested_image_size(api_model, resolution, aspect_ratio)
                 },
             )
-            .text("n", "1");
+            .text("n", image_count.to_string());
         if !Self::uses_native_image_parameters(api_model) {
             form = form.text("aspect_ratio", aspect_ratio.to_string());
         }
@@ -779,37 +814,6 @@ impl OpenAICompatibleProvider {
         Ok(Some(STANDARD.encode(bytes)))
     }
 
-    /// 解析 Responses 输出: output[] 里 image_generation_call.result(b64/url) 或 image.image_url。
-    fn extract_responses_image(payload: &Value) -> Option<String> {
-        let output = payload.get("output").and_then(|value| value.as_array())?;
-        for item in output {
-            if let Some(result) = item.get("result").and_then(|value| value.as_str()) {
-                if result.is_empty() {
-                    continue;
-                }
-                if result.starts_with("http://") || result.starts_with("https://") || result.starts_with("data:") {
-                    return Some(result.to_string());
-                }
-                return Some(format!("data:image/png;base64,{}", result));
-            }
-            if let Some(image_url) = item.get("image_url").and_then(|value| value.as_str()) {
-                if !image_url.is_empty() {
-                    return Some(image_url.to_string());
-                }
-            }
-            if let Some(content) = item.get("content").and_then(|value| value.as_array()) {
-                for part in content {
-                    if let Some(image_url) = part.get("image_url").and_then(|value| value.as_str()) {
-                        if !image_url.is_empty() {
-                            return Some(image_url.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
     fn extract_url_from_chat_content(content: &str) -> Option<String> {
         let start = content.find("https://").or_else(|| content.find("http://"))?;
         let candidate = &content[start..];
@@ -861,51 +865,66 @@ impl OpenAICompatibleProvider {
         None
     }
 
-    /// 从响应中提取图片(不报错版): 支持 data[]b64/url、顶层 b64_json/url/image/output。
-    fn extract_image_data_if_present(payload: &Value) -> Option<String> {
-        if let Some(data) = payload.get("data").and_then(|value| value.as_array()) {
-            if let Some(first) = data.first() {
-                if let Some(b64) = first.get("b64_json").and_then(|value| value.as_str()) {
-                    if !b64.is_empty() {
-                        return Some(format!("data:image/png;base64,{}", b64));
+    /// 提取响应中的全部图片。供应商常把多张图放在 data[] / output[] / choices[]，
+    /// 旧实现只取 first，导致模型实际返回 4 张时画布只显示 1 张。
+    fn extract_image_data_all(payload: &Value) -> Vec<String> {
+        fn push_value(value: &Value, key: &str, output: &mut Vec<String>) {
+            match value {
+                Value::String(text)
+                    if (matches!(key, "b64_json" | "url" | "image" | "images" | "image_url" | "image_urls" | "result" | "results" | "artifacts")
+                        || (matches!(key, "data" | "output" | "choices" | "message" | "task" | "job")
+                            && (text.starts_with("http://")
+                                || text.starts_with("https://")
+                                || text.starts_with("data:")))
+                        || (key.is_empty()
+                            && (text.starts_with("http://")
+                                || text.starts_with("https://")
+                                || text.starts_with("data:"))))
+                        && !text.trim().is_empty() =>
+                {
+                    let normalized = if key == "b64_json" {
+                        format!("data:image/png;base64,{}", text)
+                    } else if key == "result"
+                        && !text.starts_with("http://")
+                        && !text.starts_with("https://")
+                        && !text.starts_with("data:")
+                    {
+                        format!("data:image/png;base64,{}", text)
+                    } else {
+                        text.to_string()
+                    };
+                    if !output.iter().any(|item| item == &normalized) {
+                        output.push(normalized);
                     }
                 }
-                if let Some(url) = first.get("url").and_then(|value| value.as_str()) {
-                    if !url.is_empty() {
-                        return Some(url.to_string());
-                    }
-                }
-            }
-        }
-        for key in ["b64_json", "url", "image", "image_url", "output"] {
-            if let Some(value) = payload.get(key) {
-                if let Some(text) = value.as_str() {
-                    if !text.is_empty() {
-                        return Some(if key == "b64_json" {
-                            format!("data:image/png;base64,{}", text)
-                        } else {
-                            text.to_string()
-                        });
-                    }
-                }
-                if let Some(array) = value.as_array() {
-                    if let Some(first) = array.iter().find_map(|item| item.as_str()) {
-                        if !first.is_empty() {
-                            return Some(first.to_string());
+                Value::String(text) if matches!(key, "content" | "text") => {
+                    if let Some(url) = OpenAICompatibleProvider::extract_url_from_chat_content(text) {
+                        if !output.iter().any(|item| item == &url) {
+                            output.push(url);
                         }
                     }
                 }
-            }
-        }
-        for container in ["data", "result", "task", "job"] {
-            if let Some(value) = payload.get(container) {
-                if let Some(image) = Self::extract_image_data_if_present(value) {
-                    return Some(image);
+                Value::Array(items) => {
+                    for item in items {
+                        push_value(item, key, output);
+                    }
                 }
+                Value::Object(object) => {
+                    for (child_key, child_value) in object {
+                        if matches!(child_key.as_str(), "b64_json" | "url" | "image" | "images" | "image_url" | "image_urls" | "result" | "results" | "artifacts") {
+                            push_value(child_value, child_key, output);
+                        } else if matches!(child_key.as_str(), "data" | "output" | "choices" | "message" | "content" | "task" | "job" | "images" | "results" | "artifacts") {
+                            push_value(child_value, child_key, output);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
-        Self::extract_responses_image(payload)
-            .or_else(|| Self::extract_chat_image(payload))
+
+        let mut output = Vec::new();
+        push_value(payload, "", &mut output);
+        output
     }
 
     /// 从提交响应中提取任务 id(各平台非标字段名)。
@@ -1120,31 +1139,6 @@ impl OpenAICompatibleProvider {
         normalized.to_string()
     }
 
-    /// 解析 OpenAI Images 响应:优先 b64_json,其次 url
-    fn extract_image_data(payload: &Value) -> Result<String, AIError> {        if let Some(data) = payload.get("data").and_then(|value| value.as_array()) {
-            if let Some(first) = data.first() {
-                if let Some(b64) = first.get("b64_json").and_then(|value| value.as_str()) {
-                    if !b64.is_empty() {
-                        return Ok(format!("data:image/png;base64,{}", b64));
-                    }
-                }
-                if let Some(url) = first.get("url").and_then(|value| value.as_str()) {
-                    if !url.is_empty() {
-                        return Ok(url.to_string());
-                    }
-                }
-            }
-        }
-        if let Some(image) = Self::extract_chat_image(payload) {
-            return Ok(image);
-        }
-        let error_message = payload
-            .get("error")
-            .and_then(|value| value.get("message"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("响应中未找到图片数据");
-        Err(AIError::TaskFailed(error_message.to_string()))
-    }
 }
 
 impl Default for OpenAICompatibleProvider {
@@ -1212,6 +1206,7 @@ impl AIProvider for OpenAICompatibleProvider {
         let reference_image_field = Self::resolve_reference_image_field(&request.extra_params, api_model);
         let reference_image_encoding = Self::resolve_reference_image_encoding(&request.extra_params, reference_image_field);
         let reference_image_count = request.reference_images.as_ref().map(|images| images.len()).unwrap_or(0);
+        let image_count = Self::resolve_image_count(&request);
         let image_transport = Self::resolve_image_transport(
             &request.extra_params,
             provider_id,
@@ -1228,7 +1223,7 @@ impl AIProvider for OpenAICompatibleProvider {
             format!("{}/v1/images/generations", base_url)
         };
         let response = if is_responses {
-            let body = Self::build_responses_body(
+            let mut body = Self::build_responses_body(
                     api_model,
                     &request.prompt,
                     &request.size,
@@ -1236,6 +1231,7 @@ impl AIProvider for OpenAICompatibleProvider {
                     request.reference_images.as_ref(),
                 )
                 .await?;
+            Self::apply_image_count(&mut body, image_count);
             client.post(&endpoint)
                 .bearer_auth(&api_key)
                 .header("Accept-Encoding", "identity")
@@ -1243,11 +1239,12 @@ impl AIProvider for OpenAICompatibleProvider {
                 .send()
                 .await?
         } else if is_chat {
-            let body = Self::build_chat_body(
+            let mut body = Self::build_chat_body(
                     api_model,
                     &request.prompt,
                     request.reference_images.as_ref(),
                 )?;
+            Self::apply_image_count(&mut body, image_count);
             client.post(&endpoint)
                 .bearer_auth(&api_key)
                 .header("Accept-Encoding", "identity")
@@ -1262,6 +1259,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 &request.size,
                 &request.aspect_ratio,
                 request.reference_images.as_ref(),
+                image_count,
             )
             .await?;
             client.post(&endpoint)
@@ -1290,6 +1288,7 @@ impl AIProvider for OpenAICompatibleProvider {
                     reference_image_encoding,
                 )?
             };
+            Self::apply_image_count(&mut body, image_count);
             Self::apply_image_mode(&mut body, &request.extra_params);
             client.post(&endpoint)
                 .bearer_auth(&api_key)
@@ -1327,6 +1326,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 "input_image",
                 "raw_base64",
             )?;
+            Self::apply_image_count(&mut fallback_body, image_count);
             Self::apply_image_mode(&mut fallback_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] WGSPAI gpt-image Responses 404, falling back to /v1/images/generations"
@@ -1357,6 +1357,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 alternate_field,
                 Self::resolve_reference_image_encoding(&request.extra_params, alternate_field),
             )?;
+            Self::apply_image_count(&mut alternate_body, image_count);
             Self::apply_image_mode(&mut alternate_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] retrying with reference_image_field: {}",
@@ -1401,24 +1402,14 @@ impl AIProvider for OpenAICompatibleProvider {
         }
 
         if active_protocol == "responses" {
-            if let Some(image) = Self::extract_responses_image(&payload) {
-                return Ok(image);
-            }
-            return Err(AIError::TaskFailed(
-                "Responses 响应中未找到图片(请确认该平台模型为 image-to-image 变体)".to_string(),
-            ));
+            return Self::serialize_image_sources(Self::extract_image_data_all(&payload));
         }
 
         if active_protocol == "chat" {
-            if let Some(image) = Self::extract_chat_image(&payload) {
-                return Ok(image);
-            }
-            return Err(AIError::TaskFailed(
-                "Chat Completions 响应中未找到图片(请确认模型支持图像生成且提示词已要求返回图片)".to_string(),
-            ));
+            return Self::serialize_image_sources(Self::extract_image_data_all(&payload));
         }
 
-        Self::extract_image_data(&payload)
+        Self::serialize_image_sources(Self::extract_image_data_all(&payload))
     }
 
     /// 异步模式提交(extra_params.request_mode == "async"):
@@ -1465,6 +1456,7 @@ impl AIProvider for OpenAICompatibleProvider {
         let reference_image_field = Self::resolve_reference_image_field(&request.extra_params, api_model);
         let reference_image_encoding = Self::resolve_reference_image_encoding(&request.extra_params, reference_image_field);
         let reference_image_count = request.reference_images.as_ref().map(|images| images.len()).unwrap_or(0);
+        let image_count = Self::resolve_image_count(&request);
         let image_transport = Self::resolve_image_transport(
             &request.extra_params,
             provider_id,
@@ -1481,7 +1473,7 @@ impl AIProvider for OpenAICompatibleProvider {
             format!("{}/v1/images/generations", base_url)
         };
         let response = if is_responses {
-            let body = Self::build_responses_body(
+            let mut body = Self::build_responses_body(
                     api_model,
                     &request.prompt,
                     &request.size,
@@ -1489,6 +1481,7 @@ impl AIProvider for OpenAICompatibleProvider {
                     request.reference_images.as_ref(),
                 )
                 .await?;
+            Self::apply_image_count(&mut body, image_count);
             client.post(&endpoint)
                 .bearer_auth(&api_key)
                 .header("Accept-Encoding", "identity")
@@ -1496,11 +1489,12 @@ impl AIProvider for OpenAICompatibleProvider {
                 .send()
                 .await?
         } else if is_chat {
-            let body = Self::build_chat_body(
+            let mut body = Self::build_chat_body(
                     api_model,
                     &request.prompt,
                     request.reference_images.as_ref(),
                 )?;
+            Self::apply_image_count(&mut body, image_count);
             client.post(&endpoint)
                 .bearer_auth(&api_key)
                 .header("Accept-Encoding", "identity")
@@ -1515,6 +1509,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 &request.size,
                 &request.aspect_ratio,
                 request.reference_images.as_ref(),
+                image_count,
             )
             .await?;
             client.post(&endpoint)
@@ -1543,6 +1538,7 @@ impl AIProvider for OpenAICompatibleProvider {
                     reference_image_encoding,
                 )?
             };
+            Self::apply_image_count(&mut body, image_count);
             Self::apply_image_mode(&mut body, &request.extra_params);
             client.post(&endpoint)
                 .bearer_auth(&api_key)
@@ -1567,6 +1563,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 "input_image",
                 "raw_base64",
             )?;
+            Self::apply_image_count(&mut fallback_body, image_count);
             Self::apply_image_mode(&mut fallback_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] async: WGSPAI gpt-image Responses 404, falling back to /v1/images/generations"
@@ -1597,6 +1594,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 alternate_field,
                 Self::resolve_reference_image_encoding(&request.extra_params, alternate_field),
             )?;
+            Self::apply_image_count(&mut alternate_body, image_count);
             Self::apply_image_mode(&mut alternate_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] async retrying with reference_image_field: {}",
@@ -1615,8 +1613,11 @@ impl AIProvider for OpenAICompatibleProvider {
 
         if status.is_success() {
             // 平台同步直接返回图片
-            if let Some(image) = Self::extract_image_data_if_present(&payload) {
-                return Ok(ProviderTaskSubmission::Succeeded(image));
+            let images = Self::extract_image_data_all(&payload);
+            if !images.is_empty() {
+                return Ok(ProviderTaskSubmission::Succeeded(
+                    Self::serialize_image_sources(images)?,
+                ));
             }
             // 返回任务 id → 异步轮询
             if let Some(task_id) = Self::extract_task_id(&payload) {
@@ -1745,8 +1746,11 @@ impl AIProvider for OpenAICompatibleProvider {
             let (_, body_text) = Self::read_response_text(response, "自定义平台任务查询").await?;
             let payload: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
 
-            if let Some(image) = Self::extract_image_data_if_present(&payload) {
-                return Ok(ProviderTaskPollResult::Succeeded(image));
+            let images = Self::extract_image_data_all(&payload);
+            if !images.is_empty() {
+                return Ok(ProviderTaskPollResult::Succeeded(
+                    Self::serialize_image_sources(images)?,
+                ));
             }
 
             let status_text = Self::extract_status(&payload).unwrap_or_default();
@@ -1841,6 +1845,39 @@ mod tests {
         assert_eq!(
             OpenAICompatibleProvider::extract_chat_image(&payload),
             Some("https://cdn.example.com/generated.png".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_all_openai_image_results_and_serializes_multiple_sources() {
+        let payload = json!({
+            "data": [
+                { "url": "https://cdn.example.com/one.png" },
+                { "b64_json": "QUJD" },
+                { "url": "https://cdn.example.com/one.png" }
+            ]
+        });
+        let images = OpenAICompatibleProvider::extract_image_data_all(&payload);
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0], "https://cdn.example.com/one.png");
+        assert_eq!(images[1], "data:image/png;base64,QUJD");
+        let serialized = OpenAICompatibleProvider::serialize_image_sources(images)
+            .expect("multiple image sources should serialize");
+        let parsed: Vec<String> = serde_json::from_str(&serialized).expect("serialized image list");
+        assert_eq!(parsed.len(), 2);
+
+        let direct_urls = json!({
+            "output": [
+                "https://cdn.example.com/two.png",
+                "https://cdn.example.com/three.png"
+            ]
+        });
+        assert_eq!(
+            OpenAICompatibleProvider::extract_image_data_all(&direct_urls),
+            vec![
+                "https://cdn.example.com/two.png".to_string(),
+                "https://cdn.example.com/three.png".to_string(),
+            ]
         );
     }
 

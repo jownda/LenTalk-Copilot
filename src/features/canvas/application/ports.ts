@@ -23,13 +23,16 @@ export interface NodeFactory {
   createNode: (
     type: CanvasNodeType,
     position: XYPosition,
-    data?: Partial<CanvasNodeData>
+    data?: Partial<CanvasNodeData>,
+    /** 显式初始尺寸；省略则用节点类型注册的 defaultSize。 */
+    size?: { width: number; height: number }
   ) => CanvasNode;
 }
 
 export interface GraphImageResolver {
   collectInputImages: (nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]) => string[];
   collectInputAudio: (nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]) => string[];
+  collectInputVideos: (nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]) => string[];
   collectInputText: (nodeId: string, nodes: CanvasNode[], edges: CanvasEdge[]) => string[];
 }
 
@@ -40,6 +43,8 @@ export interface GenerateImagePayload {
   model: string;
   size: string;
   aspectRatio: string;
+  /** 请求的输出图片数量；供应商不支持时由其按自身能力处理。 */
+  imageCount?: number;
   referenceImages?: string[];
   extraParams?: Record<string, unknown>;
 }

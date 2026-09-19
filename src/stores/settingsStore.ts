@@ -67,10 +67,31 @@ export const DEFAULT_JIMENG_CLI_AUTO_INSTALL_STATUS: JimengCliAutoInstallStatus 
   detectedAt: 0,
 };
 
+/**
+ * 名字里带明确「图片」标记的模型 —— 即使前缀是 kling / veo / wan / grok 这类
+ * 视频厂商，它也是图片模型（kling-image-o3、wan2.7-image、grok-imagine-image）。
+ * 少了这条，「拉取模型」会把这些图片模型塞进视频清单，用户在图片列表里根本选不到。
+ */
+const IMAGE_MODEL_MARKER =
+  /(?:^|[-_.])(?:image|images|imagine|img|seedream|flux|z-image|zimage|nano-banana|banana|sdxl|midjourney|mj_imagine)(?:[-_.]|\d|$)|gpt-image|qwen-image|tongyi-image|image[-_](?:gen|edit|generation)|dall-?e/i;
+
+/**
+ * 出现这些词时一定是视频，图片标记不能翻案
+ * （image-to-video、happyhorse-1.0-video-edit、wan2.7-video…）。
+ */
+const HARD_VIDEO_MARKER =
+  /video|[-_]to[-_]video|(?:^|[-_.])(?:t2v|i2v|r2v|kf2v|flf2v|videoedit)(?:[-_.]|\d|$)/i;
+
 /** 视频模型必须与图片模型分开注册，避免通用模型拉取结果污染图片节点。 */
 export function isVideoGenerationModelName(model: string): boolean {
   const value = model.trim().toLowerCase();
   if (!value) {
+    return false;
+  }
+
+  // 先看图片标记：kling-image-o3 / wan2.7-image / doubao-seedance-2-image 都是图片。
+  // 但不能放过 video / t2v 这类硬标记，否则真正的视频模型会被图片前缀救回来。
+  if (IMAGE_MODEL_MARKER.test(value) && !HARD_VIDEO_MARKER.test(value)) {
     return false;
   }
 
@@ -86,6 +107,9 @@ export function isVideoGenerationModelName(model: string): boolean {
     /(?:^|[-_.])gz-sd(?:[-_.]|\d|$)/,
     /(?:^|[-_.])rd2(?:\.0|\.5)?(?:[-_.]|\d|$)/,
     /(?:^|[-_.])wan3(?:\.0)?(?:[-_.]|\d|$)/,
+    // wan 家族除 wan2.7-video 外还有 wan-2-6 / wan-3-0 这种「纯型号」写法，
+    // 名字里没有 video/t2v 可依据，只能按型号本身兜住（带 image 的已被上面否决）。
+    /(?:^|[-_.])wan[-_.]?\d+(?:\.\d+)?(?:[-_.]|\d|$)/,
     /(?:^|[-_.])wanneng(?:[-_.]|\d|$)/,
     /(?:^|[-_.])doubaofast(?:[-_.]|\d|$)/,
     /(?:^|[-_.])minimax-h3(?:[-_.]|\d|$)/,
@@ -102,8 +126,12 @@ export function isVideoGenerationModelName(model: string): boolean {
     /(?:^|[-_.])veo(?:[-_.]|\d|$)/,
     /(?:^|[-_.])sora(?:[-_.]|\d|$)/,
     /(?:^|[-_.])pixverse(?:[-_.]|\d|$)/,
-    /(?:^|[-_.])vidu(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])viduq?(?:[-_.]|\d|$)/,
     /(?:^|[-_.])luma(?:[-_.]|\d|$)/,
+    // happyhorse / omni-flash 在知鸟 AI 的清单里是视频模型，名字里既没有 video
+    // 也没有 t2v（happyhorse-1-0、omni-flash-1-1），只能显式列出。
+    /(?:^|[-_.])happyhorse(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])omni-flash(?:[-_.]|\d|$)/,
     /grok-imagine-video/,
     /xb-sora/,
     /me-kuaile/,
@@ -241,6 +269,12 @@ interface SettingsState {
   customModelPrices: Record<string, string>;
   /** 已实际成功生成过的模型，供拉取模型列表标记为可用。 */
   usableModelIds: string[];
+  /**
+   * 扒剧本上一次选用的模型（`custom:<apiId>/<model>` 或 `recommended:<id>/<model>`）。
+   * 记住它是为了「关掉页面再打开不用重新选模型」。
+   */
+  pajubenModelKey: string | null;
+  setPajubenModelKey: (key: string | null) => void;
   setProviderApiKey: (providerId: string, key: string) => void;
   setJimengCliExecutable: (executable: string) => void;
   setJimengCliAutoInstallStatus: (status: JimengCliAutoInstallStatus) => void;
@@ -663,6 +697,9 @@ export const useSettingsStore = create<SettingsState>()(
       lastVideoResolution: null,
       customModelPrices: {},
       usableModelIds: [],
+      pajubenModelKey: null,
+      setPajubenModelKey: (key) =>
+        set({ pajubenModelKey: normalizeOptionalSettingString(key) }),
       setProviderApiKey: (providerId, key) =>
         set((state) => ({
           apiKeys: {

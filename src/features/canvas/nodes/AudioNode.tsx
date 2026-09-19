@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { isTauri } from '@tauri-apps/api/core';
+import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { Handle, Position } from '@xyflow/react';
 import {
@@ -24,7 +24,7 @@ import { MediaDimensionsLabel, useHoverIntent, useMediaByteSize, type MediaDimen
 import { canvasEventBus } from '@/features/canvas/application/canvasServices';
 import { prepareNodeImage, reduceAspectRatio, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import { resolveMediaNodeResizeBounds } from '@/features/canvas/application/aspectLockedResize';
-import { captureVideoFrame } from '@/features/canvas/application/videoFrameCapture';
+import { captureVideoFrame, createObjectUrlFromDataUrl } from '@/features/canvas/application/videoFrameCapture';
 import { showErrorDialog } from '@/features/canvas/application/errorDialog';
 import {
   extractVideoThumbnail,
@@ -131,6 +131,10 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const [videoDuration, setVideoDuration] = useState(0);
   /** 指针是否在画面上: 控制条仅在悬停(或播放中)出现, 其余时间完全让位给拖动。 */
   const [isVideoHovered, setIsVideoHovered] = useState(false);
+  /** 本地 asset 协议在部分 WebView / 编码组合下不能直接解码，失败后切换到同源 Blob。 */
+  const [localVideoFallbackSrc, setLocalVideoFallbackSrc] = useState<string | null>(null);
+  const localVideoFallbackSrcRef = useRef<string | null>(null);
+  const localVideoFallbackLoadingRef = useRef(false);
 
   const resolvedTitle = useMemo(
     () => resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, data),
@@ -138,6 +142,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   );
   const isVideo = data.mediaType === 'video';
   const mediaSrc = data.sourcePath ? resolveImageDisplayUrl(data.sourcePath) : null;
+  const playbackSrc = localVideoFallbackSrc ?? mediaSrc;
   // 体积标注只跟随视频画面; 音频节点不显示, 传 null 避免无谓的探测请求。
   const mediaByteSize = useMediaByteSize(isVideo ? data.sourcePath : null);
   // 尺寸/体积标注改为悬停延迟显示, 避免常驻文字干扰画面。
@@ -156,7 +161,52 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     setVideoDuration(0);
     setPlaybackTime(0);
     setIsPlaying(false);
-  }, [mediaSrc]);
+    localVideoFallbackLoadingRef.current = false;
+    setLocalVideoFallbackSrc((current) => {
+      if (current) {
+        URL.revokeObjectURL(current);
+      }
+      localVideoFallbackSrcRef.current = null;
+      return null;
+    });
+  }, [data.sourcePath, isVideo]);
+
+  useEffect(() => () => {
+    const fallbackSrc = localVideoFallbackSrcRef.current;
+    if (fallbackSrc) {
+      URL.revokeObjectURL(fallbackSrc);
+      localVideoFallbackSrcRef.current = null;
+    }
+  }, []);
+
+  const handleLocalVideoLoadError = useCallback(() => {
+    const source = data.sourcePath?.trim();
+    if (!isVideo || !source || !isTauri() || localVideoFallbackLoadingRef.current) {
+      return;
+    }
+    // 远端 AI 视频不走这里；本地上传视频失败时用 Rust 读取原始字节，
+    // 转成同源 Blob 后交给 <video>，行为与可直接播放的 AI 视频源保持一致。
+    const lower = source.toLowerCase();
+    if (lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('blob:') || lower.startsWith('data:')) {
+      return;
+    }
+    localVideoFallbackLoadingRef.current = true;
+    void invoke<string>('load_media_data_url', { source })
+      .then((dataUrl) => {
+        const blobUrl = createObjectUrlFromDataUrl(dataUrl);
+        setLocalVideoFallbackSrc((current) => {
+          if (current) {
+            URL.revokeObjectURL(current);
+          }
+          localVideoFallbackSrcRef.current = blobUrl;
+          return blobUrl;
+        });
+      })
+      .catch((error) => {
+        localVideoFallbackLoadingRef.current = false;
+        console.warn('[mediaNode] local video playback fallback failed', error);
+      });
+  }, [data.sourcePath, isVideo]);
 
   const handleVideoMetadata = useCallback((event: SyntheticEvent<HTMLVideoElement>) => {
     const video = event.currentTarget;
@@ -411,7 +461,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       }
       try {
         const dataUrl = await captureVideoFrame({
-          source: sourcePath,
+          source: playbackSrc ?? sourcePath,
           maxWidth: REMOTE_VIDEO_THUMBNAIL_MAX_WIDTH,
         });
         const prepared = await prepareNodeImage(dataUrl);
@@ -424,7 +474,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     return () => {
       disposed = true;
     };
-  }, [data.previewImageUrl, data.sourcePath, id, isVideo, updateNodeData]);
+  }, [data.previewImageUrl, data.sourcePath, id, isVideo, playbackSrc, updateNodeData]);
 
   const handleCaptureFrame = useCallback(async () => {
     const source = data.sourcePath;
@@ -436,7 +486,9 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       // 抽帧统一走 captureVideoFrame: 远端 CDN 的视频不能直接绘制到 canvas(画布会被污染),
       // 该函数会回退到 Rust 取字节转同源 blob。取用户当前停留的时间点作为截图画面。
       const dataUrl = await captureVideoFrame({
-        source,
+        // 若本地视频已经切换到同源 Blob，优先使用同一个可播放源，
+        // 避免抽帧再次碰到 asset:// 解码/CORS 问题。
+        source: playbackSrc ?? source,
         timeSec: videoRef.current?.currentTime ?? 0,
       });
       const prepared = await prepareNodeImage(dataUrl);
@@ -468,7 +520,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     } finally {
       setIsCapturing(false);
     }
-  }, [addDerivedExportNode, addEdge, data.sourcePath, id]);
+  }, [addDerivedExportNode, addEdge, data.sourcePath, id, playbackSrc]);
 
   /** 截图入口已移到节点工具栏(下载旁), 通过事件总线触发, 与 upload-node/reupload 一致。 */
   useEffect(() => {
@@ -532,11 +584,12 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                 ref={videoRef}
                 draggable={false}
                 onDragStart={(event) => event.preventDefault()}
-                src={mediaSrc}
+                src={playbackSrc ?? ''}
                 preload="metadata"
                 poster={data.previewImageUrl ? resolveImageDisplayUrl(data.previewImageUrl) : undefined}
                 className="pointer-events-none h-full w-full object-contain"
                 onLoadedMetadata={handleVideoMetadata}
+                onError={handleLocalVideoLoadError}
                 onPlay={() => setIsPlaying(true)}
                 onPause={() => setIsPlaying(false)}
                 onEnded={() => setIsPlaying(false)}
@@ -713,10 +766,11 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
               event.preventDefault();
               event.stopPropagation();
             }}
-            src={mediaSrc}
+            src={playbackSrc ?? ''}
             preload="auto"
             className="max-h-full max-w-full rounded-lg object-contain shadow-2xl"
             onClick={(event) => event.stopPropagation()}
+            onError={handleLocalVideoLoadError}
           />
         </div>,
         document.body
