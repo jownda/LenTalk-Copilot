@@ -1,4 +1,4 @@
-import type { CanvasEdge, CanvasNode } from '../domain/canvasNodes';
+import type { CanvasEdge, CanvasNode } from "../domain/canvasNodes";
 
 const DEFAULT_NODE_WIDTH = 220;
 const DEFAULT_NODE_HEIGHT = 200;
@@ -8,16 +8,18 @@ const START_X = 40;
 const START_Y = 40;
 
 function getNodeSize(node: CanvasNode): { width: number; height: number } {
-  const width = typeof node.measured?.width === 'number'
-    ? node.measured.width
-    : typeof node.width === 'number'
-      ? node.width
-      : DEFAULT_NODE_WIDTH;
-  const height = typeof node.measured?.height === 'number'
-    ? node.measured.height
-    : typeof node.height === 'number'
-      ? node.height
-      : DEFAULT_NODE_HEIGHT;
+  const width =
+    typeof node.measured?.width === "number"
+      ? node.measured.width
+      : typeof node.width === "number"
+        ? node.width
+        : DEFAULT_NODE_WIDTH;
+  const height =
+    typeof node.measured?.height === "number"
+      ? node.measured.height
+      : typeof node.height === "number"
+        ? node.height
+        : DEFAULT_NODE_HEIGHT;
   return {
     width: width > 0 ? width : DEFAULT_NODE_WIDTH,
     height: height > 0 ? height : DEFAULT_NODE_HEIGHT,
@@ -45,10 +47,7 @@ function resolveTopLevelId(nodeId: string, nodeMap: Map<string, CanvasNode>): st
  * - 边会提升到顶层祖先, 组内节点的连线也参与组之间的布局。
  * - 孤立节点与无依赖节点排在最左列; 循环依赖兜底按剩余顺序排新层。
  */
-export function computeAutoLayout(
-  nodes: CanvasNode[],
-  edges: CanvasEdge[]
-): Map<string, { x: number; y: number }> {
+export function computeAutoLayout(nodes: CanvasNode[], edges: CanvasEdge[]): Map<string, { x: number; y: number }> {
   const nodeMap = new Map(nodes.map((node) => [node.id, node] as const));
   const topLevelNodes = nodes.filter((node) => !node.parentId);
   const positions = new Map<string, { x: number; y: number }>();
@@ -150,15 +149,7 @@ export function computeAutoLayout(
   return positions;
 }
 
-export type NodeAlignMode =
-  | 'left'
-  | 'centerH'
-  | 'right'
-  | 'top'
-  | 'centerV'
-  | 'bottom'
-  | 'distributeH'
-  | 'distributeV';
+export type NodeAlignMode = "left" | "centerH" | "right" | "top" | "centerV" | "bottom" | "distributeH" | "distributeV";
 
 export interface AlignableItem {
   id: string;
@@ -168,7 +159,7 @@ export interface AlignableItem {
   height: number;
 }
 
-export type AlignmentGuideAxis = 'vertical' | 'horizontal';
+export type AlignmentGuideAxis = "vertical" | "horizontal";
 
 export interface AlignmentGuide {
   axis: AlignmentGuideAxis;
@@ -189,19 +180,39 @@ interface AlignmentCandidate {
   distance: number;
   target: number;
   guidePosition: number;
-  start: number;
-  end: number;
+  /**
+   * 辅助线只绘制在两个节点外框之间；两个节点在该方向重叠时不绘制，
+   * 避免虚线穿过任何节点内容区。
+   */
+  guideSegment: { start: number; end: number } | null;
+}
+
+function getOuterFrameGapSegment(
+  firstStart: number,
+  firstEnd: number,
+  secondStart: number,
+  secondEnd: number,
+): { start: number; end: number } | null {
+  if (firstEnd <= secondStart) {
+    return { start: firstEnd, end: secondStart };
+  }
+
+  if (secondEnd <= firstStart) {
+    return { start: secondEnd, end: firstStart };
+  }
+
+  return null;
 }
 
 /**
  * 计算单个节点拖拽过程中的实时对齐位置。
  * 仅比较左/右和上/下四条边，不把中心线或相邻边缘当成对齐线，
- * 因此辅助线始终会穿过正在拖拽的节点与参考节点。
+ * 辅助线仅显示在两个节点外框之间，不会穿过节点内容区。
  */
 export function computeDragAlignment(
   moving: AlignableItem,
   references: AlignableItem[],
-  threshold = ALIGNMENT_GUIDE_SNAP_THRESHOLD
+  threshold = ALIGNMENT_GUIDE_SNAP_THRESHOLD,
 ): DragAlignmentResult {
   const snap = threshold > 0 ? threshold : ALIGNMENT_GUIDE_SNAP_THRESHOLD;
   const movingRight = moving.x + moving.width;
@@ -209,10 +220,7 @@ export function computeDragAlignment(
   let bestX: AlignmentCandidate | null = null;
   let bestY: AlignmentCandidate | null = null;
 
-  const consider = (
-    current: AlignmentCandidate | null,
-    candidate: AlignmentCandidate
-  ): AlignmentCandidate | null => {
+  const consider = (current: AlignmentCandidate | null, candidate: AlignmentCandidate): AlignmentCandidate | null => {
     if (candidate.distance > snap) {
       return current;
     }
@@ -226,20 +234,20 @@ export function computeDragAlignment(
 
     const referenceRight = reference.x + reference.width;
     const referenceBottom = reference.y + reference.height;
+    const verticalGuideSegment = getOuterFrameGapSegment(moving.y, movingBottom, reference.y, referenceBottom);
+    const horizontalGuideSegment = getOuterFrameGapSegment(moving.x, movingRight, reference.x, referenceRight);
     const xCandidates: AlignmentCandidate[] = [
       {
         distance: Math.abs(moving.x - reference.x),
         target: reference.x,
         guidePosition: reference.x,
-        start: Math.min(moving.y, reference.y),
-        end: Math.max(movingBottom, referenceBottom),
+        guideSegment: verticalGuideSegment,
       },
       {
         distance: Math.abs(movingRight - referenceRight),
         target: referenceRight - moving.width,
         guidePosition: referenceRight,
-        start: Math.min(moving.y, reference.y),
-        end: Math.max(movingBottom, referenceBottom),
+        guideSegment: verticalGuideSegment,
       },
     ];
     const yCandidates: AlignmentCandidate[] = [
@@ -247,15 +255,13 @@ export function computeDragAlignment(
         distance: Math.abs(moving.y - reference.y),
         target: reference.y,
         guidePosition: reference.y,
-        start: Math.min(moving.x, reference.x),
-        end: Math.max(movingRight, referenceRight),
+        guideSegment: horizontalGuideSegment,
       },
       {
         distance: Math.abs(movingBottom - referenceBottom),
         target: referenceBottom - moving.height,
         guidePosition: referenceBottom,
-        start: Math.min(moving.x, reference.x),
-        end: Math.max(movingRight, referenceRight),
+        guideSegment: horizontalGuideSegment,
       },
     ];
 
@@ -268,20 +274,20 @@ export function computeDragAlignment(
   }
 
   const guides: AlignmentGuide[] = [];
-  if (bestX) {
+  if (bestX?.guideSegment) {
     guides.push({
-      axis: 'vertical',
+      axis: "vertical",
       position: bestX.guidePosition,
-      start: bestX.start,
-      end: bestX.end,
+      start: bestX.guideSegment.start,
+      end: bestX.guideSegment.end,
     });
   }
-  if (bestY) {
+  if (bestY?.guideSegment) {
     guides.push({
-      axis: 'horizontal',
+      axis: "horizontal",
       position: bestY.guidePosition,
-      start: bestY.start,
-      end: bestY.end,
+      start: bestY.guideSegment.start,
+      end: bestY.guideSegment.end,
     });
   }
 
@@ -295,10 +301,7 @@ export function computeDragAlignment(
 }
 
 /** 计算选中节点的对齐目标位置(绝对坐标)。等距分布按中心点排序。 */
-export function computeAlignment(
-  items: AlignableItem[],
-  mode: NodeAlignMode
-): Map<string, { x: number; y: number }> {
+export function computeAlignment(items: AlignableItem[], mode: NodeAlignMode): Map<string, { x: number; y: number }> {
   const result = new Map<string, { x: number; y: number }>();
   if (items.length === 0) {
     return result;
@@ -311,16 +314,14 @@ export function computeAlignment(
   const centerX = (minX + maxX) / 2;
   const centerY = (minY + maxY) / 2;
 
-  if (mode === 'distributeH' || mode === 'distributeV') {
-    const sorted = [...items].sort((a, b) =>
-      mode === 'distributeH' ? a.x - b.x : a.y - b.y
-    );
+  if (mode === "distributeH" || mode === "distributeV") {
+    const sorted = [...items].sort((a, b) => (mode === "distributeH" ? a.x - b.x : a.y - b.y));
     if (sorted.length === 1) {
       result.set(sorted[0].id, { x: sorted[0].x, y: sorted[0].y });
       return result;
     }
 
-    if (mode === 'distributeH') {
+    if (mode === "distributeH") {
       const totalWidth = sorted.reduce((sum, item) => sum + item.width, 0);
       const span = maxX - minX;
       const gap = Math.max(0, (span - totalWidth) / (sorted.length - 1));
@@ -346,22 +347,22 @@ export function computeAlignment(
     let nextX = item.x;
     let nextY = item.y;
     switch (mode) {
-      case 'left':
+      case "left":
         nextX = minX;
         break;
-      case 'centerH':
+      case "centerH":
         nextX = centerX - item.width / 2;
         break;
-      case 'right':
+      case "right":
         nextX = maxX - item.width;
         break;
-      case 'top':
+      case "top":
         nextY = minY;
         break;
-      case 'centerV':
+      case "centerV":
         nextY = centerY - item.height / 2;
         break;
-      case 'bottom':
+      case "bottom":
         nextY = maxY - item.height;
         break;
       default:
@@ -372,9 +373,9 @@ export function computeAlignment(
 
   // 防重叠: 水平对齐(left/centerH/right)只动 x, y 尽量保持;
   // 若对齐后纵向重叠, 按原始相对顺序自动错开, 保证画面不叠在一起。
-  if (mode === 'left' || mode === 'centerH' || mode === 'right') {
+  if (mode === "left" || mode === "centerH" || mode === "right") {
     resolveNonOverlapAlongY(items, result);
-  } else if (mode === 'top' || mode === 'centerV' || mode === 'bottom') {
+  } else if (mode === "top" || mode === "centerV" || mode === "bottom") {
     resolveNonOverlapAlongX(items, result);
   }
 
@@ -386,14 +387,25 @@ const ALIGN_OVERLAP_GAP = 24;
 /** 沿 y 方向防重叠: 保持原始上下相对顺序, 仅在与已放置节点 x/y 均重叠时下移错开 */
 function resolveNonOverlapAlongY(
   items: AlignableItem[],
-  positions: Map<string, { x: number; y: number }>
+  positions: Map<string, { x: number; y: number }>,
+  protectedIds: ReadonlySet<string> = new Set(),
 ): void {
-  const sorted = [...items].sort(
-    (a, b) => (positions.get(a.id)?.y ?? a.y) - (positions.get(b.id)?.y ?? b.y)
-  );
+  const sorted = [...items].sort((a, b) => {
+    const protectionOrder = Number(protectedIds.has(b.id)) - Number(protectedIds.has(a.id));
+    return protectionOrder || (positions.get(a.id)?.y ?? a.y) - (positions.get(b.id)?.y ?? b.y);
+  });
   const placed: Array<{ left: number; right: number; top: number; bottom: number }> = [];
   for (const item of sorted) {
     const pos = positions.get(item.id) as { x: number; y: number };
+    if (protectedIds.has(item.id)) {
+      placed.push({
+        left: pos.x,
+        right: pos.x + item.width,
+        top: pos.y,
+        bottom: pos.y + item.height,
+      });
+      continue;
+    }
     let top = pos.y;
     for (const region of placed) {
       const overlapsX = pos.x < region.right && pos.x + item.width > region.left;
@@ -407,13 +419,8 @@ function resolveNonOverlapAlongY(
 }
 
 /** 沿 x 方向防重叠: 保持原始左右相对顺序, 仅在与已放置节点 x/y 均重叠时右移错开 */
-function resolveNonOverlapAlongX(
-  items: AlignableItem[],
-  positions: Map<string, { x: number; y: number }>
-): void {
-  const sorted = [...items].sort(
-    (a, b) => (positions.get(a.id)?.x ?? a.x) - (positions.get(b.id)?.x ?? b.x)
-  );
+function resolveNonOverlapAlongX(items: AlignableItem[], positions: Map<string, { x: number; y: number }>): void {
+  const sorted = [...items].sort((a, b) => (positions.get(a.id)?.x ?? a.x) - (positions.get(b.id)?.x ?? b.x));
   const placed: Array<{ left: number; right: number; top: number; bottom: number }> = [];
   for (const item of sorted) {
     const pos = positions.get(item.id) as { x: number; y: number };
@@ -448,10 +455,95 @@ interface SnapBox {
   height: number;
 }
 
+const STANDARD_LAYOUT_TOLERANCE = 1;
+
+function boxesOverlap(first: SnapBox, second: SnapBox): boolean {
+  return (
+    first.left < second.right && first.right > second.left && first.top < second.bottom && first.bottom > second.top
+  );
+}
+
+/** 节点是否已经落在其他节点的外框对齐线或标准间隙上。 */
+function isAtStandardSnapTarget(self: SnapBox, other: SnapBox): boolean {
+  const closeEnough = (value: number, target: number) => Math.abs(value - target) <= STANDARD_LAYOUT_TOLERANCE;
+
+  return (
+    closeEnough(self.left, other.left) ||
+    closeEnough(self.right, other.right) ||
+    closeEnough(self.left, other.right + SNAP_EDGE_GAP) ||
+    closeEnough(self.right, other.left - SNAP_EDGE_GAP) ||
+    closeEnough(self.top, other.top) ||
+    closeEnough(self.bottom, other.bottom) ||
+    closeEnough(self.top, other.bottom + SNAP_EDGE_GAP) ||
+    closeEnough(self.bottom, other.top - SNAP_EDGE_GAP)
+  );
+}
+
+/** 节点仍在可吸附范围内、但没有落到规范目标上时，需要允许一键整理修正。 */
+function hasUnresolvedSnapTarget(self: SnapBox, other: SnapBox, snap: number): boolean {
+  const candidates: Array<[current: number, target: number, edgeDistance: number]> = [
+    [self.left, other.left, Math.abs(self.left - other.left)],
+    [self.left, other.right + SNAP_EDGE_GAP, Math.abs(self.left - other.right)],
+    [self.right, other.left - SNAP_EDGE_GAP, Math.abs(self.right - other.left)],
+    [self.right, other.right, Math.abs(self.right - other.right)],
+    [self.top, other.top, Math.abs(self.top - other.top)],
+    [self.top, other.bottom + SNAP_EDGE_GAP, Math.abs(self.top - other.bottom)],
+    [self.bottom, other.top - SNAP_EDGE_GAP, Math.abs(self.bottom - other.top)],
+    [self.bottom, other.bottom, Math.abs(self.bottom - other.bottom)],
+  ];
+
+  return candidates.some(
+    ([current, target, edgeDistance]) => edgeDistance <= snap && Math.abs(current - target) > STANDARD_LAYOUT_TOLERANCE,
+  );
+}
+
+/**
+ * 已经规范摆放的节点在一键整理中作为锚点保留：
+ * - 与任一节点的外框边缘或标准间隙吻合；
+ * - 当前没有与任何节点重叠。
+ *
+ * 这样修正附近的偏移节点时，不会把已经整理好的节点连带移动。
+ */
+function getWellPlacedNodeIds(topLevelNodes: CanvasNode[], boxes: Map<string, SnapBox>, snap: number): Set<string> {
+  const wellPlacedIds = new Set<string>();
+
+  for (const node of topLevelNodes) {
+    const self = boxes.get(node.id) as SnapBox;
+    let overlapsAnyNode = false;
+    let matchesStandardTarget = false;
+    let hasUnresolvedTarget = false;
+
+    for (const otherNode of topLevelNodes) {
+      if (node.id === otherNode.id) {
+        continue;
+      }
+
+      const other = boxes.get(otherNode.id) as SnapBox;
+      if (boxesOverlap(self, other)) {
+        overlapsAnyNode = true;
+        break;
+      }
+      if (isAtStandardSnapTarget(self, other)) {
+        matchesStandardTarget = true;
+      }
+      if (hasUnresolvedSnapTarget(self, other, snap)) {
+        hasUnresolvedTarget = true;
+      }
+    }
+
+    if (!overlapsAnyNode && matchesStandardTarget && !hasUnresolvedTarget) {
+      wellPlacedIds.add(node.id);
+    }
+  }
+
+  return wellPlacedIds;
+}
+
 /**
  * 全画布智能对齐 + 防重叠:
  * - 只布局顶层节点(组内子节点随组节点整体移动, 不单独吸附);
- * - 按 y 顺序贪心处理: 先处理的节点作为固定基准(自身不动, 也不被后续节点拉动),
+ * - 已符合边框对齐/标准间隙且不重叠的节点会先固定为锚点，不参与后续调整；
+ * - 其余节点按 y 顺序贪心处理: 先处理的节点作为固定基准(自身不动, 也不被后续节点拉动),
  *   后续节点吸附到「已固定节点/组边框」的四条边(左/右、上/下),
  *   距离小于阈值(SMART_SNAP_THRESHOLD)才吸附;
  * - 保持节点原有上下相对顺序, 对齐后若有纵向重叠则自动下移错开, 保证不叠在一起。
@@ -459,7 +551,7 @@ interface SnapBox {
  */
 export function computeSmartSnapLayout(
   nodes: CanvasNode[],
-  threshold = SMART_SNAP_THRESHOLD
+  threshold = SMART_SNAP_THRESHOLD,
 ): Map<string, { x: number; y: number }> {
   const result = new Map<string, { x: number; y: number }>();
   const snap = threshold > 0 ? threshold : SMART_SNAP_THRESHOLD;
@@ -495,10 +587,18 @@ export function computeSmartSnapLayout(
     .slice()
     .sort((a, b) => (boxes.get(a.id) as SnapBox).top - (boxes.get(b.id) as SnapBox).top);
 
+  const wellPlacedIds = getWellPlacedNodeIds(topLevelNodes, boxes, snap);
+
   // 已固定节点的最终包围盒(作为后续节点的吸附参考线)
-  const fixed: SnapBox[] = [];
+  const fixed: SnapBox[] = topLevelNodes
+    .filter((node) => wellPlacedIds.has(node.id))
+    .map((node) => boxes.get(node.id) as SnapBox);
 
   for (const node of ordered) {
+    if (wellPlacedIds.has(node.id)) {
+      continue;
+    }
+
     const self = boxes.get(node.id) as SnapBox;
     let targetX: number | null = null;
     let targetY: number | null = null;
@@ -568,6 +668,6 @@ export function computeSmartSnapLayout(
       height: box.height,
     };
   });
-  resolveNonOverlapAlongY(items, result);
+  resolveNonOverlapAlongY(items, result, wellPlacedIds);
   return result;
 }

@@ -295,6 +295,39 @@ html[data-platform='macos'] #root {
   }
 }
 
+/* 「试听中」的跳动均衡器 —— 音频节点里所有试听按钮共用这一条动画。
+   以前试听按钮点了没有任何状态变化, 用户以为坏了; 现在播放中换成三根跳动的柱子,
+   再点一下即停。延迟靠 nth-child 给, 不依赖 Tailwind 的任意值语法。 */
+@keyframes audio-preview-bar {
+  0%,
+  100% {
+    transform: scaleY(0.28);
+  }
+
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+.audio-preview-bar {
+  transform-origin: center bottom;
+  animation: audio-preview-bar 0.72s ease-in-out infinite;
+}
+
+.audio-preview-bar:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.audio-preview-bar:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .audio-preview-bar {
+    animation: none;
+  }
+}
+
 /* 隐藏媒体节点视频原生控件中的「全屏」与「画中画(小窗播放)」按钮(macOS WebKit),
    只隐藏这两个按钮, 播放/进度/音量等控件保留 */
 video::-webkit-media-controls-fullscreen-button,

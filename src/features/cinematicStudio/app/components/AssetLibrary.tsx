@@ -397,9 +397,12 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
     setNotice(t.aiFillStarted);
     try {
       const patch = await fillAssetDetails(asset, locale);
+      // 名称是用户在左侧手工维护的资产标识。即使旧版模型响应里仍带 name，
+      // 也绝不允许「AI 填写详细」覆盖它。
+      const { name: _ignoredName, ...detailPatch } = patch;
       update({
-        ...patch,
-        descriptionZh: appendReferenceMatchLine(patch.descriptionZh),
+        ...detailPatch,
+        descriptionZh: appendReferenceMatchLine(detailPatch.descriptionZh),
       });
       setNotice(t.aiFillDone);
     } catch (error) {

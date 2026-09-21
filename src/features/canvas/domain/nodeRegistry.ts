@@ -23,15 +23,34 @@ import {
   type TextAnnotationNodeData,
   type UploadImageNodeData,
   type SeamlessMosaicNodeData,
-} from './canvasNodes';
-import { DEFAULT_NODE_DISPLAY_NAME } from './nodeDisplay';
-import { getAudioModel, getDefaultAudioModelId, getDefaultImageModelId, getDefaultVideoModelId, getImageModel, getVideoModel } from '../models';
-import { resolveVideoNodeModelId, resolveVideoNodeParams } from './videoNodeDefaults';
-import { resolveImageNodeModelId, resolveImageNodeParams } from './imageNodeDefaults';
-import { useSettingsStore } from '@/stores/settingsStore';
-import { createCinematicProjectId } from '@/features/cinematicStudio/app/projectId';
+} from "./canvasNodes";
+import { DEFAULT_NODE_DISPLAY_NAME } from "./nodeDisplay";
+import {
+  getAudioModel,
+  getDefaultAudioModelId,
+  getDefaultImageModelId,
+  getDefaultVideoModelId,
+  getImageModel,
+  getVideoModel,
+  resolveAudioModelFamily,
+} from "../models";
+import { resolveVideoNodeModelId, resolveVideoNodeParams } from "./videoNodeDefaults";
+import { resolveImageNodeModelId, resolveImageNodeParams } from "./imageNodeDefaults";
+import { useSettingsStore } from "@/stores/settingsStore";
+import { createCinematicProjectId } from "@/features/cinematicStudio/app/projectId";
 
-export type MenuIconKey = 'upload' | 'sparkles' | 'layout' | 'text' | 'orbit' | 'box' | 'music' | 'video' | 'mosaic' | 'clapperboard' | 'accessibility';
+export type MenuIconKey =
+  | "upload"
+  | "sparkles"
+  | "layout"
+  | "text"
+  | "orbit"
+  | "box"
+  | "music"
+  | "video"
+  | "mosaic"
+  | "clapperboard"
+  | "accessibility";
 
 export interface CanvasNodeCapabilities {
   toolbar: boolean;
@@ -61,8 +80,8 @@ export interface CanvasNodeDefinition<TData extends CanvasNodeData = CanvasNodeD
 
 const uploadNodeDefinition: CanvasNodeDefinition<UploadImageNodeData> = {
   type: CANVAS_NODE_TYPES.upload,
-  menuLabelKey: 'node.menu.uploadImage',
-  menuIcon: 'upload',
+  menuLabelKey: "node.menu.uploadImage",
+  menuIcon: "upload",
   visibleInMenu: true,
   capabilities: {
     toolbar: true,
@@ -80,7 +99,7 @@ const uploadNodeDefinition: CanvasNodeDefinition<UploadImageNodeData> = {
     displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.upload],
     imageUrl: null,
     previewImageUrl: null,
-    aspectRatio: '1:1',
+    aspectRatio: "1:1",
     isSizeManuallyAdjusted: false,
     sourceFileName: null,
   }),
@@ -88,8 +107,8 @@ const uploadNodeDefinition: CanvasNodeDefinition<UploadImageNodeData> = {
 
 const imageEditNodeDefinition: CanvasNodeDefinition<ImageEditNodeData> = {
   type: CANVAS_NODE_TYPES.imageEdit,
-  menuLabelKey: 'node.menu.aiImageGeneration',
-  menuIcon: 'sparkles',
+  menuLabelKey: "node.menu.aiImageGeneration",
+  menuIcon: "sparkles",
   visibleInMenu: true,
   capabilities: {
     toolbar: true,
@@ -112,10 +131,9 @@ const imageEditNodeDefinition: CanvasNodeDefinition<ImageEditNodeData> = {
       (candidateId) => {
         // 除模型存在外, 还要求平台已配置密钥, 否则节点建出来就无法生成。
         const resolved = getImageModel(candidateId);
-        return resolved.id === candidateId
-          && Boolean((settings.apiKeys[resolved.providerId] ?? '').trim());
+        return resolved.id === candidateId && Boolean((settings.apiKeys[resolved.providerId] ?? "").trim());
       },
-      getDefaultImageModelId()
+      getDefaultImageModelId(),
     );
     const { size, aspectRatio } = resolveImageNodeParams(getImageModel(modelId), {
       size: settings.lastImageSize,
@@ -129,7 +147,7 @@ const imageEditNodeDefinition: CanvasNodeDefinition<ImageEditNodeData> = {
       isSizeManuallyAdjusted: false,
       requestAspectRatio: aspectRatio,
       imageCount: 1,
-      prompt: '',
+      prompt: "",
       model: modelId,
       customPrice: settings.customModelPrices[modelId] ?? null,
       size: size as ImageSize,
@@ -143,8 +161,8 @@ const imageEditNodeDefinition: CanvasNodeDefinition<ImageEditNodeData> = {
 
 const videoGenNodeDefinition: CanvasNodeDefinition<VideoGenNodeData> = {
   type: CANVAS_NODE_TYPES.videoGen,
-  menuLabelKey: 'node.menu.aiVideoGeneration',
-  menuIcon: 'video',
+  menuLabelKey: "node.menu.aiVideoGeneration",
+  menuIcon: "video",
   visibleInMenu: true,
   capabilities: { toolbar: true, promptInput: false },
   connectivity: { sourceHandle: true, targetHandle: true, connectMenu: { fromSource: true, fromTarget: false } },
@@ -155,7 +173,7 @@ const videoGenNodeDefinition: CanvasNodeDefinition<VideoGenNodeData> = {
     const model = resolveVideoNodeModelId(
       settings.lastVideoModelId,
       (modelId) => Boolean(getVideoModel(modelId)),
-      getDefaultVideoModelId()
+      getDefaultVideoModelId(),
     );
     const { aspectRatio, resolution } = resolveVideoNodeParams(getVideoModel(model), {
       aspectRatio: settings.lastVideoAspectRatio,
@@ -163,13 +181,13 @@ const videoGenNodeDefinition: CanvasNodeDefinition<VideoGenNodeData> = {
     });
     return {
       displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.videoGen],
-      prompt: '',
+      prompt: "",
       model,
       customPrice: settings.customModelPrices[model] ?? null,
       duration: settings.lastVideoDuration,
       aspectRatio,
       resolution,
-      imageMode: 'reference',
+      imageMode: "reference",
     };
   },
   defaultSize: { width: 420, height: 360 },
@@ -177,8 +195,8 @@ const videoGenNodeDefinition: CanvasNodeDefinition<VideoGenNodeData> = {
 
 const exportImageNodeDefinition: CanvasNodeDefinition<ExportImageNodeData> = {
   type: CANVAS_NODE_TYPES.exportImage,
-  menuLabelKey: 'node.menu.uploadImage',
-  menuIcon: 'upload',
+  menuLabelKey: "node.menu.uploadImage",
+  menuIcon: "upload",
   visibleInMenu: false,
   capabilities: {
     toolbar: true,
@@ -198,14 +216,14 @@ const exportImageNodeDefinition: CanvasNodeDefinition<ExportImageNodeData> = {
     previewImageUrl: null,
     aspectRatio: DEFAULT_ASPECT_RATIO,
     isSizeManuallyAdjusted: false,
-    resultKind: 'generic',
+    resultKind: "generic",
   }),
 };
 
 const groupNodeDefinition: CanvasNodeDefinition<GroupNodeData> = {
   type: CANVAS_NODE_TYPES.group,
-  menuLabelKey: 'node.menu.storyboard',
-  menuIcon: 'layout',
+  menuLabelKey: "node.menu.storyboard",
+  menuIcon: "layout",
   visibleInMenu: false,
   capabilities: {
     toolbar: false,
@@ -221,14 +239,14 @@ const groupNodeDefinition: CanvasNodeDefinition<GroupNodeData> = {
   },
   createDefaultData: () => ({
     displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.group],
-    label: '组',
+    label: "组",
   }),
 };
 
 const audioNodeDefinition: CanvasNodeDefinition<AudioNodeData> = {
   type: CANVAS_NODE_TYPES.audio,
-  menuLabelKey: 'node.menu.audio',
-  menuIcon: 'music',
+  menuLabelKey: "node.menu.audio",
+  menuIcon: "music",
   // 本地上传统一入口会根据文件类型创建媒体节点;媒体节点本身仍可由素材库和生成流程创建。
   visibleInMenu: false,
   capabilities: {
@@ -248,7 +266,7 @@ const audioNodeDefinition: CanvasNodeDefinition<AudioNodeData> = {
     sourcePath: null,
     previewImageUrl: null,
     aspectRatio: DEFAULT_ASPECT_RATIO,
-    mediaType: 'audio',
+    mediaType: "audio",
   }),
   // 媒体节点与图片结果节点保持同一紧凑尺寸, 避免本地视频占满画布。
   defaultSize: { width: EXPORT_RESULT_NODE_DEFAULT_WIDTH, height: EXPORT_RESULT_NODE_LAYOUT_HEIGHT },
@@ -256,8 +274,8 @@ const audioNodeDefinition: CanvasNodeDefinition<AudioNodeData> = {
 
 const textAnnotationNodeDefinition: CanvasNodeDefinition<TextAnnotationNodeData> = {
   type: CANVAS_NODE_TYPES.textAnnotation,
-  menuLabelKey: 'node.menu.textAnnotation',
-  menuIcon: 'text',
+  menuLabelKey: "node.menu.textAnnotation",
+  menuIcon: "text",
   visibleInMenu: true,
   capabilities: {
     toolbar: true,
@@ -273,14 +291,14 @@ const textAnnotationNodeDefinition: CanvasNodeDefinition<TextAnnotationNodeData>
   },
   createDefaultData: () => ({
     displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.textAnnotation],
-    content: '',
+    content: "",
   }),
 };
 
 const storyboardSplitDefinition: CanvasNodeDefinition<StoryboardSplitNodeData> = {
   type: CANVAS_NODE_TYPES.storyboardSplit,
-  menuLabelKey: 'node.menu.storyboard',
-  menuIcon: 'layout',
+  menuLabelKey: "node.menu.storyboard",
+  menuIcon: "layout",
   visibleInMenu: false,
   capabilities: {
     toolbar: false,
@@ -304,22 +322,22 @@ const storyboardSplitDefinition: CanvasNodeDefinition<StoryboardSplitNodeData> =
     exportOptions: {
       showFrameIndex: false,
       showFrameNote: false,
-      notePlacement: 'overlay',
-      imageFit: 'cover',
-      frameIndexPrefix: 'S',
+      notePlacement: "overlay",
+      imageFit: "cover",
+      frameIndexPrefix: "S",
       cellGap: 8,
       outerPadding: 0,
       fontSize: 4,
-      backgroundColor: '#0f1115',
-      textColor: '#f8fafc',
+      backgroundColor: "#0f1115",
+      textColor: "#f8fafc",
     },
   }),
 };
 
 const storyboardGenNodeDefinition: CanvasNodeDefinition<StoryboardGenNodeData> = {
   type: CANVAS_NODE_TYPES.storyboardGen,
-  menuLabelKey: 'node.menu.storyboardGen',
-  menuIcon: 'sparkles',
+  menuLabelKey: "node.menu.storyboardGen",
+  menuIcon: "sparkles",
   visibleInMenu: true,
   capabilities: {
     toolbar: true,
@@ -338,9 +356,9 @@ const storyboardGenNodeDefinition: CanvasNodeDefinition<StoryboardGenNodeData> =
     gridRows: 2,
     gridCols: 2,
     frames: [],
-    ratioControlMode: 'cell',
+    ratioControlMode: "cell",
     model: getDefaultImageModelId(),
-    size: '2K' as ImageSize,
+    size: "2K" as ImageSize,
     requestAspectRatio: AUTO_REQUEST_ASPECT_RATIO,
     extraParams: {},
     imageUrl: null,
@@ -354,8 +372,8 @@ const storyboardGenNodeDefinition: CanvasNodeDefinition<StoryboardGenNodeData> =
 
 const panoramaNodeDefinition: CanvasNodeDefinition<PanoramaNodeData> = {
   type: CANVAS_NODE_TYPES.panorama,
-  menuLabelKey: 'node.menu.panorama',
-  menuIcon: 'orbit',
+  menuLabelKey: "node.menu.panorama",
+  menuIcon: "orbit",
   visibleInMenu: true,
   capabilities: {
     toolbar: true,
@@ -379,7 +397,7 @@ const panoramaNodeDefinition: CanvasNodeDefinition<PanoramaNodeData> = {
     yaw: 0,
     pitch: 0,
     fov: 75,
-    outputAspect: '16:9',
+    outputAspect: "16:9",
     outputImageUrl: null,
     outputPreviewImageUrl: null,
     isFraming: false,
@@ -388,8 +406,8 @@ const panoramaNodeDefinition: CanvasNodeDefinition<PanoramaNodeData> = {
 
 const directorDeskNodeDefinition: CanvasNodeDefinition<DirectorDeskNodeData> = {
   type: CANVAS_NODE_TYPES.directorDesk,
-  menuLabelKey: 'node.menu.directorDesk',
-  menuIcon: 'box',
+  menuLabelKey: "node.menu.directorDesk",
+  menuIcon: "box",
   visibleInMenu: true,
   capabilities: {
     toolbar: true,
@@ -413,8 +431,8 @@ const directorDeskNodeDefinition: CanvasNodeDefinition<DirectorDeskNodeData> = {
 
 const cinematicStudioNodeDefinition: CanvasNodeDefinition<CinematicStudioNodeData> = {
   type: CANVAS_NODE_TYPES.cinematicStudio,
-  menuLabelKey: 'node.menu.cinematicStudio',
-  menuIcon: 'clapperboard',
+  menuLabelKey: "node.menu.cinematicStudio",
+  menuIcon: "clapperboard",
   visibleInMenu: true,
   capabilities: {
     toolbar: true,
@@ -435,27 +453,27 @@ const cinematicStudioNodeDefinition: CanvasNodeDefinition<CinematicStudioNodeDat
     lastProjectTitle: null,
     lastProjectDescription: null,
     lastPromptPreview: null,
-    quickStyle: '',
-    quickSynopsis: '',
-    quickChatProvider: '',
-    quickChatModel: '',
+    quickStyle: "",
+    quickSynopsis: "",
+    quickChatProvider: "",
+    quickChatModel: "",
     quickSyncInitialized: false,
-    quickStudioSceneId: '',
+    quickStudioSceneId: "",
     quickStaging: {},
     quickSceneAssetIds: [],
     quickCharacterAssetIds: [],
     quickPrompt: null,
     quickReferenceImages: [],
-    imagePromptDraft: '',
-    imagePromptResult: '',
+    imagePromptDraft: "",
+    imagePromptResult: "",
   }),
   defaultSize: { width: 430, height: 700 },
 };
 
 const promptOptimizerNodeDefinition: CanvasNodeDefinition<PromptOptimizerNodeData> = {
   type: CANVAS_NODE_TYPES.promptOptimizer,
-  menuLabelKey: 'node.menu.promptOptimizer',
-  menuIcon: 'sparkles',
+  menuLabelKey: "node.menu.promptOptimizer",
+  menuIcon: "sparkles",
   // 已合并到「提示词工作室」节点，保留注册仅用于兼容旧画布数据。
   visibleInMenu: false,
   capabilities: {
@@ -472,13 +490,13 @@ const promptOptimizerNodeDefinition: CanvasNodeDefinition<PromptOptimizerNodeDat
   },
   createDefaultData: () => ({
     displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.promptOptimizer],
-    purpose: '',
-    taskType: 'auto',
-    targetModel: '',
-    referencePalette: '',
-    outputLang: 'zh',
-    optimizedPrompt: '',
-    routeSummary: '',
+    purpose: "",
+    taskType: "auto",
+    targetModel: "",
+    referencePalette: "",
+    outputLang: "zh",
+    optimizedPrompt: "",
+    routeSummary: "",
     notes: [],
   }),
   defaultSize: { width: 400, height: 360 },
@@ -486,8 +504,8 @@ const promptOptimizerNodeDefinition: CanvasNodeDefinition<PromptOptimizerNodeDat
 
 const seamlessMosaicNodeDefinition: CanvasNodeDefinition<SeamlessMosaicNodeData> = {
   type: CANVAS_NODE_TYPES.seamlessMosaic,
-  menuLabelKey: 'node.menu.seamlessMosaic',
-  menuIcon: 'mosaic',
+  menuLabelKey: "node.menu.seamlessMosaic",
+  menuIcon: "mosaic",
   visibleInMenu: true,
   capabilities: {
     toolbar: true,
@@ -508,13 +526,13 @@ const seamlessMosaicNodeDefinition: CanvasNodeDefinition<SeamlessMosaicNodeData>
     aspectRatio: DEFAULT_ASPECT_RATIO,
     isSizeManuallyAdjusted: false,
     layers: [],
-    template: 'grid',
+    template: "grid",
     canvasWidth: 1920,
     canvasHeight: 1080,
     gridCols: 3,
     gridRows: 2,
     gap: 8,
-    backgroundColor: '#0f1115',
+    backgroundColor: "#0f1115",
     importedSourceKeys: [],
     outputImageUrl: null,
     outputPreviewImageUrl: null,
@@ -524,8 +542,8 @@ const seamlessMosaicNodeDefinition: CanvasNodeDefinition<SeamlessMosaicNodeData>
 
 const audioGenNodeDefinition: CanvasNodeDefinition<AudioGenNodeData> = {
   type: CANVAS_NODE_TYPES.audioGen,
-  menuLabelKey: 'node.menu.aiAudioGeneration',
-  menuIcon: 'music',
+  menuLabelKey: "node.menu.aiAudioGeneration",
+  menuIcon: "music",
   visibleInMenu: true,
   capabilities: { toolbar: true, promptInput: false },
   connectivity: { sourceHandle: true, targetHandle: true, connectMenu: { fromSource: true, fromTarget: false } },
@@ -535,34 +553,55 @@ const audioGenNodeDefinition: CanvasNodeDefinition<AudioGenNodeData> = {
     const model = modelId ? getAudioModel(modelId) : undefined;
     return {
       displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.audioGen],
-      prompt: '',
+      prompt: "",
       model: modelId,
-      audioKind: model?.audioKind ?? 'speech',
-      voice: model?.defaultVoice,
-      format: model?.defaultFormat ?? 'mp3',
+      audioKind: model?.audioKind ?? "speech",
+      creativeMode: model?.audioKind === "music" ? "music" : "speech",
+      // 家族决定节点主体渲染哪套 UI(海螺三卡片 / indexTTS / 通用 TTS / 音乐),
+      // 建节点时就定好, 免得第一帧先用错布局再跳一下。
+      audioFamily: resolveAudioModelFamily(modelId),
+      // 音色优先带出「这个模型上次用过的」(全局记忆), 从没选过才退回模型默认值 ——
+      // 新建节点不必每次重挑音色。
+      voice: (modelId ? useSettingsStore.getState().lastVoiceByModel[modelId] : undefined) ?? model?.defaultVoice,
+      format: model?.defaultFormat ?? "mp3",
       durationSeconds: 5,
       musicLengthMs: model?.defaultMusicLengthMs ?? 30000,
-      lyrics: '',
+      lyrics: "",
+      // Suno 的默认档位(照抄 param_schema 的 default): operation=generate、
+      // version=chirp-v6、mode=song、vocal_gender=auto。等用户切到音乐家族再消费。
+      sunoOperation: "generate",
+      sunoVersion: "chirp-v6",
+      sunoMode: "song",
+      sunoVocalGender: "auto",
+      sunoStyle: "",
+      sunoTitle: "",
+      sunoNegativeTags: "",
+      sunoClipId: "",
+      sunoContinueClipId: "",
+      sunoContinueAt: "",
+      sunoCoverClipId: "",
     };
   },
-  defaultSize: { width: 400, height: 340 },
+  // 尺寸跟着 MINIMAX 页走(520×620): 所有音频页共用同一份默认画布,
+  // 顶部提示词框的宽高才会一致 —— 见 AudioGenNode 的 AUDIO_PROMPT_DEFAULT_HEIGHT。
+  defaultSize: { width: 520, height: 620 },
 };
 
 const motionControlNodeDefinition: CanvasNodeDefinition<MotionControlNodeData> = {
   type: CANVAS_NODE_TYPES.motionControl,
-  menuLabelKey: 'node.menu.motionControl',
-  menuIcon: 'accessibility',
+  menuLabelKey: "node.menu.motionControl",
+  menuIcon: "accessibility",
   visibleInMenu: true,
   capabilities: { toolbar: true, promptInput: false },
   connectivity: { sourceHandle: true, targetHandle: true, connectMenu: { fromSource: true, fromTarget: false } },
   createDefaultData: () => ({
     displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.motionControl],
-    mode: 'motion-control',
-    lipSyncInput: 'image',
-    model: '',
-    prompt: '',
-    resolution: '720p',
-    characterOrientation: 'image',
+    mode: "motion-control",
+    lipSyncInput: "image",
+    model: "",
+    prompt: "",
+    resolution: "720p",
+    characterOrientation: "image",
     keepOriginalAudio: true,
     imageSource: null,
     imagePreviewUrl: null,
@@ -572,8 +611,8 @@ const motionControlNodeDefinition: CanvasNodeDefinition<MotionControlNodeData> =
     inputVideoPreviewUrl: null,
     audioSource: null,
     audioPreviewUrl: null,
-    faceSessionId: '',
-    faceId: '',
+    faceSessionId: "",
+    faceId: "",
     isGenerating: false,
     generationError: null,
     outputVideoUrl: null,
@@ -616,14 +655,12 @@ export function nodeHasTargetHandle(type: CanvasNodeType): boolean {
   return canvasNodeDefinitions[type].connectivity.targetHandle;
 }
 
-export function getConnectMenuNodeTypes(handleType: 'source' | 'target'): CanvasNodeType[] {
-  const fromSource = handleType === 'source';
+export function getConnectMenuNodeTypes(handleType: "source" | "target"): CanvasNodeType[] {
+  const fromSource = handleType === "source";
   return Object.values(canvasNodeDefinitions)
-    .filter((definition) => (fromSource
-      ? definition.connectivity.connectMenu.fromSource
-      : definition.connectivity.connectMenu.fromTarget))
-    .filter((definition) => (fromSource
-      ? definition.connectivity.targetHandle
-      : definition.connectivity.sourceHandle))
+    .filter((definition) =>
+      fromSource ? definition.connectivity.connectMenu.fromSource : definition.connectivity.connectMenu.fromTarget,
+    )
+    .filter((definition) => (fromSource ? definition.connectivity.targetHandle : definition.connectivity.sourceHandle))
     .map((definition) => definition.type);
 }

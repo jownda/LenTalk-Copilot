@@ -1,8 +1,8 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react';
-import { createPortal } from 'react-dom';
-import { invoke, isTauri } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
-import { Handle, Position } from '@xyflow/react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type SyntheticEvent } from "react";
+import { createPortal } from "react-dom";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { Handle, Position } from "@xyflow/react";
 import {
   AlertTriangle,
   AudioLines,
@@ -14,24 +14,25 @@ import {
   Upload,
   Video,
   X,
-} from 'lucide-react';
+} from "lucide-react";
 
-import { CANVAS_NODE_TYPES, type AudioNodeData } from '@/features/canvas/domain/canvasNodes';
-import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
-import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
-import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
-import { MediaDimensionsLabel, useHoverIntent, useMediaByteSize, type MediaDimensions } from '@/features/canvas/ui/MediaDimensions';
-import { canvasEventBus } from '@/features/canvas/application/canvasServices';
-import { prepareNodeImage, reduceAspectRatio, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
-import { resolveMediaNodeResizeBounds } from '@/features/canvas/application/aspectLockedResize';
-import { captureVideoFrame, createObjectUrlFromDataUrl } from '@/features/canvas/application/videoFrameCapture';
-import { showErrorDialog } from '@/features/canvas/application/errorDialog';
+import { CANVAS_NODE_TYPES, type AudioNodeData } from "@/features/canvas/domain/canvasNodes";
+import { resolveNodeDisplayName } from "@/features/canvas/domain/nodeDisplay";
+import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
+import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
 import {
-  extractVideoThumbnail,
-  persistLibraryAssetBinary,
-  persistLibraryAssetFile,
-} from '@/commands/assetLibrary';
-import { useCanvasStore } from '@/stores/canvasStore';
+  MediaDimensionsLabel,
+  useHoverIntent,
+  useMediaByteSize,
+  type MediaDimensions,
+} from "@/features/canvas/ui/MediaDimensions";
+import { canvasEventBus } from "@/features/canvas/application/canvasServices";
+import { prepareNodeImage, reduceAspectRatio, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { resolveMediaNodeResizeBounds } from "@/features/canvas/application/aspectLockedResize";
+import { captureVideoFrame, createObjectUrlFromDataUrl } from "@/features/canvas/application/videoFrameCapture";
+import { showErrorDialog } from "@/features/canvas/application/errorDialog";
+import { extractVideoThumbnail, persistLibraryAssetFile, persistLibraryAssetFromFile } from "@/commands/assetLibrary";
+import { useCanvasStore } from "@/stores/canvasStore";
 
 type AudioNodeProps = {
   id: string;
@@ -45,6 +46,42 @@ type AudioNodeProps = {
  * 与 dataURL 的内存占用(4K 帧按原尺寸绘制可达数十 MB)。
  */
 const REMOTE_VIDEO_THUMBNAIL_MAX_WIDTH = 640;
+
+/**
+ * 轻量级的稳定波形占位。音频文件的解码在不同 WebView/CORS 环境下并不总是可用，
+ * 因此节点先用来源生成稳定的柱高，播放进度仍由真实 audio 元素驱动；不会因为取不到
+ * 波形而让音频节点空白或卡住。
+ */
+function createWaveformBars(source: string, count = 56): number[] {
+  let seed = 2166136261;
+  for (const character of source) {
+    seed ^= character.charCodeAt(0);
+    seed = Math.imul(seed, 16777619);
+  }
+  return Array.from({ length: count }, (_, index) => {
+    seed = Math.imul(seed ^ (index + 1), 16777619);
+    const noise = ((seed >>> 0) % 1000) / 1000;
+    const envelope = 0.55 + 0.45 * Math.sin((index / count) * Math.PI);
+    return Math.max(0.14, Math.min(1, (0.28 + noise * 0.72) * envelope));
+  });
+}
+
+function createWaveformBarsFromBuffer(buffer: AudioBuffer, count = 56): number[] {
+  const frameSize = Math.max(1, Math.floor(buffer.length / count));
+  const bars = Array.from({ length: count }, (_, index) => {
+    const start = index * frameSize;
+    const end = Math.min(buffer.length, start + frameSize);
+    const step = Math.max(1, Math.floor((end - start) / 512));
+    let peak = 0;
+    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+      const samples = buffer.getChannelData(channel);
+      for (let frame = start; frame < end; frame += step) peak = Math.max(peak, Math.abs(samples[frame] ?? 0));
+    }
+    return peak;
+  });
+  const maximum = Math.max(...bars, 0.0001);
+  return bars.map((bar) => Math.max(0.12, Math.min(1, Math.sqrt(bar / maximum))));
+}
 
 /** 已判定为空白(全透明)的缩略图地址缓存, 避免同一会话里反复解码同一张图。 */
 const blankThumbnailCache = new Set<string>();
@@ -68,10 +105,10 @@ async function isBlankThumbnail(source: string): Promise<boolean> {
     image.onload = () => {
       try {
         const side = 32;
-        const canvas = document.createElement('canvas');
+        const canvas = document.createElement("canvas");
         canvas.width = side;
         canvas.height = side;
-        const context = canvas.getContext('2d');
+        const context = canvas.getContext("2d");
         if (!context) {
           resolve(false);
           return;
@@ -102,10 +139,10 @@ async function isBlankThumbnail(source: string): Promise<boolean> {
 /** 秒 -> `m:ss`; 未加载完/非法值(NaN, Infinity)统一显示 0:00。 */
 function formatClock(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) {
-    return '0:00';
+    return "0:00";
   }
   const total = Math.floor(seconds);
-  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 }
 
 export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
@@ -115,6 +152,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const addEdge = useCanvasStore((state) => state.addEdge);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
   const viewerVideoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   /** 画面上的透明交互层: 承接指针事件并冒泡到节点, 实现"画面任意位置左键拖动节点"。 */
@@ -136,30 +174,52 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const localVideoFallbackSrcRef = useRef<string | null>(null);
   const localVideoFallbackLoadingRef = useRef(false);
 
-  const resolvedTitle = useMemo(
-    () => resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, data),
-    [data]
-  );
-  const isVideo = data.mediaType === 'video';
+  const resolvedTitle = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, data), [data]);
+  const isVideo = data.mediaType === "video";
   const mediaSrc = data.sourcePath ? resolveImageDisplayUrl(data.sourcePath) : null;
   const playbackSrc = localVideoFallbackSrc ?? mediaSrc;
-  // 体积标注只跟随视频画面; 音频节点不显示, 传 null 避免无谓的探测请求。
-  const mediaByteSize = useMediaByteSize(isVideo ? data.sourcePath : null);
+  const fallbackWaveformBars = useMemo(() => (mediaSrc ? createWaveformBars(mediaSrc) : []), [mediaSrc]);
+  const [waveformBars, setWaveformBars] = useState<number[]>(fallbackWaveformBars);
   // 尺寸/体积标注改为悬停延迟显示, 避免常驻文字干扰画面。
   const mediaHover = useHoverIntent();
-  const isGenerating = typeof data.isGenerating === 'boolean' ? data.isGenerating : false;
-  const generationError =
-    typeof data.generationError === 'string' ? data.generationError.trim() : '';
+  // 文件大小仅在用户选中或悬停时查询；大量视频节点不再同时发起原生文件 stat 调用。
+  const mediaByteSize = useMediaByteSize(isVideo && (selected || mediaHover.visible) ? data.sourcePath : null);
+  const isGenerating = typeof data.isGenerating === "boolean" ? data.isGenerating : false;
+  const generationError = typeof data.generationError === "string" ? data.generationError.trim() : "";
   const hasGenerationError = isGenerating === false && !mediaSrc && generationError.length > 0;
-  const generationStartedAt =
-    typeof data.generationStartedAt === 'number' ? data.generationStartedAt : null;
-  const generationDurationMs =
-    typeof data.generationDurationMs === 'number' ? data.generationDurationMs : 180000;
+  const generationStartedAt = typeof data.generationStartedAt === "number" ? data.generationStartedAt : null;
+  const generationDurationMs = typeof data.generationDurationMs === "number" ? data.generationDurationMs : 180000;
+  // 有封面的视频平时只显示图片，不占用解码器。悬停、播放、打开查看器时才按需挂载。
+  const shouldMountVideo = isVideo && (!data.previewImageUrl || isVideoHovered || isPlaying || isVideoViewerOpen);
+
+  useEffect(() => {
+    setWaveformBars(fallbackWaveformBars);
+    // 默认波形已经足够用于未选中节点；只有用户当前操作的音频才解码完整文件，避免
+    // 多节点画布同时把多条长音频解压到内存。
+    if (isVideo || !selected || !mediaSrc || typeof AudioContext === "undefined") return;
+    const controller = new AbortController();
+    const audioContext = new AudioContext();
+    void fetch(mediaSrc, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Audio fetch failed: ${response.status}`);
+        return response.arrayBuffer();
+      })
+      .then((bytes) => audioContext.decodeAudioData(bytes))
+      .then((buffer) => {
+        if (!controller.signal.aborted) setWaveformBars(createWaveformBarsFromBuffer(buffer));
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) console.debug("[mediaNode] waveform decode fallback", error);
+      })
+      .finally(() => void audioContext.close());
+    return () => controller.abort();
+  }, [fallbackWaveformBars, isVideo, mediaSrc, selected]);
 
   useEffect(() => {
     setVideoDimensions(null);
     setVideoDuration(0);
     setPlaybackTime(0);
+    playbackTimeRef.current = 0;
     setIsPlaying(false);
     localVideoFallbackLoadingRef.current = false;
     setLocalVideoFallbackSrc((current) => {
@@ -171,13 +231,16 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     });
   }, [data.sourcePath, isVideo]);
 
-  useEffect(() => () => {
-    const fallbackSrc = localVideoFallbackSrcRef.current;
-    if (fallbackSrc) {
-      URL.revokeObjectURL(fallbackSrc);
-      localVideoFallbackSrcRef.current = null;
-    }
-  }, []);
+  useEffect(
+    () => () => {
+      const fallbackSrc = localVideoFallbackSrcRef.current;
+      if (fallbackSrc) {
+        URL.revokeObjectURL(fallbackSrc);
+        localVideoFallbackSrcRef.current = null;
+      }
+    },
+    [],
+  );
 
   const handleLocalVideoLoadError = useCallback(() => {
     const source = data.sourcePath?.trim();
@@ -187,11 +250,16 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     // 远端 AI 视频不走这里；本地上传视频失败时用 Rust 读取原始字节，
     // 转成同源 Blob 后交给 <video>，行为与可直接播放的 AI 视频源保持一致。
     const lower = source.toLowerCase();
-    if (lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('blob:') || lower.startsWith('data:')) {
+    if (
+      lower.startsWith("http://") ||
+      lower.startsWith("https://") ||
+      lower.startsWith("blob:") ||
+      lower.startsWith("data:")
+    ) {
       return;
     }
     localVideoFallbackLoadingRef.current = true;
-    void invoke<string>('load_media_data_url', { source })
+    void invoke<string>("load_media_data_url", { source })
       .then((dataUrl) => {
         const blobUrl = createObjectUrlFromDataUrl(dataUrl);
         setLocalVideoFallbackSrc((current) => {
@@ -204,7 +272,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       })
       .catch((error) => {
         localVideoFallbackLoadingRef.current = false;
-        console.warn('[mediaNode] local video playback fallback failed', error);
+        console.warn("[mediaNode] local video playback fallback failed", error);
       });
   }, [data.sourcePath, isVideo]);
 
@@ -227,12 +295,44 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     }
     if (video.paused) {
       void video.play().catch((error: unknown) => {
-        console.warn('[mediaNode] video play failed', error);
+        console.warn("[mediaNode] video play failed", error);
       });
       return;
     }
     video.pause();
   }, []);
+
+  const toggleAudioPlayback = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audio.paused) {
+      void audio.play().catch((error: unknown) => console.warn("[mediaNode] audio play failed", error));
+    } else {
+      audio.pause();
+    }
+  }, []);
+
+  // timeupdate 通常每秒触发 4～10 次。每次都 setState 会让播放中的每个节点反复
+  // 参与 React Flow 重渲染；把画布显示精度限制到 0.2 秒，人眼看不出差异但明显减轻卡顿。
+  const playbackTimeRef = useRef(0);
+  const updatePlaybackTime = useCallback((nextTime: number, force = false) => {
+    if (!Number.isFinite(nextTime)) return;
+    if (!force && Math.abs(nextTime - playbackTimeRef.current) < 0.2) return;
+    playbackTimeRef.current = nextTime;
+    setPlaybackTime(nextTime);
+  }, []);
+
+  const seekAudio = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      const audio = audioRef.current;
+      if (!audio || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
+      const rect = event.currentTarget.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+      audio.currentTime = ratio * audio.duration;
+      updatePlaybackTime(audio.currentTime, true);
+    },
+    [updatePlaybackTime],
+  );
 
   // 视频解码出真实尺寸后, 把宽高比写回节点数据: 拖拽缩放据此保持画面比例。
   // 只是补充元信息, 不参与历史记录, 因此走 transient 写入。
@@ -269,12 +369,12 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     // 放大播放器接管播放: 先停掉节点内的播放, 避免两路声音叠在一起。
     videoRef.current?.pause();
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      if (event.key === "Escape") {
         setIsVideoViewerOpen(false);
       }
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isVideoViewerOpen]);
 
   // 双击画面 = 打开放大播放器。
@@ -295,9 +395,9 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       event.stopImmediatePropagation();
       setIsVideoViewerOpen(true);
     };
-    surface.addEventListener('dblclick', handleDoubleClick, true);
+    surface.addEventListener("dblclick", handleDoubleClick, true);
     return () => {
-      surface.removeEventListener('dblclick', handleDoubleClick, true);
+      surface.removeEventListener("dblclick", handleDoubleClick, true);
     };
   }, [isVideo, mediaSrc]);
 
@@ -311,9 +411,9 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       event.preventDefault();
       event.stopImmediatePropagation();
     };
-    video.addEventListener('dblclick', blockNativeDoubleClickFullscreen, true);
+    video.addEventListener("dblclick", blockNativeDoubleClickFullscreen, true);
     return () => {
-      video.removeEventListener('dblclick', blockNativeDoubleClickFullscreen, true);
+      video.removeEventListener("dblclick", blockNativeDoubleClickFullscreen, true);
     };
   }, [isVideoViewerOpen]);
 
@@ -336,49 +436,48 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
 
   const waitingResultText = useMemo(() => {
     if (!isGenerating || waitedMinutes < 2) {
-      return '生成中…';
+      return "生成中…";
     }
     return `生成中…（已等待 ${waitedMinutes} 分钟）`;
   }, [isGenerating, waitedMinutes]);
 
-  const applyMediaSource = useCallback((sourcePath: string, mediaType: 'audio' | 'video', fileName: string) => {
-    updateNodeData(id, {
-      sourcePath,
-      mediaType,
-      previewImageUrl: null,
-      aspectRatio: undefined,
-      displayName: fileName.replace(/\.[^.]+$/, '').trim() || fileName,
-    });
-  }, [id, updateNodeData]);
+  const applyMediaSource = useCallback(
+    (sourcePath: string, mediaType: "audio" | "video", fileName: string) => {
+      updateNodeData(id, {
+        sourcePath,
+        mediaType,
+        previewImageUrl: null,
+        aspectRatio: undefined,
+        displayName: fileName.replace(/\.[^.]+$/, "").trim() || fileName,
+      });
+    },
+    [id, updateNodeData],
+  );
 
   /** 上传媒体文件(点击选择或拖拽), 持久化后写入节点 */
-  const handleMediaFiles = useCallback(async (files: FileList | File[]) => {
-    const file = Array.from(files)[0];
-    if (!file) {
-      return;
-    }
-    const mediaType = file.type.startsWith('video/')
-      ? 'video'
-      : file.type.startsWith('audio/')
-        ? 'audio'
-        : null;
-    if (!mediaType) {
-      return;
-    }
-    setIsUploading(true);
-    try {
-      const extension = file.name.split('.').pop()?.trim() || (mediaType === 'video' ? 'mp4' : 'mp3');
-      const nativePath = (file as File & { path?: unknown }).path;
-      const sourcePath = isTauri() && typeof nativePath === 'string' && nativePath.trim()
-        ? await persistLibraryAssetFile(nativePath, extension)
-        : await persistLibraryAssetBinary(new Uint8Array(await file.arrayBuffer()), extension);
-      applyMediaSource(sourcePath, mediaType, file.name);
-    } catch (error) {
-      console.warn('[mediaNode] upload failed', error);
-    } finally {
-      setIsUploading(false);
-    }
-  }, [applyMediaSource]);
+  const handleMediaFiles = useCallback(
+    async (files: FileList | File[]) => {
+      const file = Array.from(files)[0];
+      if (!file) {
+        return;
+      }
+      const mediaType = file.type.startsWith("video/") ? "video" : file.type.startsWith("audio/") ? "audio" : null;
+      if (!mediaType) {
+        return;
+      }
+      setIsUploading(true);
+      try {
+        const extension = file.name.split(".").pop()?.trim() || (mediaType === "video" ? "mp4" : "mp3");
+        const sourcePath = isTauri() ? await persistLibraryAssetFromFile(file, extension) : URL.createObjectURL(file);
+        applyMediaSource(sourcePath, mediaType, file.name);
+      } catch (error) {
+        console.warn("[mediaNode] upload failed", error);
+      } finally {
+        setIsUploading(false);
+      }
+    },
+    [applyMediaSource],
+  );
 
   const handleUploadClick = useCallback(async () => {
     if (!isTauri()) {
@@ -388,29 +487,34 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
 
     const selectedPath = await open({
       multiple: false,
-      filters: [{ name: '媒体文件', extensions: ['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv', 'mp3', 'm4a', 'wav', 'aac', 'flac', 'ogg'] }],
+      filters: [
+        {
+          name: "媒体文件",
+          extensions: ["mp4", "mov", "m4v", "webm", "avi", "mkv", "mp3", "m4a", "wav", "aac", "flac", "ogg"],
+        },
+      ],
     });
     if (!selectedPath || Array.isArray(selectedPath)) {
       return;
     }
 
-    const fileName = selectedPath.split(/[\\/]/).pop() || 'media';
-    const extension = fileName.split('.').pop()?.trim() || 'bin';
-    const videoExtensions = new Set(['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv']);
-    const mediaType = videoExtensions.has(extension.toLowerCase()) ? 'video' : 'audio';
+    const fileName = selectedPath.split(/[\\/]/).pop() || "media";
+    const extension = fileName.split(".").pop()?.trim() || "bin";
+    const videoExtensions = new Set(["mp4", "mov", "m4v", "webm", "avi", "mkv"]);
+    const mediaType = videoExtensions.has(extension.toLowerCase()) ? "video" : "audio";
     setIsUploading(true);
     try {
       const sourcePath = await persistLibraryAssetFile(selectedPath, extension);
       applyMediaSource(sourcePath, mediaType, fileName);
     } catch (error) {
-      console.warn('[mediaNode] native upload failed', error);
+      console.warn("[mediaNode] native upload failed", error);
     } finally {
       setIsUploading(false);
     }
   }, [applyMediaSource]);
 
   useEffect(() => {
-    return canvasEventBus.subscribe('upload-node/reupload', ({ nodeId }) => {
+    return canvasEventBus.subscribe("upload-node/reupload", ({ nodeId }) => {
       if (nodeId === id) {
         void handleUploadClick();
       }
@@ -468,7 +572,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
         commitThumbnail(prepared.previewImageUrl ?? prepared.imageUrl ?? dataUrl);
       } catch (error) {
         // 三级取帧都失败时保持 video 播放器显示, 不打断用户。
-        console.warn('[mediaNode] remote video thumbnail fallback failed', error);
+        console.warn("[mediaNode] remote video thumbnail fallback failed", error);
       }
     })();
     return () => {
@@ -498,24 +602,24 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
         prepared.aspectRatio,
         prepared.previewImageUrl,
         {
-          defaultTitle: '视频截图',
-          resultKind: 'generic',
-          aspectRatioStrategy: 'provided',
-        }
+          defaultTitle: "视频截图",
+          resultKind: "generic",
+          aspectRatioStrategy: "provided",
+        },
       );
       if (createdNodeId) {
         addEdge(id, createdNodeId);
       }
     } catch (error) {
-      console.warn('[mediaNode] capture frame failed', error);
+      console.warn("[mediaNode] capture frame failed", error);
       // 截图结果节点无法创建时, 用全局错误弹窗反馈(按钮已移到节点工具栏, 节点内不再有错误行)。
       void showErrorDialog(
-        error instanceof DOMException && error.name === 'SecurityError'
-          ? '视频源未授权跨域截图'
+        error instanceof DOMException && error.name === "SecurityError"
+          ? "视频源未授权跨域截图"
           : error instanceof Error
             ? error.message
-            : '截图失败',
-        '截图失败'
+            : "截图失败",
+        "截图失败",
       );
     } finally {
       setIsCapturing(false);
@@ -524,7 +628,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
 
   /** 截图入口已移到节点工具栏(下载旁), 通过事件总线触发, 与 upload-node/reupload 一致。 */
   useEffect(() => {
-    return canvasEventBus.subscribe('media-node/capture-frame', ({ nodeId }) => {
+    return canvasEventBus.subscribe("media-node/capture-frame", ({ nodeId }) => {
       if (nodeId === id) {
         void handleCaptureFrame();
       }
@@ -547,12 +651,12 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     <div
       className={`relative flex h-full w-full flex-col rounded-[var(--node-radius)] border bg-surface-dark/90 p-2 transition-colors duration-150 ${
         hasGenerationError
-          ? (selected
-            ? 'border-red-400 shadow-[0_0_0_1px_rgba(248,113,113,0.42)]'
-            : 'border-red-500/70 bg-[rgba(127,29,29,0.12)] hover:border-red-400/80 dark:border-red-500/70 dark:hover:border-red-400/80')
+          ? selected
+            ? "border-red-400 shadow-[0_0_0_1px_rgba(248,113,113,0.42)]"
+            : "border-red-500/70 bg-[rgba(127,29,29,0.12)] hover:border-red-400/80 dark:border-red-500/70 dark:hover:border-red-400/80"
           : selected
-          ? 'border-accent shadow-[0_0_0_1px_rgba(59,130,246,0.32)]'
-          : 'border-[rgba(15,23,42,0.22)] dark:border-[rgba(255,255,255,0.22)]'
+            ? "border-accent shadow-[0_0_0_1px_rgba(59,130,246,0.32)]"
+            : "border-[rgba(15,23,42,0.22)] dark:border-[rgba(255,255,255,0.22)]"
       }`}
       {...dropHandlers}
       {...mediaHover.hoverProps}
@@ -580,21 +684,30 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                   生成一个跟随鼠标的拖影, 与 React Flow 的节点拖动争夺同一个指针,
                   表现为节点粘在鼠标上甩不掉。项目内所有 <img> 都已 draggable={false},
                   此处补齐 video/audio。 */}
-              <video
-                ref={videoRef}
-                draggable={false}
-                onDragStart={(event) => event.preventDefault()}
-                src={playbackSrc ?? ''}
-                preload="metadata"
-                poster={data.previewImageUrl ? resolveImageDisplayUrl(data.previewImageUrl) : undefined}
-                className="pointer-events-none h-full w-full object-contain"
-                onLoadedMetadata={handleVideoMetadata}
-                onError={handleLocalVideoLoadError}
-                onPlay={() => setIsPlaying(true)}
-                onPause={() => setIsPlaying(false)}
-                onEnded={() => setIsPlaying(false)}
-                onTimeUpdate={(event) => setPlaybackTime(event.currentTarget.currentTime)}
-              />
+              {shouldMountVideo ? (
+                <video
+                  ref={videoRef}
+                  draggable={false}
+                  onDragStart={(event) => event.preventDefault()}
+                  src={playbackSrc ?? ""}
+                  preload="metadata"
+                  poster={data.previewImageUrl ? resolveImageDisplayUrl(data.previewImageUrl) : undefined}
+                  className="pointer-events-none h-full w-full object-contain"
+                  onLoadedMetadata={handleVideoMetadata}
+                  onError={handleLocalVideoLoadError}
+                  onPlay={() => setIsPlaying(true)}
+                  onPause={() => setIsPlaying(false)}
+                  onEnded={() => setIsPlaying(false)}
+                  onTimeUpdate={(event) => updatePlaybackTime(event.currentTarget.currentTime)}
+                />
+              ) : (
+                <img
+                  src={resolveImageDisplayUrl(data.previewImageUrl ?? "")}
+                  alt={resolvedTitle}
+                  draggable={false}
+                  className="pointer-events-none h-full w-full object-contain"
+                />
+              )}
               {/* 透明交互层: 画面上的指针事件落在这里并冒泡到节点, 于是画面任意位置
                   左键拖拽都能移动节点。刻意不加 nodrag —— 加了就拖不动了。 */}
               <div ref={videoSurfaceRef} className="absolute inset-0" />
@@ -612,15 +725,15 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                   仅悬停/播放中出现: 其余时间 opacity-0 + pointer-events-none, 画面整块都能拖。 */}
               <div
                 className={`nodrag absolute inset-x-0 bottom-0 z-10 flex items-center gap-1.5 bg-gradient-to-t from-black/80 via-black/40 to-transparent px-2 pb-1.5 pt-6 text-white transition-opacity duration-150 ${
-                  isVideoHovered || isPlaying ? 'opacity-100' : 'pointer-events-none opacity-0'
+                  isVideoHovered || isPlaying ? "opacity-100" : "pointer-events-none opacity-0"
                 }`}
               >
                 <button
                   type="button"
                   onClick={toggleVideoPlayback}
                   className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white/20 transition-colors hover:bg-white/40"
-                  title={isPlaying ? '暂停' : '播放'}
-                  aria-label={isPlaying ? '暂停' : '播放'}
+                  title={isPlaying ? "暂停" : "播放"}
+                  aria-label={isPlaying ? "暂停" : "播放"}
                 >
                   {isPlaying ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
                 </button>
@@ -636,7 +749,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                     if (video && Number.isFinite(next)) {
                       video.currentTime = next;
                     }
-                    setPlaybackTime(next);
+                    updatePlaybackTime(next, true);
                   }}
                   className="h-3 min-w-0 flex-1 cursor-pointer accent-white"
                   title="播放进度"
@@ -656,24 +769,69 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                 </button>
               </div>
             </div>
-            <MediaDimensionsLabel
-              dimensions={videoDimensions}
-              fileSize={mediaByteSize}
-              visible={mediaHover.visible}
-            />
+            <MediaDimensionsLabel dimensions={videoDimensions} fileSize={mediaByteSize} visible={mediaHover.visible} />
           </>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2.5 rounded-lg border border-[rgba(255,255,255,0.1)] bg-bg-dark/45 p-2">
-            <AudioLines className="h-8 w-8 text-accent/70" />
-            {/* 与视频同理: 音频元素默认 draggable, 需关掉原生拖拽。 */}
+          <div className="flex min-h-0 flex-1 flex-col justify-center gap-3 rounded-lg border border-[rgba(255,255,255,0.1)] bg-bg-dark/45 px-3 py-3">
             <audio
-              controls
+              ref={audioRef}
               draggable={false}
               onDragStart={(event) => event.preventDefault()}
               src={mediaSrc}
               preload="metadata"
-              className="nodrag w-full max-w-[280px]"
+              className="sr-only"
+              onLoadedMetadata={(event) => {
+                const duration = event.currentTarget.duration;
+                if (Number.isFinite(duration) && duration > 0) setVideoDuration(duration);
+              }}
+              onPlay={() => setIsPlaying(true)}
+              onPause={() => setIsPlaying(false)}
+              onEnded={() => setIsPlaying(false)}
+              onTimeUpdate={(event) => updatePlaybackTime(event.currentTarget.currentTime)}
             />
+            <div
+              className="group relative flex h-16 cursor-pointer items-center gap-[3px] overflow-hidden rounded-md px-1.5"
+              onClick={seekAudio}
+              role="slider"
+              aria-label="音频播放进度"
+              aria-valuemin={0}
+              aria-valuemax={videoDuration || 0}
+              aria-valuenow={playbackTime}
+            >
+              <div className="absolute inset-0 rounded-md bg-accent/[0.06]" />
+              <div
+                className="pointer-events-none absolute inset-y-0 left-0 rounded-md bg-accent/[0.14] transition-[width]"
+                style={{ width: `${videoDuration > 0 ? Math.min(100, (playbackTime / videoDuration) * 100) : 0}%` }}
+              />
+              {waveformBars.map((height, index) => {
+                const played = videoDuration > 0 && index / waveformBars.length <= playbackTime / videoDuration;
+                return (
+                  <span
+                    key={`${mediaSrc}-${index}`}
+                    className={`relative z-[1] min-w-[2px] flex-1 rounded-full transition-colors ${
+                      played ? "bg-accent" : "bg-text-muted/45 group-hover:bg-text-muted/65"
+                    }`}
+                    style={{ height: `${Math.round(height * 82)}%` }}
+                  />
+                );
+              })}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                className="nodrag nopan flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-white shadow-sm transition-transform hover:scale-105"
+                onClick={toggleAudioPlayback}
+                onMouseDown={(event) => event.stopPropagation()}
+                aria-label={isPlaying ? "暂停音频" : "播放音频"}
+              >
+                {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="ml-0.5 h-3.5 w-3.5" />}
+              </button>
+              <AudioLines className="h-4 w-4 text-accent/80" />
+              <span className="min-w-0 flex-1 truncate text-[11px] text-text-muted">{resolvedTitle}</span>
+              <span className="shrink-0 text-[10px] tabular-nums text-text-muted/80">
+                {formatClock(playbackTime)} / {formatClock(videoDuration)}
+              </span>
+            </div>
           </div>
         )
       ) : hasGenerationError ? (
@@ -703,14 +861,10 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
           className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border-dark text-text-muted transition-colors hover:border-accent/60 hover:bg-accent/5 hover:text-text-dark"
           onClick={() => void handleUploadClick()}
         >
-          {isVideo ? (
-            <Video className="h-9 w-9 opacity-60" />
-          ) : (
-            <AudioLines className="h-9 w-9 opacity-60" />
-          )}
+          {isVideo ? <Video className="h-9 w-9 opacity-60" /> : <AudioLines className="h-9 w-9 opacity-60" />}
           <span className="flex items-center gap-1.5 text-xs">
             <Upload className="h-3.5 w-3.5" />
-            {isUploading ? '上传中…' : isVideo ? '点击或拖拽上传视频' : '点击或拖拽上传音频'}
+            {isUploading ? "上传中…" : isVideo ? "点击或拖拽上传视频" : "点击或拖拽上传音频"}
           </span>
         </button>
       )}
@@ -724,7 +878,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
           if (event.target.files) {
             void handleMediaFiles(event.target.files);
           }
-          event.target.value = '';
+          event.target.value = "";
         }}
       />
 
@@ -741,42 +895,44 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
         className="!h-2 !w-2 !border-surface-dark !bg-accent"
       />
       <NodeResizeHandle {...resolveMediaNodeResizeBounds(CANVAS_NODE_TYPES.audio, data)} />
-      {isVideoViewerOpen && mediaSrc && createPortal(
-        <div
-          className="fixed inset-0 z-[180] flex items-center justify-center bg-black/90 p-6 backdrop-blur-sm"
-          onClick={() => setIsVideoViewerOpen(false)}
-          onMouseDown={(event) => event.stopPropagation()}
-        >
-          <button
-            type="button"
-            className="absolute right-5 top-5 z-10 flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-black/60 text-white transition-colors hover:bg-white/15"
+      {isVideoViewerOpen &&
+        mediaSrc &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[180] flex items-center justify-center bg-black/90 p-6 backdrop-blur-sm"
             onClick={() => setIsVideoViewerOpen(false)}
-            title="关闭视频预览"
-            aria-label="关闭视频预览"
+            onMouseDown={(event) => event.stopPropagation()}
           >
-            <X className="h-5 w-5" />
-          </button>
-          <video
-            ref={viewerVideoRef}
-            controls
-            autoPlay
-            draggable={false}
-            onDragStart={(event) => event.preventDefault()}
-            onDoubleClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-            }}
-            src={playbackSrc ?? ''}
-            preload="auto"
-            className="max-h-full max-w-full rounded-lg object-contain shadow-2xl"
-            onClick={(event) => event.stopPropagation()}
-            onError={handleLocalVideoLoadError}
-          />
-        </div>,
-        document.body
-      )}
+            <button
+              type="button"
+              className="absolute right-5 top-5 z-10 flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-black/60 text-white transition-colors hover:bg-white/15"
+              onClick={() => setIsVideoViewerOpen(false)}
+              title="关闭视频预览"
+              aria-label="关闭视频预览"
+            >
+              <X className="h-5 w-5" />
+            </button>
+            <video
+              ref={viewerVideoRef}
+              controls
+              autoPlay
+              draggable={false}
+              onDragStart={(event) => event.preventDefault()}
+              onDoubleClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              src={playbackSrc ?? ""}
+              preload="auto"
+              className="max-h-full max-w-full rounded-lg object-contain shadow-2xl"
+              onClick={(event) => event.stopPropagation()}
+              onError={handleLocalVideoLoadError}
+            />
+          </div>,
+          document.body,
+        )}
     </div>
   );
 });
 
-AudioNode.displayName = 'AudioNode';
+AudioNode.displayName = "AudioNode";

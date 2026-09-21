@@ -1,7 +1,7 @@
 {
   "name": "storyboard-copilot",
   "private": true,
-  "version": "1.2.23",
+  "version": "1.2.24",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -15,7 +15,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "tauri": "tauri",
-    "pretauri": "npm run setup:ffmpeg && npm run setup:pajuben",
+    "pretauri": "npm run setup:pajuben",
     "setup:ffmpeg": "node scripts/setup-ffmpeg.mjs",
     "setup:pajuben": "node scripts/setup-pajuben.mjs",
     "sync:version": "node scripts/sync-version.mjs",

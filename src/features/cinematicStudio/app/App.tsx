@@ -103,6 +103,23 @@ const DIRECTOR_SEQUENCE_TEMPLATE = "pro-sequence" as const;
 const SHOT_PERF_TIPS = ["perf0Tip", "perf1Tip", "perf2Tip", "perf3Tip", "perf4Tip", "perf5Tip"] as const;
 const SHOT_PERF_KEYS = ["perf0", "perf1", "perf2", "perf3", "perf4", "perf5"] as const;
 
+/**
+ * 工作室的角色音频是声线/说话方式参考，不是环境音、配乐或拟音。
+ * 创建下游视频节点时把用途直接写在每个 @音频 前，保证脱离工作室上下文后
+ * 仍能让视频模型正确理解该引用；媒体上传顺序本身不作任何改变。
+ */
+function addVoiceTimbreReferenceLabels(prompt: string, audioCount: number, locale: Locale): string {
+  if (audioCount <= 0) return prompt;
+  const references = Array.from({ length: audioCount }, (_, index) => {
+    const number = index + 1;
+    return locale === "zh"
+      ? `声音音色参考：@音频${number}（仅作角色声线与说话方式参考，不作为环境音或配乐）`
+      : `VOICE TIMBRE REFERENCE: @audio${number} (character voice and delivery only; not ambience or music)`;
+  });
+  const heading = locale === "zh" ? "声音音色参考：" : "VOICE TIMBRE REFERENCES:";
+  return `${prompt}\n\n${heading}\n${references.join("\n")}`;
+}
+
 type ResumeJobKind = "scene" | "final";
 interface ResumeJob {
   kind: ResumeJobKind;
@@ -1433,7 +1450,10 @@ export default function App({
                 onClick={() => {
                   const nextPrompt = prompt.trim();
                   if (!nextPrompt || !onSendToVideo) return;
-                  onSendToVideo({ prompt: nextPrompt, ...mediaReferences });
+                  onSendToVideo({
+                    prompt: addVoiceTimbreReferenceLabels(nextPrompt, mediaReferences.referenceAudio.length, locale),
+                    ...mediaReferences,
+                  });
                   setNotice(t.sentToVideoNode);
                 }}
               >

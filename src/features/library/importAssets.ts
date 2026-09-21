@@ -1,15 +1,15 @@
-import { v4 as uuid } from 'uuid';
-import { isTauri } from '@tauri-apps/api/core';
+import { v4 as uuid } from "uuid";
+import { isTauri } from "@tauri-apps/api/core";
 
-import { persistLibraryAssetBinary, extractVideoThumbnail } from '@/commands/assetLibrary';
+import { persistLibraryAssetBinary, persistLibraryAssetFromFile, extractVideoThumbnail } from "@/commands/assetLibrary";
 import {
   blobToDataUrl,
   createPreviewDataUrl,
   detectAspectRatio,
   imageUrlToDataUrl,
   resolveImageDisplayUrl,
-} from '@/features/canvas/application/imageData';
-import { ASSET_LIBRARY_MIME_PREFIX, type AssetMediaType, type LibraryAsset } from './types';
+} from "@/features/canvas/application/imageData";
+import { ASSET_LIBRARY_MIME_PREFIX, type AssetMediaType, type LibraryAsset } from "./types";
 
 export function createAssetId(): string {
   return `asset-${uuid().slice(0, 12)}`;
@@ -17,7 +17,7 @@ export function createAssetId(): string {
 
 async function persistImageBlobForLibrary(
   blob: Blob,
-  extension: string
+  extension: string,
 ): Promise<{ sourcePath: string; previewImageUrl: string; aspectRatio: string }> {
   const sourceDataUrl = await blobToDataUrl(blob);
   const aspectRatio = await detectAspectRatio(sourceDataUrl);
@@ -32,16 +32,10 @@ async function persistImageBlobForLibrary(
   }
 
   // 素材库图片必须使用独立目录，不能复用画布的 images 目录。
-  const sourcePath = await persistLibraryAssetBinary(
-    new Uint8Array(await blob.arrayBuffer()),
-    extension
-  );
+  const sourcePath = await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension);
   const previewResponse = await fetch(previewDataUrl);
   const previewBlob = await previewResponse.blob();
-  const previewImageUrl = await persistLibraryAssetBinary(
-    new Uint8Array(await previewBlob.arrayBuffer()),
-    'png'
-  );
+  const previewImageUrl = await persistLibraryAssetBinary(new Uint8Array(await previewBlob.arrayBuffer()), "png");
   return { sourcePath, previewImageUrl, aspectRatio };
 }
 
@@ -75,7 +69,7 @@ function describeImportError(error: unknown): string {
 export async function importImageUrlToAsset(
   imageUrl: string,
   libraryId: string,
-  categoryId: string | null
+  categoryId: string | null,
 ): Promise<LibraryAsset | null> {
   const { asset } = await importImageUrlToAssetDetailed(imageUrl, libraryId, categoryId);
   return asset;
@@ -94,11 +88,11 @@ export async function importImageUrlToAsset(
 export async function importImageUrlToAssetDetailed(
   imageUrl: string,
   libraryId: string,
-  categoryId: string | null
+  categoryId: string | null,
 ): Promise<ImportImageOutcome> {
-  const source = (imageUrl ?? '').trim();
+  const source = (imageUrl ?? "").trim();
   if (!source) {
-    return { asset: null, failure: { reason: '图片地址为空' } };
+    return { asset: null, failure: { reason: "图片地址为空" } };
   }
 
   const isRemote = /^https?:\/\//i.test(source);
@@ -111,11 +105,11 @@ export async function importImageUrlToAssetDetailed(
     return {
       asset: null,
       failure: {
-        reason: isRemote ? '无法下载该图片' : '无法读取该图片的本地文件',
+        reason: isRemote ? "无法下载该图片" : "无法读取该图片的本地文件",
         details: `${
           isRemote
-            ? '远端地址不可访问，或被跨域策略拦截（常见于平台返回的临时图片链接）'
-            : '本地源文件可能已被移动、删除，或不在应用可读目录内'
+            ? "远端地址不可访问，或被跨域策略拦截（常见于平台返回的临时图片链接）"
+            : "本地源文件可能已被移动、删除，或不在应用可读目录内"
         }\nsource=${source}\n${describeImportError(error)}`,
       },
     };
@@ -137,10 +131,10 @@ export async function importImageUrlToAssetDetailed(
     if (blob.size === 0) {
       return {
         asset: null,
-        failure: { reason: '读到的图片数据为空', details: `source=${source}` },
+        failure: { reason: "读到的图片数据为空", details: `source=${source}` },
       };
     }
-    if (blob.type && !blob.type.startsWith('image/')) {
+    if (blob.type && !blob.type.startsWith("image/")) {
       return {
         asset: null,
         failure: {
@@ -150,7 +144,7 @@ export async function importImageUrlToAssetDetailed(
       };
     }
 
-    const extension = blob.type.split('/')[1] ?? 'png';
+    const extension = blob.type.split("/")[1] ?? "png";
     const fileName = `canvas-image-${Date.now()}.${extension}`;
     const stored = await persistImageBlobForLibrary(blob, extension);
     return {
@@ -159,10 +153,10 @@ export async function importImageUrlToAssetDetailed(
         libraryId,
         categoryId,
         name: `画布图片 ${new Date().toLocaleTimeString()}`,
-        mediaType: 'image',
+        mediaType: "image",
         sourcePath: stored.sourcePath,
         previewImageUrl: stored.previewImageUrl,
-        aspectRatio: stored.aspectRatio || '1:1',
+        aspectRatio: stored.aspectRatio || "1:1",
         sourceFileName: fileName,
         tags: [],
         createdAt: Date.now(),
@@ -170,11 +164,11 @@ export async function importImageUrlToAssetDetailed(
       failure: null,
     };
   } catch (error) {
-    console.warn('[assetLibrary] import image url failed', source, error);
+    console.warn("[assetLibrary] import image url failed", source, error);
     return {
       asset: null,
       failure: {
-        reason: '图片数据处理失败',
+        reason: "图片数据处理失败",
         details: `source=${source}\n${describeImportError(error)}`,
       },
     };
@@ -185,19 +179,18 @@ export async function importImageUrlToAssetDetailed(
 export async function importVideoUrlToAsset(
   videoUrl: string,
   libraryId: string,
-  categoryId: string | null
+  categoryId: string | null,
 ): Promise<LibraryAsset | null> {
   try {
-    const displayUrl = videoUrl.startsWith('data:') || /^https?:\/\//i.test(videoUrl)
-      ? videoUrl
-      : resolveImageDisplayUrl(videoUrl);
+    const displayUrl =
+      videoUrl.startsWith("data:") || /^https?:\/\//i.test(videoUrl) ? videoUrl : resolveImageDisplayUrl(videoUrl);
     const response = await fetch(displayUrl);
     if (!response.ok) {
       return null;
     }
     const blob = await response.blob();
-    const mime = blob.type || 'video/mp4';
-    const extension = mime.split('/')[1]?.split(';')[0] || 'mp4';
+    const mime = blob.type || "video/mp4";
+    const extension = mime.split("/")[1]?.split(";")[0] || "mp4";
     const sourcePath = isTauri()
       ? await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension)
       : displayUrl;
@@ -208,7 +201,7 @@ export async function importVideoUrlToAsset(
       libraryId,
       categoryId,
       name: `画布视频 ${new Date().toLocaleTimeString()}`,
-      mediaType: 'video',
+      mediaType: "video",
       sourcePath,
       previewImageUrl,
       aspectRatio: null,
@@ -217,7 +210,7 @@ export async function importVideoUrlToAsset(
       createdAt: Date.now(),
     };
   } catch (error) {
-    console.warn('[assetLibrary] import video url failed', videoUrl, error);
+    console.warn("[assetLibrary] import video url failed", videoUrl, error);
     return null;
   }
 }
@@ -230,7 +223,7 @@ export function parseAssetDragPayload(payload: string | null): string | null {
   if (!payload) return null;
   try {
     const parsed = JSON.parse(payload) as { id?: unknown };
-    return typeof parsed.id === 'string' ? parsed.id : null;
+    return typeof parsed.id === "string" ? parsed.id : null;
   } catch {
     return null;
   }
@@ -239,7 +232,7 @@ export function parseAssetDragPayload(payload: string | null): string | null {
 export const ASSET_DRAG_DATA_TYPE = ASSET_LIBRARY_MIME_PREFIX;
 
 /** 提示词拖拽到画布的数据类型(用于创建 AI 图片节点) */
-export const PROMPT_DRAG_DATA_TYPE = 'application/x-storyboard-prompt';
+export const PROMPT_DRAG_DATA_TYPE = "application/x-storyboard-prompt";
 
 export function promptDragPayload(promptId: string): string {
   return JSON.stringify({ id: promptId });
@@ -249,30 +242,30 @@ export function parsePromptDragPayload(payload: string | null): string | null {
   if (!payload) return null;
   try {
     const parsed = JSON.parse(payload) as { id?: unknown };
-    return typeof parsed.id === 'string' ? parsed.id : null;
+    return typeof parsed.id === "string" ? parsed.id : null;
   } catch {
     return null;
   }
 }
 
 function mediaTypeForFile(file: File): AssetMediaType | null {
-  if (file.type.startsWith('image/')) return 'image';
-  if (file.type.startsWith('video/')) return 'video';
-  if (file.type.startsWith('audio/')) return 'audio';
+  if (file.type.startsWith("image/")) return "image";
+  if (file.type.startsWith("video/")) return "video";
+  if (file.type.startsWith("audio/")) return "audio";
   return null;
 }
 
 function extensionForFile(file: File): string {
-  const extension = file.name.split('.').pop()?.trim();
+  const extension = file.name.split(".").pop()?.trim();
   if (extension && extension !== file.name) return extension;
-  if (file.type === 'video/mp4') return 'mp4';
-  if (file.type === 'audio/mpeg') return 'mp3';
-  if (file.type === 'audio/wav') return 'wav';
-  return 'bin';
+  if (file.type === "video/mp4") return "mp4";
+  if (file.type === "audio/mpeg") return "mp3";
+  if (file.type === "audio/wav") return "wav";
+  return "bin";
 }
 
 function assetNameFromFile(file: File): string {
-  return file.name.replace(/\.[^.]+$/, '').trim() || file.name || '未命名素材';
+  return file.name.replace(/\.[^.]+$/, "").trim() || file.name || "未命名素材";
 }
 
 /**
@@ -283,20 +276,20 @@ function assetNameFromFile(file: File): string {
 function captureVideoThumbnail(file: File): Promise<string | null> {
   return new Promise((resolve) => {
     const objectUrl = URL.createObjectURL(file);
-    const video = document.createElement('video');
+    const video = document.createElement("video");
     video.muted = true;
     video.playsInline = true;
-    video.preload = 'auto';
-    video.setAttribute('webkit-playsinline', 'true');
-    video.style.cssText = 'position:fixed;left:-9999px;top:0;width:4px;height:4px;opacity:0;pointer-events:none;';
+    video.preload = "auto";
+    video.setAttribute("webkit-playsinline", "true");
+    video.style.cssText = "position:fixed;left:-9999px;top:0;width:4px;height:4px;opacity:0;pointer-events:none;";
     document.body.appendChild(video);
 
     let settled = false;
-    const timeoutId = window.setTimeout(() => settle(null, 'timeout'), 10000);
+    const timeoutId = window.setTimeout(() => settle(null, "timeout"), 10000);
     const cleanup = () => {
       window.clearTimeout(timeoutId);
       video.pause();
-      video.removeAttribute('src');
+      video.removeAttribute("src");
       video.load();
       video.remove();
       URL.revokeObjectURL(objectUrl);
@@ -308,7 +301,7 @@ function captureVideoThumbnail(file: File): Promise<string | null> {
       settled = true;
       cleanup();
       if (dataUrl === null && reason) {
-        console.warn('[videoThumb] capture failed:', reason);
+        console.warn("[videoThumb] capture failed:", reason);
       }
       resolve(dataUrl);
     };
@@ -325,16 +318,16 @@ function captureVideoThumbnail(file: File): Promise<string | null> {
         const scale = targetWidth / vw;
         const width = targetWidth;
         const height = Math.max(1, Math.round(vh * scale));
-        const canvas = document.createElement('canvas');
+        const canvas = document.createElement("canvas");
         canvas.width = width;
         canvas.height = height;
-        const ctx = canvas.getContext('2d');
+        const ctx = canvas.getContext("2d");
         if (!ctx) {
-          settle(null, 'no 2d context');
+          settle(null, "no 2d context");
           return;
         }
         ctx.drawImage(video, 0, 0, width, height);
-        settle(canvas.toDataURL('image/jpeg', 0.72));
+        settle(canvas.toDataURL("image/jpeg", 0.72));
       } catch (error) {
         settle(null, error instanceof Error ? error.message : String(error));
       }
@@ -342,14 +335,17 @@ function captureVideoThumbnail(file: File): Promise<string | null> {
 
     const tryAutoplay = () => {
       if (video.paused) {
-        void video.play().then(() => {
-          video.pause();
-          tryDraw();
-        }).catch(() => tryDraw());
+        void video
+          .play()
+          .then(() => {
+            video.pause();
+            tryDraw();
+          })
+          .catch(() => tryDraw());
       }
     };
 
-    video.onerror = () => settle(null, 'video element error');
+    video.onerror = () => settle(null, "video element error");
     video.onloadeddata = () => tryDraw();
     video.onloadedmetadata = () => {
       try {
@@ -371,7 +367,7 @@ function captureVideoThumbnail(file: File): Promise<string | null> {
 export async function importFilesToAssets(
   files: File[],
   libraryId: string,
-  categoryId: string | null
+  categoryId: string | null,
 ): Promise<LibraryAsset[]> {
   const imported: LibraryAsset[] = [];
   for (const file of files) {
@@ -380,7 +376,7 @@ export async function importFilesToAssets(
 
     try {
       const createdAt = Date.now();
-      if (mediaType === 'image') {
+      if (mediaType === "image") {
         const stored = await persistImageBlobForLibrary(file, extensionForFile(file));
         imported.push({
           id: createAssetId(),
@@ -390,7 +386,7 @@ export async function importFilesToAssets(
           mediaType,
           sourcePath: stored.sourcePath,
           previewImageUrl: stored.previewImageUrl,
-          aspectRatio: stored.aspectRatio || '1:1',
+          aspectRatio: stored.aspectRatio || "1:1",
           sourceFileName: file.name,
           tags: [],
           createdAt,
@@ -398,16 +394,16 @@ export async function importFilesToAssets(
         continue;
       }
 
-      const sourcePath = await persistLibraryAssetBinary(
-        new Uint8Array(await file.arrayBuffer()),
-        extensionForFile(file)
-      );
+      // Tauri 文件选择器/拖拽文件通常会携带原生路径，直接在 Rust 侧复制，避免将整段
+      // 视频读进 WebView 再序列化给 IPC。没有路径时也会自动改为 2 MB 分块写入。
+      // 浏览器模式没有持久化文件系统时保留 object URL 的轻量预览行为。
+      const sourcePath = isTauri()
+        ? await persistLibraryAssetFromFile(file, extensionForFile(file))
+        : URL.createObjectURL(file);
 
-      if (mediaType === 'video') {
+      if (mediaType === "video") {
         // 视频: Tauri 用系统 QuickLook 抽帧; 浏览器用前端 canvas 截首帧; 失败回退 null
-        const previewImageUrl = isTauri()
-          ? await extractVideoThumbnail(sourcePath)
-          : await captureVideoThumbnail(file);
+        const previewImageUrl = isTauri() ? await extractVideoThumbnail(sourcePath) : await captureVideoThumbnail(file);
         imported.push({
           id: createAssetId(),
           libraryId,
@@ -438,7 +434,7 @@ export async function importFilesToAssets(
         createdAt,
       });
     } catch (error) {
-      console.warn('[assetLibrary] import failed', file.name, error);
+      console.warn("[assetLibrary] import failed", file.name, error);
     }
   }
   return imported;

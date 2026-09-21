@@ -16,7 +16,7 @@ use crate::database;
 use crate::ai::providers::build_default_providers;
 use crate::ai::providers::openai_compat::OpenAICompatibleProvider;
 use crate::ai::{
-    GenerateRequest, ProviderRegistry, ProviderTaskHandle, ProviderTaskPollResult,
+    GenerateRequest, GenerateVideoRequest, ProviderRegistry, ProviderTaskHandle, ProviderTaskPollResult,
     ProviderTaskSubmission,
 };
 
@@ -46,6 +46,19 @@ pub struct GenerateRequestDto {
     pub aspect_ratio: String,
     pub image_count: Option<u32>,
     pub reference_images: Option<Vec<String>>,
+    pub extra_params: Option<HashMap<String, Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateVideoRequestDto {
+    pub prompt: String,
+    pub model: String,
+    pub duration: u32,
+    pub aspect_ratio: String,
+    pub video_resolution: Option<String>,
+    pub image_mode: Option<String>,
+    pub reference_images: Option<Vec<String>>,
+    pub reference_audio: Option<Vec<String>>,
     pub extra_params: Option<HashMap<String, Value>>,
 }
 
@@ -868,6 +881,55 @@ pub async fn submit_generate_image_job(
     });
 
     Ok(job_id)
+}
+
+/// 将通用 OpenAI 兼容视频请求交给 Tauri 后端执行。命令立即返回本地任务 ID，
+/// 结果由 get_generate_video_job 查询；这样画布切换、节点卸载不会取消平台任务。
+#[tauri::command]
+pub async fn submit_generate_video_job(
+    app: AppHandle,
+    request: GenerateVideoRequestDto,
+) -> Result<String, String> {
+    if !request.model.starts_with("custom:") {
+        return Err("视频生成仅支持自定义平台(custom:*)模型".to_string());
+    }
+    let provider = get_registry()
+        .get_provider("openai-compatible")
+        .cloned()
+        .ok_or_else(|| "OpenAI compatible provider not found".to_string())?;
+    let job_id = Uuid::new_v4().to_string();
+    insert_generation_job(&app, &job_id, "video-openai-compatible", "running", false, None, None, None, None)?;
+    active_non_resumable_job_ids().write().await.insert(job_id.clone());
+
+    let native_request = GenerateVideoRequest {
+        prompt: request.prompt,
+        model: request.model,
+        duration: request.duration,
+        aspect_ratio: request.aspect_ratio,
+        video_resolution: request.video_resolution,
+        image_mode: request.image_mode,
+        reference_images: request.reference_images,
+        reference_audio: request.reference_audio,
+        extra_params: request.extra_params,
+    };
+    let app_handle = app.clone();
+    let spawned_job_id = job_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = provider.generate_video(native_request).await;
+        let update = match result {
+            Ok(video_url) => update_generation_job(&app_handle, &spawned_job_id, "succeeded", Some(&video_url), None),
+            Err(error) => update_generation_job(&app_handle, &spawned_job_id, "failed", None, Some(&error.to_string())),
+        };
+        if let Err(error) = update { info!("Failed to update video generation job: {}", error); }
+        active_non_resumable_job_ids().write().await.remove(&spawned_job_id);
+    });
+    Ok(job_id)
+}
+
+#[tauri::command]
+pub async fn get_generate_video_job(app: AppHandle, job_id: String) -> Result<GenerationJobStatusDto, String> {
+    // 视频任务当前均由 native worker 持续执行，状态机和图片非可恢复任务一致。
+    get_generate_image_job(app, job_id).await
 }
 
 #[tauri::command]

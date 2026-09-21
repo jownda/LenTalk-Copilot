@@ -7,8 +7,8 @@
 //! Python 解释器**优先用随包运行时**（`pajuben/runtime/`），找不到才回退系统
 //! Python —— 这样"完全内置"和"先跑起来"两种形态共用同一套代码路径。
 //!
-//! ffmpeg 复用 LenTalk 随包的 `resources/bin/ffmpeg.exe`：引擎按裸名调用
-//! `ffmpeg`/`ffprobe`，所以要把该目录前置进子进程的 PATH。
+//! ffmpeg 优先复用随包或系统版本；Windows 缺失时首次使用按需下载到应用数据目录。
+//! 引擎按裸名调用 `ffmpeg`/`ffprobe`，所以要把其目录前置进子进程的 PATH。
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -19,7 +19,13 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(windows)]
+use flate2::read::GzDecoder;
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::io::Read;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -32,6 +38,14 @@ const ENGINE_DIR_NAME: &str = "pajuben";
 const ENGINE_ENTRY: &str = "pajuben.py";
 /// 失败诊断用：保留最后多少行引擎输出。
 const LOG_TAIL_LIMIT: usize = 60;
+#[cfg(windows)]
+const WINDOWS_FFMPEG_ARCHIVE_URL: &str =
+    "https://github.com/jownda/LenTalk-Copilot/releases/download/bundled-tools/ffmpeg.tar.gz";
+#[cfg(windows)]
+const WINDOWS_FFMPEG_ARCHIVE_SHA256: &str =
+    "04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00";
+#[cfg(windows)]
+const MAX_FFMPEG_ARCHIVE_BYTES: u64 = 200 * 1024 * 1024;
 
 /// 从引擎输出尾部提取「给用户看」的失败原因。
 ///
@@ -120,6 +134,10 @@ pub struct PajubenRunRequest {
     pub resolution: Option<String>,
     pub max_frames: Option<u32>,
     pub workers: Option<u32>,
+    /// 单次模型请求的最长等待时间；None 时沿用引擎完整模式默认值。
+    pub request_timeout_secs: Option<u32>,
+    /// 单次模型请求的尝试次数；快速模式只尝试一次，避免长时间无响应。
+    pub request_attempts: Option<u32>,
     /// 是否把音频一并送给模型（能听声的模型才需要）。
     pub audio: bool,
     pub anime_mode: bool,
@@ -135,6 +153,9 @@ pub struct PajubenRunRequest {
     pub limit: Option<u32>,
     pub overwrite: bool,
     pub skip_alias_verify: bool,
+    /// 画布快速模式不应在失败后切入可能长达数十分钟的双模型降级流程。
+    #[serde(default)]
+    pub disable_dual_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,10 +217,23 @@ fn engine_dir(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
-/// ffmpeg 所在目录（复用 LenTalk 随包的二进制，不额外打包一份）。
+/// ffmpeg 所在目录：优先使用 LenTalk 随包的二进制，开发/旧版 macOS 安装则复用系统版本。
 fn ffmpeg_dir(app: &AppHandle) -> Option<PathBuf> {
     crate::commands::video_cfr::resolve_ffmpeg_path(app)
         .and_then(|path| path.parent().map(Path::to_path_buf))
+        .or_else(|| downloaded_ffmpeg_path(app).and_then(|path| path.parent().map(Path::to_path_buf)))
+        .or_else(|| system_ffmpeg_path().and_then(|path| path.parent().map(Path::to_path_buf)))
+}
+
+#[cfg(windows)]
+fn downloaded_ffmpeg_path(app: &AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?.join("tools").join("ffmpeg").join("ffmpeg.exe");
+    path.is_file().then_some(path)
+}
+
+#[cfg(not(windows))]
+fn downloaded_ffmpeg_path(_app: &AppHandle) -> Option<PathBuf> {
+    None
 }
 
 fn find_on_path(names: &[&str]) -> Option<PathBuf> {
@@ -219,6 +253,163 @@ fn find_on_path(names: &[&str]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn system_ffmpeg_path() -> Option<PathBuf> {
+    if let Some(path) = find_on_path(&["ffmpeg"]) {
+        return Some(path);
+    }
+
+    // 从 Finder / Dock 启动的 macOS App 常常拿不到 shell PATH；补查 Homebrew 的两个默认目录。
+    #[cfg(target_os = "macos")]
+    for candidate in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn homebrew_path() -> Option<PathBuf> {
+    find_on_path(&["brew"]).or_else(|| {
+        ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+    })
+}
+
+#[cfg(windows)]
+fn unpack_windows_ffmpeg_archive(archive: &[u8]) -> Result<Vec<u8>, String> {
+    let mut tar = Vec::new();
+    GzDecoder::new(archive)
+        .read_to_end(&mut tar)
+        .map_err(|error| format!("解压 FFmpeg 下载包失败：{error}"))?;
+
+    let mut offset = 0usize;
+    while offset.saturating_add(512) <= tar.len() {
+        let header = &tar[offset..offset + 512];
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let name = String::from_utf8_lossy(&header[..100])
+            .trim_end_matches('\0')
+            .to_string();
+        let size_text = String::from_utf8_lossy(&header[124..136])
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
+        let size = usize::from_str_radix(&size_text, 8)
+            .map_err(|error| format!("FFmpeg 下载包格式无效：{error}"))?;
+        let data_start = offset + 512;
+        let data_end = data_start
+            .checked_add(size)
+            .filter(|end| *end <= tar.len())
+            .ok_or_else(|| "FFmpeg 下载包内容不完整".to_string())?;
+        let type_flag = header[156];
+        if (type_flag == 0 || type_flag == b'0') && name.ends_with("ffmpeg.exe") {
+            let binary = tar[data_start..data_end].to_vec();
+            if binary.len() < 2 || &binary[..2] != b"MZ" {
+                return Err("下载的 FFmpeg 文件无效".to_string());
+            }
+            return Ok(binary);
+        }
+        offset = data_start + size.div_ceil(512) * 512;
+    }
+
+    Err("FFmpeg 下载包内未找到 ffmpeg.exe".to_string())
+}
+
+#[cfg(windows)]
+fn download_windows_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
+    let tools_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录：{error}"))?
+        .join("tools")
+        .join("ffmpeg");
+    let target = tools_dir.join("ffmpeg.exe");
+    if target.is_file() {
+        return Ok(target);
+    }
+
+    let response = reqwest::blocking::get(WINDOWS_FFMPEG_ARCHIVE_URL)
+        .map_err(|error| format!("下载 FFmpeg 失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("下载 FFmpeg 失败：{error}"))?;
+    if response.content_length().is_some_and(|size| size > MAX_FFMPEG_ARCHIVE_BYTES) {
+        return Err("FFmpeg 下载包过大，已取消安装".to_string());
+    }
+    let archive = response
+        .bytes()
+        .map_err(|error| format!("读取 FFmpeg 下载包失败：{error}"))?;
+    if archive.len() as u64 > MAX_FFMPEG_ARCHIVE_BYTES {
+        return Err("FFmpeg 下载包过大，已取消安装".to_string());
+    }
+    let digest = format!("{:x}", Sha256::digest(&archive));
+    if digest != WINDOWS_FFMPEG_ARCHIVE_SHA256 {
+        return Err("FFmpeg 下载包校验失败，请稍后重试".to_string());
+    }
+    let binary = unpack_windows_ffmpeg_archive(&archive)?;
+
+    std::fs::create_dir_all(&tools_dir)
+        .map_err(|error| format!("无法创建 FFmpeg 目录：{error}"))?;
+    let temporary = tools_dir.join(format!("ffmpeg-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temporary, binary).map_err(|error| format!("写入 FFmpeg 失败：{error}"))?;
+    std::fs::rename(&temporary, &target).map_err(|error| format!("安装 FFmpeg 失败：{error}"))?;
+    Ok(target)
+}
+
+/// 首次点击「开始扒剧本」时确保 ffmpeg 已就绪。
+///
+/// Windows 正常由安装包附带二进制；macOS 的历史安装包未随包时，自动通过 Homebrew
+/// 补装，避免 Python 引擎启动后才要求用户手动执行 `brew install ffmpeg`。
+fn ensure_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(dir) = ffmpeg_dir(app) {
+        return Ok(dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let brew = homebrew_path().ok_or_else(|| {
+            "未找到 Homebrew，无法自动安装 FFmpeg。请先安装 Homebrew 后重试。".to_string()
+        })?;
+        let output = Command::new(&brew)
+            .args(["install", "ffmpeg"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("无法启动 Homebrew 安装 FFmpeg：{error}"))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("Homebrew 未返回错误详情")
+                .trim()
+                .to_string();
+            return Err(format!("自动安装 FFmpeg 失败：{detail}"));
+        }
+        return ffmpeg_dir(app).ok_or_else(|| {
+            "Homebrew 已完成安装，但未找到 ffmpeg 可执行文件；请重启 LenTalk 后重试。".to_string()
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        let installed = download_windows_ffmpeg(app)?;
+        return installed.parent().map(Path::to_path_buf).ok_or_else(|| {
+            "FFmpeg 安装完成，但安装目录无效".to_string()
+        });
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
+        let _ = app;
+        Err("未找到 FFmpeg。请安装 FFmpeg 后重试。".to_string())
+    }
 }
 
 /// 随包运行时优先，其次系统 Python。
@@ -374,6 +565,14 @@ fn build_arguments(engine: &Path, request: &PajubenRunRequest) -> Vec<String> {
         args.push("--workers".to_string());
         args.push(workers.to_string());
     }
+    if let Some(timeout) = request.request_timeout_secs.filter(|value| *value > 0) {
+        args.push("--request-timeout".to_string());
+        args.push(timeout.to_string());
+    }
+    if let Some(attempts) = request.request_attempts.filter(|value| *value > 0) {
+        args.push("--request-attempts".to_string());
+        args.push(attempts.to_string());
+    }
     if request.audio {
         args.push("--audio".to_string());
     } else {
@@ -415,6 +614,9 @@ fn build_arguments(engine: &Path, request: &PajubenRunRequest) -> Vec<String> {
     }
     if request.skip_alias_verify {
         args.push("--no-verify".to_string());
+    }
+    if request.disable_dual_fallback {
+        args.push("--no-dual-fallback".to_string());
     }
     // 人物识别（预留开关）：关掉时用空的人物库，等价于纯模型判断。
     if !request.face_enabled {
@@ -529,6 +731,9 @@ pub fn pajuben_run(
     let (python, _) = resolve_python(&app);
     let python = python.ok_or_else(|| "未找到可用的 Python 解释器".to_string())?;
     let engine = engine_dir(&app).ok_or_else(|| "扒剧本引擎文件缺失".to_string())?;
+    // 第一次启动时若缺少 ffmpeg，先自动安装/恢复；成功后继续本次任务，
+    // 不再让 Python 引擎把缺失问题抛回给用户。
+    let ffmpeg = ensure_ffmpeg(&app)?;
 
     // 完成时要把落盘位置告诉用户（否则只提示「完成」等于让人自己去找），
     // 所以在这里先把最终输出目录定下来，随 finish 事件一起回给前端。
@@ -553,13 +758,11 @@ pub fn pajuben_run(
         .stderr(Stdio::piped());
     // 密钥走环境变量：命令行参数会出现在进程列表里，同机其他进程可读。
     command.env("PAJUBEN_API_KEY", request.api_key.trim());
-    if let Some(dir) = ffmpeg_dir(&app) {
-        let existing = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![dir];
-        paths.extend(std::env::split_paths(&existing));
-        if let Ok(joined) = std::env::join_paths(paths) {
-            command.env("PATH", joined);
-        }
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![ffmpeg];
+    paths.extend(std::env::split_paths(&existing));
+    if let Ok(joined) = std::env::join_paths(paths) {
+        command.env("PATH", joined);
     }
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
@@ -846,6 +1049,8 @@ mod tests {
             resolution: None,
             max_frames: None,
             workers: None,
+            request_timeout_secs: None,
+            request_attempts: None,
             audio: true,
             anime_mode: false,
             face_enabled: true,
@@ -858,6 +1063,7 @@ mod tests {
             limit: None,
             overwrite: false,
             skip_alias_verify: false,
+            disable_dual_fallback: false,
         }
     }
 

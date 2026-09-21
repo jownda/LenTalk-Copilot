@@ -1257,7 +1257,7 @@ const LOCK_LEVEL_VALUES: LockLevel[] = ["none", "soft", "strict"];
 
 /**
  * AI 填写详细：结合已上传参考图，把资产卡片中的描述类字段一次填完整。
- * 返回可直接 UPDATE_ASSET 的 Partial<Asset>（不含 id / kind）。
+ * 返回可直接 UPDATE_ASSET 的描述字段 Partial<Asset>（不含 id / kind / name）。
  * @throws 未配置远程模型 / 没有参考图 / 请求失败
  */
 export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Partial<Asset>> {
@@ -1310,13 +1310,14 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
     "Analyze the attached reference image(s) carefully. Every visual field must be grounded in what you can see (or, for style refs, derive consistently) — no invented details.",
     "",
     FILL_ASSET_KIND_HINTS[asset.kind],
+    `Existing asset name (identity only; preserve it exactly and never return it): ${existing.name || "(unnamed)"}`,
     `User notes (${language}, AI reference only; never copy this field into the final prompt): ${isZh ? (asset.notesZh?.trim() || "(none)") : (asset.notes?.trim() || "(none)")}`,
     "",
     "Return ONLY a JSON object with this exact schema:",
-    `{ "name": string, "${descriptionField}": string, "useFor": string[], "ignore": string[], "uniqueMarkers": string[], "alwaysVisible": string[], "forbiddenConfusions": string[], "tags": string[], "lockLevel": "none" | "soft" | "strict"${actingSchema} }`,
+    `{ "${descriptionField}": string, "useFor": string[], "ignore": string[], "uniqueMarkers": string[], "alwaysVisible": string[], "forbiddenConfusions": string[], "tags": string[], "lockLevel": "none" | "soft" | "strict"${actingSchema} }`,
     "",
     "Field rules:",
-    "- name: short production name; keep it in ALL-CAPS style like REIN / BAKERY INTERIOR / BOOMBOX.",
+    "- Never return, rename, translate, or infer the asset name. The user manages the name manually.",
     `- ${descriptionField}: canonical description in ${language}, 1-3 sentences, precise and reusable in a prompt.`,
     "- useFor: pick from the asset-type vocabulary — character: [\"face\",\"body\",\"wardrobe\",\"appearance\"], location: [\"environment\",\"appearance\"], prop / style-reference / audio-reference: [\"appearance\"]. Keep these tokens in English.",
     "- ignore: pick only what should be ignored, from [\"pose\",\"background\",\"lighting\",\"composition\",\"expression\"]. Keep these tokens in English.",
@@ -1361,7 +1362,6 @@ export async function fillAssetDetails(asset: Asset, locale: Locale): Promise<Pa
   const actingRaw = (obj.actingProfile ?? {}) as Record<string, unknown>;
 
   const patch: Partial<Asset> = {
-    name: asString(obj.name, existing.name),
     useFor: asStringArray(obj.useFor).filter((value) => ["face", "body", "wardrobe", "appearance", "environment"].includes(value)),
     ignore: asStringArray(obj.ignore).filter((value) => ["pose", "background", "lighting", "composition", "expression"].includes(value)),
     uniqueMarkers: asStringArray(obj.uniqueMarkers).slice(0, 12),

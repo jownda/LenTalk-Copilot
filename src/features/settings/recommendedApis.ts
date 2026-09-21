@@ -616,6 +616,7 @@ export const recommendedApis: RecommendedApi[] = [
       '新用户注册赠 500 RH 币',
     ],
     models: ['nano-banana'],
+    audioModels: ['indextts2_clone'],
   },
   {
     id: 'runninghub-cn',
@@ -633,6 +634,7 @@ export const recommendedApis: RecommendedApi[] = [
       '新用户注册赠 500 RH 币',
     ],
     models: ['nano-banana'],
+    audioModels: ['indextts2_clone'],
   },
   {
     id: 'modelscope',

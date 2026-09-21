@@ -1,16 +1,46 @@
-import { invoke, isTauri } from '@tauri-apps/api/core';
-import { remove } from '@tauri-apps/plugin-fs';
-import { CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from '@/stores/settingsStore';
-import type { CustomApiCapabilities } from '@/stores/settingsStore';
-import { isWindowsDesktopRuntime } from '@/platform/runtime';
-import { isKnownOpenAiImagesBaseUrl } from '@/features/settings/recommendedApis';
-import { persistImageBinary } from '@/commands/image';
-import { localPathFromReferenceSource, resolveReferenceAssetSource } from '@/commands/referenceAssetSource';
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { remove } from "@tauri-apps/plugin-fs";
+import { CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from "@/stores/settingsStore";
+import type { CustomApiCapabilities } from "@/stores/settingsStore";
+import { isWindowsDesktopRuntime } from "@/platform/runtime";
+import { isKnownOpenAiImagesBaseUrl } from "@/features/settings/recommendedApis";
+import { persistImageBinary } from "@/commands/image";
+import { localPathFromReferenceSource, resolveReferenceAssetSource } from "@/commands/referenceAssetSource";
 import {
-  createVideoIdempotencyKey,
-  getVideoTaskFailureReason,
-  resolveRjmVideoApiBaseUrl,
-} from '@/commands/videoApi';
+  MMX_AUDIO_SPEECH_PATH,
+  MMX_SPEECH_MAX_TEXT_CHARS,
+  MMX_VOICE_CLONE_MODEL,
+  MMX_VOICE_DESIGN_MODEL,
+  buildMmxSpeechBody,
+  buildMmxVoiceCloneBody,
+  buildMmxVoiceDesignBody,
+  extractMmxAudioSource,
+  extractMmxErrorMessage,
+  extractMmxVoiceId,
+  isValidMmxVoiceId,
+  resolveMmxVoiceOperation,
+} from "@/commands/minimaxVoice";
+import {
+  buildSunoMusicBody,
+  describeSunoResponse,
+  describeSunoValidation,
+  extractSunoErrorMessage,
+  extractSunoFileUrls,
+  extractSunoClipId,
+  extractSunoLyricsText,
+  extractSunoTaskId,
+  isSunoFailureState,
+  normalizeSunoOperation,
+  readSunoTaskStatus,
+  resolveSunoMusicOperation,
+  resolveSunoTaskPath,
+  SUNO_ASYNC_PATH,
+  SUNO_OPERATION_SPECS,
+  SUNO_POLL_INTERVAL_MS,
+  validateSunoMusicInput,
+  type SunoMusicBodyInput,
+} from "@/commands/sunoMusic";
+import { createVideoIdempotencyKey, getVideoTaskFailureReason, resolveRjmVideoApiBaseUrl } from "@/commands/videoApi";
 import {
   isZzdhBaseUrl,
   resolveZzdhAspectRatio,
@@ -25,13 +55,13 @@ import {
   ZZDH_BASE_DEFAULT_VOICE,
   ZZDH_DEFAULT_AUDIO_FORMAT,
   type ZzdhReferenceRole,
-} from '@/commands/zzdhApi';
+} from "@/commands/zzdhApi";
 import {
   generateZhenjianImage,
   generateZhenjianVideo,
   extractZhenjianModels,
   isZhenjianProvider,
-} from '@/commands/zhenjianApi';
+} from "@/commands/zhenjianApi";
 
 export interface GenerateRequest {
   prompt: string;
@@ -51,10 +81,18 @@ export interface GenerateVideoRequest {
   duration: number;
   aspect_ratio: string;
   video_resolution?: string;
-  image_mode?: 'reference' | 'first-last';
+  image_mode?: "reference" | "first-last";
   reference_images?: string[];
   reference_audio?: string[];
   extra_params?: Record<string, unknown>;
+}
+
+/** Native video task state; the shape intentionally matches image jobs. */
+export interface VideoGenerationJobStatus {
+  job_id: string;
+  status: "running" | "succeeded" | "failed" | "not_found" | string;
+  result: string | null;
+  error: string | null;
 }
 
 interface GenerateJimengCliVideoRequest {
@@ -65,7 +103,7 @@ interface GenerateJimengCliVideoRequest {
   duration: number;
   aspect_ratio: string;
   video_resolution?: string;
-  image_mode?: 'reference' | 'first-last';
+  image_mode?: "reference" | "first-last";
   reference_images?: string[];
   reference_audio?: string[];
 }
@@ -98,7 +136,7 @@ interface GenerateJimengCliImageUpscaleRequest {
  * 与 `canvas/models/registry.ts` 的 JIMENG_CLI_PROVIDER_ID 保持一致;
  * 这里不直接 import 是为了避免 commands 层反向依赖 features 层。
  */
-const JIMENG_CLI_IMAGE_MODEL_PREFIX = 'jimeng-cli/image-';
+const JIMENG_CLI_IMAGE_MODEL_PREFIX = "jimeng-cli/image-";
 
 /**
  * 即梦 CLI 图片超清(image_upscale)的内部模型 id —— 注意它**不以**上面的
@@ -107,9 +145,9 @@ const JIMENG_CLI_IMAGE_MODEL_PREFIX = 'jimeng-cli/image-';
  * 与 `canvas/models/registry.ts` 的 JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID 必须一致,
  * registry.test.ts 里有断言锁住两者相等。
  */
-export const JIMENG_CLI_IMAGE_UPSCALE_MODEL = 'jimeng-cli/upscale';
+export const JIMENG_CLI_IMAGE_UPSCALE_MODEL = "jimeng-cli/upscale";
 
-export type GenerationJobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'not_found';
+export type GenerationJobState = "queued" | "running" | "succeeded" | "failed" | "not_found";
 
 export interface GenerationJobStatus {
   job_id: string;
@@ -133,8 +171,8 @@ function truncateBase64Like(value: string): string {
     return value;
   }
 
-  if (value.startsWith('data:')) {
-    const [meta, payload = ''] = value.split(',', 2);
+  if (value.startsWith("data:")) {
+    const [meta, payload = ""] = value.split(",", 2);
     if (payload.length <= BASE64_PREVIEW_HEAD + BASE64_PREVIEW_TAIL) {
       return value;
     }
@@ -152,15 +190,13 @@ function truncateBase64Like(value: string): string {
 function sanitizeGenerateRequestForLog(request: GenerateRequest): Record<string, unknown> {
   return {
     prompt: truncateText(request.prompt, 240),
-    negative_prompt: truncateText(request.negative_prompt ?? '', 240),
+    negative_prompt: truncateText(request.negative_prompt ?? "", 240),
     model: request.model,
     size: request.size,
     aspect_ratio: request.aspect_ratio,
     image_count: request.image_count ?? 1,
     reference_images_count: request.reference_images?.length ?? 0,
-    reference_images_preview: (request.reference_images ?? []).map((item) =>
-      truncateBase64Like(item)
-    ),
+    reference_images_preview: (request.reference_images ?? []).map((item) => truncateBase64Like(item)),
     extra_params: request.extra_params ?? {},
   };
 }
@@ -172,25 +208,25 @@ interface ErrorWithDetails extends Error {
 function normalizeInvokeError(error: unknown): { message: string; details?: string } {
   if (error instanceof Error) {
     const detailsText =
-      'details' in error
-        ? typeof (error as { details?: unknown }).details === 'string'
+      "details" in error
+        ? typeof (error as { details?: unknown }).details === "string"
           ? (error as { details?: string }).details
           : undefined
         : undefined;
-    return { message: error.message || 'Generation failed', details: detailsText };
+    return { message: error.message || "Generation failed", details: detailsText };
   }
 
-  if (typeof error === 'string') {
-    return { message: error || 'Generation failed', details: error || undefined };
+  if (typeof error === "string") {
+    return { message: error || "Generation failed", details: error || undefined };
   }
 
-  if (error && typeof error === 'object') {
+  if (error && typeof error === "object") {
     const record = error as Record<string, unknown>;
     const message =
-      (typeof record.message === 'string' && record.message) ||
-      (typeof record.error === 'string' && record.error) ||
-      (typeof record.msg === 'string' && record.msg) ||
-      'Generation failed';
+      (typeof record.message === "string" && record.message) ||
+      (typeof record.error === "string" && record.error) ||
+      (typeof record.msg === "string" && record.msg) ||
+      "Generation failed";
     let details: string | undefined;
     try {
       details = truncateText(JSON.stringify(record, null, 2), 2000);
@@ -200,7 +236,7 @@ function normalizeInvokeError(error: unknown): { message: string; details?: stri
     return { message, details };
   }
 
-  return { message: 'Generation failed' };
+  return { message: "Generation failed" };
 }
 
 function createErrorWithDetails(message: string, details?: string): ErrorWithDetails {
@@ -220,59 +256,57 @@ function createErrorWithDetails(message: string, details?: string): ErrorWithDet
  */
 function translateTransportError(message: string, urlLabel: string): string {
   const lower = message.toLowerCase();
-  const isTransport = /(error sending request|fetch failed|failed to fetch|request failed|networkerror|connection (refused|reset|timed out)|tls handshake|ssl handshake|dns|getaddrinfo|name resolution)/i.test(lower);
+  const isTransport =
+    /(error sending request|fetch failed|failed to fetch|request failed|networkerror|connection (refused|reset|timed out)|tls handshake|ssl handshake|dns|getaddrinfo|name resolution)/i.test(
+      lower,
+    );
   if (!isTransport) return message;
   return `网络连接到 ${urlLabel} 失败(${message})。该平台服务器在境外, 国内访问可能出现间歇性丢包,稍候重试或检查代理/防火墙设置。`;
 }
 
 export async function setApiKey(provider: string, apiKey: string): Promise<void> {
-  console.info('[AI] set_api_key', {
+  console.info("[AI] set_api_key", {
     provider,
-    apiKeyMasked: apiKey ? `${apiKey.slice(0, 4)}***${apiKey.slice(-2)}` : '',
+    apiKeyMasked: apiKey ? `${apiKey.slice(0, 4)}***${apiKey.slice(-2)}` : "",
     tauri: isTauri(),
   });
   if (!isTauri()) {
     // 浏览器降级:key 已存于 settingsStore,无需传给 Rust
     return;
   }
-  return await invoke('set_api_key', { provider, apiKey });
+  return await invoke("set_api_key", { provider, apiKey });
 }
 
 function mapGptImageSize(aspectRatio: string): string {
-  if (['9:16', '3:4', '2:3', '4:5', '1:2', '1:3'].includes(aspectRatio)) {
-    return '1024x1536';
+  if (["9:16", "3:4", "2:3", "4:5", "1:2", "1:3"].includes(aspectRatio)) {
+    return "1024x1536";
   }
-  if (['16:9', '3:2', '4:3', '5:4', '2:1', '3:1', '21:9'].includes(aspectRatio)) {
-    return '1536x1024';
+  if (["16:9", "3:2", "4:3", "5:4", "2:1", "3:1", "21:9"].includes(aspectRatio)) {
+    return "1536x1024";
   }
-  return '1024x1024';
+  return "1024x1024";
 }
 
 function usesNativeImageParameters(apiModel: string): boolean {
   const normalized = apiModel.trim().toLowerCase();
-  return normalized.endsWith('-native')
-    || normalized.endsWith('-n')
-    || normalized.includes('gpt-image-1')
-    || normalized.includes('dall-e');
+  return (
+    normalized.endsWith("-native") ||
+    normalized.endsWith("-n") ||
+    normalized.includes("gpt-image-1") ||
+    normalized.includes("dall-e")
+  );
 }
 
-function mapRequestedImageSize(
-  apiModel: string,
-  resolution: string,
-  aspectRatio: string
-): string {
+function mapRequestedImageSize(apiModel: string, resolution: string, aspectRatio: string): string {
   const normalizedResolution = resolution.trim();
   if (/^\d+x\d+$/i.test(normalizedResolution)) {
     return normalizedResolution;
   }
-  if (normalizedResolution.toUpperCase() === '1K') {
+  if (normalizedResolution.toUpperCase() === "1K") {
     return mapGptImageSize(aspectRatio);
   }
-  const targetLongEdge = normalizedResolution.toUpperCase() === '4K'
-    ? 3840
-    : normalizedResolution.toUpperCase() === '2K'
-      ? 2048
-      : 0;
+  const targetLongEdge =
+    normalizedResolution.toUpperCase() === "4K" ? 3840 : normalizedResolution.toUpperCase() === "2K" ? 2048 : 0;
   const match = aspectRatio.trim().match(/^(\d+)\s*:\s*(\d+)$/);
   if (!targetLongEdge || !match) {
     return mapGptImageSize(aspectRatio);
@@ -287,9 +321,9 @@ function mapRequestedImageSize(
   let height: number;
   if (ratioWidth >= ratioHeight) {
     width = targetLongEdge;
-    height = roundTo16(targetLongEdge * ratioHeight / ratioWidth);
+    height = roundTo16((targetLongEdge * ratioHeight) / ratioWidth);
   } else {
-    width = roundTo16(targetLongEdge * ratioWidth / ratioHeight);
+    width = roundTo16((targetLongEdge * ratioWidth) / ratioHeight);
     height = targetLongEdge;
   }
   if (usesNativeImageParameters(apiModel)) {
@@ -297,8 +331,8 @@ function mapRequestedImageSize(
     const pixels = width * height;
     if (pixels > maxNativePixels) {
       const scale = Math.sqrt(maxNativePixels / pixels);
-      width = Math.max(16, Math.floor(width * scale / 16) * 16);
-      height = Math.max(16, Math.floor(height * scale / 16) * 16);
+      width = Math.max(16, Math.floor((width * scale) / 16) * 16);
+      height = Math.max(16, Math.floor((height * scale) / 16) * 16);
     }
   }
   return `${width}x${height}`;
@@ -310,42 +344,42 @@ const browserGenerationJobs = new Map<string, GenerationJobStatus>();
 function getVideoResultUrl(payload: unknown): string | null {
   const urls = new Set<string>();
   const visit = (value: unknown): void => {
-    if (typeof value === 'string') {
+    if (typeof value === "string") {
       const url = value.trim();
       if (/^(https?:|data:video\/)/i.test(url)) urls.add(url);
       const embeddedUrl = url.match(/https?:\/\/[^\s\])}",]+/i)?.[0];
       if (embeddedUrl) urls.add(embeddedUrl);
       return;
     }
-    if (!value || typeof value !== 'object') return;
+    if (!value || typeof value !== "object") return;
     if (Array.isArray(value)) {
       value.forEach(visit);
       return;
     }
     const record = value as Record<string, unknown>;
     [
-      'video_url',
-      'videoUrl',
-      'result_url',
-      'resultUrl',
-      'url',
-      'uri',
-      'value',
-      'output_url',
-      'download_url',
-      'downloadUrl',
-      'data',
-      'videos',
-      'video_urls',
-      'videoUrls',
-      'output_videos',
-      'outputs',
-      'output',
-      'results',
-      'task_result',
-      'files',
-      'task',
-      'content',
+      "video_url",
+      "videoUrl",
+      "result_url",
+      "resultUrl",
+      "url",
+      "uri",
+      "value",
+      "output_url",
+      "download_url",
+      "downloadUrl",
+      "data",
+      "videos",
+      "video_urls",
+      "videoUrls",
+      "output_videos",
+      "outputs",
+      "output",
+      "results",
+      "task_result",
+      "files",
+      "task",
+      "content",
     ].forEach((key) => visit(record[key]));
   };
   visit(payload);
@@ -353,10 +387,10 @@ function getVideoResultUrl(payload: unknown): string | null {
 }
 
 function getVideoTaskId(payload: unknown): string | null {
-  if (typeof payload === 'number' && Number.isFinite(payload)) {
+  if (typeof payload === "number" && Number.isFinite(payload)) {
     return String(payload);
   }
-  if (!payload || typeof payload !== 'object') return null;
+  if (!payload || typeof payload !== "object") return null;
   if (Array.isArray(payload)) {
     for (const item of payload) {
       const taskId = getVideoTaskId(item);
@@ -366,23 +400,23 @@ function getVideoTaskId(payload: unknown): string | null {
   }
   const record = payload as Record<string, unknown>;
   for (const key of [
-    'id',
-    'task_id',
-    'taskId',
-    'video_id',
-    'videoId',
-    'job_id',
-    'jobId',
-    'request_id',
-    'requestId',
-    'generation_id',
-    'generationId',
+    "id",
+    "task_id",
+    "taskId",
+    "video_id",
+    "videoId",
+    "job_id",
+    "jobId",
+    "request_id",
+    "requestId",
+    "generation_id",
+    "generationId",
   ]) {
     const value = record[key];
-    if (typeof value === 'string' && value.trim()) return value.trim();
-    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
   }
-  for (const key of ['data', 'detail', 'result', 'task', 'job', 'video', 'generation', 'response']) {
+  for (const key of ["data", "detail", "result", "task", "job", "video", "generation", "response"]) {
     const taskId = getVideoTaskId(record[key]);
     if (taskId) return taskId;
   }
@@ -398,61 +432,61 @@ function describeVideoResponse(payload: unknown): string {
 }
 
 function normalizeVideoProviderBaseUrl(baseUrl: string): string {
-  const normalized = baseUrl.trim().replace(/\/+$/, '');
+  const normalized = baseUrl.trim().replace(/\/+$/, "");
   // 设置页的 Base URL 约定为站点根路径。兼容用户粘贴 OpenAI 常见的
   // `.../v1` 地址，避免最终请求被拼成 `/v1/v1/video/generations`。
-  return normalized.replace(/\/v(?:1|8)$/i, '');
+  return normalized.replace(/\/v(?:1|8)$/i, "");
 }
 
 function getVideoTaskStatus(payload: unknown): string {
-  if (!payload || typeof payload !== 'object') return '';
+  if (!payload || typeof payload !== "object") return "";
   const record = payload as Record<string, unknown>;
-  for (const key of ['status', 'task_status', 'state']) {
-    if (typeof record[key] === 'string') return record[key].toUpperCase();
+  for (const key of ["status", "task_status", "state"]) {
+    if (typeof record[key] === "string") return record[key].toUpperCase();
   }
-  for (const key of ['data', 'detail', 'result', 'task']) {
+  for (const key of ["data", "detail", "result", "task"]) {
     const status = getVideoTaskStatus(record[key]);
     if (status) return status;
   }
-  return '';
+  return "";
 }
 
 /** 从平台 HTTP 错误响应中提取可读的错误摘要(解析 JSON body 的 message / error.message)。 */
 function buildHttpErrorSummary(status: number, rawResponse: string, url: string): string {
-  let platformMessage = '';
+  let platformMessage = "";
   try {
     const parsed = JSON.parse(rawResponse) as Record<string, unknown>;
     const errorNode = parsed?.error;
-    if (typeof errorNode === 'object' && errorNode !== null) {
+    if (typeof errorNode === "object" && errorNode !== null) {
       const errorMessage = (errorNode as Record<string, unknown>).message;
-      if (typeof errorMessage === 'string' && errorMessage.trim()) {
+      if (typeof errorMessage === "string" && errorMessage.trim()) {
         platformMessage = errorMessage.trim();
       }
     }
-    if (!platformMessage && typeof parsed?.message === 'string' && parsed.message.trim()) {
+    if (!platformMessage && typeof parsed?.message === "string" && parsed.message.trim()) {
       platformMessage = parsed.message.trim();
     }
   } catch {
-    platformMessage = '';
+    platformMessage = "";
   }
 
   if (status === 429) {
-    const hint = platformMessage || '请求过于频繁或平台限流';
+    const hint = platformMessage || "请求过于频繁或平台限流";
     return `HTTP 429 平台限流: ${hint} (${url})`;
   }
   if (status === 401 || status === 403) {
-    const hint = platformMessage || (status === 401 ? 'API Key 无效或未配置' : '无权限访问');
+    const hint = platformMessage || (status === 401 ? "API Key 无效或未配置" : "无权限访问");
     return `HTTP ${status} 鉴权失败: ${hint} (${url})`;
   }
   if (status === 404) {
-    return `HTTP 404 端点不存在: ${platformMessage || '接口路径可能已变更'} (${url})`;
+    return `HTTP 404 端点不存在: ${platformMessage || "接口路径可能已变更"} (${url})`;
   }
 
   const bodySummary = platformMessage
     ? `: ${platformMessage}`
     : rawResponse
       ? `: ${truncateText(rawResponse, 240)}`
-      : '';
+      : "";
   return `HTTP ${status}${bodySummary} (${url})`;
 }
 
@@ -467,31 +501,28 @@ function buildHttpErrorSummary(status: number, rawResponse: string, url: string)
  *     `kling-3.0-omni-720p-*`)文档写明「请求体里的 resolution 不会改档」,
  *     传了无意义还可能冲突 → 一律不传。
  */
-function resolveZzdhVideoResolution(
-  value: string | undefined,
-  aspectRatio: string,
-  model: string,
-): string | undefined {
+function resolveZzdhVideoResolution(value: string | undefined, aspectRatio: string, model: string): string | undefined {
   if (resolveZzdhResolutionTier(model)) return undefined;
-  const requested = value?.trim().toLowerCase() ?? '';
+  const requested = value?.trim().toLowerCase() ?? "";
   if (/^\d+x\d+$/.test(requested)) return requested;
   const dimensions: Record<string, Record<string, string>> = {
-    '16:9': { '480p': '854x480', '720p': '1280x720', '1080p': '1920x1080', '2k': '2560x1440' },
-    '9:16': { '480p': '480x854', '720p': '720x1280', '1080p': '1080x1920', '2k': '1440x2560' },
-    '1:1': { '480p': '480x480', '720p': '720x720', '1080p': '1080x1080', '2k': '2048x2048' },
+    "16:9": { "480p": "854x480", "720p": "1280x720", "1080p": "1920x1080", "2k": "2560x1440" },
+    "9:16": { "480p": "480x854", "720p": "720x1280", "1080p": "1080x1920", "2k": "1440x2560" },
+    "1:1": { "480p": "480x480", "720p": "720x720", "1080p": "1080x1080", "2k": "2048x2048" },
   };
-  return dimensions[aspectRatio.trim()]?.[requested]
-    ?? dimensions[aspectRatio.trim()]?.['720p']
-    ?? '1280x720';
+  return dimensions[aspectRatio.trim()]?.[requested] ?? dimensions[aspectRatio.trim()]?.["720p"] ?? "1280x720";
 }
 
-function resolveProviderEndpoint(baseUrl: string, configuredPath: unknown, fallbackPath: string, taskId?: string): string {
-  const configured = typeof configuredPath === 'string' && configuredPath.trim()
-    ? configuredPath.trim()
-    : fallbackPath;
-  const resolvedPath = taskId ? configured.replace('{taskId}', encodeURIComponent(taskId)) : configured;
+function resolveProviderEndpoint(
+  baseUrl: string,
+  configuredPath: unknown,
+  fallbackPath: string,
+  taskId?: string,
+): string {
+  const configured = typeof configuredPath === "string" && configuredPath.trim() ? configuredPath.trim() : fallbackPath;
+  const resolvedPath = taskId ? configured.replace("{taskId}", encodeURIComponent(taskId)) : configured;
   if (/^https?:\/\//i.test(resolvedPath)) return resolvedPath;
-  return `${baseUrl}${resolvedPath.startsWith('/') ? resolvedPath : `/${resolvedPath}`}`;
+  return `${baseUrl}${resolvedPath.startsWith("/") ? resolvedPath : `/${resolvedPath}`}`;
 }
 
 /** 读取图片实际宽高(供首尾帧画幅跟随首帧), 失败返回 null */
@@ -528,7 +559,7 @@ interface ProviderBinaryResponse {
 /** Generic JSON provider requests use Rust's native desktop HTTP client. */
 export async function requestProviderJson(
   url: string,
-  init: { method?: string; headers?: Record<string, string>; body?: string }
+  init: { method?: string; headers?: Record<string, string>; body?: string },
 ): Promise<ProviderJsonResponse> {
   if (!isTauri()) {
     return await fetch(url, init);
@@ -542,9 +573,9 @@ export async function requestProviderJson(
       throw new Error(`Provider request body is not valid JSON (${url})`);
     }
   }
-  const result = await invoke<{ status: number; body: string }>('request_provider_json', {
+  const result = await invoke<{ status: number; body: string }>("request_provider_json", {
     url,
-    method: init.method ?? 'GET',
+    method: init.method ?? "GET",
     headers: init.headers ?? {},
     body,
   });
@@ -574,7 +605,7 @@ async function requestProviderMultipartViaWebView(
   const bytes = decodeBase64Bytes(init.bodyBase64);
   const form = new FormData();
   form.append(init.fieldName, new Blob([bytes], { type: init.contentType }), init.filename);
-  const response = await fetch(url, { method: 'POST', headers: init.headers, body: form });
+  const response = await fetch(url, { method: "POST", headers: init.headers, body: form });
   return {
     ok: response.ok,
     status: response.status,
@@ -591,7 +622,7 @@ export async function requestProviderMultipart(
     filename: string;
     contentType: string;
     bodyBase64: string;
-  }
+  },
 ): Promise<ProviderJsonResponse> {
   if (!isTauri()) {
     return await requestProviderMultipartViaWebView(url, init);
@@ -612,7 +643,7 @@ export async function requestProviderMultipart(
   }
 
   try {
-    const result = await invoke<{ status: number; body: string }>('request_provider_multipart', {
+    const result = await invoke<{ status: number; body: string }>("request_provider_multipart", {
       url,
       headers: init.headers ?? {},
       fieldName: init.fieldName,
@@ -627,11 +658,10 @@ export async function requestProviderMultipart(
     };
   } catch (nativeError) {
     if (webViewError) {
-      const describe = (error: unknown): string =>
-        error instanceof Error ? error.message : String(error);
+      const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
       throw new Error(
-        `Provider multipart request failed via WebView (${describe(webViewError)}); `
-        + `native fallback failed (${describe(nativeError)})`,
+        `Provider multipart request failed via WebView (${describe(webViewError)}); ` +
+          `native fallback failed (${describe(nativeError)})`,
       );
     }
     throw nativeError;
@@ -645,7 +675,7 @@ export async function requestProviderMultipart(
  */
 async function requestProviderBinary(
   url: string,
-  init: { method?: string; headers?: Record<string, string>; body?: string }
+  init: { method?: string; headers?: Record<string, string>; body?: string },
 ): Promise<ProviderBinaryResponse> {
   if (!isTauri()) {
     const response = await fetch(url, init);
@@ -665,15 +695,15 @@ async function requestProviderBinary(
       throw new Error(`Provider request body is not valid JSON (${url})`);
     }
   }
-  const result = await invoke<{ status: number; body: string; body_base64?: string | null }>('request_provider_json', {
+  const result = await invoke<{ status: number; body: string; body_base64?: string | null }>("request_provider_json", {
     url,
-    method: init.method ?? 'GET',
+    method: init.method ?? "GET",
     headers: init.headers ?? {},
     body: parsedBody,
-    responseEncoding: 'base64',
+    responseEncoding: "base64",
   });
-  const encoded = result.body_base64 ?? '';
-  const binary = encoded ? atob(encoded) : '';
+  const encoded = result.body_base64 ?? "";
+  const binary = encoded ? atob(encoded) : "";
   const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
   return {
     ok: result.status >= 200 && result.status < 300,
@@ -685,9 +715,9 @@ async function requestProviderBinary(
 
 async function persistSub2ApiVideo(bytes: Uint8Array): Promise<string> {
   if (isTauri()) {
-    return await persistImageBinary(bytes, 'mp4');
+    return await persistImageBinary(bytes, "mp4");
   }
-  return URL.createObjectURL(new Blob([bytes], { type: 'video/mp4' }));
+  return URL.createObjectURL(new Blob([bytes], { type: "video/mp4" }));
 }
 
 /**
@@ -697,9 +727,9 @@ async function persistSub2ApiVideo(bytes: Uint8Array): Promise<string> {
  */
 async function resolveZzdhFirstLastAspectRatio(
   firstFrameSource: string | undefined,
-  fallbackAspectRatio: string
+  fallbackAspectRatio: string,
 ): Promise<string> {
-  const dimensions = await loadImageDimensions(firstFrameSource ?? '');
+  const dimensions = await loadImageDimensions(firstFrameSource ?? "");
   if (!dimensions) return resolveZzdhAspectRatio(fallbackAspectRatio);
   return resolveZzdhAspectRatioFromSize(dimensions.width, dimensions.height);
 }
@@ -715,12 +745,12 @@ async function submitZzdhVideoTask(
   headers: Record<string, string>,
   body: string,
 ): Promise<{ ok: boolean; status: number; rawResponse: string }> {
-  let last = { ok: false, status: 0, rawResponse: '' };
+  let last = { ok: false, status: 0, rawResponse: "" };
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const response = await requestProviderJson(submitUrl, { method: 'POST', headers, body });
+    const response = await requestProviderJson(submitUrl, { method: "POST", headers, body });
     const rawResponse = await response.text();
     last = { ok: response.ok, status: response.status, rawResponse };
-    const retriable = !response.ok && attempt === 0 && rawResponse.includes('请求转换失败');
+    const retriable = !response.ok && attempt === 0 && rawResponse.includes("请求转换失败");
     if (!retriable) break;
     await new Promise((resolve) => setTimeout(resolve, 1500));
   }
@@ -734,39 +764,39 @@ async function submitZzdhVideoTask(
 export { resolveZzdhGenerationMode };
 
 /** 字子动画参考图：H3 只接受公网地址；其它兼容模型可接收内嵌 base64。 */
-export type ZzdhReferenceImage =
-  | { url: string; role: ZzdhReferenceRole }
-  | { base64: string; role: ZzdhReferenceRole };
+export type ZzdhReferenceImage = { url: string; role: ZzdhReferenceRole } | { base64: string; role: ZzdhReferenceRole };
 
 /** 字子动画参考视频沿用 reference_videos: [{ url }] 结构。H3 只接受公网 URL。 */
-export type ZzdhReferenceVideo =
-  | { url: string }
-  | { base64: string };
+export type ZzdhReferenceVideo = { url: string } | { base64: string };
 
 interface ReferenceAssetUploadConfig {
   url: string;
   token: string;
 }
 
-function resolveReferenceAssetUploadConfig(extraParams: GenerateVideoRequest['extra_params']): ReferenceAssetUploadConfig | null {
-  const url = typeof extraParams?.reference_asset_upload_url === 'string'
-    ? extraParams.reference_asset_upload_url.trim().replace(/\/+$/, '')
-    : '';
-  const token = typeof extraParams?.reference_asset_upload_token === 'string'
-    ? extraParams.reference_asset_upload_token.trim()
-    : '';
+function resolveReferenceAssetUploadConfig(
+  extraParams: GenerateVideoRequest["extra_params"],
+): ReferenceAssetUploadConfig | null {
+  const url =
+    typeof extraParams?.reference_asset_upload_url === "string"
+      ? extraParams.reference_asset_upload_url.trim().replace(/\/+$/, "")
+      : "";
+  const token =
+    typeof extraParams?.reference_asset_upload_token === "string"
+      ? extraParams.reference_asset_upload_token.trim()
+      : "";
   return url && token ? { url, token } : null;
 }
 
 async function uploadPublicReferenceAsset(
-  asset: Exclude<Awaited<ReturnType<typeof resolveReferenceAssetSource>>, { kind: 'url' }>,
+  asset: Exclude<Awaited<ReturnType<typeof resolveReferenceAssetSource>>, { kind: "url" }>,
   upload: ReferenceAssetUploadConfig,
   index: number,
 ): Promise<string> {
   const response = await requestProviderJson(upload.url, {
-    method: 'POST',
+    method: "POST",
     headers: {
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
       Authorization: `Bearer ${upload.token}`,
     },
     body: JSON.stringify({
@@ -800,23 +830,25 @@ async function uploadPublicReferenceAsset(
 export async function resolveZzdhReferenceImages(
   sources: string[],
   family: ReturnType<typeof resolveZzdhVideoFamily>,
-  imageMode: GenerateVideoRequest['image_mode'],
+  imageMode: GenerateVideoRequest["image_mode"],
   upload?: ReferenceAssetUploadConfig | null,
 ): Promise<ZzdhReferenceImage[]> {
-  return await Promise.all(sources.map(async (source, index) => {
-    const asset = await resolveReferenceAssetSource(source, `字子动画参考图片 ${index + 1}`);
-    const role = resolveZzdhReferenceRole(family, imageMode, index);
-    if (asset.kind === 'url') return { url: asset.url, role };
-    if (family === 'minimax-h3') {
-      if (upload) {
-        return { url: await uploadPublicReferenceAsset(asset, upload, index), role };
+  return await Promise.all(
+    sources.map(async (source, index) => {
+      const asset = await resolveReferenceAssetSource(source, `字子动画参考图片 ${index + 1}`);
+      const role = resolveZzdhReferenceRole(family, imageMode, index);
+      if (asset.kind === "url") return { url: asset.url, role };
+      if (family === "minimax-h3") {
+        if (upload) {
+          return { url: await uploadPublicReferenceAsset(asset, upload, index), role };
+        }
+        throw new Error(
+          `字子动画 MiniMax H3 参考图仅支持公网 HTTP(S) URL：第 ${index + 1} 张是本地或内嵌素材。请先在字子动画的平台设置中配置“参考素材上传地址”和“上传令牌”，或上传到可公开访问的图床/CDN 后再生成。`,
+        );
       }
-      throw new Error(
-        `字子动画 MiniMax H3 参考图仅支持公网 HTTP(S) URL：第 ${index + 1} 张是本地或内嵌素材。请先在字子动画的平台设置中配置“参考素材上传地址”和“上传令牌”，或上传到可公开访问的图床/CDN 后再生成。`,
-      );
-    }
-    return { base64: asset.base64, role };
-  }));
+      return { base64: asset.base64, role };
+    }),
+  );
 }
 
 export async function resolveZzdhReferenceVideos(
@@ -824,31 +856,33 @@ export async function resolveZzdhReferenceVideos(
   family: ReturnType<typeof resolveZzdhVideoFamily>,
   upload?: ReferenceAssetUploadConfig | null,
 ): Promise<ZzdhReferenceVideo[]> {
-  return await Promise.all(sources.map(async (source, index) => {
-    const asset = await resolveReferenceAssetSource(source, `字子动画参考视频 ${index + 1}`);
-    if (asset.kind === 'url') return { url: asset.url };
-    if (family === 'minimax-h3') {
-      if (upload) {
-        return { url: await uploadPublicReferenceAsset(asset, upload, index) };
+  return await Promise.all(
+    sources.map(async (source, index) => {
+      const asset = await resolveReferenceAssetSource(source, `字子动画参考视频 ${index + 1}`);
+      if (asset.kind === "url") return { url: asset.url };
+      if (family === "minimax-h3") {
+        if (upload) {
+          return { url: await uploadPublicReferenceAsset(asset, upload, index) };
+        }
+        throw new Error(
+          "字子动画 MiniMax H3 对口型参考视频仅支持公网 HTTP(S) URL：当前素材是本地或内嵌视频。请先在字子动画的平台设置中配置“参考素材上传地址”和“上传令牌”，或上传到可公开访问的图床/CDN 后再生成。",
+        );
       }
-      throw new Error(
-        '字子动画 MiniMax H3 对口型参考视频仅支持公网 HTTP(S) URL：当前素材是本地或内嵌视频。请先在字子动画的平台设置中配置“参考素材上传地址”和“上传令牌”，或上传到可公开访问的图床/CDN 后再生成。',
-      );
-    }
-    return { base64: asset.base64 };
-  }));
+      return { base64: asset.base64 };
+    }),
+  );
 }
 
 async function generateZzdhVideo(
   request: GenerateVideoRequest,
   baseUrl: string,
   apiModel: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
 ): Promise<string> {
-  const isFirstLast = request.image_mode === 'first-last';
+  const isFirstLast = request.image_mode === "first-last";
   // 产品线决定 role 语义 / mode 支持 / 时长范围(见 zzdhApi 文档注释)。
   const family = resolveZzdhVideoFamily(apiModel);
-  const isMinimaxH3 = family === 'minimax-h3';
+  const isMinimaxH3 = family === "minimax-h3";
   const images = request.reference_images?.slice(0, isFirstLast ? 2 : undefined) ?? [];
   // H3 的 `url` 只接受公网 HTTP(S) 地址。本地素材会在此处提前给出可操作提示，避免
   // 被平台错误当成公网 URL 而触发「reference image must be public」。
@@ -862,7 +896,7 @@ async function generateZzdhVideo(
     const value = request.extra_params?.reference_videos;
     if (!Array.isArray(value)) return [];
     return value
-      .filter((video): video is string => typeof video === 'string' && video.trim().length > 0)
+      .filter((video): video is string => typeof video === "string" && video.trim().length > 0)
       .map((video) => video.trim())
       .slice(0, 3);
   })();
@@ -910,11 +944,11 @@ async function generateZzdhVideo(
     ...(referenceAudios.length ? { reference_audios: referenceAudios } : {}),
   };
   const submitUrl = `${baseUrl}/v8/videos/generations`;
-  const { ok: submitOk, status: submitStatus, rawResponse } = await submitZzdhVideoTask(
-    submitUrl,
-    headers,
-    JSON.stringify(body),
-  );
+  const {
+    ok: submitOk,
+    status: submitStatus,
+    rawResponse,
+  } = await submitZzdhVideoTask(submitUrl, headers, JSON.stringify(body));
   let payload: unknown;
   try {
     payload = rawResponse ? JSON.parse(rawResponse) : {};
@@ -947,14 +981,14 @@ async function generateZzdhVideo(
     const videoUrl = getVideoResultUrl(payload);
     if (videoUrl) return videoUrl;
     const status = getVideoTaskStatus(payload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
       throw new Error(`字子动画视频生成失败: ${status}`);
     }
   }
 }
 
 function extractSub2ApiUploadImageId(payload: unknown): string | null {
-  if (!payload || typeof payload !== 'object') return null;
+  if (!payload || typeof payload !== "object") return null;
   if (Array.isArray(payload)) {
     for (const item of payload) {
       const imageId = extractSub2ApiUploadImageId(item);
@@ -964,8 +998,8 @@ function extractSub2ApiUploadImageId(payload: unknown): string | null {
   }
   const record = payload as Record<string, unknown>;
   const imageId = record.image_id ?? record.imageId;
-  if (typeof imageId === 'string' && imageId.trim()) return imageId.trim();
-  for (const key of ['data', 'file', 'result']) {
+  if (typeof imageId === "string" && imageId.trim()) return imageId.trim();
+  for (const key of ["data", "file", "result"]) {
     const nestedId = extractSub2ApiUploadImageId(record[key]);
     if (nestedId) return nestedId;
   }
@@ -978,18 +1012,14 @@ function getDataUrlBase64(source: string): string | null {
 }
 
 function resolveRjmSeedanceResolution(model: string, requested: string | undefined): string {
-  const allowed = model.trim().toLowerCase() === 'seedance2.5'
-    ? ['480p', '720p']
-    : ['480p', '720p', '1080p', '4k'];
+  const allowed = model.trim().toLowerCase() === "seedance2.5" ? ["480p", "720p"] : ["480p", "720p", "1080p", "4k"];
   const normalizedRequested = requested?.trim().toLowerCase();
-  return normalizedRequested && allowed.includes(normalizedRequested)
-    ? normalizedRequested
-    : '720p';
+  return normalizedRequested && allowed.includes(normalizedRequested) ? normalizedRequested : "720p";
 }
 
 function extractBinghuoAssetUrl(payload: unknown): string | null {
-  if (typeof payload === 'string' && /^https?:\/\//i.test(payload.trim())) return payload.trim();
-  if (!payload || typeof payload !== 'object') return null;
+  if (typeof payload === "string" && /^https?:\/\//i.test(payload.trim())) return payload.trim();
+  if (!payload || typeof payload !== "object") return null;
   if (Array.isArray(payload)) {
     for (const item of payload) {
       const url = extractBinghuoAssetUrl(item);
@@ -999,9 +1029,25 @@ function extractBinghuoAssetUrl(payload: unknown): string | null {
   }
   const record = payload as Record<string, unknown>;
   for (const key of [
-    'url', 'asset_url', 'assetUrl', 'public_url', 'publicUrl', 'cdn_url', 'cdnUrl',
-    'file_url', 'fileUrl', 'web_url', 'webUrl', 'signed_url', 'signedUrl', 'href',
-    'download_url', 'downloadUrl', 'data', 'result', 'asset',
+    "url",
+    "asset_url",
+    "assetUrl",
+    "public_url",
+    "publicUrl",
+    "cdn_url",
+    "cdnUrl",
+    "file_url",
+    "fileUrl",
+    "web_url",
+    "webUrl",
+    "signed_url",
+    "signedUrl",
+    "href",
+    "download_url",
+    "downloadUrl",
+    "data",
+    "result",
+    "asset",
   ]) {
     const url = extractBinghuoAssetUrl(record[key]);
     if (url) return url;
@@ -1023,16 +1069,16 @@ async function uploadPlatformReferenceAsset(
   uploadPath: string,
 ): Promise<string> {
   const asset = await resolveReferenceAssetSource(source, platformLabel);
-  if (asset.kind === 'url') return asset.url;
+  if (asset.kind === "url") return asset.url;
   const uploadUrl = `${baseUrl}${uploadPath}`;
   // multipart 需自行生成 boundary, 转发 JSON 的 Content-Type 会让上传体失效。
   const uploadHeaders = Object.fromEntries(
-    Object.entries(headers).filter(([name]) => name.toLowerCase() !== 'content-type'),
+    Object.entries(headers).filter(([name]) => name.toLowerCase() !== "content-type"),
   );
   const uploadAttempt = (): Promise<ProviderJsonResponse> =>
     requestProviderMultipart(uploadUrl, {
       headers: uploadHeaders,
-      fieldName: 'file',
+      fieldName: "file",
       filename: `reference-${index + 1}.${asset.extension}`,
       contentType: asset.mimeType,
       bodyBase64: asset.base64,
@@ -1049,15 +1095,15 @@ async function uploadPlatformReferenceAsset(
       throw new Error(`${platformLabel} 参考素材上传失败: 平台返回了非 JSON 响应 (${uploadUrl})`);
     }
     if (!response.ok) {
-      throw new Error(`${platformLabel} 参考素材上传失败: ${buildHttpErrorSummary(response.status, rawResponse, uploadUrl)}`);
+      throw new Error(
+        `${platformLabel} 参考素材上传失败: ${buildHttpErrorSummary(response.status, rawResponse, uploadUrl)}`,
+      );
     }
     const url = extractBinghuoAssetUrl(payload);
     if (url) return url;
     lastPayload = payload;
   }
-  throw new Error(
-    `${platformLabel} 参考素材上传响应中未找到公网 URL: ${describeVideoResponse(lastPayload)}`,
-  );
+  throw new Error(`${platformLabel} 参考素材上传响应中未找到公网 URL: ${describeVideoResponse(lastPayload)}`);
 }
 
 async function uploadBinghuoReferenceAsset(
@@ -1066,14 +1112,7 @@ async function uploadBinghuoReferenceAsset(
   headers: Record<string, string>,
   index: number,
 ): Promise<string> {
-  return await uploadPlatformReferenceAsset(
-    source,
-    baseUrl,
-    headers,
-    index,
-    '炳火 API',
-    '/v1/assets/uploads',
-  );
+  return await uploadPlatformReferenceAsset(source, baseUrl, headers, index, "炳火 API", "/v1/assets/uploads");
 }
 
 async function generateBinghuoVideo(
@@ -1083,14 +1122,17 @@ async function generateBinghuoVideo(
   headers: Record<string, string>,
 ): Promise<string> {
   const rawImages = request.reference_images ?? [];
-  const isMinimaxH3 = apiModel.trim().toLowerCase().startsWith('minimax-h3-pro-');
-  const imageLimit = request.image_mode === 'first-last' ? 2 : (isMinimaxH3 ? 9 : 30);
+  const isMinimaxH3 = apiModel.trim().toLowerCase().startsWith("minimax-h3-pro-");
+  const imageLimit = request.image_mode === "first-last" ? 2 : isMinimaxH3 ? 9 : 30;
   // 参考视频: 来自 extra_params.reference_videos(URL 列表), 上传换 OSS 后填 reference_videos。
   // 字段名必须叫 reference_videos(手册 3.3 红字强调: 'videos'/'video_urls' 部分模型被忽略)。
   const rawReferenceVideos = (() => {
     const value = request.extra_params?.reference_videos;
     if (!Array.isArray(value)) return [];
-    return value.filter((v): v is string => typeof v === 'string' && v.trim().length > 0).map((v) => v.trim()).slice(0, 3);
+    return value
+      .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+      .map((v) => v.trim())
+      .slice(0, 3);
   })();
   // 跳过真人审核: 责任声明(手册 3.8), 仅 bh 系模型生效, 显式 true 时下游跳过审核。
   // 炳火限定为以 'bh2.0-' 开头或等于 'bh2.04K' 的模型 id, 其余模型传了也由平台忽略。
@@ -1100,25 +1142,23 @@ async function generateBinghuoVideo(
   let referenceVideoSources: string[];
   try {
     imageSources = await Promise.all(
-      rawImages.slice(0, imageLimit)
+      rawImages
+        .slice(0, imageLimit)
         .map((source, index) => uploadBinghuoReferenceAsset(source, baseUrl, headers, index)),
     );
     audioSources = await Promise.all(
-      (request.reference_audio ?? []).slice(0, 3)
+      (request.reference_audio ?? [])
+        .slice(0, 3)
         .map((source, index) => uploadBinghuoReferenceAsset(source, baseUrl, headers, imageSources.length + index)),
     );
     referenceVideoSources = await Promise.all(
-      rawReferenceVideos
-        .map((source, index) => uploadBinghuoReferenceAsset(
-          source,
-          baseUrl,
-          headers,
-          imageSources.length + audioSources.length + index,
-        )),
+      rawReferenceVideos.map((source, index) =>
+        uploadBinghuoReferenceAsset(source, baseUrl, headers, imageSources.length + audioSources.length + index),
+      ),
     );
   } catch (error) {
     if (error instanceof Error) {
-      error.message = translateTransportError(error.message, '炳火 API 上传端点');
+      error.message = translateTransportError(error.message, "炳火 API 上传端点");
     }
     throw error;
   }
@@ -1130,7 +1170,7 @@ async function generateBinghuoVideo(
     generate_audio: true,
     n: 1,
   };
-  if (request.image_mode === 'first-last' && imageSources.length > 0) {
+  if (request.image_mode === "first-last" && imageSources.length > 0) {
     body.start_frame = [imageSources[0]];
     if (imageSources[1]) body.end_frame = [imageSources[1]];
   } else if (imageSources.length > 0) {
@@ -1146,14 +1186,14 @@ async function generateBinghuoVideo(
   let submitRaw: string;
   try {
     submitResponse = await requestProviderJson(submitUrl, {
-      method: 'POST',
+      method: "POST",
       headers,
       body: JSON.stringify(body),
     });
     submitRaw = await submitResponse.text();
   } catch (error) {
     if (error instanceof Error) {
-      error.message = translateTransportError(error.message, '炳火 API 提交端点');
+      error.message = translateTransportError(error.message, "炳火 API 提交端点");
     }
     throw error;
   }
@@ -1182,7 +1222,7 @@ async function generateBinghuoVideo(
       taskRawResponse = await taskResponse.text();
     } catch (error) {
       if (error instanceof Error) {
-        error.message = translateTransportError(error.message, '炳火 API 轮询端点');
+        error.message = translateTransportError(error.message, "炳火 API 轮询端点");
       }
       throw error;
     }
@@ -1197,7 +1237,7 @@ async function generateBinghuoVideo(
     const videoUrl = getVideoResultUrl(payload);
     if (videoUrl) return videoUrl;
     const status = getVideoTaskStatus(payload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
       const reason = getVideoTaskFailureReason(payload);
       throw new Error(`炳火 API 视频生成失败: ${reason ?? describeVideoResponse(payload)}`);
     }
@@ -1216,12 +1256,12 @@ async function generateWgspaiVideo(
   headers: Record<string, string>,
 ): Promise<string> {
   const rawImages = request.reference_images ?? [];
-  const imageSources = rawImages.slice(0, request.image_mode === 'first-last' ? 2 : 30);
+  const imageSources = rawImages.slice(0, request.image_mode === "first-last" ? 2 : 30);
   const audioSources = (request.reference_audio ?? []).slice(0, 3);
   // 平台没有独立上传端点, 本地素材只能读成 data URL 内嵌进请求体。
   const normalizeSource = async (source: string, label: string): Promise<string> => {
     const asset = await resolveReferenceAssetSource(source, `wgspai API 参考${label}`);
-    return asset.kind === 'url' ? asset.url : `data:${asset.mimeType};base64,${asset.base64}`;
+    return asset.kind === "url" ? asset.url : `data:${asset.mimeType};base64,${asset.base64}`;
   };
   const normalizedImages = await Promise.all(
     imageSources.map((source, index) => normalizeSource(source, `素材 ${index + 1}`)),
@@ -1237,7 +1277,7 @@ async function generateWgspaiVideo(
     generate_audio: true,
     n: 1,
   };
-  if (request.image_mode === 'first-last' && normalizedImages.length > 0) {
+  if (request.image_mode === "first-last" && normalizedImages.length > 0) {
     body.start_frame = [normalizedImages[0]];
     if (normalizedImages[1]) body.end_frame = [normalizedImages[1]];
   } else if (normalizedImages.length > 0) {
@@ -1248,7 +1288,7 @@ async function generateWgspaiVideo(
 
   const submitUrl = `${baseUrl}/v1/video/generations`;
   const response = await requestProviderJson(submitUrl, {
-    method: 'POST',
+    method: "POST",
     headers,
     body: JSON.stringify(body),
   });
@@ -1279,12 +1319,14 @@ async function generateWgspaiVideo(
       throw new Error(`wgspai API 视频查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
     }
     if (!taskResponse.ok) {
-      throw new Error(`wgspai API 视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+      throw new Error(
+        `wgspai API 视频查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`,
+      );
     }
     const videoUrl = getVideoResultUrl(payload);
     if (videoUrl) return videoUrl;
     const status = getVideoTaskStatus(payload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
       throw new Error(`wgspai API 视频生成失败: ${describeVideoResponse(payload)}`);
     }
   }
@@ -1302,15 +1344,15 @@ export async function uploadZhiniaoReferenceAsset(
   headers: Record<string, string>,
   index: number,
 ): Promise<string> {
-  return await uploadPlatformReferenceAsset(source, baseUrl, headers, index, '知鸟 AI', '/v1/files');
+  return await uploadPlatformReferenceAsset(source, baseUrl, headers, index, "知鸟 AI", "/v1/files");
 }
 
 /** 知鸟 AI 扁平入口的 mode 取值: 无参考=文生视频, 单图=首帧, 双图首尾帧, 多图=参考生视频。 */
 function resolveZhiniaoVideoMode(imageMode: string | undefined, imageCount: number): string {
-  if (imageCount === 0) return 'text-to-video';
-  if (imageMode === 'first-last' && imageCount >= 2) return 'first-last';
-  if (imageCount === 1) return 'first-frame';
-  return 'reference';
+  if (imageCount === 0) return "text-to-video";
+  if (imageMode === "first-last" && imageCount >= 2) return "first-last";
+  if (imageCount === 1) return "first-frame";
+  return "reference";
 }
 
 /**
@@ -1325,7 +1367,7 @@ async function generateZhiniaoVideo(
   apiModel: string,
   headers: Record<string, string>,
 ): Promise<string> {
-  const maxImages = request.image_mode === 'first-last' ? 2 : 30;
+  const maxImages = request.image_mode === "first-last" ? 2 : 30;
   const rawImages = (request.reference_images ?? []).slice(0, maxImages);
   const imageSources = await Promise.all(
     rawImages.map((source, index) => uploadZhiniaoReferenceAsset(source, baseUrl, headers, index)),
@@ -1333,7 +1375,8 @@ async function generateZhiniaoVideo(
   const rawAudios = (request.reference_audio ?? []).slice(0, 10);
   const audioSources = await Promise.all(
     rawAudios.map((source, index) =>
-      uploadZhiniaoReferenceAsset(source, baseUrl, headers, imageSources.length + index)),
+      uploadZhiniaoReferenceAsset(source, baseUrl, headers, imageSources.length + index),
+    ),
   );
 
   const body: Record<string, unknown> = {
@@ -1351,7 +1394,7 @@ async function generateZhiniaoVideo(
 
   const submitUrl = `${baseUrl}/v1/videos/generations`;
   const response = await requestProviderJson(submitUrl, {
-    method: 'POST',
+    method: "POST",
     headers,
     body: JSON.stringify(body),
   });
@@ -1389,7 +1432,7 @@ async function generateZhiniaoVideo(
     const videoUrl = getVideoResultUrl(payload);
     if (videoUrl) return videoUrl;
     const status = getVideoTaskStatus(payload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
       throw new Error(`知鸟 AI 视频生成失败: ${describeVideoResponse(payload)}`);
     }
   }
@@ -1406,11 +1449,11 @@ async function generateZhiniaoVideo(
  */
 const ZHINIAO_UPSCALE_VERIFY = {
   // 源视频公网 URL 字段名（已实测确认）
-  videoUrlField: 'video_url',
+  videoUrlField: "video_url",
   // 档位字段名（已实测确认），取值：720p | 1080p | 4K
-  tierField: 'resolution',
+  tierField: "resolution",
   // BitRate 字段名（已实测确认，网关透传）
-  bitRateField: 'bit_rate',
+  bitRateField: "bit_rate",
 } as const;
 
 export interface UpscaleZhiniaoVideoRequest {
@@ -1440,7 +1483,7 @@ export async function upscaleZhiniaoVideo(
 
   const submitUrl = `${baseUrl}/v1/videos/generations`;
   const response = await requestProviderJson(submitUrl, {
-    method: 'POST',
+    method: "POST",
     headers,
     body: JSON.stringify(body),
   });
@@ -1472,12 +1515,14 @@ export async function upscaleZhiniaoVideo(
       throw new Error(`知鸟 AI 视频超分查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
     }
     if (!taskResponse.ok) {
-      throw new Error(`知鸟 AI 视频超分查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+      throw new Error(
+        `知鸟 AI 视频超分查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`,
+      );
     }
     const videoUrl = getVideoResultUrl(payload);
     if (videoUrl) return videoUrl;
     const status = getVideoTaskStatus(payload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
       throw new Error(`知鸟 AI 视频超分失败: ${describeVideoResponse(payload)}`);
     }
   }
@@ -1512,15 +1557,15 @@ export function resolveZhiniaoUpscaleCredentials(
   configuredBaseUrl: string,
 ): { baseUrl: string; apiKey: string } | null {
   const store = useSettingsStore.getState();
-  const directKey = (store.apiKeys[providerId] ?? '').trim();
+  const directKey = (store.apiKeys[providerId] ?? "").trim();
   const directBaseUrl = normalizeVideoProviderBaseUrl(configuredBaseUrl);
   if (directBaseUrl && directKey) {
     return { baseUrl: directBaseUrl, apiKey: directKey };
   }
   for (const api of store.customApis) {
-    const candidateBaseUrl = (api.baseUrl ?? '').trim();
+    const candidateBaseUrl = (api.baseUrl ?? "").trim();
     if (!/(?:cuai\.token6688\.com|api\.tokengo\.love)/i.test(candidateBaseUrl)) continue;
-    const candidateKey = (store.apiKeys[`custom:${api.id}`] ?? '').trim();
+    const candidateKey = (store.apiKeys[`custom:${api.id}`] ?? "").trim();
     if (!candidateKey) continue;
     return {
       baseUrl: normalizeVideoProviderBaseUrl(directBaseUrl || candidateBaseUrl),
@@ -1530,22 +1575,60 @@ export function resolveZhiniaoUpscaleCredentials(
   return null;
 }
 
+function isRunningHubBaseUrl(baseUrl: string): boolean {
+  return /runninghub\.(?:ai|cn)/i.test(baseUrl);
+}
+
+/**
+ * 解析 RunningHub 视频超分凭证。
+ *
+ * Topaz 工作流沿用用户已配置的 RunningHub 自定义平台；provider id 只是默认值，
+ * 因此即使设置里平台被改名，也会按 RunningHub 域名回退查找已填写 API Key 的配置。
+ */
+export function resolveRunningHubUpscaleCredentials(
+  providerId: string,
+  configuredBaseUrl: string,
+): { baseUrl: string; apiKey: string } | null {
+  const store = useSettingsStore.getState();
+  const directBaseUrl = normalizeVideoProviderBaseUrl(configuredBaseUrl);
+  const directKey = (store.apiKeys[providerId] ?? "").trim();
+  if (isRunningHubBaseUrl(directBaseUrl) && directKey) {
+    return { baseUrl: directBaseUrl, apiKey: directKey };
+  }
+  for (const api of store.customApis) {
+    const candidateBaseUrl = normalizeVideoProviderBaseUrl(api.baseUrl ?? "");
+    if (!isRunningHubBaseUrl(candidateBaseUrl)) continue;
+    const candidateKey = (store.apiKeys[`custom:${api.id}`] ?? "").trim();
+    if (candidateKey) return { baseUrl: candidateBaseUrl, apiKey: candidateKey };
+  }
+  return null;
+}
+
 export async function upscaleVideo(request: UpscaleVideoRequest): Promise<string> {
   if (!isCustomModel(request.model)) {
-    throw new Error('视频超分仅支持自定义平台(custom:*)模型');
+    throw new Error("视频超分仅支持自定义平台(custom:*)模型");
   }
-  const providerId = request.model.split('/')[0] ?? '';
-  const apiModel = request.model.split('/').slice(1).join('/').trim();
-  const configuredBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
-    ? request.extra_params.provider_base_url
-    : '';
+  const providerId = request.model.split("/")[0] ?? "";
+  const apiModel = request.model.split("/").slice(1).join("/").trim();
+  const configuredBaseUrl =
+    typeof request.extra_params?.provider_base_url === "string" ? request.extra_params.provider_base_url : "";
+  if (request.extra_params?.video_upscale_provider === "runninghub-topaz") {
+    const credentials = resolveRunningHubUpscaleCredentials(providerId, configuredBaseUrl);
+    if (!credentials) {
+      throw new Error("请在设置中配置 RunningHub 视频超分对应的 Base URL 与 API Key");
+    }
+    return await generateRunningHubTopazVideoUpscale(request, credentials.baseUrl, {
+      Authorization: `Bearer ${credentials.apiKey}`,
+      "Content-Type": "application/json",
+    });
+  }
   const credentials = resolveZhiniaoUpscaleCredentials(providerId, configuredBaseUrl);
-  const baseUrl = credentials?.baseUrl ?? '';
-  const apiKey = credentials?.apiKey ?? '';
+  const baseUrl = credentials?.baseUrl ?? "";
+  const apiKey = credentials?.apiKey ?? "";
   if (!baseUrl || !apiKey || !apiModel) {
-    throw new Error('请在设置中配置视频超分模型对应的 Base URL、API Key 和模型名称');
+    throw new Error("请在设置中配置视频超分模型对应的 Base URL、API Key 和模型名称");
   }
-  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
 
   // VFR(可变帧率)源视频直接上传，会被超分服务端按错误时间轴整体拉伸成慢动作
   //（实测 14.02s/337 帧被拉到 25.02s/600 帧、音画不同步）。本地素材先做 CFR 归一化：
@@ -1555,14 +1638,14 @@ export async function upscaleVideo(request: UpscaleVideoRequest): Promise<string
   const localVideoPath = localPathFromReferenceSource(request.videoSource);
   if (localVideoPath && isTauri()) {
     try {
-      const cfr = await invoke<VideoCfrResult>('normalize_video_cfr', {
+      const cfr = await invoke<VideoCfrResult>("normalize_video_cfr", {
         sourcePath: localVideoPath,
       });
       if (cfr.converted && cfr.outputPath) {
         uploadSource = cfr.outputPath;
       }
     } catch (error) {
-      console.warn('[upscaleVideo] CFR 归一化不可用，按原始视频上传:', error);
+      console.warn("[upscaleVideo] CFR 归一化不可用，按原始视频上传:", error);
     }
   }
   const videoUrl = await uploadZhiniaoReferenceAsset(uploadSource, baseUrl, headers, 0);
@@ -1582,15 +1665,15 @@ export async function upscaleVideo(request: UpscaleVideoRequest): Promise<string
 async function uploadSub2ApiReferenceImage(
   source: string,
   baseUrl: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
 ): Promise<string> {
   const imageB64 = getDataUrlBase64(source);
   if (!imageB64) {
-    throw new Error('Sub2API 本地参考图必须转换为 Base64 图片数据后上传');
+    throw new Error("Sub2API 本地参考图必须转换为 Base64 图片数据后上传");
   }
   const uploadUrl = `${baseUrl}/v1/files`;
   const response = await requestProviderJson(uploadUrl, {
-    method: 'POST',
+    method: "POST",
     headers,
     body: JSON.stringify({ image_b64: imageB64 }),
   });
@@ -1619,11 +1702,10 @@ async function generateSub2ApiVideo(
   useRjmProtocol = false,
 ): Promise<string> {
   if (request.reference_audio?.length) {
-    throw new Error('Sub2API 当前推荐的 Seedance 视频链路只支持图片参考，暂不提交音频参考。');
+    throw new Error("Sub2API 当前推荐的 Seedance 视频链路只支持图片参考，暂不提交音频参考。");
   }
-  const videoImages = request.image_mode === 'first-last'
-    ? request.reference_images?.slice(0, 2)
-    : request.reference_images;
+  const videoImages =
+    request.image_mode === "first-last" ? request.reference_images?.slice(0, 2) : request.reference_images;
   const imageIds: string[] = [];
   const imageUrls: string[] = [];
   for (const source of videoImages ?? []) {
@@ -1636,29 +1718,28 @@ async function generateSub2ApiVideo(
 
   const submitUrl = useRjmProtocol
     ? `${baseUrl}/v1/videos`
-    : resolveProviderEndpoint(baseUrl, request.extra_params?.video_submit_path, '/v1/videos');
+    : resolveProviderEndpoint(baseUrl, request.extra_params?.video_submit_path, "/v1/videos");
   const normalizedApiModel = apiModel.trim().toLowerCase();
-  const fixedSeedanceDuration = normalizedApiModel === 'seedance2.5'
-    ? 30
-    : normalizedApiModel === 'seedance2.0'
-      ? 15
-      : undefined;
+  const fixedSeedanceDuration =
+    normalizedApiModel === "seedance2.5" ? 30 : normalizedApiModel === "seedance2.0" ? 15 : undefined;
   const isFixedSeedanceModel = fixedSeedanceDuration !== undefined;
-  const ratio = request.image_mode === 'first-last' && imageIds.length > 0 && useRjmProtocol
-    ? 'auto'
-    : isFixedSeedanceModel && (request.aspect_ratio === '16:9' || request.aspect_ratio === '9:16')
-    ? request.aspect_ratio
-    : isFixedSeedanceModel
-      ? '16:9'
-      : request.aspect_ratio;
+  const ratio =
+    request.image_mode === "first-last" && imageIds.length > 0 && useRjmProtocol
+      ? "auto"
+      : isFixedSeedanceModel && (request.aspect_ratio === "16:9" || request.aspect_ratio === "9:16")
+        ? request.aspect_ratio
+        : isFixedSeedanceModel
+          ? "16:9"
+          : request.aspect_ratio;
   const idempotencyKey = request.extra_params?.client_job_id;
   const response = await requestProviderJson(submitUrl, {
-    method: 'POST',
+    method: "POST",
     headers: {
       ...headers,
-      'Idempotency-Key': typeof idempotencyKey === 'string' && idempotencyKey.trim()
-        ? idempotencyKey.trim()
-        : createVideoIdempotencyKey(),
+      "Idempotency-Key":
+        typeof idempotencyKey === "string" && idempotencyKey.trim()
+          ? idempotencyKey.trim()
+          : createVideoIdempotencyKey(),
     },
     body: JSON.stringify({
       model: apiModel,
@@ -1667,14 +1748,12 @@ async function generateSub2ApiVideo(
       ratio,
       ...(isFixedSeedanceModel
         ? {
-          resolution: useRjmProtocol
-            ? resolveRjmSeedanceResolution(apiModel, request.video_resolution)
-            : '720p',
-        }
+            resolution: useRjmProtocol ? resolveRjmSeedanceResolution(apiModel, request.video_resolution) : "720p",
+          }
         : request.video_resolution?.trim()
           ? { resolution: request.video_resolution.trim() }
           : {}),
-      camera_movement: 'auto',
+      camera_movement: "auto",
       ...(imageIds.length ? { image_ids: imageIds } : {}),
       ...(imageUrls.length ? { images: imageUrls } : {}),
     }),
@@ -1698,7 +1777,7 @@ async function generateSub2ApiVideo(
 
   const taskUrl = useRjmProtocol
     ? `${baseUrl}/v1/videos/${encodeURIComponent(taskId)}`
-    : resolveProviderEndpoint(baseUrl, request.extra_params?.video_query_path, '/v1/videos/{taskId}', taskId);
+    : resolveProviderEndpoint(baseUrl, request.extra_params?.video_query_path, "/v1/videos/{taskId}", taskId);
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 4000));
     const taskResponse = await requestProviderJson(taskUrl, { headers });
@@ -1714,16 +1793,18 @@ async function generateSub2ApiVideo(
     const videoUrl = getVideoResultUrl(payload);
     if (videoUrl) return videoUrl;
     const status = getVideoTaskStatus(payload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
       const reason = getVideoTaskFailureReason(payload);
       throw new Error(`Sub2API 视频生成失败: ${reason ?? status}`);
     }
-    if (['COMPLETED', 'COMPLETE', 'SUCCESS', 'SUCCEEDED', 'DONE'].includes(status)) {
+    if (["COMPLETED", "COMPLETE", "SUCCESS", "SUCCEEDED", "DONE"].includes(status)) {
       const contentUrl = `${taskUrl}/content`;
       const contentResponse = await requestProviderBinary(contentUrl, { headers });
       if (!contentResponse.ok) {
         const contentText = await contentResponse.text();
-        throw new Error(`Sub2API 视频下载失败: ${buildHttpErrorSummary(contentResponse.status, contentText, contentUrl)}`);
+        throw new Error(
+          `Sub2API 视频下载失败: ${buildHttpErrorSummary(contentResponse.status, contentText, contentUrl)}`,
+        );
       }
       if (!contentResponse.bytes.length) {
         throw new Error(`Sub2API 视频下载失败: 内容为空 (${contentUrl})`);
@@ -1733,11 +1814,11 @@ async function generateSub2ApiVideo(
   }
 }
 
-type KlingControlMode = 'motion-control' | 'lip-sync';
+type KlingControlMode = "motion-control" | "lip-sync";
 
-function readKlingString(extraParams: GenerateVideoRequest['extra_params'], key: string): string {
+function readKlingString(extraParams: GenerateVideoRequest["extra_params"], key: string): string {
   const value = extraParams?.[key];
-  return typeof value === 'string' ? value.trim() : '';
+  return typeof value === "string" ? value.trim() : "";
 }
 
 async function resolveKlingControlAsset(
@@ -1748,7 +1829,7 @@ async function resolveKlingControlAsset(
   zhiniaoUpload?: { baseUrl: string; headers: Record<string, string> },
 ): Promise<string> {
   const asset = await resolveReferenceAssetSource(source, label);
-  if (asset.kind === 'url') return asset.url;
+  if (asset.kind === "url") return asset.url;
   if (upload) return await uploadPublicReferenceAsset(asset, upload, index);
   if (zhiniaoUpload) {
     return await uploadZhiniaoReferenceAsset(source, zhiniaoUpload.baseUrl, zhiniaoUpload.headers, index);
@@ -1771,57 +1852,57 @@ async function generateKlingControlVideo(
   headers: Record<string, string>,
 ): Promise<string> {
   const extraParams = request.extra_params ?? {};
-  const mode: KlingControlMode = extraParams.control_mode === 'lip-sync'
-    ? 'lip-sync'
-    : 'motion-control';
+  const mode: KlingControlMode = extraParams.control_mode === "lip-sync" ? "lip-sync" : "motion-control";
   const upload = resolveReferenceAssetUploadConfig(extraParams);
-  const zhiniaoUpload = /(?:cuai\.token6688\.com|api\.tokengo\.love)/i.test(baseUrl)
-    ? { baseUrl, headers }
-    : undefined;
-  const imageSource = request.reference_images?.[0] ?? '';
-  const motionVideoSource = readKlingString(extraParams, 'motion_reference_video');
-  const sourceVideo = readKlingString(extraParams, 'source_video');
-  const audioSource = readKlingString(extraParams, 'lip_sync_audio') || request.reference_audio?.[0] || '';
+  const zhiniaoUpload = /(?:cuai\.token6688\.com|api\.tokengo\.love)/i.test(baseUrl) ? { baseUrl, headers } : undefined;
+  const imageSource = request.reference_images?.[0] ?? "";
+  const motionVideoSource = readKlingString(extraParams, "motion_reference_video");
+  const sourceVideo = readKlingString(extraParams, "source_video");
+  const audioSource = readKlingString(extraParams, "lip_sync_audio") || request.reference_audio?.[0] || "";
 
-  if (mode === 'motion-control' && (!imageSource || !motionVideoSource)) {
-    throw new Error('Kling Motion Control 需要角色图片和动作参考视频');
+  if (mode === "motion-control" && (!imageSource || !motionVideoSource)) {
+    throw new Error("Kling Motion Control 需要角色图片和动作参考视频");
   }
-  if (mode === 'lip-sync' && (!sourceVideo || !audioSource)) {
-    throw new Error('Kling 对口型需要待处理视频和音频');
+  if (mode === "lip-sync" && (!sourceVideo || !audioSource)) {
+    throw new Error("Kling 对口型需要待处理视频和音频");
   }
 
-  const image = mode === 'motion-control'
-    ? await resolveKlingControlAsset(imageSource, 'Kling 角色图片', upload, 0, zhiniaoUpload)
-    : undefined;
-  const motionVideo = mode === 'motion-control'
-    ? await resolveKlingControlAsset(motionVideoSource, 'Kling 动作参考视频', upload, 1, zhiniaoUpload)
-    : undefined;
-  const sourceVideoUrl = mode === 'lip-sync'
-    ? await resolveKlingControlAsset(sourceVideo, 'Kling 待处理视频', upload, 0, zhiniaoUpload)
-    : undefined;
-  const audio = mode === 'lip-sync'
-    ? await resolveKlingControlAsset(audioSource, 'Kling 对口型音频', upload, 1, zhiniaoUpload)
-    : undefined;
+  const image =
+    mode === "motion-control"
+      ? await resolveKlingControlAsset(imageSource, "Kling 角色图片", upload, 0, zhiniaoUpload)
+      : undefined;
+  const motionVideo =
+    mode === "motion-control"
+      ? await resolveKlingControlAsset(motionVideoSource, "Kling 动作参考视频", upload, 1, zhiniaoUpload)
+      : undefined;
+  const sourceVideoUrl =
+    mode === "lip-sync"
+      ? await resolveKlingControlAsset(sourceVideo, "Kling 待处理视频", upload, 0, zhiniaoUpload)
+      : undefined;
+  const audio =
+    mode === "lip-sync"
+      ? await resolveKlingControlAsset(audioSource, "Kling 对口型音频", upload, 1, zhiniaoUpload)
+      : undefined;
 
-  const klingVersion = /2[._-]?6/i.test(apiModel) ? 'kling-2.6' : 'kling-3.0';
+  const klingVersion = /2[._-]?6/i.test(apiModel) ? "kling-2.6" : "kling-3.0";
   // Do not reuse generic video_submit_path/video_query_path injected by a
   // provider profile (for example Zhiniao's /v1/tasks); Kling control has
   // its own official endpoints. Custom overrides use Kling-specific keys.
-  const submitPath = readKlingString(extraParams, 'kling_submit_path') || (
-    mode === 'motion-control' ? `/motion-control/${klingVersion}` : '/v1/videos/advanced-lip-sync'
-  );
-  const queryPath = readKlingString(extraParams, 'kling_query_path') || (
-    mode === 'motion-control' ? '/tasks?task_ids={taskId}' : '/v1/videos/advanced-lip-sync/{taskId}'
-  );
-  const resolution = readKlingString(extraParams, 'resolution') || request.video_resolution || '720p';
-  const orientation = readKlingString(extraParams, 'character_orientation') || 'image';
+  const submitPath =
+    readKlingString(extraParams, "kling_submit_path") ||
+    (mode === "motion-control" ? `/motion-control/${klingVersion}` : "/v1/videos/advanced-lip-sync");
+  const queryPath =
+    readKlingString(extraParams, "kling_query_path") ||
+    (mode === "motion-control" ? "/tasks?task_ids={taskId}" : "/v1/videos/advanced-lip-sync/{taskId}");
+  const resolution = readKlingString(extraParams, "resolution") || request.video_resolution || "720p";
+  const orientation = readKlingString(extraParams, "character_orientation") || "image";
   const prompt = request.prompt.trim();
 
-  let faceSessionId = readKlingString(extraParams, 'face_session_id');
-  let faceId = readKlingString(extraParams, 'face_id');
-  if (mode === 'lip-sync' && sourceVideoUrl && (!faceSessionId || !faceId)) {
+  let faceSessionId = readKlingString(extraParams, "face_session_id");
+  let faceId = readKlingString(extraParams, "face_id");
+  if (mode === "lip-sync" && sourceVideoUrl && (!faceSessionId || !faceId)) {
     const faceResponse = await requestProviderJson(`${baseUrl}/v1/videos/identify-face`, {
-      method: 'POST',
+      method: "POST",
       headers,
       body: JSON.stringify({ video_url: sourceVideoUrl }),
     });
@@ -1833,51 +1914,58 @@ async function generateKlingControlVideo(
       throw new Error(`Kling 人脸识别失败：平台返回了非 JSON 响应 (${baseUrl}/v1/videos/identify-face)`);
     }
     if (!faceResponse.ok) {
-      throw new Error(`Kling 人脸识别失败: ${buildHttpErrorSummary(faceResponse.status, faceRawResponse, `${baseUrl}/v1/videos/identify-face`)}`);
+      throw new Error(
+        `Kling 人脸识别失败: ${buildHttpErrorSummary(faceResponse.status, faceRawResponse, `${baseUrl}/v1/videos/identify-face`)}`,
+      );
     }
-    const faceData = facePayload && typeof facePayload === 'object'
-      ? (facePayload as Record<string, unknown>).data
-      : undefined;
-    const faceRecord = faceData && typeof faceData === 'object' ? faceData as Record<string, unknown> : {};
+    const faceData =
+      facePayload && typeof facePayload === "object" ? (facePayload as Record<string, unknown>).data : undefined;
+    const faceRecord = faceData && typeof faceData === "object" ? (faceData as Record<string, unknown>) : {};
     const detectedFaces = Array.isArray(faceRecord.face_data) ? faceRecord.face_data : [];
-    const firstFace = detectedFaces.find((item) => item && typeof item === 'object') as Record<string, unknown> | undefined;
-    faceSessionId = typeof faceRecord.session_id === 'string' ? faceRecord.session_id.trim() : faceSessionId;
-    faceId = typeof firstFace?.face_id === 'string' ? firstFace.face_id.trim() : faceId;
+    const firstFace = detectedFaces.find((item) => item && typeof item === "object") as
+      Record<string, unknown> | undefined;
+    faceSessionId = typeof faceRecord.session_id === "string" ? faceRecord.session_id.trim() : faceSessionId;
+    faceId = typeof firstFace?.face_id === "string" ? firstFace.face_id.trim() : faceId;
   }
 
-  const body: Record<string, unknown> = mode === 'motion-control'
-    ? {
-      contents: [
-        ...(prompt ? [{ type: 'prompt', text: prompt }] : []),
-        { type: 'image', url: image },
-        { type: 'video', url: motionVideo },
-      ],
-      settings: {
-        character_orientation: orientation === 'video' ? 'video' : 'image',
-        audio: extraParams.keep_original_audio === false ? 'off' : 'original',
-        resolution: resolution === '1080p' ? '1080p' : '720p',
-      },
-    }
-    : {
-      session_id: faceSessionId,
-      face_choose: [{
-        face_id: faceId,
-        sound_file: audio,
-        sound_start_time: Number(extraParams.sound_start_time) || 0,
-        sound_end_time: Number(extraParams.sound_end_time) || 60000,
-        sound_insert_time: Number(extraParams.sound_insert_time) || 0,
-        sound_volume: Number.isFinite(Number(extraParams.sound_volume)) ? Number(extraParams.sound_volume) : 1,
-        original_audio_volume: Number.isFinite(Number(extraParams.original_audio_volume)) ? Number(extraParams.original_audio_volume) : 1,
-      }],
-    };
+  const body: Record<string, unknown> =
+    mode === "motion-control"
+      ? {
+          contents: [
+            ...(prompt ? [{ type: "prompt", text: prompt }] : []),
+            { type: "image", url: image },
+            { type: "video", url: motionVideo },
+          ],
+          settings: {
+            character_orientation: orientation === "video" ? "video" : "image",
+            audio: extraParams.keep_original_audio === false ? "off" : "original",
+            resolution: resolution === "1080p" ? "1080p" : "720p",
+          },
+        }
+      : {
+          session_id: faceSessionId,
+          face_choose: [
+            {
+              face_id: faceId,
+              sound_file: audio,
+              sound_start_time: Number(extraParams.sound_start_time) || 0,
+              sound_end_time: Number(extraParams.sound_end_time) || 60000,
+              sound_insert_time: Number(extraParams.sound_insert_time) || 0,
+              sound_volume: Number.isFinite(Number(extraParams.sound_volume)) ? Number(extraParams.sound_volume) : 1,
+              original_audio_volume: Number.isFinite(Number(extraParams.original_audio_volume))
+                ? Number(extraParams.original_audio_volume)
+                : 1,
+            },
+          ],
+        };
 
-  if (mode === 'lip-sync' && (!body.session_id || !faceId)) {
-    throw new Error('Kling 对口型需要先做人脸识别，并提供 session_id 和 face_id');
+  if (mode === "lip-sync" && (!body.session_id || !faceId)) {
+    throw new Error("Kling 对口型需要先做人脸识别，并提供 session_id 和 face_id");
   }
 
   const submitUrl = resolveProviderEndpoint(baseUrl, submitPath, submitPath);
   const response = await requestProviderJson(submitUrl, {
-    method: 'POST',
+    method: "POST",
     headers,
     body: JSON.stringify(body),
   });
@@ -1886,10 +1974,14 @@ async function generateKlingControlVideo(
   try {
     payload = rawResponse ? JSON.parse(rawResponse) : {};
   } catch {
-    throw new Error(`Kling ${mode === 'motion-control' ? 'Motion Control' : '对口型'}请求失败：平台返回了非 JSON 响应 (${submitUrl})`);
+    throw new Error(
+      `Kling ${mode === "motion-control" ? "Motion Control" : "对口型"}请求失败：平台返回了非 JSON 响应 (${submitUrl})`,
+    );
   }
   if (!response.ok) {
-    throw new Error(`Kling ${mode === 'motion-control' ? 'Motion Control' : '对口型'}请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+    throw new Error(
+      `Kling ${mode === "motion-control" ? "Motion Control" : "对口型"}请求失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`,
+    );
   }
   const immediateResult = getVideoResultUrl(payload);
   if (immediateResult && !getVideoTaskId(payload)) return immediateResult;
@@ -1898,7 +1990,7 @@ async function generateKlingControlVideo(
     throw new Error(`Kling 响应中未找到任务 ID: ${describeVideoResponse(payload)}`);
   }
 
-  const taskUrl = resolveProviderEndpoint(baseUrl, queryPath, '/v1/videos/{taskId}', taskId);
+  const taskUrl = resolveProviderEndpoint(baseUrl, queryPath, "/v1/videos/{taskId}", taskId);
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 4000));
     const taskResponse = await requestProviderJson(taskUrl, { headers });
@@ -1914,31 +2006,32 @@ async function generateKlingControlVideo(
     const resultUrl = getVideoResultUrl(payload);
     if (resultUrl) return resultUrl;
     const status = getVideoTaskStatus(payload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
-      throw new Error(`Kling ${mode === 'motion-control' ? 'Motion Control' : '对口型'}生成失败: ${getVideoTaskFailureReason(payload) ?? describeVideoResponse(payload)}`);
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
+      throw new Error(
+        `Kling ${mode === "motion-control" ? "Motion Control" : "对口型"}生成失败: ${getVideoTaskFailureReason(payload) ?? describeVideoResponse(payload)}`,
+      );
     }
   }
 }
 
 export async function generateVideo(request: GenerateVideoRequest): Promise<string> {
   if (!isCustomModel(request.model)) {
-    throw new Error('视频生成仅支持自定义平台(custom:*)模型');
+    throw new Error("视频生成仅支持自定义平台(custom:*)模型");
   }
-  const providerId = request.model.split('/')[0] ?? '';
-  const apiModel = request.model.split('/').slice(1).join('/').trim();
-  const configuredBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
-    ? request.extra_params.provider_base_url
-    : '';
+  const providerId = request.model.split("/")[0] ?? "";
+  const apiModel = request.model.split("/").slice(1).join("/").trim();
+  const configuredBaseUrl =
+    typeof request.extra_params?.provider_base_url === "string" ? request.extra_params.provider_base_url : "";
   const baseUrl = normalizeVideoProviderBaseUrl(configuredBaseUrl);
-  const apiKey = (useSettingsStore.getState().apiKeys[providerId] ?? '').trim();
+  const apiKey = (useSettingsStore.getState().apiKeys[providerId] ?? "").trim();
   if (!baseUrl || !apiKey || !apiModel) {
-    throw new Error('请在设置中配置视频模型对应的 Base URL、API Key 和模型名称');
+    throw new Error("请在设置中配置视频模型对应的 Base URL、API Key 和模型名称");
   }
-  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
-  if (request.extra_params?.video_transport === 'kling-control') {
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
+  if (request.extra_params?.video_transport === "kling-control") {
     return await generateKlingControlVideo(request, baseUrl, apiModel, headers);
   }
-  if (request.extra_params?.video_transport === 'zhenjian-task-api' || isZhenjianProvider(providerId, baseUrl)) {
+  if (request.extra_params?.video_transport === "zhenjian-task-api" || isZhenjianProvider(providerId, baseUrl)) {
     return await generateZhenjianVideo(request);
   }
   const rjmVideoBaseUrl = resolveRjmVideoApiBaseUrl(baseUrl);
@@ -1947,49 +2040,46 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   }
   // 字子动画: transport 标记或 Base URL 命中都走专有链路(用户自建平台时 id 常是中文,
   // 只靠 transport 标记在极端情况下会漏, 加域名兜底不改变其它平台的分支顺序)。
-  if (request.extra_params?.video_transport === 'zzdh-v8-video' || isZzdhBaseUrl(baseUrl)) {
+  if (request.extra_params?.video_transport === "zzdh-v8-video" || isZzdhBaseUrl(baseUrl)) {
     return await generateZzdhVideo(request, baseUrl, apiModel, headers);
   }
-  if (request.extra_params?.video_transport === 'sub2api-video') {
+  if (request.extra_params?.video_transport === "sub2api-video") {
     return await generateSub2ApiVideo(request, baseUrl, apiModel, headers);
   }
-  if (request.extra_params?.video_transport === 'binghuo-video') {
+  if (request.extra_params?.video_transport === "binghuo-video") {
     return await generateBinghuoVideo(request, baseUrl, apiModel, headers);
   }
-  if (request.extra_params?.video_transport === 'wgspai-video') {
+  if (request.extra_params?.video_transport === "wgspai-video") {
     return await generateWgspaiVideo(request, baseUrl, apiModel, headers);
   }
-  if (request.extra_params?.video_transport === 'zhiniao-video') {
+  if (request.extra_params?.video_transport === "zhiniao-video") {
     return await generateZhiniaoVideo(request, baseUrl, apiModel, headers);
   }
-  const videoImages = request.image_mode === 'first-last'
-    ? request.reference_images?.slice(0, 2)
-    : request.reference_images;
+  const videoImages =
+    request.image_mode === "first-last" ? request.reference_images?.slice(0, 2) : request.reference_images;
   const body = {
     model: apiModel,
     prompt: request.prompt,
     duration: Math.max(1, Math.round(request.duration)),
     aspect_ratio: request.aspect_ratio,
-    ...(videoImages?.length ? {
-      images: videoImages,
-      ...(request.image_mode === 'first-last' ? { generation_type: 'frame' } : {}),
-    } : {}),
+    ...(videoImages?.length
+      ? {
+          images: videoImages,
+          ...(request.image_mode === "first-last" ? { generation_type: "frame" } : {}),
+        }
+      : {}),
     ...(request.reference_audio?.length
       ? {
-        audio_url: request.reference_audio[0],
-        ...(request.reference_audio.length > 1 ? { audio_urls: request.reference_audio } : {}),
-      }
+          audio_url: request.reference_audio[0],
+          ...(request.reference_audio.length > 1 ? { audio_urls: request.reference_audio } : {}),
+        }
       : {}),
   };
   // 自定义平台的 Base URL 统一按站点根路径保存，因此这里固定使用
   // OpenAI 兼容视频入口。不要为同一请求探测多个端点，以免重复扣费。
-  const submitUrl = resolveProviderEndpoint(
-    baseUrl,
-    request.extra_params?.video_submit_path,
-    '/v1/videos/generations'
-  );
+  const submitUrl = resolveProviderEndpoint(baseUrl, request.extra_params?.video_submit_path, "/v1/videos/generations");
   const response = await requestProviderJson(submitUrl, {
-    method: 'POST',
+    method: "POST",
     headers,
     body: JSON.stringify(body),
   });
@@ -2012,8 +2102,8 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   const taskUrl = resolveProviderEndpoint(
     baseUrl,
     request.extra_params?.video_query_path,
-    `${request.extra_params?.video_submit_path ?? '/v1/videos/generations'}/{taskId}`,
-    taskId
+    `${request.extra_params?.video_submit_path ?? "/v1/videos/generations"}/{taskId}`,
+    taskId,
   );
   // 视频生成耗时受排队、模型和时长影响，持续轮询直到平台给出终态。
   while (true) {
@@ -2031,17 +2121,40 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
     const videoUrl = getVideoResultUrl(payload);
     if (videoUrl) return videoUrl;
     const status = getVideoTaskStatus(payload);
-    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
       throw new Error(`视频生成失败: ${status}`);
     }
   }
+}
+
+/**
+ * Submit a video generation to the Tauri worker. This returns as soon as the
+ * native task is persisted; callers must poll getGenerateVideoJob for output.
+ */
+export async function submitGenerateVideoJob(request: GenerateVideoRequest): Promise<string> {
+  if (!isTauri()) {
+    throw new Error("视频后台任务仅在桌面应用中可用");
+  }
+  const jobId = await invoke<string>("submit_generate_video_job", { request });
+  if (typeof jobId !== "string" || !jobId.trim()) {
+    throw new Error("submit_generate_video_job returned invalid job id");
+  }
+  return jobId.trim();
+}
+
+export async function getGenerateVideoJob(jobId: string): Promise<VideoGenerationJobStatus> {
+  const result = await invoke<VideoGenerationJobStatus>("get_generate_video_job", { jobId });
+  if (!result || typeof result !== "object" || typeof result.status !== "string") {
+    throw new Error("get_generate_video_job returned invalid payload");
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
 // 音频生成(语音合成 / 音效 / 音乐)
 // ---------------------------------------------------------------------------
 
-export type GenerateAudioKind = 'speech' | 'sound-effects' | 'music';
+export type GenerateAudioKind = "speech" | "sound-effects" | "music";
 
 export interface GenerateAudioRequest {
   /** 文本内容: 语音合成的台词 / 音效描述 / 音乐描述 */
@@ -2051,6 +2164,22 @@ export interface GenerateAudioRequest {
   audio_kind?: GenerateAudioKind;
   /** 音色(语音合成, 可选项) */
   voice?: string;
+  /** 声音克隆的参考样音，本地路径、data URL 或公网 URL。 */
+  reference_audio?: string;
+  /** 情绪控制（由支持的 TTS 模型消费）。 */
+  emotion?: string;
+  /** 情绪强度，范围 0-100。 */
+  emotion_intensity?: number;
+  /**
+   * 自然语言风格指令(GM 系列 / GT-4o Mini TTS 独有)。
+   *
+   * 与 `emotion` 是两条通路: emotion 是从固定枚举里挑一个, instructions 是让模型
+   * 理解任意描述(「以温柔耳语朗读」「快速兴奋」「低沉缓慢」)。平台的 param_schema
+   * 里它就是 free-form string, 不要往枚举里塞。
+   */
+  instructions?: string;
+  /** 语速(平台声明 0.25-4.0, 字符串透传)。 */
+  speed?: string;
   /** 输出格式(语音合成, 默认 mp3) */
   format?: string;
   /** 音效时长(秒) */
@@ -2059,13 +2188,89 @@ export interface GenerateAudioRequest {
   music_length_ms?: number;
   /** 歌词(音乐生成) */
   lyrics?: string;
+  /**
+   * 音乐生成的操作(知鸟 Suno `music` 模型专有)。
+   * `generate` / `extend` / `cover` / `lyrics` / `stems` / `stems_all` / `mp4` / `concat`。
+   * 见 `@/commands/sunoMusic` 的 `SUNO_OPERATION_SPECS`。
+   */
+  suno_operation?: string;
+  /** Suno 模型版本: chirp-v6(默认) / chirp-v6-mini / chirp-v5 / chirp-v4-5。 */
+  suno_version?: string;
+  /** Suno 模式: song(含人声) / instrumental(纯器乐)。 */
+  suno_mode?: string;
+  /** Suno 风格标签(映射 Suno `tags`, 逗号分隔)。 */
+  suno_style?: string;
+  /** Suno 歌曲标题。 */
+  suno_title?: string;
+  /** Suno 演唱声线: auto / m / f。**仅 song 模式有效**。 */
+  suno_vocal_gender?: string;
+  /** Suno 排除风格(映射 Suno `negative_tags`, 逗号分隔)。 */
+  suno_negative_tags?: string;
+  /** Suno 源 clip(stems / stems_all / mp4 / concat 必填)。可取上次结果的 `source_id`。 */
+  suno_clip_id?: string;
+  /** Suno 续写源 clip(extend 必填)。 */
+  suno_continue_clip_id?: string;
+  /** Suno 续写起点秒(extend 可选, 不传从结尾续)。 */
+  suno_continue_at?: string;
+  /** Suno 翻唱源 clip(cover 必填)。 */
+  suno_cover_clip_id?: string;
+  /**
+   * MiniMax 音色 ID。
+   *
+   * 创建链路(voice-clone / voice-design)必须自带 —— 平台要求调用方提供,
+   * 且按它幂等(同一 ID 重复克隆不二次收费)。
+   * 合成链路(speech-2.8)用它引用音色库里的音色。
+   */
+  voice_id?: string;
+  /** MiniMax 音色克隆的参考样音(本地路径 / data URL / 公网 URL)。 */
+  sample_audio?: string;
+  /** MiniMax 音色设计的试听文本(voice-design 必填, 返回的音频即此文本念出)。 */
+  preview_text?: string;
+  /**
+   * MiniMax speech-2.8 专有参数。
+   *
+   * 不能复用上面那套 `emotion` / `format` —— 两边枚举对不上:
+   * 节点上的通用 emotion 是 `natural/calm/happy/...`, 而平台 speech-2.8 只认
+   * `auto/happy/sad/angry/fearful/surprised/calm`。混用会发出平台不认的值。
+   */
+  mmx_params?: {
+    version?: string;
+    tier?: string;
+    speed?: string;
+    pitch?: string;
+    emotion?: string;
+    soundEffects?: string;
+  };
+  extra_params?: Record<string, unknown>;
+}
+
+/** 创建音色资产的结果。 */
+export interface GenerateAudioAssetResult {
+  /** 创建出来的音色 ID。平台没回填时退回调用方自带的那一个。 */
+  voiceId: string;
+  /** 试听音频。音色设计直接返回; 音色克隆不产出(需另发一次 speech-2.8 才能听到)。 */
+  previewAudio?: string;
+}
+
+/** 创建音色资产的请求(voice-clone / voice-design)。 */
+export interface GenerateAudioAssetRequest {
+  model: string;
+  /** 音色描述词(voice-design 必填)。 */
+  prompt: string;
+  /** 调用方自带的音色 ID。 */
+  voiceId: string;
+  /** 音色克隆的参考样音(voice-clone 必填)。 */
+  sampleAudio?: string;
+  /** 音色设计的试听文本(voice-design 必填)。 */
+  previewText?: string;
+  format?: string;
   extra_params?: Record<string, unknown>;
 }
 
 /** 音频响应若是 JSON(部分中转返回 URL 或 data URL), 从中取出可播放地址。 */
 function extractAudioSourceFromJson(raw: string): string | null {
   const trimmed = raw.trim();
-  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
   let payload: unknown;
   try {
     payload = JSON.parse(trimmed);
@@ -2078,12 +2283,12 @@ function extractAudioSourceFromJson(raw: string): string | null {
   let dataAudio: string | null = null;
   const visit = (value: unknown): void => {
     if (dataAudio) return;
-    if (typeof value === 'string') {
+    if (typeof value === "string") {
       const hit = value.trim().match(/data:audio\/[a-z0-9.+-]+;base64,[^\s"']+/i)?.[0];
       if (hit) dataAudio = hit;
       return;
     }
-    if (!value || typeof value !== 'object') return;
+    if (!value || typeof value !== "object") return;
     if (Array.isArray(value)) {
       value.forEach(visit);
       return;
@@ -2096,22 +2301,414 @@ function extractAudioSourceFromJson(raw: string): string | null {
 
 /** 音频字节落盘: 桌面端写成文件(节点用 convertFileSrc 播放), Web 端退化为 Blob URL。 */
 async function persistAudioBytes(bytes: Uint8Array, format: string): Promise<string> {
-  const extension = format.trim().toLowerCase().replace(/[^a-z0-9]/g, '') || ZZDH_DEFAULT_AUDIO_FORMAT;
+  const extension =
+    format
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "") || ZZDH_DEFAULT_AUDIO_FORMAT;
   if (isTauri()) {
     return await persistImageBinary(bytes, extension);
   }
-  const mime = extension === 'mp3' ? 'audio/mpeg' : `audio/${extension}`;
+  const mime = extension === "mp3" ? "audio/mpeg" : `audio/${extension}`;
   return URL.createObjectURL(new Blob([bytes], { type: mime }));
 }
 
+/** base64 -> 字节。桌面端与 Web 端都有全局 atob。 */
+function decodeBase64ToBytes(base64: string): Uint8Array {
+  const binary = globalThis.atob(base64.replace(/\s+/g, ""));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+/**
+ * 把「音频地址」统一落成节点可直接播放的形式。
+ *
+ * 平台对 data URL 与 http URL 都可能返回, 所以先判形状:
+ *   - `data:audio/...;base64,` → 解码后按二进制落盘(和同步二进制响应同一条路);
+ *   - http(s) URL → 原样返回(节点播放时会自己处理)。
+ */
+async function persistAudioSource(source: string, format: string): Promise<string> {
+  const trimmed = source.trim();
+  const dataUrl = trimmed.match(/^data:audio\/[a-z0-9.+-]+;base64,(.*)$/i);
+  if (!dataUrl) return trimmed;
+  return await persistAudioBytes(decodeBase64ToBytes(dataUrl[1]), format);
+}
+
+/**
+ * RunningHub AI App「声音克隆 IndexTTS2.5 情感参考」。
+ *
+ * 旧的 IndexTTS2 App（2067594933602705409）在 2026-09 已无法稳定运行，
+ * 情感参考 App 的公开输入节点为：2=声线样音、3=情感样音、5=语言、9=提示词。
+ */
+const RH_INDEXTTS25_APP_ID = "2088185966304518146";
+/** RunningHub AI App「IndexTTS 2.5多音字语音克隆(中文版)」。
+ * 公开输入节点为：6=文本、13=手工读音表、2=声线样音、16=语言。 */
+const RH_INDEXTTS25_POLYPHONE_APP_ID = "2089785773884268545";
+/** RunningHub AI App「Topaz Video 高清放大V1（非星光）」：2=视频、4=宽度、5=高度。 */
+const RH_TOPAZ_VIDEO_UPSCALE_APP_ID = "2098790412247982081";
+
+function isRunningHubIndexTts2(baseUrl: string, apiModel: string): boolean {
+  return isRunningHubBaseUrl(baseUrl) && /^(?:indextts2[_-]clone|index[-_ ]?tts2)$/i.test(apiModel.trim());
+}
+
+function findRunningHubAudioUrl(value: unknown): string | null {
+  if (typeof value === "string") {
+    const hit = value.trim();
+    return /^(?:https?:|data:audio\/)/i.test(hit) ? hit : null;
+  }
+  if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const hit = findRunningHubAudioUrl(item);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ["url", "audio_url", "audioUrl", "fileUrl", "download_url", "downloadUrl", "result", "results", "data", "output"]) {
+    const hit = findRunningHubAudioUrl(record[key]);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * 只从 RunningHub 的结果字段中取视频。输出 URL 通常是 mp4，也兼容工作流返回
+ * 没有扩展名的 download_url / output_url，避免把提交时的本地素材地址当成成片。
+ */
+function findRunningHubVideoUrl(value: unknown, allowGenericUrl = false): string | null {
+  if (typeof value === "string") {
+    const hit = value.trim();
+    if (/^data:video\//i.test(hit)) return hit;
+    if (!/^https?:/i.test(hit)) return null;
+    return allowGenericUrl || /\.(?:mp4|mov|m4v|webm|mkv)(?:[?#]|$)/i.test(hit) ? hit : null;
+  }
+  if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const hit = findRunningHubVideoUrl(item, allowGenericUrl);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of [
+    "video_url",
+    "videoUrl",
+    "output_url",
+    "outputUrl",
+    "result_url",
+    "resultUrl",
+    "download_url",
+    "downloadUrl",
+    "fileUrl",
+    "file_url",
+  ]) {
+    const hit = findRunningHubVideoUrl(record[key], true);
+    if (hit) return hit;
+  }
+  for (const key of ["result", "results", "output", "data", "url", "file"]) {
+    const hit = findRunningHubVideoUrl(record[key], key === "url");
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function findRunningHubFileValue(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) { const hit = findRunningHubFileValue(item); if (hit) return hit; }
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  // `POST /openapi/v2/media/upload/binary` 的成功响应是
+  // `{ code: 0, data: { download_url, fileName, ... } }`。必须优先取 download_url：
+  // fileName 只是展示名，传给工作流的 LoadAudio 节点不能下载它。
+  for (const key of [
+    "download_url",
+    "downloadUrl",
+    "url",
+    "fileUrl",
+    "file_url",
+    "fileName",
+    "file_name",
+    "filename",
+    "path",
+    "data",
+    "result",
+    "file",
+  ]) {
+    const hit = findRunningHubFileValue(record[key]);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function findRunningHubTaskId(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) { const hit = findRunningHubTaskId(item); if (hit) return hit; }
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ["taskId", "task_id", "id"]) {
+    if (typeof record[key] === "string" && record[key].trim()) return record[key].trim();
+  }
+  for (const key of ["data", "result", "task"]) { const hit = findRunningHubTaskId(record[key]); if (hit) return hit; }
+  return null;
+}
+
+/** RunningHub 查询接口的失败原因分散在多种字段中，不能只显示 FAILED。 */
+function getRunningHubTaskFailureReason(value: unknown, depth = 0): string | null {
+  if (depth > 6 || value == null) return null;
+  if (typeof value === "string") {
+    const message = value.trim();
+    // `工作流运行失败` 只是平台的总状态；继续向下找节点真实异常，才能给出可操作的提示。
+    if (!message || /^(?:工作流运行失败|unknown error|未知错误|failed)$/i.test(message)) return null;
+    return message;
+  }
+  if (typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const reason = getRunningHubTaskFailureReason(item, depth + 1);
+      if (reason) return reason;
+    }
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  // ComfyUI 节点异常藏在 `failedReason.exception_message`。优先取它，不能被顶层的
+  // `errorMessage: 工作流运行失败` 覆盖。
+  for (const key of ["exception_message", "exceptionMessage", "errorMessage", "error_message", "promptTips"]) {
+    const reason = getRunningHubTaskFailureReason(record[key], depth + 1);
+    if (reason) return reason.slice(0, 800);
+  }
+  for (const key of [
+    "failedReason",
+    "failed_reason",
+    "failureReason",
+    "failure_reason",
+    "message",
+    "msg",
+    "error",
+    "detail",
+    "reason",
+  ]) {
+    const reason = getRunningHubTaskFailureReason(record[key], depth + 1);
+    if (reason) return reason.slice(0, 800);
+  }
+  for (const key of ["data", "result", "results", "task", "taskResult", "task_result"]) {
+    const reason = getRunningHubTaskFailureReason(record[key], depth + 1);
+    if (reason) return reason.slice(0, 800);
+  }
+  return null;
+}
+
+async function uploadRunningHubMedia(
+  source: string,
+  baseUrl: string,
+  headers: Record<string, string>,
+  label: string,
+): Promise<string> {
+  const asset = await resolveReferenceAssetSource(source, `RunningHub ${label}`);
+  if (asset.kind === "url") return asset.url;
+  const uploadHeaders = Object.fromEntries(Object.entries(headers).filter(([key]) => key.toLowerCase() !== "content-type"));
+  // `/openapi/v2/upload` 是 RunningHub 的旧上传路径，国内版会返回 code=1000 的
+  // “Unknown error”。媒体上传 API 才是工作流的 LoadAudio 节点所需的公网下载地址。
+  const uploadUrl = `${baseUrl}/openapi/v2/media/upload/binary`;
+  const response = await requestProviderMultipart(uploadUrl, {
+    headers: uploadHeaders,
+    fieldName: "file",
+    filename: `runninghub-upload.${asset.extension}`,
+    contentType: asset.mimeType,
+    bodyBase64: asset.base64,
+  });
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`RunningHub ${label}上传失败: ${buildHttpErrorSummary(response.status, raw, uploadUrl)}`);
+  let payload: unknown; try { payload = raw ? JSON.parse(raw) : {}; } catch { throw new Error(`RunningHub ${label}上传返回了非 JSON`); }
+  const responseRecord = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : null;
+  const responseCode = Number(responseRecord?.code);
+  if (Number.isFinite(responseCode) && responseCode !== 0) {
+    const reason = typeof responseRecord?.message === "string"
+      ? responseRecord.message
+      : typeof responseRecord?.msg === "string"
+        ? responseRecord.msg
+        : typeof responseRecord?.errorMessage === "string"
+          ? responseRecord.errorMessage
+          : describeVideoResponse(payload);
+    throw new Error(`RunningHub ${label}上传失败（code ${responseCode}）: ${reason}`);
+  }
+  const url = findRunningHubFileValue(payload);
+  if (!url) throw new Error(`RunningHub ${label}上传成功但未返回 download_url: ${describeVideoResponse(payload)}`);
+  return url;
+}
+
+async function uploadRunningHubAudio(source: string, baseUrl: string, headers: Record<string, string>): Promise<string> {
+  return await uploadRunningHubMedia(source, baseUrl, headers, "样音");
+}
+
+function resolveRunningHubTargetDimension(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+async function generateRunningHubTopazVideoUpscale(
+  request: UpscaleVideoRequest,
+  baseUrl: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const width = resolveRunningHubTargetDimension(request.extra_params?.topaz_width, 1920);
+  const height = resolveRunningHubTargetDimension(request.extra_params?.topaz_height, 1080);
+  const sourceUrl = await uploadRunningHubMedia(request.videoSource, baseUrl, headers, "视频");
+  const workflowName = "Topaz Video 高清放大V1";
+  const submitUrl = `${baseUrl}/openapi/v2/run/ai-app/${RH_TOPAZ_VIDEO_UPSCALE_APP_ID}`;
+  const response = await requestProviderJson(submitUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      nodeInfoList: [
+        { nodeId: "2", fieldName: "file", fieldValue: sourceUrl },
+        { nodeId: "4", fieldName: "value", fieldValue: String(width) },
+        { nodeId: "5", fieldName: "value", fieldValue: String(height) },
+      ],
+    }),
+  });
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`RunningHub ${workflowName} 提交失败: ${buildHttpErrorSummary(response.status, raw, submitUrl)}`);
+  let payload: unknown;
+  try {
+    payload = raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new Error("RunningHub 视频超分提交返回了非 JSON");
+  }
+  const immediate = findRunningHubVideoUrl(payload);
+  if (immediate) return immediate;
+  const taskId = findRunningHubTaskId(payload);
+  if (!taskId) throw new Error(`RunningHub ${workflowName} 未返回任务 ID: ${describeVideoResponse(payload)}`);
+
+  const queryUrl = `${baseUrl}/openapi/v2/query`;
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    const result = await requestProviderJson(queryUrl, { method: "POST", headers, body: JSON.stringify({ taskId }) });
+    const resultRaw = await result.text();
+    if (!result.ok) throw new Error(`RunningHub ${workflowName} 查询失败: ${buildHttpErrorSummary(result.status, resultRaw, queryUrl)}`);
+    let resultPayload: unknown;
+    try {
+      resultPayload = resultRaw ? JSON.parse(resultRaw) : {};
+    } catch {
+      continue;
+    }
+    const video = findRunningHubVideoUrl(resultPayload);
+    if (video) return video;
+    const status = getVideoTaskStatus(resultPayload);
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
+      const reason = getRunningHubTaskFailureReason(resultPayload);
+      throw new Error(
+        `RunningHub ${workflowName} 生成失败（任务 ${taskId}，状态 ${status}）: ${reason ?? describeVideoResponse(resultPayload)}`,
+      );
+    }
+  }
+  throw new Error(`RunningHub ${workflowName} 任务超时，请稍后重试`);
+}
+
+async function generateRunningHubIndexTts25(request: GenerateAudioRequest, baseUrl: string, headers: Record<string, string>): Promise<string> {
+  const reference = request.reference_audio?.trim();
+  const indexTtsMode = request.extra_params?.index_tts_mode === "polyphone" ? "polyphone" : "emotion-reference";
+  const isPolyphone = indexTtsMode === "polyphone";
+  const workflowName = isPolyphone ? "IndexTTS2.5 多音字语音克隆" : "IndexTTS2.5 情感参考克隆";
+  const secondSource = typeof request.extra_params?.index_tts_second_audio === "string" ? request.extra_params.index_tts_second_audio : "";
+  const pronunciation = typeof request.extra_params?.index_tts_pronunciation === "string"
+    ? request.extra_params.index_tts_pronunciation.trim()
+    : "";
+  if (!reference) throw new Error(`${workflowName} 需要声线参考样音`);
+  if (!isPolyphone && !secondSource) throw new Error("IndexTTS2.5 的情感参考模式需要第二段情感样音");
+  if (!request.prompt.trim()) throw new Error(`${workflowName} 请输入要合成的文本`);
+  const refUrl = await uploadRunningHubAudio(reference, baseUrl, headers);
+  const secondUrl = !isPolyphone ? await uploadRunningHubAudio(secondSource, baseUrl, headers) : "";
+  const suppliedLanguage = typeof request.extra_params?.index_tts_language === "string"
+    ? request.extra_params.index_tts_language.trim().toUpperCase()
+    : "";
+  const language = ["ZH", "EN", "JA", "ES", "AR"].includes(suppliedLanguage) ? suppliedLanguage : "ZH";
+  const nodeInfoList = isPolyphone
+    ? [
+        { nodeId: "6", fieldName: "prompt", fieldValue: request.prompt.trim() },
+        ...(pronunciation ? [{ nodeId: "13", fieldName: "prompt", fieldValue: pronunciation }] : []),
+        { nodeId: "2", fieldName: "audio", fieldValue: refUrl },
+        { nodeId: "16", fieldName: "language", fieldValue: language },
+      ]
+    : [
+        { nodeId: "2", fieldName: "audio", fieldValue: refUrl },
+        { nodeId: "3", fieldName: "audio", fieldValue: secondUrl },
+        { nodeId: "5", fieldName: "language", fieldValue: language },
+        { nodeId: "9", fieldName: "prompt", fieldValue: request.prompt.trim() },
+      ];
+  const appId = isPolyphone ? RH_INDEXTTS25_POLYPHONE_APP_ID : RH_INDEXTTS25_APP_ID;
+  const submitUrl = `${baseUrl}/openapi/v2/run/ai-app/${appId}`;
+  const response = await requestProviderJson(submitUrl, { method: "POST", headers, body: JSON.stringify({ nodeInfoList }) });
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`RunningHub ${workflowName} 提交失败: ${buildHttpErrorSummary(response.status, raw, submitUrl)}`);
+  let payload: unknown; try { payload = raw ? JSON.parse(raw) : {}; } catch { throw new Error("RunningHub 任务提交返回了非 JSON"); }
+  const immediate = findRunningHubAudioUrl(payload); if (immediate) return await persistAudioSource(immediate, "mp3");
+  const taskId = findRunningHubTaskId(payload); if (!taskId) throw new Error(`RunningHub 未返回任务 ID: ${describeVideoResponse(payload)}`);
+  const queryUrl = `${baseUrl}/openapi/v2/query`;
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    const result = await requestProviderJson(queryUrl, { method: "POST", headers, body: JSON.stringify({ taskId }) });
+    const resultRaw = await result.text();
+    if (!result.ok) throw new Error(`RunningHub ${workflowName} 查询失败: ${buildHttpErrorSummary(result.status, resultRaw, queryUrl)}`);
+    let resultPayload: unknown; try { resultPayload = resultRaw ? JSON.parse(resultRaw) : {}; } catch { continue; }
+    const audio = findRunningHubAudioUrl(resultPayload); if (audio) return await persistAudioSource(audio, "mp3");
+    const status = getVideoTaskStatus(resultPayload);
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
+      const reason = getRunningHubTaskFailureReason(resultPayload);
+      throw new Error(
+        `RunningHub ${workflowName} 生成失败（任务 ${taskId}，状态 ${status}）: ${reason ?? describeVideoResponse(resultPayload)}`,
+      );
+    }
+  }
+  throw new Error(`RunningHub ${workflowName} 任务超时，请稍后重试`);
+}
+
 /** 按音频类型组装请求体(字段名照抄官方模型页示例)。 */
-function buildAudioBody(request: GenerateAudioRequest, apiModel: string, kind: GenerateAudioKind): string {
+async function buildAudioBody(
+  request: GenerateAudioRequest,
+  apiModel: string,
+  kind: GenerateAudioKind,
+): Promise<string> {
   const format = request.format?.trim().toLowerCase() || ZZDH_DEFAULT_AUDIO_FORMAT;
   const body: Record<string, unknown> = { model: apiModel, input: request.prompt };
-  if (kind === 'speech') {
+  if (kind === "speech") {
     body.voice = request.voice?.trim() || ZZDH_BASE_DEFAULT_VOICE;
     body.format = format;
-  } else if (kind === 'sound-effects') {
+    const referenceAudio = request.reference_audio?.trim();
+    if (referenceAudio) {
+      const asset = await resolveReferenceAssetSource(referenceAudio, "声音克隆参考样音");
+      const source = asset.kind === "url" ? asset.url : `data:${asset.mimeType};base64,${asset.base64}`;
+      // 不同 OpenAI 兼容网关的字段名称尚未统一，因此同时发送两种常见写法。
+      // 不支持克隆的模型会忽略它们；支持的模型可直接消费 data URL 或公网 URL。
+      body.reference_audio = source;
+      body.reference_audio_url = source;
+    }
+    const emotion = request.emotion?.trim();
+    if (emotion) body.emotion = emotion;
+    if (Number.isFinite(request.emotion_intensity)) {
+      body.emotion_intensity = Math.max(0, Math.min(100, Math.round(request.emotion_intensity!)));
+    }
+    // 自然语言风格指令(GM 系列 / GT-4o Mini TTS 独有): 「以温柔耳语朗读」「快速兴奋」
+    // 这类描述走 `instructions`, 与 emotion 枚举是两条不同的通路 ——
+    // 平台的 param_schema 里 instructions 是 free-form string, 不是枚举。
+    const instructions = request.instructions?.trim();
+    if (instructions) body.instructions = instructions;
+    // 语速: 平台声明 0.25-4.0 小数, vendor 实际接受 float、由 gateway 字符串透传,
+    // 所以这里不做 Number() 转换, 原样发。
+    const speed = request.speed?.trim();
+    if (speed) body.speed = speed;
+  } else if (kind === "sound-effects") {
     body.metadata = {
       ...(request.duration_seconds ? { duration_seconds: Math.max(1, Math.round(request.duration_seconds)) } : {}),
       loop: false,
@@ -2138,12 +2735,12 @@ async function generateZzdhAudio(
   apiModel: string,
   headers: Record<string, string>,
 ): Promise<string> {
-  const kind = request.audio_kind ?? resolveZzdhAudioKind(apiModel) ?? 'speech';
+  const kind = request.audio_kind ?? resolveZzdhAudioKind(apiModel) ?? "speech";
   const submitUrl = `${baseUrl}${resolveZzdhAudioPath(kind)}`;
   const response = await requestProviderBinary(submitUrl, {
-    method: 'POST',
+    method: "POST",
     headers,
-    body: buildAudioBody(request, apiModel, kind),
+    body: await buildAudioBody(request, apiModel, kind),
   });
   const raw = await response.text();
   if (!response.ok) {
@@ -2165,10 +2762,13 @@ async function generateOpenAiCompatAudio(
   apiModel: string,
   headers: Record<string, string>,
 ): Promise<string> {
-  const submitUrl = resolveProviderEndpoint(baseUrl, request.extra_params?.audio_submit_path, '/v1/audio/speech');
-  const body = JSON.parse(buildAudioBody(request, apiModel, request.audio_kind ?? 'speech')) as Record<string, unknown>;
+  const submitUrl = resolveProviderEndpoint(baseUrl, request.extra_params?.audio_submit_path, "/v1/audio/speech");
+  const body = JSON.parse(await buildAudioBody(request, apiModel, request.audio_kind ?? "speech")) as Record<
+    string,
+    unknown
+  >;
   const response = await requestProviderBinary(submitUrl, {
-    method: 'POST',
+    method: "POST",
     headers,
     body: JSON.stringify(body),
   });
@@ -2184,58 +2784,430 @@ async function generateOpenAiCompatAudio(
   return await persistAudioBytes(response.bytes, request.format?.trim() || ZZDH_DEFAULT_AUDIO_FORMAT);
 }
 
-/** 音频生成入口: 字子动画走专有端点, 其它平台走 OpenAI 兼容 speech。 */
-export async function generateAudio(request: GenerateAudioRequest): Promise<string> {
+/** 音频链路共用的凭证与地址解析(合成与建音色都要用)。 */
+function resolveAudioCallContext(request: { model: string; extra_params?: Record<string, unknown> }): {
+  baseUrl: string;
+  apiModel: string;
+  headers: Record<string, string>;
+} {
   if (!isCustomModel(request.model)) {
-    throw new Error('音频生成仅支持自定义平台(custom:*)模型');
+    throw new Error("音频生成仅支持自定义平台(custom:*)模型");
   }
-  const providerId = request.model.split('/')[0] ?? '';
-  const apiModel = request.model.split('/').slice(1).join('/').trim();
-  const configuredBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
-    ? request.extra_params.provider_base_url
-    : '';
+  const providerId = request.model.split("/")[0] ?? "";
+  const apiModel = request.model.split("/").slice(1).join("/").trim();
+  const configuredBaseUrl =
+    typeof request.extra_params?.provider_base_url === "string" ? request.extra_params.provider_base_url : "";
   const baseUrl = normalizeVideoProviderBaseUrl(configuredBaseUrl);
-  const apiKey = (useSettingsStore.getState().apiKeys[providerId] ?? '').trim();
+  const apiKey = (useSettingsStore.getState().apiKeys[providerId] ?? "").trim();
   if (!baseUrl || !apiKey || !apiModel) {
-    throw new Error('请在设置中配置音频模型对应的 Base URL、API Key 和模型名称');
+    throw new Error("请在设置中配置音频模型对应的 Base URL、API Key 和模型名称");
   }
-  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
-  if (request.extra_params?.audio_transport === 'zzdh-openai-audio' || isZzdhBaseUrl(baseUrl)) {
+  return {
+    baseUrl,
+    apiModel,
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+  };
+}
+
+/**
+ * MiniMax 海螺 speech-2.8 配音合成。
+ *
+ * 事实(见 docs/api_docs/ZhiniaoAI_MiniMax_Voice_Chain.md):
+ *   - 端点就是 `/v1/audio/speech`, 与 TTS 同一个; 同步返回**音频二进制**。
+ *   - 必填 `voice` —— 只吃 voice_id(预设 id 或音色库里克隆/设计出来的 ID)。
+ *   - 🚨 **没有任何参考样音字段**。所以这条链路**绝不**带 `reference_audio`:
+ *     带了平台也会静默忽略, 用户看到的是「克隆了但声音没变」。
+ *     要换声音必须先在「音色克隆 / 音色设计」页把音色建出来。
+ */
+async function generateMmxSpeech(
+  request: GenerateAudioRequest,
+  baseUrl: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const text = request.prompt ?? "";
+  if (!text.trim()) {
+    throw new Error("请输入要朗读的文本");
+  }
+  if (text.length > MMX_SPEECH_MAX_TEXT_CHARS) {
+    throw new Error(`文本超出上限: 该模型最多 ${MMX_SPEECH_MAX_TEXT_CHARS} 个字符, 当前 ${text.length}`);
+  }
+  const voice = request.voice?.trim() ?? "";
+  if (!voice) {
+    throw new Error("请先选择音色 —— 海螺 speech-2.8 只接受音色 ID, 可先在「音色克隆 / 音色设计」页创建");
+  }
+  const format = request.format?.trim().toLowerCase() || "mp3";
+  const body = buildMmxSpeechBody({
+    text,
+    voice,
+    version: request.mmx_params?.version,
+    tier: request.mmx_params?.tier,
+    speed: request.mmx_params?.speed,
+    pitch: request.mmx_params?.pitch,
+    emotion: request.mmx_params?.emotion,
+    soundEffects: request.mmx_params?.soundEffects,
+    format,
+  });
+  const submitUrl = `${baseUrl}${MMX_AUDIO_SPEECH_PATH}`;
+  const response = await requestProviderBinary(submitUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  const raw = await response.text();
+  if (!response.ok) {
+    const platformMessage = extractMmxErrorMessage(raw);
+    throw new Error(
+      `海螺 speech-2.8 配音失败: ${platformMessage ?? buildHttpErrorSummary(response.status, raw, submitUrl)}`,
+    );
+  }
+  // 正常是二进制音频; 但网关也可能回 JSON(URL / data URL), 两种都要接住。
+  const jsonSource = extractAudioSourceFromJson(raw);
+  if (jsonSource) return await persistAudioSource(jsonSource, format);
+  if (!response.bytes.length) {
+    throw new Error(`海螺 speech-2.8 响应为空 (${submitUrl})`);
+  }
+  return await persistAudioBytes(response.bytes, format);
+}
+
+/**
+ * MiniMax 音色资产创建 —— 「音色克隆」与「音色设计」共用入口。
+ *
+ * 两条链路都是**按次一次性计费**(voice-clone ⚡2.20 / voice-design ⚡2.1944), 都打
+ * 同一个 `/v1/audio/speech`, 靠 `model` 分流。差别:
+ *   - `voice-clone`:  样音 → 音色。**不返回试听**(官方原文「当前克隆动作不产出试听」),
+ *                     要听到声音得再发一次 speech-2.8。
+ *   - `voice-design`: 描述词 + 试听文本 → 音色 + **试听音频**。
+ *
+ * `voice_id` 由调用方自带, 且平台按它幂等 —— 所以调用方必须**先落库再发请求**,
+ * 这样重试沿用同一个 id, 不会被二次收费。
+ */
+export async function generateAudioAsset(request: GenerateAudioAssetRequest): Promise<GenerateAudioAssetResult> {
+  const { baseUrl, apiModel, headers } = resolveAudioCallContext(request);
+  const operation = resolveMmxVoiceOperation(apiModel);
+  const voiceId = request.voiceId.trim();
+  if (!isValidMmxVoiceId(voiceId)) {
+    // 字母开头、≥8 字符、只含字母数字 —— 取 voice-clone 与 voice-design 要求的交集。
+    throw new Error(`音色 ID 不合法: 需以字母开头、至少 8 位、只含字母和数字 (当前 "${voiceId}")`);
+  }
+
+  let body: Record<string, unknown>;
+  let label: string;
+  if (operation === "voice-clone") {
+    label = "海螺音色克隆";
+    const sample = request.sampleAudio?.trim();
+    if (!sample) {
+      throw new Error("请先选择一段人声样本 —— 音色克隆需要 10-300 秒的 MP3 / M4A / WAV");
+    }
+    // 平台允许 `sample_url` 传「我方存储 URL 或 data:」, 所以本地样音直接转 data URL 提交,
+    // 不需要额外的上传端点。委托给统一的参考素材解析器, 它已覆盖 file: / asset: / 绝对路径。
+    const asset = await resolveReferenceAssetSource(sample, "音色克隆参考样音");
+    const sampleUrl = asset.kind === "url" ? asset.url : `data:${asset.mimeType};base64,${asset.base64}`;
+    body = buildMmxVoiceCloneBody({ voiceId, sampleUrl });
+  } else if (operation === "voice-design") {
+    label = "海螺音色设计";
+    const description = request.prompt?.trim();
+    if (!description) {
+      throw new Error("请输入音色描述词 —— 例如「低沉富有磁性的悬疑播音员」");
+    }
+    const previewText = request.previewText?.trim();
+    if (!previewText) {
+      throw new Error("请输入试听文本 —— 返回的试听音频就是这句话用新音色念出来");
+    }
+    body = buildMmxVoiceDesignBody({ voiceId, prompt: description, previewText });
+  } else {
+    throw new Error(`模型 ${apiModel} 不是音色创建模型: 需要 ${MMX_VOICE_CLONE_MODEL} 或 ${MMX_VOICE_DESIGN_MODEL}`);
+  }
+
+  const submitUrl = `${baseUrl}${MMX_AUDIO_SPEECH_PATH}`;
+  const response = await requestProviderBinary(submitUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  const raw = await response.text();
+  if (!response.ok) {
+    const platformMessage = extractMmxErrorMessage(raw);
+    throw new Error(`${label}失败: ${platformMessage ?? buildHttpErrorSummary(response.status, raw, submitUrl)}`);
+  }
+
+  const format = request.format?.trim().toLowerCase() || "mp3";
+  let payload: unknown = null;
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      payload = JSON.parse(trimmed);
+    } catch {
+      payload = null;
+    }
+  }
+
+  // 平台回填的 voice_id 优先; 取不到就沿用调用方自带的那一个(它本来就是正主)。
+  const confirmedVoiceId = (payload ? extractMmxVoiceId(payload) : null) ?? voiceId;
+
+  let previewAudio: string | undefined;
+  const jsonAudio = payload ? extractMmxAudioSource(payload) : null;
+  if (jsonAudio) {
+    previewAudio = await persistAudioSource(jsonAudio, format);
+  } else if (!payload && response.bytes.length) {
+    // 极少数情况下建音色接口也可能直接吐音频字节。
+    previewAudio = await persistAudioBytes(response.bytes, format);
+  }
+
+  return { voiceId: confirmedVoiceId, previewAudio };
+}
+
+// ---------------------------------------------------------------------------
+// 知鸟AI · Suno 音乐链路（`music` 模型）
+// ---------------------------------------------------------------------------
+
+/** 出歌中位 60–120 秒，p90 更长；20 分钟是「明显卡死」的兜底，不是预期耗时。 */
+const SUNO_TASK_TIMEOUT_MS = 20 * 60 * 1000;
+
+/**
+ * 生成结果路径 → 该结果在平台上的 clip 标识。
+ *
+ * 为什么需要这层映射：后处理操作（续写/翻唱/分离/拼接）的 `clip_id` 就来自上次结果的
+ * `source_id`，但 `generateAudio` 的契约是「返回媒体路径」，带不出第二个值。
+ * 不改契约的前提下，用这个内存表把两者关联起来，节点在拿到路径后回查一次，
+ * 把 clip 写到**输出媒体节点**上，下游音乐节点就能从上游连线里选到它。
+ *
+ * 已知取舍：只存在内存里，应用重启后历史结果查不到 clip（与即梦 CLI 的 job map 同）。
+ */
+const sunoClipIdByResultPath = new Map<string, string>();
+
+/** 查询某个生成结果对应的 Suno clip 标识（没有就返回 null）。 */
+export function resolveSunoClipIdForSource(sourcePath: string): string | null {
+  return sunoClipIdByResultPath.get(sourcePath.trim()) ?? null;
+}
+
+/** 把节点数据里的零散字段收拢成协议模块要的形状。 */
+function collectSunoInput(request: GenerateAudioRequest): SunoMusicBodyInput {
+  return {
+    operation: normalizeSunoOperation(request.suno_operation),
+    prompt: request.prompt,
+    version: request.suno_version,
+    mode: request.suno_mode,
+    style: request.suno_style,
+    lyrics: request.lyrics,
+    title: request.suno_title,
+    vocalGender: request.suno_vocal_gender,
+    negativeTags: request.suno_negative_tags,
+    clipId: request.suno_clip_id,
+    continueClipId: request.suno_continue_clip_id,
+    continueAt: request.suno_continue_at,
+    coverClipId: request.suno_cover_clip_id,
+  };
+}
+
+/**
+ * 提交任务 → 轮询到终态 → 用 `extract` 从负载里取出想要的东西。
+ *
+ * 抽成泛型是因为音乐链路有两个产出类型：媒体文件（音频/视频）与歌词**文本**，
+ * 但提交与轮询两部分完全一样。
+ *
+ * 轮询状态判定按文档：`state` 取 `success|failed`，`status` 取 `completed|failed`，
+ * **不能只判 `is_final`** —— 成功和失败都满足它。
+ */
+async function submitAndPollSunoTask<T>(
+  baseUrl: string,
+  headers: Record<string, string>,
+  body: Record<string, unknown>,
+  label: string,
+  extract: (payload: unknown) => T | null,
+): Promise<T> {
+  const submitUrl = `${baseUrl}${SUNO_ASYNC_PATH}`;
+  const response = await requestProviderJson(submitUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  const rawResponse = await response.text();
+  let payload: unknown;
+  try {
+    payload = rawResponse ? JSON.parse(rawResponse) : {};
+  } catch {
+    throw new Error(`${label}失败: 平台返回了非 JSON 响应 (${submitUrl})`);
+  }
+  if (!response.ok) {
+    throw new Error(`${label}失败: ${buildHttpErrorSummary(response.status, rawResponse, submitUrl)}`);
+  }
+
+  // 少数渠道会同步直接给结果；有结果且没有任务 ID 时无需再轮询。
+  const immediate = extract(payload);
+  const taskId = extractSunoTaskId(payload);
+  if (immediate !== null && !taskId) return immediate;
+  if (!taskId) {
+    throw new Error(`${label}响应中未找到任务 ID: ${describeSunoResponse(payload)}`);
+  }
+
+  const taskUrl = `${baseUrl}${resolveSunoTaskPath(taskId)}`;
+  const deadline = Date.now() + SUNO_TASK_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, SUNO_POLL_INTERVAL_MS));
+    const taskResponse = await requestProviderJson(taskUrl, { headers });
+    const taskRawResponse = await taskResponse.text();
+    let taskPayload: unknown;
+    try {
+      taskPayload = taskRawResponse ? JSON.parse(taskRawResponse) : {};
+    } catch {
+      throw new Error(`${label}查询失败: 平台返回了非 JSON 响应 (${taskUrl})`);
+    }
+    if (!taskResponse.ok) {
+      throw new Error(`${label}查询失败: ${buildHttpErrorSummary(taskResponse.status, taskRawResponse, taskUrl)}`);
+    }
+    const result = extract(taskPayload);
+    if (result !== null) return result;
+    const status = readSunoTaskStatus(taskPayload);
+    if (isSunoFailureState(status)) {
+      const reason = extractSunoErrorMessage(taskPayload);
+      throw new Error(`${label}失败${reason ? `: ${reason}` : ` (${status})`} — ${describeSunoResponse(taskPayload)}`);
+    }
+  }
+  throw new Error(`${label}超时: 已等待 ${Math.round(SUNO_TASK_TIMEOUT_MS / 60000)} 分钟仍未完成`);
+}
+
+/**
+ * 把平台返回的 CDN 直链落成可长期播放的本地文件。
+ *
+ * 知鸟的结果是 CDN URL（文档原文「完成后通过 GET /v1/tasks/{task_id} 获取
+ * ZN 知鸟AI CDN URL」），这类链接会过期。下载用**裸请求**（不带平台 Authorization）——
+ * CDN 是公开直链，带上平台密钥反而可能被拒。
+ *
+ * 下载失败不视为任务失败：退回原 URL，节点仍能播放（只是不持久）。
+ */
+async function downloadSunoMedia(url: string, wantsVideo: boolean): Promise<string> {
+  if (/^data:/i.test(url) || !/^https?:/i.test(url)) return url;
+  try {
+    const response = await requestProviderBinary(url, {});
+    if (response.ok && response.bytes.length > 0) {
+      return wantsVideo
+        ? await persistImageBinary(response.bytes, "mp4")
+        : await persistAudioBytes(response.bytes, "mp3");
+    }
+  } catch {
+    // 落盘失败就退回直链。
+  }
+  return url;
+}
+
+/**
+ * Suno 媒体产出（`generate` / `extend` / `cover` / `stems` / `stems_all` / `mp4` / `concat`）。
+ *
+ * `operation=lyrics` **不走这里** —— 它产出歌词文本，见 `generateSunoLyrics`。
+ *
+ * 分离类操作（`stems` / `stems_all`）平台会返回多条音轨，当前只落**第一条**
+ * （`extractSunoFileUrls` 会给字段路径含 `vocal` 的加分，所以拿到的通常是人声轨）。
+ */
+async function generateSunoMusic(
+  request: GenerateAudioRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const input = collectSunoInput(request);
+  if (input.operation === "lyrics") {
+    throw new Error("Suno 的 lyrics 操作产出歌词文本而非音频, 请调用 generateSunoLyrics");
+  }
+  const spec = SUNO_OPERATION_SPECS[input.operation];
+  const invalid = validateSunoMusicInput(input);
+  if (invalid) {
+    // 平台的鉴权在参数校验之前（无 key 一律 401），客户端不挡就会白扣一次费。
+    throw new Error(`Suno 参数不完整: ${describeSunoValidation(invalid)}`);
+  }
+
+  const wantsVideo = spec.output === "video";
+  const body = buildSunoMusicBody(apiModel, input);
+  // 顺手记下结果自带的 clip —— 供后续 extend/cover/stems/concat 当源。
+  let clipId: string | null = null;
+  const files = await submitAndPollSunoTask(baseUrl, headers, body, "Suno 音乐生成", (payload) => {
+    const urls = extractSunoFileUrls(payload, { wantsVideo });
+    if (urls.length === 0) return null;
+    clipId = clipId ?? extractSunoClipId(payload);
+    return urls;
+  });
+
+  const first = files[0];
+  if (!first) throw new Error("Suno 音乐生成失败: 任务已完成但没有产出文件");
+  const persisted = await downloadSunoMedia(first, wantsVideo);
+  if (clipId) sunoClipIdByResultPath.set(persisted.trim(), clipId);
+  return persisted;
+}
+
+/**
+ * `operation=lyrics` —— 按主题生成歌词**文本**（产出不是音频）。
+ *
+ * UI 侧把它挂在歌词框旁边的「AI 写词」按钮上，拿到文本后直接填进歌词框，
+ * 而不是走节点的生成流程（那是给媒体产出用的）。
+ */
+export async function generateSunoLyrics(request: GenerateAudioRequest): Promise<string> {
+  const { baseUrl, apiModel, headers } = resolveAudioCallContext(request);
+  const input = collectSunoInput(request);
+  input.operation = "lyrics";
+  const invalid = validateSunoMusicInput(input);
+  if (invalid) throw new Error(`Suno 参数不完整: ${describeSunoValidation(invalid)}`);
+  const body = buildSunoMusicBody(apiModel, input);
+  return await submitAndPollSunoTask(baseUrl, headers, body, "Suno AI 写词", (payload) =>
+    extractSunoLyricsText(payload),
+  );
+}
+
+/**
+ * 音频生成入口。
+ *
+ * 分流顺序要紧: **MiniMax 三件套必须最先判** —— 它们的 audioKind 也是 `speech`,
+ * 落到后面的分支就会被当普通 TTS 处理(这正是 `voice-design` 历史上被送成
+ * `input=文本` 的原因)。建音色的两个能力不走这里, 由 `generateAudioAsset` 承担。
+ *
+ * 字子动画排在 Suno 之前: 它的 `music-2.6` 走 `/v1/audio/music` +
+ * `metadata{lyrics_text, music_length_ms}`, 与 Suno 的扁平字段**是两套协议**,
+ * 靠 `audio_transport` 标记区分（`isSunoMusicModel` 只认裸 `music`, 不会误判）。
+ */
+export async function generateAudio(request: GenerateAudioRequest): Promise<string> {
+  const { baseUrl, apiModel, headers } = resolveAudioCallContext(request);
+  if (isRunningHubIndexTts2(baseUrl, apiModel)) {
+    return await generateRunningHubIndexTts25(request, baseUrl, headers);
+  }
+  const mmxOperation = resolveMmxVoiceOperation(apiModel);
+  if (mmxOperation === "voice-clone" || mmxOperation === "voice-design") {
+    throw new Error("音色克隆 / 音色设计不产出音频, 请调用 generateAudioAsset");
+  }
+  if (mmxOperation === "speech") {
+    return await generateMmxSpeech(request, baseUrl, headers);
+  }
+  const zzdhTransport = request.extra_params?.audio_transport === "zzdh-openai-audio" || isZzdhBaseUrl(baseUrl);
+  if (!zzdhTransport && resolveSunoMusicOperation(apiModel)) {
+    return await generateSunoMusic(request, baseUrl, apiModel, headers);
+  }
+  if (zzdhTransport) {
     return await generateZzdhAudio(request, baseUrl, apiModel, headers);
   }
   return await generateOpenAiCompatAudio(request, baseUrl, apiModel, headers);
 }
 
-export async function generateJimengCliVideo(
-  request: GenerateJimengCliVideoRequest
-): Promise<string> {
+export async function generateJimengCliVideo(request: GenerateJimengCliVideoRequest): Promise<string> {
   if (!isTauri()) {
-    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再生成。');
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再生成。");
   }
 
-  return await invoke<string>('generate_jimeng_cli_video', { request });
+  return await invoke<string>("generate_jimeng_cli_video", { request });
 }
 
 /** 即梦 CLI 图片生成(文生图 / 图生图), 返回落盘后的本地图片路径或远端 URL。 */
-export async function generateJimengCliImage(
-  request: GenerateJimengCliImageRequest
-): Promise<string> {
+export async function generateJimengCliImage(request: GenerateJimengCliImageRequest): Promise<string> {
   if (!isTauri()) {
-    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再生成。');
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再生成。");
   }
 
-  return await invoke<string>('generate_jimeng_cli_image', { request });
+  return await invoke<string>("generate_jimeng_cli_image", { request });
 }
 
 /** 即梦 CLI 图片超清(2K/4K/8K), 产出新文件而不覆盖原图。 */
-export async function generateJimengCliImageUpscale(
-  request: GenerateJimengCliImageUpscaleRequest
-): Promise<string> {
+export async function generateJimengCliImageUpscale(request: GenerateJimengCliImageUpscaleRequest): Promise<string> {
   if (!isTauri()) {
-    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再生成。');
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再生成。");
   }
 
-  return await invoke<string>('generate_jimeng_cli_image_upscale', { request });
+  return await invoke<string>("generate_jimeng_cli_image_upscale", { request });
 }
 
 /**
@@ -2249,7 +3221,7 @@ export async function generateJimengCliImageUpscale(
  */
 async function submitJimengCliImageJob(request: GenerateRequest): Promise<string> {
   const jobId = crypto.randomUUID();
-  browserGenerationJobs.set(jobId, { job_id: jobId, status: 'running', result: null, error: null });
+  browserGenerationJobs.set(jobId, { job_id: jobId, status: "running", result: null, error: null });
 
   const modelVersion = request.model.slice(JIMENG_CLI_IMAGE_MODEL_PREFIX.length).trim();
   const executable = useSettingsStore.getState().jimengCli.executable;
@@ -2259,11 +3231,7 @@ async function submitJimengCliImageJob(request: GenerateRequest): Promise<string
       // 参考图可能是远端 CDN 地址: 交给 Rust 统一取字节转 data URL,
       // 既绕开 webview 的 CORS 限制, 也让 CLI 拿到本地可读的文件。
       const referenceImages = request.reference_images?.length
-        ? await Promise.all(
-            request.reference_images.map((source) =>
-              invoke<string>('load_media_data_url', { source })
-            )
-          )
+        ? await Promise.all(request.reference_images.map((source) => invoke<string>("load_media_data_url", { source })))
         : undefined;
 
       const result = await generateJimengCliImage({
@@ -2273,16 +3241,17 @@ async function submitJimengCliImageJob(request: GenerateRequest): Promise<string
         // LenTalk 的 size 就是档位(1K/1.5K/2K/4K), Rust 侧会归一化成 CLI 要的小写。
         resolution_type: request.size,
         aspect_ratio: request.aspect_ratio,
-        generate_num: typeof request.extra_params?.image_count === 'number'
-          ? Math.max(1, Math.min(10, Math.round(request.extra_params.image_count)))
-          : undefined,
+        generate_num:
+          typeof request.extra_params?.image_count === "number"
+            ? Math.max(1, Math.min(10, Math.round(request.extra_params.image_count)))
+            : undefined,
         reference_images: referenceImages,
       });
-      browserGenerationJobs.set(jobId, { job_id: jobId, status: 'succeeded', result, error: null });
+      browserGenerationJobs.set(jobId, { job_id: jobId, status: "succeeded", result, error: null });
     } catch (error) {
       browserGenerationJobs.set(jobId, {
         job_id: jobId,
-        status: 'failed',
+        status: "failed",
         result: null,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -2308,30 +3277,30 @@ async function submitJimengCliImageUpscaleJob(request: GenerateRequest): Promise
     // 没有源图就没有超清可言: 直接落一条 failed, 让结果节点显示原因而不是空转。
     browserGenerationJobs.set(jobId, {
       job_id: jobId,
-      status: 'failed',
+      status: "failed",
       result: null,
-      error: '图片超清需要一张源图：请选中带图的结果节点，或先在本节点生成一张图。',
+      error: "图片超清需要一张源图：请选中带图的结果节点，或先在本节点生成一张图。",
     });
     return jobId;
   }
 
-  browserGenerationJobs.set(jobId, { job_id: jobId, status: 'running', result: null, error: null });
+  browserGenerationJobs.set(jobId, { job_id: jobId, status: "running", result: null, error: null });
   const executable = useSettingsStore.getState().jimengCli.executable;
 
   void (async () => {
     try {
-      const image = await invoke<string>('load_media_data_url', { source });
+      const image = await invoke<string>("load_media_data_url", { source });
       const result = await generateJimengCliImageUpscale({
         executable,
         image,
         // LenTalk 的 size 就是档位(2K/4K/8K), Rust 侧归一化成 CLI 要的小写。
         resolution_type: request.size,
       });
-      browserGenerationJobs.set(jobId, { job_id: jobId, status: 'succeeded', result, error: null });
+      browserGenerationJobs.set(jobId, { job_id: jobId, status: "succeeded", result, error: null });
     } catch (error) {
       browserGenerationJobs.set(jobId, {
         job_id: jobId,
-        status: 'failed',
+        status: "failed",
         result: null,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -2357,28 +3326,25 @@ export interface JimengCliLoginCheckResult {
 /** 开始即梦 CLI 登录: 返回设备码登录材料(验证地址/用户码/设备码), 由调用方打开浏览器并轮询检查 */
 export async function jimengCliLoginStart(executable: string): Promise<JimengCliLoginStartResult> {
   if (!isTauri()) {
-    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。');
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。");
   }
-  return await invoke<JimengCliLoginStartResult>('jimeng_cli_login_start', { executable });
+  return await invoke<JimengCliLoginStartResult>("jimeng_cli_login_start", { executable });
 }
 
 /** 查询即梦 CLI 设备码登录是否完成 */
-export async function jimengCliLoginCheck(
-  executable: string,
-  deviceCode: string
-): Promise<JimengCliLoginCheckResult> {
+export async function jimengCliLoginCheck(executable: string, deviceCode: string): Promise<JimengCliLoginCheckResult> {
   if (!isTauri()) {
-    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。');
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。");
   }
-  return await invoke<JimengCliLoginCheckResult>('jimeng_cli_login_check', { executable, deviceCode });
+  return await invoke<JimengCliLoginCheckResult>("jimeng_cli_login_check", { executable, deviceCode });
 }
 
 /** Clear the local Dreamina CLI OAuth login state. */
 export async function jimengCliLogout(executable: string): Promise<JimengCliLoginCheckResult> {
   if (!isTauri()) {
-    throw new Error('Dreamina CLI is desktop-only.');
+    throw new Error("Dreamina CLI is desktop-only.");
   }
-  return await invoke<JimengCliLoginCheckResult>('jimeng_cli_logout', { executable });
+  return await invoke<JimengCliLoginCheckResult>("jimeng_cli_logout", { executable });
 }
 
 export interface JimengCliDetectResult {
@@ -2398,17 +3364,17 @@ export interface JimengCliInstallResult {
 /** 检测本机是否安装即梦 CLI（只读探测，不触发安装） */
 export async function jimengCliDetect(executable?: string): Promise<JimengCliDetectResult> {
   if (!isTauri()) {
-    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。');
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。");
   }
-  return await invoke<JimengCliDetectResult>('jimeng_cli_detect', { executable: executable ?? '' });
+  return await invoke<JimengCliDetectResult>("jimeng_cli_detect", { executable: executable ?? "" });
 }
 
 /** 自动安装即梦 CLI（仅 Windows；失败不致命，只写用户目录） */
 export async function jimengCliInstall(): Promise<JimengCliInstallResult> {
   if (!isTauri()) {
-    throw new Error('即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。');
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。");
   }
-  return await invoke<JimengCliInstallResult>('jimeng_cli_install');
+  return await invoke<JimengCliInstallResult>("jimeng_cli_install");
 }
 
 function isCustomModel(model: string): boolean {
@@ -2427,37 +3393,33 @@ function shouldUseWebviewProviderRequests(): boolean {
 
 function assertWindowsModelSupported(request: GenerateRequest): void {
   if (isWindowsDesktopRuntime() && !isCustomModel(request.model)) {
-    throw new Error('Windows 桌面端仅支持通过自定义平台(custom:*)生成图片，请在设置中配置 OpenAI 兼容 API。');
+    throw new Error("Windows 桌面端仅支持通过自定义平台(custom:*)生成图片，请在设置中配置 OpenAI 兼容 API。");
   }
 }
 
-function uses65535GeminiEdits(
-  providerId: string,
-  apiModel: string,
-  referenceImageCount: number
-): boolean {
-  if (providerId !== 'custom:65535' || referenceImageCount === 0) {
+function uses65535GeminiEdits(providerId: string, apiModel: string, referenceImageCount: number): boolean {
+  if (providerId !== "custom:65535" || referenceImageCount === 0) {
     return false;
   }
   const normalizedModel = apiModel.trim().toLowerCase();
-  return normalizedModel.includes('gemini') && normalizedModel.includes('image');
+  return normalizedModel.includes("gemini") && normalizedModel.includes("image");
 }
 
 async function buildBrowserGeminiEditsForm(
   request: GenerateRequest,
   apiModel: string,
-  referenceImages: string[]
+  referenceImages: string[],
 ): Promise<FormData> {
   const form = new FormData();
-  form.append('model', apiModel);
-  form.append('prompt', request.prompt);
+  form.append("model", apiModel);
+  form.append("prompt", request.prompt);
   const normalizedSize = request.size.trim().toUpperCase();
-  const size = ['1K', '2K', '4K'].includes(normalizedSize)
+  const size = ["1K", "2K", "4K"].includes(normalizedSize)
     ? normalizedSize
     : mapRequestedImageSize(apiModel, request.size, request.aspect_ratio);
-  form.append('size', size);
-  form.append('n', '1');
-  form.append('aspect_ratio', request.aspect_ratio);
+  form.append("size", size);
+  form.append("n", "1");
+  form.append("aspect_ratio", request.aspect_ratio);
 
   for (const [index, source] of referenceImages.entries()) {
     const response = await fetch(source);
@@ -2465,8 +3427,8 @@ async function buildBrowserGeminiEditsForm(
       throw new Error(`读取第 ${index + 1} 张参考图失败 (HTTP ${response.status})`);
     }
     const blob = await response.blob();
-    const extension = blob.type.split('/')[1]?.split(';')[0] || 'png';
-    form.append('image', blob, `reference-${index + 1}.${extension}`);
+    const extension = blob.type.split("/")[1]?.split(";")[0] || "png";
+    form.append("image", blob, `reference-${index + 1}.${extension}`);
   }
   return form;
 }
@@ -2478,32 +3440,31 @@ async function buildBrowserGeminiEditsForm(
  */
 async function browserGenerateImage(request: GenerateRequest): Promise<string> {
   const model = request.model;
-  const providerId = model.split('/')[0] ?? '';
+  const providerId = model.split("/")[0] ?? "";
   if (!providerId.startsWith(CUSTOM_API_PROVIDER_PREFIX)) {
-    throw new Error('浏览器模式仅支持自定义平台(custom:*)模型,其他平台请使用桌面版 LenTalk 生成');
+    throw new Error("浏览器模式仅支持自定义平台(custom:*)模型,其他平台请使用桌面版 LenTalk 生成");
   }
   // 发送给平台的 model 需去掉 custom:<id>/ 前缀(与 Rust 端拆分逻辑一致)
-  const apiModel = model.split('/').slice(1).join('/') || model;
+  const apiModel = model.split("/").slice(1).join("/") || model;
 
   const rawBaseUrl = request.extra_params?.provider_base_url;
-  const baseUrl = typeof rawBaseUrl === 'string'
-    ? rawBaseUrl.trim().replace(/\/+$/, '').replace(/\/v1$/i, '').replace(/\/+$/, '')
-    : '';
+  const baseUrl =
+    typeof rawBaseUrl === "string"
+      ? rawBaseUrl.trim().replace(/\/+$/, "").replace(/\/v1$/i, "").replace(/\/+$/, "")
+      : "";
   if (!baseUrl) {
-    throw new Error('缺少 provider_base_url,请检查自定义平台配置');
+    throw new Error("缺少 provider_base_url,请检查自定义平台配置");
   }
 
-  const apiKey = useSettingsStore.getState().apiKeys[providerId] ?? '';
+  const apiKey = useSettingsStore.getState().apiKeys[providerId] ?? "";
   if (!apiKey) {
-    throw new Error('未配置 API Key,请在「设置-密钥」中填写该平台的密钥');
+    throw new Error("未配置 API Key,请在「设置-密钥」中填写该平台的密钥");
   }
 
   const usesResponsesProtocol =
-    typeof request.extra_params?.protocol === 'string' &&
-    request.extra_params.protocol.toLowerCase() === 'responses';
+    typeof request.extra_params?.protocol === "string" && request.extra_params.protocol.toLowerCase() === "responses";
   const usesChatProtocol =
-    typeof request.extra_params?.protocol === 'string' &&
-    request.extra_params.protocol.toLowerCase() === 'chat';
+    typeof request.extra_params?.protocol === "string" && request.extra_params.protocol.toLowerCase() === "chat";
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 180000);
   try {
@@ -2512,20 +3473,20 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
     const referenceSources = request.reference_images ?? [];
     for (const rawSource of referenceSources) {
       const source = rawSource.trim();
-      if (source.startsWith('data:') || source.startsWith('http://') || source.startsWith('https://')) {
+      if (source.startsWith("data:") || source.startsWith("http://") || source.startsWith("https://")) {
         referenceImages.push(source);
-      } else if (source.startsWith('blob:')) {
+      } else if (source.startsWith("blob:")) {
         try {
           const blob = await (await fetch(source)).blob();
           const dataUrl = await new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
-            reader.onload = () => resolve(String(reader.result ?? ''));
-            reader.onerror = () => reject(new Error('参考图读取失败'));
+            reader.onload = () => resolve(String(reader.result ?? ""));
+            reader.onerror = () => reject(new Error("参考图读取失败"));
             reader.readAsDataURL(blob);
           });
           referenceImages.push(dataUrl);
         } catch (error) {
-          console.warn('[AI] browser fallback: failed to read blob reference image', { error });
+          console.warn("[AI] browser fallback: failed to read blob reference image", { error });
         }
       }
     }
@@ -2533,55 +3494,61 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
     const useGeminiEdits = uses65535GeminiEdits(providerId, apiModel, referenceImages.length);
     const endpoint = `${baseUrl}/v1/${
       usesResponsesProtocol
-        ? 'responses'
+        ? "responses"
         : usesChatProtocol
-          ? 'chat/completions'
+          ? "chat/completions"
           : useGeminiEdits
-            ? 'images/edits'
-            : 'images/generations'
+            ? "images/edits"
+            : "images/generations"
     }`;
     const body: Record<string, unknown> = usesResponsesProtocol
       ? {
           model: apiModel,
-          input: [{
-            role: 'user',
-            content: [
-              { type: 'input_text', text: request.prompt },
-              ...referenceImages.map((image) => ({
-                type: 'input_image',
-                image_url: image.startsWith('data:') ? (image.split(',', 2)[1] ?? image) : image,
-              })),
-            ],
-          }],
-          tools: [{
-            type: 'image_generation',
-            action: referenceImages.length > 0 ? 'edit' : 'generate',
-            size: mapRequestedImageSize(apiModel, request.size, request.aspect_ratio),
-          }],
-          tool_choice: { type: 'image_generation' },
+          input: [
+            {
+              role: "user",
+              content: [
+                { type: "input_text", text: request.prompt },
+                ...referenceImages.map((image) => ({
+                  type: "input_image",
+                  image_url: image.startsWith("data:") ? (image.split(",", 2)[1] ?? image) : image,
+                })),
+              ],
+            },
+          ],
+          tools: [
+            {
+              type: "image_generation",
+              action: referenceImages.length > 0 ? "edit" : "generate",
+              size: mapRequestedImageSize(apiModel, request.size, request.aspect_ratio),
+            },
+          ],
+          tool_choice: { type: "image_generation" },
           n: request.image_count ?? 1,
         }
       : usesChatProtocol
         ? {
             model: apiModel,
-            messages: [{
-              role: 'user',
-              content: [
-                { type: 'text', text: request.prompt },
-                ...referenceImages.map((image) => ({
-                  type: 'image_url',
-                  image_url: { url: image },
-                })),
-              ],
-            }],
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: request.prompt },
+                  ...referenceImages.map((image) => ({
+                    type: "image_url",
+                    image_url: { url: image },
+                  })),
+                ],
+              },
+            ],
             n: request.image_count ?? 1,
-            response_format: { type: 'image' },
+            response_format: { type: "image" },
           }
         : buildBrowserImagesRequestBody(request, apiModel, referenceImages);
 
     const response = useGeminiEdits
       ? await fetch(endpoint, {
-          method: 'POST',
+          method: "POST",
           headers: {
             Authorization: `Bearer ${apiKey}`,
           },
@@ -2589,9 +3556,9 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
           signal: controller.signal,
         })
       : await fetch(endpoint, {
-          method: 'POST',
+          method: "POST",
           headers: {
-            'Content-Type': 'application/json',
+            "Content-Type": "application/json",
             Authorization: `Bearer ${apiKey}`,
           },
           body: JSON.stringify(body),
@@ -2607,59 +3574,55 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
 
     if (!response.ok) {
       const errorMessage =
-        payload && typeof payload === 'object'
-          ? ((payload as { error?: { message?: unknown } }).error?.message as string | undefined) ??
-            ((payload as { message?: unknown }).message as string | undefined)
+        payload && typeof payload === "object"
+          ? (((payload as { error?: { message?: unknown } }).error?.message as string | undefined) ??
+            ((payload as { message?: unknown }).message as string | undefined))
           : undefined;
-      throw new Error(
-        `自定义平台请求失败 (HTTP ${response.status}): ${errorMessage ?? response.statusText}`
-      );
+      throw new Error(`自定义平台请求失败 (HTTP ${response.status}): ${errorMessage ?? response.statusText}`);
     }
 
     if (usesResponsesProtocol) {
-      const images = extractBrowserImageResults(payload, 'responses');
+      const images = extractBrowserImageResults(payload, "responses");
       if (images.length > 0) {
         return serializeBrowserImageResults(images);
       }
-      throw new Error('Responses 响应中未找到图片，请确认该平台模型支持图像生成');
+      throw new Error("Responses 响应中未找到图片，请确认该平台模型支持图像生成");
     }
 
     if (usesChatProtocol) {
-      const images = extractBrowserImageResults(payload, 'chat');
+      const images = extractBrowserImageResults(payload, "chat");
       if (images.length > 0) {
         return serializeBrowserImageResults(images);
       }
-      throw new Error('Chat Completions 响应中未找到图片，请确认该平台模型支持图像生成');
+      throw new Error("Chat Completions 响应中未找到图片，请确认该平台模型支持图像生成");
     }
 
     const data =
-      payload && typeof payload === 'object' && Array.isArray((payload as { data?: unknown }).data)
+      payload && typeof payload === "object" && Array.isArray((payload as { data?: unknown }).data)
         ? (payload as { data: unknown[] }).data
         : [];
     const images = data.flatMap((item) => {
-      if (!item || typeof item !== 'object') return [];
+      if (!item || typeof item !== "object") return [];
       const b64 = (item as { b64_json?: unknown }).b64_json;
-      if (typeof b64 === 'string' && b64) return [`data:image/png;base64,${b64}`];
+      if (typeof b64 === "string" && b64) return [`data:image/png;base64,${b64}`];
       const url = (item as { url?: unknown }).url;
-      return typeof url === 'string' && url ? [url] : [];
+      return typeof url === "string" && url ? [url] : [];
     });
     if (images.length > 0) {
       return serializeBrowserImageResults(images);
     }
     const errorMessage =
-      payload && typeof payload === 'object'
+      payload && typeof payload === "object"
         ? ((payload as { error?: { message?: unknown } }).error?.message as string | undefined)
         : undefined;
-    throw new Error(errorMessage ?? '响应中未找到图片数据');
+    throw new Error(errorMessage ?? "响应中未找到图片数据");
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error('生成超时(180s),请检查平台服务状态或网络');
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("生成超时(180s),请检查平台服务状态或网络");
     }
     // 浏览器跨域(CORS)或网络错误:fetch 会抛 TypeError
     if (error instanceof TypeError) {
-      throw new Error(
-        `浏览器跨域(CORS)或网络错误:${error.message}。若平台未开放跨域访问,请使用桌面版 LenTalk 生成`
-      );
+      throw new Error(`浏览器跨域(CORS)或网络错误:${error.message}。若平台未开放跨域访问,请使用桌面版 LenTalk 生成`);
     }
     throw error;
   } finally {
@@ -2670,26 +3633,31 @@ async function browserGenerateImage(request: GenerateRequest): Promise<string> {
 function buildBrowserImagesRequestBody(
   request: GenerateRequest,
   apiModel: string,
-  referenceImages: string[]
+  referenceImages: string[],
 ): Record<string, unknown> {
-  const isGptImage = apiModel.toLowerCase().includes('gpt-image');
+  const isGptImage = apiModel.toLowerCase().includes("gpt-image");
   const rawReferenceImageField = request.extra_params?.reference_image_field;
-  const referenceImageField = rawReferenceImageField === 'input_image'
-    ? 'input_image'
-    : rawReferenceImageField === 'images'
-      ? 'images'
-      : rawReferenceImageField === 'reference_images'
-        ? 'reference_images'
-        : 'image';
-  const configuredEncoding = typeof request.extra_params?.reference_image_encoding === 'string'
-    ? request.extra_params.reference_image_encoding.toLowerCase()
-    : 'auto';
-  const referenceImageEncoding = configuredEncoding === 'raw_base64' || configuredEncoding === 'data_url' || configuredEncoding === 'url'
-    ? configuredEncoding
-    : referenceImageField === 'input_image' ? 'raw_base64' : 'data_url';
+  const referenceImageField =
+    rawReferenceImageField === "input_image"
+      ? "input_image"
+      : rawReferenceImageField === "images"
+        ? "images"
+        : rawReferenceImageField === "reference_images"
+          ? "reference_images"
+          : "image";
+  const configuredEncoding =
+    typeof request.extra_params?.reference_image_encoding === "string"
+      ? request.extra_params.reference_image_encoding.toLowerCase()
+      : "auto";
+  const referenceImageEncoding =
+    configuredEncoding === "raw_base64" || configuredEncoding === "data_url" || configuredEncoding === "url"
+      ? configuredEncoding
+      : referenceImageField === "input_image"
+        ? "raw_base64"
+        : "data_url";
   const normalizeReferenceImage = (image: string): string => {
-    if (referenceImageEncoding !== 'raw_base64' || !image.startsWith('data:')) return image;
-    return image.split(',', 2)[1] ?? image;
+    if (referenceImageEncoding !== "raw_base64" || !image.startsWith("data:")) return image;
+    return image.split(",", 2)[1] ?? image;
   };
   const body: Record<string, unknown> = {
     model: apiModel,
@@ -2698,28 +3666,26 @@ function buildBrowserImagesRequestBody(
     n: request.image_count ?? 1,
   };
   if (isGptImage) {
-    body.output_format = 'png';
-    if (apiModel.toLowerCase().includes('gpt-image-2') && !usesNativeImageParameters(apiModel)) {
+    body.output_format = "png";
+    if (apiModel.toLowerCase().includes("gpt-image-2") && !usesNativeImageParameters(apiModel)) {
       body.aspect_ratio = request.aspect_ratio;
     }
   } else {
     // 非 GPT 的 OpenAI 兼容模型通常以 aspect_ratio 控制画幅；此前只传了
     // 固定的 1024x1024，导致节点选择的横竖比例被服务端默认值覆盖。
     body.aspect_ratio = request.aspect_ratio;
-    body.response_format = 'b64_json';
+    body.response_format = "b64_json";
   }
   if (referenceImages.length > 0) {
-    if (referenceImageField === 'input_image') {
+    if (referenceImageField === "input_image") {
       const normalized = referenceImages.map(normalizeReferenceImage);
       body.input_image = normalized.length === 1 ? normalized[0] : normalized;
-    } else if (referenceImageField === 'images') {
+    } else if (referenceImageField === "images") {
       // 知鸟 AI 等平台的参考图字段是 images 纯数组(单图也是数组)。
       body.images = referenceImages.map(normalizeReferenceImage);
-    } else if (referenceImageField === 'reference_images') {
+    } else if (referenceImageField === "reference_images") {
       // 字子动画等平台: 参考图是对象数组 [{"url": "..."}](官方模型页字段表)。
-      body.reference_images = referenceImages
-        .map(normalizeReferenceImage)
-        .map((url) => ({ url }));
+      body.reference_images = referenceImages.map(normalizeReferenceImage).map((url) => ({ url }));
     } else {
       body.image = normalizeReferenceImage(referenceImages[0]);
       if (referenceImages.length > 1) {
@@ -2729,9 +3695,10 @@ function buildBrowserImagesRequestBody(
   }
   // 知鸟 AI 等平台把「参考图用途」放在 mode 上: 默认 text-to-image 会忽略参考图,
   // 有参考图时必须显式声明 image-edit(单图编辑) / multi-reference(多图融合)。
-  const imageGenerationMode = typeof request.extra_params?.image_generation_mode === 'string'
-    ? request.extra_params.image_generation_mode.trim()
-    : '';
+  const imageGenerationMode =
+    typeof request.extra_params?.image_generation_mode === "string"
+      ? request.extra_params.image_generation_mode.trim()
+      : "";
   if (imageGenerationMode) {
     body.mode = imageGenerationMode;
   }
@@ -2740,34 +3707,35 @@ function buildBrowserImagesRequestBody(
 
 function serializeBrowserImageResults(images: string[]): string {
   const unique = images.filter((image, index) => image.trim() && images.indexOf(image) === index);
-  return unique.length > 1 ? JSON.stringify(unique) : (unique[0] ?? '');
+  return unique.length > 1 ? JSON.stringify(unique) : (unique[0] ?? "");
 }
 
-function extractBrowserImageResults(payload: unknown, protocol: 'responses' | 'chat'): string[] {
+function extractBrowserImageResults(payload: unknown, protocol: "responses" | "chat"): string[] {
   const results: string[] = [];
   const push = (value: unknown, key: string) => {
-    if (typeof value !== 'string' || !value.trim()) return;
-    const normalized = key === 'b64_json'
-      ? `data:image/png;base64,${value}`
-      : key === 'result' && !/^(https?:|data:)/i.test(value)
+    if (typeof value !== "string" || !value.trim()) return;
+    const normalized =
+      key === "b64_json"
         ? `data:image/png;base64,${value}`
-        : value;
+        : key === "result" && !/^(https?:|data:)/i.test(value)
+          ? `data:image/png;base64,${value}`
+          : value;
     if (!results.includes(normalized)) results.push(normalized);
   };
-  if (!payload || typeof payload !== 'object') return results;
-  if (protocol === 'responses') {
+  if (!payload || typeof payload !== "object") return results;
+  if (protocol === "responses") {
     const output = (payload as { output?: unknown }).output;
     if (Array.isArray(output)) {
       for (const item of output) {
-        if (!item || typeof item !== 'object') continue;
+        if (!item || typeof item !== "object") continue;
         const record = item as Record<string, unknown>;
-        push(record.result, 'result');
-        push(record.image_url, 'image_url');
+        push(record.result, "result");
+        push(record.image_url, "image_url");
         if (Array.isArray(record.content)) {
           for (const part of record.content) {
-            if (part && typeof part === 'object') {
-              push((part as Record<string, unknown>).result, 'result');
-              push((part as Record<string, unknown>).image_url, 'image_url');
+            if (part && typeof part === "object") {
+              push((part as Record<string, unknown>).result, "result");
+              push((part as Record<string, unknown>).image_url, "image_url");
             }
           }
         }
@@ -2777,25 +3745,23 @@ function extractBrowserImageResults(payload: unknown, protocol: 'responses' | 'c
     const choices = (payload as { choices?: unknown }).choices;
     if (Array.isArray(choices)) {
       for (const choice of choices) {
-        const message = choice && typeof choice === 'object'
-          ? (choice as Record<string, unknown>).message
-          : undefined;
-        if (!message || typeof message !== 'object') continue;
+        const message = choice && typeof choice === "object" ? (choice as Record<string, unknown>).message : undefined;
+        if (!message || typeof message !== "object") continue;
         const record = message as Record<string, unknown>;
-        push(record.image_url, 'image_url');
+        push(record.image_url, "image_url");
         if (Array.isArray(record.content)) {
           for (const part of record.content) {
-            if (part && typeof part === 'object') {
+            if (part && typeof part === "object") {
               const partRecord = part as Record<string, unknown>;
               const imageUrl = partRecord.image_url;
-              if (imageUrl && typeof imageUrl === 'object') {
-                push((imageUrl as Record<string, unknown>).url, 'url');
+              if (imageUrl && typeof imageUrl === "object") {
+                push((imageUrl as Record<string, unknown>).url, "url");
               } else {
-                push(imageUrl, 'image_url');
+                push(imageUrl, "image_url");
               }
-              if (typeof partRecord.text === 'string') {
+              if (typeof partRecord.text === "string") {
                 const markdownUrl = partRecord.text.match(/https?:\/\/[^\s)\]}"',]+/i)?.[0];
-                if (markdownUrl) push(markdownUrl, 'url');
+                if (markdownUrl) push(markdownUrl, "url");
               }
             }
           }
@@ -2808,18 +3774,19 @@ function extractBrowserImageResults(payload: unknown, protocol: 'responses' | 'c
 
 export async function generateImage(request: GenerateRequest): Promise<string> {
   const startedAt = performance.now();
-  console.info('[AI] generate_image request', {
+  console.info("[AI] generate_image request", {
     ...sanitizeGenerateRequestForLog(request),
     tauri: isTauri(),
   });
 
   assertWindowsModelSupported(request);
-  const imageProviderId = request.model.split('/')[0] ?? '';
-  const imageBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
-    ? request.extra_params.provider_base_url
-    : '';
-  if (request.extra_params?.image_transport === 'zhenjian-task-api'
-    || isZhenjianProvider(imageProviderId, imageBaseUrl)) {
+  const imageProviderId = request.model.split("/")[0] ?? "";
+  const imageBaseUrl =
+    typeof request.extra_params?.provider_base_url === "string" ? request.extra_params.provider_base_url : "";
+  if (
+    request.extra_params?.image_transport === "zhenjian-task-api" ||
+    isZhenjianProvider(imageProviderId, imageBaseUrl)
+  ) {
     return await generateZhenjianImage(request);
   }
   if (shouldUseWebviewGeneration(request)) {
@@ -2828,10 +3795,10 @@ export async function generateImage(request: GenerateRequest): Promise<string> {
   }
 
   try {
-    const rawResult = await invoke<unknown>('generate_image', { request });
-    if (typeof rawResult !== 'string') {
+    const rawResult = await invoke<unknown>("generate_image", { request });
+    if (typeof rawResult !== "string") {
       throw createErrorWithDetails(
-        'Generation returned non-string payload',
+        "Generation returned non-string payload",
         truncateText(
           (() => {
             try {
@@ -2840,16 +3807,16 @@ export async function generateImage(request: GenerateRequest): Promise<string> {
               return String(rawResult);
             }
           })(),
-          2000
-        )
+          2000,
+        ),
       );
     }
     const result = rawResult.trim();
     if (!result) {
-      throw createErrorWithDetails('Generation returned empty image source');
+      throw createErrorWithDetails("Generation returned empty image source");
     }
     const elapsedMs = Math.round(performance.now() - startedAt);
-    console.info('[AI] generate_image success', {
+    console.info("[AI] generate_image success", {
       elapsedMs,
       resultPreview: truncateText(result, 220),
     });
@@ -2857,7 +3824,7 @@ export async function generateImage(request: GenerateRequest): Promise<string> {
   } catch (error) {
     const elapsedMs = Math.round(performance.now() - startedAt);
     const normalizedError = normalizeInvokeError(error);
-    console.error('[AI] generate_image failed', {
+    console.error("[AI] generate_image failed", {
       elapsedMs,
       request: sanitizeGenerateRequestForLog(request),
       error,
@@ -2870,7 +3837,7 @@ export async function generateImage(request: GenerateRequest): Promise<string> {
 }
 
 export async function submitGenerateImageJob(request: GenerateRequest): Promise<string> {
-  console.info('[AI] submit_generate_image_job request', {
+  console.info("[AI] submit_generate_image_job request", {
     ...sanitizeGenerateRequestForLog(request),
     tauri: isTauri(),
   });
@@ -2887,27 +3854,29 @@ export async function submitGenerateImageJob(request: GenerateRequest): Promise<
   }
 
   assertWindowsModelSupported(request);
-  const imageProviderId = request.model.split('/')[0] ?? '';
-  const imageBaseUrl = typeof request.extra_params?.provider_base_url === 'string'
-    ? request.extra_params.provider_base_url
-    : '';
-  if (request.extra_params?.image_transport === 'zhenjian-task-api'
-    || isZhenjianProvider(imageProviderId, imageBaseUrl)) {
+  const imageProviderId = request.model.split("/")[0] ?? "";
+  const imageBaseUrl =
+    typeof request.extra_params?.provider_base_url === "string" ? request.extra_params.provider_base_url : "";
+  if (
+    request.extra_params?.image_transport === "zhenjian-task-api" ||
+    isZhenjianProvider(imageProviderId, imageBaseUrl)
+  ) {
     const jobId = crypto.randomUUID();
     browserGenerationJobs.set(jobId, {
       job_id: jobId,
-      status: 'running',
+      status: "running",
       result: null,
       error: null,
     });
     void generateZhenjianImage(request).then(
-      (result) => browserGenerationJobs.set(jobId, { job_id: jobId, status: 'succeeded', result, error: null }),
-      (error) => browserGenerationJobs.set(jobId, {
-        job_id: jobId,
-        status: 'failed',
-        result: null,
-        error: error instanceof Error ? error.message : String(error),
-      }),
+      (result) => browserGenerationJobs.set(jobId, { job_id: jobId, status: "succeeded", result, error: null }),
+      (error) =>
+        browserGenerationJobs.set(jobId, {
+          job_id: jobId,
+          status: "failed",
+          result: null,
+          error: error instanceof Error ? error.message : String(error),
+        }),
     );
     return jobId;
   }
@@ -2916,29 +3885,29 @@ export async function submitGenerateImageJob(request: GenerateRequest): Promise<
     const jobId = crypto.randomUUID();
     browserGenerationJobs.set(jobId, {
       job_id: jobId,
-      status: 'running',
+      status: "running",
       result: null,
       error: null,
     });
     void browserGenerateImage(request).then(
       (result) => {
-        browserGenerationJobs.set(jobId, { job_id: jobId, status: 'succeeded', result, error: null });
+        browserGenerationJobs.set(jobId, { job_id: jobId, status: "succeeded", result, error: null });
       },
       (error) => {
         browserGenerationJobs.set(jobId, {
           job_id: jobId,
-          status: 'failed',
+          status: "failed",
           result: null,
           error: error instanceof Error ? error.message : String(error),
         });
-      }
+      },
     );
     return jobId;
   }
 
-  const jobId = await invoke<string>('submit_generate_image_job', { request });
-  if (typeof jobId !== 'string' || !jobId.trim()) {
-    throw new Error('submit_generate_image_job returned invalid job id');
+  const jobId = await invoke<string>("submit_generate_image_job", { request });
+  if (typeof jobId !== "string" || !jobId.trim()) {
+    throw new Error("submit_generate_image_job returned invalid job id");
   }
   return jobId.trim();
 }
@@ -2948,20 +3917,20 @@ export async function getGenerateImageJob(jobId: string): Promise<GenerationJobS
     // 浏览器降级:从内存 job map 读取
     const record = browserGenerationJobs.get(jobId);
     if (!record) {
-      return { job_id: jobId, status: 'not_found', result: null, error: 'job not found' };
+      return { job_id: jobId, status: "not_found", result: null, error: "job not found" };
     }
     return record;
   }
 
-  const result = await invoke<GenerationJobStatus>('get_generate_image_job', { jobId });
-  if (!result || typeof result !== 'object' || typeof result.status !== 'string') {
-    throw new Error('get_generate_image_job returned invalid payload');
+  const result = await invoke<GenerationJobStatus>("get_generate_image_job", { jobId });
+  if (!result || typeof result !== "object" || typeof result.status !== "string") {
+    throw new Error("get_generate_image_job returned invalid payload");
   }
   return result;
 }
 
 export async function listModels(): Promise<string[]> {
-  return await invoke('list_models');
+  return await invoke("list_models");
 }
 
 export interface ProviderConnectionResult {
@@ -2975,7 +3944,7 @@ export interface ProviderConnectionResult {
 }
 
 function normalizeBaseUrl(baseUrl: string): string {
-  return baseUrl.trim().replace(/\/+$/, '');
+  return baseUrl.trim().replace(/\/+$/, "");
 }
 
 /** 浏览器降级 fetch:带超时与跨域友好错误 */
@@ -2985,13 +3954,11 @@ async function httpFetchWithTimeout(url: string, init: RequestInit, timeoutMs = 
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error('请求超时(10s),请检查网络或平台服务状态');
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("请求超时(10s),请检查网络或平台服务状态");
     }
     // 浏览器跨域(CORS)被拦截或网络错误时 fetch 会抛 TypeError
-    throw new Error(
-      error instanceof Error ? error.message : String(error)
-    );
+    throw new Error(error instanceof Error ? error.message : String(error));
   } finally {
     clearTimeout(timer);
   }
@@ -3007,43 +3974,41 @@ function parseProviderPayload(raw: string): unknown {
 }
 
 function extractModelsFromPayload(payload: unknown): string[] {
-  if (!payload || typeof payload !== 'object') {
+  if (!payload || typeof payload !== "object") {
     return [];
   }
   const output = new Set<string>();
   const visit = (value: unknown, allowDirect = false): void => {
-    if (!value || typeof value !== 'object') return;
+    if (!value || typeof value !== "object") return;
     if (Array.isArray(value)) {
       value.forEach((item) => visit(item, true));
       return;
     }
     const record = value as Record<string, unknown>;
-    for (const key of ['id', 'model', 'model_id', 'modelId', 'name']) {
+    for (const key of ["id", "model", "model_id", "modelId", "name"]) {
       const candidate = record[key];
-      if (typeof candidate === 'string' && candidate.trim() && (allowDirect || key !== 'name')) {
+      if (typeof candidate === "string" && candidate.trim() && (allowDirect || key !== "name")) {
         output.add(candidate.trim());
         break;
       }
     }
-    for (const key of ['data', 'models', 'items', 'results']) visit(record[key], true);
+    for (const key of ["data", "models", "items", "results"]) visit(record[key], true);
   };
   visit(payload);
   return [...output];
 }
 
 /** 仅验证自定义平台 Base URL 是否可达(不需要 Key) */
-export async function verifyProviderUrl(
-  baseUrl: string
-): Promise<{ ok: boolean; status: number }> {
+export async function verifyProviderUrl(baseUrl: string): Promise<{ ok: boolean; status: number }> {
   if (shouldUseWebviewProviderRequests()) {
     // 浏览器降级:先尝试普通请求拿真实状态码;被 CORS 拦截时退化为 no-cors 探测可达性
     const url = normalizeBaseUrl(baseUrl);
     try {
-      const response = await httpFetchWithTimeout(url, { method: 'GET', cache: 'no-store' });
+      const response = await httpFetchWithTimeout(url, { method: "GET", cache: "no-store" });
       return { ok: response.status < 500, status: response.status };
     } catch {
       try {
-        await httpFetchWithTimeout(url, { method: 'GET', mode: 'no-cors', cache: 'no-store' });
+        await httpFetchWithTimeout(url, { method: "GET", mode: "no-cors", cache: "no-store" });
         // no-cors 响应为 opaque,无法读取状态码,可达即视为成功
         return { ok: true, status: 0 };
       } catch {
@@ -3051,18 +4016,15 @@ export async function verifyProviderUrl(
       }
     }
   }
-  return await invoke<{ ok: boolean; status: number }>('verify_provider_url', { baseUrl });
+  return await invoke<{ ok: boolean; status: number }>("verify_provider_url", { baseUrl });
 }
 
 /** 验证自定义平台协议(带 Key 调 /v1/models,检测 OpenAI 兼容) */
-export async function testProviderConnection(
-  baseUrl: string,
-  apiKey: string
-): Promise<ProviderConnectionResult> {
-  if (isZhenjianProvider('', baseUrl)) {
+export async function testProviderConnection(baseUrl: string, apiKey: string): Promise<ProviderConnectionResult> {
+  if (isZhenjianProvider("", baseUrl)) {
     const normalized = normalizeBaseUrl(baseUrl);
     const response = await requestProviderJson(`${normalized}/v1/models`, {
-      method: 'GET',
+      method: "GET",
       headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
     });
     const raw = await response.text();
@@ -3070,7 +4032,7 @@ export async function testProviderConnection(
     const parsed = extractZhenjianModels(parseProviderPayload(raw));
     return {
       ok: true,
-      protocol: 'zhenjian-task-api',
+      protocol: "zhenjian-task-api",
       models: parsed.models,
       count: parsed.models.length,
       status: response.status,
@@ -3082,16 +4044,14 @@ export async function testProviderConnection(
     const url = `${normalizeBaseUrl(baseUrl)}/v1/models`;
     const headers: Record<string, string> = {};
     if (apiKey) {
-      headers['Authorization'] = `Bearer ${apiKey}`;
+      headers["Authorization"] = `Bearer ${apiKey}`;
     }
     let response: Response;
     try {
-      response = await httpFetchWithTimeout(url, { method: 'GET', headers });
+      response = await httpFetchWithTimeout(url, { method: "GET", headers });
     } catch (error) {
       const hint = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `浏览器跨域(CORS)或网络错误:${hint}。若平台未开放跨域访问,请使用桌面版 LenTalk 验证`
-      );
+      throw new Error(`浏览器跨域(CORS)或网络错误:${hint}。若平台未开放跨域访问,请使用桌面版 LenTalk 验证`);
     }
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} ${response.statusText}`);
@@ -3105,29 +4065,29 @@ export async function testProviderConnection(
     }
     return {
       ok: true,
-      protocol: 'openai',
+      protocol: "openai",
       models,
       count: models.length,
       status: response.status,
     };
   }
-  return await invoke<ProviderConnectionResult>('test_provider_connection', { baseUrl, apiKey });
+  return await invoke<ProviderConnectionResult>("test_provider_connection", { baseUrl, apiKey });
 }
 
 /** Probe metadata and OPTIONS endpoints only; never submits a billable task. */
 export async function detectProviderCapabilities(
   baseUrl: string,
-  apiKey: string
+  apiKey: string,
 ): Promise<{
   capabilities: CustomApiCapabilities;
   models: string[];
   endpoints: Record<string, unknown>;
   modelPrices?: Record<string, number>;
 }> {
-  if (isZhenjianProvider('', baseUrl)) {
+  if (isZhenjianProvider("", baseUrl)) {
     const normalized = normalizeBaseUrl(baseUrl);
     const response = await requestProviderJson(`${normalized}/v1/models`, {
-      method: 'GET',
+      method: "GET",
       headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
     });
     const raw = await response.text();
@@ -3136,34 +4096,34 @@ export async function detectProviderCapabilities(
     return {
       capabilities: {
         detectedAt: Date.now(),
-        detectionSource: 'probe',
-        confidence: 'high',
-        imageProtocol: 'images',
-        imageReferenceField: 'images',
-        imageReferenceEncoding: 'multipart',
-        imageTransport: 'generations_json',
-        videoSubmitPath: '/v1/videos',
-        videoQueryPath: '/v1/tasks/{taskId}',
-        videoReferenceEncoding: 'multipart',
-        taskProtocol: 'generic',
-        videoTransport: 'zhenjian-task-api',
+        detectionSource: "probe",
+        confidence: "high",
+        imageProtocol: "images",
+        imageReferenceField: "images",
+        imageReferenceEncoding: "multipart",
+        imageTransport: "generations_json",
+        videoSubmitPath: "/v1/videos",
+        videoQueryPath: "/v1/tasks/{taskId}",
+        videoReferenceEncoding: "multipart",
+        taskProtocol: "generic",
+        videoTransport: "zhenjian-task-api",
       },
       models: parsed.models,
       modelPrices: parsed.prices,
       endpoints: {
-        models: { path: '/v1/models', status: response.status },
-        images: { path: '/v1/images/generations' },
-        edits: { path: '/v1/images/edits' },
-        videos: { path: '/v1/videos' },
-        tasks: { path: '/v1/tasks/{taskId}' },
-        assets: { path: '/v1/assets' },
+        models: { path: "/v1/models", status: response.status },
+        images: { path: "/v1/images/generations" },
+        edits: { path: "/v1/images/edits" },
+        videos: { path: "/v1/videos" },
+        tasks: { path: "/v1/tasks/{taskId}" },
+        assets: { path: "/v1/assets" },
       },
     };
   }
   if (!shouldUseWebviewProviderRequests()) {
     return await invoke<{ capabilities: CustomApiCapabilities; models: string[]; endpoints: Record<string, unknown> }>(
-      'detect_provider_capabilities',
-      { baseUrl, apiKey }
+      "detect_provider_capabilities",
+      { baseUrl, apiKey },
     );
   }
 
@@ -3173,7 +4133,7 @@ export async function detectProviderCapabilities(
   // 探测时直接按已知平台判定, 避免把「已知」平台的字段猜错。
   const isZhiniaoHost = /(?:cuai\.token6688\.com|api\.tokengo\.love)/i.test(normalized);
   const headers: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
-  const modelsResponse = await httpFetchWithTimeout(`${normalized}/v1/models`, { method: 'GET', headers });
+  const modelsResponse = await httpFetchWithTimeout(`${normalized}/v1/models`, { method: "GET", headers });
   if (!modelsResponse.ok) {
     throw new Error(`/v1/models 返回 HTTP ${modelsResponse.status} ${modelsResponse.statusText}`);
   }
@@ -3181,7 +4141,7 @@ export async function detectProviderCapabilities(
   const models = extractModelsFromPayload(modelsPayload);
   const probe = async (path: string) => {
     try {
-      const response = await httpFetchWithTimeout(`${normalized}${path}`, { method: 'OPTIONS', headers });
+      const response = await httpFetchWithTimeout(`${normalized}${path}`, { method: "OPTIONS", headers });
       return response.status;
     } catch {
       return 0;
@@ -3190,51 +4150,50 @@ export async function detectProviderCapabilities(
   const [imagesStatus, responsesStatus, chatStatus, videosStatus] = isKnownOpenAiImages
     ? [0, 0, 0, 0]
     : await Promise.all([
-        probe('/v1/images/generations'),
-        probe('/v1/responses'),
-        probe('/v1/chat/completions'),
-        probe('/v1/videos/generations'),
+        probe("/v1/images/generations"),
+        probe("/v1/responses"),
+        probe("/v1/chat/completions"),
+        probe("/v1/videos/generations"),
       ]);
   const hasGptImage = models.some((model) => /gpt-image/i.test(model));
   const probeAvailable = (status: number) => status !== 0 && status !== 404;
   const imageProtocol = isKnownOpenAiImages
-    ? 'images'
+    ? "images"
     : probeAvailable(chatStatus) && !probeAvailable(imagesStatus)
-      ? 'chat'
+      ? "chat"
       : probeAvailable(responsesStatus) && !probeAvailable(imagesStatus)
-        ? 'responses'
-        : 'images';
+        ? "responses"
+        : "images";
   const imageReferenceField = isZhiniaoHost
-    ? 'images'
+    ? "images"
     : isKnownOpenAiImages
-      ? 'image'
+      ? "image"
       : hasGptImage
-        ? 'input_image'
-        : 'image';
+        ? "input_image"
+        : "image";
   const capabilities: CustomApiCapabilities = {
     detectedAt: Date.now(),
-    detectionSource: 'probe',
-    confidence: isKnownOpenAiImages ? 'high' : 'low',
-    imageProtocol: imageProtocol as CustomApiCapabilities['imageProtocol'],
+    detectionSource: "probe",
+    confidence: isKnownOpenAiImages ? "high" : "low",
+    imageProtocol: imageProtocol as CustomApiCapabilities["imageProtocol"],
     imageReferenceField,
-    imageReferenceEncoding: imageReferenceField === 'input_image'
-      ? 'raw_base64'
-      : imageReferenceField === 'images' ? 'url' : 'data_url',
-    imageTransport: isKnownOpenAiImages ? 'generations_json' : 'unknown',
-    videoSubmitPath: '/v1/videos/generations',
-    videoQueryPath: isZhiniaoHost ? '/v1/tasks/{taskId}' : '/v1/videos/generations/{taskId}',
-    videoReferenceEncoding: isZhiniaoHost ? 'url' : 'data_url',
-    taskProtocol: 'generic',
-    ...(isZhiniaoHost ? { videoTransport: 'zhiniao-video' as const } : {}),
+    imageReferenceEncoding:
+      imageReferenceField === "input_image" ? "raw_base64" : imageReferenceField === "images" ? "url" : "data_url",
+    imageTransport: isKnownOpenAiImages ? "generations_json" : "unknown",
+    videoSubmitPath: "/v1/videos/generations",
+    videoQueryPath: isZhiniaoHost ? "/v1/tasks/{taskId}" : "/v1/videos/generations/{taskId}",
+    videoReferenceEncoding: isZhiniaoHost ? "url" : "data_url",
+    taskProtocol: "generic",
+    ...(isZhiniaoHost ? { videoTransport: "zhiniao-video" as const } : {}),
   };
   return {
     capabilities,
     models,
     endpoints: {
-      images: { path: '/v1/images/generations', optionsStatus: imagesStatus },
-      responses: { path: '/v1/responses', optionsStatus: responsesStatus },
-      chat: { path: '/v1/chat/completions', optionsStatus: chatStatus },
-      videos: { path: '/v1/videos/generations', optionsStatus: videosStatus },
+      images: { path: "/v1/images/generations", optionsStatus: imagesStatus },
+      responses: { path: "/v1/responses", optionsStatus: responsesStatus },
+      chat: { path: "/v1/chat/completions", optionsStatus: chatStatus },
+      videos: { path: "/v1/videos/generations", optionsStatus: videosStatus },
     },
   };
 }
@@ -3242,12 +4201,12 @@ export async function detectProviderCapabilities(
 /** 从自定义平台拉取模型列表(OpenAI 兼容 /v1/models) */
 export async function fetchProviderModels(
   baseUrl: string,
-  apiKey: string
+  apiKey: string,
 ): Promise<{ models: string[]; count: number; prices?: Record<string, number> }> {
-  if (isZhenjianProvider('', baseUrl)) {
+  if (isZhenjianProvider("", baseUrl)) {
     const normalized = normalizeBaseUrl(baseUrl);
     const response = await requestProviderJson(`${normalized}/v1/models`, {
-      method: 'GET',
+      method: "GET",
       headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
     });
     const raw = await response.text();
@@ -3260,16 +4219,14 @@ export async function fetchProviderModels(
     const url = `${normalizeBaseUrl(baseUrl)}/v1/models`;
     const headers: Record<string, string> = {};
     if (apiKey) {
-      headers['Authorization'] = `Bearer ${apiKey}`;
+      headers["Authorization"] = `Bearer ${apiKey}`;
     }
     let response: Response;
     try {
-      response = await httpFetchWithTimeout(url, { method: 'GET', headers });
+      response = await httpFetchWithTimeout(url, { method: "GET", headers });
     } catch (error) {
       const hint = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `浏览器跨域(CORS)或网络错误:${hint}。若平台未开放跨域访问,请使用桌面版 LenTalk 验证`
-      );
+      throw new Error(`浏览器跨域(CORS)或网络错误:${hint}。若平台未开放跨域访问,请使用桌面版 LenTalk 验证`);
     }
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} ${response.statusText}`);
@@ -3278,18 +4235,17 @@ export async function fetchProviderModels(
     const models = extractModelsFromPayload(payload);
     return { models, count: models.length };
   }
-  return await invoke<{ models: string[]; count: number }>('fetch_provider_models', {
+  return await invoke<{ models: string[]; count: number }>("fetch_provider_models", {
     baseUrl,
     apiKey,
   });
 }
 
 export type ChatCompletionContentPart =
-  | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string } };
+  { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
 
 export interface ChatCompletionMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: "system" | "user" | "assistant";
   content: string | ChatCompletionContentPart[];
 }
 
@@ -3302,16 +4258,16 @@ export async function chatCompletion(
 ): Promise<string> {
   if (shouldUseWebviewProviderRequests()) {
     const url = `${normalizeBaseUrl(baseUrl)}/v1/chat/completions`;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (apiKey) {
-      headers['Authorization'] = `Bearer ${apiKey}`;
+      headers["Authorization"] = `Bearer ${apiKey}`;
     }
     let response: Response;
     try {
       response = await httpFetchWithTimeout(
         url,
         {
-          method: 'POST',
+          method: "POST",
           headers,
           body: JSON.stringify({ model, messages, temperature: 0.4 }),
         },
@@ -3322,17 +4278,17 @@ export async function chatCompletion(
       throw new Error(`浏览器跨域(CORS)或网络错误:${hint}。请使用桌面版 LenTalk 配置自定义平台。`);
     }
     if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`HTTP ${response.status} ${response.statusText}${body ? `: ${body.slice(0, 200)}` : ''}`);
+      const body = await response.text().catch(() => "");
+      throw new Error(`HTTP ${response.status} ${response.statusText}${body ? `: ${body.slice(0, 200)}` : ""}`);
     }
     const payload = (await response.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
     };
     const content = payload.choices?.[0]?.message?.content;
-    if (typeof content !== 'string' || !content) {
-      throw new Error('chat completion 响应缺少 choices[0].message.content');
+    if (typeof content !== "string" || !content) {
+      throw new Error("chat completion 响应缺少 choices[0].message.content");
     }
     return content;
   }
-  return await invoke<string>('chat_completion', { baseUrl, apiKey, model, messages });
+  return await invoke<string>("chat_completion", { baseUrl, apiKey, model, messages });
 }

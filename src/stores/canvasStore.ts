@@ -868,6 +868,9 @@ function maybeApplyImageAutoResize(node: CanvasNode, patch: Partial<CanvasNodeDa
 /** 组内生成下游节点时的内边距(组扩容时保留的呼吸空间) */
 const GROUP_PADDING = 24;
 
+/** 生成下游节点时，边缘对齐保留的最小像素间距。 */
+const DOWNSTREAM_ALIGNMENT_GAP = 8;
+
 /**
  * 组内生成下游节点: 返回组内相对坐标 + parentId + 可选扩组信息。
  * - 锚定在来源节点右侧(最近 24px), 碰撞检测仅与同组兄弟节点比较;
@@ -1455,135 +1458,78 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       }
     }
 
-    // Helper to check if a position collides with existing nodes.
-    const collides = (x: number, y: number, width: number, height: number) => {
-      return state.nodes.some((node) => {
-        const nodeWidth = node.measured?.width ?? DEFAULT_NODE_WIDTH;
-        const nodeHeight = node.measured?.height ?? 200;
-        const margin = 8;
-        return (
-          x < node.position.x + nodeWidth + margin &&
-          x + width + margin > node.position.x &&
-          y < node.position.y + nodeHeight + margin &&
-          y + height + margin > node.position.y
-        );
-      });
-    };
-
     const sourceWidth = sourceNode.measured?.width ?? DEFAULT_NODE_WIDTH;
-    const sourceHeight = sourceNode.measured?.height ?? 200;
-    // 下游生成节点尽量贴近母节点右侧(最近间隔 24px)
-    const anchorX = sourceNode.position.x + sourceWidth + 24;
-    const anchorY = sourceNode.position.y;
-
-    const zoom = Math.max(0.01, state.currentViewport.zoom || 1);
-    const viewportWidth = state.canvasViewportSize.width;
-    const viewportHeight = state.canvasViewportSize.height;
-    const hasViewportBounds = viewportWidth > 0 && viewportHeight > 0;
-    const visibleBounds = hasViewportBounds
-      ? {
-          minX: -state.currentViewport.x / zoom,
-          minY: -state.currentViewport.y / zoom,
-          maxX: -state.currentViewport.x / zoom + viewportWidth / zoom,
-          maxY: -state.currentViewport.y / zoom + viewportHeight / zoom,
-        }
-      : null;
-
-    const overflowAmount = (x: number, y: number): number => {
-      if (!visibleBounds) {
-        return 0;
-      }
-      const overLeft = Math.max(0, visibleBounds.minX - x);
-      const overTop = Math.max(0, visibleBounds.minY - y);
-      const overRight = Math.max(0, x + newNodeWidth - visibleBounds.maxX);
-      const overBottom = Math.max(0, y + newNodeHeight - visibleBounds.maxY);
-      return overLeft + overTop + overRight + overBottom;
-    };
-
-    const stepX = Math.max(newNodeWidth + 16, 110);
-    const stepY = Math.max(newNodeHeight + 16, 112);
-    const rightSideOffsets = [0, 1, 2, -1, 3, -2, 4, -3];
-    let bestCandidate: { x: number; y: number; score: number } | null = null;
-
-    const evaluateCandidate = (x: number, y: number) => {
-      if (collides(x, y, newNodeWidth, newNodeHeight)) {
-        return;
-      }
-
-      const dx = x - anchorX;
-      const dy = y - anchorY;
-      const distanceScore = Math.hypot(dx, dy);
-      // 右侧位置优先；同一列的下方位置优先于上方位置。
-      const nonRightPenalty = x < anchorX ? Math.max(80, Math.round(newNodeWidth * 0.75)) : 0;
-      const upwardPenalty = dy < 0 ? Math.round(newNodeHeight * 0.35) : 0;
-      const overflow = overflowAmount(x, y);
-      // 保持与来源节点接近，比留在当前可视区域更重要。
-      const score = distanceScore + nonRightPenalty + upwardPenalty + overflow * 0.4;
-      const candidate = { x, y, score };
-
-      if (!bestCandidate || score < bestCandidate.score) {
-        bestCandidate = candidate;
-      }
-    };
-
-    // 输出节点优先沿来源节点右边排列，右侧被占用时仅做就近的上下错位。
-    for (const offsetY of rightSideOffsets) {
-      evaluateCandidate(anchorX, anchorY + offsetY * stepY);
-    }
-
-    // 细粒度右移采样: 在母节点右侧 0~96px 内小步进找最近空位,
-    // 避免 anchorX 被占时直接跳到很远的第一列(column*stepX)。
-    const fineOffsets = [12, 24, 48, 72, 96];
-    for (const offsetX of fineOffsets) {
-      for (const offsetY of rightSideOffsets) {
-        evaluateCandidate(anchorX + offsetX, anchorY + offsetY * stepY);
-      }
-    }
-
-    for (let column = 1; column <= 4; column += 1) {
-      for (const offsetY of rightSideOffsets) {
-        evaluateCandidate(anchorX + column * stepX, anchorY + offsetY * stepY);
-      }
-    }
-
-    // 只有右侧附近均无空位时，才考虑来源节点的其他方向。
-    evaluateCandidate(sourceNode.position.x, sourceNode.position.y + sourceHeight + 20);
-    evaluateCandidate(sourceNode.position.x - newNodeWidth - 20, sourceNode.position.y);
-    evaluateCandidate(sourceNode.position.x, sourceNode.position.y - newNodeHeight - 20);
-
-    // If ring sampling misses an available slot in current viewport,
-    // run a denser viewport sweep before falling back outside view.
-    if (!bestCandidate && visibleBounds) {
-      const padding = 8;
-      const minX = visibleBounds.minX + padding;
-      const maxX = visibleBounds.maxX - newNodeWidth - padding;
-      const minY = visibleBounds.minY + padding;
-      const maxY = visibleBounds.maxY - newNodeHeight - padding;
-
-      if (maxX >= minX && maxY >= minY) {
-        const scanStepX = Math.max(42, Math.round(newNodeWidth * 0.32));
-        const scanStepY = Math.max(42, Math.round(newNodeHeight * 0.32));
-
-        for (let y = minY; y <= maxY; y += scanStepY) {
-          for (let x = minX; x <= maxX; x += scanStepX) {
-            evaluateCandidate(x, y);
+    // 下游节点采用稳定的“首个右侧、后续向下”布局:
+    // 1. 第一个下游节点与母节点顶边对齐, 右侧只留最小间距;
+    // 2. 第二个及后续节点与第一个下游节点左边对齐, 上下只留最小间距;
+    // 3. 目标位置若被其它节点挡住, 就把对齐基准换成挡住的节点, 继续向右/向下吸附。
+    // 这段优先于旧的环形搜索, 因而生成结果不会因为附近有节点而跳到较远位置。
+    const downstreamNodes = state.edges
+      .filter((edge) => edge.source === sourceNodeId)
+      .map((edge) => state.nodes.find((node) => node.id === edge.target))
+      .filter((node): node is CanvasNode => Boolean(node));
+    const getNodeSize = (node: CanvasNode) => ({
+      width: node.measured?.width ?? node.width ?? DEFAULT_NODE_WIDTH,
+      height: node.measured?.height ?? node.height ?? 200,
+    });
+    const collidingNode = (x: number, y: number): CanvasNode | null => {
+      return (
+        state.nodes.find((node) => {
+          // 顶层下游节点的坐标是画布绝对坐标, 组内子节点则是相对父组坐标,
+          // 不能把后者误当成画布上的挡板。
+          if (node.id === sourceNodeId || node.parentId) {
+            return false;
           }
+          const size = getNodeSize(node);
+          return (
+            x < node.position.x + size.width &&
+            x + newNodeWidth > node.position.x &&
+            y < node.position.y + size.height &&
+            y + newNodeHeight > node.position.y
+          );
+        }) ?? null
+      );
+    };
+    const resolveDownstreamPosition = (
+      initial: { x: number; y: number },
+      axis: "horizontal" | "vertical",
+    ) => {
+      let position = initial;
+      const visited = new Set<string>();
+      // 最多沿所有现有节点走一遍, 防止极端重叠数据造成死循环。
+      for (let index = 0; index <= state.nodes.length; index += 1) {
+        const blocker = collidingNode(position.x, position.y);
+        if (!blocker || visited.has(blocker.id)) {
+          return position;
         }
-
-        // Ensure boundary positions are also considered.
-        evaluateCandidate(minX, minY);
-        evaluateCandidate(maxX, minY);
-        evaluateCandidate(minX, maxY);
-        evaluateCandidate(maxX, maxY);
+        visited.add(blocker.id);
+        const blockerSize = getNodeSize(blocker);
+        position =
+          axis === "horizontal"
+            ? { x: blocker.position.x + blockerSize.width + DOWNSTREAM_ALIGNMENT_GAP, y: blocker.position.y }
+            : { x: blocker.position.x, y: blocker.position.y + blockerSize.height + DOWNSTREAM_ALIGNMENT_GAP };
       }
+      return position;
+    };
+
+    if (downstreamNodes.length === 0) {
+      return resolveDownstreamPosition(
+        { x: sourceNode.position.x + sourceWidth + DOWNSTREAM_ALIGNMENT_GAP, y: sourceNode.position.y },
+        "horizontal",
+      );
     }
 
-    const resolvedCandidate = bestCandidate as { x: number; y: number; score: number } | null;
-    if (resolvedCandidate) {
-      return { x: resolvedCandidate.x, y: resolvedCandidate.y };
-    }
+    const firstDownstream = downstreamNodes[0];
+    const lastDownstream = downstreamNodes[downstreamNodes.length - 1];
+    const lastSize = getNodeSize(lastDownstream);
+    return resolveDownstreamPosition(
+      {
+        x: firstDownstream.position.x,
+        y: lastDownstream.position.y + lastSize.height + DOWNSTREAM_ALIGNMENT_GAP,
+      },
+      "vertical",
+    );
 
-    return { x: anchorX + 2 * stepX, y: anchorY };
   },
 
   addDerivedUploadNode: (sourceNodeId, imageUrl, aspectRatio, previewImageUrl) => {

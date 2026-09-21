@@ -78,7 +78,13 @@ const ZZDH_AUDIO_KIND_PATTERNS: Array<{ kind: ZzdhAudioKind; pattern: RegExp }> 
   { kind: 'speech', pattern: /(?:^|[-_./])(?:tts|speech|voice|audio|eleven|indextts|vocoder|cosyvoice)(?:[-_./]|\d|$)/ },
 ];
 
-/** 按模型名判定它属于哪条音频端点(文档按系列分三个入口)。 */
+/**
+ * 按模型名判定它属于哪条音频端点(文档按系列分三个入口)。
+ *
+ * 规则本身与平台无关(只看名字里的 music / sfx / tts 等词), 因此音频节点把模型分到
+ * 「声音克隆 / 文字转语音 / 音乐创作」三个面板时也用这一套 —— 名字带 Zzdh 是历史原因,
+ * 不要误以为只服务字子动画(知鸟的 `music`、FHL 的 `suno-v3` 同样靠它归位)。
+ */
 export function resolveZzdhAudioKind(model: string): ZzdhAudioKind | null {
   const normalized = model.trim().toLowerCase();
   if (!normalized) return null;

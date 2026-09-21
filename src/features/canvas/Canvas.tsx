@@ -58,7 +58,7 @@ import {
   nodeHasTargetHandle,
 } from "@/features/canvas/domain/nodeRegistry";
 import { embedStoryboardImageMetadata } from "@/commands/image";
-import { persistLibraryAssetBinary, persistLibraryAssetFile } from "@/commands/assetLibrary";
+import { persistLibraryAssetFromFile } from "@/commands/assetLibrary";
 import {
   ALIGNMENT_GUIDE_SNAP_THRESHOLD,
   computeDragAlignment,
@@ -105,13 +105,11 @@ const DEFAULT_VIEWPORT: Viewport = { x: 0, y: 0, zoom: 1 };
 /** 兼容供应商返回的 JSON 图片数组；旧任务仍然直接返回单个图片源。 */
 function parseImageResultSources(result: string): string[] {
   const trimmed = result.trim();
-  if (trimmed.startsWith('[')) {
+  if (trimmed.startsWith("[")) {
     try {
       const parsed: unknown = JSON.parse(trimmed);
       if (Array.isArray(parsed)) {
-        const sources = parsed.filter(
-          (value): value is string => typeof value === 'string' && value.trim().length > 0,
-        );
+        const sources = parsed.filter((value): value is string => typeof value === "string" && value.trim().length > 0);
         if (sources.length > 0) return sources;
       }
     } catch {
@@ -121,27 +119,26 @@ function parseImageResultSources(result: string): string[] {
   return [trimmed];
 }
 
-type LocalUploadMediaType = 'image' | 'video' | 'audio';
+type LocalUploadMediaType = "image" | "video" | "audio";
 
 function resolveLocalUploadMediaType(file: File): LocalUploadMediaType | null {
-  if (file.type.startsWith('image/')) return 'image';
-  if (file.type.startsWith('video/')) return 'video';
-  if (file.type.startsWith('audio/')) return 'audio';
+  if (file.type.startsWith("image/")) return "image";
+  if (file.type.startsWith("video/")) return "video";
+  if (file.type.startsWith("audio/")) return "audio";
 
-  const extension = file.name.split('.').pop()?.toLowerCase() ?? '';
-  if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif', 'heic', 'heif'].includes(extension)) return 'image';
-  if (['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv'].includes(extension)) return 'video';
-  if (['mp3', 'm4a', 'wav', 'aac', 'flac', 'ogg'].includes(extension)) return 'audio';
+  const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+  if (["png", "jpg", "jpeg", "webp", "gif", "bmp", "avif", "heic", "heif"].includes(extension)) return "image";
+  if (["mp4", "mov", "m4v", "webm", "avi", "mkv"].includes(extension)) return "video";
+  if (["mp3", "m4a", "wav", "aac", "flac", "ogg"].includes(extension)) return "audio";
   return null;
 }
 
-async function persistLocalMediaFile(file: File, mediaType: 'video' | 'audio'): Promise<string> {
-  const extension = file.name.split('.').pop()?.trim() || (mediaType === 'video' ? 'mp4' : 'mp3');
-  const nativePath = (file as File & { path?: unknown }).path;
-  if (isTauri() && typeof nativePath === 'string' && nativePath.trim()) {
-    return await persistLibraryAssetFile(nativePath, extension);
+async function persistLocalMediaFile(file: File, mediaType: "video" | "audio"): Promise<string> {
+  const extension = file.name.split(".").pop()?.trim() || (mediaType === "video" ? "mp4" : "mp3");
+  if (isTauri()) {
+    return await persistLibraryAssetFromFile(file, extension);
   }
-  return await persistLibraryAssetBinary(new Uint8Array(await file.arrayBuffer()), extension);
+  return URL.createObjectURL(file);
 }
 
 const ALIGN_OPTIONS: Array<{ mode: NodeAlignMode; label: string }> = [
@@ -501,6 +498,10 @@ export function Canvas() {
   const [pendingConnectStart, setPendingConnectStart] = useState<PendingConnectStart | null>(null);
   const [previewConnectionVisual, setPreviewConnectionVisual] = useState<PreviewConnectionVisual | null>(null);
   const [alignmentGuides, setAlignmentGuides] = useState<AlignmentGuide[]>([]);
+  // React Flow may emit the final `dragging: false` change using its raw pointer
+  // position after the visual snap has already been applied. Keep the latest
+  // snapped position around so that final change cannot undo the snap.
+  const activeDragAlignmentRef = useRef<Map<string, { x: number; y: number }>>(new Map());
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [isTemplateOpen, setIsTemplateOpen] = useState(false);
   const [cinematicAssetLibrary, setCinematicAssetLibrary] = useState<CinematicAssetLibraryBridge | null>(null);
@@ -566,11 +567,14 @@ export function Canvas() {
     };
   }, []);
 
-  useEffect(() => () => {
-    if (groupDragFeedbackTimerRef.current !== null) {
-      window.clearTimeout(groupDragFeedbackTimerRef.current);
-    }
-  }, []);
+  useEffect(
+    () => () => {
+      if (groupDragFeedbackTimerRef.current !== null) {
+        window.clearTimeout(groupDragFeedbackTimerRef.current);
+      }
+    },
+    [],
+  );
   const duplicateNodesRef = useRef<((sourceNodeIds: string[], options?: DuplicateOptions) => string | null) | null>(
     null,
   );
@@ -591,35 +595,27 @@ export function Canvas() {
     moved: boolean;
   } | null>(null);
 
-  const resolveNearbyConnectionHandle = useCallback(
-    (clientX: number, clientY: number): HTMLElement | null => {
-      const wrapper = wrapperRef.current;
-      if (!wrapper) {
-        return null;
+  const resolveNearbyConnectionHandle = useCallback((clientX: number, clientY: number): HTMLElement | null => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) {
+      return null;
+    }
+
+    let nearestHandle: HTMLElement | null = null;
+    let nearestDistance = CONNECTION_HANDLE_HIT_RADIUS;
+    const handles = wrapper.querySelectorAll<HTMLElement>(".react-flow__handle.connectable.connectablestart");
+
+    handles.forEach((handle) => {
+      const rect = handle.getBoundingClientRect();
+      const distance = Math.hypot(clientX - (rect.left + rect.width / 2), clientY - (rect.top + rect.height / 2));
+      if (distance <= nearestDistance) {
+        nearestDistance = distance;
+        nearestHandle = handle;
       }
+    });
 
-      let nearestHandle: HTMLElement | null = null;
-      let nearestDistance = CONNECTION_HANDLE_HIT_RADIUS;
-      const handles = wrapper.querySelectorAll<HTMLElement>(
-        ".react-flow__handle.connectable.connectablestart",
-      );
-
-      handles.forEach((handle) => {
-        const rect = handle.getBoundingClientRect();
-        const distance = Math.hypot(
-          clientX - (rect.left + rect.width / 2),
-          clientY - (rect.top + rect.height / 2),
-        );
-        if (distance <= nearestDistance) {
-          nearestDistance = distance;
-          nearestHandle = handle;
-        }
-      });
-
-      return nearestHandle;
-    },
-    [],
-  );
+    return nearestHandle;
+  }, []);
 
   const updateNearbyConnectionHandle = useCallback(
     (clientX: number, clientY: number) => {
@@ -649,6 +645,11 @@ export function Canvas() {
       }
 
       const eventTarget = event.target as Element | null;
+      // 原生 select 和弹窗会在节点 DOM 树内冒泡。它们标记为 `nodrag` 后，
+      // 不应再被画布的邻近 Handle 逻辑接管，否则会残留一次拖拽状态。
+      if (eventTarget?.closest?.(".nodrag")) {
+        return;
+      }
       if (eventTarget?.closest?.(".react-flow__handle")) {
         return;
       }
@@ -945,9 +946,8 @@ export function Canvas() {
                   size: typeof generationRequest.size === "string" ? generationRequest.size : "1K",
                   aspectRatio:
                     typeof generationRequest.aspectRatio === "string" ? generationRequest.aspectRatio : "1:1",
-                  imageCount: typeof generationRequest.imageCount === "number"
-                    ? generationRequest.imageCount
-                    : undefined,
+                  imageCount:
+                    typeof generationRequest.imageCount === "number" ? generationRequest.imageCount : undefined,
                   referenceImages: Array.isArray(generationRequest.referenceImages)
                     ? generationRequest.referenceImages.filter((value): value is string => typeof value === "string")
                     : [],
@@ -1037,50 +1037,46 @@ export function Canvas() {
               // 多图结果拆成多个结果节点，保持每个节点只有一张图，
               // 这样下游引用、下载和后续编辑仍与单图结果完全一致。
               if (resultSources.length > 1) {
-                const sourceNodeId = useCanvasStore.getState().edges.find(
-                  (edge) => edge.target === pendingNode.id,
-                )?.source;
+                const sourceNodeId = useCanvasStore
+                  .getState()
+                  .edges.find((edge) => edge.target === pendingNode.id)?.source;
                 if (sourceNodeId) {
                   const baseTitle =
-                    typeof (currentData as { displayName?: unknown }).displayName === 'string'
+                    typeof (currentData as { displayName?: unknown }).displayName === "string"
                       ? String((currentData as { displayName?: unknown }).displayName)
-                      : '结果图片';
+                      : "结果图片";
                   resultSources.slice(1).forEach((source, index) => {
                     const extraNodeId = addNode(
                       CANVAS_NODE_TYPES.exportImage,
-                      findNodePosition(
-                        sourceNodeId,
-                        EXPORT_RESULT_NODE_MIN_WIDTH,
-                        EXPORT_RESULT_NODE_MIN_HEIGHT,
-                      ),
+                      findNodePosition(sourceNodeId, EXPORT_RESULT_NODE_MIN_WIDTH, EXPORT_RESULT_NODE_MIN_HEIGHT),
                       {
                         imageUrl: source,
                         previewImageUrl: source,
-                        aspectRatio: typeof currentData.aspectRatio === 'string'
-                          ? currentData.aspectRatio
-                          : '1:1',
+                        aspectRatio: typeof currentData.aspectRatio === "string" ? currentData.aspectRatio : "1:1",
                         generationResultProtected: true,
-                        resultKind: 'generic',
+                        resultKind: "generic",
                         displayName: `${baseTitle} (${index + 2})`,
                       },
                     );
                     addEdge(sourceNodeId, extraNodeId);
                     requestAnimationFrame(() => updateNodeInternals(extraNodeId));
-                    void prepareNodeImage(source).then((prepared) => {
-                      const latest = useCanvasStore.getState().nodes.find((node) => node.id === extraNodeId);
-                      if (!latest || (latest.data as Record<string, unknown>).imageUrl !== source) return;
-                      updateNodeDataTransient(extraNodeId, {
-                        imageUrl: prepared.imageUrl,
-                        previewImageUrl: prepared.previewImageUrl,
-                        aspectRatio: prepared.aspectRatio,
+                    void prepareNodeImage(source)
+                      .then((prepared) => {
+                        const latest = useCanvasStore.getState().nodes.find((node) => node.id === extraNodeId);
+                        if (!latest || (latest.data as Record<string, unknown>).imageUrl !== source) return;
+                        updateNodeDataTransient(extraNodeId, {
+                          imageUrl: prepared.imageUrl,
+                          previewImageUrl: prepared.previewImageUrl,
+                          aspectRatio: prepared.aspectRatio,
+                        });
+                        requestAnimationFrame(() => updateNodeInternals(extraNodeId));
+                      })
+                      .catch((error) => {
+                        console.warn("[GenerationJob] extra image persistence failed after result display", {
+                          nodeId: extraNodeId,
+                          error,
+                        });
                       });
-                      requestAnimationFrame(() => updateNodeInternals(extraNodeId));
-                    }).catch((error) => {
-                      console.warn('[GenerationJob] extra image persistence failed after result display', {
-                        nodeId: extraNodeId,
-                        error,
-                      });
-                    });
                   });
                 }
               }
@@ -1185,6 +1181,9 @@ export function Canvas() {
       if (node.type !== CANVAS_NODE_TYPES.audio) return false;
       const data = node.data as Record<string, unknown>;
       const request = data.generationRequest;
+      // 新版视频已拥有后端任务 ID，由下面的统一状态轮询负责；这里只处理
+      // 旧项目中没有任务 ID 的显式重试，避免重复提交、重复扣费。
+      if (typeof data.generationJobId === "string" && data.generationJobId.length > 0) return false;
       const isExplicitRetry = data.generationRetryRequested === true;
       // 本次运行会话已提交的任务跳过自动恢复: 正常点击生成时节点刚创建,
       // 若不排除会与节点自身的提交重复(同一任务提交两次、重复扣费)。
@@ -1349,6 +1348,93 @@ export function Canvas() {
     }
   }, [apiKeys, processingRevision, updateNodeDataTransient]);
 
+  // 视频与图片一样：节点只保存后端任务 ID，画布负责轮询并将最终媒体回写。
+  useEffect(() => {
+    const sleep = (delayMs: number) => new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+    const pendingVideoNodes = useCanvasStore.getState().nodes.filter((node) => {
+      if (node.type !== CANVAS_NODE_TYPES.audio) return false;
+      const data = node.data as Record<string, unknown>;
+      return data.isGenerating === true && typeof data.generationJobId === "string" && data.generationJobId.length > 0;
+    });
+    for (const pendingNode of pendingVideoNodes) {
+      if (activeVideoRecoveryNodeIdsRef.current.has(pendingNode.id)) continue;
+      activeVideoRecoveryNodeIdsRef.current.add(pendingNode.id);
+      void (async () => {
+        try {
+          for (let attempts = 0; recoveryMountedRef.current && attempts < 900; attempts += 1) {
+            const node = useCanvasStore.getState().nodes.find((item) => item.id === pendingNode.id);
+            const data = node?.data as Record<string, unknown> | undefined;
+            const jobId = typeof data?.generationJobId === "string" ? data.generationJobId : "";
+            if (!node || !jobId || data?.isGenerating !== true) return;
+            const status = await canvasAiGateway.getGenerateVideoJob(jobId);
+            if (status.status === "running" || status.status === "queued") {
+              await sleep(2000);
+              continue;
+            }
+            if (status.status === "succeeded" && status.result) {
+              const request = data.generationRequest as
+                | { model?: unknown; videoResolution?: unknown; duration?: unknown; referenceImages?: unknown }
+                | undefined;
+              recordGenerationOutcome({
+                nodeId: pendingNode.id,
+                kind: "video",
+                providerId: typeof data.generationProviderId === "string" ? data.generationProviderId : "",
+                modelId: typeof request?.model === "string" ? request.model : "",
+                size: typeof request?.videoResolution === "string" ? request.videoResolution : undefined,
+                duration: typeof request?.duration === "number" ? request.duration : 0,
+                referenceCount: Array.isArray(request?.referenceImages) ? request.referenceImages.length : 0,
+                status: "succeeded",
+              });
+              updateNodeDataTransient(pendingNode.id, {
+                sourcePath: status.result,
+                generationResultProtected: true,
+                isGenerating: false,
+                generationStartedAt: null,
+                generationJobId: null,
+                generationClientSessionId: null,
+                generationError: null,
+                generationErrorDetails: null,
+              });
+              return;
+            }
+            const message = status.error ?? "视频生成失败";
+            recordGenerationOutcome({
+              nodeId: pendingNode.id,
+              kind: "video",
+              providerId: typeof data.generationProviderId === "string" ? data.generationProviderId : "",
+              modelId:
+                typeof (data.generationRequest as { model?: unknown } | undefined)?.model === "string"
+                  ? (data.generationRequest as { model: string }).model
+                  : "",
+              status: "failed",
+              errorMessage: message,
+            });
+            updateNodeDataTransient(pendingNode.id, {
+              isGenerating: false,
+              generationStartedAt: null,
+              generationJobId: null,
+              generationClientSessionId: null,
+              generationError: message,
+              generationErrorDetails: message,
+            });
+            return;
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          updateNodeDataTransient(pendingNode.id, {
+            isGenerating: false,
+            generationStartedAt: null,
+            generationJobId: null,
+            generationError: message,
+            generationErrorDetails: message,
+          });
+        } finally {
+          activeVideoRecoveryNodeIdsRef.current.delete(pendingNode.id);
+        }
+      })();
+    }
+  }, [processingRevision, updateNodeDataTransient]);
+
   useEffect(() => {
     const element = wrapperRef.current;
     if (!element) {
@@ -1374,7 +1460,20 @@ export function Canvas() {
 
   const handleNodesChange = useCallback(
     (changes: NodeChange<CanvasNode>[]) => {
-      applyNodesChange(changes);
+      const alignedChanges = changes.map((change) => {
+        if (change.type !== "position" || change.dragging !== false) {
+          return change;
+        }
+        const alignedPosition = activeDragAlignmentRef.current.get(change.id);
+        return alignedPosition ? { ...change, position: alignedPosition } : change;
+      });
+
+      applyNodesChange(alignedChanges);
+      for (const change of alignedChanges) {
+        if (change.type === "position" && change.dragging === false) {
+          activeDragAlignmentRef.current.delete(change.id);
+        }
+      }
 
       const hasDragMove = changes.some(
         (change) => change.type === "position" && "dragging" in change && Boolean(change.dragging),
@@ -1462,14 +1561,17 @@ export function Canvas() {
     [setViewportState],
   );
 
-  const handleMoveStart = useCallback((event: unknown) => {
-    cancelPendingViewportPersist();
-    // 用户主动平移/缩放画布时收起素材库/模板栏; 程序化 setViewport 的 event 为 null, 不误伤
-    if (event) {
-      setIsLibraryOpen(false);
-      setIsTemplateOpen(false);
-    }
-  }, [cancelPendingViewportPersist]);
+  const handleMoveStart = useCallback(
+    (event: unknown) => {
+      cancelPendingViewportPersist();
+      // 用户主动平移/缩放画布时收起素材库/模板栏; 程序化 setViewport 的 event 为 null, 不误伤
+      if (event) {
+        setIsLibraryOpen(false);
+        setIsTemplateOpen(false);
+      }
+    },
+    [cancelPendingViewportPersist],
+  );
 
   useEffect(() => {
     const wrapperElement = wrapperRef.current;
@@ -2291,7 +2393,7 @@ export function Canvas() {
 
   // 本地上传节点收到视频/音频后替换为媒体节点, 保留原节点 ID 和已有连线。
   useEffect(() => {
-    return canvasEventBus.subscribe('upload-node/convert-media', ({ nodeId, file, mediaType }) => {
+    return canvasEventBus.subscribe("upload-node/convert-media", ({ nodeId, file, mediaType }) => {
       void (async () => {
         try {
           const sourcePath = await persistLocalMediaFile(file, mediaType);
@@ -2299,16 +2401,16 @@ export function Canvas() {
             sourcePath,
             mediaType,
             previewImageUrl: null,
-            aspectRatio: '1:1',
-            displayName: file.name.replace(/\.[^.]+$/, '').trim() || file.name,
+            aspectRatio: "1:1",
+            displayName: file.name.replace(/\.[^.]+$/, "").trim() || file.name,
           });
           if (replaced) {
             setSelectedNode(nodeId);
             scheduleCanvasPersist(0);
           }
         } catch (error) {
-          console.warn('[localUpload] media conversion failed', error);
-          void showErrorDialog('本地媒体导入失败', '上传失败', error instanceof Error ? error.message : String(error));
+          console.warn("[localUpload] media conversion failed", error);
+          void showErrorDialog("本地媒体导入失败", "上传失败", error instanceof Error ? error.message : String(error));
         }
       })();
     });
@@ -2344,9 +2446,10 @@ export function Canvas() {
               if (!source || !target) continue;
               addEdge(source, target, edge.sourceHandle ?? undefined, edge.targetHandle ?? undefined);
             }
-            const focusId = (placement.outputTemplateNodeId ? idMap.get(placement.outputTemplateNodeId) : undefined)
-              ?? (placement.videoTemplateNodeId ? idMap.get(placement.videoTemplateNodeId) : undefined)
-              ?? placement.nodes.map((node) => idMap.get(node.templateNodeId)).find(Boolean);
+            const focusId =
+              (placement.outputTemplateNodeId ? idMap.get(placement.outputTemplateNodeId) : undefined) ??
+              (placement.videoTemplateNodeId ? idMap.get(placement.videoTemplateNodeId) : undefined) ??
+              placement.nodes.map((node) => idMap.get(node.templateNodeId)).find(Boolean);
             if (focusId) setSelectedNode(focusId);
             scheduleCanvasPersist(0);
           } catch (error) {
@@ -2437,10 +2540,10 @@ export function Canvas() {
         y: event.clientY,
       });
 
-      const imageFiles = files.filter((file) => resolveLocalUploadMediaType(file) === 'image');
+      const imageFiles = files.filter((file) => resolveLocalUploadMediaType(file) === "image");
       const mediaFiles = files.filter((file) => {
         const type = resolveLocalUploadMediaType(file);
-        return type === 'video' || type === 'audio';
+        return type === "video" || type === "audio";
       });
       const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.upload);
 
@@ -2497,20 +2600,28 @@ export function Canvas() {
         const mediaY = imageFiles.length > 0 ? cursorY + rowMaxHeight + GAP : basePosition.y;
         for (const file of mediaFiles) {
           const mediaType = resolveLocalUploadMediaType(file);
-          if (mediaType !== 'video' && mediaType !== 'audio') continue;
+          if (mediaType !== "video" && mediaType !== "audio") continue;
           try {
             const sourcePath = await persistLocalMediaFile(file, mediaType);
-            const mediaNodeId = addNode(CANVAS_NODE_TYPES.audio, { x: mediaX, y: mediaY }, {
-              ...mediaDefinition.createDefaultData(),
-              sourcePath,
-              mediaType,
-              displayName: file.name.replace(/\.[^.]+$/, '').trim() || file.name,
-            });
+            const mediaNodeId = addNode(
+              CANVAS_NODE_TYPES.audio,
+              { x: mediaX, y: mediaY },
+              {
+                ...mediaDefinition.createDefaultData(),
+                sourcePath,
+                mediaType,
+                displayName: file.name.replace(/\.[^.]+$/, "").trim() || file.name,
+              },
+            );
             lastNodeId = mediaNodeId;
             mediaX += 344;
           } catch (error) {
-            console.warn('[localUpload] file drop failed', error);
-            void showErrorDialog('本地媒体导入失败', '上传失败', error instanceof Error ? error.message : String(error));
+            console.warn("[localUpload] file drop failed", error);
+            void showErrorDialog(
+              "本地媒体导入失败",
+              "上传失败",
+              error instanceof Error ? error.message : String(error),
+            );
           }
         }
       }
@@ -2701,9 +2812,10 @@ export function Canvas() {
         if (sourceNode.type === CANVAS_NODE_TYPES.cinematicStudio) {
           // 工作室节点各自持有一份工程：复制节点时分配新工程并把内容复制过去，
           // 让副本能独立编辑，而不是和原节点共享同一份数据。
-          const sourceProjectId = typeof (data as { studioProjectId?: unknown }).studioProjectId === "string"
-            ? (data as { studioProjectId: string }).studioProjectId
-            : "";
+          const sourceProjectId =
+            typeof (data as { studioProjectId?: unknown }).studioProjectId === "string"
+              ? (data as { studioProjectId: string }).studioProjectId
+              : "";
           const nextProjectId = createCinematicProjectId();
           if (sourceProjectId) void duplicateCinematicProject(sourceProjectId, nextProjectId);
           (data as { studioProjectId?: string }).studioProjectId = nextProjectId;
@@ -2812,6 +2924,7 @@ export function Canvas() {
   const handleNodeDragStart = useCallback(
     (event: ReactMouseEvent, node: CanvasNode) => {
       setAlignmentGuides([]);
+      activeDragAlignmentRef.current.clear();
       // 拖拽画布节点也视为画布区交互, 收起素材库/模板侧边栏
       setIsLibraryOpen(false);
       setIsTemplateOpen(false);
@@ -2820,9 +2933,8 @@ export function Canvas() {
         groupDragFeedbackTimerRef.current = null;
       }
       pendingGroupDragNodeRef.current = null;
-      hasActiveGroupsDuringDragRef.current = !event.altKey && useCanvasStore.getState().nodes.some(
-        (item) => item.type === CANVAS_NODE_TYPES.group,
-      );
+      hasActiveGroupsDuringDragRef.current =
+        !event.altKey && useCanvasStore.getState().nodes.some((item) => item.type === CANVAS_NODE_TYPES.group);
 
       if (!event.altKey) {
         altDragCopyRef.current = null;
@@ -3087,11 +3199,7 @@ export function Canvas() {
           const movingSize = resolveCanvasNodeSize(node);
           const references = state.nodes
             .filter((reference) => {
-              return (
-                reference.id !== node.id &&
-                !reference.parentId &&
-                !reference.dragging
-              );
+              return reference.id !== node.id && !reference.parentId && !reference.dragging;
             })
             .map((reference) => {
               const absolute = resolveCanvasNodeAbsolutePosition(reference.id, nodeMap);
@@ -3119,6 +3227,7 @@ export function Canvas() {
           setAlignmentGuides(alignment.guides);
 
           if (alignment.position.x !== node.position.x || alignment.position.y !== node.position.y) {
+            activeDragAlignmentRef.current.set(node.id, alignment.position);
             const alignedChange = {
               id: node.id,
               type: "position" as const,
@@ -3127,9 +3236,12 @@ export function Canvas() {
             };
             applyNodesChange([alignedChange]);
             feedbackNode = { ...node, position: alignment.position };
+          } else {
+            activeDragAlignmentRef.current.delete(node.id);
           }
         } else {
           setAlignmentGuides([]);
+          activeDragAlignmentRef.current.delete(node.id);
         }
 
         scheduleGroupDragFeedback(feedbackNode);
@@ -3622,7 +3734,11 @@ export function Canvas() {
         onNodeDragStop={handleNodeDragStop}
         onPaneClick={handlePaneClick}
         // 点击画布上的节点同样收起素材库/模板侧边栏
-        onNodeClick={() => { setIsLibraryOpen(false); setIsTemplateOpen(false); setIsAgentOpen(false); }}
+        onNodeClick={() => {
+          setIsLibraryOpen(false);
+          setIsTemplateOpen(false);
+          setIsAgentOpen(false);
+        }}
         onNodeContextMenu={(event, node) => handleNodeContextMenu(event, node as CanvasNode)}
         onDragOver={handleAssetLibraryDragOver}
         onDrop={handleCanvasDrop}
@@ -3935,9 +4051,7 @@ export function Canvas() {
             />
           </label>
           <div className="rounded-lg border border-border-dark bg-bg-dark/60 px-3 py-2">
-            <div className="mb-1 text-[11px] text-text-muted">
-              {t("canvas.saveTextPrompt.content", "提示词内容")}
-            </div>
+            <div className="mb-1 text-[11px] text-text-muted">{t("canvas.saveTextPrompt.content", "提示词内容")}</div>
             <div className="max-h-32 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-text-dark">
               {saveTextPromptDialog?.content ?? ""}
             </div>

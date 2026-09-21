@@ -24,7 +24,7 @@ import { getNodeToolPlugins } from '@/features/canvas/tools';
 import type { ToolIconKey } from '@/features/canvas/tools';
 import { UiChipButton, UiPanel, UiModal, UiButton } from '@/components/ui';
 import { useSettingsStore } from '@/stores/settingsStore';
-import { resolveZhiniaoUpscaleCredentials } from '@/commands/ai';
+import { resolveRunningHubUpscaleCredentials, resolveZhiniaoUpscaleCredentials } from '@/commands/ai';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { sanitizeStoryboardText } from '@/features/canvas/application/storyboardText';
 import {
@@ -56,6 +56,25 @@ interface NodeActionToolbarProps {
 }
 
 const REFERENCE_ENCODINGS = ['data_url', 'raw_base64', 'url'] as const;
+const ZHINIAO_VIDEO_UPSCALE_MODEL_ID = 'custom:zhiniao/aliyun-video-superres';
+const RUNNINGHUB_TOPAZ_VIDEO_UPSCALE_MODEL_ID = 'custom:runninghub-国内版/topaz-video-upscale-v1';
+
+type VideoUpscaleProvider = 'zhiniao' | 'runninghub-topaz';
+
+function getTopazTargetDimensions(aspectRatio: unknown): { width: string; height: string } {
+  switch (typeof aspectRatio === 'string' ? aspectRatio.trim() : '') {
+    case '9:16':
+      return { width: '1080', height: '1920' };
+    case '1:1':
+      return { width: '1080', height: '1080' };
+    case '4:3':
+      return { width: '1440', height: '1080' };
+    case '3:4':
+      return { width: '1080', height: '1440' };
+    default:
+      return { width: '1920', height: '1080' };
+  }
+}
 
 function isReferenceEncodingError(message: string): boolean {
   return /(invalid\s+base64|base64\s+(?:format|decode)|invalid\s+(?:image|media)\s+format|failed\s+to\s+parse\s+request\s+body|unsupported\s+(?:image|reference)\s+(?:field|format)|(?:编码|格式).*(?:不匹配|错误|base64|参考图)|(?:base64|参考图).*(?:编码|格式))/i.test(message);
@@ -132,10 +151,11 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isLibraryDialogOpen, setIsLibraryDialogOpen] = useState(false);
   const [isUpscaleDialogOpen, setIsUpscaleDialogOpen] = useState(false);
   const [isImageUpscaleDialogOpen, setIsImageUpscaleDialogOpen] = useState(false);
+  const [videoUpscaleProvider, setVideoUpscaleProvider] = useState<VideoUpscaleProvider>('zhiniao');
   const [videoUpscaleTier, setVideoUpscaleTier] = useState<string>('1080p');
+  const [topazWidth, setTopazWidth] = useState('1920');
+  const [topazHeight, setTopazHeight] = useState('1080');
   const [isUpscalingVideo, setIsUpscalingVideo] = useState(false);
-  // 超分模型固定为知鸟 aliyun-video-superres。
-  const VIDEO_UPSCALE_MODEL_ID = 'custom:zhiniao/aliyun-video-superres';
   const [imageUpscaleModelId, setImageUpscaleModelId] = useState<string>(
     JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID
   );
@@ -164,6 +184,12 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const videoSource = isVideoMediaNode
     ? ((node.data as { sourcePath?: string | null }).sourcePath ?? null)
     : null;
+  useEffect(() => {
+    if (!isUpscaleDialogOpen || videoUpscaleProvider !== 'runninghub-topaz') return;
+    const dimensions = getTopazTargetDimensions(node.data.aspectRatio);
+    setTopazWidth(dimensions.width);
+    setTopazHeight(dimensions.height);
+  }, [isUpscaleDialogOpen, node.data.aspectRatio, videoUpscaleProvider]);
   const canSaveVideoTemplate = isVideoMediaNode
     && Boolean(videoSource)
     && Boolean((node.data as { generationModel?: string | null }).generationModel || (node.data as { generationResultProtected?: boolean }).generationResultProtected);
@@ -282,17 +308,43 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   ]);
   const handleUpscaleVideo = useCallback(async () => {
     if (!videoSource || isUpscalingVideo) return;
-    const credentials = resolveZhiniaoUpscaleCredentials('custom:zhiniao', '');
+    const isRunningHubTopaz = videoUpscaleProvider === 'runninghub-topaz';
+    const credentials = isRunningHubTopaz
+      ? resolveRunningHubUpscaleCredentials('custom:runninghub-国内版', '')
+      : resolveZhiniaoUpscaleCredentials('custom:zhiniao', '');
     if (!credentials) {
       void showErrorDialog(t('nodeToolbar.videoUpscaleApiKeyMissing'), t('common.error'));
       return;
     }
+    const topazTargetWidth = Number(topazWidth);
+    const topazTargetHeight = Number(topazHeight);
+    if (
+      isRunningHubTopaz
+      && (!Number.isInteger(topazTargetWidth) || topazTargetWidth < 1
+        || !Number.isInteger(topazTargetHeight) || topazTargetHeight < 1)
+    ) {
+      void showErrorDialog('请填写有效的目标宽度和高度（正整数）。', t('common.error'));
+      return;
+    }
+    const model = isRunningHubTopaz
+      ? RUNNINGHUB_TOPAZ_VIDEO_UPSCALE_MODEL_ID
+      : ZHINIAO_VIDEO_UPSCALE_MODEL_ID;
+    const extraParams = isRunningHubTopaz
+      ? {
+          video_upscale_provider: 'runninghub-topaz',
+          topaz_width: topazTargetWidth,
+          topaz_height: topazTargetHeight,
+        }
+      : undefined;
+    const displayName = isRunningHubTopaz
+      ? `${t('nodeToolbar.upscale')} Topaz Video ${topazTargetWidth}×${topazTargetHeight}`
+      : `${t('nodeToolbar.upscale')} ${videoUpscaleTier}`;
     setIsUpscalingVideo(true);
     const newNodeId = addNode(
       CANVAS_NODE_TYPES.audio,
       findNodePosition(node.id, 360, 240),
       {
-        displayName: `${t('nodeToolbar.upscale')} ${videoUpscaleTier}`,
+        displayName,
         mediaType: 'video',
         aspectRatio: typeof node.data.aspectRatio === 'string' && node.data.aspectRatio.trim()
           ? node.data.aspectRatio
@@ -303,9 +355,9 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
         generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
         generationRequest: {
           kind: 'video-upscale',
-          model: VIDEO_UPSCALE_MODEL_ID,
+          model,
           videoSource,
-          tier: videoUpscaleTier,
+          ...(isRunningHubTopaz ? { extraParams } : { tier: videoUpscaleTier }),
         },
       },
     );
@@ -313,8 +365,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     try {
       const videoUrl = await canvasAiGateway.upscaleVideo({
         videoSource,
-        model: VIDEO_UPSCALE_MODEL_ID,
-        tier: videoUpscaleTier,
+        model,
+        ...(isRunningHubTopaz ? { extraParams } : { tier: videoUpscaleTier }),
       });
       updateNodeData(newNodeId, {
         sourcePath: videoUrl,
@@ -344,8 +396,11 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     node.data.aspectRatio,
     node.id,
     t,
+    topazHeight,
+    topazWidth,
     updateNodeData,
     videoSource,
+    videoUpscaleProvider,
     videoUpscaleTier,
   ]);
   const handleDownloadMedia = useCallback(async () => {
@@ -884,30 +939,81 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           isOpen={isUpscaleDialogOpen}
           title={t('nodeToolbar.upscale')}
           onClose={() => setIsUpscaleDialogOpen(false)}
-          widthClassName="w-[380px]"
+          widthClassName="w-[430px]"
         >
           <div className="space-y-3">
             <p className="text-xs leading-relaxed text-text-muted">{t('nodeToolbar.upscaleDesc')}</p>
             <div className="space-y-1">
               <label className="text-xs text-text-muted">{t('nodeToolbar.videoUpscaleModel')}</label>
-              <div className="rounded-lg border border-white/10 bg-bg-dark/60 px-2.5 py-2 text-xs">
-                aliyun-video-superres（2x）
+              <div className="grid grid-cols-2 gap-2">
+                <UiChipButton
+                  type="button"
+                  active={videoUpscaleProvider === 'zhiniao'}
+                  className="h-auto min-h-12 items-start justify-start px-3 py-2 text-left"
+                  onClick={() => setVideoUpscaleProvider('zhiniao')}
+                >
+                  <span>
+                    <span className="block text-xs font-medium">知鸟视频超分</span>
+                    <span className="mt-0.5 block text-[11px] text-text-muted">2× 放大</span>
+                  </span>
+                </UiChipButton>
+                <UiChipButton
+                  type="button"
+                  active={videoUpscaleProvider === 'runninghub-topaz'}
+                  className="h-auto min-h-12 items-start justify-start px-3 py-2 text-left"
+                  onClick={() => setVideoUpscaleProvider('runninghub-topaz')}
+                >
+                  <span>
+                    <span className="block text-xs font-medium">Topaz Video 高清放大 V1</span>
+                    <span className="mt-0.5 block text-[11px] text-text-muted">RunningHub · 指定尺寸</span>
+                  </span>
+                </UiChipButton>
               </div>
             </div>
-            <div className="space-y-1">
-              <label className="text-xs text-text-muted">{t('nodeToolbar.videoUpscaleTier')}</label>
-              <div className="flex gap-2">
-                {['720p', '1080p', '4K'].map((tier) => (
-                  <UiChipButton
-                    key={tier}
-                    className={`h-8 px-3 text-xs ${videoUpscaleTier === tier ? 'ring-1 ring-primary' : ''}`}
-                    onClick={() => setVideoUpscaleTier(tier)}
-                  >
-                    {tier}
-                  </UiChipButton>
-                ))}
+            {videoUpscaleProvider === 'runninghub-topaz' ? (
+              <>
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="space-y-1">
+                    <span className="text-xs text-text-muted">目标宽度</span>
+                    <UiInput
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={topazWidth}
+                      onChange={(event) => setTopazWidth(event.target.value)}
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-xs text-text-muted">目标高度</span>
+                    <UiInput
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={topazHeight}
+                      onChange={(event) => setTopazHeight(event.target.value)}
+                    />
+                  </label>
+                </div>
+                <p className="text-[11px] leading-relaxed text-text-muted/80">
+                  输出尺寸会直接提交给 Topaz 工作流；打开时会按当前视频画幅预填。RunningHub 按实际用量结算。
+                </p>
+              </>
+            ) : (
+              <div className="space-y-1">
+                <label className="text-xs text-text-muted">{t('nodeToolbar.videoUpscaleTier')}</label>
+                <div className="flex gap-2">
+                  {['720p', '1080p', '4K'].map((tier) => (
+                    <UiChipButton
+                      key={tier}
+                      className={`h-8 px-3 text-xs ${videoUpscaleTier === tier ? 'ring-1 ring-primary' : ''}`}
+                      onClick={() => setVideoUpscaleTier(tier)}
+                    >
+                      {tier}
+                    </UiChipButton>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
             <div className="flex justify-end gap-2">
               <UiButton type="button" variant="ghost" size="sm" onClick={() => setIsUpscaleDialogOpen(false)}>
                 {t('common.cancel')}

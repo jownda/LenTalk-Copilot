@@ -98,17 +98,35 @@ export interface AudioGenerationRequestData {
   prompt: string;
   model: string;
   audioKind: "speech" | "sound-effects" | "music";
+  /** 节点中的创作面板，用于恢复用户当时的工作区。 */
+  creativeMode?: "voice-clone" | "speech" | "music";
   voice?: string;
+  /** 已保存音色档案 ID（生成时保留快照，便于复盘）。 */
+  voiceProfileId?: string;
+  /** 声音克隆的参考样音：本地持久化路径或可访问 URL。 */
+  referenceAudio?: string;
+  /** IndexTTS2.5/RH 工作流第二段情感参考样音。 */
+  indexTtsSecondReferenceAudio?: string;
+  /** IndexTTS2.5 可合成的语言（ZH / EN / JA / ES / AR）。 */
+  indexTtsLanguage?: string;
+  /** IndexTTS 工作流：双样音情感参考，或多音字手工标注。 */
+  indexTtsMode?: "emotion-reference" | "polyphone";
+  /** IndexTTS 多音字工作流的手工读音表，每行一条，如 `银行|YIN2 HANG2|ZH`。 */
+  indexTtsPronunciation?: string;
+  /** 情绪控制（由支持该字段的模型消费）。 */
+  emotion?: string;
+  /** 情绪强度，范围 0-100。 */
+  emotionIntensity?: number;
   format?: string;
   durationSeconds?: number;
   musicLengthMs?: number;
   lyrics?: string;
+  /** 生成时透传给适配层的供应商扩展参数快照。 */
+  extraParams?: Record<string, unknown>;
 }
 
 export type PersistedGenerationRequest =
-  | ImageGenerationRequestData
-  | VideoGenerationRequestData
-  | AudioGenerationRequestData;
+  ImageGenerationRequestData | VideoGenerationRequestData | AudioGenerationRequestData;
 
 export interface ExportImageNodeData extends NodeImageData {
   resultKind?: ExportImageNodeResultKind;
@@ -125,14 +143,7 @@ export interface TextAnnotationNodeData extends NodeDisplayData {
   [key: string]: unknown;
 }
 
-export type PromptOptimizerTaskType =
-  | "auto"
-  | "character"
-  | "location"
-  | "prop"
-  | "edit"
-  | "texture"
-  | "viewChange";
+export type PromptOptimizerTaskType = "auto" | "character" | "location" | "prop" | "edit" | "texture" | "viewChange";
 
 export interface PromptOptimizerNodeData extends NodeDisplayData {
   purpose: string;
@@ -143,12 +154,12 @@ export interface PromptOptimizerNodeData extends NodeDisplayData {
   routeSummary?: string;
   notes?: string[];
   /** 最近一次优化的执行模式：local=本地规则, ai=AI 增强, ai-fallback=AI 失败已回退。 */
-  enhanceMode?: 'local' | 'ai' | 'ai-fallback';
+  enhanceMode?: "local" | "ai" | "ai-fallback";
   /** Chat 模型选择(来自设置中 providers 的 chatModels)。 */
   chatProviderId?: string;
   chatModel?: string;
   /** 输出语言：zh=中文, en=English。 */
-  outputLang?: 'zh' | 'en';
+  outputLang?: "zh" | "en";
   [key: string]: unknown;
 }
 
@@ -164,6 +175,8 @@ export interface ImageEditNodeData extends NodeImageData {
   extraParams?: Record<string, unknown>;
   isGenerating?: boolean;
   generationStartedAt?: number | null;
+  /** 后端异步任务 ID。视频与图片结果节点共用同一状态语义。 */
+  generationJobId?: string | null;
   generationDurationMs?: number;
 }
 
@@ -319,7 +332,7 @@ export interface CinematicStudioNodeData extends NodeDisplayData {
    * 极简链路生成提示词的输出语言。未设置（undefined）表示「跟随画布语言」，
    * 用户在节点上点过中/英切换后才会固定下来，此后不再随画布语言漂移。
    */
-  quickPromptLang?: 'zh' | 'en';
+  quickPromptLang?: "zh" | "en";
   /** 图片提示词优化区：与视频提示词工作流分开保存。 */
   imagePromptDraft?: string;
   imagePromptResult?: string;
@@ -392,6 +405,16 @@ export interface AudioNodeData extends NodeDisplayData {
   /** AI 生成完成后保留结果, 撤销时不会恢复为生成中或删除结果。 */
   generationResultProtected?: boolean;
   generationRequest?: PersistedGenerationRequest;
+  /**
+   * 该结果的 **Suno clip 标识**(知鸟音乐链路)。
+   *
+   * 后处理操作(续写/翻唱/分离/拼接)要拿上次结果的 clip 当源, 但生成接口只返回媒体路径,
+   * 所以由 `@/commands/ai` 的内存表带回、写在这里, 下游音乐节点从连线里选它。
+   *
+   * 注意与 `AudioGenNodeData.sunoClipId` 区分: 那个是「本节点**消费**的源」,
+   * 这个是「本结果**对应**的 clip」。同名会串义, 故分开命名。
+   */
+  sunoResultClipId?: string;
   [key: string]: unknown;
 }
 
@@ -404,16 +427,126 @@ export interface AudioGenNodeData extends NodeDisplayData {
   model: string;
   /** 音频类型(决定端点与附加参数), 由所选模型决定。 */
   audioKind?: "speech" | "sound-effects" | "music";
+  /**
+   * 该节点上一次使用的创作形态。
+   *
+   * 注意: 自 2026-09-20 起 UI 改为**按模型家族分页**(右上角选家族), `creativeMode`
+   * 退化为「生成请求里的快照字段」, 不再驱动界面 —— 驱动界面的是 `audioFamily`。
+   * 前两个是「建音色」(按次一次性计费), 后两个是「用音色」(合成)。
+   * 分工见 docs/api_docs/ZhiniaoAI_MiniMax_Voice_Chain.md
+   */
+  creativeMode?: "voice-clone" | "voice-design" | "speech" | "music";
+  /** 当前模型家族(minimax / indextts / openai / gemini / doubao / elevenlabs / suno / other), 决定节点主体布局。 */
+  audioFamily?: string;
   /** 音色(语音合成) */
   voice?: string;
+  /**
+   * 各模型「最后一次选中的音色」—— 模型 id → 音色。
+   *
+   * 切模型/切家族时，各家的音色是互不相通的（GM 的 `Zephyr` 在 GT 里不存在，MiniMax
+   * 的音色则只来自音色库）。以前的做法是切到哪家就无脑写那家的默认音色，于是回到
+   * 原家族时用户自己选的那个已经没了。改成先按模型存一份再恢复：
+   * 切走时记录当前音色，切回时优先还原；没有记忆值才退回该模型的默认值。
+   */
+  voiceByModel?: Record<string, string>;
+  /** 已保存的本地音色档案 ID。 */
+  voiceProfileId?: string;
+  /** 声音克隆参考样音。 */
+  referenceAudio?: string;
+  /** IndexTTS2.5/RH 工作流第二段情感参考样音。 */
+  indexTtsSecondReferenceAudio?: string;
+  /** IndexTTS2.5 可合成的语言（ZH / EN / JA / ES / AR）。 */
+  indexTtsLanguage?: string;
+  /**
+   * 待创建的音色 ID(MiniMax 链路)。克隆与设计各存一份。
+   *
+   * 平台要求**调用方自带** voice_id, 且按它幂等(同一 ID 重复克隆不二次收费)。
+   * 所以它必须在点「克隆/设计」的**那一刻**就生成并写进节点, 这样失败重试沿用同一个
+   * ID 不会被重复计费 —— 等响应回来再定就晚了。
+   */
+  mmxCloneVoiceId?: string;
+  mmxDesignVoiceId?: string;
+  /** 待创建音色的名字(入库用)。 */
+  mmxCloneVoiceName?: string;
+  mmxDesignVoiceName?: string;
+  /** 音色克隆卡片选中的模型(决定供应商)。 */
+  mmxCloneModel?: string;
+  /** 音色设计卡片选中的模型(决定供应商)。 */
+  mmxDesignModel?: string;
+  /** 音色克隆成功后生成的试听音频(点「试听」才会生成)。 */
+  mmxClonePreviewAudio?: string;
+  /** 音色设计接口直接返回的试听音频。 */
+  mmxDesignPreviewAudio?: string;
+  /** 音色设计: 音色描述词。 */
+  voiceDesignPrompt?: string;
+  /** 音色设计: 试听文本(返回的试听音频即此文本念出)。 */
+  voiceDesignPreviewText?: string;
+  /** speech-2.8 档位: hd(高音质) / turbo(速度优先)。 */
+  mmxTier?: string;
+  /** speech-2.8 版本: 2.8 / 2.6。 */
+  mmxVersion?: string;
+  /** speech-2.8 语速。 */
+  mmxSpeed?: string;
+  /** speech-2.8 语调。 */
+  mmxPitch?: string;
+  /** speech-2.8 情绪(取值域与通用 emotion 不同, 故独立成字段)。 */
+  mmxEmotion?: string;
+  /** speech-2.8 音效。 */
+  mmxSoundEffect?: string;
+  /** 情绪控制。 */
+  emotion?: string;
+  /** 情绪强度，范围 0-100。 */
+  emotionIntensity?: number;
+  /**
+   * 自然语言风格指令(GM 系列 / GT-4o Mini TTS 独有)。
+   *
+   * 与 `emotion` 是两条通路: emotion 从固定枚举里挑, instructions 让模型理解任意描述
+   * (「以温柔耳语朗读」「快速兴奋」)。GM 系列的官方卖点就是这个 ——
+   * 藏了它, 「自然语言语气控制」等于没接。
+   */
+  instructions?: string;
+  /** 语速(GT 系列独有, 平台声明 0.25-4.0)。 */
+  speed?: string;
   /** 输出格式(语音合成) */
   format?: string;
   /** 音效时长(秒) */
   durationSeconds?: number;
-  /** 音乐时长(毫秒) */
+  /**
+   * 音乐时长(毫秒) —— **字子动画专有**。
+   * 知鸟的 Suno 没有这个字段(曲长由模型决定), 它的音乐页不渲染这一项。
+   */
   musicLengthMs?: number;
-  /** 歌词(音乐生成) */
+  /** 歌词(音乐生成)。Suno 的 `operation=generate` 留空即灵感模式自动作词。 */
   lyrics?: string;
+  /**
+   * Suno 的音乐操作(知鸟 `music` 模型专有)。
+   * generate / extend / cover / lyrics / stems / stems_all / mp4 / concat。
+   */
+  sunoOperation?: string;
+  /** Suno 模型版本: chirp-v6(默认) / chirp-v6-mini / chirp-v5 / chirp-v4-5。 */
+  sunoVersion?: string;
+  /** Suno 模式: song(含人声) / instrumental(纯器乐)。 */
+  sunoMode?: string;
+  /** Suno 风格标签(映射 Suno tags, 逗号分隔)。 */
+  sunoStyle?: string;
+  /** Suno 歌曲标题。 */
+  sunoTitle?: string;
+  /** Suno 演唱声线 auto / m / f。**这才是真正的声线控制**, 仅 song 模式有效。 */
+  sunoVocalGender?: string;
+  /** Suno 排除风格(映射 negative_tags, 逗号分隔)。 */
+  sunoNegativeTags?: string;
+  /**
+   * 源 clip —— stems / stems_all / mp4 / concat 必填, extend 用 `sunoContinueClipId`。
+   *
+   * 两种来源: 上游音频节点的生成结果(`source_id`), 或手填。手填优先。
+   */
+  sunoClipId?: string;
+  /** extend 的源 clip。 */
+  sunoContinueClipId?: string;
+  /** extend 的续写起点秒(留空从结尾续)。 */
+  sunoContinueAt?: string;
+  /** cover 的翻唱源 clip。 */
+  sunoCoverClipId?: string;
   [key: string]: unknown;
 }
 

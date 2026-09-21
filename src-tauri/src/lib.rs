@@ -17,6 +17,7 @@ use commands::pajuben;
 use commands::wan_cli;
 use commands::project_state;
 use commands::project_archive;
+use commands::runninghub_cli;
 use commands::system;
 use commands::template_state;
 use commands::template_sync;
@@ -202,6 +203,8 @@ pub fn run() {
             pajuben::pajuben_cancel,
             pajuben::pajuben_resolve_output_dir,
             pajuben::pajuben_read_script,
+            runninghub_cli::runninghub_cli_set_key,
+            runninghub_cli::runninghub_cli_check,
             image::persist_image_source,
             image::persist_image_binary,
             image::save_image_source_to_downloads,
@@ -234,6 +237,8 @@ pub fn run() {
             ai_commands::request_provider_stream,
             ai_commands::submit_generate_image_job,
             ai_commands::get_generate_image_job,
+            ai_commands::submit_generate_video_job,
+            ai_commands::get_generate_video_job,
             ai_commands::generate_image,
             jimeng_cli::generate_jimeng_cli_video,
             jimeng_cli::generate_jimeng_cli_image,

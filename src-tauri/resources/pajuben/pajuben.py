@@ -777,29 +777,59 @@ def process_video(S, video, ep, known_roles):
             if m > 1:
                 log(f"  第{ep}集 段 {k}/{m}（{fmt_ts(start)}–{fmt_ts(end)}）调用模型…")
             ep_progress(ep, 15 + base, seg_tag + "调用模型…")
-            parts.append(call_api(S["base_url"], S["key"], S["model"], messages, S["proxy"]))
+            part = call_api(
+                S["base_url"], S["key"], S["model"], messages, S["proxy"],
+                timeout=S["request_timeout"], attempts=S["request_attempts"])
+            # 一些中转渠道无视 max_tokens 并在很短的输出上限处截断。保留
+            # 原始多模态上下文，让模型从截断处续写，比整集重新抽帧更可靠。
+            part = continue_truncated_script(S, messages, part, ep, seg_tag)
+            parts.append(part)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
     ep_progress(ep, 98, "整理输出…")
     return stitch_segments(parts, ep)
 
 
+MAX_SCRIPT_CONTINUATIONS = 3
+
+
+def continue_truncated_script(S, source_messages, script_text, ep, segment_label=""):
+    """遇到渠道输出上限时，带着同一份视频上下文续写到角色表为止。
+
+    `max_tokens` 在 OpenAI 兼容中转上并不总会生效；此前单集任务会把“留”
+    这种半句话直接写成最终剧本。续写使用 assistant 历史消息，因此模型既看得到
+    已输出的内容，也仍能访问原始音频和关键帧。
+    """
+    result = script_text.strip()
+    for index in range(MAX_SCRIPT_CONTINUATIONS):
+        if is_complete(result):
+            return result
+        log(f"  ⚠ 第{ep}集 {segment_label}输出被截断，正在续写（{index + 1}/{MAX_SCRIPT_CONTINUATIONS}）…")
+        continuation = list(source_messages)
+        continuation.append({"role": "assistant", "content": result})
+        continuation.append({
+            "role": "user",
+            "content": (
+                "上一段剧本因输出长度限制在中途截断。请从最后一个未完成的句子接着写，"
+                "不要重复已经输出的内容；继续按原格式覆盖后续时间线，最后必须输出完整“角色表”。"
+            ),
+        })
+        addition = call_api(
+            S["base_url"], S["key"], S["model"], continuation, S["proxy"],
+            timeout=S["request_timeout"], attempts=S["request_attempts"])
+        addition = addition.strip()
+        if not addition:
+            break
+        result = f"{result}\n{addition}"
+    return result
+
+
 def process_video_checked(S, video, ep, known_roles):
-    """扒一集并校验完整性（结尾要有角色表），不完整自动重扒一次。"""
+    """扒一集并校验完整性（结尾必须有角色表）。"""
     result = process_video(S, video, ep, known_roles)
     if is_complete(result):
         return result
-    log(f"  ⚠ 第{ep}集 结尾没有角色表，自动重扒一次…")
-    try:
-        retry = process_video(S, video, ep, known_roles)
-        if is_complete(retry):
-            return retry
-        if len(retry) > len(result):
-            result = retry
-    except Exception as e:
-        log(f"  ⚠ 第{ep}集 重扒失败：{e}")
-    log(f"  ⚠ 第{ep}集 仍不完整，先保存；下次批量运行会自动重扒")
-    return result
+    raise RuntimeError("剧本输出被截断：已自动续写和重试，仍缺少结尾角色表。请更换支持更长输出的模型或渠道后重试。")
 
 
 FALLBACK_ERROR_MARKERS = (
@@ -1158,6 +1188,8 @@ def build_settings(args, cfg):
         "max_frames": args.max_frames,
         "max_segments": args.max_segments,
         "workers": args.workers,
+        "request_timeout": args.request_timeout,
+        "request_attempts": args.request_attempts,
         "want_audio": args.audio or (cfg.get("send_audio", True) and not args.no_audio),
         "dual_fallback": not args.no_dual_fallback,
         # 配置中的豆包降级模型不能拿到 OpenRouter/OpenAI 等渠道调用。
@@ -1206,6 +1238,12 @@ def main():
                     help="长视频最多分几段扒取（默认4；超出后段内降帧率）")
     ap.add_argument("--workers", type=int, default=cfg.get("workers", 3),
                     help="批量阶段二并发数（默认3）")
+    ap.add_argument("--request-timeout", type=int,
+                    default=cfg.get("request_timeout", 420),
+                    help="单次模型请求最长等待秒数（默认420）")
+    ap.add_argument("--request-attempts", type=int,
+                    default=cfg.get("request_attempts", 3),
+                    help="单次模型请求最多尝试次数（默认3）")
     ap.add_argument("--roles", default="", help="已知角色表文本（单集用，填入 {known_roles}）")
     ap.add_argument("--no-audio", action="store_true",
                     help="不送音频（默认送；仅对能听声的模型有意义）")

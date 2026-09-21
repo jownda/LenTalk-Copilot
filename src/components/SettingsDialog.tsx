@@ -19,11 +19,18 @@ import {
   type RecommendedApi,
 } from '@/features/settings/recommendedApis';
 import { UiCheckbox, UiModal, UiSelect } from '@/components/ui';
-import { UI_CONTENT_OVERLAY_INSET_CLASS, UI_DIALOG_TRANSITION_MS } from '@/components/ui/motion';
+import { OverlayLayerProvider } from '@/components/ui/overlayLayer';
+import {
+  UI_CONTENT_OVERLAY_INSET_CLASS,
+  UI_DIALOG_TRANSITION_MS,
+  UI_SETTINGS_LAYER_Z,
+  UI_SETTINGS_OVERLAY_LAYER_Z,
+} from '@/components/ui/motion';
 import { useDialogTransition } from '@/components/ui/useDialogTransition';
 import { listModelProviders } from '@/features/canvas/models';
 import type { SettingsCategory } from '@/features/settings/settingsEvents';
 import { WanCliSettings } from '@/features/settings/WanCliSettings';
+import { RunningHubCliSettings } from '@/features/settings/RunningHubCliSettings';
 import { isZhenjianProvider } from '@/commands/zhenjianApi';
 
 const JIMENG_LOGIN_POLL_INTERVAL_MS = 3000;
@@ -1216,6 +1223,14 @@ export function SettingsDialog({
     setLocalEnableUpdateDialog(enableUpdateDialog);
     setCheckUpdateStatus('');
     setRevealedApiKeys({});
+
+    // 面板内的弹窗/表单状态也要复位：设置面板只是 return null，state 并不会随关闭清空。
+    // 不重置的话，上次没关干净的「新增/编辑平台」弹窗会在下次打开设置、切到「密钥」时自己弹出来。
+    setShowAddCustomApi(false);
+    setEditingCustomApiId(null);
+    setCustomApiStatus(null);
+    setIsModelPickerOpen(false);
+    setShowJimengCliSettings(false);
   }, [
     isOpen,
   ]);
@@ -1227,6 +1242,21 @@ export function SettingsDialog({
 
     setActiveCategory(initialCategory);
   }, [initialCategory, isOpen]);
+
+  /**
+   * 切换设置分类时收起面板内的临时弹窗与表单。
+   *
+   * 这些弹窗的 JSX 只挂在「密钥」分类下，但开关它们是独立的 state。切分类时若不复位，
+   * 上次留在打开状态的「编辑平台」表单就会跟着新分类一起弹出来 —— 表现为
+   * "点一下「密钥」就自己蹦出一个编辑页面"。
+   */
+  useEffect(() => {
+    setShowAddCustomApi(false);
+    setEditingCustomApiId(null);
+    setCustomApiStatus(null);
+    setIsModelPickerOpen(false);
+    setShowJimengCliSettings(false);
+  }, [activeCategory]);
 
   const handleSave = useCallback(() => {
     providers.forEach((provider) => {
@@ -1301,7 +1331,13 @@ export function SettingsDialog({
   if (!shouldRender) return null;
 
   return (
-    <div className={`fixed ${UI_CONTENT_OVERLAY_INSET_CLASS} z-[300] flex items-center justify-center`}>
+    // 面板内部的弹窗/下拉都会被 portal 到 body, 默认层级低于面板自身,
+    // 会被面板整个遮住(表现为"点了没反应")。这里把面板层级传下去, 内部浮层自动抬到面板之上。
+    <OverlayLayerProvider value={UI_SETTINGS_OVERLAY_LAYER_Z}>
+      <div
+        className={`fixed ${UI_CONTENT_OVERLAY_INSET_CLASS} flex items-center justify-center`}
+        style={{ zIndex: UI_SETTINGS_LAYER_Z }}
+      >
       <div
         className={`absolute inset-0 bg-black/90 transition-opacity duration-200 ${isVisible ? 'opacity-100' : 'opacity-0'}`}
         onClick={onClose}
@@ -1730,6 +1766,7 @@ export function SettingsDialog({
                     )}
                   </div>
 
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                   <div className="rounded-lg border border-border-dark bg-bg-dark/60 p-4">
                     <button
                       type="button"
@@ -1763,6 +1800,8 @@ export function SettingsDialog({
                   </div>
 
                   <WanCliSettings />
+                  <RunningHubCliSettings />
+                  </div>
 
                   {/* 自定义平台(OpenAI 兼容) */}
                   <div ref={customApiSectionRef} className="rounded-lg border border-border-dark bg-bg-dark/60 p-4">
@@ -2679,6 +2718,7 @@ export function SettingsDialog({
           </div>
         </div>
       </div>
-    </div>
+      </div>
+    </OverlayLayerProvider>
   );
 }

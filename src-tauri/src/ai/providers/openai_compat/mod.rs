@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::ai::error::AIError;
 use crate::ai::{
-    AIProvider, GenerateRequest, ProviderTaskHandle, ProviderTaskPollResult, ProviderTaskSubmission,
+    AIProvider, GenerateRequest, GenerateVideoRequest, ProviderTaskHandle, ProviderTaskPollResult, ProviderTaskSubmission,
 };
 
 const CUSTOM_PROVIDER_PREFIX: &str = "custom:";
@@ -42,6 +42,122 @@ impl OpenAICompatibleProvider {
     async fn resolve_custom_key(&self, provider_id: &str) -> Option<String> {
         let keys = self.custom_api_keys.read().await;
         keys.get(provider_id).cloned()
+    }
+
+    fn video_result_url(payload: &Value) -> Option<String> {
+        match payload {
+            Value::String(value) if value.starts_with("http://") || value.starts_with("https://") => Some(value.clone()),
+            Value::Array(items) => items.iter().find_map(Self::video_result_url),
+            Value::Object(map) => ["url", "video_url", "videoUrl", "download_url", "downloadUrl", "file_url", "fileUrl", "output_url", "outputUrl"]
+                .iter().find_map(|key| map.get(*key).and_then(Self::video_result_url))
+                .or_else(|| ["data", "result", "output", "task", "detail"].iter().find_map(|key| map.get(*key).and_then(Self::video_result_url))),
+            _ => None,
+        }
+    }
+
+    fn video_task_id(payload: &Value) -> Option<String> {
+        match payload {
+            Value::Object(map) => ["id", "task_id", "taskId", "video_id", "videoId"]
+                .iter().find_map(|key| map.get(*key).and_then(Value::as_str).map(str::to_string))
+                .or_else(|| ["data", "result", "task"].iter().find_map(|key| map.get(*key).and_then(Self::video_task_id))),
+            _ => None,
+        }
+    }
+
+    fn video_task_status(payload: &Value) -> String {
+        match payload {
+            Value::Object(map) => {
+                if let Some(status) = ["status", "task_status", "state"].iter().find_map(|key| map.get(*key).and_then(Value::as_str)) {
+                    return status.to_uppercase();
+                }
+                ["data", "result", "task", "detail"].iter()
+                    .map(|key| map.get(*key).map(Self::video_task_status).unwrap_or_default())
+                    .find(|status| !status.is_empty())
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// 通用 OpenAI 兼容视频生成链路在 native 端运行。提交后的长轮询不再占用
+    /// WebView/React 生命周期，任务状态由 commands/ai.rs 统一持久化。
+    pub async fn generate_video(&self, request: GenerateVideoRequest) -> Result<String, AIError> {
+        let (provider_id, api_model) = request
+            .model
+            .split_once('/')
+            .ok_or_else(|| AIError::InvalidRequest("自定义平台模型格式应为 custom:<id>/<model>".into()))?;
+        if !provider_id.starts_with(CUSTOM_PROVIDER_PREFIX) {
+            return Err(AIError::InvalidRequest("视频生成仅支持自定义平台(custom:*)模型".into()));
+        }
+
+        let (base_url, api_key) = self.resolve_base_url_and_key(provider_id, &request.extra_params).await?;
+        let base_url = base_url.trim_end_matches('/').trim_end_matches("/v1").trim_end_matches('/');
+        let extras = request.extra_params.as_ref();
+        let transport = extras
+            .and_then(|params| params.get("video_transport"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !transport.is_empty() && transport != "openai-video" {
+            return Err(AIError::InvalidRequest(format!(
+                "视频协议 {} 尚未迁移到后端任务执行器，请在模型设置中使用 OpenAI 兼容视频协议",
+                transport
+            )));
+        }
+
+        let endpoint_for = |configured: Option<&Value>, fallback: &str, task_id: Option<&str>| {
+            let configured = configured.and_then(Value::as_str).filter(|value| !value.trim().is_empty()).unwrap_or(fallback);
+            let path = if let Some(task_id) = task_id {
+                configured.replace("{taskId}", &urlencoding::encode(task_id))
+            } else {
+                configured.to_string()
+            };
+            if path.starts_with("http://") || path.starts_with("https://") { path } else { format!("{}{}", base_url, if path.starts_with('/') { path } else { format!("/{}", path) }) }
+        };
+
+        let images = if request.image_mode.as_deref() == Some("first-last") {
+            request.reference_images.as_ref().map(|items| items.iter().take(2).cloned().collect())
+        } else { request.reference_images.clone() };
+        let mut body = serde_json::json!({
+            "model": api_model,
+            "prompt": request.prompt,
+            "duration": request.duration.max(1),
+            "aspect_ratio": request.aspect_ratio,
+        });
+        if let Some(object) = body.as_object_mut() {
+            if let Some(images) = images.filter(|items| !items.is_empty()) {
+                object.insert("images".into(), serde_json::json!(images));
+                if request.image_mode.as_deref() == Some("first-last") { object.insert("generation_type".into(), Value::String("frame".into())); }
+            }
+            if let Some(audio) = request.reference_audio.filter(|items| !items.is_empty()) {
+                object.insert("audio_url".into(), Value::String(audio[0].clone()));
+                if audio.len() > 1 { object.insert("audio_urls".into(), serde_json::json!(audio)); }
+            }
+            if let Some(resolution) = request.video_resolution.filter(|value| !value.trim().is_empty()) { object.insert("resolution".into(), Value::String(resolution)); }
+        }
+
+        let client = Self::build_client();
+        let submit_url = endpoint_for(extras.and_then(|params| params.get("video_submit_path")), "/v1/videos/generations", None);
+        let response = client.post(&submit_url).bearer_auth(api_key.clone()).header("Accept-Encoding", "identity").json(&body).send().await?;
+        let status = response.status();
+        let raw = response.text().await.unwrap_or_default();
+        let mut payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        if !status.is_success() { return Err(AIError::TaskFailed(format!("视频生成请求失败: HTTP {} {}", status, raw.chars().take(500).collect::<String>()))); }
+        if let Some(url) = Self::video_result_url(&payload) { return Ok(url); }
+        let id = Self::video_task_id(&payload).ok_or_else(|| AIError::TaskFailed("视频平台响应中未找到任务 ID 或视频地址".into()))?;
+        let query_fallback = format!("{}/{{taskId}}", extras.and_then(|params| params.get("video_submit_path")).and_then(Value::as_str).unwrap_or("/v1/videos/generations"));
+        let query_url = endpoint_for(extras.and_then(|params| params.get("video_query_path")), &query_fallback, Some(&id));
+        for _ in 0..600 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let response = client.get(&query_url).bearer_auth(&api_key).header("Accept-Encoding", "identity").send().await?;
+            let status = response.status();
+            let raw = response.text().await.unwrap_or_default();
+            payload = serde_json::from_str(&raw).unwrap_or(Value::Null);
+            if !status.is_success() { return Err(AIError::TaskFailed(format!("视频生成查询失败: HTTP {} {}", status, raw.chars().take(500).collect::<String>()))); }
+            if let Some(url) = Self::video_result_url(&payload) { return Ok(url); }
+            let status = Self::video_task_status(&payload);
+            if matches!(status.as_str(), "FAILED" | "FAILURE" | "ERROR" | "CANCELED" | "CANCELLED" | "REJECTED") { return Err(AIError::TaskFailed(format!("视频生成失败: {}", status))); }
+        }
+        Err(AIError::TaskFailed("视频生成超时（30 分钟）".into()))
     }
 
     fn build_client() -> reqwest::Client {
@@ -1794,6 +1910,10 @@ impl AIProvider for OpenAICompatibleProvider {
         Ok(ProviderTaskPollResult::Failed(
             "平台未提供可识别的任务状态端点；已尝试 query_url、/v1/images/generations、/v1/tasks、/v1/jobs、/v1/async 等路径。请在平台能力设置中配置正确的查询地址，或将请求模式改为同步".to_string(),
         ))
+    }
+
+    async fn generate_video(&self, request: GenerateVideoRequest) -> Result<String, AIError> {
+        OpenAICompatibleProvider::generate_video(self, request).await
     }
 }
 

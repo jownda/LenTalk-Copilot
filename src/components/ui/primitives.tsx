@@ -22,6 +22,7 @@ import {
   UI_DIALOG_TRANSITION_MS,
   UI_POPOVER_TRANSITION_MS,
 } from './motion';
+import { useOverlayLayerFloor } from './overlayLayer';
 import { useDialogTransition } from './useDialogTransition';
 
 type ButtonVariant = 'primary' | 'muted' | 'ghost';
@@ -207,6 +208,10 @@ export function UiSelect({ className = '', children, ...props }: UiSelectProps) 
     'aria-label': ariaLabel,
     ...selectProps
   } = props;
+  // 被高层级容器(如设置面板)包裹时, 菜单要抬到容器之上, 否则会被容器遮住。
+  // 没有 Provider 时保持 null, 沿用 className 里的 z-[140], 行为不变。
+  const overlayFloor = useOverlayLayerFloor();
+  const menuZIndex = overlayFloor > 0 ? overlayFloor + 10 : null;
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const hiddenSelectRef = useRef<HTMLSelectElement | null>(null);
   const listboxIdRef = useRef(`ui-select-${Math.random().toString(36).slice(2, 10)}`);
@@ -428,6 +433,7 @@ export function UiSelect({ className = '', children, ...props }: UiSelectProps) 
                 width: menuStyle.width,
                 maxHeight: 240,
                 transitionDuration: `${UI_POPOVER_TRANSITION_MS}ms`,
+                ...(menuZIndex != null ? { zIndex: menuZIndex } : {}),
               }}
             >
               <div className="ui-scrollbar max-h-[228px] overflow-y-auto">
@@ -480,13 +486,28 @@ export function UiModal({
   containerClassName = '',
 }: UiModalProps) {
   const { shouldRender, isVisible } = useDialogTransition(isOpen, UI_DIALOG_TRANSITION_MS);
+  // 被高层级容器(如设置面板 z-[300])包裹时, 弹窗必须抬到容器之上。
+  // 用内联样式而不是追加 class, 是为了不受 Tailwind class 生成顺序影响;
+  // 没有 Provider 时不写 style, 仍然走 className 的 z-50 / containerClassName 覆盖。
+  const overlayFloor = useOverlayLayerFloor();
 
   if (!shouldRender) {
     return null;
   }
 
-  return (
-    <div className={`fixed ${UI_CONTENT_OVERLAY_INSET_CLASS} z-50 flex items-center justify-center ${containerClassName}`}>
+  // 对话框可能由 React Flow 节点内部触发。必须 portal 到 body：仅靠 `.nodrag`
+  // 无法隔离原生 <select> 的系统下拉层，它会把鼠标按下继续交给节点的拖拽监听器。
+  // Portal 后弹窗 DOM 不再属于节点，选择模型时不会再带着节点/画布一起拖动。
+  const modal = (
+    <div
+      // 对话框也会从 React Flow 的节点/工具栏中渲染。阻断指针事件并标记为
+      // `nodrag`，避免下拉框等原生控件的按下事件穿透到节点，导致节点一直跟着鼠标移动。
+      className={`nodrag nowheel fixed ${UI_CONTENT_OVERLAY_INSET_CLASS} z-50 flex items-center justify-center ${containerClassName}`}
+      style={overlayFloor > 0 ? { zIndex: overlayFloor } : undefined}
+      onPointerDown={(event) => event.stopPropagation()}
+      onMouseDown={(event) => event.stopPropagation()}
+      onWheelCapture={(event) => event.stopPropagation()}
+    >
       <div
         className={`absolute inset-0 bg-black/55 transition-opacity duration-200 ${isVisible ? 'opacity-100' : 'opacity-0'}`}
         onClick={onClose}
@@ -511,4 +532,6 @@ export function UiModal({
       </UiPanel>
     </div>
   );
+
+  return typeof document === 'undefined' ? modal : createPortal(modal, document.body);
 }

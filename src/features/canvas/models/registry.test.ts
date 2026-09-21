@@ -6,6 +6,7 @@ import {
   getImageModel,
   isApiKeylessProvider,
   listAudioModels,
+  matchesAudioCreativePanel,
   listImageModels,
   listImageUpscaleModels,
   listVideoModels,
@@ -13,6 +14,8 @@ import {
 import { JIMENG_CLI_IMAGE_UPSCALE_MODEL } from '@/commands/ai';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { isVideoGenerationModelName, useSettingsStore, type CustomApiProvider } from '@/stores/settingsStore';
+import { recommendedApis, type RecommendedApi } from '@/features/settings/recommendedApis';
+import type { AudioCreativePanel } from './types';
 
 describe('isVideoGenerationModelName', () => {
   it.each([
@@ -327,6 +330,113 @@ describe('listAudioModels(字子动画)', () => {
     } finally {
       useSettingsStore.setState({ customApis: previousCustomApis });
     }
+  });
+});
+
+/**
+ * 音频节点四个创作面板的归属(音色克隆 / 音色设计 / 2.8 配音 / 音乐创作)。
+ *
+ * 这一层埋过三次坑, 每次都是「模型名认错 -> 模型整个消失或语义错」:
+ *  1. 一度所有模型都能进任何面板(切供应商看不出变化);
+ *  2. 修完又变成「名字里没有 clone 的克隆模型列不出来」;
+ *  3. 2026-09-20 反向修正 —— 为了救 (2) 把 `speech[-_]?\d` 塞进了克隆标记, 结果把
+ *     **消费端** `speech-2.8` 也拖进了克隆页。它的 param_schema 里没有任何参考样音
+ *     字段, 用户传完样音平台静默忽略, 表现是「克隆了但声音没变」。
+ *
+ * 现在的分工(见 docs/api_docs/ZhiniaoAI_MiniMax_Voice_Chain.md):
+ *   voice-clone  → 音色克隆页(上传样音建音色)
+ *   voice-design → 音色设计页(文字描述建音色)
+ *   speech-2.8   → 2.8 配音页(用 voice_id 合成)
+ */
+describe('listAudioModels: 创作面板归属', () => {
+  const AUDIO_PANELS: AudioCreativePanel[] = ['voice-clone', 'voice-design', 'speech', 'music'];
+
+  const toCustomApi = (api: RecommendedApi, audioModels: string[]): CustomApiProvider => ({
+    id: api.id,
+    name: api.name,
+    baseUrl: api.baseUrl,
+    apiKey: '',
+    models: api.models ?? [],
+    videoModels: api.videoModels ?? [],
+    audioModels,
+    chatModels: api.chatModels ?? [],
+    createdAt: Date.now(),
+    requestMode: 'sync',
+    protocol: 'images',
+    referenceImageField: 'image',
+    referenceImageEncoding: 'auto',
+    imageTransport: 'auto',
+  });
+
+  const withCustomApis = <T>(apis: CustomApiProvider[], run: () => T): T => {
+    const previous = useSettingsStore.getState().customApis;
+    useSettingsStore.setState({ customApis: apis });
+    try {
+      return run();
+    } finally {
+      useSettingsStore.setState({ customApis: previous });
+    }
+  };
+
+  /** 某个模型会出现在哪些面板上(顺序同 AUDIO_PANELS)。 */
+  const panelsOf = (apiId: string, model: string): AudioCreativePanel[] => {
+    const definition = listAudioModels().find(
+      (item) => item.id === `custom:${apiId}/${model}`,
+    );
+    if (!definition) throw new Error(`音频模型未注册: ${apiId}/${model}`);
+    return AUDIO_PANELS.filter((panel) => matchesAudioCreativePanel(definition, panel));
+  };
+
+  const zhiniao = recommendedApis.find((api) => api.id === 'zhiniao');
+
+  it('知鸟AI: MiniMax 三件套各归各页, Suno music 只进「音乐创作」', () => {
+    expect(zhiniao).toBeTruthy();
+    const models = zhiniao?.audioModels ?? [];
+    withCustomApis([toCustomApi(zhiniao as RecommendedApi, models)], () => {
+      const apiId = (zhiniao as RecommendedApi).id;
+
+      // 建音色的两个入口各自独立: 克隆吃样音, 设计吃文字描述。
+      expect(panelsOf(apiId, 'voice-clone')).toEqual(['voice-clone']);
+      expect(panelsOf(apiId, 'voice-design')).toEqual(['voice-design']);
+      // speech-2.8 是消费端(只吃 voice_id), 绝不能出现在克隆页 ——
+      // 它没有参考样音字段, 混进去就是「传了样音但声音没变」。
+      expect(panelsOf(apiId, 'speech-2.8')).toEqual(['speech']);
+      // 音乐模型必须离开「2.8 配音」, 否则语音页会混进 Suno。
+      expect(panelsOf(apiId, 'music')).toEqual(['music']);
+      expect(panelsOf(apiId, 'gemini-2.5-pro-tts')).toEqual(['speech']);
+      expect(panelsOf(apiId, 'tts-1')).toEqual(['speech']);
+    });
+  });
+
+  it('字子动画: 音乐模型只进「音乐创作」, 音效模型不会从所有面板消失', () => {
+    const zzdh = recommendedApis.find((api) => api.id === 'zizidonghua');
+    expect(zzdh).toBeTruthy();
+    const models = zzdh?.audioModels ?? [];
+    withCustomApis([toCustomApi(zzdh as RecommendedApi, models)], () => {
+      const apiId = (zzdh as RecommendedApi).id;
+
+      expect(panelsOf(apiId, 'eleven_music_v2')).toEqual(['music']);
+      // eleven 系既能克隆也能直接合成(有内置音色), 两个页面都该有它。
+      expect(panelsOf(apiId, 'eleven_multilingual_v2')).toEqual(['voice-clone', 'speech']);
+      // 节点没有「音效」页: 音效模型必须仍然落在某个面板里。
+      expect(panelsOf(apiId, 'eleven_text_to_sound_v2')).toEqual(['voice-clone']);
+    });
+  });
+
+  it('推荐平台预置的音频模型都能落在至少一个面板(不会凭空消失)', () => {
+    const presets = recommendedApis.filter((api) => (api.audioModels ?? []).length > 0);
+    expect(presets.length).toBeGreaterThan(0);
+
+    withCustomApis(
+      presets.map((api) => toCustomApi(api, api.audioModels ?? [])),
+      () => {
+        for (const api of presets) {
+          for (const model of api.audioModels ?? []) {
+            expect(panelsOf(api.id, model).length, `${api.id}/${model}`).toBeGreaterThan(0);
+          }
+        }
+      },
+    );
   });
 });
 

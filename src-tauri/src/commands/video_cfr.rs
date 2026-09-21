@@ -182,6 +182,15 @@ pub(crate) fn resolve_ffmpeg_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     if manifest.is_file() {
         return Some(manifest);
     }
+    // Windows 安装包不再内置约 79MB 的 ffmpeg；扒剧本首次使用后会按需下载到
+    // 应用数据目录，视频超分与缩略图也应复用同一份二进制。
+    #[cfg(windows)]
+    if let Ok(app_data) = app.path().app_data_dir() {
+        let candidate = app_data.join("tools").join("ffmpeg").join(ffmpeg_exe_name());
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join("bin").join(ffmpeg_exe_name());

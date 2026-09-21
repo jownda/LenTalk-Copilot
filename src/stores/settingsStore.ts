@@ -205,6 +205,57 @@ export interface CustomApiProvider {
   capabilities?: CustomApiCapabilities;
 }
 
+/**
+ * 音色是怎么来的 —— 决定「重新克隆 / 重新设计」这类操作能不能做, 以及要不要显示价钱。
+ *
+ * - `clone`:  从参考样音复刻(voice-clone), 一次性音色费
+ * - `design`: 由文字描述生成(voice-design), 一次性音色费
+ * - `preset`: 服务商预置音色(如 MMX 的 `female-tianmei`), 不花钱
+ * - `builtin`: 客户端内置音色名(如 `alloy`), 不花钱
+ */
+export type VoiceProfileSource = 'clone' | 'design' | 'preset' | 'builtin';
+
+/**
+ * 音色的就绪状态 —— 照抄平台声纹库的状态机:
+ * `activating`(激活中, 稍后可用) → `ready`; `expired`(已失效, 需重新上传样本克隆)。
+ */
+export type VoiceProfileStatus = 'activating' | 'ready' | 'expired';
+
+/** 本地保存的音色档案。样音保存在应用素材目录，设置里仅保存其路径。 */
+export interface SavedVoiceProfile {
+  id: string;
+  name: string;
+  /** 创建该音色时使用的渠道；空值表示可跨渠道尝试。 */
+  providerId?: string;
+  /**
+   * 音色 ID。
+   *
+   * 2026-09-20 起语义收紧: 对 MiniMax 海螺链路, 这必须是**真实的 `voice_id`** ——
+   * 由客户端在发请求前生成(见 `generateMmxVoiceId`)、或平台回填, 直接喂给
+   * `speech-2.8` 的 `voice` 参数。以前这里存的是本地下拉的音色名(默认 `alloy`),
+   * 那是「假克隆」: 服务端从未见过这个音色。
+   */
+  voiceId: string;
+  /** 音色来源。老数据没有这个字段时按「有样音算克隆, 否则算内置」推断。 */
+  source?: VoiceProfileSource;
+  /**
+   * 所属语音家族(如 `speech-2.8`)。
+   *
+   * 平台按家族隔离音色 —— 别的家族的语音模型用不了这个声纹(文档 `familyMismatchHint`:
+   * 「你的克隆音色属于其它语音家族，当前模型无法使用」)。留着它才能在界面上提前拦住。
+   */
+  family?: string;
+  /** 声音克隆的参考样音，本地路径或公网 URL。 */
+  referenceAudio?: string;
+  /** 音色设计的描述词, 留痕以便「重新设计」。 */
+  designPrompt?: string;
+  /** 试听音频(设计接口直接返回; 克隆则来自首次合成)。 */
+  previewAudio?: string;
+  status?: VoiceProfileStatus;
+  emotion?: string;
+  createdAt: number;
+}
+
 export type CustomApiRequestMode = CustomApiProvider['requestMode'];
 export type CustomApiProtocol = CustomApiProvider['protocol'];
 export type CustomApiReferenceImageField = CustomApiProvider['referenceImageField'];
@@ -224,6 +275,23 @@ interface SettingsState {
   isHydrated: boolean;
   apiKeys: ProviderApiKeys;
   customApis: CustomApiProvider[];
+  /** 用户保存的音色库，随本机设置持久化。 */
+  voiceProfiles: SavedVoiceProfile[];
+  /**
+   * 官方系统音色的本地试听缓存（voice_id → 音频路径）。
+   *
+   * 官方音色库里 44 条 legacy 音色没有官方试听 MP3 —— 但只要用它合成过一次，生成结果
+   * 本来就落了盘，直接把那份音频记下来当试听。这样 legacy 音色在用过一次之后，下拉里
+   * 也有可点的试听键，不用每次都靠「先生成一段」来听效果。随本机设置持久化。
+   */
+  systemVoicePreviews: Record<string, string>;
+  /**
+   * 「各模型最后一次选用的音色」（模型 id → 音色 id）。
+   *
+   * 节点自己的 `voiceByModel` 只记一个节点内的切换；这里是**全局**的那份 —— 新建音频
+   * 节点时默认带出上次用过的音色，而不是每次都从空开始重挑。随本机设置持久化。
+   */
+  lastVoiceByModel: Record<string, string>;
   cinematicAiSelection: CinematicAiSelection;
   jimengCli: JimengCliSettings;
   /** 即梦 CLI 自动检测/安装状态（运行时内存态，不随设置持久化）。 */
@@ -281,6 +349,12 @@ interface SettingsState {
   addCustomApi: (input: Omit<CustomApiProvider, 'id' | 'createdAt'>) => CustomApiProvider;
   updateCustomApi: (id: string, patch: Partial<Omit<CustomApiProvider, 'id'>>) => void;
   removeCustomApi: (id: string) => void;
+  saveVoiceProfile: (profile: Omit<SavedVoiceProfile, 'id' | 'createdAt'> & Partial<Pick<SavedVoiceProfile, 'id' | 'createdAt'>>) => SavedVoiceProfile;
+  /** 记下某个官方系统音色的本地试听音频（首次用该音色合成成功后调用）。 */
+  saveSystemVoicePreview: (voiceId: string, audio: string) => void;
+  /** 记下某模型最后一次选用的音色（选了非空音色时调用；空值不覆盖旧记忆）。 */
+  rememberLastVoice: (modelId: string, voice: string) => void;
+  removeVoiceProfile: (id: string) => void;
   setCinematicAiSelection: (selection: CinematicAiSelection) => void;
   setGrsaiNanoBananaProModel: (model: string) => void;
   setHideProviderGuidePopover: (hide: boolean) => void;
@@ -625,6 +699,75 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
     .filter((item) => item.id && item.name && item.baseUrl);
 }
 
+const VOICE_PROFILE_SOURCES: VoiceProfileSource[] = ['clone', 'design', 'preset', 'builtin'];
+const VOICE_PROFILE_STATUSES: VoiceProfileStatus[] = ['activating', 'ready', 'expired'];
+
+function normalizeVoiceProfileSource(value: unknown, hasReferenceAudio: boolean): VoiceProfileSource {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  const hit = VOICE_PROFILE_SOURCES.find((candidate) => candidate === normalized);
+  if (hit) return hit;
+  // 老数据没有 source: 有样音说明是克隆来的, 否则只可能是内置/预置音色名。
+  return hasReferenceAudio ? 'clone' : 'builtin';
+}
+
+function normalizeVoiceProfileStatus(value: unknown): VoiceProfileStatus {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return VOICE_PROFILE_STATUSES.find((candidate) => candidate === normalized) ?? 'ready';
+}
+
+function normalizeVoiceProfiles(input: unknown): SavedVoiceProfile[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  return input.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const value = item as Record<string, unknown>;
+    const id = String(value.id ?? '').trim();
+    const name = String(value.name ?? '').trim();
+    const voiceId = String(value.voiceId ?? '').trim();
+    if (!id || !name || !voiceId || seen.has(id)) return [];
+    seen.add(id);
+    const referenceAudio = String(value.referenceAudio ?? '').trim() || undefined;
+    return [{
+      id,
+      name,
+      voiceId,
+      providerId: String(value.providerId ?? '').trim() || undefined,
+      source: normalizeVoiceProfileSource(value.source, Boolean(referenceAudio)),
+      family: String(value.family ?? '').trim() || undefined,
+      referenceAudio,
+      designPrompt: String(value.designPrompt ?? '').trim() || undefined,
+      previewAudio: String(value.previewAudio ?? '').trim() || undefined,
+      status: normalizeVoiceProfileStatus(value.status),
+      emotion: String(value.emotion ?? '').trim() || undefined,
+      createdAt: typeof value.createdAt === 'number' ? value.createdAt : Date.now(),
+    }];
+  }).slice(0, 200);
+}
+
+/** 官方系统音色本地试听缓存的归一化：只留「非空 voice_id → 非空路径」的键值对。 */
+function normalizeSystemVoicePreviews(input: unknown): Record<string, string> {
+  if (!input || typeof input !== 'object') return {};
+  const output: Record<string, string> = {};
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    const voiceId = key.trim();
+    const audio = String(value ?? '').trim();
+    if (voiceId && audio) output[voiceId] = audio;
+  }
+  return output;
+}
+
+/** 「各模型最后音色」记忆的归一化：只留「非空模型 id → 非空音色」的键值对。 */
+function normalizeLastVoiceByModel(input: unknown): Record<string, string> {
+  if (!input || typeof input !== 'object') return {};
+  const output: Record<string, string> = {};
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    const modelId = key.trim();
+    const voice = String(value ?? '').trim();
+    if (modelId && voice) output[modelId] = voice;
+  }
+  return output;
+}
+
 /** 基于名称生成稳定的自定义平台 id(附加短随机避免重名覆盖) */
 function deriveCustomApiId(name: string, existingIds: Set<string>): string {
   const base = name
@@ -663,6 +806,9 @@ export const useSettingsStore = create<SettingsState>()(
       isHydrated: false,
       apiKeys: {},
       customApis: [],
+      voiceProfiles: [],
+      systemVoicePreviews: {},
+      lastVoiceByModel: {},
       cinematicAiSelection: { provider: '', model: '', reasoningEffort: '' },
       jimengCli: { executable: DEFAULT_JIMENG_CLI_EXECUTABLE },
       jimengCliAutoInstallStatus: DEFAULT_JIMENG_CLI_AUTO_INSTALL_STATUS,
@@ -749,6 +895,60 @@ export const useSettingsStore = create<SettingsState>()(
           const nextKeys = { ...state.apiKeys };
           delete nextKeys[buildCustomProviderId(id)];
           return { customApis, apiKeys: nextKeys };
+        });
+      },
+      saveVoiceProfile: (profile) => {
+        const name = profile.name.trim();
+        const voiceId = profile.voiceId.trim();
+        if (!name || !voiceId) {
+          throw new Error('音色名称和音色 ID 不能为空');
+        }
+        // 同一个 voice_id 视为同一个音色资产。
+        //
+        // 平台对 voice-clone 是按 voice_id 幂等的(同一 ID 重复克隆不二次收费), 所以
+        // 「克隆重试」「重新激活」都会带着同一个 voice_id 回来 —— 这里必须**更新**而不是
+        // 再插一条, 否则音色库里会堆出一串同名同 ID 的重复项, 用户根本分不清哪个能用。
+        const existing = get().voiceProfiles.find((item) => item.voiceId === voiceId);
+        const entry: SavedVoiceProfile = {
+          id: profile.id?.trim() || existing?.id || `voice-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          name,
+          voiceId,
+          providerId: profile.providerId?.trim() || undefined,
+          source: profile.source ?? existing?.source ?? 'clone',
+          family: profile.family?.trim() || existing?.family,
+          referenceAudio: profile.referenceAudio?.trim() || undefined,
+          designPrompt: profile.designPrompt?.trim() || existing?.designPrompt,
+          previewAudio: profile.previewAudio?.trim() || existing?.previewAudio,
+          status: profile.status ?? existing?.status ?? 'ready',
+          emotion: profile.emotion?.trim() || undefined,
+          createdAt: profile.createdAt ?? existing?.createdAt ?? Date.now(),
+        };
+        set((state) => ({
+          voiceProfiles: [...state.voiceProfiles.filter((item) => item.id !== entry.id), entry].slice(-200),
+        }));
+        return entry;
+      },
+      removeVoiceProfile: (id) => set((state) => ({
+        voiceProfiles: state.voiceProfiles.filter((item) => item.id !== id),
+      })),
+      saveSystemVoicePreview: (voiceId, audio) => {
+        const key = voiceId.trim();
+        const source = audio.trim();
+        if (!key || !source) return;
+        set((state) => {
+          // 已经有缓存就不覆盖 —— 首次合成的那份就是试听, 重复生成不该把它顶掉。
+          if (state.systemVoicePreviews[key]) return state;
+          return { systemVoicePreviews: { ...state.systemVoicePreviews, [key]: source } };
+        });
+      },
+      rememberLastVoice: (modelId, voice) => {
+        const key = modelId.trim();
+        const next = voice.trim();
+        if (!key || !next) return;
+        set((state) => {
+          // 同值不写, 免得每次渲染都触发一次持久化。
+          if (state.lastVoiceByModel[key] === next) return state;
+          return { lastVoiceByModel: { ...state.lastVoiceByModel, [key]: next } };
         });
       },
       setCinematicAiSelection: (selection) =>
@@ -839,7 +1039,7 @@ export const useSettingsStore = create<SettingsState>()(
     {
       name: SETTINGS_STORAGE_KEY,
       storage: createJSONStorage(() => settingsStorage),
-      version: 20,
+      version: 21,
       onRehydrateStorage: () => {
         return (_state, error) => {
           if (error) {
@@ -880,6 +1080,9 @@ export const useSettingsStore = create<SettingsState>()(
           preferDiscountedPrice?: boolean;
           grsaiCreditTierId?: GrsaiCreditTierId | string;
           jimengCli?: unknown;
+          voiceProfiles?: unknown;
+          systemVoicePreviews?: unknown;
+          lastVoiceByModel?: unknown;
         };
 
         const migratedApiKeys = normalizeApiKeys(state.apiKeys);
@@ -894,6 +1097,9 @@ export const useSettingsStore = create<SettingsState>()(
             isHydrated: true,
             apiKeys: migratedApiKeys,
             customApis,
+            voiceProfiles: normalizeVoiceProfiles(state.voiceProfiles),
+            systemVoicePreviews: normalizeSystemVoicePreviews(state.systemVoicePreviews),
+            lastVoiceByModel: normalizeLastVoiceByModel(state.lastVoiceByModel),
             jimengCli: normalizeJimengCliSettings(state.jimengCli),
             ignoreAtTagWhenCopyingAndGenerating,
             grsaiNanoBananaProModel: normalizeGrsaiNanoBananaProModel(
@@ -932,6 +1138,9 @@ export const useSettingsStore = create<SettingsState>()(
           isHydrated: true,
           apiKeys: state.apiKey ? { ppio: normalizeApiKey(state.apiKey) } : {},
           customApis,
+          voiceProfiles: normalizeVoiceProfiles(state.voiceProfiles),
+          systemVoicePreviews: normalizeSystemVoicePreviews(state.systemVoicePreviews),
+          lastVoiceByModel: normalizeLastVoiceByModel(state.lastVoiceByModel),
           jimengCli: normalizeJimengCliSettings(state.jimengCli),
           ignoreAtTagWhenCopyingAndGenerating,
           grsaiNanoBananaProModel: normalizeGrsaiNanoBananaProModel(

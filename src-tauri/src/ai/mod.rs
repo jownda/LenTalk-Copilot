@@ -18,6 +18,21 @@ pub struct GenerateRequest {
     pub extra_params: Option<HashMap<String, serde_json::Value>>,
 }
 
+/// 视频任务与图片任务分开建模。视频接口的 duration / 首尾帧 / 音频参数不能
+/// 塞进图片请求，避免后端任务执行时丢失语义。
+#[derive(Debug, Clone)]
+pub struct GenerateVideoRequest {
+    pub prompt: String,
+    pub model: String,
+    pub duration: u32,
+    pub aspect_ratio: String,
+    pub video_resolution: Option<String>,
+    pub image_mode: Option<String>,
+    pub reference_images: Option<Vec<String>>,
+    pub reference_audio: Option<Vec<String>>,
+    pub extra_params: Option<HashMap<String, serde_json::Value>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderTaskHandle {
     pub task_id: String,
@@ -78,6 +93,13 @@ pub trait AIProvider: Send + Sync {
     }
 
     async fn generate(&self, request: GenerateRequest) -> Result<String, AIError>;
+
+    async fn generate_video(&self, _request: GenerateVideoRequest) -> Result<String, AIError> {
+        Err(AIError::Provider(format!(
+            "Provider '{}' does not support native video generation",
+            self.name()
+        )))
+    }
 }
 
 pub struct ProviderRegistry {

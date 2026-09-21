@@ -40,6 +40,10 @@ export interface PajubenRunRequest {
   resolution?: string | null;
   maxFrames?: number | null;
   workers?: number | null;
+  /** 单次模型请求的最长等待时间；留空时引擎使用完整模式默认值。 */
+  requestTimeoutSecs?: number | null;
+  /** 单次模型请求的尝试次数；快速模式只尝试一次，避免用户误以为界面卡死。 */
+  requestAttempts?: number | null;
   audio: boolean;
   animeMode: boolean;
   faceEnabled: boolean;
@@ -52,6 +56,8 @@ export interface PajubenRunRequest {
   limit?: number | null;
   overwrite: boolean;
   skipAliasVerify: boolean;
+  /** 禁用失败后的双模型长流程降级，供画布上的「扒视频」快速模式使用。 */
+  disableDualFallback?: boolean;
 }
 
 export interface PajubenLogPayload {

@@ -2,8 +2,8 @@
 // 画布「扒视频」：从视频节点的工具栏一键跑一次最精简的单集扒取，
 // 扒完直接把剧本落到画布右边新生成的文本节点上，不用进全屏的扒剧本工作台。
 //
-// 复用同一套引擎与事件协议（pajuben://log|progress|finish），只是把参数收敛成
-// 「单集 + 低清晰度 + 低频抽帧 + 不跑本地人物库」，界面上只留一个模型选择。
+// 复用与「扒剧本」工作台相同的引擎、参数与事件协议（pajuben://log|progress|finish），
+// 区别仅是界面上只留模型选择，并把成功结果自动落到视频节点右侧的文本节点。
 // ---------------------------------------------------------------------------
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -19,6 +19,7 @@ import {
   onPajubenFinish,
   onPajubenLog,
   onPajubenProgress,
+  probePajubenEnvironment,
   readPajubenScript,
   runPajuben,
   type PajubenRunRequest,
@@ -34,6 +35,23 @@ const SCRIPT_NODE_HEIGHT = 420;
 
 /** `pajuben_run` 只负责拉起子进程，正常几百毫秒内回包；超时说明 Rust 侧没响应。 */
 const SPAWN_TIMEOUT_MS = 30_000;
+/** 首次补装 FFmpeg 要下载/安装，不能沿用普通拉起的 30 秒兜底。 */
+const FFMPEG_INSTALL_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * 某些 OpenAI 兼容中转会静默丢弃 `input_audio`。模型会返回一段“请上传音频”
+ * 的说明文字，进程却正常退出；这不是可用剧本，不能当成功结果落到画布。
+ */
+function isAudioInputRejected(script: string): boolean {
+  const normalized = script.replace(/\s+/g, '');
+  return [
+    /未收到.*音频/,
+    /没有.*音频/,
+    /未提供.*音频/,
+    /请补充.*音频/,
+    /无法.*(?:台词|听写|转写)/,
+  ].some((pattern) => pattern.test(normalized));
+}
 
 const FIELD_CLASS =
   'h-9 w-full rounded-lg border border-border-dark bg-bg-dark px-3 text-sm text-text-dark outline-none transition-colors placeholder:text-text-muted focus:border-accent';
@@ -63,6 +81,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
   const [running, setRunning] = useState(false);
   const [percent, setPercent] = useState(0);
   const [statusText, setStatusText] = useState('');
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const runIdRef = useRef<string | null>(null);
   /** 已经发出 runPajuben、但还没收到 finish —— 用来把「秒失败」的 finish 认领回来。 */
@@ -112,6 +131,15 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
       }
       try {
         const script = await readPajubenScript({ target: videoPath, episode });
+        if (isAudioInputRejected(script)) {
+          setNotice(
+            t(
+              'pajuben.quickAudioUnsupported',
+              '所选模型或渠道没有接收到视频音频，无法生成完整台词剧本。请改用支持音频输入/视频理解的模型后重试。'
+            )
+          );
+          return;
+        }
         addNode(
           CANVAS_NODE_TYPES.textAnnotation,
           findNodePosition(node.id, SCRIPT_NODE_WIDTH, SCRIPT_NODE_HEIGHT),
@@ -164,6 +192,18 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
     };
   }, [handleFinished]);
 
+  useEffect(() => {
+    if (!running) {
+      setElapsedSeconds(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      setElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [running]);
+
   const handleGenerate = useCallback(async () => {
     if (running) return;
     if (!canExtract) {
@@ -181,12 +221,26 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
 
     setNotice(null);
     setPercent(0);
-    setStatusText('');
+    setStatusText(t('pajuben.quickPreparing', '正在准备视频和模型请求…'));
+    setElapsedSeconds(0);
     setRunning(true);
     // 先武装再发命令：引擎起手就失败时 finish 事件可能早于 runPajuben 回包
     armedRef.current = true;
     pendingFinishRef.current = null;
     try {
+      setStatusText(t('pajuben.quickCheckingFfmpeg', '正在检查 FFmpeg…'));
+      const environment = await probePajubenEnvironment();
+      const needsFfmpegInstall = !environment.ffmpegDir;
+      if (needsFfmpegInstall) {
+        setStatusText(
+          t(
+            'pajuben.quickInstallingFfmpeg',
+            '未检测到 FFmpeg，正在下载并自动安装；请保持网络连接，首次安装可能需要几分钟…'
+          )
+        );
+      } else {
+        setStatusText(t('pajuben.quickPreparing', '正在准备视频和模型请求…'));
+      }
       const spawnRequest: PajubenRunRequest = {
         target: videoPath,
         batch: false,
@@ -196,14 +250,14 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
         provider: '',
         proxy: '',
         episode,
-        // 最精简：低清晰度 + 低频抽帧 + 不跑本地人物库，单集几十秒出结果
+        // 与「扒剧本」工作台的单集默认参数完全一致；这里只是把成功结果自动落为文本节点。
         fps: 1,
         resolution: 'low',
         maxFrames: 120,
         workers: 3,
         audio: true,
         animeMode: false,
-        faceEnabled: false,
+        faceEnabled: environment.faceReady,
         outputDir: null,
         roleSheet: null,
         dualAudioModel: null,
@@ -211,8 +265,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
         fromEpisode: null,
         toEpisode: null,
         limit: null,
-        // 点「生成」就是要重扒一遍，命中旧产物直接跳过会让人以为没反应
-        overwrite: true,
+        overwrite: false,
         skipAliasVerify: false,
       };
       // 超时兜底：Rust 侧一旦不回包（例如命令 panic），await 永不 settle，
@@ -222,7 +275,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
         new Promise<never>((_, reject) =>
           setTimeout(
             () => reject(new Error(t('pajuben.quickSpawnTimeout', '启动扒取超时，请重试'))),
-            SPAWN_TIMEOUT_MS
+            needsFfmpegInstall ? FFMPEG_INSTALL_TIMEOUT_MS : SPAWN_TIMEOUT_MS
           )
         ),
       ]);
@@ -304,9 +357,11 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
             {t('pajuben.model', '模型')}
           </span>
           <select
-            className={FIELD_CLASS}
+            className={`nodrag nowheel ${FIELD_CLASS}`}
             value={modelKey}
             onChange={(event) => setModelKey(event.target.value)}
+            onPointerDown={(event) => event.stopPropagation()}
+            onMouseDown={(event) => event.stopPropagation()}
             disabled={running}
           >
             <option value="">
@@ -324,6 +379,12 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
               </optgroup>
             ))}
           </select>
+          <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">
+            {t(
+              'pajuben.quickAudioModelHint',
+              '请使用支持音频输入或视频理解的模型；纯文本/仅图片模型无法还原完整台词。'
+            )}
+          </p>
         </div>
 
         {running && (
@@ -336,6 +397,11 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
             </div>
             <p className="truncate text-[11px] text-text-muted" title={statusText}>
               {statusText || t('pajuben.consoleEmpty', '等待开始…引擎的输出会实时显示在这里')}
+            </p>
+            <p className="text-[11px] text-text-muted">
+              {t('pajuben.quickElapsed', '已等待 {{seconds}} 秒；处理规则与「扒剧本」工作台一致', {
+                seconds: elapsedSeconds,
+              })}
             </p>
           </div>
         )}
