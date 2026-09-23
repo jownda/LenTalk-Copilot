@@ -57,6 +57,10 @@ const PRESUBMIT_FAILURE_PATTERNS: &[&str] = &[
     "upload image",
     "apply phase",
     "commit phase",
+    // 真实报文: `upload resource "...image-1.png": upload image: upload phase,
+    // no file upload, please check log for more details` —— 同样卡在 submit 之前。
+    "upload phase",
+    "no file upload",
 ];
 
 /// 瞬时网络失败的特征(大小写不敏感)。命中只代表「值得再试一次」, 真正能不能重试还要由
@@ -456,12 +460,25 @@ fn submit_and_poll_jimeng_task(
     }
 }
 
-/// 服务端任务探针结果 —— 决定「这次失败能否重试」的唯一依据。
+/// 任务记录探针结果 —— 决定「这次失败能否重试」的唯一依据。
+///
+/// 数据来源是 `dreamina list_task`。实测它读的是 **CLI 本地任务库**
+/// (`~/.dreamina_cli/tasks.db`: 本地 37 行与 `list_task` 返回 37 条逐条一致,
+/// 最老的一条 `querying` 从 09-15 起就没再更新), 不是实时服务端状态 ——
+/// 但对计费判定已经够用, 因为**即梦自己的计费字段 `commerce_info` 就落在记录里**:
+/// 27 条 success 全带 `credit_count`; 4 条 `generation failed`(生成阶段失败)的 fail
+/// 也带 —— 说明扣费发生在**任务创建成功**时; 而「上传阶段失败」与
+/// `CreditPreDeductNotEnough`(积分预扣不足)这 2 条为空 ⇒ **空就一定没扣钱**。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ServerTaskProbe {
-    /// 服务端已经有这一次的任务(生成任务一创建就预缴积分): 绝不再提交。
-    Exists { submit_id: String, failed: bool },
-    /// 服务端确认没有这一次的任务: 重试不会重复扣费。
+    /// 本地任务库里已经有这一次的记录。
+    /// `charged` 取自 `commerce_info`: true = 已产生计费, 再提交就是重复扣费。
+    Exists {
+        submit_id: String,
+        failed: bool,
+        charged: bool,
+    },
+    /// 确认没有这一次的任务: 重试不会重复扣费。
     Absent,
     /// 查不动(未登录 / CLI 不可用 / `list_task` 报错 / 冒出来的是别的节点的任务):
     /// 只能退回报错阶段来判断。
@@ -473,6 +490,8 @@ enum ServerTaskProbe {
 struct TaskEntry {
     submit_id: String,
     failed: bool,
+    /// 是否已经产生计费(`commerce_info` 非空)。空的失败记录 = 没扣过钱。
+    charged: bool,
     prompt: String,
 }
 
@@ -507,15 +526,24 @@ fn is_transient_submit_failure(reason: &str) -> bool {
         .any(|pattern| lowered.contains(*pattern))
 }
 
-/// 纯函数: 依据「服务端有没有这一次的任务」+ 报错性质, 决定这次失败能否重试。
+/// 纯函数: 依据「本地任务库里有没有这一次的记录、有没有产生计费」+ 报错性质,
+/// 决定这次失败能否重试。
 ///
-/// 三种不重试的情况, 优先级从高到低:
-///   ① 服务端已有任务 —— 已经预缴积分, 再提交就是重复下单;
-///   ② 情况不明且报错不指向 submit 之前 —— 无法证明任务没被创建;
-///   ③ 报错不是网络抖动(参数错、审核拦截等), 重试没有意义。
+/// 四种不重试的情况, 优先级从高到低:
+///   ① 记录里已有计费信息 —— 已经扣过钱, 再提交就是重复扣费;
+///   ② 有失败记录但报错不指向 submit 之前 —— 无法证明任务没被创建;
+///   ③ 情况不明且报错不指向 submit 之前 —— 同上, 宁可不重试;
+///   ④ 报错不是网络抖动(参数错、审核拦截等), 重试没有意义。
+///
+/// 唯一允许「已经有失败记录仍然重试」的情形: 记录里**没有计费信息**
+/// (上传阶段失败留下的空壳, 实测不会产生任何费用) **且** 报错能证明卡在
+/// submit 之前的上传阶段 —— 两条同时成立, 重试就不会产生新费用。
+/// 反例(必须继续拦住): `CreditPreDeductNotEnough` 虽然也没有计费信息,
+/// 但它不满足「卡在上传阶段」, 重试只会再被拒一次。
 fn decide_submit_retry(probe: &ServerTaskProbe, reason: &str) -> bool {
     match probe {
-        ServerTaskProbe::Exists { .. } => false,
+        ServerTaskProbe::Exists { charged: true, .. } => false,
+        ServerTaskProbe::Exists { charged: false, .. } => is_presubmit_failure(reason),
         ServerTaskProbe::Absent => {
             is_transient_submit_failure(reason) || is_presubmit_failure(reason)
         }
@@ -557,9 +585,16 @@ fn parse_task_list(output: &str) -> ParsedTaskList {
         .get("gen_status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
+    // 计费字段: 成功任务形如 `{"credit_count":132,...}`; 上传阶段失败与积分预扣
+    // 不足的记录里它是空串 / null —— 「空」就等于「没扣钱」, 是重试安全性的依据。
+    let charged = first
+        .get("commerce_info")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|info| !info.is_empty());
     ParsedTaskList::Parsed(Some(TaskEntry {
         submit_id,
         failed: matches!(status.to_ascii_lowercase().as_str(), "fail" | "failed"),
+        charged,
         prompt: first
             .get("prompt")
             .and_then(serde_json::Value::as_str)
@@ -629,6 +664,7 @@ fn diff_task_snapshots(
         ServerTaskProbe::Exists {
             submit_id: entry.submit_id.clone(),
             failed: entry.failed,
+            charged: entry.charged,
         }
     } else {
         // 冒出来的是别的节点/别的会话的任务: 无法证明我们的任务没被创建。
@@ -636,11 +672,14 @@ fn diff_task_snapshots(
     }
 }
 
-/// 用 CLI 自己打印的 submit_id 精确查服务端。
+/// 用 CLI 自己打印的 submit_id 去本地任务库里精确核对。
 ///
-/// 关键事实: 即梦 CLI **失败时也会打印** `submit_id="<uuid>"`, 但那可能只是本地 id ——
-/// 实测拿它去查 `list_task --submit_id=<该值>` 返回 `[]`。所以「输出里有 submit_id」
-/// 并不等于「任务已创建」, 必须向服务端核对。
+/// 关键事实一: 即梦 CLI **失败时也会打印** `submit_id="<uuid>"`, 但那可能只是本地 id ——
+/// 实测拿它去查 `list_task --submit_id=<该值>` 会返回 `[]`。所以「输出里有 submit_id」
+/// 并不等于「任务已创建」。
+///
+/// 关键事实二: 这里查到的记录**不是实时服务端状态**, 而是 CLI 本地任务库。
+/// 真正决定能否重试的是记录里的 `commerce_info`(计费字段) —— 见 `ServerTaskProbe`。
 fn probe_reported_submit_id(
     executable: &str,
     submit_id: &str,
@@ -652,6 +691,7 @@ fn probe_reported_submit_id(
             ParsedTaskList::Parsed(Some(entry)) => ServerTaskProbe::Exists {
                 submit_id: entry.submit_id,
                 failed: entry.failed,
+                charged: entry.charged,
             },
             // 该 id 查不到 ⇒ 它只是本地 id, 服务端没有对应任务。
             ParsedTaskList::Parsed(None) => ServerTaskProbe::Absent,
@@ -682,15 +722,28 @@ fn probe_server_task(
 /// 把即梦 CLI 的原始英文报错翻成用户能照着做的中文说明; 未命中已知模式返回 None。
 fn humanize_jimeng_failure(reason: &str) -> Option<&'static str> {
     let lowered = reason.to_ascii_lowercase();
+    // DNS 解析失败最容易被误判成「素材 / 提示词有问题」, 而且它的处理办法与
+    // 单纯的超时完全不同, 所以要抢在下面那条上传分支之前单独识别。
+    if lowered.contains("no such host") || lowered.contains("server misbehaving") {
+        return Some(
+            "说明: 上传参考图时域名解析失败(DNS 查不到字节的上传服务器), 与提示词、素材内容都无关,\
+             也不代表账户或登录有问题。\n\
+             建议: ① 先直接重试一次(这类多半是当时的偶发失败); \
+             ② 把系统 DNS 换成 223.5.5.5 / 119.29.29.29, 或先执行 `ipconfig /flushdns` \
+             清掉失败的解析缓存; ③ 换个网络(如手机热点)做对照。",
+        );
+    }
     if lowered.contains("applyimageupload")
         || lowered.contains("upload resource")
+        || lowered.contains("upload image")
         || lowered.contains("apply phase")
+        || lowered.contains("upload phase")
     {
         return Some(
-            "说明: 卡在「参考图上传到字节图床」这一步, 还没进入生成阶段, 与提示词、素材内容无关。\n\
-             建议: ① 把代理切到「全局 / TUN」模式, 或确认代理规则覆盖 http(80) 端口;\
-             ② 换个网络(如手机热点)重试; ③ 参考图先减到 1~2 张再试; \
-             ④ 若长期失败, 到「设置 - 密钥 - 即梦 CLI」重新登录一次。",
+            "说明: 卡在「参考图上传到字节图床」这一步, 还没进入生成阶段, 与提示词、素材内容无关;\
+             这一步失败**不会产生任何费用**。\n\
+             建议: ① 先直接重试(上传阶段失败是免费可重试的); ② 换个网络(如手机热点)做对照; \
+             ③ 参考图先减到 1~2 张再试; ④ 若长期失败, 到「设置 - 密钥 - 即梦 CLI」重新登录一次。",
         );
     }
     if lowered.contains("fail_to_fetch_task")
@@ -772,13 +825,13 @@ fn probe_upload_host(timeout: Duration) -> String {
             "诊断: 本机到 {JIMENG_UPLOAD_HOST} 的 80 与 443 都不通, 问题出在本机网络或代理, 请按下面的建议处理。"
         ),
         (false, true) => format!(
-            "诊断: {JIMENG_UPLOAD_HOST} 的 443 可通、80 不通 —— 即梦 CLI 上传参考图走的正是明文 http, 这多半就是失败原因。把代理切到「全局 / TUN」模式或放行 80 端口后重试。"
+            "诊断: {JIMENG_UPLOAD_HOST} 的 443 可通、80 不通 —— 即梦 CLI 的申请上传位接口走的正是明文 http, 这多半就是失败原因。请放行 80 端口(或让该域名直连)后重试。"
         ),
         (true, false) => format!(
             "诊断: {JIMENG_UPLOAD_HOST} 的 80 可通、443 不通, 本机网络策略可能限制了 https, 建议换网络重试。"
         ),
         (true, true) => format!(
-            "诊断: 本机到 {JIMENG_UPLOAD_HOST} 的 80 / 443 都可达, 上传超时更像是上游偶发抖动, 稍后重试通常可恢复。"
+            "诊断: 本机到 {JIMENG_UPLOAD_HOST} 的 80 / 443 都可达 —— 本机网络本身是通的, {JIMENG_UPLOAD_HOST} 这一个域名不是失败点。分片上传另有对象存储域名(见 CLI 日志里的 `Fail to upload`)。"
         ),
     }
 }
@@ -796,17 +849,181 @@ fn tcp_reachable(host: &str, port: u16, timeout: Duration) -> bool {
         .is_some()
 }
 
-/// 第一次瞬时失败时的诊断文本: 探测上传服务是否可达 + 找出可用的系统代理。
-fn describe_submit_failure_context(proxy_env: &[(String, String)]) -> String {
+/// 失败时的诊断文本: 说明这次走的是哪条网络 + 失败到底卡在哪个域名。
+///
+/// 诊断来源有优先级: **CLI 自己的日志**永远比我们猜一个域名去探测准 ——
+/// 真实失败域名是分片上传随机分配的(`tos-d-lf` / `tos-d-lq` …), 猜不到。
+/// 只有日志读不到时才退化为探测 `JIMENG_UPLOAD_HOST`。
+fn describe_submit_failure_context(
+    proxy_env: &[(String, String)],
+    log_failure: Option<&CliLogFailure>,
+) -> Vec<String> {
     let mut lines = Vec::new();
     match proxy_env.iter().find(|(key, _)| key == "HTTP_PROXY") {
         Some((_, value)) => lines.push(format!(
-            "诊断: 检测到系统代理 {value}, 调用时已让即梦 CLI 走该代理(它默认不读 Windows 系统代理)。"
+            "诊断: 检测到系统代理 {value}, 已注入给即梦 CLI(它默认不读 Windows 系统代理); 图床上传由 CLI 自行处理, 未必经过该代理。"
         )),
-        None => lines.push("诊断: 未检测到可用的系统代理, 重试仍按直连进行。".to_string()),
+        None => lines.push("诊断: 未检测到可用的系统代理, 本次按直连进行。".to_string()),
     }
-    lines.push(probe_upload_host(Duration::from_millis(2_500)));
-    lines.join("\n")
+    match log_failure {
+        Some(failure) => lines.extend(describe_cli_log_failure(failure)),
+        None => lines.push(probe_upload_host(Duration::from_millis(2_500))),
+    }
+    lines
+}
+
+/// CLI 日志里读到的一次上传失败要点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliLogFailure {
+    /// 失败的那台主机(分片上传每次随机分配, 所以只能在日志里读到)。
+    host: String,
+    kind: CliLogFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliLogFailureKind {
+    /// `dial tcp: lookup <host>: no such host` —— DNS 解析失败。
+    Dns,
+    /// `context deadline exceeded` / `i/o timeout` —— 连接超时。
+    Timeout,
+    /// 只知道域名, 弄不清类型。
+    Other,
+}
+
+/// 即梦 CLI 的运行日志目录(官方排障指引指定的位置)。
+fn cli_log_directory() -> Option<PathBuf> {
+    current_user_home().map(|home| home.join(".dreamina_cli").join("logs"))
+}
+
+/// 读最新一份 CLI 日志的尾部若干行。
+///
+/// CLI 的失败细节(失败域名、每次重试的原始错误)只写在它自己的日志里,
+/// 透传给我们的 `fail_reason` 往往只剩一句 `no file upload, please check log` ——
+/// 这正是用户说的「哪里错误都不知道」的根源。
+fn read_cli_log_tail(max_lines: usize) -> Option<Vec<String>> {
+    let directory = cli_log_directory()?;
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&directory).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().map(|name| name.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if !name.starts_with("dreamina.log") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .is_none_or(|(previous, _)| modified > *previous)
+        {
+            newest = Some((modified, path));
+        }
+    }
+    let (_, path) = newest?;
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(
+        content
+            .lines()
+            .rev()
+            .take(max_lines)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// 纯函数: 从日志尾部找出上传失败的主机与类型。
+///
+/// 真实日志形如:
+///   Error ... Fail to upload image, file_0 upload by HOST, isDirectUpload:false,
+///   err:doamin tos-d-lq.bytedancevod.com, contentType , All attempts fail:
+///   #1: http do, Post "https://tos-d-lq.bytedancevod.com/upload/v1/...":
+///       dial tcp: lookup tos-d-lq.bytedancevod.com: no such host
+/// 注意 `doamin` 是 CLI 自己的拼写, 这里按原文匹配。
+fn extract_cli_log_failure(tail: &[String]) -> Option<CliLogFailure> {
+    for line in tail {
+        let Some(position) = line.find("lookup ") else {
+            continue;
+        };
+        let rest = &line[position + "lookup ".len()..];
+        let end = rest
+            .find(|character: char| matches!(character, ':' | ' ' | '"'))
+            .unwrap_or(rest.len());
+        let host = rest[..end].trim();
+        if !host.contains('.') {
+            continue;
+        }
+        let lowered = rest.to_ascii_lowercase();
+        let kind = if lowered.contains("no such host") {
+            CliLogFailureKind::Dns
+        } else if lowered.contains("timeout") || lowered.contains("i/o") {
+            CliLogFailureKind::Timeout
+        } else {
+            CliLogFailureKind::Other
+        };
+        return Some(CliLogFailure {
+            host: host.to_string(),
+            kind,
+        });
+    }
+    // 兜底: 只拿得到域名(CLI 的 `err:doamin <host>`)时, 按「类型未知」返回。
+    for line in tail {
+        let (position, marker_len) = if let Some(position) = line.find("err:doamin ") {
+            (position, "err:doamin ".len())
+        } else if let Some(position) = line.find("err:domain ") {
+            (position, "err:domain ".len())
+        } else {
+            continue;
+        };
+        let rest = &line[position + marker_len..];
+        let end = rest
+            .find(|character: char| matches!(character, ',' | ' '))
+            .unwrap_or(rest.len());
+        let host = rest[..end].trim();
+        if host.contains('.') {
+            return Some(CliLogFailure {
+                host: host.to_string(),
+                kind: CliLogFailureKind::Other,
+            });
+        }
+    }
+    None
+}
+
+/// 失败时取证: 从 CLI 日志里读出真正的失败域名与类型。
+fn read_cli_log_failure() -> Option<CliLogFailure> {
+    let tail = read_cli_log_tail(200)?;
+    extract_cli_log_failure(&tail)
+}
+
+/// 把日志取证结果写成用户能照做的诊断: 失败域名 + 类型 + **此刻是否已恢复**。
+fn describe_cli_log_failure(failure: &CliLogFailure) -> Vec<String> {
+    let what = match failure.kind {
+        CliLogFailureKind::Dns => {
+            "解析失败(DNS 查不到该主机)。这属于本机 DNS 层面的问题, 与提示词、素材内容无关。"
+        }
+        CliLogFailureKind::Timeout => "连接超时(请求发出后没等到响应)。",
+        CliLogFailureKind::Other => "连接失败。",
+    };
+    let mut lines = vec![format!(
+        "诊断: 即梦 CLI 日志显示, 失败发生在把参考图上传到字节对象存储时 —— 域名 {} {what}",
+        failure.host
+    )];
+    // 用**此刻**的连通性做对照, 把「当时偶发」与「一直不通」区分开 ——
+    // 这直接决定用户该「直接重试」还是该「先去修网络」。
+    if tcp_reachable(&failure.host, 443, Duration::from_millis(2_500)) {
+        lines.push(format!(
+            "诊断: 本机此刻已能连通 {} ⇒ 说明是当时那一刻的偶发失败, 直接重试通常即可恢复。",
+            failure.host
+        ));
+    } else {
+        lines.push(format!(
+            "诊断: 本机此刻仍连不上 {} ⇒ 请先按下面的建议处理本机网络 / DNS, 再重试。",
+            failure.host
+        ));
+    }
+    lines
 }
 
 /// 官方排障指引: 报错的完整描述在 CLI 日志里, 且很多问题升级 CLI 后即可解决。
@@ -814,8 +1031,8 @@ fn describe_submit_failure_context(proxy_env: &[(String, String)]) -> String {
 /// 附在每条失败信息末尾, 用户就不会「哪里错了都不知道」——尤其当报错来自 CLI
 /// 内部(比如上传阶段)而不是我们自己的链路时。
 fn cli_log_hint() -> String {
-    let logs = current_user_home()
-        .map(|home| home.join(".dreamina_cli").join("logs").display().to_string())
+    let logs = cli_log_directory()
+        .map(|directory| directory.display().to_string())
         .unwrap_or_else(|| "~/.dreamina_cli/logs/".to_string());
     format!(
         "参考: 即梦 CLI 的完整运行日志在 {logs}; 按官方指引, 先保留出错的命令, 再对照该日志, \
@@ -837,7 +1054,8 @@ fn submit_jimeng_command(
 ) -> Result<String, String> {
     let mut attempt = 0u32;
     let mut proxy_env: Vec<(String, String)> = Vec::new();
-    let mut diagnosis: Option<String> = None;
+    let mut diagnosis: Option<Vec<String>> = None;
+    let mut log_failure: Option<CliLogFailure> = None;
     let prompt = prompt_from_arguments(arguments);
     // 提交前的服务端基线: 失败后用它判断有没有新任务冒出来(有 ⇒ 已扣费, 不能重试)。
     let mut baseline = read_task_snapshot(executable, &proxy_env);
@@ -861,45 +1079,51 @@ fn submit_jimeng_command(
             Err(_) => None,
         };
 
-        // 第一次失败时先把系统代理解析出来, 之后的核对与重试都走同一条网络。
+        // 第一次失败时: 解析系统代理 + 从 CLI 日志取证真实失败原因。
+        // 之后的核对与重试复用同一条网络, 诊断也只生成一次。
         if diagnosis.is_none() {
             proxy_env = resolve_cli_proxy_env();
+            log_failure = read_cli_log_failure();
+            diagnosis = Some(describe_submit_failure_context(
+                &proxy_env,
+                log_failure.as_ref(),
+            ));
         }
         let probe =
             probe_server_task(executable, reported_submit_id.as_deref(), &baseline, &prompt, &proxy_env);
 
-        // 服务端已经有这次的任务: 绝不再提交 —— 生成任务一创建就预缴积分, 重试等于重复下单。
-        if let ServerTaskProbe::Exists { submit_id, failed } = &probe {
-            if !*failed {
-                // 任务已建好, 只是提交请求没拿到回执: 直接接管它, 不重复下单也不丢任务。
-                return Ok(format!("submit_id={submit_id}"));
-            }
-            let mut message = format!(
-                "即梦 CLI {label}失败(submit_id={submit_id} 已在服务端存在, 已跳过自动重试以免重复扣费): {}",
-                condense_upload_paths(&failure_reason)
-            );
-            message.push('\n');
-            message.push_str(&describe_submit_failure_context(&proxy_env));
+        // 任务已建好、只是提交请求没拿到回执: 直接接管它, 不重复下单也不丢任务。
+        if let ServerTaskProbe::Exists { submit_id, failed: false, .. } = &probe {
+            return Ok(format!("submit_id={submit_id}"));
+        }
+
+        if !decide_submit_retry(&probe, &failure_reason) {
+            let condensed = condense_upload_paths(&failure_reason);
+            let mut message = match &probe {
+                // 本地任务库里已经有这一次的失败记录 —— 把「到底扣没扣钱」说清楚,
+                // 用户才知道能不能自己手动重试, 而不是对着一句英文发呆。
+                ServerTaskProbe::Exists { submit_id, charged, .. } => {
+                    let billing = if *charged {
+                        "该记录已产生计费, 请勿重复提交"
+                    } else {
+                        "该记录未见计费信息, 未扣费, 可放心手动重试"
+                    };
+                    format!(
+                        "即梦 CLI {label}失败(submit_id={submit_id} 已在本地任务库中, {billing}, 已跳过自动重试): {condensed}"
+                    )
+                }
+                _ if failure_reason.starts_with("即梦 CLI") => condensed,
+                _ => format!("即梦 CLI {label}生成失败: {condensed}"),
+            };
+            // 这一类失败(参数错、审核拦截、无法核实的超时等)原来只回一句原始错误,
+            // 补上中文说明、日志取证与官方日志位置, 用户才知道下一步该做什么。
             if let Some(hint) = humanize_jimeng_failure(&failure_reason) {
                 message.push('\n');
                 message.push_str(hint);
             }
-            message.push('\n');
-            message.push_str(&cli_log_hint());
-            return Err(message);
-        }
-
-        if !decide_submit_retry(&probe, &failure_reason) {
-            let mut message = if failure_reason.starts_with("即梦 CLI") {
-                failure_reason
-            } else {
-                format!("即梦 CLI {label}生成失败: {failure_reason}")
-            };
-            // 这一类失败(参数错、审核拦截、无法核实的超时等)原来只回一句原始错误,
-            // 补上中文说明与官方日志位置, 用户才知道下一步该做什么。
-            if let Some(hint) = humanize_jimeng_failure(&message) {
+            if let Some(note) = &diagnosis {
                 message.push('\n');
-                message.push_str(hint);
+                message.push_str(&note.join("\n"));
             }
             message.push('\n');
             message.push_str(&cli_log_hint());
@@ -907,13 +1131,13 @@ fn submit_jimeng_command(
         }
         if attempt >= JIMENG_SUBMIT_MAX_ATTEMPTS {
             let mut message = format!(
-                "即梦 CLI {label}生成失败(提交阶段网络超时, 已自动重试 {} 次): {}",
+                "即梦 CLI {label}生成失败(提交阶段失败, 已自动重试 {} 次): {}",
                 JIMENG_SUBMIT_MAX_ATTEMPTS - 1,
                 condense_upload_paths(&failure_reason),
             );
-            if let Some(note) = diagnosis {
+            if let Some(note) = &diagnosis {
                 message.push('\n');
-                message.push_str(&note);
+                message.push_str(&note.join("\n"));
             }
             if let Some(hint) = humanize_jimeng_failure(&failure_reason) {
                 message.push('\n');
@@ -924,10 +1148,6 @@ fn submit_jimeng_command(
             return Err(message);
         }
 
-        // 诊断文本只在第一次失败时生成一次, 既用于最终报错, 也说明下一次重试走的网络。
-        if diagnosis.is_none() {
-            diagnosis = Some(describe_submit_failure_context(&proxy_env));
-        }
         emit_cli_task_status(
             app,
             client_job_id,
@@ -935,7 +1155,7 @@ fn submit_jimeng_command(
             "retrying",
             None,
             Some(format!(
-                "参考图上传超时, 正在自动重试(第 {}/{} 次)",
+                "参考图上传失败, 正在自动重试(第 {}/{} 次)",
                 attempt + 1,
                 JIMENG_SUBMIT_MAX_ATTEMPTS
             )),
@@ -1931,9 +2151,15 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
         assert!(decide_submit_retry(&ServerTaskProbe::Absent, reason));
         // 情况不明, 但报错证明卡在 submit 之前的上传阶段 ⇒ 仍然安全。
         assert!(decide_submit_retry(&ServerTaskProbe::Unknown, reason));
-        // 服务端已有这次的任务 ⇒ 已预缴积分, 绝不重试。
+        // 记录里已产生计费 ⇒ 已扣过钱, 绝不重试。
         assert!(!decide_submit_retry(
-            &ServerTaskProbe::Exists { submit_id: "t".into(), failed: false },
+            &ServerTaskProbe::Exists { submit_id: "t".into(), failed: false, charged: true },
+            reason
+        ));
+        // 记录里没有计费信息(上传阶段失败留下的空壳) + 报错证明卡在上传阶段
+        // ⇒ 免费可重试。
+        assert!(decide_submit_retry(
+            &ServerTaskProbe::Exists { submit_id: "t".into(), failed: true, charged: false },
             reason
         ));
     }
@@ -1980,6 +2206,50 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
         assert_eq!(entry.submit_id, "5b99bb21-70dc-4bb9-becc-0e314a4c33d2");
         assert!(entry.failed);
         assert!(entry.prompt.starts_with("SCENE CONTEXT"));
+        // 该记录没有 commerce_info ⇒ 没扣钱(实测 CreditPreDeductNotEnough 正是这种)。
+        assert!(!entry.charged);
+    }
+
+    #[test]
+    fn parse_task_list_reads_billing_from_commerce_info() {
+        // 真实 `list_task` 输出: 生成阶段的失败**已经扣了费**, 记录里带 credit_count。
+        let charged = r#"[{"submit_id":"s1","gen_status":"fail","prompt":"p",
+          "commerce_info":{"credit_count":132,"triplets":[{"resource_type":"aigc"}]}}]"#;
+        let ParsedTaskList::Parsed(Some(entry)) = parse_task_list(charged) else {
+            panic!("应能解析出任务");
+        };
+        assert!(entry.charged, "有 credit_count 就必须判定为已计费");
+
+        // 上传阶段失败与积分预扣不足: 计费字段缺失 / 为空 ⇒ 没扣钱。
+        let empty_object = r#"[{"submit_id":"s2","gen_status":"fail","commerce_info":{}}]"#;
+        let ParsedTaskList::Parsed(Some(entry)) = parse_task_list(empty_object) else {
+            panic!("应能解析出任务");
+        };
+        assert!(!entry.charged);
+
+        let null_billing = r#"[{"submit_id":"s3","gen_status":"fail","commerce_info":null}]"#;
+        let ParsedTaskList::Parsed(Some(entry)) = parse_task_list(null_billing) else {
+            panic!("应能解析出任务");
+        };
+        assert!(!entry.charged);
+    }
+
+    #[test]
+    fn unattributable_failure_record_never_retries() {
+        // 关键安全线: 「有失败记录但没计费信息」**不等于**可以重试 ——
+        // 还必须让这次的报错本身也能证明卡在 submit 之前, 否则一律不重试。
+        // CreditPreDeductNotEnough(积分预扣不足)正是这种: 无计费信息, 但重试只会再被拒。
+        let credit = "api error: ret=1006, message=CreditPreDeductNotEnough, logid=2026";
+        assert!(!is_presubmit_failure(credit));
+        assert!(!decide_submit_retry(
+            &ServerTaskProbe::Exists { submit_id: "t".into(), failed: true, charged: false },
+            credit
+        ));
+        // 生成阶段失败(已扣费)就更不必说。
+        assert!(!decide_submit_retry(
+            &ServerTaskProbe::Exists { submit_id: "t".into(), failed: true, charged: true },
+            "generation failed: final generation failed"
+        ));
     }
 
     #[test]
@@ -2002,17 +2272,19 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
         let before = TaskListSnapshot::Read(Some(TaskEntry {
             submit_id: "old-task".into(),
             failed: false,
+            charged: true,
             prompt: "上一单的提示词".into(),
         }));
         let after = TaskListSnapshot::Read(Some(TaskEntry {
             submit_id: "new-task".into(),
             failed: false,
+            charged: true,
             prompt: prompt.into(),
         }));
 
         assert_eq!(
             diff_task_snapshots(&before, &after, prompt),
-            ServerTaskProbe::Exists { submit_id: "new-task".into(), failed: false }
+            ServerTaskProbe::Exists { submit_id: "new-task".into(), failed: false, charged: true }
         );
         // 最新任务没变 ⇒ 没有新任务。
         assert_eq!(
@@ -2033,11 +2305,13 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
         let before = TaskListSnapshot::Read(Some(TaskEntry {
             submit_id: "old-task".into(),
             failed: false,
+            charged: true,
             prompt: "上一单的提示词".into(),
         }));
         let after = TaskListSnapshot::Read(Some(TaskEntry {
             submit_id: "other-node-task".into(),
             failed: false,
+            charged: true,
             prompt: "另一个节点的完全不同的提示词内容，用于验证不会被误认领成我们这一单。".into(),
         }));
 
@@ -2105,6 +2379,60 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
         // 已知的参数校验错误不该套上「网络有问题」的说明。
         assert!(humanize_jimeng_failure("image_resource_id_list length is 10, should be <= 9").is_none());
         assert!(!is_transient_submit_failure("image_resource_id_list length is 10, should be <= 9"));
+    }
+
+    #[test]
+    fn humanize_explains_dns_failure_without_blaming_the_proxy() {
+        // 真实报文(2026-09-23 18:13, 上传分片阶段 DNS 查不到主机)。
+        let reason = "upload resource \"参考图 image-1.png\": upload image: upload phase, no file upload";
+        assert!(is_presubmit_failure(reason));
+        assert!(
+            humanize_jimeng_failure("dial tcp: lookup tos-d-lq.bytedancevod.com: no such host")
+                .is_some_and(|hint| hint.contains("域名解析失败"))
+        );
+        // 那条曾经写错方向的建议(「把代理切到全局 / TUN 模式」)不该再出现在说明里;
+        // 上传阶段失败要明确告诉用户「不产生费用、可以直接重试」。
+        let upload_hint =
+            humanize_jimeng_failure("apply phase, ApplyImageUpload failed").expect("上传类失败应有人话说明");
+        assert!(!upload_hint.contains("TUN"), "实际: {upload_hint}");
+        assert!(upload_hint.contains("参考图上传"));
+        assert!(upload_hint.contains("不会产生任何费用"));
+    }
+
+    #[test]
+    fn extracts_upload_failure_from_real_cli_log() {
+        // 真实 `dreamina.log` 片段(2026-09-23 18:13): 失败域名只在这里出现 ——
+        //   第 2 张图成功走 tos-d-lf, 第 1 张图挂在 tos-d-lq 的 DNS 上。
+        let tail: Vec<String> = [
+            "Info 2026-09-23 18:12:57 upload completed resource_type=image path=...image-2.png uri=tos-cn-i-tb4s082cfz/9b6aea47",
+            "Error 2026-09-23 18:13:15 Fail to upload image, file_0 upload by HOST, isDirectUpload:false, err:doamin tos-d-lq.bytedancevod.com, contentType , All attempts fail:",
+            "#1: http do, Post \"https://tos-d-lq.bytedancevod.com/upload/v1/tos-cn-i-tb4s082cfz/3046a174\": dial tcp: lookup tos-d-lq.bytedancevod.com: no such host",
+            "#2: http do, Post \"https://tos-d-lq.bytedancevod.com/upload/v1/...\": dial tcp: lookup tos-d-lq.bytedancevod.com: no such host",
+        ]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect();
+
+        let failure = extract_cli_log_failure(&tail).expect("应能从日志里读出失败主机");
+        assert_eq!(failure.host, "tos-d-lq.bytedancevod.com");
+        assert_eq!(failure.kind, CliLogFailureKind::Dns);
+    }
+
+    #[test]
+    fn log_forensics_falls_back_to_bare_host_and_stays_silent_on_clean_logs() {
+        // 只有 `err:doamin <host>` 时也要能拿到域名(类型未知)。
+        let tail: Vec<String> = vec![
+            "Error 2026-09-23 18:13:15 Fail to upload image ... err:doamin tos-d-lq.bytedancevod.com, contentType".to_string(),
+        ];
+        let failure = extract_cli_log_failure(&tail).expect("应能读出域名");
+        assert_eq!(failure.host, "tos-d-lq.bytedancevod.com");
+        assert_eq!(failure.kind, CliLogFailureKind::Other);
+
+        // 日志干净(没有失败记录)时不该硬编一个域名出来。
+        let clean: Vec<String> = vec![
+            "Info 2026-09-23 18:12:57 Direct Upload success, domain tos-d-lf.bytedancevod.com".to_string(),
+        ];
+        assert_eq!(extract_cli_log_failure(&clean), None);
     }
 
     #[cfg(target_os = "windows")]

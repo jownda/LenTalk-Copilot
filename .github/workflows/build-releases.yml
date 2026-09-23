@@ -269,10 +269,14 @@ jobs:
             --clobber
           jq -s '.[0] as $windows | .[1] as $macos | ($windows * $macos) | .platforms = ($windows.platforms * $macos.platforms)' \
             metadata/latest-windows.json metadata/latest-macos.json > metadata/latest-combined.json
-          cp metadata/latest-combined.json metadata/latest-windows.json
-          cp metadata/latest-combined.json metadata/latest-macos.json
-          gh release upload "$VERSION" \
-            --repo "${{ github.repository }}" \
-            metadata/latest-windows.json \
-            metadata/latest-macos.json \
-            --clobber
+          # 逐个「先删后传」，不要用 `gh release upload --clobber`。
+          # 实测 2026-09-23 v1.2.25：多资产场景下 clobber 会报
+          #   HTTP 422: Validation Failed — ReleaseAsset.name already exists
+          # 它的 delete-then-create 有竞态，会让整个 job 变红（产物本身不受影响，
+          # 但 Actions 页面是 ✗，且最新一个清单不会被合并）。
+          # delete-asset 对不存在的资产返回非 0，故用 `|| true` 兜住。
+          for f in latest-windows.json latest-macos.json; do
+            cp metadata/latest-combined.json "metadata/$f"
+            gh release delete-asset "$VERSION" "$f" --repo "${{ github.repository }}" --yes || true
+            gh release upload "$VERSION" "metadata/$f" --repo "${{ github.repository }}"
+          done
