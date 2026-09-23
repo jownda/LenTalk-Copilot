@@ -1,5 +1,64 @@
 import { describe, expect, it } from "vitest";
-import { isPubliclyReachableHttpUrl, localizeReferenceTokens, withZhiniaoImageMode } from "./tauriAiGateway";
+import { JIMENG_CLI_PROVIDER_ID } from "@/features/canvas/models";
+import {
+  isPubliclyReachableHttpUrl,
+  localizeReferenceTokens,
+  needsCompatibilityVideoWorker,
+  withZhiniaoImageMode,
+} from "./tauriAiGateway";
+
+describe("needsCompatibilityVideoWorker", () => {
+  const withTransport = (model: string, transport?: string) =>
+    ({
+      model,
+      extraParams: transport ? { video_transport: transport } : {},
+    }) as never;
+
+  it("所有远端视频协议都必须交给 Rust 后端任务执行器", () => {
+    // 这些协议迁到后端后, 任务 ID 与查询地址会落进 ai_generation_jobs;
+    // 只要有一条退回前端兼容 worker, 它的任务就会回到 WebView 内存 Map ——
+    // 刷新/切页即丢, 仍在平台生成且已计费的付费任务会被判成「中断」。
+    const remoteTransports = [
+      "openai-video",
+      "zhiniao-video",
+      "wgspai-video",
+      "binghuo-video",
+      "kling-control",
+      "zhenjian-task-api",
+      "zzdh-v8-video",
+      "sub2api-video",
+    ];
+    for (const transport of remoteTransports) {
+      expect(needsCompatibilityVideoWorker(withTransport("custom:relay/m", transport))).toBe(false);
+    }
+  });
+
+  it("Base URL 兜底不再把已迁后端的平台拉回前端", () => {
+    // 旧实现有 isRjmVideoApiBaseUrl / isZhenjianProvider / isZzdhProvider 三条
+    // Base URL 兜底; transport 缺失时它们会把任务退回 WebView 内存 Map。
+    for (const baseUrl of [
+      "https://zhenjian.work",
+      "https://zizidonghua.com",
+      "https://video.rjm.us.ci",
+      "https://sub2api.rjm.us.ci",
+      "https://cuai.token6688.com",
+      "https://api.7tai.cc",
+      "https://api.wgspai.cn",
+    ]) {
+      expect(
+        needsCompatibilityVideoWorker({
+          model: "custom:relay/m",
+          extraParams: { provider_base_url: baseUrl },
+        } as never),
+      ).toBe(false);
+    }
+  });
+
+  it("本地 CLI 类视频(即梦 / Wan)仍由前端适配器承载", () => {
+    expect(needsCompatibilityVideoWorker(withTransport("wan-cli/2.2"))).toBe(true);
+    expect(needsCompatibilityVideoWorker(withTransport(`${JIMENG_CLI_PROVIDER_ID}/v3`))).toBe(true);
+  });
+});
 
 describe("localizeReferenceTokens", () => {
   it("fal 模型: @图N / 图N 转换为 Image N", () => {

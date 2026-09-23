@@ -4,6 +4,7 @@ import type { Viewport } from '@xyflow/react';
 import {
   useCanvasStore,
   type CanvasEdge,
+  type CanvasHistorySnapshot,
   type CanvasHistoryState,
   type CanvasNode,
   type CanvasNodeData,
@@ -41,6 +42,13 @@ const IDLE_PERSIST_TIMEOUT_MS = 1200;
 const FALLBACK_IDLE_DELAY_MS = 64;
 const MAX_PERSISTED_HISTORY_STEPS = 12;
 const MAX_HISTORY_RESTORE_JSON_CHARS = 1_500_000;
+/**
+ * 落库 historyJson 的目标上限。读取侧(fromProjectRecord)对超过
+ * `MAX_HISTORY_RESTORE_JSON_CHARS` 的 history 整段丢弃, 所以写超了等于白写 ——
+ * 实测大画布(75 节点)曾写入 49.5MB 的 undo 快照却一步都还原不了。
+ * 这里留出余量, 保证"写进去的都能读回来"。
+ */
+const PERSISTED_HISTORY_BUDGET_CHARS = 1_000_000;
 const DELETE_RETRY_DELAY_MS = 80;
 const MAX_DELETE_RETRIES = 10;
 
@@ -294,11 +302,45 @@ function mapHistoryImageReferences(
   };
 }
 
+/**
+ * 从最新一步往回收集快照, 直到用满 budget。
+ * 保证"最近的一步"优先保留; 单步就超预算时返回空(与旧的整段丢弃行为一致)。
+ */
+function takeNewestWithinBudget(
+  snapshots: CanvasHistorySnapshot[],
+  budget: number
+): { items: CanvasHistorySnapshot[]; used: number } {
+  if (budget <= 0) {
+    return { items: [], used: 0 };
+  }
+
+  const kept: CanvasHistorySnapshot[] = [];
+  let used = 0;
+
+  for (let index = snapshots.length - 1; index >= 0; index -= 1) {
+    const size = JSON.stringify(snapshots[index]).length;
+    if (used + size > budget) {
+      break;
+    }
+    used += size;
+    kept.unshift(snapshots[index]);
+  }
+
+  return { items: kept, used };
+}
+
+/**
+ * 按步数 + 字节预算裁剪要落库的 undo 历史。
+ * 不超预算的项目(小画布)行为与之前完全一致, 仍保留最多 12 步。
+ */
 function trimHistoryForPersistence(history: CanvasHistoryState): CanvasHistoryState {
-  return {
-    past: history.past.slice(-MAX_PERSISTED_HISTORY_STEPS),
-    future: history.future.slice(-MAX_PERSISTED_HISTORY_STEPS),
-  };
+  const cappedPast = history.past.slice(-MAX_PERSISTED_HISTORY_STEPS);
+  const cappedFuture = history.future.slice(-MAX_PERSISTED_HISTORY_STEPS);
+
+  const past = takeNewestWithinBudget(cappedPast, PERSISTED_HISTORY_BUDGET_CHARS);
+  const future = takeNewestWithinBudget(cappedFuture, PERSISTED_HISTORY_BUDGET_CHARS - past.used);
+
+  return { past: past.items, future: future.items };
 }
 
 function encodeProject(project: Project): PersistedProject {
@@ -307,10 +349,15 @@ function encodeProject(project: Project): PersistedProject {
   const encode = (imageUrl: string | null | undefined) =>
     encodeImageReference(imageUrl, imagePool, imageIndexMap);
 
+  // 先按步数/字节预算裁剪, 再编码。顺序很关键: 编码会遍历每个快照的全部节点重写
+  // 图片引用, 而内存里保留的步数(canvasStore 的 MAX_HISTORY_STEPS)远多于落库步数,
+  // 先编码再丢弃等于给注定丢掉的快照白做几百 MB 的映射。
+  const persistedHistory = trimHistoryForPersistence(project.history);
+
   return {
     ...project,
     nodes: mapNodeImageReferences(project.nodes, encode),
-    history: mapHistoryImageReferences(project.history, encode),
+    history: mapHistoryImageReferences(persistedHistory, encode),
     imagePool,
   };
 }
@@ -411,7 +458,21 @@ function toProjectSummary(record: ProjectSummaryRecord): ProjectSummary {
 function toProjectRecord(project: Project): ProjectRecord {
   const encodedProject = encodeProject(project);
   const persistedNodes = encodedProject.nodes;
-  const persistedHistory = trimHistoryForPersistence(encodedProject.history);
+  const imagePool = encodedProject.imagePool ?? [];
+
+  let historyJson = JSON.stringify({
+    ...encodedProject.history,
+    imagePool,
+  });
+
+  if (historyJson.length > PERSISTED_HISTORY_BUDGET_CHARS) {
+    // 兜底: 只落 imagePool。它是资源回收(project_image_refs)与图片还原的必需数据,
+    // 而 undo 快照纯属会话级 UI 状态, 丢了不影响项目内容。
+    historyJson = JSON.stringify({ past: [], future: [], imagePool });
+    console.warn(
+      `Canvas history exceeded the persistence budget; stored image pool only (project ${project.id})`
+    );
+  }
 
   return {
     id: encodedProject.id,
@@ -423,10 +484,7 @@ function toProjectRecord(project: Project): ProjectRecord {
     nodesJson: JSON.stringify(persistedNodes),
     edgesJson: JSON.stringify(encodedProject.edges),
     viewportJson: JSON.stringify(encodedProject.viewport),
-    historyJson: JSON.stringify({
-      ...persistedHistory,
-      imagePool: encodedProject.imagePool ?? [],
-    }),
+    historyJson,
   };
 }
 

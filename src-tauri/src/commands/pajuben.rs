@@ -42,7 +42,9 @@ const LOG_TAIL_LIMIT: usize = 60;
 const WINDOWS_FFMPEG_ARCHIVE_URL: &str =
     "https://github.com/jownda/LenTalk-Copilot/releases/download/bundled-tools/ffmpeg.tar.gz";
 #[cfg(windows)]
-const WINDOWS_FFMPEG_ARCHIVE_SHA256: &str =
+/// 解压后的 ffmpeg.exe SHA256。与 scripts/setup-ffmpeg.mjs 保持一致；
+/// 不能拿这个值直接校验 tar.gz 压缩包本身。
+const WINDOWS_FFMPEG_BINARY_SHA256: &str =
     "04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00";
 #[cfg(windows)]
 const MAX_FFMPEG_ARCHIVE_BYTES: u64 = 200 * 1024 * 1024;
@@ -156,6 +158,9 @@ pub struct PajubenRunRequest {
     /// 画布快速模式不应在失败后切入可能长达数十分钟的双模型降级流程。
     #[serde(default)]
     pub disable_dual_fallback: bool,
+    /// 选中的模型不支持音频输入时，直接走音频模型 + 视觉模型的双模型流程。
+    #[serde(default)]
+    pub force_dual_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -349,11 +354,11 @@ fn download_windows_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
     if archive.len() as u64 > MAX_FFMPEG_ARCHIVE_BYTES {
         return Err("FFmpeg 下载包过大，已取消安装".to_string());
     }
-    let digest = format!("{:x}", Sha256::digest(&archive));
-    if digest != WINDOWS_FFMPEG_ARCHIVE_SHA256 {
-        return Err("FFmpeg 下载包校验失败，请稍后重试".to_string());
-    }
     let binary = unpack_windows_ffmpeg_archive(&archive)?;
+    let digest = format!("{:x}", Sha256::digest(&binary));
+    if digest != WINDOWS_FFMPEG_BINARY_SHA256 {
+        return Err("下载的 FFmpeg 文件校验失败，请稍后重试".to_string());
+    }
 
     std::fs::create_dir_all(&tools_dir)
         .map_err(|error| format!("无法创建 FFmpeg 目录：{error}"))?;
@@ -617,6 +622,9 @@ fn build_arguments(engine: &Path, request: &PajubenRunRequest) -> Vec<String> {
     }
     if request.disable_dual_fallback {
         args.push("--no-dual-fallback".to_string());
+    }
+    if request.force_dual_fallback {
+        args.push("--dual-only".to_string());
     }
     // 人物识别（预留开关）：关掉时用空的人物库，等价于纯模型判断。
     if !request.face_enabled {
@@ -1064,6 +1072,7 @@ mod tests {
             overwrite: false,
             skip_alias_verify: false,
             disable_dual_fallback: false,
+            force_dual_fallback: false,
         }
     }
 

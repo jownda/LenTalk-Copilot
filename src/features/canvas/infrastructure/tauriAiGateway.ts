@@ -22,31 +22,28 @@ import { isZhenjianProvider } from "@/commands/zhenjianApi";
 import { isZzdhProvider } from "@/commands/zzdhApi";
 
 type LocalVideoJob = { job_id: string; status: string; result: string | null; error: string | null };
-// 专有协议尚未提供 Rust 版本时，保留原适配器以避免已有 Kling/即梦/Wan 工作流
-// 回归；它们也采用相同 job 状态接口，画布无需区分轮询方式。
+// 本地 CLI 类视频链路(即梦 / Wan)只能在本机跑可执行文件, 仍由前端适配器承载;
+// 其余视频协议全部由 Rust 后端任务执行器承载 —— 它们与后端任务共用同一套 job
+// 状态接口, 画布无需区分轮询方式。
 const compatibilityVideoJobs = new Map<string, LocalVideoJob>();
 
-function needsCompatibilityVideoWorker(payload: GenerateVideoPayload): boolean {
-  if (payload.model.startsWith("wan-cli/") || payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`)) return true;
-  const transport = typeof payload.extraParams?.video_transport === "string" ? payload.extraParams.video_transport : "";
-  if (
-    [
-      "kling-control",
-      "zhenjian-task-api",
-      "zzdh-v8-video",
-      "sub2api-video",
-      "binghuo-video",
-      "wgspai-video",
-      "zhiniao-video",
-    ].includes(transport)
-  )
-    return true;
-  const baseUrl =
-    typeof payload.extraParams?.provider_base_url === "string" ? payload.extraParams.provider_base_url : "";
+/**
+ * 仍需前端兼容 worker 承载的视频协议 —— **只剩本地 CLI 两种**。
+ *
+ * 所有远端视频协议(kling-control / zhenjian-task-api / zzdh-v8-video /
+ * sub2api-video / binghuo-video / wgspai-video / zhiniao-video / openai-video)
+ * 已迁到 Rust 后端任务执行器。协议判定统一以 `video_transport` 为准, 因为
+ * `injectCustomApiRequestMode` 会按平台 id 与 Base URL 把它注入好; 这里不再做
+ * Base URL 兜底 —— 兜底会让本该交给后端的任务退回 WebView 内存 Map(刷新即丢,
+ * 仍在平台生成且已计费的付费任务会被判成「中断」, 用户只能重新提交)。
+ *
+ * **必须与 Rust 的 `video_protocols::BACKEND_VIDEO_TRANSPORTS` 严格互补**:
+ * 已迁后端的协议若仍留在这里, 任务会继续存在 WebView 内存 Map 里(刷新即丢);
+ * 反过来, 未迁后端的协议若被交给后端, Rust 会直接拒绝(连请求都不发)。
+ */
+export function needsCompatibilityVideoWorker(payload: GenerateVideoPayload): boolean {
   return (
-    isRjmVideoApiBaseUrl(baseUrl) ||
-    isZhenjianProvider(payload.model.split("/")[0] ?? "", baseUrl) ||
-    isZzdhProvider(payload.model.split("/")[0] ?? "", baseUrl)
+    payload.model.startsWith("wan-cli/") || payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`)
   );
 }
 
@@ -524,9 +521,21 @@ export const tauriAiGateway: AiGateway = {
   getGenerateImageJob,
   getGenerateVideoJob: async (jobId: string) => compatibilityVideoJobs.get(jobId) ?? (await getGenerateVideoJob(jobId)),
   submitGenerateVideoJob: async (payload: GenerateVideoPayload) => {
-    if (needsCompatibilityVideoWorker(payload)) {
+    // 先按平台设置补全协议参数, 再判定由谁承载这次视频任务。
+    // 节点上保存的 extraParams 通常只含模型自身字段, video_transport 与
+    // provider_base_url 都是由 injectCustomApiRequestMode 从平台配置(Base URL /
+    // capabilities)推导出来的。若只用裸 payload 判定, 炳火 / WGSPAI 这类靠 Base URL
+    // 推导 transport 的平台会被误判成通用 OpenAI 视频协议而投给后端任务执行器;
+    // 后者对白名单之外的协议直接返回 InvalidRequest, 连一个网络请求都不会发出
+    // —— 表现为「点了生成但平台收不到请求」。
+    const normalized = injectCustomApiRequestMode(payload, "async");
+    if (needsCompatibilityVideoWorker(payload) || needsCompatibilityVideoWorker(normalized)) {
       const jobId = crypto.randomUUID();
       compatibilityVideoJobs.set(jobId, { job_id: jobId, status: "running", result: null, error: null });
+      // 这里仍传原始 payload: 注入交给 generateVideo 内部统一处理 —— 它还会顺带
+      // 保留「节点显式选择的 transport 优先」的补偿分支(见下 :619), 提前注入会把
+      // 用户的选择覆盖掉。注意本分支现在**只剩本地 CLI 两条**(wan-cli / jimeng-cli):
+      // 8 条远程协议已全部由后端任务执行器承载, 不再走这里。
       void tauriAiGateway.generateVideo(payload).then(
         (result: string) =>
           compatibilityVideoJobs.set(jobId, { job_id: jobId, status: "succeeded", result, error: null }),
@@ -540,7 +549,9 @@ export const tauriAiGateway: AiGateway = {
       );
       return jobId;
     }
-    const injected = injectCustomApiRequestMode(payload, "async");
+    // 复用上面已注入的结果, 不再二次注入。能走到这里说明该平台确实由后端
+    // OpenAI 兼容视频任务执行器承载(transport 为空或 openai-video)。
+    const injected = normalized;
     const unifiedRequest = toVideoGenerationRequest(payload);
     const imageResources =
       payload.imageMode === "first-last"
@@ -548,10 +559,13 @@ export const tauriAiGateway: AiGateway = {
             (resource): resource is NonNullable<typeof resource> => Boolean(resource),
           )
         : unifiedRequest.referenceImages;
-    const referenceImages = await normalizeVideoReferenceImages(
-      imageResources.map((resource) => resource.source),
-      injected.extraParams,
-    );
+    const imageSources = imageResources.map((resource) => resource.source);
+    // 知鸟只收公网 URL(videoReferenceEncoding: url): 本地素材先经 /v1/files 换成 URL
+    // 再交给后端任务执行器; 其余平台仍走通用规整。
+    const referenceImages =
+      injected.extraParams?.video_transport === "zhiniao-video"
+        ? await resolveZhiniaoImageReferences(imageSources, payload.model.split("/")[0] ?? "")
+        : await normalizeVideoReferenceImages(imageSources, injected.extraParams);
     return await submitGenerateVideoJob({
       prompt: unifiedRequest.prompt,
       model: unifiedRequest.modelId,
@@ -601,12 +615,13 @@ export const tauriAiGateway: AiGateway = {
     // 视频语义固定为异步任务(提交+轮询), 不受图片默认 sync 影响
     const requestedTransport = payload.extraParams?.video_transport;
     const injected = injectCustomApiRequestMode(payload, "async");
-    // 动作控制 / 对口型是 Kling 专用 endpoint。即使自定义平台之前探测过
-    // 普通视频 transport，也不能覆盖节点显式选择的控制协议。
+    // 动作控制 / 对口型是 Kling 专用 endpoint, 字子动画是 /v8 专用 endpoint: 两者
+    // 都不能被平台级探测出来的通用视频 transport 覆盖。这里必须**回填节点自己选中的
+    // 那个值** —— 早先写死成 "kling-control" 会把字子动画节点错路由到 Kling 接口。
     if (requestedTransport === "kling-control" || requestedTransport === "zzdh-v8-video") {
       injected.extraParams = {
         ...(injected.extraParams ?? {}),
-        video_transport: "kling-control",
+        video_transport: requestedTransport,
       };
     }
     const profile = resolveVideoModelProfile(

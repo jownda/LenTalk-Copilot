@@ -90,6 +90,19 @@ describe('canvasStore history (undo/redo)', () => {
     expect(useCanvasStore.getState().routingRevision).toBe(routingRevision);
   });
 
+  it('重复的画布状态写入不会广播无效更新', () => {
+    const state = useCanvasStore.getState();
+    const viewport = state.currentViewport;
+    const viewportSize = state.canvasViewportSize;
+    const before = useCanvasStore.getState();
+
+    state.setViewportState(viewport);
+    state.setCanvasViewportSize(viewportSize);
+    state.setSelectedNode(null);
+
+    expect(useCanvasStore.getState()).toBe(before);
+  });
+
   it('节点移动会触发连线重新走线', () => {
     const id = addTextNode();
     const routingRevision = useCanvasStore.getState().routingRevision;

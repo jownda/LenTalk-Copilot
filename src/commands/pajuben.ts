@@ -5,13 +5,13 @@
 // `##PROGRESS` / `##EP` 协议转成事件；这里只管订阅与调用。
 // ---------------------------------------------------------------------------
 
-import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { isTauri } from '@tauri-apps/api/core';
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { isTauri } from "@tauri-apps/api/core";
 
-export const PAJUBEN_LOG_EVENT = 'pajuben://log';
-export const PAJUBEN_PROGRESS_EVENT = 'pajuben://progress';
-export const PAJUBEN_FINISH_EVENT = 'pajuben://finish';
+export const PAJUBEN_LOG_EVENT = "pajuben://log";
+export const PAJUBEN_PROGRESS_EVENT = "pajuben://progress";
+export const PAJUBEN_FINISH_EVENT = "pajuben://finish";
 
 /** 引擎运行环境（Python 解释器 / 引擎文件 / ffmpeg / 人脸依赖）。 */
 export interface PajubenEnvironment {
@@ -58,6 +58,8 @@ export interface PajubenRunRequest {
   skipAliasVerify: boolean;
   /** 禁用失败后的双模型长流程降级，供画布上的「扒视频」快速模式使用。 */
   disableDualFallback?: boolean;
+  /** 直接使用双模型流程：音频模型听写，视觉模型负责画面与合并。 */
+  forceDualFallback?: boolean;
 }
 
 export interface PajubenLogPayload {
@@ -66,7 +68,7 @@ export interface PajubenLogPayload {
   isError: boolean;
 }
 
-export type PajubenProgressKind = 'overall' | 'episode' | 'episodeDone' | 'episodeFailed';
+export type PajubenProgressKind = "overall" | "episode" | "episodeDone" | "episodeFailed";
 
 export interface PajubenProgressPayload {
   runId: string;
@@ -88,32 +90,32 @@ export interface PajubenFinishPayload {
 
 function ensureDesktop(): void {
   if (!isTauri()) {
-    throw new Error('扒剧本需要在 LenTalk 桌面端运行');
+    throw new Error("扒剧本需要在 LenTalk 桌面端运行");
   }
 }
 
 /** 探测引擎可用环境；打开面板时调用一次即可。 */
 export async function probePajubenEnvironment(): Promise<PajubenEnvironment> {
   ensureDesktop();
-  return invoke<PajubenEnvironment>('pajuben_probe');
+  return invoke<PajubenEnvironment>("pajuben_probe");
 }
 
 /** 启动一次扒取；返回本次运行的 runId。 */
 export async function runPajuben(request: PajubenRunRequest): Promise<string> {
   ensureDesktop();
-  return invoke<string>('pajuben_run', { request });
+  return invoke<string>("pajuben_run", { request });
 }
 
 /** 取消正在运行的扒取（连同 ffmpeg / curl 子进程一起回收）。 */
 export async function cancelPajuben(): Promise<void> {
   ensureDesktop();
-  await invoke('pajuben_cancel');
+  await invoke("pajuben_cancel");
 }
 
 /** 计算默认输出目录：视频同目录下的「剧本」文件夹。 */
 export async function resolvePajubenOutputDir(target: string): Promise<string> {
   ensureDesktop();
-  return invoke<string>('pajuben_resolve_output_dir', { target });
+  return invoke<string>("pajuben_resolve_output_dir", { target });
 }
 
 /**
@@ -129,7 +131,7 @@ export async function readPajubenScript(options: {
   episode?: number | null;
 }): Promise<string> {
   ensureDesktop();
-  return invoke<string>('pajuben_read_script', {
+  return invoke<string>("pajuben_read_script", {
     target: options.target,
     outputDir: options.outputDir ?? null,
     episode: options.episode ?? null,
@@ -140,14 +142,10 @@ export function onPajubenLog(handler: (payload: PajubenLogPayload) => void): Pro
   return listen<PajubenLogPayload>(PAJUBEN_LOG_EVENT, (event) => handler(event.payload));
 }
 
-export function onPajubenProgress(
-  handler: (payload: PajubenProgressPayload) => void
-): Promise<UnlistenFn> {
+export function onPajubenProgress(handler: (payload: PajubenProgressPayload) => void): Promise<UnlistenFn> {
   return listen<PajubenProgressPayload>(PAJUBEN_PROGRESS_EVENT, (event) => handler(event.payload));
 }
 
-export function onPajubenFinish(
-  handler: (payload: PajubenFinishPayload) => void
-): Promise<UnlistenFn> {
+export function onPajubenFinish(handler: (payload: PajubenFinishPayload) => void): Promise<UnlistenFn> {
   return listen<PajubenFinishPayload>(PAJUBEN_FINISH_EVENT, (event) => handler(event.payload));
 }

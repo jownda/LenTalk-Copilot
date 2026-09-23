@@ -172,6 +172,8 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   /** 本地 asset 协议在部分 WebView / 编码组合下不能直接解码，失败后切换到同源 Blob。 */
   const [localVideoFallbackSrc, setLocalVideoFallbackSrc] = useState<string | null>(null);
   const localVideoFallbackSrcRef = useRef<string | null>(null);
+  const playbackTempPathRef = useRef<string | null>(null);
+  const videoFallbackRequestRef = useRef(0);
   const localVideoFallbackLoadingRef = useRef(false);
 
   const resolvedTitle = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, data), [data]);
@@ -190,7 +192,9 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const generationStartedAt = typeof data.generationStartedAt === "number" ? data.generationStartedAt : null;
   const generationDurationMs = typeof data.generationDurationMs === "number" ? data.generationDurationMs : 180000;
   // 有封面的视频平时只显示图片，不占用解码器。悬停、播放、打开查看器时才按需挂载。
-  const shouldMountVideo = isVideo && (!data.previewImageUrl || isVideoHovered || isPlaying || isVideoViewerOpen);
+  // 选中节点时保持 video 元素挂载，否则点击节点工具栏截图时 ref 为空，时间点会退回 0 秒。
+  const shouldMountVideo =
+    isVideo && (!data.previewImageUrl || selected || isVideoHovered || isPlaying || isVideoViewerOpen);
 
   useEffect(() => {
     setWaveformBars(fallbackWaveformBars);
@@ -216,6 +220,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   }, [fallbackWaveformBars, isVideo, mediaSrc, selected]);
 
   useEffect(() => {
+    videoFallbackRequestRef.current += 1;
     setVideoDimensions(null);
     setVideoDuration(0);
     setPlaybackTime(0);
@@ -224,19 +229,29 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     localVideoFallbackLoadingRef.current = false;
     setLocalVideoFallbackSrc((current) => {
       if (current) {
-        URL.revokeObjectURL(current);
+        if (current.startsWith("blob:")) URL.revokeObjectURL(current);
       }
       localVideoFallbackSrcRef.current = null;
       return null;
     });
+    const previousPlaybackPath = playbackTempPathRef.current;
+    playbackTempPathRef.current = null;
+    if (previousPlaybackPath) {
+      void invoke("remove_video_playback_file", { path: previousPlaybackPath }).catch(() => undefined);
+    }
   }, [data.sourcePath, isVideo]);
 
   useEffect(
     () => () => {
       const fallbackSrc = localVideoFallbackSrcRef.current;
-      if (fallbackSrc) {
+      if (fallbackSrc?.startsWith("blob:")) {
         URL.revokeObjectURL(fallbackSrc);
         localVideoFallbackSrcRef.current = null;
+      }
+      const playbackPath = playbackTempPathRef.current;
+      playbackTempPathRef.current = null;
+      if (playbackPath) {
+        void invoke("remove_video_playback_file", { path: playbackPath }).catch(() => undefined);
       }
     },
     [],
@@ -247,32 +262,46 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     if (!isVideo || !source || !isTauri() || localVideoFallbackLoadingRef.current) {
       return;
     }
-    // 远端 AI 视频不走这里；本地上传视频失败时用 Rust 读取原始字节，
-    // 转成同源 Blob 后交给 <video>，行为与可直接播放的 AI 视频源保持一致。
+    // 原生播放器失败时统一转成 H.264/AAC MP4。MOV 里的 HEVC、ProRes 等编码在
+    // WebView2 中常常只能显示元信息，不能真正解码或 seek；远程视频也走同一条链路。
     const lower = source.toLowerCase();
-    if (
-      lower.startsWith("http://") ||
-      lower.startsWith("https://") ||
-      lower.startsWith("blob:") ||
-      lower.startsWith("data:")
-    ) {
+    if (lower.startsWith("blob:") || lower.startsWith("data:")) {
       return;
     }
+    const requestId = ++videoFallbackRequestRef.current;
     localVideoFallbackLoadingRef.current = true;
-    void invoke<string>("load_media_data_url", { source })
-      .then((dataUrl) => {
-        const blobUrl = createObjectUrlFromDataUrl(dataUrl);
+    void invoke<string>("prepare_video_playback", { source })
+      .then((preparedPath) => {
+        if (videoFallbackRequestRef.current !== requestId) {
+          void invoke("remove_video_playback_file", { path: preparedPath }).catch(() => undefined);
+          return;
+        }
+        playbackTempPathRef.current = preparedPath;
+        const preparedUrl = resolveImageDisplayUrl(preparedPath);
         setLocalVideoFallbackSrc((current) => {
-          if (current) {
+          if (current?.startsWith("blob:")) {
             URL.revokeObjectURL(current);
           }
-          localVideoFallbackSrcRef.current = blobUrl;
-          return blobUrl;
+          localVideoFallbackSrcRef.current = preparedUrl;
+          return preparedUrl;
         });
       })
-      .catch((error) => {
-        localVideoFallbackLoadingRef.current = false;
-        console.warn("[mediaNode] local video playback fallback failed", error);
+      .catch(async (error) => {
+        // 转码不可用时仍尝试读取原始字节，兼容少量 WebView 能解码但 asset 协议加载失败的文件。
+        try {
+          if (videoFallbackRequestRef.current !== requestId) return;
+          const dataUrl = await invoke<string>("load_media_data_url", { source });
+          if (videoFallbackRequestRef.current !== requestId) return;
+          const blobUrl = createObjectUrlFromDataUrl(dataUrl);
+          setLocalVideoFallbackSrc((current) => {
+            if (current?.startsWith("blob:")) URL.revokeObjectURL(current);
+            localVideoFallbackSrcRef.current = blobUrl;
+            return blobUrl;
+          });
+        } catch (fallbackError) {
+          localVideoFallbackLoadingRef.current = false;
+          console.warn("[mediaNode] video playback fallback failed", error, fallbackError);
+        }
       });
   }, [data.sourcePath, isVideo]);
 
@@ -540,10 +569,8 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     };
   }, [data.previewImageUrl, id, isVideo, updateNodeData]);
 
-  // 本地桌面视频优先使用系统抽帧，避免 WKWebView 对视频 canvas 截图的限制。
-  // 但 QuickLook 只认本地文件路径(AI 视频节点生成的结果是远端 CDN 地址), 因此再加一级
-  // captureVideoFrame 兜底: 它会先尝试带 crossOrigin 直连, 不行就让 Rust 取回字节转同源
-  // blob 后再抽帧, 既不污染画布也不受 CDN 的 CORS 配置影响。
+  // 桌面端优先由 FFmpeg 抽取视频封面，避免 WebView2 对 MOV 编码和视频 canvas 的限制；
+  // 没有 FFmpeg 时再回退到前端解码路径。
   useEffect(() => {
     // 存成局部常量: data.sourcePath 是属性访问, 跨 async 边界后 TS 无法保持窄化。
     const sourcePath = data.sourcePath;
@@ -565,7 +592,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       }
       try {
         const dataUrl = await captureVideoFrame({
-          source: playbackSrc ?? sourcePath,
+          source: sourcePath,
           maxWidth: REMOTE_VIDEO_THUMBNAIL_MAX_WIDTH,
         });
         const prepared = await prepareNodeImage(dataUrl);
@@ -578,7 +605,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     return () => {
       disposed = true;
     };
-  }, [data.previewImageUrl, data.sourcePath, id, isVideo, playbackSrc, updateNodeData]);
+  }, [data.previewImageUrl, data.sourcePath, id, isVideo, updateNodeData]);
 
   const handleCaptureFrame = useCallback(async () => {
     const source = data.sourcePath;
@@ -587,13 +614,16 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     }
     setIsCapturing(true);
     try {
-      // 抽帧统一走 captureVideoFrame: 远端 CDN 的视频不能直接绘制到 canvas(画布会被污染),
-      // 该函数会回退到 Rust 取字节转同源 blob。取用户当前停留的时间点作为截图画面。
+      // 取帧优先交给 FFmpeg，MOV/远程视频不再依赖 WebView2 canvas；浏览器环境仍回退到
+      // 原来的 video + canvas 路径。始终使用原始 source，让 native 路径能识别本地文件。
+      const playerTime = videoRef.current?.currentTime;
+      const requestedTime =
+        Number.isFinite(playerTime) && Math.abs((playerTime ?? 0) - playbackTimeRef.current) < 0.25
+          ? playerTime
+          : playbackTimeRef.current;
       const dataUrl = await captureVideoFrame({
-        // 若本地视频已经切换到同源 Blob，优先使用同一个可播放源，
-        // 避免抽帧再次碰到 asset:// 解码/CORS 问题。
-        source: playbackSrc ?? source,
-        timeSec: videoRef.current?.currentTime ?? 0,
+        source,
+        timeSec: requestedTime,
       });
       const prepared = await prepareNodeImage(dataUrl);
       const createdNodeId = addDerivedExportNode(
@@ -624,7 +654,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     } finally {
       setIsCapturing(false);
     }
-  }, [addDerivedExportNode, addEdge, data.sourcePath, id, playbackSrc]);
+  }, [addDerivedExportNode, addEdge, data.sourcePath, id]);
 
   /** 截图入口已移到节点工具栏(下载旁), 通过事件总线触发, 与 upload-node/reupload 一致。 */
   useEffect(() => {

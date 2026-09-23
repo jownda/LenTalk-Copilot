@@ -68,7 +68,12 @@ export interface CanvasHistoryState {
   future: CanvasHistorySnapshot[];
 }
 
-const MAX_HISTORY_STEPS = 50;
+/**
+ * 内存中保留的 undo 步数。每步快照持有当时的 nodes/edges 数组, 大画布(单节点带
+ * base64 参考图)下 50 步会让编辑期常驻数百 MB 并拖慢每次入栈的内容去重比较。
+ * 20 步足够覆盖正常编辑节奏, 同时显著降低主线程压力。
+ */
+const MAX_HISTORY_STEPS = 20;
 const IMAGE_NODE_VISUAL_MIN_EDGE = 96;
 
 interface CanvasState {
@@ -423,6 +428,33 @@ function isCompletedGenerationResultNode(node: CanvasNode): boolean {
     (data.mediaType === 'video' || data.mediaType === 'audio') &&
     typeof data.sourcePath === 'string' &&
     data.sourcePath.trim().length > 0
+  );
+}
+
+/**
+ * 生成态是否发生"需要重新扫描画布"的变化。
+ *
+ * 两个字段都要看:
+ * - `isGenerating` 的翻转决定"生成中"光效与观察循环的启停;
+ * - `generationJobId` 的落库是**观察循环唯一入口** —— 画布的视频/图片轮询 effect
+ *   都以 `processingRevision` 为依赖, 过滤器要求 `isGenerating === true` **且**
+ *   `generationJobId` 非空。
+ *
+ * 只把 `isGenerating` 计入会漏掉一个致命窗口: 提交方先建出 `isGenerating: true`
+ * 的结果节点, 稍后再把 job id 写上去, 这时 `isGenerating` 没有变化 ⇒
+ * `processingRevision` 不 bump ⇒ 观察循环不会重新扫描 ⇒ 节点带着
+ * "生成中 + jobId"停在原地, 永远不被轮询。表现出来就是任务在平台侧照跑照计费、
+ * 界面一直转圈, 最后只能报「视频任务等待超时」(实机 2026-09-22 的知鸟任务)。
+ */
+function nodeDataChangesProcessingState(
+  before: CanvasNodeData,
+  after: CanvasNodeData
+): boolean {
+  return (
+    (before as { isGenerating?: unknown }).isGenerating
+      !== (after as { isGenerating?: unknown }).isGenerating
+    || (before as { generationJobId?: unknown }).generationJobId
+      !== (after as { generationJobId?: unknown }).generationJobId
   );
 }
 
@@ -1255,10 +1287,22 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
 
   setViewportState: (viewport) => {
+    const currentViewport = get().currentViewport;
+    if (
+      currentViewport.x === viewport.x &&
+      currentViewport.y === viewport.y &&
+      currentViewport.zoom === viewport.zoom
+    ) {
+      return;
+    }
     set({ currentViewport: viewport });
   },
 
   setCanvasViewportSize: (size) => {
+    const currentSize = get().canvasViewportSize;
+    if (currentSize.width === size.width && currentSize.height === size.height) {
+      return;
+    }
     set({ canvasViewportSize: size });
   },
 
@@ -1775,8 +1819,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
           || resizedNode.width !== node.width
           || resizedNode.height !== node.height;
         processingChanged = processingChanged
-          || (node.data as { isGenerating?: unknown }).isGenerating
-            !== (mergedData as { isGenerating?: unknown }).isGenerating;
+          || nodeDataChangesProcessingState(
+            node.data as CanvasNodeData,
+            mergedData as CanvasNodeData
+          );
         inputGraphChanged = inputGraphChanged || nodeDataAffectsInputGraph(node, data);
         changed = true;
         return resizedNode;
@@ -1819,8 +1865,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
           || resizedNode.width !== node.width
           || resizedNode.height !== node.height;
         processingChanged = processingChanged
-          || (node.data as { isGenerating?: unknown }).isGenerating
-            !== (mergedData as { isGenerating?: unknown }).isGenerating;
+          || nodeDataChangesProcessingState(
+            node.data as CanvasNodeData,
+            mergedData as CanvasNodeData
+          );
         inputGraphChanged = inputGraphChanged || nodeDataAffectsInputGraph(node, data);
         return resizedNode;
       });
@@ -2534,6 +2582,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
 
   setSelectedNode: (nodeId) => {
+    if (get().selectedNodeId === nodeId) {
+      return;
+    }
     set({ selectedNodeId: nodeId });
   },
 

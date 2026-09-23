@@ -1479,6 +1479,23 @@ pub async fn persist_image_binary(
     Ok(output)
 }
 
+/// 供 `video_protocols` 注入的媒体落盘实现。
+///
+/// AI 层刻意不依赖 tauri, 所以「把平台返回的二进制成片写进本地媒体目录」这一步
+/// 由命令层提供: 与 `persist_image_binary` 写同一个目录(`<app_data>/images`),
+/// 返回的也是本地绝对路径 —— 前端 `resolveImageDisplayUrl` 会对本地路径做
+/// convertFileSrc, 与迁移前前端自己 `persistImageBinary` 的结果形态完全一致。
+pub fn make_media_persister(
+    app: AppHandle,
+) -> Box<dyn Fn(&[u8], &str) -> Result<String, String> + Send + Sync> {
+    Box::new(move |bytes, extension| {
+        if bytes.is_empty() {
+            return Err("媒体字节为空".to_string());
+        }
+        persist_image_bytes(&app, bytes, &normalize_extension(extension))
+    })
+}
+
 fn sanitize_file_stem(raw: &str) -> String {
     let trimmed = raw.trim();
     let fallback = "storyboard-image";

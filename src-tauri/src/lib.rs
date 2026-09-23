@@ -112,6 +112,13 @@ pub fn run() {
         .setup(|app| {
             database::initialize(app.handle())?;
 
+            // 专有视频协议里有一部分成片只能带鉴权下载回来(帧间 / Sub2API 等),
+            // 后端要把字节落盘再把本地路径交回画布。AI 层不依赖 tauri, 因此落盘
+            // 实现由命令层在这里注入一次。
+            ai::providers::video_protocols::install_media_persister(image::make_media_persister(
+                app.handle().clone(),
+            ));
+
             let window_config = app
                 .config()
                 .app
@@ -198,6 +205,9 @@ pub fn run() {
             media_file::resolve_media_file_size,
             media_file::load_media_data_url,
             video_cfr::normalize_video_cfr,
+            video_cfr::prepare_video_playback,
+            video_cfr::remove_video_playback_file,
+            video_cfr::extract_video_frame,
             pajuben::pajuben_probe,
             pajuben::pajuben_run,
             pajuben::pajuben_cancel,

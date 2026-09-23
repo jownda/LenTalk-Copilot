@@ -15,9 +15,10 @@ use crate::ai::error::AIError;
 use crate::database;
 use crate::ai::providers::build_default_providers;
 use crate::ai::providers::openai_compat::OpenAICompatibleProvider;
+use crate::ai::providers::video_protocols::is_retryable_submit_failure;
 use crate::ai::{
-    GenerateRequest, GenerateVideoRequest, ProviderRegistry, ProviderTaskHandle, ProviderTaskPollResult,
-    ProviderTaskSubmission,
+    AIProvider, GenerateRequest, GenerateVideoRequest, ProviderRegistry, ProviderTaskHandle,
+    ProviderTaskPollResult, ProviderTaskSubmission,
 };
 
 static REGISTRY: std::sync::OnceLock<ProviderRegistry> = std::sync::OnceLock::new();
@@ -36,6 +37,45 @@ fn get_registry() -> &'static ProviderRegistry {
 
 fn active_non_resumable_job_ids() -> &'static Arc<RwLock<HashSet<String>>> {
     ACTIVE_NON_RESUMABLE_JOB_IDS.get_or_init(|| Arc::new(RwLock::new(HashSet::new())))
+}
+
+/// 视频任务的「任务类别」标识 —— 落在 `ai_generation_jobs.provider_id` 上。
+///
+/// 它**不是**注册表里的 provider 名: 视频与图片共用同一个 OpenAI 兼容 provider
+/// (`submit_generate_video_job` 取的就是 `openai-compatible`)。查任务表时必须先
+/// 归一化, 见 `resolve_job_provider`。
+const VIDEO_JOB_PROVIDER_ID: &str = "video-openai-compatible";
+
+/// 提交视频任务遇到**平台侧抖动**时的最大尝试次数。
+///
+/// 3 次(首次 + 2 次重试、退避 1s / 3s)是针对中转平台 5xx/429 的经验值: 够吃掉一次
+/// 瞬时抖动, 又不至于让用户在明显故障时白等太久。**只有平台回过话的错误才算抖动**
+/// (判据见 `video_protocols::is_retryable_submit_failure`), 纯网络层错误不重试。
+const VIDEO_SUBMIT_MAX_ATTEMPTS: usize = 3;
+
+/// 提交重试的退避时长。抖动通常是秒级的, 不必指数增长。
+fn video_submit_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(if attempt <= 1 { 1_000 } else { 3_000 })
+}
+
+/// 把任务表里的 `provider_id` 解析成注册表中的 provider。
+///
+/// 为什么必须归一化: 视频任务行落的是 `video-openai-compatible`, 而注册表里只有
+/// `openai-compatible`。直接 `get_provider(record.provider_id)` 会返回 None, 于是
+/// **每一次续查都在这里报错** —— 前端 observer 把这次 IPC 失败当成"临时故障"
+/// 吞掉后 2 秒重试, 结果是提交之后一次成功轮询都不会发生: 任务状态永远停在
+/// `running`(库里 `updated_at == created_at` 就是它的指纹)、界面永远转圈, 而平台
+/// 侧照跑照计费, 成片永久收不回。(实测 2026-09-23 的知鸟任务即为此因。)
+fn resolve_job_provider(provider_id: &str) -> Option<Arc<dyn AIProvider>> {
+    let registry = get_registry();
+    if let Some(provider) = registry.get_provider(provider_id) {
+        return Some(Arc::clone(provider));
+    }
+    let registry_name = match provider_id {
+        VIDEO_JOB_PROVIDER_ID => "openai-compatible",
+        _ => return None,
+    };
+    registry.get_provider(registry_name).map(Arc::clone)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,6 +108,16 @@ pub struct GenerationJobStatusDto {
     pub status: String,
     pub result: Option<String>,
     pub error: Option<String>,
+    /// `true` ⇒ 这次 `error` 只是**诊断文本**(查询时的网络抖动 / 5xx / 平台回话慢),
+    /// 平台任务仍在跑, 前端必须继续轮询。
+    ///
+    /// 为什么需要这个字段: 前端曾拿 `error` 的文本做子串匹配, 而诊断文本
+    /// `binghuo-video 查询失败(网络): error sending request for url (...)` 里带着
+    /// 「失败」二字 ⇒ 一次网络抖动就把已计费、已跑到 14 分钟的长任务判死, 并清掉
+    /// job id —— 平台照跑照计费, 成片永久收不回(2026-09-23 11:53 实证)。
+    /// 只有后端知道「这个 Err 是可重试的」, 所以由后端显式声明, 前端不再猜。
+    #[serde(default)]
+    pub transient: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -299,6 +349,7 @@ fn dto_from_record(record: &GenerationJobRecord) -> GenerationJobStatusDto {
         status: record.status.clone(),
         result: record.result.clone(),
         error: record.error.clone(),
+        transient: false,
     }
 }
 
@@ -898,7 +949,7 @@ pub async fn submit_generate_video_job(
         .cloned()
         .ok_or_else(|| "OpenAI compatible provider not found".to_string())?;
     let job_id = Uuid::new_v4().to_string();
-    insert_generation_job(&app, &job_id, "video-openai-compatible", "running", false, None, None, None, None)?;
+    insert_generation_job(&app, &job_id, VIDEO_JOB_PROVIDER_ID, "running", false, None, None, None, None)?;
     active_non_resumable_job_ids().write().await.insert(job_id.clone());
 
     let native_request = GenerateVideoRequest {
@@ -914,11 +965,84 @@ pub async fn submit_generate_video_job(
     };
     let app_handle = app.clone();
     let spawned_job_id = job_id.clone();
+    // 可恢复通道: 提交后立刻把平台 task_id 与查询元数据落库, 本地任务随即结束。
+    // 这样应用重启后 get_generate_video_job 仍能凭 task_id 续查到成片, 而不是把
+    // 仍在平台生成(且已计费)的任务判成「中断」逼用户重新提交、二次扣费。
+    let use_resumable_video_task = provider.supports_video_task_resume();
     tauri::async_runtime::spawn(async move {
-        let result = provider.generate_video(native_request).await;
-        let update = match result {
-            Ok(video_url) => update_generation_job(&app_handle, &spawned_job_id, "succeeded", Some(&video_url), None),
-            Err(error) => update_generation_job(&app_handle, &spawned_job_id, "failed", None, Some(&error.to_string())),
+        let update = if use_resumable_video_task {
+            // 平台侧抖动(5xx / 408 / 429)时重试提交。实机 2026-09-23 13:49 炳火提交返回
+            // HTTP 503「服务暂时不可用，请稍后重试」—— 提交侧原先对任何 Err 都直接落
+            // failed, 用户只能重提; 而重提要重新上传素材, 还可能二次扣费。
+            //
+            // 只重试「平台回过话的服务端抖动」(`is_retryable_submit_failure`),
+            // 纯网络层错误不重试: 请求可能已经送达并被计费。
+            let mut attempt = 0usize;
+            let mut submission = Err(AIError::TaskFailed("视频任务提交未执行".to_string()));
+            while attempt < VIDEO_SUBMIT_MAX_ATTEMPTS {
+                attempt += 1;
+                submission = tokio::time::timeout(
+                    Duration::from_secs(30 * 60),
+                    provider.submit_video_task(native_request.clone()),
+                )
+                .await
+                .map_err(|_| AIError::TaskFailed("视频任务提交超时(30 分钟)".to_string()))
+                .and_then(|result| result);
+                match &submission {
+                    Err(error)
+                        if attempt < VIDEO_SUBMIT_MAX_ATTEMPTS
+                            && is_retryable_submit_failure(error) =>
+                    {
+                        let delay = video_submit_retry_delay(attempt);
+                        info!(
+                            "视频提交遇到平台侧抖动(第 {} 次尝试), {}ms 后进行第 {} 次尝试: {}",
+                            attempt,
+                            delay.as_millis(),
+                            attempt + 1,
+                            error
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    _ => break,
+                }
+            }
+            // 重试过的瞬时错误不再以 `Provider error: …` 的形式抛给用户(那是内部措辞),
+            // 换成一条直的说明, 并注明重试过几次。
+            let submission = match submission {
+                Err(AIError::Provider(message)) => Err(AIError::TaskFailed(if attempt > 1 {
+                    format!("{}（平台侧抖动，已自动重试 {} 次仍失败）", message, attempt - 1)
+                } else {
+                    message
+                })),
+                other => other,
+            };
+            match submission {
+                Ok(ProviderTaskSubmission::Succeeded(video_url)) => {
+                    update_generation_job(&app_handle, &spawned_job_id, "succeeded", Some(&video_url), None)
+                }
+                Ok(ProviderTaskSubmission::Queued(handle)) => {
+                    let meta_json = handle
+                        .metadata
+                        .as_ref()
+                        .and_then(|value| serde_json::to_string(value).ok());
+                    mark_generation_job_resumable(
+                        &app_handle,
+                        spawned_job_id.as_str(),
+                        handle.task_id.as_str(),
+                        meta_json.as_deref(),
+                    )
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    update_generation_job(&app_handle, &spawned_job_id, "failed", None, Some(message.as_str()))
+                }
+            }
+        } else {
+            let result = provider.generate_video(native_request).await;
+            match result {
+                Ok(video_url) => update_generation_job(&app_handle, &spawned_job_id, "succeeded", Some(&video_url), None),
+                Err(error) => update_generation_job(&app_handle, &spawned_job_id, "failed", None, Some(&error.to_string())),
+            }
         };
         if let Err(error) = update { info!("Failed to update video generation job: {}", error); }
         active_non_resumable_job_ids().write().await.remove(&spawned_job_id);
@@ -928,14 +1052,24 @@ pub async fn submit_generate_video_job(
 
 #[tauri::command]
 pub async fn get_generate_video_job(app: AppHandle, job_id: String) -> Result<GenerationJobStatusDto, String> {
-    // 视频任务当前均由 native worker 持续执行，状态机和图片非可恢复任务一致。
-    get_generate_image_job(app, job_id).await
+    // 视频任务与图片共用同一套任务表, 但可恢复任务的续查通道不同: 视频必须走
+    // poll_video_task, 否则拿图片的轮询实现去查视频 task_id 只会得到错误。
+    get_generation_job_status(app, job_id, true).await
 }
 
 #[tauri::command]
 pub async fn get_generate_image_job(
     app: AppHandle,
     job_id: String,
+) -> Result<GenerationJobStatusDto, String> {
+    get_generation_job_status(app, job_id, false).await
+}
+
+/// 生成任务状态的统一读取实现。`video` 决定可恢复任务走哪条 provider 续查通道。
+async fn get_generation_job_status(
+    app: AppHandle,
+    job_id: String,
+    video: bool,
 ) -> Result<GenerationJobStatusDto, String> {
     let maybe_record = get_generation_job(&app, job_id.as_str())?;
     let Some(mut record) = maybe_record else {
@@ -944,6 +1078,7 @@ pub async fn get_generate_image_job(
             status: "not_found".to_string(),
             result: None,
             error: Some("job not found".to_string()),
+            transient: false,
         });
     };
 
@@ -974,10 +1109,19 @@ pub async fn get_generate_image_job(
         return Ok(dto_from_record(&record));
     }
 
-    let provider = get_registry()
-        .get_provider(record.provider_id.as_str())
-        .cloned()
-        .ok_or_else(|| format!("Provider not found for job: {}", record.provider_id))?;
+    let provider = match resolve_job_provider(record.provider_id.as_str()) {
+        Some(provider) => provider,
+        None => {
+            // 前端 observer 会把这次 IPC 失败当成"临时故障"吞掉并无限重试, 所以这里
+            // 必须留下后端日志 —— 否则「平台生成完了却一直卡在生成界面」将毫无线索。
+            tracing::warn!(
+                "Generation job {} references unknown provider '{}'; polling cannot continue",
+                record.job_id,
+                record.provider_id
+            );
+            return Err(format!("Provider not found for job: {}", record.provider_id));
+        }
+    };
 
     let Some(task_id) = record.external_task_id.clone() else {
         let message = "missing external task id".to_string();
@@ -998,13 +1142,17 @@ pub async fn get_generate_image_job(
         .as_deref()
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
 
-    match provider
-        .poll_task(ProviderTaskHandle {
-            task_id,
-            metadata: task_meta,
-        })
-        .await
-    {
+    let handle = ProviderTaskHandle {
+        task_id,
+        metadata: task_meta,
+    };
+    let poll_result = if video {
+        provider.poll_video_task(handle).await
+    } else {
+        provider.poll_task(handle).await
+    };
+
+    match poll_result {
         Ok(ProviderTaskPollResult::Running) => {
             let _ = touch_generation_job(&app, record.job_id.as_str());
             Ok(dto_from_record(&record))
@@ -1022,6 +1170,7 @@ pub async fn get_generate_image_job(
                 status: "succeeded".to_string(),
                 result: Some(image_source),
                 error: None,
+                transient: false,
             })
         }
         Ok(ProviderTaskPollResult::Failed(message)) => {
@@ -1037,9 +1186,13 @@ pub async fn get_generate_image_job(
                 status: "failed".to_string(),
                 result: None,
                 error: Some(message),
+                transient: false,
             })
         }
-        Err(AIError::TaskFailed(message)) => {
+        Err(AIError::TaskFailed(message))
+        | Err(AIError::InvalidRequest(message))
+        | Err(AIError::TaskNotFound(message))
+        | Err(AIError::ModelNotSupported(message)) => {
             update_generation_job(
                 &app,
                 record.job_id.as_str(),
@@ -1052,13 +1205,18 @@ pub async fn get_generate_image_job(
                 status: "failed".to_string(),
                 result: None,
                 error: Some(message),
+                transient: false,
             })
         }
+        // 可重试错误(网络抖动 / 5xx / 平台回话慢): 任务保持 running, 交给下一轮轮询。
+        // `transient: true` 是给前端的硬信号 —— 这里 `error` 装的是诊断文本, 前端
+        // 不得据此判定终态(文本里可能带「失败」「timeout」等词, 那是我们自己的措辞)。
         Err(error) => Ok(GenerationJobStatusDto {
             job_id: record.job_id,
             status: "running".to_string(),
             result: None,
             error: Some(error.to_string()),
+            transient: true,
         }),
     }
 }
@@ -1093,9 +1251,26 @@ pub async fn list_models() -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::request_explicitly_uses_async_mode;
+    use super::{request_explicitly_uses_async_mode, resolve_job_provider, VIDEO_JOB_PROVIDER_ID};
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// 视频任务行落的是「任务类别」`video-openai-compatible`, 注册表里只有
+    /// `openai-compatible`。这条归一化缺失时, 每一次视频续查都会在这里返回 None,
+    /// 表现为「平台生成完了但软件一直卡在生成界面」。
+    #[test]
+    fn video_job_provider_alias_resolves_to_openai_compatible() {
+        let resolved = resolve_job_provider(VIDEO_JOB_PROVIDER_ID)
+            .expect("video 任务类别必须能解析到 provider");
+        assert_eq!(resolved.name(), "openai-compatible");
+        assert!(resolve_job_provider("openai-compatible").is_some());
+    }
+
+    #[test]
+    fn unknown_job_provider_is_rejected() {
+        assert!(resolve_job_provider("not-a-provider").is_none());
+        assert!(resolve_job_provider("video-not-registered").is_none());
+    }
 
     #[test]
     fn image_jobs_are_sync_by_default() {

@@ -27,6 +27,175 @@ pub struct VideoCfrResult {
     pub reason: Option<String>,
 }
 
+const PLAYBACK_FILE_PREFIX: &str = "lentalk-playback-";
+
+fn playback_temp_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{}{}.mp4",
+        PLAYBACK_FILE_PREFIX,
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn local_or_remote_video_source(source: &str) -> Option<String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(trimmed.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("file://") {
+        let decoded = urlencoding::decode(rest).ok()?;
+        #[cfg(target_os = "windows")]
+        let decoded = decoded.strip_prefix('/').unwrap_or(&decoded);
+        return Some(decoded.to_string());
+    }
+    if trimmed.contains("://") || trimmed.starts_with("data:") {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn run_ffmpeg_to_mp4(ffmpeg: &Path, input: &str, output: &Path) -> Result<(), String> {
+    let status = Command::new(ffmpeg)
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .arg("-i")
+        .arg(input)
+        .args(["-map", "0:v:0", "-map", "0:a?"])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        ])
+        .args(["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"])
+        .arg(output)
+        .status()
+        .map_err(|error| format!("无法启动 ffmpeg: {error}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg 播放兼容转换失败 (exit: {status:?})"));
+    }
+    let empty_or_missing = output
+        .metadata()
+        .map(|meta| meta.len() == 0)
+        .unwrap_or(true);
+    if empty_or_missing {
+        return Err("ffmpeg 播放兼容转换未生成有效文件".to_string());
+    }
+    Ok(())
+}
+
+/// 为 WebView2 生成一个 H.264/AAC 播放代理。
+///
+/// MOV 容器本身不是问题，实际不稳定的通常是 HEVC、ProRes 或相机生成的时间轴。
+/// 只有原生播放器触发 error 时才调用此命令，因此正常的 MP4/MOV 不会额外转码。
+#[tauri::command]
+pub fn prepare_video_playback(
+    app: tauri::AppHandle,
+    source: String,
+) -> Result<String, String> {
+    let input = local_or_remote_video_source(&source)
+        .ok_or_else(|| "不支持的视频来源，无法准备兼容播放文件".to_string())?;
+    if !input.starts_with("http://") && !input.starts_with("https://") && !Path::new(&input).is_file() {
+        return Err(format!("视频文件不存在: {input}"));
+    }
+    let ffmpeg = resolve_ffmpeg_path(&app)
+        .ok_or_else(|| "未找到 ffmpeg，无法转换视频播放格式".to_string())?;
+    let output = playback_temp_path();
+    if let Err(error) = run_ffmpeg_to_mp4(&ffmpeg, &input, &output) {
+        let _ = std::fs::remove_file(&output);
+        return Err(error);
+    }
+    Ok(output.to_string_lossy().to_string())
+}
+
+/// 删除由 `prepare_video_playback` 产生的临时文件，拒绝删除其它路径。
+#[tauri::command]
+pub fn remove_video_playback_file(path: String) -> Result<(), String> {
+    let target = PathBuf::from(path.trim());
+    let file_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "播放临时文件路径无效".to_string())?;
+    let expected_parent = std::env::temp_dir();
+    if target.parent() != Some(expected_parent.as_path())
+        || !file_name.starts_with(PLAYBACK_FILE_PREFIX)
+        || target.extension().and_then(|value| value.to_str()) != Some("mp4")
+    {
+        return Err("拒绝删除非 LenTalk 播放临时文件".to_string());
+    }
+    match std::fs::remove_file(&target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("删除播放临时文件失败: {error}")),
+    }
+}
+
+/// 用 FFmpeg 按时间点直接抽取一帧，返回 JPEG data URL。
+///
+/// 该路径不经过 WebView2 的视频解码器，特别适合 HEVC/ProRes MOV 和无法被 canvas
+/// 读取的远程视频。`-ss` 放在输入之后，保证用户选中的时间点准确。
+#[tauri::command]
+pub fn extract_video_frame(
+    app: tauri::AppHandle,
+    source: String,
+    time_sec: f64,
+    max_width: Option<u32>,
+) -> Result<String, String> {
+    use base64::Engine;
+
+    let input = local_or_remote_video_source(&source)
+        .ok_or_else(|| "不支持的视频来源，无法用 ffmpeg 抽帧".to_string())?;
+    if !input.starts_with("http://") && !input.starts_with("https://") && !Path::new(&input).is_file() {
+        return Err(format!("视频文件不存在: {input}"));
+    }
+    let ffmpeg = resolve_ffmpeg_path(&app)
+        .ok_or_else(|| "未找到 ffmpeg，无法抽取视频帧".to_string())?;
+    let bounded_time = if time_sec.is_finite() && time_sec > 0.0 {
+        time_sec
+    } else {
+        0.05
+    };
+    let mut command = Command::new(ffmpeg);
+    command
+        .args(["-hide_banner", "-loglevel", "error"])
+        .arg("-i")
+        .arg(&input)
+        .arg("-ss")
+        .arg(format!("{bounded_time:.6}"))
+        .args(["-frames:v", "1"]);
+    if let Some(width) = max_width.filter(|value| *value > 0) {
+        // 保持 max_width 的语义：小视频不被无意义地放大，宽视频才按比例缩小。
+        command.args([
+            "-vf",
+            &format!("scale={width}:-2:force_original_aspect_ratio=decrease"),
+        ]);
+    }
+    let output = command
+        .args(["-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1"])
+        .output()
+        .map_err(|error| format!("无法启动 ffmpeg: {error}"))?;
+    if !output.status.success() || output.stdout.is_empty() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "ffmpeg 抽帧失败".to_string()
+        } else {
+            format!("ffmpeg 抽帧失败: {detail}")
+        });
+    }
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(output.stdout)
+    ))
+}
+
 #[derive(Debug, Clone)]
 struct Mp4Box {
     box_type: [u8; 4],

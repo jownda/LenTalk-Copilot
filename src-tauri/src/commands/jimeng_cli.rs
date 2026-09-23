@@ -24,6 +24,66 @@ const CLI_SUBMIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CLI_TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const JIMENG_CLI_MAX_REFERENCE_IMAGES: usize = 9;
 
+// 提交阶段的重试策略 —— 一切以即梦官方规则为准, 首要保证**不重复扣费**。
+//
+// 官方 CLI 说明(`dreamina -h`):
+//   * "All generation operations consume credits." —— 扣费发生在**生成任务被创建**时;
+//     `list_task` 返回的 commerce_info.credit_count 就是账单, 任务失败也会留下
+//     CreditPreDeductNotEnough 这类预扣记录。
+//   * "local files are uploaded automatically before submit" —— 本地素材在 submit
+//     **之前**上传, 所以上传阶段失败时任务根本还没创建, 重试不产生任何新扣费。
+//
+// 因此重试的前提是**能证明服务端还没有这一次的任务**, 只有两条路:
+//   ① 向服务端核对(首选): `list_task` 查得到这次的任务就绝不重试 —— 已扣费,
+//      再提交就是重复下单; 查得到且任务还活着, 就直接接管它(既不重复扣费也不丢任务);
+//   ② 报错本身证明卡在 submit 之前的上传阶段(见 PRESUBMIT_FAILURE_PATTERNS)。
+// 两条都走不通(核对不了 + 报错阶段不明)时**一律不重试** —— 宁可让用户看到错误,
+// 也不能冒重复扣费的风险。
+const JIMENG_SUBMIT_MAX_ATTEMPTS: u32 = 3;
+const JIMENG_SUBMIT_RETRY_BACKOFF_MS: [u64; 2] = [2_000, 5_000];
+/// 上传参考图用的字节图床服务; 仅在提交失败后用于连通性诊断。
+const JIMENG_UPLOAD_HOST: &str = "imagex.bytedanceapi.com";
+
+/// 能证明「失败发生在服务端创建任务之前」的特征(大小写不敏感)。
+///
+/// 官方 CLI 会先把本地素材上传到字节图床再 submit —— 命中这些特征说明卡在上传阶段,
+/// 此时服务端没有任务、没有预缴积分, 重试是安全的。两个真实命中的例子:
+/// `ApplyImageUpload: do request ... context deadline exceeded`、
+/// `upload resource "...image-1.png": upload image: apply phase`。
+const PRESUBMIT_FAILURE_PATTERNS: &[&str] = &[
+    "applyimageupload",
+    "commit image upload",
+    "upload resource",
+    "upload image",
+    "apply phase",
+    "commit phase",
+];
+
+/// 瞬时网络失败的特征(大小写不敏感)。命中只代表「值得再试一次」, 真正能不能重试还要由
+/// `probe_server_task` 确认服务端没有这一次的任务(见 `decide_submit_retry`)。
+///
+/// 刻意**不**包含「即梦 CLI 命令超过 N 秒未返回」——那是我们自己的提交超时,
+/// 重试一次就要再等 5 分钟, 不如让用户尽快看到错误。
+const TRANSIENT_SUBMIT_FAILURE_PATTERNS: &[&str] = &[
+    "context deadline exceeded",
+    "deadline exceeded",
+    "i/o timeout",
+    "timed out",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "connection closed",
+    "broken pipe",
+    "unexpected eof",
+    "network is unreachable",
+    "no such host",
+    "temporary failure in name resolution",
+    "tls handshake",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+];
+
 /// 即梦 CLI 官方 Windows 安装包下载前缀（与官方安装脚本 `https://jimeng.jianying.com/cli` 同源）。
 /// 仅在用户明确触发「自动安装」时使用；域名为白名单内固定地址，不做任何动态拼接。
 const JIMENG_CLI_DOWNLOAD_BASE: &str =
@@ -330,10 +390,7 @@ fn submit_and_poll_jimeng_task(
         JimengArtifactKind::Image => "图片",
     };
 
-    let submission = run_cli_with_timeout(executable, &arguments, CLI_SUBMIT_COMMAND_TIMEOUT)?;
-    if is_failed(&submission) {
-        return Err(format!("即梦 CLI {label}生成失败: {}", output_summary(&submission)));
-    }
+    let submission = submit_jimeng_command(app, client_job_id, executable, &arguments, label)?;
     // --poll=0 通常只提交任务；保留即时结果分支，兼容 CLI 后端直接返回成品的情况。
     if is_succeeded(&submission) {
         if let Some(result) = find_downloaded_artifact(download_dir, artifact) {
@@ -396,6 +453,497 @@ fn submit_and_poll_jimeng_task(
         emit_cli_task_status(app, client_job_id, &submit_id, normalized_status, queue_count(executable), None);
 
         thread::sleep(Duration::from_secs(3));
+    }
+}
+
+/// 服务端任务探针结果 —— 决定「这次失败能否重试」的唯一依据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServerTaskProbe {
+    /// 服务端已经有这一次的任务(生成任务一创建就预缴积分): 绝不再提交。
+    Exists { submit_id: String, failed: bool },
+    /// 服务端确认没有这一次的任务: 重试不会重复扣费。
+    Absent,
+    /// 查不动(未登录 / CLI 不可用 / `list_task` 报错 / 冒出来的是别的节点的任务):
+    /// 只能退回报错阶段来判断。
+    Unknown,
+}
+
+/// `list_task` 里的一条任务。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskEntry {
+    submit_id: String,
+    failed: bool,
+    prompt: String,
+}
+
+/// `list_task` 输出的解析结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedTaskList {
+    /// 解析成功; `None` 表示列表为空(服务端一个任务都没有)。
+    Parsed(Option<TaskEntry>),
+    /// 不是任务列表(CLI 报错 / 未登录 / 输出被日志污染)。
+    Unparsable,
+}
+
+/// 服务端任务快照: 比对「提交前」与「提交后」有没有冒出新任务。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskListSnapshot {
+    Read(Option<TaskEntry>),
+    Unavailable,
+}
+
+/// 失败是否可证明发生在服务端创建任务之前(即上传本地素材的阶段)。
+fn is_presubmit_failure(reason: &str) -> bool {
+    let lowered = reason.to_ascii_lowercase();
+    PRESUBMIT_FAILURE_PATTERNS
+        .iter()
+        .any(|pattern| lowered.contains(*pattern))
+}
+
+fn is_transient_submit_failure(reason: &str) -> bool {
+    let lowered = reason.to_ascii_lowercase();
+    TRANSIENT_SUBMIT_FAILURE_PATTERNS
+        .iter()
+        .any(|pattern| lowered.contains(*pattern))
+}
+
+/// 纯函数: 依据「服务端有没有这一次的任务」+ 报错性质, 决定这次失败能否重试。
+///
+/// 三种不重试的情况, 优先级从高到低:
+///   ① 服务端已有任务 —— 已经预缴积分, 再提交就是重复下单;
+///   ② 情况不明且报错不指向 submit 之前 —— 无法证明任务没被创建;
+///   ③ 报错不是网络抖动(参数错、审核拦截等), 重试没有意义。
+fn decide_submit_retry(probe: &ServerTaskProbe, reason: &str) -> bool {
+    match probe {
+        ServerTaskProbe::Exists { .. } => false,
+        ServerTaskProbe::Absent => {
+            is_transient_submit_failure(reason) || is_presubmit_failure(reason)
+        }
+        ServerTaskProbe::Unknown => is_presubmit_failure(reason),
+    }
+}
+
+/// 取 CLI 输出里第一个 `[` 到最后一个 `]` 之间的片段 —— `list_task` 返回数组,
+/// 而 CLI 常在 JSON 前后夹带日志行(`user_credit` 那套取的是 `{`, 用法不同)。
+fn extract_json_array(output: &str) -> Option<&str> {
+    let start = output.find('[')?;
+    let end = output.rfind(']')?;
+    (end > start).then(|| &output[start..=end])
+}
+
+/// 解析 `list_task` 的 JSON 数组, 取第一条(CLI 按最新在前返回)。
+fn parse_task_list(output: &str) -> ParsedTaskList {
+    let Some(raw) = extract_json_array(output) else {
+        return ParsedTaskList::Unparsable;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return ParsedTaskList::Unparsable;
+    };
+    let Some(tasks) = value.as_array() else {
+        return ParsedTaskList::Unparsable;
+    };
+    let Some(first) = tasks.first() else {
+        return ParsedTaskList::Parsed(None);
+    };
+    let submit_id = first
+        .get("submit_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if submit_id.is_empty() {
+        return ParsedTaskList::Unparsable;
+    }
+    let status = first
+        .get("gen_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    ParsedTaskList::Parsed(Some(TaskEntry {
+        submit_id,
+        failed: matches!(status.to_ascii_lowercase().as_str(), "fail" | "failed"),
+        prompt: first
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    }))
+}
+
+/// 读取服务端任务快照(最新一条)。`Unavailable` 表示查不动, 调用方必须按「不冒险」处理。
+fn read_task_snapshot(executable: &str, extra_env: &[(String, String)]) -> TaskListSnapshot {
+    let arguments = vec!["list_task".to_string(), "--limit=1".to_string()];
+    match run_cli_with_timeout_env(executable, &arguments, CLI_COMMAND_TIMEOUT, extra_env) {
+        Ok(output) => match parse_task_list(&output) {
+            ParsedTaskList::Parsed(entry) => TaskListSnapshot::Read(entry),
+            ParsedTaskList::Unparsable => TaskListSnapshot::Unavailable,
+        },
+        Err(_) => TaskListSnapshot::Unavailable,
+    }
+}
+
+/// 提交参数里的提示词, 用于核对「新出现的任务是不是我们这次提交的」。
+fn prompt_from_arguments(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--prompt="))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn normalize_prompt(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 新冒出来的任务是否属于本次提交。
+///
+/// 画布上可能有多个节点并发提交, 只看「最新任务变了」会把别人的任务错认成我们的,
+/// 所以还要比对提示词前缀。
+fn is_our_task(entry: &TaskEntry, prompt: &str) -> bool {
+    const SAMPLE: usize = 120;
+    let expected = normalize_prompt(prompt);
+    let actual = normalize_prompt(&entry.prompt);
+    if expected.len() < 40 || actual.len() < 40 {
+        return false;
+    }
+    expected.chars().take(SAMPLE).eq(actual.chars().take(SAMPLE))
+}
+
+/// 纯函数: 比对提交前后的快照, 判断服务端有没有新产生「我们这次」的任务。
+fn diff_task_snapshots(
+    before: &TaskListSnapshot,
+    after: &TaskListSnapshot,
+    prompt: &str,
+) -> ServerTaskProbe {
+    let (TaskListSnapshot::Read(before), TaskListSnapshot::Read(after)) = (before, after) else {
+        return ServerTaskProbe::Unknown;
+    };
+    let entry = match (before, after) {
+        // 列表反而空了: 情况不明, 不冒险。
+        (_, None) => return ServerTaskProbe::Unknown,
+        // 最新任务没变 ⇒ 没有新任务。
+        (Some(previous), Some(latest)) if previous.submit_id == latest.submit_id => {
+            return ServerTaskProbe::Absent;
+        }
+        (_, Some(latest)) => latest,
+    };
+    if is_our_task(entry, prompt) {
+        ServerTaskProbe::Exists {
+            submit_id: entry.submit_id.clone(),
+            failed: entry.failed,
+        }
+    } else {
+        // 冒出来的是别的节点/别的会话的任务: 无法证明我们的任务没被创建。
+        ServerTaskProbe::Unknown
+    }
+}
+
+/// 用 CLI 自己打印的 submit_id 精确查服务端。
+///
+/// 关键事实: 即梦 CLI **失败时也会打印** `submit_id="<uuid>"`, 但那可能只是本地 id ——
+/// 实测拿它去查 `list_task --submit_id=<该值>` 返回 `[]`。所以「输出里有 submit_id」
+/// 并不等于「任务已创建」, 必须向服务端核对。
+fn probe_reported_submit_id(
+    executable: &str,
+    submit_id: &str,
+    extra_env: &[(String, String)],
+) -> ServerTaskProbe {
+    let arguments = vec!["list_task".to_string(), format!("--submit_id={submit_id}")];
+    match run_cli_with_timeout_env(executable, &arguments, CLI_COMMAND_TIMEOUT, extra_env) {
+        Ok(output) => match parse_task_list(&output) {
+            ParsedTaskList::Parsed(Some(entry)) => ServerTaskProbe::Exists {
+                submit_id: entry.submit_id,
+                failed: entry.failed,
+            },
+            // 该 id 查不到 ⇒ 它只是本地 id, 服务端没有对应任务。
+            ParsedTaskList::Parsed(None) => ServerTaskProbe::Absent,
+            ParsedTaskList::Unparsable => ServerTaskProbe::Unknown,
+        },
+        Err(_) => ServerTaskProbe::Unknown,
+    }
+}
+
+/// 提交失败后的计费安全核对: 服务端到底有没有这一次的任务?
+fn probe_server_task(
+    executable: &str,
+    reported_submit_id: Option<&str>,
+    baseline: &TaskListSnapshot,
+    prompt: &str,
+    extra_env: &[(String, String)],
+) -> ServerTaskProbe {
+    if let Some(submit_id) = reported_submit_id {
+        let probed = probe_reported_submit_id(executable, submit_id, extra_env);
+        // 精确命中说明这个 id 确实是服务端任务, 直接采信。
+        if matches!(probed, ServerTaskProbe::Exists { .. }) {
+            return probed;
+        }
+    }
+    diff_task_snapshots(baseline, &read_task_snapshot(executable, extra_env), prompt)
+}
+
+/// 把即梦 CLI 的原始英文报错翻成用户能照着做的中文说明; 未命中已知模式返回 None。
+fn humanize_jimeng_failure(reason: &str) -> Option<&'static str> {
+    let lowered = reason.to_ascii_lowercase();
+    if lowered.contains("applyimageupload")
+        || lowered.contains("upload resource")
+        || lowered.contains("apply phase")
+    {
+        return Some(
+            "说明: 卡在「参考图上传到字节图床」这一步, 还没进入生成阶段, 与提示词、素材内容无关。\n\
+             建议: ① 把代理切到「全局 / TUN」模式, 或确认代理规则覆盖 http(80) 端口;\
+             ② 换个网络(如手机热点)重试; ③ 参考图先减到 1~2 张再试; \
+             ④ 若长期失败, 到「设置 - 密钥 - 即梦 CLI」重新登录一次。",
+        );
+    }
+    if lowered.contains("fail_to_fetch_task")
+        && (reason.contains("审核")
+            || lowered.contains("moderation")
+            || lowered.contains("sensitive")
+            || lowered.contains("review"))
+    {
+        return Some(
+            "说明: 本次请求被上游内容审核拦截。\n\
+             建议: 调整参考素材或提示词描述(如虚化商标与文字、减少真人面部特写描述)后重试。",
+        );
+    }
+    if lowered.contains("creditpredeductnotenough") || reason.contains("积分不足") {
+        return Some(
+            "说明: 即梦账户积分不足, 任务在「预扣积分」这一步就被拒了 —— 任务没有创建成功, 也没有扣费。\n             建议: 在终端运行 `dreamina user_credit` 查看余额, 到即梦账户补充积分或开通会员后重试。",
+        );
+    }
+    if lowered.contains("aigccomplianceconfirmationrequired") {
+        return Some(
+            "说明: 该模型首次使用需要在即梦 Web 端先完成一次合规确认(官方 CLI 说明里的 AigcComplianceConfirmationRequired)。\n             建议: 打开即梦官网, 用同一个模型先成功生成一次, 之后 CLI 就能正常提交。",
+        );
+    }
+    if lowered.contains("not login")
+        || lowered.contains("unauthorized")
+        || lowered.contains("invalid token")
+        || reason.contains("未登录")
+    {
+        return Some(
+            "说明: 即梦 CLI 的登录态已失效。\n建议: 到「设置 - 密钥 - 即梦 CLI」重新登录后再试。",
+        );
+    }
+    None
+}
+
+/// 把报错里的临时目录折叠掉: `C:\...\Temp\lentalk-jimeng-cli-<uuid>\image-1.png`
+/// 这种路径会淹没真正的原因, 换成「参考图 image-1.png」即可。
+fn condense_upload_paths(reason: &str) -> String {
+    const MARKER: &str = "lentalk-jimeng-cli-";
+    let mut out = String::with_capacity(reason.len());
+    let mut rest = reason;
+    while let Some(index) = rest.find(MARKER) {
+        // 左边界: 向前吃掉路径与盘符, 停在引号/空白/括号处(路径里的 `:` 不算边界,
+        // 否则会停在 `C:` 上把剩下的盘符路径留在消息里)。
+        let head_cut = rest[..index]
+            .char_indices()
+            .rev()
+            .find(|&(_, character)| matches!(character, '"' | '\'' | ' ' | '(' | '[' | '=' | '\n'))
+            .map(|(position, character)| position + character.len_utf8())
+            .unwrap_or(0);
+        out.push_str(&rest[..head_cut]);
+        let tail = &rest[index..];
+        let end = tail
+            .char_indices()
+            .find(|&(_, character)| matches!(character, '"' | '\'' | ' ' | '\n' | '\r'))
+            .map(|(position, _)| position)
+            .unwrap_or(tail.len());
+        // 报错里的路径是 JSON 转义过的, 结尾的 `\"` 会在文件名后留下一个反斜杠,
+        // 直接按分隔符切会切出空文件名 —— 先去掉尾部分隔符再取最后一段。
+        let segment = tail[..end].trim_end_matches(|character| character == '/' || character == '\\');
+        let file_name = segment
+            .rsplit(|character| character == '/' || character == '\\')
+            .next()
+            .unwrap_or(segment);
+        out.push_str(&format!("参考图 {file_name}"));
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// DNS + TCP 探测上传服务的 80 / 443 端口, 区分三种情况:
+/// 完全不通(本机网络/代理)、只有 443 通(明文 http 被漏掉)、都通(上游偶发抖动)。
+fn probe_upload_host(timeout: Duration) -> String {
+    let http_reachable = tcp_reachable(JIMENG_UPLOAD_HOST, 80, timeout);
+    let https_reachable = tcp_reachable(JIMENG_UPLOAD_HOST, 443, timeout);
+    match (http_reachable, https_reachable) {
+        (false, false) => format!(
+            "诊断: 本机到 {JIMENG_UPLOAD_HOST} 的 80 与 443 都不通, 问题出在本机网络或代理, 请按下面的建议处理。"
+        ),
+        (false, true) => format!(
+            "诊断: {JIMENG_UPLOAD_HOST} 的 443 可通、80 不通 —— 即梦 CLI 上传参考图走的正是明文 http, 这多半就是失败原因。把代理切到「全局 / TUN」模式或放行 80 端口后重试。"
+        ),
+        (true, false) => format!(
+            "诊断: {JIMENG_UPLOAD_HOST} 的 80 可通、443 不通, 本机网络策略可能限制了 https, 建议换网络重试。"
+        ),
+        (true, true) => format!(
+            "诊断: 本机到 {JIMENG_UPLOAD_HOST} 的 80 / 443 都可达, 上传超时更像是上游偶发抖动, 稍后重试通常可恢复。"
+        ),
+    }
+}
+
+/// DNS 解析 + TCP 连接。`to_socket_addrs` / `connect_timeout` 都是阻塞调用,
+/// 只在这条失败诊断路径上使用(在 spawn_blocking 线程里, 不会卡住异步运行时)。
+fn tcp_reachable(host: &str, port: u16, timeout: Duration) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(addresses) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addresses
+        .filter_map(|address| TcpStream::connect_timeout(&address, timeout).ok())
+        .next()
+        .is_some()
+}
+
+/// 第一次瞬时失败时的诊断文本: 探测上传服务是否可达 + 找出可用的系统代理。
+fn describe_submit_failure_context(proxy_env: &[(String, String)]) -> String {
+    let mut lines = Vec::new();
+    match proxy_env.iter().find(|(key, _)| key == "HTTP_PROXY") {
+        Some((_, value)) => lines.push(format!(
+            "诊断: 检测到系统代理 {value}, 调用时已让即梦 CLI 走该代理(它默认不读 Windows 系统代理)。"
+        )),
+        None => lines.push("诊断: 未检测到可用的系统代理, 重试仍按直连进行。".to_string()),
+    }
+    lines.push(probe_upload_host(Duration::from_millis(2_500)));
+    lines.join("\n")
+}
+
+/// 官方排障指引: 报错的完整描述在 CLI 日志里, 且很多问题升级 CLI 后即可解决。
+///
+/// 附在每条失败信息末尾, 用户就不会「哪里错了都不知道」——尤其当报错来自 CLI
+/// 内部(比如上传阶段)而不是我们自己的链路时。
+fn cli_log_hint() -> String {
+    let logs = current_user_home()
+        .map(|home| home.join(".dreamina_cli").join("logs").display().to_string())
+        .unwrap_or_else(|| "~/.dreamina_cli/logs/".to_string());
+    format!(
+        "参考: 即梦 CLI 的完整运行日志在 {logs}; 按官方指引, 先保留出错的命令, 再对照该日志, \
+         并优先把 CLI 升级到最新版后重试(很多问题在新版本已修复)。"
+    )
+}
+
+/// 提交即梦 CLI 任务。
+///
+/// 失败时**先向服务端核对这次的任务有没有被创建**(即梦的生成任务一创建就预缴积分),
+/// 只有确认没有才可能重试; 若发现任务其实已经建好(例如提交请求超时但服务端收到了),
+/// 就直接接管它继续查询 —— 既不重复下单, 也不丢掉这个已经扣过费的任务。
+fn submit_jimeng_command(
+    app: &AppHandle,
+    client_job_id: Option<&str>,
+    executable: &str,
+    arguments: &[String],
+    label: &str,
+) -> Result<String, String> {
+    let mut attempt = 0u32;
+    let mut proxy_env: Vec<(String, String)> = Vec::new();
+    let mut diagnosis: Option<String> = None;
+    let prompt = prompt_from_arguments(arguments);
+    // 提交前的服务端基线: 失败后用它判断有没有新任务冒出来(有 ⇒ 已扣费, 不能重试)。
+    let mut baseline = read_task_snapshot(executable, &proxy_env);
+
+    loop {
+        attempt += 1;
+        let outcome = run_cli_with_timeout_env(
+            executable,
+            arguments,
+            CLI_SUBMIT_COMMAND_TIMEOUT,
+            &proxy_env,
+        );
+
+        let failure_reason = match &outcome {
+            Ok(output) if !is_failed(output) => return Ok(output.clone()),
+            Ok(output) => output_summary(output),
+            Err(message) => message.clone(),
+        };
+        let reported_submit_id = match &outcome {
+            Ok(output) => extract_field(output, &["submit_id", "submitId"]),
+            Err(_) => None,
+        };
+
+        // 第一次失败时先把系统代理解析出来, 之后的核对与重试都走同一条网络。
+        if diagnosis.is_none() {
+            proxy_env = resolve_cli_proxy_env();
+        }
+        let probe =
+            probe_server_task(executable, reported_submit_id.as_deref(), &baseline, &prompt, &proxy_env);
+
+        // 服务端已经有这次的任务: 绝不再提交 —— 生成任务一创建就预缴积分, 重试等于重复下单。
+        if let ServerTaskProbe::Exists { submit_id, failed } = &probe {
+            if !*failed {
+                // 任务已建好, 只是提交请求没拿到回执: 直接接管它, 不重复下单也不丢任务。
+                return Ok(format!("submit_id={submit_id}"));
+            }
+            let mut message = format!(
+                "即梦 CLI {label}失败(submit_id={submit_id} 已在服务端存在, 已跳过自动重试以免重复扣费): {}",
+                condense_upload_paths(&failure_reason)
+            );
+            message.push('\n');
+            message.push_str(&describe_submit_failure_context(&proxy_env));
+            if let Some(hint) = humanize_jimeng_failure(&failure_reason) {
+                message.push('\n');
+                message.push_str(hint);
+            }
+            message.push('\n');
+            message.push_str(&cli_log_hint());
+            return Err(message);
+        }
+
+        if !decide_submit_retry(&probe, &failure_reason) {
+            let mut message = if failure_reason.starts_with("即梦 CLI") {
+                failure_reason
+            } else {
+                format!("即梦 CLI {label}生成失败: {failure_reason}")
+            };
+            // 这一类失败(参数错、审核拦截、无法核实的超时等)原来只回一句原始错误,
+            // 补上中文说明与官方日志位置, 用户才知道下一步该做什么。
+            if let Some(hint) = humanize_jimeng_failure(&message) {
+                message.push('\n');
+                message.push_str(hint);
+            }
+            message.push('\n');
+            message.push_str(&cli_log_hint());
+            return Err(message);
+        }
+        if attempt >= JIMENG_SUBMIT_MAX_ATTEMPTS {
+            let mut message = format!(
+                "即梦 CLI {label}生成失败(提交阶段网络超时, 已自动重试 {} 次): {}",
+                JIMENG_SUBMIT_MAX_ATTEMPTS - 1,
+                condense_upload_paths(&failure_reason),
+            );
+            if let Some(note) = diagnosis {
+                message.push('\n');
+                message.push_str(&note);
+            }
+            if let Some(hint) = humanize_jimeng_failure(&failure_reason) {
+                message.push('\n');
+                message.push_str(hint);
+            }
+            message.push('\n');
+            message.push_str(&cli_log_hint());
+            return Err(message);
+        }
+
+        // 诊断文本只在第一次失败时生成一次, 既用于最终报错, 也说明下一次重试走的网络。
+        if diagnosis.is_none() {
+            diagnosis = Some(describe_submit_failure_context(&proxy_env));
+        }
+        emit_cli_task_status(
+            app,
+            client_job_id,
+            "",
+            "retrying",
+            None,
+            Some(format!(
+                "参考图上传超时, 正在自动重试(第 {}/{} 次)",
+                attempt + 1,
+                JIMENG_SUBMIT_MAX_ATTEMPTS
+            )),
+        );
+        let index = ((attempt - 1) as usize).min(JIMENG_SUBMIT_RETRY_BACKOFF_MS.len() - 1);
+        thread::sleep(Duration::from_millis(JIMENG_SUBMIT_RETRY_BACKOFF_MS[index]));
+        // 刷新基线: 下一轮失败时以「这一轮之前」的服务端状态做比对。
+        baseline = read_task_snapshot(executable, &proxy_env);
     }
 }
 
@@ -489,12 +1037,23 @@ fn run_cli_with_timeout(
     arguments: &[String],
     timeout: Duration,
 ) -> Result<String, String> {
+    run_cli_with_timeout_env(executable, arguments, timeout, &[])
+}
+
+/// 与 `run_cli_with_timeout` 相同, 但可追加环境变量 —— 重试时用它把系统代理显式传给
+/// 即梦 CLI(它不读 Windows 系统代理, 只认 `HTTP_PROXY` / `HTTPS_PROXY`)。
+fn run_cli_with_timeout_env(
+    executable: &str,
+    arguments: &[String],
+    timeout: Duration,
+    extra_env: &[(String, String)],
+) -> Result<String, String> {
     let lock = JIMENG_CLI_PROCESS_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .map_err(|_| "即梦 CLI 调用锁异常，请重启应用后重试".to_string())?;
     let resolved = resolve_executable(executable)?;
-    let mut command = build_cli_command(&resolved);
+    let mut command = build_cli_command(&resolved, extra_env);
     #[cfg(target_os = "windows")]
     if is_windows_script(&resolved) {
         // cmd.exe /S /C requires an extra pair of quotes around the complete
@@ -559,7 +1118,7 @@ fn run_cli_with_timeout(
 /// GUI applications inherit a minimal environment. Keep the CLI's user
 /// profile and executable search paths explicit so its credential backend and
 /// helper commands behave the same as when launched from a terminal.
-fn build_cli_command(resolved: &str) -> Command {
+fn build_cli_command(resolved: &str, extra_env: &[(String, String)]) -> Command {
     #[cfg(target_os = "windows")]
     let mut command = if is_windows_script(resolved) {
         let command = Command::new("cmd.exe");
@@ -591,7 +1150,121 @@ fn build_cli_command(resolved: &str) -> Command {
         // Avoid an invalid working directory inherited from a desktop shell.
         command.current_dir(home);
     }
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     command
+}
+
+/// 把 Windows 系统代理(WinINET 设置)翻译成即梦 CLI 认的环境变量。
+///
+/// 即梦 CLI 只认 `HTTP_PROXY` / `HTTPS_PROXY`, **不读** Windows 系统代理; 而它上传
+/// 参考图用的是明文 `http://` 地址, 很多代理规则只覆盖 https 就漏掉了这一步。这里把
+/// 系统代理显式传给子进程, 让 CLI 和浏览器走同一条网络。
+///
+/// 只在「上一次提交因网络问题失败」后调用, 不进入正常路径。
+#[cfg(target_os = "windows")]
+fn resolve_cli_proxy_env() -> Vec<(String, String)> {
+    // 应用本身就是带着代理变量启动的: 子进程默认继承环境, 不要覆盖用户的选择。
+    if std::env::var_os("HTTP_PROXY").is_some() || std::env::var_os("http_proxy").is_some() {
+        return Vec::new();
+    }
+    let Some((http, https)) = read_windows_system_proxy() else {
+        return Vec::new();
+    };
+    vec![
+        ("HTTP_PROXY".to_string(), proxy_url(&http)),
+        ("HTTPS_PROXY".to_string(), proxy_url(&https)),
+        ("NO_PROXY".to_string(), "localhost,127.0.0.1,::1".to_string()),
+    ]
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_cli_proxy_env() -> Vec<(String, String)> {
+    // macOS / Linux 的系统代理同样不被即梦 CLI 识别, 但读取方式不同, 本次未覆盖。
+    Vec::new()
+}
+
+/// 统一成 `http://host:port`: HTTPS 目标也是走 HTTP CONNECT, 这是各代理客户端通用的写法。
+#[cfg(target_os = "windows")]
+fn proxy_url(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+/// 解析注册表里的 `ProxyServer`: 既可能是裸的 `host:port`, 也可能是
+/// `http=host:port;https=host:port`。同一个代理同时覆盖两种协议时, 缺失的一侧回落到另一侧。
+#[cfg(target_os = "windows")]
+fn parse_system_proxy_server(raw: &str) -> Option<(String, String)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if !raw.contains('=') {
+        return Some((raw.to_string(), raw.to_string()));
+    }
+    let mut http = None;
+    let mut https = None;
+    for entry in raw.split(';') {
+        let mut parts = entry.splitn(2, '=');
+        let Some(scheme) = parts.next() else {
+            continue;
+        };
+        let value = parts.next().unwrap_or("").trim();
+        if value.is_empty() {
+            continue;
+        }
+        match scheme.trim().to_ascii_lowercase().as_str() {
+            "http" => http = Some(value.to_string()),
+            "https" => https = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    match (http, https) {
+        (Some(http), Some(https)) => Some((http, https)),
+        (Some(http), None) => Some((http.clone(), http)),
+        (None, Some(https)) => Some((https.clone(), https)),
+        (None, None) => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_system_proxy() -> Option<(String, String)> {
+    const INTERNET_SETTINGS: &str =
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let mut command = Command::new("reg");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command.args(["query", INTERNET_SETTINGS]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut enabled = false;
+    let mut server = None;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let _kind = parts.next();
+        let Some(value) = parts.next() else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("ProxyEnable") {
+            let value = value.trim();
+            enabled = value != "0x0" && value != "0";
+        } else if name.eq_ignore_ascii_case("ProxyServer") {
+            server = Some(value.trim().to_string());
+        }
+    }
+    if !enabled {
+        return None;
+    }
+    parse_system_proxy_server(server.as_deref()?)
 }
 
 #[cfg(target_os = "windows")]
@@ -1246,7 +1919,211 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
         assert_eq!(extract_json_object("尚未登录, 请先执行 dreamina login"), None);
         assert_eq!(extract_json_object(""), None);
     }
+
+    #[test]
+    fn upload_deadline_exceeded_retries_only_without_a_server_task() {
+        // 真实报文: 上传参考图的 apply 阶段超时。
+        let reason = r#"gen_status="fail", fail_reason="upload resource \"C:\\Users\\A\\AppData\\Local\\Temp\\lentalk-jimeng-cli-6ce178c8-5000-4729-a0dc-ddb99119e4b2\\image-1.png\": upload image: apply phase, ApplyImageUpload: do request, Get \"http://imagex.bytedanceapi.com/?Action=ApplyImageUpload&NeedFallback=true&UploadNum=1\": context deadline exceeded""#;
+
+        assert!(is_presubmit_failure(reason));
+        assert!(is_transient_submit_failure(reason));
+        // 服务端确认没有这次的任务 ⇒ 可以重试。
+        assert!(decide_submit_retry(&ServerTaskProbe::Absent, reason));
+        // 情况不明, 但报错证明卡在 submit 之前的上传阶段 ⇒ 仍然安全。
+        assert!(decide_submit_retry(&ServerTaskProbe::Unknown, reason));
+        // 服务端已有这次的任务 ⇒ 已预缴积分, 绝不重试。
+        assert!(!decide_submit_retry(
+            &ServerTaskProbe::Exists { submit_id: "t".into(), failed: false },
+            reason
+        ));
+    }
+
+    #[test]
+    fn content_moderation_is_not_retryable() {
+        let reason = "gen_status=\"fail\", fail_reason=\"炳火 API 请求失败: HTTP 500 fail_to_fetch_task 参考素材或提示词触发了上游内容审核\"";
+
+        assert!(!is_transient_submit_failure(reason));
+        assert!(!is_presubmit_failure(reason));
+        assert!(!decide_submit_retry(&ServerTaskProbe::Absent, reason));
+        assert!(!decide_submit_retry(&ServerTaskProbe::Unknown, reason));
+        assert!(humanize_jimeng_failure(reason).is_some_and(|hint| hint.contains("内容审核")));
+    }
+
+    #[test]
+    fn unknown_phase_failure_without_network_signal_never_retries() {
+        // 提交超时(我们自己的 5 分钟)既不能证明任务没建好, 也不是网络抖动特征 ——
+        // 重试还要再等 5 分钟, 且可能是重复下单, 所以一律不重试。
+        let reason = "即梦 CLI 命令超过 300 秒未返回, 已终止";
+
+        assert!(!is_presubmit_failure(reason));
+        assert!(!is_transient_submit_failure(reason));
+        assert!(!decide_submit_retry(&ServerTaskProbe::Unknown, reason));
+        assert!(!decide_submit_retry(&ServerTaskProbe::Absent, reason));
+    }
+
+    #[test]
+    fn parse_task_list_reads_newest_entry() {
+        // 真实 `list_task --limit=1` 输出(节选, 字段保持原样)。
+        let output = r#"[
+  {
+    "submit_id": "5b99bb21-70dc-4bb9-becc-0e314a4c33d2",
+    "prompt": "SCENE CONTEXT 藏医诊所，8秒真人实景质感短片。",
+    "gen_task_type": "multimodal2video",
+    "gen_status": "fail",
+    "fail_reason": "api error: ret=1006, message=CreditPreDeductNotEnough, logid=20260923163929192168003026079BF8C"
+  }
+]"#;
+
+        let ParsedTaskList::Parsed(Some(entry)) = parse_task_list(output) else {
+            panic!("应能解析出任务");
+        };
+        assert_eq!(entry.submit_id, "5b99bb21-70dc-4bb9-becc-0e314a4c33d2");
+        assert!(entry.failed);
+        assert!(entry.prompt.starts_with("SCENE CONTEXT"));
+    }
+
+    #[test]
+    fn parse_task_list_treats_empty_list_as_no_task() {
+        // 关键实证: 用户报错里那个 submit_id 拿去精确查询返回 `[]` —— 它不是服务端任务。
+        assert_eq!(
+            parse_task_list("[]"),
+            ParsedTaskList::Parsed(None)
+        );
+        // CLI 报错文案(而非 JSON)必须被识别为「查不动」, 不能当成「没有任务」。
+        assert_eq!(
+            parse_task_list("尚未登录, 请先执行 dreamina login"),
+            ParsedTaskList::Unparsable
+        );
+    }
+
+    #[test]
+    fn diff_detects_new_task_of_the_same_submission() {
+        let prompt = "SCENE CONTEXT 苗医馆内，一名苗族男子坐在桌后，对镜头口播，全程中景，十秒真人实景。";
+        let before = TaskListSnapshot::Read(Some(TaskEntry {
+            submit_id: "old-task".into(),
+            failed: false,
+            prompt: "上一单的提示词".into(),
+        }));
+        let after = TaskListSnapshot::Read(Some(TaskEntry {
+            submit_id: "new-task".into(),
+            failed: false,
+            prompt: prompt.into(),
+        }));
+
+        assert_eq!(
+            diff_task_snapshots(&before, &after, prompt),
+            ServerTaskProbe::Exists { submit_id: "new-task".into(), failed: false }
+        );
+        // 最新任务没变 ⇒ 没有新任务。
+        assert_eq!(
+            diff_task_snapshots(&before, &before, prompt),
+            ServerTaskProbe::Absent
+        );
+        // 快照读不到 ⇒ 不冒险。
+        assert_eq!(
+            diff_task_snapshots(&TaskListSnapshot::Unavailable, &after, prompt),
+            ServerTaskProbe::Unknown
+        );
+    }
+
+    #[test]
+    fn foreign_task_is_not_treated_as_ours() {
+        // 画布上别的节点并发提交时, 最新任务会变, 但提示词对不上 —— 不能认领。
+        let prompt = "SCENE CONTEXT 苗医馆内，一名苗族男子坐在桌后，对镜头口播，全程中景，十秒真人实景。";
+        let before = TaskListSnapshot::Read(Some(TaskEntry {
+            submit_id: "old-task".into(),
+            failed: false,
+            prompt: "上一单的提示词".into(),
+        }));
+        let after = TaskListSnapshot::Read(Some(TaskEntry {
+            submit_id: "other-node-task".into(),
+            failed: false,
+            prompt: "另一个节点的完全不同的提示词内容，用于验证不会被误认领成我们这一单。".into(),
+        }));
+
+        assert_eq!(
+            diff_task_snapshots(&before, &after, prompt),
+            ServerTaskProbe::Unknown
+        );
+    }
+
+    #[test]
+    fn humanize_covers_credit_and_compliance_failures() {
+        // 真实报文: 积分不足导致预扣失败。
+        assert!(humanize_jimeng_failure(
+            "gen_status=\"fail\", fail_reason=\"api error: ret=1006, message=CreditPreDeductNotEnough, logid=2026\""
+        )
+        .is_some_and(|hint| hint.contains("积分不足")));
+        assert!(humanize_jimeng_failure("api error: AigcComplianceConfirmationRequired")
+            .is_some_and(|hint| hint.contains("合规确认")));
+    }
+
+    #[test]
+    fn prompt_is_read_from_submit_arguments() {
+        let arguments = vec![
+            "multimodal2video".to_string(),
+            "--prompt=一段测试用的提示词".to_string(),
+            "--duration=5".to_string(),
+        ];
+        assert_eq!(prompt_from_arguments(&arguments), "一段测试用的提示词");
+        assert_eq!(prompt_from_arguments(&["text2image".to_string()]), "");
+    }
+
+    #[test]
+    fn log_hint_points_to_cli_log_directory() {
+        // 官方排障指引要求让用户能对照 CLI 自己的日志, 所以失败信息里必须带出该目录。
+        let hint = cli_log_hint();
+        assert!(hint.contains(".dreamina_cli"), "实际: {hint}");
+        assert!(hint.contains("logs"), "实际: {hint}");
+    }
+
+    #[test]
+    fn condenses_upload_temp_path() {
+        // 真实报文里路径是 JSON 转义过的: 文件名后面紧跟着 `\"`, 那个反斜杠不是路径分隔符。
+        let reason = r#"fail_reason="upload resource \"C:\\Users\\A\\AppData\\Local\\Temp\\lentalk-jimeng-cli-6ce\\image-1.png\": upload image""#;
+
+        let condensed = condense_upload_paths(reason);
+
+        assert!(condensed.contains("参考图 image-1.png"));
+        assert!(!condensed.contains("lentalk-jimeng-cli-"));
+        assert!(!condensed.contains("AppData"));
+        // 未转义(路径直接写在引号里)的写法同样要折叠对。
+        assert_eq!(
+            condense_upload_paths(
+                r#"upload resource "C:\Users\A\Temp\lentalk-jimeng-cli-9\image-3.png": upload image"#
+            ),
+            r#"upload resource "参考图 image-3.png": upload image"#
+        );
+    }
+
+    #[test]
+    fn humanize_covers_upload_and_login_failures() {
+        assert!(humanize_jimeng_failure("ApplyImageUpload: do request: context deadline exceeded")
+            .is_some_and(|hint| hint.contains("参考图上传")));
+        assert!(humanize_jimeng_failure("status_code=401, unauthorized, not login")
+            .is_some_and(|hint| hint.contains("重新登录")));
+        // 已知的参数校验错误不该套上「网络有问题」的说明。
+        assert!(humanize_jimeng_failure("image_resource_id_list length is 10, should be <= 9").is_none());
+        assert!(!is_transient_submit_failure("image_resource_id_list length is 10, should be <= 9"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_system_proxy_server_formats() {
+        assert_eq!(
+            parse_system_proxy_server("127.0.0.1:7890"),
+            Some(("127.0.0.1:7890".to_string(), "127.0.0.1:7890".to_string()))
+        );
+        assert_eq!(
+            parse_system_proxy_server("http=127.0.0.1:7890;https=127.0.0.1:7891"),
+            Some(("127.0.0.1:7890".to_string(), "127.0.0.1:7891".to_string()))
+        );
+        assert_eq!(parse_system_proxy_server(""), None);
+        assert_eq!(proxy_url("127.0.0.1:7890"), "http://127.0.0.1:7890");
+        assert_eq!(proxy_url("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
+    }
 }
+
 
 /// Clear the local Dreamina CLI OAuth login state.
 #[tauri::command]

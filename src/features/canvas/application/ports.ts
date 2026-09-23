@@ -234,6 +234,8 @@ export interface AiGateway {
     status: string;
     result: string | null;
     error: string | null;
+    /** 后端声明: 本次 `error` 只是诊断文本(网络抖动 / 5xx), 任务仍在平台侧生成。 */
+    transient?: boolean;
   }>;
   generateVideo: (payload: GenerateVideoPayload) => Promise<string>;
   /** 视频超分：本地视频先上传换 URL，提交后轮询取片。 */

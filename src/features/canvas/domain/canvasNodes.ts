@@ -206,6 +206,8 @@ export interface VideoGenNodeData extends NodeDisplayData {
   binghuoReferenceVideos?: string[];
   /** 炳火专用: 跳过真人审核(责任声明, 手册 3.8)。仅 bh 系(bh2.0-*, bh2.04K)生效。 */
   binghuoSkipReview?: boolean;
+  /** 当前视频节点发起的下游媒体任务；任务终态前禁止再次提交。 */
+  activeGenerationNodeId?: string | null;
 }
 
 export interface StoryboardFrameItem {
@@ -333,6 +335,14 @@ export interface CinematicStudioNodeData extends NodeDisplayData {
    * 用户在节点上点过中/英切换后才会固定下来，此后不再随画布语言漂移。
    */
   quickPromptLang?: "zh" | "en";
+  /**
+   * 「生成并创建视频」的进行中标记(时间戳 + 运行时会话 id)。
+   * 画布开了 onlyRenderVisibleElements, 节点移出视口会被卸载、局部 state 丢失,
+   * 按钮就会谎报空闲; 靠这两个字段把「生成中…」恢复回来, 并保证上一次运行的
+   * 残留标记不会锁住按钮(会话 id 不匹配即视为已结束)。
+   */
+  quickGenerationStartedAt?: number | null;
+  quickGenerationSessionId?: string | null;
   /** 图片提示词优化区：与视频提示词工作流分开保存。 */
   imagePromptDraft?: string;
   imagePromptResult?: string;

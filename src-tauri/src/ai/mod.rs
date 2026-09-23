@@ -100,6 +100,37 @@ pub trait AIProvider: Send + Sync {
             self.name()
         )))
     }
+
+    /// 视频任务是否支持「提交后落库、之后凭平台任务 ID 续查」。
+    ///
+    /// 支持时 `submit_generate_video_job` 会在提交后立刻把外部任务 ID 写进
+    /// ai_generation_jobs 并结束本地任务, 之后由 `poll_video_task` 续查。这样应用
+    /// 重启不会把仍在平台生成(且已计费)的任务判死, 用户也就不需要「重新提交」。
+    fn supports_video_task_resume(&self) -> bool {
+        false
+    }
+
+    /// 提交视频任务并返回平台侧句柄。仅当 `supports_video_task_resume` 为真时使用。
+    async fn submit_video_task(
+        &self,
+        _request: GenerateVideoRequest,
+    ) -> Result<ProviderTaskSubmission, AIError> {
+        Err(AIError::Provider(format!(
+            "Provider '{}' does not support resumable video submission",
+            self.name()
+        )))
+    }
+
+    /// 凭 `submit_video_task` 返回的句柄查询视频任务状态。
+    async fn poll_video_task(
+        &self,
+        _handle: ProviderTaskHandle,
+    ) -> Result<ProviderTaskPollResult, AIError> {
+        Err(AIError::Provider(format!(
+            "Provider '{}' does not support resumable video polling",
+            self.name()
+        )))
+    }
 }
 
 pub struct ProviderRegistry {

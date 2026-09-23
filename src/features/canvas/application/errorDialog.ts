@@ -30,6 +30,7 @@ function stringifyUnknown(value: unknown): string | undefined {
 }
 
 /** 余额不足错误的常见特征(大小写不敏感): OpenAI 兼容平台标准码 + 各平台变体 + 中文 */
+const JIMENG_CREDIT_PREDEDUCT_PATTERN = /creditpre[ _-]?deduct[ _-]?notenough/i;
 const BALANCE_INSUFFICIENT_PATTERNS = [
   /insufficient[ _-]?balance/i,
   /insufficient[ _-]?account[ _-]?balance/i,
@@ -106,6 +107,27 @@ export const BALANCE_INSUFFICIENT_MESSAGE =
   '余额不足：当前所选平台的账户余额/积分不足以完成本次生成。\n' +
   '请到对应平台（模型选择里显示的供应商）官网充值或购买积分后重试；刚充值过可稍等 1~2 分钟再试。';
 
+/** 即梦 CLI 预扣失败明确代表可用积分不足。 */
+export const JIMENG_CREDIT_INSUFFICIENT_MESSAGE =
+  '积分不足，请前往即梦充值后重试。';
+
+function resolveJimengCreditInsufficient(
+  message: string,
+  details: string | undefined
+): { message: string; details?: string } {
+  const combined = `${message} ${details ?? ''}`;
+  if (!JIMENG_CREDIT_PREDEDUCT_PATTERN.test(combined)) {
+    return { message, details };
+  }
+  const rawDetails = message && message !== JIMENG_CREDIT_INSUFFICIENT_MESSAGE
+    ? (details ? `${message}\n${details}` : message)
+    : details;
+  return {
+    message: JIMENG_CREDIT_INSUFFICIENT_MESSAGE,
+    details: rawDetails?.trim() || undefined,
+  };
+}
+
 /** 若命中余额不足, 把原始错误降级为 details, message 换成明确的充值提示 */
 function resolveBalanceInsufficient(
   message: string,
@@ -154,10 +176,11 @@ export function resolveErrorContent(error: unknown, fallbackMessage: string): Re
   }
 
   const balanceResolved = resolveBalanceInsufficient(resolved.message, resolved.details);
-  if (isImageEditsNetworkError(balanceResolved.message, balanceResolved.details)) {
-    return resolveImageEditsNetworkError(balanceResolved.message, balanceResolved.details);
+  const jimengResolved = resolveJimengCreditInsufficient(balanceResolved.message, balanceResolved.details);
+  if (isImageEditsNetworkError(jimengResolved.message, jimengResolved.details)) {
+    return resolveImageEditsNetworkError(jimengResolved.message, jimengResolved.details);
   }
-  return resolveProxyRequired65535NetworkError(balanceResolved.message, balanceResolved.details);
+  return resolveProxyRequired65535NetworkError(jimengResolved.message, jimengResolved.details);
 }
 
 export async function showErrorDialog(
@@ -172,9 +195,10 @@ export async function showErrorDialog(
   }
 
   const balanceResolved = resolveBalanceInsufficient(content, details?.trim() || undefined);
-  const resolved = isImageEditsNetworkError(balanceResolved.message, balanceResolved.details)
-    ? resolveImageEditsNetworkError(balanceResolved.message, balanceResolved.details)
-    : resolveProxyRequired65535NetworkError(balanceResolved.message, balanceResolved.details);
+  const jimengResolved = resolveJimengCreditInsufficient(balanceResolved.message, balanceResolved.details);
+  const resolved = isImageEditsNetworkError(jimengResolved.message, jimengResolved.details)
+    ? resolveImageEditsNetworkError(jimengResolved.message, jimengResolved.details)
+    : resolveProxyRequired65535NetworkError(jimengResolved.message, jimengResolved.details);
   openGlobalErrorDialog({
     title,
     message: resolved.message,

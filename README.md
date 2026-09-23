@@ -47,9 +47,24 @@
 > 1. Tauri v2 依赖 Microsoft Edge WebView2 运行时，微软自 WebView2 110 / SDK 1.0.1519.0 起不再支持 Win7 与 8/8.1（109 是最后一个支持版本，已停止更新）；
 > 2. Rust 1.78+ 生成的程序依赖 Windows 10 才有的 `bcryptprimitives.dll!ProcessPrng`，在 Win7 上会直接报「无法定位程序输入点 ProcessPrng」，进程连启动阶段都进不去。
 
-应用内会检查 GitHub Releases 的最新正式版本，并在发现更新后直接打开当前系统对应的安装包下载链接。
+应用内置**自动更新**（Tauri updater + ed25519 签名校验）：启动后按「**自建更新源 → GitHub 镜像兜底**」的顺序
+检查新版本，签名校验通过后自动下载并安装，无需手动重装。分发链路与运维说明见
+[`deploy/ota-source/README.md`](./deploy/ota-source/README.md)。
 
-> macOS 首次打开若提示"无法验证开发者"，请在应用上右键 → 打开 → 仍要打开。
+> **macOS 首次打开被拦**：安装包未做 Apple 公证（详见下方说明），首次运行会被 Gatekeeper 挡住。
+>
+> - 提示「**无法验证开发者**」→ 在应用上右键 → **打开** → **仍要打开**（只需一次）。
+> - 提示「**"LenTalk"已损坏，无法打开。你应该将它移到废纸篓**」→ 右键那招无效，这是下载隔离标记（quarantine）导致的。执行一次：
+>
+>   ```bash
+>   sudo xattr -rd com.apple.quarantine /Applications/LenTalk.app
+>   ```
+>
+>   （装到别处就把路径换成实际位置；把它拖到终端窗口里可自动补全路径。校验是否已清除：`xattr -l /Applications/LenTalk.app` 应无输出。）
+>
+> 为什么要这样做：应用未购买 Apple 开发者证书（$99/年）与公证服务，属于个人分发。
+> **这不影响自动更新的安全性** —— 应用更新走 Tauri updater 自己的 ed25519 签名校验，与 Apple 公证是两套独立机制。
+> 每次发新版首次安装都需重复上述一次，之后的自动更新不需要。
 
 ## 🛠️ 本地开发
 
@@ -78,9 +93,22 @@ npm run tauri build
 
 产物位置：
 - macOS：`src-tauri/target/release/bundle/dmg/`
-- Windows：`src-tauri/target/release/bundle/nsis/` 与 `bundle/wix/`
+- Windows：`src-tauri/target/release/bundle/nsis/`（`.exe`）与 `bundle/msi/`（`.msi`）
 
-> 仓库已配置 [GitHub Actions](./.github/workflows/build-releases.yml)：推送 `v*` 标签或手动触发，自动在 Windows / macOS 云构建并发布安装包到 Releases。
+> 仓库已配置 [GitHub Actions](./.github/workflows/build-releases.yml)：推送 `v*` 标签或手动触发，
+> 自动在 Windows / macOS 云构建并发布安装包到 Releases。
+
+## 🚀 发布流程
+
+1. 同步改**五处**版本号：`package.json`、`package-lock.json`（顶层 + `packages[""]`）、
+   `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`
+2. 本机验证：`tsc` → `vitest` → `vite build` →（有 Rust 改动时）`cargo test --lib`
+3. 提交 + 打**附注 tag** `vX.Y.Z`，推送 `main` 与 tag
+4. CI 构建完成后核对 GitHub Release 资产**按平台成组**，并确认自建源三份根清单已切到新版本
+
+> ⚠️ 本机 `git push` 写通道不可用（`Connection was reset`），推送走 Git Data API。
+> 详细步骤、`--dry-run` 的「删除 0」判据、大文件与 OTA 同步的坑，见
+> [`deploy/ota-source/README.md`](./deploy/ota-source/README.md)。
 
 ## 🧰 技术栈
 

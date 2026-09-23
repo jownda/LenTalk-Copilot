@@ -77,6 +77,7 @@ import { SelectedNodeOverlay } from "./ui/SelectedNodeOverlay";
 import { NodeToolDialog } from "./ui/NodeToolDialog";
 import { ImageViewerModal } from "./ui/ImageViewerModal";
 import { saveMediaSourceWithDialog } from "./application/mediaDownload";
+import { shouldFailRunningVideoJob } from "./application/videoJobPolling";
 import { VideoFrameExtractDialog } from "./ui/VideoFrameExtractDialog";
 import { ShortcutSettingsDialog } from "./ui/ShortcutSettingsDialog";
 import { AssetLibraryPanel } from "@/features/library/AssetLibraryPanel";
@@ -324,6 +325,17 @@ const ALT_DRAG_COPY_Z_INDEX = 2000;
 const GENERATION_JOB_POLL_INTERVAL_MS = 1400;
 const CONNECTION_HANDLE_HIT_RADIUS = 18;
 
+interface ConnectionHandlePosition {
+  element: HTMLElement;
+  centerX: number;
+  centerY: number;
+}
+
+interface ConnectionHandleCache {
+  isDirty: boolean;
+  positions: ConnectionHandlePosition[];
+}
+
 interface GenerationStoryboardMetadata {
   gridRows: number;
   gridCols: number;
@@ -465,6 +477,12 @@ export function Canvas() {
 
   const wrapperRef = useRef<HTMLDivElement>(null);
   const nearbyConnectionHandleRef = useRef<HTMLElement | null>(null);
+  const nearbyConnectionHandleCacheRef = useRef<ConnectionHandleCache>({
+    isDirty: true,
+    positions: [],
+  });
+  const nearbyConnectionHandleFrameRef = useRef<number | null>(null);
+  const pendingNearbyConnectionPointerRef = useRef<{ x: number; y: number } | null>(null);
   const suppressNextPaneClickRef = useRef(false);
   // 框选成功后的 click/dblclick 抑制时间窗(ms 时间戳)。
   // 必须用 ref 而非 effect 闭包变量: setNodes 会触发 store 更新导致 effect 重建, 闭包变量值会丢失。
@@ -572,6 +590,9 @@ export function Canvas() {
       if (groupDragFeedbackTimerRef.current !== null) {
         window.clearTimeout(groupDragFeedbackTimerRef.current);
       }
+      if (nearbyConnectionHandleFrameRef.current !== null) {
+        window.cancelAnimationFrame(nearbyConnectionHandleFrameRef.current);
+      }
     },
     [],
   );
@@ -595,26 +616,51 @@ export function Canvas() {
     moved: boolean;
   } | null>(null);
 
+  const invalidateNearbyConnectionHandleCache = useCallback(() => {
+    const cache = nearbyConnectionHandleCacheRef.current;
+    cache.isDirty = true;
+    nearbyConnectionHandleRef.current?.classList.remove("connection-handle-nearby");
+    nearbyConnectionHandleRef.current = null;
+  }, []);
+
   const resolveNearbyConnectionHandle = useCallback((clientX: number, clientY: number): HTMLElement | null => {
     const wrapper = wrapperRef.current;
     if (!wrapper) {
       return null;
     }
 
-    let nearestHandle: HTMLElement | null = null;
-    let nearestDistance = CONNECTION_HANDLE_HIT_RADIUS;
-    const handles = wrapper.querySelectorAll<HTMLElement>(".react-flow__handle.connectable.connectablestart");
+    const cache = nearbyConnectionHandleCacheRef.current;
+    if (cache.isDirty) {
+      const positions: ConnectionHandlePosition[] = [];
+      const handles = wrapper.querySelectorAll<HTMLElement>(".react-flow__handle.connectable.connectablestart");
 
-    handles.forEach((handle) => {
-      const rect = handle.getBoundingClientRect();
-      const distance = Math.hypot(clientX - (rect.left + rect.width / 2), clientY - (rect.top + rect.height / 2));
+      for (const handle of handles) {
+        const rect = handle.getBoundingClientRect();
+        positions.push({
+          element: handle,
+          centerX: rect.left + rect.width / 2,
+          centerY: rect.top + rect.height / 2,
+        });
+      }
+
+      cache.positions = positions;
+      cache.isDirty = false;
+    }
+
+    let nearestHandle: ConnectionHandlePosition | null = null;
+    let nearestDistance = CONNECTION_HANDLE_HIT_RADIUS;
+    for (const handle of cache.positions) {
+      if (!handle.element.isConnected) {
+        continue;
+      }
+      const distance = Math.hypot(clientX - handle.centerX, clientY - handle.centerY);
       if (distance <= nearestDistance) {
         nearestDistance = distance;
         nearestHandle = handle;
       }
-    });
+    }
 
-    return nearestHandle;
+    return nearestHandle?.element ?? null;
   }, []);
 
   const updateNearbyConnectionHandle = useCallback(
@@ -633,7 +679,25 @@ export function Canvas() {
 
   const handleCanvasMouseMoveCapture = useCallback(
     (event: ReactMouseEvent) => {
-      updateNearbyConnectionHandle(event.clientX, event.clientY);
+      // Nearby-handle hit testing is only needed before a connection starts.
+      // Skipping it while a pointer button is down avoids scanning every
+      // connectable handle during node drags on large canvases.
+      if (event.buttons !== 0) {
+        return;
+      }
+
+      pendingNearbyConnectionPointerRef.current = { x: event.clientX, y: event.clientY };
+      if (nearbyConnectionHandleFrameRef.current !== null) {
+        return;
+      }
+
+      nearbyConnectionHandleFrameRef.current = window.requestAnimationFrame(() => {
+        nearbyConnectionHandleFrameRef.current = null;
+        const pointer = pendingNearbyConnectionPointerRef.current;
+        if (pointer) {
+          updateNearbyConnectionHandle(pointer.x, pointer.y);
+        }
+      });
     },
     [updateNearbyConnectionHandle],
   );
@@ -654,6 +718,10 @@ export function Canvas() {
         return;
       }
 
+      if (nearbyConnectionHandleFrameRef.current !== null) {
+        window.cancelAnimationFrame(nearbyConnectionHandleFrameRef.current);
+        nearbyConnectionHandleFrameRef.current = null;
+      }
       const handle = updateNearbyConnectionHandle(event.clientX, event.clientY);
       if (!handle) {
         return;
@@ -1361,13 +1429,79 @@ export function Canvas() {
       activeVideoRecoveryNodeIdsRef.current.add(pendingNode.id);
       void (async () => {
         try {
-          for (let attempts = 0; recoveryMountedRef.current && attempts < 900; attempts += 1) {
+          // 视频任务状态已由后端落库, 但画布仍需要足够宽的观察窗: 知鸟官方口径
+          // p90 为 55~75 分钟, 原来的 900×2s=30 分钟会把长任务误判成"没结果"。
+          //
+          // 视频任务现在是可以跨重启续查的(后端已落平台 task_id), 而 provider 的
+          // 密钥在后端是内存态: 应用重启后若不先推送一次, 续查会因为缺 key 而查不动,
+          // 平台任务照跑照计费、结果却收不回。密钥可能晚于任务就绪, 所以放在循环内
+          // 重试, 拿到即止, 不会每轮都发 IPC。
+          let providerKeyPushed = false;
+          for (let attempts = 0; recoveryMountedRef.current; attempts += 1) {
             const node = useCanvasStore.getState().nodes.find((item) => item.id === pendingNode.id);
             const data = node?.data as Record<string, unknown> | undefined;
             const jobId = typeof data?.generationJobId === "string" ? data.generationJobId : "";
             if (!node || !jobId || data?.isGenerating !== true) return;
-            const status = await canvasAiGateway.getGenerateVideoJob(jobId);
+            if (!providerKeyPushed) {
+              const providerIdForPoll = typeof data?.generationProviderId === "string" ? data.generationProviderId : "";
+              const providerApiKey = providerIdForPoll
+                ? (useSettingsStore.getState().apiKeys[providerIdForPoll] ?? "")
+                : "";
+              if (providerApiKey) {
+                await canvasAiGateway.setApiKey(providerIdForPoll, providerApiKey).catch((error) => {
+                  console.warn("[VideoGenerationJob] set_api_key failed before poll", {
+                    nodeId: pendingNode.id,
+                    providerIdForPoll,
+                    error,
+                  });
+                });
+                providerKeyPushed = true;
+              }
+            }
+            const status = await canvasAiGateway.getGenerateVideoJob(jobId).catch((error) => {
+              // 临时 IPC/网络异常不能当作平台终态失败，否则已扣费的任务会被错误清掉 job id。
+              console.warn("[VideoGenerationJob] poll failed; retaining resumable task", {
+                nodeId: pendingNode.id,
+                jobId,
+                error,
+              });
+              return null;
+            });
+            if (!status) {
+              await sleep(2_000);
+              continue;
+            }
             if (status.status === "running" || status.status === "queued") {
+              // 后端已把「任务仍在跑, 这次查询只是临时失败(网络抖动 / 5xx)」显式标成
+              // transient —— 此时 `error` 里是**诊断文本**, 不是终态依据, 只能继续等。
+              // 2026-09-23: 旧代码对文本做 `includes("失败")` 匹配, 被诊断文本
+              // `binghuo-video 查询失败(网络): ...` 命中, 一次网络抖动就把已计费、
+              // 已在平台跑到 14 分钟的长任务判死并清掉 job id。判据见 videoJobPolling.ts。
+              const statusError = typeof status.error === "string" ? status.error : "";
+              const looksLikeFailure = shouldFailRunningVideoJob(status);
+              if (looksLikeFailure) {
+                const message = statusError || "视频生成失败";
+                recordGenerationOutcome({
+                  nodeId: pendingNode.id,
+                  kind: "video",
+                  providerId: typeof data.generationProviderId === "string" ? data.generationProviderId : "",
+                  modelId:
+                    typeof (data.generationRequest as { model?: unknown } | undefined)?.model === "string"
+                      ? (data.generationRequest as { model: string }).model
+                      : "",
+                  status: "failed",
+                  errorMessage: message,
+                });
+                updateNodeDataTransient(pendingNode.id, {
+                  isGenerating: false,
+                  generationStartedAt: null,
+                  generationJobId: null,
+                  generationClientSessionId: null,
+                  generationError: message,
+                  generationErrorDetails: message,
+                });
+                return;
+              }
               await sleep(2000);
               continue;
             }
@@ -1420,13 +1554,11 @@ export function Canvas() {
             return;
           }
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          updateNodeDataTransient(pendingNode.id, {
-            isGenerating: false,
-            generationStartedAt: null,
-            generationJobId: null,
-            generationError: message,
-            generationErrorDetails: message,
+          // 非预期观察器异常同样保留 job id：下次 processingRevision 触发时可续查，
+          // 不应把“观察失败”误判为“平台任务失败”。
+          console.warn("[VideoGenerationJob] observer stopped; retaining resumable task", {
+            nodeId: pendingNode.id,
+            error,
           });
         } finally {
           activeVideoRecoveryNodeIdsRef.current.delete(pendingNode.id);
@@ -1443,6 +1575,7 @@ export function Canvas() {
 
     const updateSize = () => {
       const rect = element.getBoundingClientRect();
+      invalidateNearbyConnectionHandleCache();
       setCanvasViewportSize({
         width: Math.max(0, Math.round(rect.width)),
         height: Math.max(0, Math.round(rect.height)),
@@ -1456,10 +1589,23 @@ export function Canvas() {
     return () => {
       observer.disconnect();
     };
-  }, [setCanvasViewportSize]);
+  }, [invalidateNearbyConnectionHandleCache, setCanvasViewportSize]);
 
   const handleNodesChange = useCallback(
     (changes: NodeChange<CanvasNode>[]) => {
+      if (
+        changes.some(
+          (change) =>
+            change.type === "position" ||
+            change.type === "dimensions" ||
+            change.type === "add" ||
+            change.type === "remove" ||
+            change.type === "replace",
+        )
+      ) {
+        invalidateNearbyConnectionHandleCache();
+      }
+
       const alignedChanges = changes.map((change) => {
         if (change.type !== "position" || change.dragging !== false) {
           return change;
@@ -1501,7 +1647,7 @@ export function Canvas() {
 
       scheduleCanvasPersist();
     },
-    [applyNodesChange, scheduleCanvasPersist],
+    [applyNodesChange, invalidateNearbyConnectionHandleCache, scheduleCanvasPersist],
   );
 
   const handleEdgesChange = useCallback(
@@ -1544,6 +1690,7 @@ export function Canvas() {
 
   const handleMoveEnd = useCallback(
     (_event: unknown, viewport: Viewport) => {
+      invalidateNearbyConnectionHandleCache();
       setViewportState(viewport);
       const project = getCurrentProject();
       if (!project || isRestoringCanvasRef.current) {
@@ -1551,14 +1698,15 @@ export function Canvas() {
       }
       saveCurrentProjectViewport(viewport);
     },
-    [getCurrentProject, saveCurrentProjectViewport, setViewportState],
+    [getCurrentProject, invalidateNearbyConnectionHandleCache, saveCurrentProjectViewport, setViewportState],
   );
 
   const handleMove = useCallback(
     (_event: unknown, viewport: Viewport) => {
+      invalidateNearbyConnectionHandleCache();
       setViewportState(viewport);
     },
-    [setViewportState],
+    [invalidateNearbyConnectionHandleCache, setViewportState],
   );
 
   const handleMoveStart = useCallback(

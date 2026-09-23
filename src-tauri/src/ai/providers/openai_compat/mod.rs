@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::ai::error::AIError;
+use crate::ai::providers::video_protocols;
 use crate::ai::{
     AIProvider, GenerateRequest, GenerateVideoRequest, ProviderTaskHandle, ProviderTaskPollResult, ProviderTaskSubmission,
 };
@@ -44,18 +45,40 @@ impl OpenAICompatibleProvider {
         keys.get(provider_id).cloned()
     }
 
-    fn video_result_url(payload: &Value) -> Option<String> {
+    pub(crate) fn video_result_url(payload: &Value) -> Option<String> {
         match payload {
-            Value::String(value) if value.starts_with("http://") || value.starts_with("https://") => Some(value.clone()),
+            Value::String(value) => {
+                let trimmed = value.trim();
+                if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                    return Some(trimmed.to_string());
+                }
+                // 平台有时会返回“视频已生成: https://...”这类说明文本。
+                for marker in ["https://", "http://"] {
+                    if let Some(start) = trimmed.find(marker) {
+                        let tail = &trimmed[start..];
+                        let end = tail
+                            .char_indices()
+                            .find(|(_, ch)| ch.is_whitespace() || matches!(ch, ']' | ')' | '}' | '"' | '\'' | ','))
+                            .map(|(offset, _)| offset)
+                            .unwrap_or(tail.len());
+                        if end > marker.len() {
+                            return Some(tail[..end].to_string());
+                        }
+                    }
+                }
+                None
+            }
             Value::Array(items) => items.iter().find_map(Self::video_result_url),
-            Value::Object(map) => ["url", "video_url", "videoUrl", "download_url", "downloadUrl", "file_url", "fileUrl", "output_url", "outputUrl"]
+            // 与前端 getVideoResultUrl 的键集合对齐: 知鸟 AI 的成片地址就放在
+            // result_url 上, 缺了它任务会一直轮询到超时为止。
+            Value::Object(map) => ["url", "video_url", "videoUrl", "result_url", "resultUrl", "uri", "download_url", "downloadUrl", "file_url", "fileUrl", "output_url", "outputUrl", "video", "media_url", "mediaUrl", "content_url", "contentUrl", "play_url", "playUrl", "mp4_url", "mp4Url", "result_video", "resultVideo"]
                 .iter().find_map(|key| map.get(*key).and_then(Self::video_result_url))
-                .or_else(|| ["data", "result", "output", "task", "detail"].iter().find_map(|key| map.get(*key).and_then(Self::video_result_url))),
+                .or_else(|| ["data", "result", "output", "task", "detail", "videos", "video_urls", "videoUrls", "output_videos", "outputs", "results", "task_result", "files", "response", "media", "content", "message"].iter().find_map(|key| map.get(*key).and_then(Self::video_result_url))),
             _ => None,
         }
     }
 
-    fn video_task_id(payload: &Value) -> Option<String> {
+    pub(crate) fn video_task_id(payload: &Value) -> Option<String> {
         match payload {
             Value::Object(map) => ["id", "task_id", "taskId", "video_id", "videoId"]
                 .iter().find_map(|key| map.get(*key).and_then(Value::as_str).map(str::to_string))
@@ -64,24 +87,157 @@ impl OpenAICompatibleProvider {
         }
     }
 
-    fn video_task_status(payload: &Value) -> String {
-        match payload {
-            Value::Object(map) => {
-                if let Some(status) = ["status", "task_status", "state"].iter().find_map(|key| map.get(*key).and_then(Value::as_str)) {
-                    return status.to_uppercase();
+    pub(crate) fn video_task_status(payload: &Value) -> String {
+        fn collect(value: &Value, statuses: &mut Vec<String>) {
+            match value {
+                Value::String(status) => {
+                    let normalized = status.trim().to_uppercase();
+                    if matches!(normalized.as_str(), "FAILED" | "FAIL" | "FAILURE" | "ERROR" | "CANCELED" | "CANCELLED" | "REJECTED" | "EXPIRED" | "TIMEOUT" | "TIMED_OUT" | "ABORTED") {
+                        statuses.push(normalized);
+                    }
                 }
-                ["data", "result", "task", "detail"].iter()
-                    .map(|key| map.get(*key).map(Self::video_task_status).unwrap_or_default())
-                    .find(|status| !status.is_empty())
-                    .unwrap_or_default()
+                Value::Object(map) => {
+                    for key in ["status", "task_status", "taskStatus", "state", "task_state", "taskState"] {
+                        if let Some(status) = map.get(key).and_then(Value::as_str) {
+                            statuses.push(status.to_uppercase());
+                        }
+                    }
+                    for value in map.values() {
+                        collect(value, statuses);
+                    }
+                }
+                Value::Array(items) => {
+                    for value in items {
+                        collect(value, statuses);
+                    }
+                }
+                _ => {}
             }
-            _ => String::new(),
+        }
+
+        let mut statuses = Vec::new();
+        collect(payload, &mut statuses);
+        statuses
+            .iter()
+            .find(|status| matches!(status.as_str(), "FAILED" | "FAIL" | "FAILURE" | "ERROR" | "CANCELED" | "CANCELLED" | "REJECTED" | "EXPIRED" | "TIMEOUT" | "TIMED_OUT" | "ABORTED"))
+            .cloned()
+            .or_else(|| statuses.into_iter().next())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn video_failure_reason(payload: &Value) -> Option<String> {
+        fn find(value: &Value) -> Option<String> {
+            match value {
+                Value::Object(map) => {
+                    for key in ["failure_reason", "failureReason", "fail_reason", "failReason", "error_message", "errorMessage", "error"] {
+                        if let Some(reason) = map.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()) {
+                            return Some(reason.to_string());
+                        }
+                    }
+                    map.values().find_map(find)
+                }
+                Value::Array(items) => items.iter().find_map(find),
+                _ => None,
+            }
+        }
+        find(payload)
+    }
+
+    /// 失败字段必须**真的有内容**才算失败。
+    ///
+    /// 平台普遍会每轮都带一个空占位: 炳火在 `status: IN_PROGRESS / progress: 30%` 时返回
+    /// `"fail_reason": ""`, 同族实现还会返回 `"error": {}` / `"error": false`。原实现只看
+    /// **键是否存在**, 于是"还在生成"的第一次轮询就被判死 —— 平台照跑照计费, 成片永久
+    /// 收不回(实机 2026-09-23 11:17 的 `task_YJrE1qDyOyFwgMVh1b3W4WPRiVJNN7AV`,
+    /// 查询时 `progress: 30%` 仍在跑, 软件已报「平台返回失败标记」)。
+    fn failure_value_is_present(value: &Value) -> bool {
+        match value {
+            Value::Null => false,
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Bool(flag) => *flag,
+            Value::Number(number) => number.as_f64().is_some_and(|value| value != 0.0),
+            Value::Array(items) => !items.is_empty(),
+            Value::Object(map) => !map.is_empty(),
         }
     }
 
-    /// 通用 OpenAI 兼容视频生成链路在 native 端运行。提交后的长轮询不再占用
-    /// WebView/React 生命周期，任务状态由 commands/ai.rs 统一持久化。
+    pub(crate) fn video_has_failure_signal(payload: &Value) -> bool {
+        match payload {
+            Value::Object(map) => {
+                for key in ["success", "ok"] {
+                    if map.get(key).and_then(Value::as_bool) == Some(false) {
+                        return true;
+                    }
+                }
+                if ["error", "failure_reason", "failureReason", "fail_reason", "failReason"]
+                    .iter()
+                    .any(|key| map.get(*key).is_some_and(Self::failure_value_is_present))
+                {
+                    return true;
+                }
+                map.values().any(Self::video_has_failure_signal)
+            }
+            Value::Array(items) => items.iter().any(Self::video_has_failure_signal),
+            _ => false,
+        }
+    }
+
+    /// 视频任务的轮询窗口(次数)。**不要再维护第二份常量的值** —— 窗口与间隔的
+    /// 单一真源在 `video_protocols::{max_poll_attempts, poll_interval}`(知鸟官方口径
+    /// 中位 4~40 分钟、p90 55~75 分钟, 沿用通用的 30 分钟会把长任务误判成超时)。
+    fn video_max_poll_attempts(transport: &str) -> u32 {
+        video_protocols::max_poll_attempts(transport)
+    }
+
+    /// 同步驱动: 提交后在本函数内长轮询直到出结果。保留这条路径是为了兼容不落库的
+    /// 调用方; 后端任务执行器走 submit_video_task + poll_video_task, 两段共用同一份
+    /// 请求体与查询实现, 避免两条链路各自漂移。
     pub async fn generate_video(&self, request: GenerateVideoRequest) -> Result<String, AIError> {
+        let transport = request
+            .extra_params
+            .as_ref()
+            .and_then(|params| params.get("video_transport"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let max_polls = Self::video_max_poll_attempts(transport);
+        let poll_every = video_protocols::poll_interval(transport);
+        match self.submit_video_task(request).await? {
+            ProviderTaskSubmission::Succeeded(url) => Ok(url),
+            ProviderTaskSubmission::Queued(handle) => {
+                for _ in 0..max_polls {
+                    tokio::time::sleep(poll_every).await;
+                    match self.poll_video_task(handle.clone()).await {
+                        Ok(ProviderTaskPollResult::Running) => continue,
+                        Ok(ProviderTaskPollResult::Succeeded(url)) => return Ok(url),
+                        Ok(ProviderTaskPollResult::Failed(message)) => {
+                            return Err(AIError::TaskFailed(message))
+                        }
+                        // 4xx / 缺配置这类**确定性**错误: 再等下去也是同一个结果,
+                        // 直接把原因报出去, 别让用户干等到窗口耗尽。
+                        Err(error @ AIError::TaskFailed(_)) => return Err(error),
+                        // 5xx / 408 / 429 / 网络抖动: 保持等待。这里原本用的是 `?`,
+                        // 一次平台抖动就会把仍在生成的长任务判死 —— 用户只能重提,
+                        // 等于我们自己制造了二次扣费。
+                        Err(_) => continue,
+                    }
+                }
+                Err(AIError::TaskFailed(format!(
+                    "视频生成超时（{} 分钟）",
+                    (max_polls as u64 * poll_every.as_secs()) / 60
+                )))
+            }
+        }
+    }
+
+    /// 提交视频任务。平台若立即返回成片地址则直接 Succeeded; 否则返回 Queued 句柄,
+    /// 由调用方把 task_id 与查询元数据落库, 再用 poll_video_task 续查。
+    ///
+    /// 元数据里带的是**提交时解析好的绝对查询地址**: 轮询时 extra_params 已不可用,
+    /// 再走一遍 base_url/路径推导会重新依赖平台配置, 平台配置一改就查不到旧任务。
+    pub async fn submit_video_task(
+        &self,
+        request: GenerateVideoRequest,
+    ) -> Result<ProviderTaskSubmission, AIError> {
         let (provider_id, api_model) = request
             .model
             .split_once('/')
@@ -97,12 +253,48 @@ impl OpenAICompatibleProvider {
             .and_then(|params| params.get("video_transport"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        if !transport.is_empty() && transport != "openai-video" {
+        // 后端任务执行器已实现的视频协议白名单。前端 needsCompatibilityVideoWorker
+        // 必须与这里保持一致 —— 不在此列却交给后端的协议会被直接拒掉(一个请求都
+        // 不发, 表现为「点生成但平台收不到请求」)。
+        if !video_protocols::is_backend_transport(transport) {
             return Err(AIError::InvalidRequest(format!(
                 "视频协议 {} 尚未迁移到后端任务执行器，请在模型设置中使用 OpenAI 兼容视频协议",
                 transport
             )));
         }
+
+        // 专有协议(端点/字段名与通用 OpenAI 兼容视频不同)在这里分流。它们与通用
+        // 协议共用 submit/poll 两段式接口, 因此同样享受「提交即落库、可跨会话续查」——
+        // 任务不再因为 WebView 刷新/切页而丢失, 用户也就不必重新提交(二次扣费)。
+        //
+        // 分派顺序无关紧要: 每个 matches 都以 `transport` 精确命中为主, Base URL /
+        // 平台 id 兜底只在 transport 为空时才参与, 不会互相抢。
+        let protocol_ctx = video_protocols::SubmitContext {
+            client: Self::build_client(),
+            base_url: base_url.to_string(),
+            api_key: api_key.clone(),
+            provider_id: provider_id.to_string(),
+        };
+        if video_protocols::kling::matches(transport, base_url, provider_id) {
+            return video_protocols::kling::submit(&protocol_ctx, &request).await;
+        }
+        if video_protocols::zhenjian::matches(transport, base_url, provider_id) {
+            return video_protocols::zhenjian::submit(&protocol_ctx, &request).await;
+        }
+        if video_protocols::zzdh::matches(transport, base_url, provider_id) {
+            return video_protocols::zzdh::submit(&protocol_ctx, &request).await;
+        }
+        if video_protocols::sub2api::matches(transport, base_url, provider_id) {
+            return video_protocols::sub2api::submit(&protocol_ctx, &request).await;
+        }
+        if video_protocols::wgspai::matches(transport, base_url, provider_id) {
+            return video_protocols::wgspai::submit(&protocol_ctx, &request).await;
+        }
+        if video_protocols::binghuo::matches(transport, base_url, provider_id) {
+            return video_protocols::binghuo::submit(&protocol_ctx, &request).await;
+        }
+
+        let is_zhiniao = transport == "zhiniao-video";
 
         let endpoint_for = |configured: Option<&Value>, fallback: &str, task_id: Option<&str>| {
             let configured = configured.and_then(Value::as_str).filter(|value| !value.trim().is_empty()).unwrap_or(fallback);
@@ -114,23 +306,56 @@ impl OpenAICompatibleProvider {
             if path.starts_with("http://") || path.starts_with("https://") { path } else { format!("{}{}", base_url, if path.starts_with('/') { path } else { format!("/{}", path) }) }
         };
 
-        let images = if request.image_mode.as_deref() == Some("first-last") {
+        let is_first_last = request.image_mode.as_deref() == Some("first-last");
+        // 知鸟单次最多 30 张参考图(首尾帧模式取 2 张), 与前端 generateZhiniaoVideo 一致。
+        let images = if is_first_last {
             request.reference_images.as_ref().map(|items| items.iter().take(2).cloned().collect())
+        } else if is_zhiniao {
+            request.reference_images.as_ref().map(|items| items.iter().take(30).cloned().collect())
         } else { request.reference_images.clone() };
-        let mut body = serde_json::json!({
-            "model": api_model,
-            "prompt": request.prompt,
-            "duration": request.duration.max(1),
-            "aspect_ratio": request.aspect_ratio,
-        });
+        let mut body = if is_zhiniao {
+            // 知鸟 AI(TokenGo) 的扁平入口: 参数全部放顶层, 不接受 params 信封。
+            // 参考图的用途由 mode 决定(取值与前端 resolveZhiniaoVideoMode 严格一致),
+            // 缺了 mode 平台会静默退化成纯文生视频。
+            let image_count = images.as_ref().map(|items| items.len()).unwrap_or(0);
+            let mode = if image_count == 0 {
+                "text-to-video"
+            } else if is_first_last && image_count >= 2 {
+                "first-last"
+            } else if image_count == 1 {
+                "first-frame"
+            } else {
+                "reference"
+            };
+            serde_json::json!({
+                "model": api_model,
+                "prompt": request.prompt,
+                "mode": mode,
+                "duration": request.duration.max(1),
+                "aspect_ratio": request.aspect_ratio,
+                "count": 1,
+            })
+        } else {
+            serde_json::json!({
+                "model": api_model,
+                "prompt": request.prompt,
+                "duration": request.duration.max(1),
+                "aspect_ratio": request.aspect_ratio,
+            })
+        };
         if let Some(object) = body.as_object_mut() {
             if let Some(images) = images.filter(|items| !items.is_empty()) {
                 object.insert("images".into(), serde_json::json!(images));
-                if request.image_mode.as_deref() == Some("first-last") { object.insert("generation_type".into(), Value::String("frame".into())); }
+                if is_first_last && !is_zhiniao { object.insert("generation_type".into(), Value::String("frame".into())); }
             }
             if let Some(audio) = request.reference_audio.filter(|items| !items.is_empty()) {
-                object.insert("audio_url".into(), Value::String(audio[0].clone()));
-                if audio.len() > 1 { object.insert("audio_urls".into(), serde_json::json!(audio)); }
+                if is_zhiniao {
+                    // 知鸟用 audios 数组(单次最多 10 条), 不是 audio_url / audio_urls。
+                    object.insert("audios".into(), serde_json::json!(audio.into_iter().take(10).collect::<Vec<_>>()));
+                } else {
+                    object.insert("audio_url".into(), Value::String(audio[0].clone()));
+                    if audio.len() > 1 { object.insert("audio_urls".into(), serde_json::json!(audio)); }
+                }
             }
             if let Some(resolution) = request.video_resolution.filter(|value| !value.trim().is_empty()) { object.insert("resolution".into(), Value::String(resolution)); }
         }
@@ -140,24 +365,133 @@ impl OpenAICompatibleProvider {
         let response = client.post(&submit_url).bearer_auth(api_key.clone()).header("Accept-Encoding", "identity").json(&body).send().await?;
         let status = response.status();
         let raw = response.text().await.unwrap_or_default();
-        let mut payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        let raw_lower = raw.to_ascii_lowercase();
+        if payload.is_null()
+            && (raw_lower.contains("failed")
+                || raw_lower.contains("failure")
+                || raw_lower.contains("error")
+                || raw_lower.contains("rejected")
+                || raw_lower.contains("cancelled")
+                || raw_lower.contains("canceled")
+                || raw.contains("失败"))
+        {
+            return Err(AIError::TaskFailed(format!(
+                "视频生成失败: {}",
+                raw.chars().take(800).collect::<String>()
+            )));
+        }
         if !status.is_success() { return Err(AIError::TaskFailed(format!("视频生成请求失败: HTTP {} {}", status, raw.chars().take(500).collect::<String>()))); }
-        if let Some(url) = Self::video_result_url(&payload) { return Ok(url); }
+        if let Some(url) = Self::video_result_url(&payload) { return Ok(ProviderTaskSubmission::Succeeded(url)); }
         let id = Self::video_task_id(&payload).ok_or_else(|| AIError::TaskFailed("视频平台响应中未找到任务 ID 或视频地址".into()))?;
         let query_fallback = format!("{}/{{taskId}}", extras.and_then(|params| params.get("video_submit_path")).and_then(Value::as_str).unwrap_or("/v1/videos/generations"));
         let query_url = endpoint_for(extras.and_then(|params| params.get("video_query_path")), &query_fallback, Some(&id));
-        for _ in 0..600 {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            let response = client.get(&query_url).bearer_auth(&api_key).header("Accept-Encoding", "identity").send().await?;
-            let status = response.status();
-            let raw = response.text().await.unwrap_or_default();
-            payload = serde_json::from_str(&raw).unwrap_or(Value::Null);
-            if !status.is_success() { return Err(AIError::TaskFailed(format!("视频生成查询失败: HTTP {} {}", status, raw.chars().take(500).collect::<String>()))); }
-            if let Some(url) = Self::video_result_url(&payload) { return Ok(url); }
-            let status = Self::video_task_status(&payload);
-            if matches!(status.as_str(), "FAILED" | "FAILURE" | "ERROR" | "CANCELED" | "CANCELLED" | "REJECTED") { return Err(AIError::TaskFailed(format!("视频生成失败: {}", status))); }
+        Ok(ProviderTaskSubmission::Queued(ProviderTaskHandle {
+            task_id: id,
+            metadata: Some(serde_json::json!({
+                // 轮询时重新解析 API Key 需要 provider_id; base_url 不再参与,
+                // 因为 query_url 已经是提交时算好的绝对地址。
+                "provider_id": provider_id,
+                "query_url": query_url,
+                "max_poll_attempts": Self::video_max_poll_attempts(transport),
+            })),
+        }))
+    }
+
+    /// 凭落库的句柄查询视频任务状态。可由任意进程/会话调用, 因此不依赖任何内存状态。
+    pub async fn poll_video_task(
+        &self,
+        handle: ProviderTaskHandle,
+    ) -> Result<ProviderTaskPollResult, AIError> {
+        let metadata = handle
+            .metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| AIError::InvalidRequest("视频任务缺少查询元数据, 无法续查".into()))?;
+        let query_url = metadata
+            .get("query_url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| AIError::InvalidRequest("视频任务缺少查询地址, 无法续查".into()))?;
+        let provider_id = metadata.get("provider_id").and_then(Value::as_str).unwrap_or_default();
+        let api_key = match self.resolve_custom_key(provider_id).await {
+            Some(key) if !key.is_empty() => key,
+            _ => self.resolve_custom_key("default").await.unwrap_or_default(),
+        };
+        if api_key.is_empty() {
+            return Err(AIError::InvalidRequest("未配置 API Key".into()));
         }
-        Err(AIError::TaskFailed("视频生成超时（30 分钟）".into()))
+
+        let transport = metadata.get("transport").and_then(Value::as_str).unwrap_or("");
+        // 专有协议的查询响应形状与通用协议不同(相对地址要补站点根、二进制成片要先
+        // 下载落盘、motion-control 返回顶层数组……), 交给各协议自己的解析实现。
+        if video_protocols::has_protocol_poll(transport) {
+            let ctx = video_protocols::PollContext {
+                client: Self::build_client(),
+                api_key: api_key.clone(),
+            };
+            return video_protocols::poll(&ctx, transport, metadata, &handle).await;
+        }
+
+        let client = Self::build_client();
+        let response = client
+            .get(query_url)
+            .bearer_auth(&api_key)
+            .header("Accept-Encoding", "identity")
+            .send()
+            .await?;
+        let status = response.status();
+        let raw = response.text().await.unwrap_or_default();
+        let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        if !status.is_success() {
+            // 4xx 是配置/鉴权类问题, 不会自愈, 判为失败让用户看到原因; 5xx 与网络抖动
+            // 属于暂时性故障, 必须保持 running —— 否则一次 502 就会把仍在平台生成
+            // (且已计费)的长任务判死, 用户只能重新提交, 反而多扣一次钱。
+            if status.is_client_error() {
+                return Ok(ProviderTaskPollResult::Failed(format!(
+                    "视频生成查询失败: HTTP {} {}",
+                    status,
+                    raw.chars().take(500).collect::<String>()
+                )));
+            }
+            return Err(AIError::Provider(format!(
+                "视频生成查询暂时不可用: HTTP {} {}",
+                status,
+                raw.chars().take(200).collect::<String>()
+            )));
+        }
+        let task_status = Self::video_task_status(&payload);
+        if video_protocols::is_failed_status(&task_status) {
+            let reason = Self::video_failure_reason(&payload).unwrap_or(task_status);
+            return Ok(ProviderTaskPollResult::Failed(format!("视频生成失败: {}", reason)));
+        }
+        // 与 `video_protocols::classify` 保持同一条判据: 平台说「还在跑」时,
+        // 响应里的失败字段不采信(炳火 `IN_PROGRESS` 会带 `"fail_reason": ""`)。
+        // 注意这里只能回 Running, 不能回 Err —— 回 Err 会每 2 秒打一条前端 warn,
+        // 还会被当成"临时故障"掩盖真正的失败原因。
+        if video_protocols::is_running_status(&task_status) {
+            return Ok(ProviderTaskPollResult::Running);
+        }
+        if Self::video_has_failure_signal(&payload) {
+            let reason = Self::video_failure_reason(&payload).unwrap_or_else(|| "平台返回失败标记".to_string());
+            return Ok(ProviderTaskPollResult::Failed(format!("视频生成失败: {}", reason)));
+        }
+        if let Some(url) = Self::video_result_url(&payload) {
+            let lower = url.to_ascii_lowercase();
+            let placeholder = lower.contains("placeholder")
+                || lower.ends_with("/pending")
+                || lower.ends_with("/processing");
+            if !placeholder {
+                return Ok(ProviderTaskPollResult::Succeeded(url));
+            }
+        }
+        if let Some(reason) = Self::video_failure_reason(&payload) {
+            let lower = reason.to_ascii_lowercase();
+            if lower.contains("fail") || lower.contains("error") || lower.contains("reject") || lower.contains("cancel") || lower.contains("timeout") || reason.contains("失败") {
+                return Ok(ProviderTaskPollResult::Failed(format!("视频生成失败: {}", reason)));
+            }
+        }
+        Ok(ProviderTaskPollResult::Running)
     }
 
     fn build_client() -> reqwest::Client {
@@ -1292,6 +1626,27 @@ impl AIProvider for OpenAICompatibleProvider {
         true
     }
 
+    fn supports_video_task_resume(&self) -> bool {
+        // 视频提交后立刻落库平台任务 ID, 之后凭它续查。若返回 false,
+        // submit_generate_video_job 会把长轮询整个塞进进程内任务 —— 进程一退,
+        // 仍在平台生成(且已计费)的任务就被判成中断。
+        true
+    }
+
+    async fn submit_video_task(
+        &self,
+        request: GenerateVideoRequest,
+    ) -> Result<ProviderTaskSubmission, AIError> {
+        OpenAICompatibleProvider::submit_video_task(self, request).await
+    }
+
+    async fn poll_video_task(
+        &self,
+        handle: ProviderTaskHandle,
+    ) -> Result<ProviderTaskPollResult, AIError> {
+        OpenAICompatibleProvider::poll_video_task(self, handle).await
+    }
+
     async fn generate(&self, request: GenerateRequest) -> Result<String, AIError> {
         let (provider_id, api_model) = request
             .model
@@ -1998,6 +2353,45 @@ mod tests {
                 "https://cdn.example.com/two.png".to_string(),
                 "https://cdn.example.com/three.png".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn detects_failed_video_status_nested_in_arrays() {
+        let payload = json!({
+            "data": [{
+                "task": { "status": "failed", "failureReason": "内容审核未通过" }
+            }]
+        });
+
+        assert_eq!(OpenAICompatibleProvider::video_task_status(&payload), "FAILED");
+        assert_eq!(
+            OpenAICompatibleProvider::video_failure_reason(&payload).as_deref(),
+            Some("内容审核未通过")
+        );
+    }
+
+    #[test]
+    fn recognizes_expired_and_timeout_video_states() {
+        for status in ["FAIL", "EXPIRED", "TIMEOUT", "TIMED_OUT", "ABORTED"] {
+            let payload = json!({ "result": [{ "task_status": status }] });
+            assert_eq!(OpenAICompatibleProvider::video_task_status(&payload), status);
+        }
+    }
+
+    #[test]
+    fn extracts_video_url_from_nested_media_fields_and_message_text() {
+        let payload = json!({
+            "status": "completed",
+            "data": [{
+                "media": { "contentUrl": "https://cdn.example.com/result.mp4" },
+                "message": "视频已生成：https://cdn.example.com/message.mp4"
+            }]
+        });
+
+        assert_eq!(
+            OpenAICompatibleProvider::video_result_url(&payload).as_deref(),
+            Some("https://cdn.example.com/result.mp4")
         );
     }
 

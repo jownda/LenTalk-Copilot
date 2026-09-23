@@ -245,6 +245,7 @@
     "copyErrorReport": "Copy Error",
     "retryGeneration": "Retry Generation",
     "retryWithEncoding": "Switch Encoding & Retry",
+    "resumeGeneration": "Keep Waiting (No Re-submit)",
     "rename": "Rename",
     "confirmEncodingRetry": "This will submit a new generation request with another reference-image encoding. The provider may charge for it. Continue?",
     "copied": "Copied",
@@ -1254,6 +1255,7 @@
     "quickCheckingFfmpeg": "Checking FFmpeg…",
     "quickInstallingFfmpeg": "FFmpeg is missing. Downloading and installing it automatically; keep the network connected — initial setup may take a few minutes…",
     "quickAudioUnsupported": "The selected model or provider did not receive the video's audio, so a complete dialogue script cannot be created. Choose a model that supports audio input or video understanding and try again.",
-    "quickAudioModelHint": "Use a model that supports audio input or video understanding; text-only or image-only models cannot reconstruct the complete dialogue."
+    "quickAudioModelHint": "Audio-capable models listen directly; ordinary vision models use a same-provider audio model when available, otherwise they extract dialogue from the video's subtitles.",
+    "quickAudioModelUnavailable": "This model does not accept audio input; dialogue will be taken from the video's subtitles."
   }
 }

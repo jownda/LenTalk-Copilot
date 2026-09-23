@@ -1,7 +1,24 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { NodeToolbar as ReactFlowNodeToolbar } from '@xyflow/react';
-import { Camera, Copy, Crop, Download, FileText, Library, Maximize2, PenLine, RefreshCw, RotateCw, Scissors, SlidersHorizontal, Sparkles, Trash2, Unlink2, LayoutTemplate } from 'lucide-react';
-import { useTranslation } from 'react-i18next';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { NodeToolbar as ReactFlowNodeToolbar } from "@xyflow/react";
+import {
+  Camera,
+  Copy,
+  Crop,
+  Download,
+  FileText,
+  Library,
+  Maximize2,
+  PenLine,
+  RefreshCw,
+  RotateCw,
+  Scissors,
+  SlidersHorizontal,
+  Sparkles,
+  Trash2,
+  Unlink2,
+  LayoutTemplate,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import {
   CANVAS_NODE_TYPES,
@@ -18,94 +35,172 @@ import {
   isUploadNode,
   type CanvasNode,
   type NodeToolType,
-} from '@/features/canvas/domain/canvasNodes';
-import { canvasAiGateway, canvasEventBus } from '@/features/canvas/application/canvasServices';
-import { getNodeToolPlugins } from '@/features/canvas/tools';
-import type { ToolIconKey } from '@/features/canvas/tools';
-import { UiChipButton, UiPanel, UiModal, UiButton } from '@/components/ui';
-import { useSettingsStore } from '@/stores/settingsStore';
-import { resolveRunningHubUpscaleCredentials, resolveZhiniaoUpscaleCredentials } from '@/commands/ai';
-import { useCanvasStore } from '@/stores/canvasStore';
-import { sanitizeStoryboardText } from '@/features/canvas/application/storyboardText';
+} from "@/features/canvas/domain/canvasNodes";
+import { canvasAiGateway, canvasEventBus } from "@/features/canvas/application/canvasServices";
+import { getNodeToolPlugins } from "@/features/canvas/tools";
+import type { ToolIconKey } from "@/features/canvas/tools";
+import { UiChipButton, UiPanel, UiModal, UiButton } from "@/components/ui";
+import { useSettingsStore } from "@/stores/settingsStore";
+import { resolveRunningHubUpscaleCredentials, resolveZhiniaoUpscaleCredentials } from "@/commands/ai";
+import { useCanvasStore } from "@/stores/canvasStore";
+import { sanitizeStoryboardText } from "@/features/canvas/application/storyboardText";
 import {
   buildGenerationErrorReport,
   CURRENT_RUNTIME_SESSION_ID,
-} from '@/features/canvas/application/generationErrorReport';
-import { showErrorDialog } from '@/features/canvas/application/errorDialog';
-import { saveMediaSourceWithDialog } from '@/features/canvas/application/mediaDownload';
-import { importVideoUrlToAsset } from '@/features/library/importAssets';
-import { buildTemplateFromCanvas, createTemplateFromCanvas, validateTemplateChain } from '@/features/templates/createTemplate';
-import { UiInput, UiTextArea } from '@/components/ui/primitives';
-import { PajubenQuickExtractDialog } from '@/features/pajuben/PajubenQuickExtractDialog';
-import { useAssetLibraryStore } from '@/features/library/assetStore';
+} from "@/features/canvas/application/generationErrorReport";
+import { showErrorDialog } from "@/features/canvas/application/errorDialog";
+import { saveMediaSourceWithDialog } from "@/features/canvas/application/mediaDownload";
+import { importVideoUrlToAsset } from "@/features/library/importAssets";
+import {
+  buildTemplateFromCanvas,
+  createTemplateFromCanvas,
+  validateTemplateChain,
+} from "@/features/templates/createTemplate";
+import { UiInput, UiTextArea } from "@/components/ui/primitives";
+import { PajubenQuickExtractDialog } from "@/features/pajuben/PajubenQuickExtractDialog";
+import { useAssetLibraryStore } from "@/features/library/assetStore";
 import {
   JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID,
   listImageUpscaleModels,
   resolveImageModelResolutions,
   type ImageModelDefinition,
-} from '@/features/canvas/models';
+} from "@/features/canvas/models";
 import {
   NODE_TOOLBAR_ALIGN,
   NODE_TOOLBAR_CLASS,
   NODE_TOOLBAR_OFFSET,
   NODE_TOOLBAR_POSITION,
-} from './nodeToolbarConfig';
+} from "./nodeToolbarConfig";
 
 interface NodeActionToolbarProps {
   node: CanvasNode;
 }
 
-const REFERENCE_ENCODINGS = ['data_url', 'raw_base64', 'url'] as const;
-const ZHINIAO_VIDEO_UPSCALE_MODEL_ID = 'custom:zhiniao/aliyun-video-superres';
-const RUNNINGHUB_TOPAZ_VIDEO_UPSCALE_MODEL_ID = 'custom:runninghub-国内版/topaz-video-upscale-v1';
+const REFERENCE_ENCODINGS = ["data_url", "raw_base64", "url"] as const;
+const ZHINIAO_VIDEO_UPSCALE_MODEL_ID = "custom:zhiniao/aliyun-video-superres";
+const RUNNINGHUB_TOPAZ_VIDEO_UPSCALE_MODEL_ID = "custom:runninghub-国内版/topaz-video-upscale-v1";
 
-type VideoUpscaleProvider = 'zhiniao' | 'runninghub-topaz';
+type VideoUpscaleProvider = "zhiniao" | "runninghub-topaz";
 
 function getTopazTargetDimensions(aspectRatio: unknown): { width: string; height: string } {
-  switch (typeof aspectRatio === 'string' ? aspectRatio.trim() : '') {
-    case '9:16':
-      return { width: '1080', height: '1920' };
-    case '1:1':
-      return { width: '1080', height: '1080' };
-    case '4:3':
-      return { width: '1440', height: '1080' };
-    case '3:4':
-      return { width: '1080', height: '1440' };
+  switch (typeof aspectRatio === "string" ? aspectRatio.trim() : "") {
+    case "9:16":
+      return { width: "1080", height: "1920" };
+    case "1:1":
+      return { width: "1080", height: "1080" };
+    case "4:3":
+      return { width: "1440", height: "1080" };
+    case "3:4":
+      return { width: "1080", height: "1440" };
     default:
-      return { width: '1920', height: '1080' };
+      return { width: "1920", height: "1080" };
   }
 }
 
+/**
+ * Topaz 超分输出尺寸预设。
+ * 横屏按 16:9、竖屏按 9:16, 三档取标准分辨率, 一键回填上方宽高输入框。
+ */
+const TOPAZ_SIZE_PRESETS: ReadonlyArray<{
+  key: "landscape" | "portrait";
+  label: string;
+  tiers: ReadonlyArray<{ label: string; width: number; height: number }>;
+}> = [
+  {
+    key: "landscape",
+    label: "横屏",
+    tiers: [
+      { label: "1080p", width: 1920, height: 1080 },
+      { label: "2K", width: 2560, height: 1440 },
+      { label: "4K", width: 3840, height: 2160 },
+    ],
+  },
+  {
+    key: "portrait",
+    label: "竖屏",
+    tiers: [
+      { label: "1080p", width: 1080, height: 1920 },
+      { label: "2K", width: 1440, height: 2560 },
+      { label: "4K", width: 2160, height: 3840 },
+    ],
+  },
+];
+
 function isReferenceEncodingError(message: string): boolean {
-  return /(invalid\s+base64|base64\s+(?:format|decode)|invalid\s+(?:image|media)\s+format|failed\s+to\s+parse\s+request\s+body|unsupported\s+(?:image|reference)\s+(?:field|format)|(?:编码|格式).*(?:不匹配|错误|base64|参考图)|(?:base64|参考图).*(?:编码|格式))/i.test(message);
+  return /(invalid\s+base64|base64\s+(?:format|decode)|invalid\s+(?:image|media)\s+format|failed\s+to\s+parse\s+request\s+body|unsupported\s+(?:image|reference)\s+(?:field|format)|(?:编码|格式).*(?:不匹配|错误|base64|参考图)|(?:base64|参考图).*(?:编码|格式))/i.test(
+    message,
+  );
 }
 
 function prepareEncodingRetry(node: CanvasNode, errorMessage: string): Record<string, unknown> | undefined {
   if (!isReferenceEncodingError(errorMessage)) return undefined;
   const data = node.data as Record<string, unknown>;
   const request = data.generationRequest;
-  if (!request || typeof request !== 'object') return undefined;
+  if (!request || typeof request !== "object") return undefined;
   const requestRecord = request as Record<string, unknown>;
-  const extras = requestRecord.extraParams && typeof requestRecord.extraParams === 'object'
-    ? { ...(requestRecord.extraParams as Record<string, unknown>) }
-    : {};
-  const isVideo = requestRecord.kind === 'video';
-  const key = isVideo ? 'video_reference_encoding' : 'reference_image_encoding';
-  const fieldKey = isVideo ? undefined : 'reference_image_field';
-  const configured = typeof extras[key] === 'string' ? String(extras[key]).toLowerCase() : 'auto';
-  const field = fieldKey && extras[fieldKey] === 'input_image' ? 'input_image' : 'image';
-  const current = configured === 'raw_base64' || configured === 'data_url' || configured === 'url'
-    ? configured
-    : field === 'input_image' ? 'raw_base64' : 'data_url';
+  const extras =
+    requestRecord.extraParams && typeof requestRecord.extraParams === "object"
+      ? { ...(requestRecord.extraParams as Record<string, unknown>) }
+      : {};
+  const isVideo = requestRecord.kind === "video";
+  const key = isVideo ? "video_reference_encoding" : "reference_image_encoding";
+  const fieldKey = isVideo ? undefined : "reference_image_field";
+  const configured = typeof extras[key] === "string" ? String(extras[key]).toLowerCase() : "auto";
+  const field = fieldKey && extras[fieldKey] === "input_image" ? "input_image" : "image";
+  const current =
+    configured === "raw_base64" || configured === "data_url" || configured === "url"
+      ? configured
+      : field === "input_image"
+        ? "raw_base64"
+        : "data_url";
   const currentIndex = REFERENCE_ENCODINGS.indexOf(current as (typeof REFERENCE_ENCODINGS)[number]);
-  const retryCount = typeof data.generationEncodingRetryCount === 'number'
-    ? data.generationEncodingRetryCount
-    : 0;
+  const retryCount = typeof data.generationEncodingRetryCount === "number" ? data.generationEncodingRetryCount : 0;
   if (retryCount >= REFERENCE_ENCODINGS.length - 1 || currentIndex < 0) return undefined;
   extras[key] = REFERENCE_ENCODINGS[currentIndex + 1];
   return {
     generationRequest: { ...requestRecord, extraParams: extras },
     generationEncodingRetryCount: retryCount + 1,
+  };
+}
+
+/** 旧视频任务未保存诊断上下文时，从持久化请求快照还原一份可读报告。 */
+function resolveGenerationErrorContext(node: CanvasNode): unknown {
+  const data = node.data as Record<string, unknown>;
+  if (data.generationDebugContext && typeof data.generationDebugContext === "object") {
+    return data.generationDebugContext;
+  }
+  const request = data.generationRequest;
+  if (!request || typeof request !== "object") return undefined;
+  const requestData = request as Record<string, unknown>;
+  const kind = requestData.kind;
+  if (kind !== "video" && kind !== "image") return undefined;
+  const references = Array.isArray(requestData.referenceImages)
+    ? requestData.referenceImages.filter(
+        (value): value is string => typeof value === "string" && value.trim().length > 0,
+      )
+    : [];
+  const audioReferences = Array.isArray(requestData.referenceAudio)
+    ? requestData.referenceAudio.filter(
+        (value): value is string => typeof value === "string" && value.trim().length > 0,
+      )
+    : [];
+  const extraParams =
+    requestData.extraParams && typeof requestData.extraParams === "object"
+      ? (requestData.extraParams as Record<string, unknown>)
+      : {};
+  return {
+    sourceType: kind === "video" ? "videoGen" : "unknown",
+    providerId: typeof data.generationProviderId === "string" ? data.generationProviderId : undefined,
+    requestModel: typeof requestData.model === "string" ? requestData.model : undefined,
+    requestAspectRatio: typeof requestData.aspectRatio === "string" ? requestData.aspectRatio : undefined,
+    prompt: typeof requestData.prompt === "string" ? requestData.prompt : undefined,
+    extraParams: {
+      ...extraParams,
+      ...(typeof requestData.videoResolution === "string" ? { video_resolution: requestData.videoResolution } : {}),
+      ...(typeof requestData.imageMode === "string" ? { image_mode: requestData.imageMode } : {}),
+    },
+    referenceImageCount: references.length,
+    referenceAudioCount: audioReferences.length,
   };
 }
 
@@ -117,15 +212,15 @@ const toolIconMap: Record<ToolIconKey, typeof Crop> = {
   adjust: SlidersHorizontal,
 };
 
-const TOOLBAR_BUTTON_RADIUS_CLASS = 'rounded-full';
+const TOOLBAR_BUTTON_RADIUS_CLASS = "rounded-full";
 const TOOLBAR_NEUTRAL_BUTTON_CLASS =
-  'border-[rgba(255,255,255,0.18)] bg-bg-dark/70 text-text-dark hover:border-[rgba(255,255,255,0.32)] hover:bg-bg-dark';
+  "border-[rgba(255,255,255,0.18)] bg-bg-dark/70 text-text-dark hover:border-[rgba(255,255,255,0.32)] hover:bg-bg-dark";
 
 export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const { t, i18n } = useTranslation();
   const isImageEdit = isImageEditNode(node);
   // AI 生成视频与本地上传视频最终都落在同一个媒体节点，统一开放视频工具栏。
-  const isVideoMediaNode = isAudioNode(node) && node.data.mediaType === 'video';
+  const isVideoMediaNode = isAudioNode(node) && node.data.mediaType === "video";
   const isStoryboardGen = isStoryboardGenNode(node);
   const isStoryboardSplit = isStoryboardSplitNode(node);
   const canCopyStoryboardText = isStoryboardGen || isStoryboardSplit;
@@ -145,21 +240,17 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const categories = useAssetLibraryStore((state) => state.categories);
   const activeLibraryId = useAssetLibraryStore((state) => state.activeLibraryId);
   const addAssets = useAssetLibraryStore((state) => state.addAssets);
-  const ignoreAtTagWhenCopyingAndGenerating = useSettingsStore(
-    (state) => state.ignoreAtTagWhenCopyingAndGenerating
-  );
+  const ignoreAtTagWhenCopyingAndGenerating = useSettingsStore((state) => state.ignoreAtTagWhenCopyingAndGenerating);
   const [isLibraryDialogOpen, setIsLibraryDialogOpen] = useState(false);
   const [isUpscaleDialogOpen, setIsUpscaleDialogOpen] = useState(false);
   const [isImageUpscaleDialogOpen, setIsImageUpscaleDialogOpen] = useState(false);
-  const [videoUpscaleProvider, setVideoUpscaleProvider] = useState<VideoUpscaleProvider>('zhiniao');
-  const [videoUpscaleTier, setVideoUpscaleTier] = useState<string>('1080p');
-  const [topazWidth, setTopazWidth] = useState('1920');
-  const [topazHeight, setTopazHeight] = useState('1080');
+  const [videoUpscaleProvider, setVideoUpscaleProvider] = useState<VideoUpscaleProvider>("zhiniao");
+  const [videoUpscaleTier, setVideoUpscaleTier] = useState<string>("1080p");
+  const [topazWidth, setTopazWidth] = useState("1920");
+  const [topazHeight, setTopazHeight] = useState("1080");
   const [isUpscalingVideo, setIsUpscalingVideo] = useState(false);
-  const [imageUpscaleModelId, setImageUpscaleModelId] = useState<string>(
-    JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID
-  );
-  const [imageUpscaleResolution, setImageUpscaleResolution] = useState<string>('');
+  const [imageUpscaleModelId, setImageUpscaleModelId] = useState<string>(JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID);
+  const [imageUpscaleResolution, setImageUpscaleResolution] = useState<string>("");
   // 「更换模型」列表默认收起: 弹窗只显示当前高清模型, 避免一屏模型铺开。
   const [isUpscaleModelPickerOpen, setIsUpscaleModelPickerOpen] = useState(false);
   const [isUpscalingImage, setIsUpscalingImage] = useState(false);
@@ -169,8 +260,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isScriptDialogOpen, setIsScriptDialogOpen] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
   const [isTemplateDialogOpen, setIsTemplateDialogOpen] = useState(false);
-  const [templateName, setTemplateName] = useState('');
-  const [templateDescription, setTemplateDescription] = useState('');
+  const [templateName, setTemplateName] = useState("");
+  const [templateDescription, setTemplateDescription] = useState("");
   const [isSavingTemplate, setIsSavingTemplate] = useState(false);
   const [templateNotice, setTemplateNotice] = useState<string | null>(null);
   const copyTextFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -181,21 +272,27 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     }
     return null;
   }, [node]);
-  const videoSource = isVideoMediaNode
-    ? ((node.data as { sourcePath?: string | null }).sourcePath ?? null)
-    : null;
+  const videoSource = isVideoMediaNode ? ((node.data as { sourcePath?: string | null }).sourcePath ?? null) : null;
   useEffect(() => {
-    if (!isUpscaleDialogOpen || videoUpscaleProvider !== 'runninghub-topaz') return;
+    if (!isUpscaleDialogOpen || videoUpscaleProvider !== "runninghub-topaz") return;
     const dimensions = getTopazTargetDimensions(node.data.aspectRatio);
     setTopazWidth(dimensions.width);
     setTopazHeight(dimensions.height);
   }, [isUpscaleDialogOpen, node.data.aspectRatio, videoUpscaleProvider]);
-  const canSaveVideoTemplate = isVideoMediaNode
-    && Boolean(videoSource)
-    && Boolean((node.data as { generationModel?: string | null }).generationModel || (node.data as { generationResultProtected?: boolean }).generationResultProtected);
+  const canSaveVideoTemplate =
+    isVideoMediaNode &&
+    Boolean(videoSource) &&
+    Boolean(
+      (node.data as { generationModel?: string | null }).generationModel ||
+      (node.data as { generationResultProtected?: boolean }).generationResultProtected,
+    );
   const templateDraft = useMemo(() => {
     if (!canSaveVideoTemplate || !videoSource) return null;
-    try { return validateTemplateChain(buildTemplateFromCanvas(node, canvasNodes, canvasEdges)); } catch { return { valid: false, missing: ['生成链路'] }; }
+    try {
+      return validateTemplateChain(buildTemplateFromCanvas(node, canvasNodes, canvasEdges));
+    } catch {
+      return { valid: false, missing: ["生成链路"] };
+    }
   }, [canSaveVideoTemplate, canvasEdges, canvasNodes, node, videoSource]);
   const downloadSource = imageSource || videoSource;
   const canHandleMedia = Boolean(downloadSource);
@@ -203,44 +300,39 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const canUpscaleImage = !isImageEdit && Boolean(imageSource) && !videoSource;
   const upscaleModelOptions = useMemo<ImageModelDefinition[]>(
     () => (isImageUpscaleDialogOpen ? listImageUpscaleModels() : []),
-    [isImageUpscaleDialogOpen]
+    [isImageUpscaleDialogOpen],
   );
   const selectedUpscaleModel = useMemo(
-    () =>
-      upscaleModelOptions.find((model) => model.id === imageUpscaleModelId)
-      ?? upscaleModelOptions[0]
-      ?? null,
-    [imageUpscaleModelId, upscaleModelOptions]
+    () => upscaleModelOptions.find((model) => model.id === imageUpscaleModelId) ?? upscaleModelOptions[0] ?? null,
+    [imageUpscaleModelId, upscaleModelOptions],
   );
   const upscaleResolutionOptions = useMemo(
     () => (selectedUpscaleModel ? resolveImageModelResolutions(selectedUpscaleModel) : []),
-    [selectedUpscaleModel]
+    [selectedUpscaleModel],
   );
   // 档位随模型变 —— 换模型后原档位可能不被支持, 这里收敛到该模型的首档。
-  const resolvedUpscaleResolution = upscaleResolutionOptions.some(
-    (option) => option.value === imageUpscaleResolution
-  )
+  const resolvedUpscaleResolution = upscaleResolutionOptions.some((option) => option.value === imageUpscaleResolution)
     ? imageUpscaleResolution
-    : (selectedUpscaleModel?.defaultResolution ?? upscaleResolutionOptions[0]?.value ?? '2K');
+    : (selectedUpscaleModel?.defaultResolution ?? upscaleResolutionOptions[0]?.value ?? "2K");
   const handleUpscaleImage = useCallback(async () => {
     if (!imageSource || !selectedUpscaleModel || isUpscalingImage) {
       return;
     }
 
     const isJimengUpscale = selectedUpscaleModel.id === JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID;
-    if (!isJimengUpscale && !(apiKeys[selectedUpscaleModel.providerId] ?? '').trim()) {
-      const message = t('nodeToolbar.imageUpscaleApiKeyMissing');
-      void showErrorDialog(message, t('common.error'));
+    if (!isJimengUpscale && !(apiKeys[selectedUpscaleModel.providerId] ?? "").trim()) {
+      const message = t("nodeToolbar.imageUpscaleApiKeyMissing");
+      void showErrorDialog(message, t("common.error"));
       return;
     }
 
     setIsUpscalingImage(true);
     // 超分要保住原图比例: 优先沿用节点自身的画幅, 没有就用默认值。
     const aspectRatio =
-      typeof node.data.aspectRatio === 'string' && node.data.aspectRatio.trim()
+      typeof node.data.aspectRatio === "string" && node.data.aspectRatio.trim()
         ? node.data.aspectRatio
         : DEFAULT_ASPECT_RATIO;
-    const prompt = isJimengUpscale ? '' : t('nodeToolbar.imageUpscalePrompt');
+    const prompt = isJimengUpscale ? "" : t("nodeToolbar.imageUpscalePrompt");
     const requestModel = selectedUpscaleModel.resolveRequest({ referenceImageCount: 1 }).requestModel;
     const newNodeId = addNode(
       CANVAS_NODE_TYPES.exportImage,
@@ -252,16 +344,16 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
         // 先认领本次运行会话, 避免提交拿到 jobId 前被当成重启残留任务重复提交。
         generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
         generationRequest: {
-          kind: 'image',
+          kind: "image",
           prompt,
           model: requestModel,
           size: resolvedUpscaleResolution,
           aspectRatio,
           referenceImages: [imageSource],
         },
-        resultKind: 'generic',
-        displayName: `${t('nodeToolbar.imageUpscale')} ${resolvedUpscaleResolution}`,
-      }
+        resultKind: "generic",
+        displayName: `${t("nodeToolbar.imageUpscale")} ${resolvedUpscaleResolution}`,
+      },
     );
     addEdge(node.id, newNodeId);
 
@@ -275,7 +367,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       });
       updateNodeData(newNodeId, {
         generationJobId: jobId,
-        generationSourceType: 'imageEdit',
+        generationSourceType: "imageEdit",
         generationProviderId: selectedUpscaleModel.providerId,
         generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
       });
@@ -288,7 +380,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
         generationStartedAt: null,
         generationError: message,
       });
-      void showErrorDialog(message, t('common.error'));
+      void showErrorDialog(message, t("common.error"));
     } finally {
       setIsUpscalingImage(false);
     }
@@ -308,59 +400,56 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   ]);
   const handleUpscaleVideo = useCallback(async () => {
     if (!videoSource || isUpscalingVideo) return;
-    const isRunningHubTopaz = videoUpscaleProvider === 'runninghub-topaz';
+    const isRunningHubTopaz = videoUpscaleProvider === "runninghub-topaz";
     const credentials = isRunningHubTopaz
-      ? resolveRunningHubUpscaleCredentials('custom:runninghub-国内版', '')
-      : resolveZhiniaoUpscaleCredentials('custom:zhiniao', '');
+      ? resolveRunningHubUpscaleCredentials("custom:runninghub-国内版", "")
+      : resolveZhiniaoUpscaleCredentials("custom:zhiniao", "");
     if (!credentials) {
-      void showErrorDialog(t('nodeToolbar.videoUpscaleApiKeyMissing'), t('common.error'));
+      void showErrorDialog(t("nodeToolbar.videoUpscaleApiKeyMissing"), t("common.error"));
       return;
     }
     const topazTargetWidth = Number(topazWidth);
     const topazTargetHeight = Number(topazHeight);
     if (
-      isRunningHubTopaz
-      && (!Number.isInteger(topazTargetWidth) || topazTargetWidth < 1
-        || !Number.isInteger(topazTargetHeight) || topazTargetHeight < 1)
+      isRunningHubTopaz &&
+      (!Number.isInteger(topazTargetWidth) ||
+        topazTargetWidth < 1 ||
+        !Number.isInteger(topazTargetHeight) ||
+        topazTargetHeight < 1)
     ) {
-      void showErrorDialog('请填写有效的目标宽度和高度（正整数）。', t('common.error'));
+      void showErrorDialog("请填写有效的目标宽度和高度（正整数）。", t("common.error"));
       return;
     }
-    const model = isRunningHubTopaz
-      ? RUNNINGHUB_TOPAZ_VIDEO_UPSCALE_MODEL_ID
-      : ZHINIAO_VIDEO_UPSCALE_MODEL_ID;
+    const model = isRunningHubTopaz ? RUNNINGHUB_TOPAZ_VIDEO_UPSCALE_MODEL_ID : ZHINIAO_VIDEO_UPSCALE_MODEL_ID;
     const extraParams = isRunningHubTopaz
       ? {
-          video_upscale_provider: 'runninghub-topaz',
+          video_upscale_provider: "runninghub-topaz",
           topaz_width: topazTargetWidth,
           topaz_height: topazTargetHeight,
         }
       : undefined;
     const displayName = isRunningHubTopaz
-      ? `${t('nodeToolbar.upscale')} Topaz Video ${topazTargetWidth}×${topazTargetHeight}`
-      : `${t('nodeToolbar.upscale')} ${videoUpscaleTier}`;
+      ? `${t("nodeToolbar.upscale")} Topaz Video ${topazTargetWidth}×${topazTargetHeight}`
+      : `${t("nodeToolbar.upscale")} ${videoUpscaleTier}`;
     setIsUpscalingVideo(true);
-    const newNodeId = addNode(
-      CANVAS_NODE_TYPES.audio,
-      findNodePosition(node.id, 360, 240),
-      {
-        displayName,
-        mediaType: 'video',
-        aspectRatio: typeof node.data.aspectRatio === 'string' && node.data.aspectRatio.trim()
+    const newNodeId = addNode(CANVAS_NODE_TYPES.audio, findNodePosition(node.id, 360, 240), {
+      displayName,
+      mediaType: "video",
+      aspectRatio:
+        typeof node.data.aspectRatio === "string" && node.data.aspectRatio.trim()
           ? node.data.aspectRatio
           : DEFAULT_ASPECT_RATIO,
-        isGenerating: true,
-        generationStartedAt: Date.now(),
-        generationDurationMs: 120000,
-        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
-        generationRequest: {
-          kind: 'video-upscale',
-          model,
-          videoSource,
-          ...(isRunningHubTopaz ? { extraParams } : { tier: videoUpscaleTier }),
-        },
+      isGenerating: true,
+      generationStartedAt: Date.now(),
+      generationDurationMs: 120000,
+      generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+      generationRequest: {
+        kind: "video-upscale",
+        model,
+        videoSource,
+        ...(isRunningHubTopaz ? { extraParams } : { tier: videoUpscaleTier }),
       },
-    );
+    });
     addEdge(node.id, newNodeId);
     try {
       const videoUrl = await canvasAiGateway.upscaleVideo({
@@ -384,7 +473,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
         generationStartedAt: null,
         generationError: message,
       });
-      void showErrorDialog(message, t('common.error'));
+      void showErrorDialog(message, t("common.error"));
     } finally {
       setIsUpscalingVideo(false);
     }
@@ -408,7 +497,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       return;
     }
 
-    const mediaType = videoSource ? 'video' : 'image';
+    const mediaType = videoSource ? "video" : "image";
     try {
       await saveMediaSourceWithDialog({
         source: downloadSource,
@@ -416,63 +505,76 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
         mediaType,
       });
     } catch (error) {
-      console.error('Failed to save media from node toolbar', error);
+      console.error("Failed to save media from node toolbar", error);
       void showErrorDialog(
-        mediaType === 'video' ? '视频下载失败' : '图片下载失败',
-        '下载失败',
+        mediaType === "video" ? "视频下载失败" : "图片下载失败",
+        "下载失败",
         error instanceof Error ? error.message : String(error),
       );
     }
   }, [downloadSource, node.id, videoSource]);
   const libraryCategories = useMemo(
     () => categories.filter((category) => category.libraryId === (activeLibraryId || libraries[0]?.id)),
-    [activeLibraryId, categories, libraries]
+    [activeLibraryId, categories, libraries],
   );
   const generationError =
-    (isExportImageNode(node) || isVideoMediaNode)
-    && typeof (node.data as { generationError?: unknown }).generationError === 'string'
-      ? ((node.data as { generationError?: string }).generationError ?? '').trim()
-      : '';
+    (isExportImageNode(node) || isVideoMediaNode) &&
+    typeof (node.data as { generationError?: unknown }).generationError === "string"
+      ? ((node.data as { generationError?: string }).generationError ?? "").trim()
+      : "";
   const generationErrorDetails =
-    (isExportImageNode(node) || isVideoMediaNode)
-    && typeof (node.data as { generationErrorDetails?: unknown }).generationErrorDetails === 'string'
-      ? ((node.data as { generationErrorDetails?: string }).generationErrorDetails ?? '').trim()
-      : '';
-  const canCopyGenerationError =
-    (isExportImageNode(node) || isVideoMediaNode) && generationError.length > 0;
-  const canRetryGeneration = canCopyGenerationError
-    && Boolean((node.data as { generationRequest?: unknown }).generationRequest);
-  const encodingRetryAvailable = Boolean(
-    prepareEncodingRetry(node, `${generationError}\n${generationErrorDetails}`)
-  );
+    (isExportImageNode(node) || isVideoMediaNode) &&
+    typeof (node.data as { generationErrorDetails?: unknown }).generationErrorDetails === "string"
+      ? ((node.data as { generationErrorDetails?: string }).generationErrorDetails ?? "").trim()
+      : "";
+  const canCopyGenerationError = (isExportImageNode(node) || isVideoMediaNode) && generationError.length > 0;
+  const canRetryGeneration =
+    canCopyGenerationError && Boolean((node.data as { generationRequest?: unknown }).generationRequest);
+  const encodingRetryAvailable = Boolean(prepareEncodingRetry(node, `${generationError}\n${generationErrorDetails}`));
+  // 节点上仍挂着后端任务 ID, 说明平台那条任务可能还在生成(且已经计费)。
+  // 这种情况下「重试」必须是续查而不是重新提交, 否则同一支视频扣两次钱。
+  // 后端判终态失败时会清掉 job id, 所以"能续查"本身就等价于"任务未必死"。
+  const resumableJobId =
+    typeof (node.data as { generationJobId?: unknown }).generationJobId === "string"
+      ? (node.data as { generationJobId: string }).generationJobId || ""
+      : "";
+  const canResumeGeneration = resumableJobId.length > 0;
+  const retryActionLabel = encodingRetryAvailable
+    ? t("nodeToolbar.retryWithEncoding", "切换编码并重试")
+    : canResumeGeneration
+      ? t("nodeToolbar.resumeGeneration", "继续等待（不重新提交）")
+      : t("nodeToolbar.retryGeneration");
   const generationErrorReport = useMemo(
     () =>
       buildGenerationErrorReport({
-        errorMessage: generationError || t('ai.error'),
+        errorMessage: generationError || t("ai.error"),
         errorDetails: generationErrorDetails || undefined,
-        context: (node.data as { generationDebugContext?: unknown }).generationDebugContext,
+        context: resolveGenerationErrorContext(node),
       }),
-    [generationError, generationErrorDetails, node.data, t]
+    [generationError, generationErrorDetails, node.data, t],
   );
 
-  const resolveToolLabel = useCallback((toolType: NodeToolType) => {
-    if (toolType === NODE_TOOL_TYPES.crop) {
-      return t('tool.crop');
-    }
-    if (toolType === NODE_TOOL_TYPES.annotate) {
-      return t('tool.annotate');
-    }
-    if (toolType === NODE_TOOL_TYPES.splitStoryboard) {
-      return t('tool.split');
-    }
-    if (toolType === NODE_TOOL_TYPES.rotate) {
-      return t('tool.rotate.title');
-    }
-    if (toolType === NODE_TOOL_TYPES.adjust) {
-      return t('tool.adjust');
-    }
-    return '';
-  }, [t]);
+  const resolveToolLabel = useCallback(
+    (toolType: NodeToolType) => {
+      if (toolType === NODE_TOOL_TYPES.crop) {
+        return t("tool.crop");
+      }
+      if (toolType === NODE_TOOL_TYPES.annotate) {
+        return t("tool.annotate");
+      }
+      if (toolType === NODE_TOOL_TYPES.splitStoryboard) {
+        return t("tool.split");
+      }
+      if (toolType === NODE_TOOL_TYPES.rotate) {
+        return t("tool.rotate.title");
+      }
+      if (toolType === NODE_TOOL_TYPES.adjust) {
+        return t("tool.adjust");
+      }
+      return "";
+    },
+    [t],
+  );
 
   useEffect(() => {
     return () => {
@@ -488,25 +590,26 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const storyboardText = useMemo(() => {
     if (isStoryboardGen) {
       return node.data.frames
-        .map((frame, index) => t('nodeToolbar.storyboardLine', {
-          index: String(index + 1).padStart(2, '0'),
-          content: sanitizeStoryboardText(
-            frame.description ?? '',
-            ignoreAtTagWhenCopyingAndGenerating
-          ),
-        }))
-        .join('\n');
+        .map((frame, index) =>
+          t("nodeToolbar.storyboardLine", {
+            index: String(index + 1).padStart(2, "0"),
+            content: sanitizeStoryboardText(frame.description ?? "", ignoreAtTagWhenCopyingAndGenerating),
+          }),
+        )
+        .join("\n");
     }
     if (isStoryboardSplit) {
       const orderedFrames = [...node.data.frames].sort((a, b) => a.order - b.order);
       return orderedFrames
-        .map((frame, index) => t('nodeToolbar.storyboardLine', {
-          index: String(index + 1).padStart(2, '0'),
-          content: sanitizeStoryboardText(frame.note ?? '', ignoreAtTagWhenCopyingAndGenerating),
-        }))
-        .join('\n');
+        .map((frame, index) =>
+          t("nodeToolbar.storyboardLine", {
+            index: String(index + 1).padStart(2, "0"),
+            content: sanitizeStoryboardText(frame.note ?? "", ignoreAtTagWhenCopyingAndGenerating),
+          }),
+        )
+        .join("\n");
     }
-    return '';
+    return "";
   }, [ignoreAtTagWhenCopyingAndGenerating, isStoryboardGen, isStoryboardSplit, node, t, i18n.language]);
 
   const handleCopyStoryboardText = useCallback(async () => {
@@ -526,7 +629,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     try {
       await navigator.clipboard.writeText(storyboardText);
     } catch (error) {
-      console.error('Failed to copy storyboard text', error);
+      console.error("Failed to copy storyboard text", error);
     }
   }, [storyboardText]);
 
@@ -547,7 +650,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     try {
       await navigator.clipboard.writeText(generationErrorReport);
     } catch (error) {
-      console.error('Failed to copy generation error report', error);
+      console.error("Failed to copy generation error report", error);
     }
   }, [canCopyGenerationError, generationErrorReport]);
 
@@ -556,45 +659,55 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       return;
     }
     const encodingRetry = prepareEncodingRetry(node, `${generationError}\n${generationErrorDetails}`);
-    if (encodingRetry && !window.confirm(t(
-      'nodeToolbar.confirmEncodingRetry',
-      '将使用另一种参考图编码提交新的生成请求，平台可能计费。继续吗？'
-    ))) {
+    if (
+      encodingRetry &&
+      !window.confirm(
+        t("nodeToolbar.confirmEncodingRetry", "将使用另一种参考图编码提交新的生成请求，平台可能计费。继续吗？"),
+      )
+    ) {
       return;
     }
+    // 切换编码是"换一种请求重发", 天然是一次新提交; 其余情况只要节点还握着后端
+    // 任务 ID, 就只续查那条任务(零成本), 不重新提交 —— 平台那条可能还在跑并计费,
+    // 重新提交会让同一支视频扣两次钱。任务真的死了则 job id 已被失败路径清掉,
+    // 这里自然落回重新提交。
+    const resumeExistingJob = resumableJobId.length > 0 && !encodingRetry;
     updateNodeData(node.id, {
       ...(encodingRetry ?? {}),
       isGenerating: true,
       generationStartedAt: Date.now(),
       generationError: null,
       generationErrorDetails: null,
-      generationJobId: null,
+      generationJobId: resumeExistingJob ? resumableJobId : null,
       generationClientSessionId: null,
-      generationRetryRequested: true,
+      generationRetryRequested: !resumeExistingJob,
     });
-  }, [canRetryGeneration, generationError, generationErrorDetails, node, node.id, t, updateNodeData]);
+  }, [canRetryGeneration, generationError, generationErrorDetails, node, node.id, resumableJobId, t, updateNodeData]);
 
-  const handleAddVideoToLibrary = useCallback(async (categoryId: string | null) => {
-    if (!videoSource || isSavingToLibrary) {
-      return;
-    }
-    const libraryId = activeLibraryId || libraries[0]?.id;
-    if (!libraryId) {
-      return;
-    }
-    setIsSavingToLibrary(true);
-    try {
-      const asset = await importVideoUrlToAsset(videoSource, libraryId, categoryId);
-      if (asset) {
-        addAssets([asset]);
-        setIsLibraryDialogOpen(false);
+  const handleAddVideoToLibrary = useCallback(
+    async (categoryId: string | null) => {
+      if (!videoSource || isSavingToLibrary) {
+        return;
       }
-    } catch (error) {
-      console.error('Failed to add video to asset library', error);
-    } finally {
-      setIsSavingToLibrary(false);
-    }
-  }, [activeLibraryId, addAssets, isSavingToLibrary, libraries, videoSource]);
+      const libraryId = activeLibraryId || libraries[0]?.id;
+      if (!libraryId) {
+        return;
+      }
+      setIsSavingToLibrary(true);
+      try {
+        const asset = await importVideoUrlToAsset(videoSource, libraryId, categoryId);
+        if (asset) {
+          addAssets([asset]);
+          setIsLibraryDialogOpen(false);
+        }
+      } catch (error) {
+        console.error("Failed to add video to asset library", error);
+      } finally {
+        setIsSavingToLibrary(false);
+      }
+    },
+    [activeLibraryId, addAssets, isSavingToLibrary, libraries, videoSource],
+  );
 
   const handleSaveTemplate = useCallback(async () => {
     if (!templateDraft?.valid || isSavingTemplate) return;
@@ -602,12 +715,12 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     setTemplateNotice(null);
     try {
       await createTemplateFromCanvas(node, canvasNodes, canvasEdges, templateName, templateDescription);
-      setTemplateNotice(t('nodeToolbar.templateSaved'));
+      setTemplateNotice(t("nodeToolbar.templateSaved"));
       setIsTemplateDialogOpen(false);
-      setTemplateName('');
-      setTemplateDescription('');
+      setTemplateName("");
+      setTemplateDescription("");
     } catch (error) {
-      setTemplateNotice(error instanceof Error ? error.message : t('nodeToolbar.templateSaveFailed'));
+      setTemplateNotice(error instanceof Error ? error.message : t("nodeToolbar.templateSaveFailed"));
     } finally {
       setIsSavingTemplate(false);
     }
@@ -623,37 +736,38 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       className={NODE_TOOLBAR_CLASS}
     >
       <UiPanel className="flex items-center gap-1 rounded-full p-1">
-        {!isImageEdit && tools.map((tool) => {
-          const Icon = toolIconMap[tool.icon] ?? Crop;
+        {!isImageEdit &&
+          tools.map((tool) => {
+            const Icon = toolIconMap[tool.icon] ?? Crop;
 
-          return (
-            <UiChipButton
-              key={tool.type}
-              className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
-              onClick={() =>
-                canvasEventBus.publish('tool-dialog/open', {
-                  nodeId: node.id,
-                  toolType: tool.type,
-                })
-              }
-            >
-              <Icon className="h-3.5 w-3.5" />
-              {resolveToolLabel(tool.type)}
-            </UiChipButton>
-          );
-        })}
+            return (
+              <UiChipButton
+                key={tool.type}
+                className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+                onClick={() =>
+                  canvasEventBus.publish("tool-dialog/open", {
+                    nodeId: node.id,
+                    toolType: tool.type,
+                  })
+                }
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {resolveToolLabel(tool.type)}
+              </UiChipButton>
+            );
+          })}
         {!isImageEdit && canReupload && (
           <UiChipButton
             key="upload-reupload"
             className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
             onClick={() =>
-              canvasEventBus.publish('upload-node/reupload', {
+              canvasEventBus.publish("upload-node/reupload", {
                 nodeId: node.id,
               })
             }
           >
             <RefreshCw className="h-3.5 w-3.5" />
-            {t('nodeToolbar.reupload')}
+            {t("nodeToolbar.reupload")}
           </UiChipButton>
         )}
         {!isImageEdit && canCopyStoryboardText && (
@@ -661,15 +775,15 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             key="storyboard-text-copy"
             className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS} ${
               isCopyTextSuccess
-                ? '!border-emerald-400/70 !bg-emerald-500/20 !text-emerald-200 hover:!bg-emerald-500/30'
-                : ''
+                ? "!border-emerald-400/70 !bg-emerald-500/20 !text-emerald-200 hover:!bg-emerald-500/30"
+                : ""
             }`}
             onClick={() => {
               void handleCopyStoryboardText();
             }}
           >
             <Copy className="h-3.5 w-3.5" />
-            {t('nodeToolbar.copyText')}
+            {t("nodeToolbar.copyText")}
           </UiChipButton>
         )}
         {!isImageEdit && canCopyGenerationError && (
@@ -677,15 +791,15 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             key="generation-error-copy"
             className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS} ${
               isCopyErrorSuccess
-                ? '!border-emerald-400/70 !bg-emerald-500/20 !text-emerald-200 hover:!bg-emerald-500/30'
-                : '!border-red-500/45 !bg-red-500/15 !text-red-200 hover:!bg-red-500/25'
+                ? "!border-emerald-400/70 !bg-emerald-500/20 !text-emerald-200 hover:!bg-emerald-500/30"
+                : "!border-red-500/45 !bg-red-500/15 !text-red-200 hover:!bg-red-500/25"
             }`}
             onClick={() => {
               void handleCopyGenerationError();
             }}
           >
             <Copy className="h-3.5 w-3.5" />
-            {isCopyErrorSuccess ? t('nodeToolbar.copied') : t('nodeToolbar.copyErrorReport')}
+            {isCopyErrorSuccess ? t("nodeToolbar.copied") : t("nodeToolbar.copyErrorReport")}
           </UiChipButton>
         )}
         {!isImageEdit && canRetryGeneration && (
@@ -696,14 +810,10 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               event.stopPropagation();
               handleRetryGeneration();
             }}
-            title={encodingRetryAvailable
-              ? t('nodeToolbar.retryWithEncoding', '切换编码并重试')
-              : t('nodeToolbar.retryGeneration')}
-            >
+            title={retryActionLabel}
+          >
             <RefreshCw className="h-3.5 w-3.5" />
-            {encodingRetryAvailable
-              ? t('nodeToolbar.retryWithEncoding', '切换编码并重试')
-              : t('nodeToolbar.retryGeneration')}
+            {retryActionLabel}
           </UiChipButton>
         )}
         {!isImageEdit && canHandleMedia && (
@@ -714,11 +824,11 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
                 onClick={(event) => {
                   event.stopPropagation();
-                  canvasEventBus.publish('upload-node/reupload', { nodeId: node.id });
+                  canvasEventBus.publish("upload-node/reupload", { nodeId: node.id });
                 }}
               >
                 <RefreshCw className="h-3.5 w-3.5" />
-                {t('nodeToolbar.reupload')}
+                {t("nodeToolbar.reupload")}
               </UiChipButton>
             )}
             <UiChipButton
@@ -730,7 +840,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               }}
             >
               <Download className="h-3.5 w-3.5" />
-              {t('nodeToolbar.download')}
+              {t("nodeToolbar.download")}
             </UiChipButton>
             {isVideoMediaNode && videoSource && (
               <UiChipButton
@@ -739,11 +849,11 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 onClick={(event) => {
                   event.stopPropagation();
                   // 截图需要读节点内 <video> 的当前时间点, 由 AudioNode 订阅后执行。
-                  canvasEventBus.publish('media-node/capture-frame', { nodeId: node.id });
+                  canvasEventBus.publish("media-node/capture-frame", { nodeId: node.id });
                 }}
               >
                 <Camera className="h-3.5 w-3.5" />
-                {t('nodeToolbar.captureFrame')}
+                {t("nodeToolbar.captureFrame")}
               </UiChipButton>
             )}
             {isVideoMediaNode && videoSource && (
@@ -755,10 +865,10 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                   // 一键扒剧本: 弹窗里只选模型, 扒完把剧本落成右侧文本节点。
                   setIsScriptDialogOpen(true);
                 }}
-                title={t('pajuben.quickTitle', '扒视频')}
+                title={t("pajuben.quickTitle", "扒视频")}
               >
                 <FileText className="h-3.5 w-3.5" />
-                {t('pajuben.quickTitle', '扒视频')}
+                {t("pajuben.quickTitle", "扒视频")}
               </UiChipButton>
             )}
             {canUpscaleImage && (
@@ -773,7 +883,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 }}
               >
                 <Maximize2 className="h-3.5 w-3.5" />
-                {t('nodeToolbar.imageUpscale')}
+                {t("nodeToolbar.imageUpscale")}
               </UiChipButton>
             )}
             {isVideoMediaNode && videoSource && (
@@ -785,10 +895,10 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                   // 将本节点视频交给超分专用链路，结果作为新的视频节点接入画布。
                   setIsUpscaleDialogOpen(true);
                 }}
-                title={t('nodeToolbar.upscale')}
+                title={t("nodeToolbar.upscale")}
               >
                 <Sparkles className="h-3.5 w-3.5" />
-                {t('nodeToolbar.upscale')}
+                {t("nodeToolbar.upscale")}
               </UiChipButton>
             )}
           </>
@@ -799,15 +909,19 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               key="save-video-template"
               disabled={!templateDraft?.valid || isSavingTemplate}
               className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
-              title={templateDraft?.valid ? t('nodeToolbar.saveAsTemplate') : `${t('nodeToolbar.incompleteChain')}: ${templateDraft?.missing.join('、') ?? ''}`}
+              title={
+                templateDraft?.valid
+                  ? t("nodeToolbar.saveAsTemplate")
+                  : `${t("nodeToolbar.incompleteChain")}: ${templateDraft?.missing.join("、") ?? ""}`
+              }
               onClick={(event) => {
                 event.stopPropagation();
-                setTemplateName(node.data.displayName?.trim() || '');
+                setTemplateName(node.data.displayName?.trim() || "");
                 setIsTemplateDialogOpen(true);
               }}
             >
               <LayoutTemplate className="h-3.5 w-3.5" />
-              {t('nodeToolbar.saveAsTemplate')}
+              {t("nodeToolbar.saveAsTemplate")}
             </UiChipButton>
             {templateNotice && <span className="px-2 text-[11px] text-emerald-300">{templateNotice}</span>}
           </>
@@ -823,7 +937,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             }}
           >
             <Library className="h-3.5 w-3.5" />
-            {isSavingToLibrary ? '保存中…' : '添加到素材库'}
+            {isSavingToLibrary ? "保存中…" : "添加到素材库"}
           </UiChipButton>
         )}
         {!isImageEdit && isGroupNode(node) && (
@@ -833,11 +947,11 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
               onClick={(event) => {
                 event.stopPropagation();
-                canvasEventBus.publish('group-node/rename', { nodeId: node.id });
+                canvasEventBus.publish("group-node/rename", { nodeId: node.id });
               }}
             >
               <PenLine className="h-3.5 w-3.5" />
-              {t('nodeToolbar.rename')}
+              {t("nodeToolbar.rename")}
             </UiChipButton>
             <UiChipButton
               key="group-ungroup"
@@ -848,7 +962,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               }}
             >
               <Unlink2 className="h-3.5 w-3.5" />
-              {t('nodeToolbar.ungroup')}
+              {t("nodeToolbar.ungroup")}
             </UiChipButton>
           </>
         )}
@@ -861,7 +975,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           }}
         >
           <Trash2 className="h-3.5 w-3.5" />
-          {t('common.delete')}
+          {t("common.delete")}
         </UiChipButton>
       </UiPanel>
 
@@ -872,18 +986,49 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       {!isImageEdit && (
         <UiModal
           isOpen={isTemplateDialogOpen}
-          title={t('nodeToolbar.saveAsTemplate')}
+          title={t("nodeToolbar.saveAsTemplate")}
           onClose={() => setIsTemplateDialogOpen(false)}
           widthClassName="w-[420px]"
-          footer={<>
-            <UiButton type="button" variant="ghost" size="sm" onClick={() => setIsTemplateDialogOpen(false)}>{t('common.cancel')}</UiButton>
-            <UiButton type="button" variant="primary" size="sm" disabled={isSavingTemplate || !templateDraft?.valid} onClick={() => void handleSaveTemplate()}>{isSavingTemplate ? t('nodeToolbar.templateSaving') : t('common.confirm')}</UiButton>
-          </>}
+          footer={
+            <>
+              <UiButton type="button" variant="ghost" size="sm" onClick={() => setIsTemplateDialogOpen(false)}>
+                {t("common.cancel")}
+              </UiButton>
+              <UiButton
+                type="button"
+                variant="primary"
+                size="sm"
+                disabled={isSavingTemplate || !templateDraft?.valid}
+                onClick={() => void handleSaveTemplate()}
+              >
+                {isSavingTemplate ? t("nodeToolbar.templateSaving") : t("common.confirm")}
+              </UiButton>
+            </>
+          }
         >
           <div className="space-y-3">
-            <label className="block text-xs text-text-muted">{t('nodeToolbar.templateName')}<UiInput value={templateName} onChange={(event) => setTemplateName(event.target.value)} className="mt-1.5" /></label>
-            <label className="block text-xs text-text-muted">{t('nodeToolbar.templateDescription')}<UiTextArea value={templateDescription} onChange={(event) => setTemplateDescription(event.target.value)} rows={3} className="mt-1.5" /></label>
-            {!templateDraft?.valid && <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">{t('nodeToolbar.incompleteChain')}: {templateDraft?.missing.join('、')}</p>}
+            <label className="block text-xs text-text-muted">
+              {t("nodeToolbar.templateName")}
+              <UiInput
+                value={templateName}
+                onChange={(event) => setTemplateName(event.target.value)}
+                className="mt-1.5"
+              />
+            </label>
+            <label className="block text-xs text-text-muted">
+              {t("nodeToolbar.templateDescription")}
+              <UiTextArea
+                value={templateDescription}
+                onChange={(event) => setTemplateDescription(event.target.value)}
+                rows={3}
+                className="mt-1.5"
+              />
+            </label>
+            {!templateDraft?.valid && (
+              <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                {t("nodeToolbar.incompleteChain")}: {templateDraft?.missing.join("、")}
+              </p>
+            )}
           </div>
         </UiModal>
       )}
@@ -897,9 +1042,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
         >
           <div className="space-y-2">
             {!activeLibraryId && libraries.length === 0 ? (
-              <p className="py-4 text-center text-xs text-text-muted/70">
-                请先在素材库面板创建一个素材库
-              </p>
+              <p className="py-4 text-center text-xs text-text-muted/70">请先在素材库面板创建一个素材库</p>
             ) : (
               <>
                 <button
@@ -937,20 +1080,20 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       {!isImageEdit && (
         <UiModal
           isOpen={isUpscaleDialogOpen}
-          title={t('nodeToolbar.upscale')}
+          title={t("nodeToolbar.upscale")}
           onClose={() => setIsUpscaleDialogOpen(false)}
           widthClassName="w-[430px]"
         >
           <div className="space-y-3">
-            <p className="text-xs leading-relaxed text-text-muted">{t('nodeToolbar.upscaleDesc')}</p>
+            <p className="text-xs leading-relaxed text-text-muted">{t("nodeToolbar.upscaleDesc")}</p>
             <div className="space-y-1">
-              <label className="text-xs text-text-muted">{t('nodeToolbar.videoUpscaleModel')}</label>
+              <label className="text-xs text-text-muted">{t("nodeToolbar.videoUpscaleModel")}</label>
               <div className="grid grid-cols-2 gap-2">
                 <UiChipButton
                   type="button"
-                  active={videoUpscaleProvider === 'zhiniao'}
+                  active={videoUpscaleProvider === "zhiniao"}
                   className="h-auto min-h-12 items-start justify-start px-3 py-2 text-left"
-                  onClick={() => setVideoUpscaleProvider('zhiniao')}
+                  onClick={() => setVideoUpscaleProvider("zhiniao")}
                 >
                   <span>
                     <span className="block text-xs font-medium">知鸟视频超分</span>
@@ -959,9 +1102,9 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 </UiChipButton>
                 <UiChipButton
                   type="button"
-                  active={videoUpscaleProvider === 'runninghub-topaz'}
+                  active={videoUpscaleProvider === "runninghub-topaz"}
                   className="h-auto min-h-12 items-start justify-start px-3 py-2 text-left"
-                  onClick={() => setVideoUpscaleProvider('runninghub-topaz')}
+                  onClick={() => setVideoUpscaleProvider("runninghub-topaz")}
                 >
                   <span>
                     <span className="block text-xs font-medium">Topaz Video 高清放大 V1</span>
@@ -970,7 +1113,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 </UiChipButton>
               </div>
             </div>
-            {videoUpscaleProvider === 'runninghub-topaz' ? (
+            {videoUpscaleProvider === "runninghub-topaz" ? (
               <>
                 <div className="grid grid-cols-2 gap-2">
                   <label className="space-y-1">
@@ -994,18 +1137,47 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                     />
                   </label>
                 </div>
+                <div className="space-y-1.5">
+                  <span className="block text-xs text-text-muted">尺寸预设</span>
+                  {TOPAZ_SIZE_PRESETS.map((preset) => (
+                    <div key={preset.key} className="flex items-center gap-2">
+                      <span className="w-8 shrink-0 text-xs text-text-muted">{preset.label}</span>
+                      <div className="flex min-w-0 flex-1 gap-2">
+                        {preset.tiers.map((tier) => {
+                          const isPresetActive =
+                            Number(topazWidth) === tier.width && Number(topazHeight) === tier.height;
+                          return (
+                            <UiChipButton
+                              key={`${preset.key}-${tier.label}`}
+                              type="button"
+                              active={isPresetActive}
+                              className="h-7 min-w-0 flex-1 justify-center text-xs"
+                              title={`${tier.width} × ${tier.height}`}
+                              onClick={() => {
+                                setTopazWidth(String(tier.width));
+                                setTopazHeight(String(tier.height));
+                              }}
+                            >
+                              {tier.label}
+                            </UiChipButton>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
                 <p className="text-[11px] leading-relaxed text-text-muted/80">
-                  输出尺寸会直接提交给 Topaz 工作流；打开时会按当前视频画幅预填。RunningHub 按实际用量结算。
+                  点上方预设一键填入尺寸（悬停可见具体像素），也可手动微调。输出尺寸会直接提交给 Topaz 工作流；打开时会按当前视频画幅预填。RunningHub 按实际用量结算。
                 </p>
               </>
             ) : (
               <div className="space-y-1">
-                <label className="text-xs text-text-muted">{t('nodeToolbar.videoUpscaleTier')}</label>
+                <label className="text-xs text-text-muted">{t("nodeToolbar.videoUpscaleTier")}</label>
                 <div className="flex gap-2">
-                  {['720p', '1080p', '4K'].map((tier) => (
+                  {["720p", "1080p", "4K"].map((tier) => (
                     <UiChipButton
                       key={tier}
-                      className={`h-8 px-3 text-xs ${videoUpscaleTier === tier ? 'ring-1 ring-primary' : ''}`}
+                      className={`h-8 px-3 text-xs ${videoUpscaleTier === tier ? "ring-1 ring-primary" : ""}`}
                       onClick={() => setVideoUpscaleTier(tier)}
                     >
                       {tier}
@@ -1016,7 +1188,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             )}
             <div className="flex justify-end gap-2">
               <UiButton type="button" variant="ghost" size="sm" onClick={() => setIsUpscaleDialogOpen(false)}>
-                {t('common.cancel')}
+                {t("common.cancel")}
               </UiButton>
               <UiButton
                 type="button"
@@ -1025,7 +1197,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 disabled={isUpscalingVideo || !videoSource}
                 onClick={() => void handleUpscaleVideo()}
               >
-                {isUpscalingVideo ? t('nodeToolbar.videoUpscaleRunning') : t('canvas.generate')}
+                {isUpscalingVideo ? t("nodeToolbar.videoUpscaleRunning") : t("canvas.generate")}
               </UiButton>
             </div>
           </div>
@@ -1035,7 +1207,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       {!isImageEdit && (
         <UiModal
           isOpen={isImageUpscaleDialogOpen}
-          title={t('nodeToolbar.imageUpscale')}
+          title={t("nodeToolbar.imageUpscale")}
           onClose={() => {
             setIsUpscaleModelPickerOpen(false);
             setIsImageUpscaleDialogOpen(false);
@@ -1044,13 +1216,11 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
         >
           <div className="space-y-3">
             <div>
-              <span className="mb-1.5 block text-xs text-text-muted">
-                {t('nodeToolbar.imageUpscaleModel')}
-              </span>
+              <span className="mb-1.5 block text-xs text-text-muted">{t("nodeToolbar.imageUpscaleModel")}</span>
               <div className="flex items-center gap-2">
                 <span className="flex h-9 min-w-0 flex-1 items-center rounded-lg border border-white/10 bg-bg-dark/50 px-2.5 text-xs text-text-dark">
                   <span className="min-w-0 truncate">
-                    {selectedUpscaleModel?.displayName ?? t('nodeToolbar.imageUpscaleNoModel')}
+                    {selectedUpscaleModel?.displayName ?? t("nodeToolbar.imageUpscaleNoModel")}
                   </span>
                 </span>
                 <UiButton
@@ -1060,7 +1230,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                   className="shrink-0"
                   onClick={() => setIsUpscaleModelPickerOpen((open) => !open)}
                 >
-                  {t('nodeToolbar.imageUpscaleChangeModel')}
+                  {t("nodeToolbar.imageUpscaleChangeModel")}
                 </UiButton>
               </div>
               {isUpscaleModelPickerOpen && (
@@ -1076,9 +1246,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                           setIsUpscaleModelPickerOpen(false);
                         }}
                         className={`flex h-8 w-full items-center justify-between gap-2 rounded-md px-2 text-left text-xs transition-colors ${
-                          isActive
-                            ? 'bg-accent/20 text-text-dark'
-                            : 'text-text-muted hover:bg-bg-dark'
+                          isActive ? "bg-accent/20 text-text-dark" : "text-text-muted hover:bg-bg-dark"
                         }`}
                       >
                         <span className="min-w-0 truncate">{model.displayName}</span>
@@ -1088,7 +1256,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                   })}
                   {upscaleModelOptions.length === 0 && (
                     <p className="px-2 py-3 text-center text-xs text-text-muted/60">
-                      {t('nodeToolbar.imageUpscaleNoModel')}
+                      {t("nodeToolbar.imageUpscaleNoModel")}
                     </p>
                   )}
                 </div>
@@ -1096,9 +1264,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             </div>
 
             <div>
-              <span className="mb-1.5 block text-xs text-text-muted">
-                {t('nodeToolbar.imageUpscaleResolution')}
-              </span>
+              <span className="mb-1.5 block text-xs text-text-muted">{t("nodeToolbar.imageUpscaleResolution")}</span>
               <div className="flex flex-wrap gap-1.5">
                 {upscaleResolutionOptions.map((option) => {
                   const isActive = option.value === resolvedUpscaleResolution;
@@ -1109,8 +1275,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                       onClick={() => setImageUpscaleResolution(option.value)}
                       className={`h-7 rounded-full border px-3 text-xs transition-colors ${
                         isActive
-                          ? 'border-accent bg-accent/20 text-text-dark'
-                          : 'border-white/15 bg-bg-dark/60 text-text-muted hover:border-white/30'
+                          ? "border-accent bg-accent/20 text-text-dark"
+                          : "border-white/15 bg-bg-dark/60 text-text-muted hover:border-white/30"
                       }`}
                     >
                       {option.label}
@@ -1121,13 +1287,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             </div>
 
             <div className="flex justify-end gap-2 border-t border-white/10 pt-3">
-              <UiButton
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => setIsImageUpscaleDialogOpen(false)}
-              >
-                {t('common.cancel')}
+              <UiButton type="button" variant="ghost" size="sm" onClick={() => setIsImageUpscaleDialogOpen(false)}>
+                {t("common.cancel")}
               </UiButton>
               <UiButton
                 type="button"
@@ -1136,9 +1297,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 disabled={isUpscalingImage || !selectedUpscaleModel}
                 onClick={() => void handleUpscaleImage()}
               >
-                {isUpscalingImage
-                  ? t('nodeToolbar.imageUpscaleRunning')
-                  : t('canvas.generate')}
+                {isUpscalingImage ? t("nodeToolbar.imageUpscaleRunning") : t("canvas.generate")}
               </UiButton>
             </div>
           </div>
@@ -1148,4 +1307,4 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   );
 });
 
-NodeActionToolbar.displayName = 'NodeActionToolbar';
+NodeActionToolbar.displayName = "NodeActionToolbar";

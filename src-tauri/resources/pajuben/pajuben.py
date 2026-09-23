@@ -37,6 +37,12 @@ PROVIDERS = {
 
 # low/high 大致对应的抽帧长边像素（控制 token 消耗）
 RES_LONGEDGE = {"low": 512, "medium": 768, "high": 1024}
+SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".ass", ".ssa")
+SUBTITLE_TIME_RE = re.compile(
+    r"(?P<start>(?:\d{1,2}:)?\d{1,2}:\d{2}[,.]\d{1,3})\s*-->\s*"
+    r"(?P<end>(?:\d{1,2}:)?\d{1,2}:\d{2}[,.]\d{1,3})"
+)
+MAX_SUBTITLE_CHARS_PER_SEGMENT = 24_000
 
 
 def log(msg):
@@ -219,6 +225,131 @@ def extract_audio(video_path, workdir, start=0.0, seg_dur=0.0):
     return out if os.path.exists(out) and os.path.getsize(out) > 0 else None
 
 
+def subtitle_timestamp(value):
+    """SRT/VTT/ASS 时间戳转秒；解析失败时返回 None。"""
+    match = re.match(r"^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[,.](\d+))?$", value.strip())
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    fraction_text = match.group(4) or "0"
+    fraction = int(fraction_text) / (10 ** len(fraction_text))
+    return hours * 3600 + minutes * 60 + seconds + fraction
+
+
+def clean_subtitle_text(text):
+    """去除 VTT/ASS 样式标签，保留可作为台词证据的正文。"""
+    cleaned = text.replace("\\N", " ").replace("\\n", " ")
+    cleaned = re.sub(r"\{\\[^}]*\}", "", cleaned)
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def parse_text_subtitles(text, extension):
+    """解析常见文本字幕，统一成 (开始秒, 结束秒, 正文) 列表。"""
+    if extension.lower() in (".ass", ".ssa"):
+        cues = []
+        for line in text.splitlines():
+            if not line.lstrip().lower().startswith("dialogue:"):
+                continue
+            fields = line.split(":", 1)[1].split(",", 9)
+            if len(fields) < 10:
+                continue
+            start, end = subtitle_timestamp(fields[1]), subtitle_timestamp(fields[2])
+            body = clean_subtitle_text(fields[9])
+            if start is not None and end is not None and end >= start and body:
+                cues.append((start, end, body))
+        return cues
+
+    cues, start, end, lines = [], None, None, []
+
+    def flush():
+        nonlocal start, end, lines
+        body = clean_subtitle_text(" ".join(lines))
+        if start is not None and end is not None and end >= start and body:
+            cues.append((start, end, body))
+        start, end, lines = None, None, []
+
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") + [""]:
+        line = raw_line.strip().lstrip("\ufeff")
+        match = SUBTITLE_TIME_RE.search(line)
+        if match:
+            flush()
+            start = subtitle_timestamp(match.group("start"))
+            end = subtitle_timestamp(match.group("end"))
+        elif start is not None:
+            if line:
+                lines.append(line)
+            else:
+                flush()
+    return cues
+
+
+def sidecar_subtitle_paths(video_path):
+    """找到与视频同名（或同名前缀）的外挂文本字幕。"""
+    directory = os.path.dirname(os.path.abspath(video_path))
+    stem = os.path.splitext(os.path.basename(video_path))[0].lower()
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    result = []
+    for name in names:
+        candidate_stem, extension = os.path.splitext(name)
+        if extension.lower() not in SUBTITLE_EXTENSIONS:
+            continue
+        if candidate_stem.lower() == stem or candidate_stem.lower().startswith(stem + "."):
+            result.append(os.path.join(directory, name))
+    return result
+
+
+def load_video_subtitles(video_path):
+    """优先外挂字幕，随后尝试导出视频第一条内嵌文本字幕。"""
+    for path in sidecar_subtitle_paths(video_path):
+        try:
+            with open(path, encoding="utf-8-sig", errors="replace") as source:
+                cues = parse_text_subtitles(source.read(), os.path.splitext(path)[1])
+            if cues:
+                return cues, path
+        except OSError:
+            continue
+
+    workdir = tempfile.mkdtemp(prefix="pajuben_subtitle_")
+    output = os.path.join(workdir, "embedded.srt")
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", video_path,
+             "-map", "0:s:0", "-c:s", "srt", output],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0 or not os.path.exists(output):
+            return [], None
+        with open(output, encoding="utf-8-sig", errors="replace") as source:
+            cues = parse_text_subtitles(source.read(), ".srt")
+        return (cues, "内嵌字幕") if cues else ([], None)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def subtitles_for_segment(cues, start, seg_dur, duration):
+    """只给当前视频分段带入对应字幕，防止长视频把整集字幕重复塞进每次请求。"""
+    if not cues:
+        return ""
+    end = start + seg_dur if seg_dur else duration
+    lines, size = [], 0
+    for cue_start, cue_end, text in cues:
+        if cue_end < start or cue_start > end:
+            continue
+        line = f"【{fmt_ts(cue_start)}-{fmt_ts(cue_end)}】{text}"
+        if lines and size + len(line) + 1 > MAX_SUBTITLE_CHARS_PER_SEGMENT:
+            lines.append("【字幕过长，以下内容省略】")
+            break
+        lines.append(line)
+        size += len(line) + 1
+    return "\n".join(lines)
+
+
 def b64_file(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
@@ -315,7 +446,7 @@ def segment_frame_settings(max_frames, segment_count, covered_duration, requeste
 
 
 def build_messages(prompt_text, ep_num, known_roles, frames, detail, audio_path=None,
-                   face_hints=None, anime_mode=False):
+                   face_hints=None, anime_mode=False, subtitle_text=""):
     prompt_filled = prompt_text.replace("{ep_num}", str(ep_num)).replace(
         "{known_roles}", known_roles or ""
     )
@@ -330,6 +461,14 @@ def build_messages(prompt_text, ep_num, known_roles, frames, detail, audio_path=
     if audio_path:
         tip += ("另外附上本集完整音频，台词、旁白(VO)、内心独白请以音频为准，"
                 "画面用来判断场景、动作和人物。\n")
+    elif subtitle_text:
+        tip += ("当前模型未接收视频音频。以下是视频字幕，请以字幕内容和时间戳为台词、"
+                "旁白及内心独白依据；字幕没有覆盖的声音不要编造。\n")
+    else:
+        tip += ("当前模型未接收视频音频，且没有可读取的字幕。只记录画面；不要编造台词、"
+                "旁白或内心独白。\n")
+    if subtitle_text:
+        tip += f"\n【本段视频字幕】\n{subtitle_text}\n"
     content = [{"type": "text", "text": prompt_filled + tip}]
     if audio_path:
         content.append({
@@ -742,6 +881,11 @@ def process_video(S, video, ep, known_roles):
     if known_roles:
         known = known_roles if known_roles.startswith("\n") else (
             f"\n已知角色表（角色名必须用这里的名字）：\n{known_roles}\n")
+    subtitle_cues, subtitle_source = load_video_subtitles(video)
+    if subtitle_source:
+        log(f"  第{ep}集 已读取字幕：{subtitle_source}")
+    elif not S["want_audio"]:
+        log(f"  第{ep}集 未找到外挂或内嵌字幕，将只根据画面记录")
     parts = []
     for k, (start, seg_dur, eff_fps) in enumerate(segments, 1):
         base = 90.0 * (k - 1) / m
@@ -770,10 +914,11 @@ def process_video(S, video, ep, known_roles):
             audio_path = (extract_audio(video, workdir, start, seg_dur)
                           if S["want_audio"] else None)
             end = start + seg_dur if seg_dur else duration
+            subtitle_text = subtitles_for_segment(subtitle_cues, start, seg_dur, duration)
             prompt = S["prompt_text"] + segment_tip(ep, k, m, start, end,
                                                     parts[-1] if parts else "")
             messages = build_messages(prompt, ep, known, frames, S["res"], audio_path,
-                                      face_hints, S.get("anime_mode", False))
+                                      face_hints, S.get("anime_mode", False), subtitle_text)
             if m > 1:
                 log(f"  第{ep}集 段 {k}/{m}（{fmt_ts(start)}–{fmt_ts(end)}）调用模型…")
             ep_progress(ep, 15 + base, seg_tag + "调用模型…")
@@ -841,7 +986,14 @@ FALLBACK_ERROR_MARKERS = (
 def should_use_dual_fallback(error):
     """只对媒体解析、超时和连接异常降级；鉴权/余额等错误直接上报。"""
     text = f"{type(error).__name__}: {error}".lower()
-    return any(marker in text for marker in FALLBACK_ERROR_MARKERS)
+    audio_markers = (
+        "未收到音频", "没有音频", "未提供音频", "请补充音频",
+        "无法生成完整台词", "input_audio", "audio input", "audio modality",
+        "does not support audio", "unsupported audio",
+    )
+    return any(marker in text for marker in FALLBACK_ERROR_MARKERS) or any(
+        marker.lower() in text for marker in audio_markers
+    )
 
 
 def run_dual_fallback(S, video, ep, out_dir, roles_file):
@@ -852,8 +1004,16 @@ def run_dual_fallback(S, video, ep, out_dir, roles_file):
     cache_dir = os.path.join(out_dir, "_双模型中间文件", f"第{ep}集")
     os.makedirs(cache_dir, exist_ok=True)
     native_gemini = is_gemini_native_base(S["base_url"])
-    audio_model = S["model"] if native_gemini else S["dual_audio_model"]
-    vision_model = S["model"] if native_gemini else S["dual_vision_model"]
+    # 原生 Gemini 单模型可以同时听声和看图；快速入口的 --dual-only 则明确
+    # 使用前端挑出的同渠道音频模型和视觉模型，不能再被当前选中模型覆盖。
+    use_single_native_model = native_gemini and not S.get("force_dual", False)
+    audio_model = S["model"] if use_single_native_model else S["dual_audio_model"]
+    vision_model = S["model"] if use_single_native_model else S["dual_vision_model"]
+    if not audio_model or not vision_model:
+        raise RuntimeError(
+            "当前模型不支持音频输入，且当前渠道没有配置可用的音频模型（例如 Gemini）。"
+            "请在同一渠道加入 Gemini 或支持音频输入的模型后重试"
+        )
     cmd = [sys.executable, "-u", script, video, "--ep", str(ep),
            "--base", S["base_url"],
            "--audio-model", audio_model,
@@ -1192,10 +1352,20 @@ def build_settings(args, cfg):
         "request_attempts": args.request_attempts,
         "want_audio": args.audio or (cfg.get("send_audio", True) and not args.no_audio),
         "dual_fallback": not args.no_dual_fallback,
-        # 配置中的豆包降级模型不能拿到 OpenRouter/OpenAI 等渠道调用。
-        # 非火山渠道默认沿用当前模型，保证模型 ID 与 endpoint 匹配。
-        "dual_audio_model": args.model if same_provider_fallback else args.dual_audio_model,
-        "dual_vision_model": args.model if same_provider_fallback else args.dual_vision_model,
+        # 普通工作台任务保持历史行为：同渠道默认沿用当前模型。
+        # 画布快速模式传 --dual-only 时，必须保留前端传入的音频/视觉模型，
+        # 否则 gpt-6-astra 这类普通模型会再次被当成音频模型调用。
+        "dual_audio_model": (
+            args.dual_audio_model
+            if args.dual_only and args.dual_audio_model
+            else args.model if same_provider_fallback else args.dual_audio_model
+        ),
+        "dual_vision_model": (
+            args.dual_vision_model
+            if args.dual_only and args.dual_vision_model
+            else args.model if same_provider_fallback else args.dual_vision_model
+        ),
+        "force_dual": bool(args.dual_only),
         "anime_mode": bool(args.anime_mode),
         "want_face": not args.no_face,
         "prompt_text": load_prompt() + (
@@ -1256,6 +1426,8 @@ def main():
                     help="强制发送音频（覆盖 config.json 中关闭音频的设置）")
     ap.add_argument("--no-dual-fallback", action="store_true",
                     help="单模型超时/解析失败时不自动切换双模型")
+    ap.add_argument("--dual-only", action="store_true",
+                    help="跳过单模型音频请求，直接使用音频模型听写 + 视觉模型合并")
     ap.add_argument("--dual-audio-model",
                     default=cfg.get("dual_audio_model", "doubao-seed-2-0-lite-260428"),
                     help="自动降级时使用的音频模型")
@@ -1305,7 +1477,11 @@ def main():
     S["output_dir"] = out_dir
     try:
         log("处理中（抽帧+听声+调模型）…")
-        result = process_video_checked(S, args.target, ep, args.roles)
+        if S["force_dual"]:
+            log(f"直接使用双模型：音频 {S['dual_audio_model']}｜画面与合并 {S['dual_vision_model']}")
+            result = run_dual_fallback(S, args.target, ep, out_dir, "")
+        else:
+            result = process_video_checked(S, args.target, ep, args.roles)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "ignore")
         sys.exit(f"\n❌ API 报错 HTTP {e.code}：{detail[:500]}")

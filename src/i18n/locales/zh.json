@@ -245,6 +245,7 @@
     "copyErrorReport": "复制报错",
     "retryGeneration": "重试生成",
     "retryWithEncoding": "切换编码并重试",
+    "resumeGeneration": "继续等待（不重新提交）",
     "rename": "重命名",
     "confirmEncodingRetry": "将使用另一种参考图编码提交新的生成请求，平台可能计费。继续吗？",
     "copied": "已复制",
@@ -1254,6 +1255,7 @@
     "quickCheckingFfmpeg": "正在检查 FFmpeg…",
     "quickInstallingFfmpeg": "未检测到 FFmpeg，正在下载并自动安装；请保持网络连接，首次安装可能需要几分钟…",
     "quickAudioUnsupported": "所选模型或渠道没有接收到视频音频，无法生成完整台词剧本。请改用支持音频输入/视频理解的模型后重试。",
-    "quickAudioModelHint": "请使用支持音频输入或视频理解的模型；纯文本/仅图片模型无法还原完整台词。"
+    "quickAudioModelHint": "支持音频的模型直接听声；普通视觉模型优先使用同渠道音频模型，没有音频模型时改用视频字幕提取台词。",
+    "quickAudioModelUnavailable": "当前模型不支持音频输入，将改用视频字幕提取台词。"
   }
 }

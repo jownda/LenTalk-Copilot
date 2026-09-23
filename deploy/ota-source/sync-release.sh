@@ -142,19 +142,28 @@ sync_platform() {
 
   local destdir="$OTA_ROOT/releases/$TAG"
   mkdir -p "$destdir"
-  if ! dl "$REPO/releases/download/$TAG/$fname" "$dir/$fname"; then
-    log "[$name] 失败: 安装包下载不成功"
-    return 1
-  fi
 
-  local got_size
-  got_size=$(stat -c%s "$dir/$fname")
-  if [ "$got_size" != "$expect_size" ]; then
-    log "[$name] 失败: 体积不符 期望 $expect_size 实得 $got_size（下载被截断）"
-    return 1
-  fi
+  # 本地直投旁路：目标位置已有同名文件且体积相符时，跳过 GitHub 下载。
+  # 使用场景：服务器直连 GitHub 极慢（实测 12 KB/s，116MB 需 2.7 小时）且国内镜像普遍失效，
+  # 由外部链路把安装包送到 releases/$TAG/ 后再让本脚本只负责更新清单。
+  # 安全前提：投放的文件必须与 Release 的 .sig 验签通过（否则 updater 会拒装）。
+  if [ -f "$destdir/$fname" ] && [ "$(stat -c%s "$destdir/$fname")" = "$expect_size" ]; then
+    log "[$name] 跳过下载: $destdir/$fname 已就位且体积相符（本地直投）"
+  else
+    if ! dl "$REPO/releases/download/$TAG/$fname" "$dir/$fname"; then
+      log "[$name] 失败: 安装包下载不成功"
+      return 1
+    fi
 
-  mv -f "$dir/$fname" "$destdir/$fname"
+    local got_size
+    got_size=$(stat -c%s "$dir/$fname")
+    if [ "$got_size" != "$expect_size" ]; then
+      log "[$name] 失败: 体积不符 期望 $expect_size 实得 $got_size（下载被截断）"
+      return 1
+    fi
+
+    mv -f "$dir/$fname" "$destdir/$fname"
+  fi
   # .sig 是给人手工验签用的，非必需，尽力而为
   dl "$REPO/releases/download/$TAG/$fname.sig" "$destdir/$fname.sig" 2>/dev/null || true
 

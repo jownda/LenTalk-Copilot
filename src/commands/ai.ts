@@ -93,6 +93,12 @@ export interface VideoGenerationJobStatus {
   status: "running" | "succeeded" | "failed" | "not_found" | string;
   result: string | null;
   error: string | null;
+  /**
+   * 后端声明: 本次 `error` 只是诊断文本(查询时的网络抖动 / 5xx), 平台任务仍在跑。
+   * `true` 时调用方必须继续轮询, 不得拿 `error` 的文本判终态 —— 诊断文本里会出现
+   * 「查询失败(网络)」这类带「失败」二字的措辞。
+   */
+  transient?: boolean;
 }
 
 interface GenerateJimengCliVideoRequest {

@@ -17,6 +17,16 @@
 >
 > **CI 侧已删除两个 `Publish updater files to self-hosted source` 步骤**，
 > 也不再需要任何 SSH 凭据。**不要把 scp 加回去。**
+>
+> **⚠️ 2026-09-19 补充：大文件（>50MB）服务器拉不动是常态**
+>
+> 服务器 → GitHub **直连只有 12 KB/s**（116MB 的 exe 要 **2.7 小时**），会被脚本的
+> `--speed-limit 20480` 判死；而 **21MB 的 `LenTalk.app.tar.gz` 能过**。
+> 所以典型症状是「**darwin 清单秒切新版、windows 清单一直停在旧版**」。
+> 国内加速镜像当晚实测 6 个全部失效，**别再一个个试**。
+>
+> **处置 = 本地直投**（脚本已内置旁路，见 §2.4）：本机下载 CI 产物 → `scp` 上传
+> （本机 → 服务器 **~3 MB/s**，122MB 约 40 秒）→ 原子替换根清单。
 
 ---
 
@@ -34,21 +44,26 @@ LenTalk 客户端
        ├── latest-darwin.json
        ├── latest-macos.json        ← 兼容 1.2.12 及更早客户端
        └── releases/
-            └── v1.2.19/
-                 ├── LenTalk_1.2.19_x64-setup.exe
-                 ├── LenTalk_1.2.19_x64-setup.exe.sig
+            └── v1.2.23/
+                 ├── LenTalk_1.2.23_x64-setup.exe
+                 ├── LenTalk_1.2.23_x64-setup.exe.sig
                  ├── LenTalk.app.tar.gz
-                 ├── LenTalk.app.tar.gz.sig
-                 └── LenTalk_1.2.19_aarch64.dmg
+                 └── LenTalk.app.tar.gz.sig
 
 同步链路（新）：
 
   GitHub runner (美国) ──构建+发布 Release(几秒)──> GitHub Release
   腾讯云服务器 ──lentalk-ota-sync.timer 每 2 分钟──> ghfast.top 镜像 ──> GitHub Release
                └─ 下载到 releases/<tag>/ → 校验体积 → 原子替换根目录清单
+
+  大文件（exe/dmg）镜像也拉不动时的旁路：
+  本机 ──下载 CI 产物──> scp ~3MB/s ──> 服务器 releases/<tag>/
+                                       └─ 脚本发现"已就位且体积相符" → 跳过下载，只更新清单
 ```
 
 **目录里没有 `.msi` 是正常的**：updater 不使用 MSI，`.msi` 只进 GitHub Release。
+**目录里也没有 `.dmg`**：macOS 的 updater 用的是 `LenTalk.app.tar.gz`，
+`.dmg` 只进 GitHub Release 供首次安装（自建源只同步两个 updater 产物 + 它们的 `.sig`）。
 
 两处地址必须对齐，这是唯一容易出错的地方：
 
@@ -116,18 +131,76 @@ journalctl -u lentalk-ota-sync -n 50 --no-pager            # 看日志
 **unit 文件里的 `TimeoutStartSec=600` 不能删**：systemd 默认 `DefaultTimeoutStartSec`
 只有 90 秒，一次全平台同步遇到镜像抖动会超过它，被半路 kill 会留下半截文件。
 
-### 2.3 脚本的三道保护
+### 2.3 脚本的四道保护
 
 | 保护 | 作用 |
 | --- | --- |
 | **版本守卫** | 新版本号必须**严格大于**根清单现有版本才覆盖。旧任务/手动同步都不可能把清单写回旧版本（也顺带根治了历史上"上一次发版的慢 job 覆盖新清单"的竞态） |
 | **原子替换** | 清单先写临时文件再 `mv`（同文件系统的 rename 是原子的），绝不对外暴露半截 JSON |
 | **体积校验** | 下载完比对文件体积与 GitHub API 报告的 size，不符则判失败、**不更新清单** |
+| **本地直投旁路** | 目标目录里已有同名文件且体积与 Release API 一致时，**跳过下载只更新清单**。用于服务器拉不动大文件时由外部链路投递（见 §2.4）。安全前提：投放的文件必须能通过 `.sig` 验签，否则客户端会拒装 |
 
 另外：Release 里某平台清单缺失时，脚本**在触碰根清单之前就退出** →
 "某个平台还没发布完"不会把好清单改坏。
 
 自愈行为：macOS 还没发布时只跳过 darwin，不影响 Windows；下一轮自动补上。
+
+### 2.4 大文件拉不动时：本地直投 SOP
+
+**判据（一眼认出）**：`latest-darwin.json` / `latest-macos.json` 已切到新版本，
+而 **`latest-windows.json` 一直停在旧版本**。
+
+```bash
+journalctl -u lentalk-ota-sync -n 50 --no-pager
+# → [windows] 失败: 安装包下载不成功(HTTP 200 curl=92)
+#   curl 92 = CURLE_HTTP2_STREAM：HTTP 状态是 200，但流被中途掐断
+```
+
+**根因**：服务器 → GitHub 直连只有 **12 KB/s**。exe 116MB 需 2.7 小时，必被脚本
+`--speed-limit 20480 --speed-time 45`（20KB/s）判死；而 tar.gz 只有 21MB，能过。
+国内加速镜像（`gh-proxy.com` / `ghproxy.net` / `hub.gitmirror.com` / `gh.llkk.cc` /
+`github.moeyy.xyz` …）实测**全部失效**，不要再逐个试。
+
+**处置**：
+
+```bash
+# 1) 本机下载「CI 产物」——不是本机 tauri build 的包！
+#    本机构建是 createUpdaterArtifacts:false（体积、签名都与清单不匹配），混用必验签失败
+#    同时取回 Release 的 latest-windows.json 与 *.exe.sig（各 ~1KB）
+# 2) 上传（本机 → 服务器 ~3MB/s，122MB 约 40 秒）
+scp -i ~/.ssh/lentalk-ota-ci LenTalk_X.Y.Z_x64-setup.exe ubuntu@118.25.194.71:/tmp/
+
+# 3) 服务器侧：核对 sha256 → 落盘 → 原子替换根清单 → 恢复 timer
+sha256sum /tmp/LenTalk_X.Y.Z_x64-setup.exe          # 与 Release 的 digest 比对
+sudo mv -f /tmp/LenTalk_X.Y.Z_x64-setup.exe /var/www/lentalk-ota/releases/vX.Y.Z/
+sudo mv -f /tmp/LenTalk_X.Y.Z_x64-setup.exe.sig /var/www/lentalk-ota/releases/vX.Y.Z/
+sudo chown ubuntu:ubuntu /var/www/lentalk-ota/releases/vX.Y.Z/LenTalk_X.Y.Z_x64-setup.exe*
+cp /tmp/latest-windows.json /var/www/lentalk-ota/.latest-windows.json.new
+mv -f /var/www/lentalk-ota/.latest-windows.json.new /var/www/lentalk-ota/latest-windows.json
+sudo systemctl start lentalk-ota-sync.timer
+```
+
+**验证（缺一不可）**：
+
+```bash
+# ① 清单版本 + url 指向自建源自身
+curl -s http://118.25.194.71/ota/latest-windows.json | jq -r '.version, .platforms["windows-x86_64-nsis"].url'
+# ② 端点存在（期望 206）
+curl -s -o /dev/null -r 0-0 -w "%{http_code}\n" \
+  http://118.25.194.71/ota/releases/vX.Y.Z/LenTalk_X.Y.Z_x64-setup.exe
+# ③ nginx 实际吐出的字节与本地文件逐位一致
+ssh ubuntu@118.25.194.71 'curl -s http://127.0.0.1/ota/releases/vX.Y.Z/LenTalk_X.Y.Z_x64-setup.exe | sha256sum'
+# ④ 验签（见 §9）；⑤ 强制跑一轮确认旁路生效
+sudo env LOCK=/tmp/ota-manual.lock /usr/local/bin/lentalk-ota-sync --force
+# → [windows] 跳过下载: ... 已就位且体积相符（本地直投）
+```
+
+**两个坑**：
+
+- `--dry-run` / `--force` 是 **CLI 开关，不是环境变量**（`DRY=1 cmd` 之类写法不生效）。
+- 手工跑会和 systemd 抢 `/tmp/lentalk-ota-sync.lock`，报 `Permission denied` +
+  `flock: Bad file descriptor`，日志显示「另一个同步任务正在运行」——**这是假报**，
+  用 `LOCK=/tmp/ota-manual.lock` 换把锁即可。
 
 ---
 
@@ -174,12 +247,14 @@ bash deploy/ota-source/set-endpoint.sh --clear            # 移除自建源, 恢
 
 ## 5. 发版流程
 
-与现状完全一致，无需额外操作：
-
 ```bash
-# 改版本号 → 提交 → 打 tag
-git tag v1.2.20 && git push origin v1.2.20
+# 改五处版本号 → 本机验证（tsc / vitest / vite build / cargo test）→ 提交 → 打附注 tag
+git tag -a vX.Y.Z -m "LenTalk vX.Y.Z"
 ```
+
+> **本机 `git push` 恒坏**（`Connection was reset`，写通道被墙），推送走 Git Data API：
+> `~/.workbuddy/tools/gh_api_push_index.py --branch main --message-file MSG.txt --tag vX.Y.Z`。
+> 先 `--dry-run` 看「**删除 0**」再正式跑；成功判据是 **tree 一致**（`TREE_MATCH_OK`），不是 commit SHA。
 
 CI 会自动：构建 → 生成带自建源地址的清单 → **发布 GitHub Release**。
 服务器上的 timer 最多 **2 分钟**后把产物拉到自建源并更新根清单。
@@ -195,6 +270,10 @@ curl -s http://118.25.194.71/ota/latest-darwin.json  | jq -r '.platforms["darwin
 # 服务器上：
 journalctl -u lentalk-ota-sync -n 50 --no-pager
 ```
+
+> ⚠️ **务必单独盯 windows 清单**：darwin 通常几秒就位，而 **116MB 的 exe 有可能拉不动**
+> （症状：darwin 已切新版、windows 停在旧版）。出现就走 §2.4 的本地直投，
+> 别以为是「timer 还没跑」。三份根清单版本一致才算发版完成。
 
 ---
 
@@ -263,7 +342,10 @@ HTTP 只影响保密性（版本号、IP 可见），不影响完整性。若日
 | **根清单迟迟不更新** | timer 没跑 / Release 里还没有该平台清单 | `journalctl -u lentalk-ota-sync -n 100`；日志会写明"跳过"原因 |
 | 日志显示"资源不存在(404)" | Release 里确实没有该资产 | 等下一个周期；或确认该 tag 是否发布完整 |
 | 日志显示"体积不符" | 下载被截断 | 脚本已自动放弃且**不更新清单**，下轮重试；持续出现则换镜像（`MIRROR=`） |
-| 想强制同步某版本 | — | `--dry-run` 确认后再加 `--force`（会绕过版本守卫，谨慎） |
+| **只有 windows 清单不更新，darwin 已切新版** | 116MB 的 exe 拉不动（服务器直连 GitHub 仅 12 KB/s，被 `--speed-limit` 判死） | **走 §2.4 本地直投**；不要把镜像换来换去，实测全失效 |
+| 日志显示 `下载失败(HTTP 200 curl=92)` | `CURLE_HTTP2_STREAM`：HTTP 200 但流被中途掐断 | 同上。注意「404（资产确实没发布）」与「下载被中断」是两回事，脚本已分开处理 |
+| 手工跑报"另一个同步任务正在运行"，但确实没有别人在跑 | 和 systemd 抢 `/tmp/lentalk-ota-sync.lock` 失败（`Permission denied` + `flock: Bad file descriptor`） | **假报**。加 `LOCK=/tmp/ota-manual.lock` 换把锁 |
+| 想强制同步某版本 | — | `--dry-run` 确认后再加 `--force`（会绕过版本守卫，谨慎）。**二者是 CLI 开关，不是环境变量** |
 | 定时任务"另一个同步任务正在运行" | 上一轮还没跑完 | `flock -n` 保护，正常；说明单轮超过了轮询间隔 |
 | 已装版本不走自建源 | 端点是编译期写死的 | 必须发一版新号才能生效 |
 
@@ -286,3 +368,29 @@ sigcheck.exe <pubkey.b64> <signature.b64> <文件>      # 期望 VERIFY_OK
 
 **必做反向自测**：把文件中间翻转一个字节再验，必须得到 `VERIFY_FAIL` ——
 否则无法排除"这个工具永远说 OK"。
+
+---
+
+## 10. 实测速率与发版基线
+
+| 链路 | 速率 | 备注 |
+| --- | --- | --- |
+| GitHub runner（美国）→ 腾讯云（`scp`） | **6~9 KB/s** | **已废弃**，v1.2.19 的 macOS job 卡 2858s 后失败 |
+| 腾讯云 → `github.com` 直连 | 9.7 KB/s（复测 **12 KB/s**） | 116MB 要 2.7 小时 → 大文件必栽 |
+| 腾讯云 → `ghfast.top` 镜像 | 900 KB/s ~ 1.1 MB/s | 21MB 级能过，116MB 仍悬 |
+| 本机 → GitHub（代理） | ~110 KB/s | 116MB ≈ 15 分钟 |
+| **本机 → 腾讯云（ssh 上传）** | **~3 MB/s** | 122MB ≈ 40 秒，大文件发版走这条 |
+| 腾讯云自建源 → 客户端 | 595~650 KB/s | 用户侧下载速度 |
+
+**根因**：美国 runner → 广州跨境 RTT ~180ms + 丢包，而 `scp` 每块要等服务端 ACK
+（吞吐 ≈ TCP 窗口 / RTT）→ 长肥链路必然塌陷。与 dmg 压缩级别、服务器带宽都无关。
+
+**发版基线（v1.2.22 / run 35436535070，全绿 14 分 10 秒）**：
+
+| job | 关键步骤耗时 |
+| --- | --- |
+| Windows（NSIS exe + MSI） | Install deps 24s → **Build installers 824s** → Publish 9s |
+| macOS（dmg） | **Build bundle 398s** → Package dmg 19s → Publish 4s |
+| Merge updater manifests | 2s |
+
+**瓶颈是应用层编译，不是网络** —— 别再往传输环节找优化空间。

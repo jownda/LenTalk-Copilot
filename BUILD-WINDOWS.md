@@ -34,9 +34,28 @@ npm install
 npm run tauri build
 
 :: 完成！安装包在:
-::   src-tauri\target\release\bundle\nsis\LenTalk_0.1.13_x64-setup.exe   ← 双击安装
-::   src-tauri\target\release\bundle\msi\LenTalk_0.1.13_x64_en-US.msi  ← 备用
+::   src-tauri\target\release\bundle\nsis\LenTalk_1.2.25_x64-setup.exe    ← 双击安装
+::   src-tauri\target\release\bundle\msi\LenTalk_1.2.25_x64_zh-CN.msi   ← 备用
 ```
+
+> **本地打包默认不带 updater 签名产物**。若本机没有配置 `TAURI_SIGNING_PRIVATE_KEY`，
+> 签名阶段会报 `A public key has been found, but no private key` 以 1 退出 ——
+> 但 bundle 其实已经生成，**直接看 `bundle/nsis/` 有没有 exe 即可**。
+> 想让它安静退出，可传一个覆盖配置 `{"bundle":{"createUpdaterArtifacts":false}}`：
+>
+> ```bat
+> npx tauri build --bundles nsis --config override.json
+> ```
+>
+> ⚠️ 这样出来的包**没有 `.sig`、与线上 OTA 清单的签名不匹配，只能自己装，不要上传到自建源**。
+
+> ⚠️ **C 盘要留足空间**。C 盘满会同时砸掉两个看起来无关的步骤：NSIS 在 `%TEMP%` 建 ~142MB
+> 内存映射（`Internal compiler error #12345: error creating mmap`）、rustc 提交内存不足
+> （`rustc-LLVM ERROR: out of memory`）。构建前把临时目录指到空间充足的分区：
+>
+> ```bat
+> set TEMP=D:\build-tmp && set TMP=D:\build-tmp && set CARGO_BUILD_JOBS=2
+> ```
 
 ## 三、常见问题
 
@@ -49,10 +68,20 @@ npm run tauri build
 
 ## 四、可选: 走 GitHub Actions 云端打包（不用装上面任何环境）
 
-项目已包含 `.github/workflows/build-windows.yml`：
-1. 在 https://github.com/new 新建仓库（不要勾选 README）
-2. 把本 zip **解压后**的所有文件拖拽上传到仓库（GitHub 网页支持批量拖拽上传，或用 Git 命令推送）
-3. 仓库 → Actions → "Build Windows EXE" → Run workflow
-4. 等 15-25 分钟 → 在 run 页面 Artifacts 下载 exe
+仓库已配置 [`.github/workflows/build-releases.yml`](./.github/workflows/build-releases.yml)，
+在 GitHub 云端同时构建 **Windows（NSIS `.exe` + `.msi`）与 macOS（`.dmg` + updater 包）** 并发布到 Releases。
+
+```bash
+# 同步改五处版本号后，打附注 tag 推送即可触发（推 main 不触发）
+git tag -a vX.Y.Z -m "LenTalk vX.Y.Z"
+git push origin main vX.Y.Z
+```
+
+> 若本机 git 写通道不可用（`Connection was reset`），改走 Git Data API 推送，
+> 见 [`deploy/ota-source/README.md`](./deploy/ota-source/README.md) 第 5 节。
+
+单次构建约 **14 分钟**（Windows 编译 824s、macOS 编译 398s），产物自动挂到 Release。
+完整发布流程（版本号位置、验证链、推送方式、发布后验收）见
+[`deploy/ota-source/README.md`](./deploy/ota-source/README.md) 与 [README](./README.md)。
 
 > 版本号、应用名（LenTalk）、图标、NSIS 简体中文安装界面均已配置好，无需修改。

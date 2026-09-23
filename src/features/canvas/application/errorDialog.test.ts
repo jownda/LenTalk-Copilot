@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   BALANCE_INSUFFICIENT_MESSAGE,
   IMAGE_EDITS_NETWORK_ERROR_MESSAGE,
+  JIMENG_CREDIT_INSUFFICIENT_MESSAGE,
   PROXY_REQUIRED_65535_MESSAGE,
   isBalanceInsufficientError,
   isImageEditsNetworkError,
@@ -104,5 +105,16 @@ describe('resolveErrorContent with balance errors', () => {
     const result = resolveErrorContent('余额不足，请充值后重试', '生成失败');
     expect(result.message).toBe(BALANCE_INSUFFICIENT_MESSAGE);
     expect(result.details).toContain('余额不足');
+  });
+
+  it('maps Jimeng pre-deduction credit failures to a top-up hint', () => {
+    const rawError =
+      '即梦 CLI 视频生成失败: gen_status="fail", fail_reason="api error: ret=1006, message=CreditPreDeductNotEnough"';
+    const result = resolveErrorContent(rawError, '视频生成失败');
+
+    expect(result.message).toBe(JIMENG_CREDIT_INSUFFICIENT_MESSAGE);
+    expect(result.message).toContain('积分不足');
+    expect(result.message).toContain('充值');
+    expect(result.details).toContain('CreditPreDeductNotEnough');
   });
 });
