@@ -1251,9 +1251,76 @@ async function generateBinghuoVideo(
 }
 
 /**
- * wgspai 平台链路：提交/轮询端点与炳火一致(/v1/video/generations)，
- * 但平台没有 /v1/assets/uploads 独立上传端点，参考素材只能以公网 URL 或
- * data URL 直接内嵌进请求体，不再执行独立文件上传。
+ * WGSPAI 图床与 API **不同 host**: API 是 `api.wgspai.cn`, 图床在同站的
+ * `wgspai.cn`(见 seedance2.5 文档第 1/4 节、seedance-v2-720p 文档第 2.1 节),
+ * 因此不能拿 Base URL 直接拼上传地址, 需要先把 `api.` 前缀摘掉。
+ */
+function resolveWgspaiImageBedBaseUrl(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/+$/, "").replace("://api.", "://");
+}
+
+/**
+ * WGSPAI 各模型的参考素材上限与时长规则。
+ * **必须与后端 `wgspai.rs` 的 `model_limits` 保持一致** —— 同一个平台有两条活路径
+ * (节点走 submitGenerateVideoJob → 后端; Canvas / 动作控制 / 模板重跑走
+ * canvasAiGateway.generateVideo → 本函数), 两边规则不同会出现「同样素材换个入口
+ * 就报错」的怪象。
+ */
+function resolveWgspaiModelLimits(apiModel: string): {
+  maxReferenceImages: number;
+  fixedDuration: boolean;
+  referenceAudio: boolean;
+  referenceVideo: boolean;
+} {
+  const model = apiModel.trim().toLowerCase();
+  // seedance2.5: 固定 30 秒按次计费, 参考图最多 30。
+  if (model.includes("seedance2.5") || model.includes("seedance-2.5")) {
+    return { maxReferenceImages: 30, fixedDuration: true, referenceAudio: true, referenceVideo: true };
+  }
+  // seedance v2 系列: 9 图 / 3 音频 / 3 视频, 视频参考仅 `-video` 后缀模型支持。
+  if (model.includes("seedance-v2")) {
+    return {
+      maxReferenceImages: 9,
+      fixedDuration: false,
+      referenceAudio: true,
+      referenceVideo: model.includes("-video"),
+    };
+  }
+  // Minimax-h3: 图 ≤9, 文档明确「不支持参考音视频」。
+  if (model.includes("minimax-h3")) {
+    return { maxReferenceImages: 9, fixedDuration: false, referenceAudio: false, referenceVideo: false };
+  }
+  return { maxReferenceImages: 30, fixedDuration: false, referenceAudio: true, referenceVideo: true };
+}
+
+/** 画幅比例 → 像素尺寸。文档里 `size` 收像素串; 未覆盖的比例只发 `ratio`。 */
+function wgspaiPixelSize(aspectRatio: string): string | undefined {
+  const table: Record<string, string> = {
+    "16:9": "1280x720",
+    "9:16": "720x1280",
+    "1:1": "1024x1024",
+    "4:3": "1024x768",
+    "3:4": "768x1024",
+  };
+  return table[aspectRatio.trim()];
+}
+
+/**
+ * wgspai 平台链路(api.wgspai.cn)。
+ *
+ * 按站点四份对接文档对齐:
+ *   - 提交 `POST /v1/videos` → 查询 `GET /v1/videos/{id}`
+ *     (文档三处写明「推荐统一用 /v1/videos」, `/v1/video/generations` 仅为兼容路径)
+ *   - 本地素材先上传**官方背景机图床** `https://wgspai.cn/image-bed/api/upload`
+ *     (字段 `file`, 匿名可传), 不再内联 data URL —— 文档明确「请求里的图片须为公网
+ *     可访问 URL, 本地文件先上传本站图床」, 并对 data URL 标注「易触达请求上限」
+ *   - 参考音频字段是 `audio_urls`、参考视频是 `video_urls`(720p 文档口径),
+ *     不是炳火的 `reference_audios` / `reference_videos`
+ *   - 首尾帧用 `images` + `image_usage: "first_frame"`(seedance2.5 文档口径),
+ *     文档里没有 `start_frame` / `end_frame`
+ *   - 时长用 `seconds` 字符串; 固定时长的模型(seedance2.5)省略
+ *
+ * 后端同源实现见 `src-tauri/src/ai/providers/video_protocols/wgspai.rs`。
  */
 async function generateWgspaiVideo(
   request: GenerateVideoRequest,
@@ -1261,38 +1328,81 @@ async function generateWgspaiVideo(
   apiModel: string,
   headers: Record<string, string>,
 ): Promise<string> {
-  const rawImages = request.reference_images ?? [];
-  const imageSources = rawImages.slice(0, request.image_mode === "first-last" ? 2 : 30);
-  const audioSources = (request.reference_audio ?? []).slice(0, 3);
-  // 平台没有独立上传端点, 本地素材只能读成 data URL 内嵌进请求体。
-  const normalizeSource = async (source: string, label: string): Promise<string> => {
-    const asset = await resolveReferenceAssetSource(source, `wgspai API 参考${label}`);
-    return asset.kind === "url" ? asset.url : `data:${asset.mimeType};base64,${asset.base64}`;
-  };
-  const normalizedImages = await Promise.all(
-    imageSources.map((source, index) => normalizeSource(source, `素材 ${index + 1}`)),
+  const limits = resolveWgspaiModelLimits(apiModel);
+  const isFirstLast = request.image_mode === "first-last";
+  const rawImages = (request.reference_images ?? []).slice(
+    0,
+    isFirstLast ? 2 : limits.maxReferenceImages,
   );
-  const normalizedAudios = await Promise.all(
-    audioSources.map((source, index) => normalizeSource(source, `音频 ${index + 1}`)),
-  );
+  const rawAudios = limits.referenceAudio ? (request.reference_audio ?? []).slice(0, 3) : [];
+  // 参考视频来自 extra_params.reference_videos(URL 列表); 该通道由上游节点写入。
+  const rawVideos = limits.referenceVideo
+    ? (() => {
+        const value = request.extra_params?.reference_videos;
+        if (!Array.isArray(value)) return [];
+        return value
+          .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+          .map((item) => item.trim())
+          .slice(0, 3);
+      })()
+    : [];
+
+  const imageBedBaseUrl = resolveWgspaiImageBedBaseUrl(baseUrl);
+  // 图床按文档是匿名可上传的(官方 curl 不带鉴权头), 这里传空 headers, 不转发
+  // Authorization —— 带一个空 Bearer 会让部分网关直接 401。
+  const upload = (source: string, index: number, label: string): Promise<string> =>
+    uploadPlatformReferenceAsset(source, imageBedBaseUrl, {}, index, label, "/image-bed/api/upload");
+
+  let imageSources: string[];
+  let audioSources: string[];
+  let videoSources: string[];
+  try {
+    imageSources = await Promise.all(
+      rawImages.map((source, index) => upload(source, index, "WGSPAI 参考图")),
+    );
+    audioSources = await Promise.all(
+      rawAudios.map((source, index) => upload(source, imageSources.length + index, "WGSPAI 参考音频")),
+    );
+    videoSources = await Promise.all(
+      rawVideos.map((source, index) =>
+        upload(source, imageSources.length + audioSources.length + index, "WGSPAI 参考视频"),
+      ),
+    );
+  } catch (error) {
+    if (error instanceof Error) {
+      error.message = translateTransportError(error.message, "WGSPAI 图床");
+    }
+    throw error;
+  }
+
   const body: Record<string, unknown> = {
     model: apiModel,
     prompt: request.prompt,
-    duration: Math.max(1, Math.round(request.duration)),
-    ratio: request.aspect_ratio,
+    // 非四份文档字段, 从炳火协议继承下来的兼容字段, 保留以不改变既有行为。
     generate_audio: true,
     n: 1,
   };
-  if (request.image_mode === "first-last" && normalizedImages.length > 0) {
-    body.start_frame = [normalizedImages[0]];
-    if (normalizedImages[1]) body.end_frame = [normalizedImages[1]];
-  } else if (normalizedImages.length > 0) {
-    body.images = normalizedImages;
+  // 固定时长的模型(seedance2.5 = 30 秒)省略 seconds, 让平台用自己的默认值。
+  if (!limits.fixedDuration) {
+    body.seconds = String(Math.max(1, Math.round(request.duration)));
   }
-  if (normalizedAudios.length > 0) body.reference_audios = normalizedAudios;
+  const aspectRatio = request.aspect_ratio?.trim();
+  if (aspectRatio) {
+    // `ratio` 与 `size` 同传: seedance2.5 / Minimax-h3 认 ratio,
+    // seedance-v2-720p 的正式字段是 size, 只发 ratio 会被它忽略。
+    body.ratio = aspectRatio;
+    const size = wgspaiPixelSize(aspectRatio);
+    if (size) body.size = size;
+  }
+  if (imageSources.length > 0) {
+    body.images = imageSources;
+    if (isFirstLast) body.image_usage = "first_frame";
+  }
+  if (audioSources.length > 0) body.audio_urls = audioSources;
+  if (videoSources.length > 0) body.video_urls = videoSources;
   if (request.video_resolution?.trim()) body.resolution = request.video_resolution.trim();
 
-  const submitUrl = `${baseUrl}/v1/video/generations`;
+  const submitUrl = `${baseUrl}/v1/videos`;
   const response = await requestProviderJson(submitUrl, {
     method: "POST",
     headers,
@@ -1314,7 +1424,7 @@ async function generateWgspaiVideo(
   if (!taskId) {
     throw new Error(`wgspai API 视频响应中未找到任务 ID: ${describeVideoResponse(payload)}`);
   }
-  const taskUrl = `${baseUrl}/v1/video/generations/${encodeURIComponent(taskId)}`;
+  const taskUrl = `${baseUrl}/v1/videos/${encodeURIComponent(taskId)}`;
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 5000));
     const taskResponse = await requestProviderJson(taskUrl, { headers });

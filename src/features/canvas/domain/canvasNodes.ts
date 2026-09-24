@@ -135,6 +135,8 @@ export interface ExportImageNodeData extends NodeImageData {
 
 export interface GroupNodeData extends NodeDisplayData {
   label: string;
+  /** 冻结组: 组本身与其内部节点位置锁定, 不可拖动、不可缩放。 */
+  frozen?: boolean;
   [key: string]: unknown;
 }
 
@@ -666,6 +668,43 @@ export function isGroupNode(
   node: CanvasNode | null | undefined,
 ): node is Node<GroupNodeData, typeof CANVAS_NODE_TYPES.group> {
   return node?.type === CANVAS_NODE_TYPES.group;
+}
+
+/** 是否处于冻结状态的组(位置已锁定)。 */
+export function isFrozenGroupNode(
+  node: CanvasNode | null | undefined,
+): node is Node<GroupNodeData, typeof CANVAS_NODE_TYPES.group> {
+  return isGroupNode(node) && node.data.frozen === true;
+}
+
+/**
+ * 冻结组锁定的节点 id 集合: 冻结组自身 + 其全部后代(含嵌套子组与其内部节点)。
+ * 这些节点的位置与尺寸都不可再变更。
+ */
+export function collectFrozenLockedNodeIds(nodes: CanvasNode[]): Set<string> {
+  const locked = new Set<string>();
+  for (const node of nodes) {
+    if (isFrozenGroupNode(node)) {
+      locked.add(node.id);
+    }
+  }
+  if (locked.size === 0) {
+    return locked;
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const node of nodes) {
+      if (!node.parentId || locked.has(node.id) || !locked.has(node.parentId)) {
+        continue;
+      }
+      locked.add(node.id);
+      changed = true;
+    }
+  }
+
+  return locked;
 }
 
 export function isTextAnnotationNode(

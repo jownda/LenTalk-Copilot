@@ -23,6 +23,9 @@ import {
   type CinematicStudioNodeData,
 } from "@/features/canvas/domain/canvasNodes";
 import { resolveNodeDisplayName, isNodeUsingDefaultDisplayName } from "@/features/canvas/domain/nodeDisplay";
+import { resolveVideoNodeModelId } from "@/features/canvas/domain/videoNodeDefaults";
+import { resolveVideoDurationHintFromTexts } from "@/features/canvas/domain/videoDurationHint";
+import { getDefaultVideoModelId, getVideoModel } from "@/features/canvas/models";
 import { graphImageResolver } from "@/features/canvas/application/canvasServices";
 import { CURRENT_RUNTIME_SESSION_ID } from "@/features/canvas/application/generationErrorReport";
 import { isQuickGenerationRunActive } from "@/features/canvas/application/quickGenerationRunState";
@@ -487,7 +490,13 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   );
 
   const handleSendToVideo = useCallback(
-    (payload: { prompt: string; referenceImages: string[]; referenceAudio: string[] }) => {
+    (payload: {
+      prompt: string;
+      referenceImages: string[];
+      referenceAudio: string[];
+      /** 除提示词外还要一起找秒数的原文：用户自己写的故事梗概 / 风格。 */
+      durationHintSources?: readonly string[];
+    }) => {
       const nextPrompt = payload.prompt.trim();
       if (!nextPrompt) return;
       const pendingVideoNode = nodes.find((node) => {
@@ -503,10 +512,26 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         return;
       }
       const placement = findNodePosition(id, 420, 360);
+      // 文案里写明了几秒（例如梗概写「5秒的视频」）就直接落到节点时长上；没写、
+      // 或者目标模型只支持固定时长时返回 null，此时保持 createDefaultData 给出的
+      // 「上次使用」时长不动。模型解析与 nodeRegistry 的 createDefaultData 保持一致，
+      // 保证算的确实是这个新节点将要用的模型。
+      const settings = useSettingsStore.getState();
+      const targetModelId = resolveVideoNodeModelId(
+        settings.lastVideoModelId,
+        (modelId) => Boolean(getVideoModel(modelId)),
+        getDefaultVideoModelId(),
+      );
+      const durationHint = resolveVideoDurationHintFromTexts(getVideoModel(targetModelId), [
+        nextPrompt,
+        ...(payload.durationHintSources ?? []),
+      ]);
       const videoNodeId = addNode(CANVAS_NODE_TYPES.videoGen, placement, {
         prompt: nextPrompt,
         // 模型 / 宽高比 / 分辨率不再写死: 交给 createDefaultData 沿用「上次使用」的配置
         // (与 duration 的既有行为一致), 避免工作室发过去的节点还要重新选一遍。
+        // duration 只在文案写明秒数时才覆盖，否则同样沿用「上次使用」的值。
+        ...(durationHint !== null ? { duration: durationHint } : {}),
         studioReferenceImages: payload.referenceImages,
         studioReferenceAudio: payload.referenceAudio,
       });
@@ -927,7 +952,14 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           studioReferenceImages: referenceImages,
           studioReferenceAudio: referenceAudio,
         });
-        handleSendToVideo({ prompt, referenceImages, referenceAudio });
+        handleSendToVideo({
+          prompt,
+          referenceImages,
+          referenceAudio,
+          // Agent 的输出语言未必保留用户原话里的「5秒」，所以把自己写的故事梗概 /
+          // 风格也一起找一遍；两者都已并上上游接进来的文本。
+          durationHintSources: [effectiveQuickSynopsis, effectiveQuickStyle],
+        });
       } catch (error) {
         setQuickError(error instanceof Error ? error.message : "生成提示词失败，请稍后重试。");
       } finally {

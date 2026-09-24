@@ -23,9 +23,11 @@ import {
   type CanvasNodeData,
   type CanvasNodeType,
   type ExportImageNodeResultKind,
+  type GroupNodeData,
   type NodeToolType,
   type StoryboardExportOptions,
   type StoryboardFrameItem,
+  collectFrozenLockedNodeIds,
   isStoryboardSplitNode,
 } from '@/features/canvas/domain/canvasNodes';
 import {
@@ -173,6 +175,8 @@ interface CanvasState {
   deleteNodes: (nodeIds: string[]) => void;
   groupNodes: (nodeIds: string[], groupName?: string) => string | null;
   ungroupNode: (groupNodeId: string) => boolean;
+  /** 冻结/解冻组: 冻结后组与其内部节点位置锁定, 不可拖动与缩放。返回是否发生变更 */
+  setGroupFrozen: (groupNodeId: string, frozen: boolean) => boolean;
   /** 把节点加入已有分组(拖入), 返回是否发生变更 */
   addNodesToGroup: (nodeIds: string[], groupId: string) => boolean;
   /** 把节点移出分组(拖出), 返回是否发生变更 */
@@ -661,6 +665,30 @@ function collectNodeIdsWithDescendants(nodes: CanvasNode[], seedIds: string[]): 
   return deleteSet;
 }
 
+/**
+ * 丢弃冻结节点上的几何变更(position 位移与手动缩放),
+ * 保留选中 / 尺寸测量等非几何变更。
+ */
+function dropFrozenNodeGeometryChanges(
+  changes: NodeChange<CanvasNode>[],
+  nodes: CanvasNode[]
+): NodeChange<CanvasNode>[] {
+  const lockedIds = collectFrozenLockedNodeIds(nodes);
+  if (lockedIds.size === 0) {
+    return changes;
+  }
+  return changes.filter((change) => {
+    if (change.type === 'position') {
+      return !lockedIds.has(change.id);
+    }
+    // 手动缩放带的 resizing 标记; 首次渲染的尺寸测量没有该字段, 必须放行
+    if (change.type === 'dimensions' && 'resizing' in change) {
+      return !lockedIds.has(change.id);
+    }
+    return true;
+  });
+}
+
 function getNodeSize(node: CanvasNode): { width: number; height: number } {
   return {
     width:
@@ -1118,7 +1146,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
   onNodesChange: (changes) => {
     set((state) => {
-      const lockedChanges = applyAspectLockedResizeToChanges(changes, state.nodes);
+      const lockedChanges = applyAspectLockedResizeToChanges(
+        dropFrozenNodeGeometryChanges(changes, state.nodes),
+        state.nodes
+      );
       const resizedNodeIds = new Set(
         lockedChanges
           .filter(
@@ -1497,7 +1528,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     // ---- 组内生成: 下游节点保持在组内, 组空间不足自动扩组 ----
     if (sourceNode.parentId) {
       const groupNode = state.nodes.find((n) => n.id === sourceNode.parentId && n.type === CANVAS_NODE_TYPES.group);
-      if (groupNode) {
+      // 冻结组不吸收新节点: 否则新节点一诞生就被锁死, 也无法自动扩组
+      if (groupNode && (groupNode.data as GroupNodeData).frozen !== true) {
         return placeNodeInsideGroup(state, groupNode, sourceNode, newNodeWidth, newNodeHeight);
       }
     }
@@ -1885,6 +1917,11 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
   updateNodePosition: (nodeId, position) => {
     set((state) => {
+      // 冻结组及其内部节点位置锁定(AI 助手 / 脚本调用同样受约束)
+      if (collectFrozenLockedNodeIds(state.nodes).has(nodeId)) {
+        return {};
+      }
+
       let changed = false;
       const nextNodes = state.nodes.map((node) => {
         if (node.id !== nodeId) {
@@ -2126,8 +2163,15 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return null;
     }
 
-    const memberSet = new Set(memberIds);
-    const members = memberIds
+    // 冻结组及其内部节点不参与新建分组: 否则拖动外层组会连带移动已冻结的组
+    const lockedIds = collectFrozenLockedNodeIds(state.nodes);
+    const groupableIds = memberIds.filter((id) => !lockedIds.has(id));
+    if (groupableIds.length < 2) {
+      return null;
+    }
+
+    const memberSet = new Set(groupableIds);
+    const members = groupableIds
       .map((id) => nodeMap.get(id))
       .filter((node): node is CanvasNode => Boolean(node));
 
@@ -2244,6 +2288,45 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     return groupNode.id;
   },
 
+  setGroupFrozen: (groupNodeId, frozen) => {
+    const state = get();
+    const groupNode = state.nodes.find(
+      (node) => node.id === groupNodeId && node.type === CANVAS_NODE_TYPES.group
+    );
+    if (!groupNode) {
+      return false;
+    }
+    if (((groupNode.data as GroupNodeData).frozen === true) === frozen) {
+      return false;
+    }
+
+    // 只翻转组自身的数据标记; 组内节点靠 parentId 继承锁定状态,
+    // 由 Canvas 派生的 draggable 与 onNodesChange 拦截共同生效。
+    const nextNodes = state.nodes.map((node) => {
+      if (node.id !== groupNodeId) {
+        return node;
+      }
+      const nextData: GroupNodeData = { ...(node.data as GroupNodeData) };
+      if (frozen) {
+        nextData.frozen = true;
+      } else {
+        delete nextData.frozen;
+      }
+      return { ...node, data: nextData };
+    });
+
+    set({
+      nodes: nextNodes,
+      history: {
+        past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
+        future: [],
+      },
+      dragHistorySnapshot: null,
+    });
+
+    return true;
+  },
+
   ungroupNode: (groupNodeId) => {
     const state = get();
     const groupNode = state.nodes.find(
@@ -2306,7 +2389,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const groupNode = state.nodes.find(
       (node) => node.id === groupId && node.type === CANVAS_NODE_TYPES.group
     );
-    if (!groupNode) {
+    if (!groupNode || (groupNode.data as GroupNodeData).frozen === true) {
+      // 冻结组不接受新节点: 否则新节点会被就地锁死, 用户无法再调整位置
       return false;
     }
 
@@ -2372,7 +2456,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         .map((nodeId) => nodeId.trim())
         .filter((nodeId) => {
           const node = nodeMap.get(nodeId);
-          return Boolean(node && node.parentId);
+          if (!node || !node.parentId) {
+            return false;
+          }
+          // 冻结组内的节点不允许被移出(位置已锁定)
+          const parent = nodeMap.get(node.parentId);
+          return !(parent && parent.type === CANVAS_NODE_TYPES.group && (parent.data as GroupNodeData).frozen === true);
         })
     );
     if (ids.size === 0) {
@@ -2423,8 +2512,13 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return false;
     }
 
+    // 冻结组及其内部节点保持原位, 不参与自动整理
+    const lockedIds = collectFrozenLockedNodeIds(state.nodes);
     let changed = false;
     const nextNodes = state.nodes.map((node) => {
+      if (lockedIds.has(node.id)) {
+        return node;
+      }
       const position = positions.get(node.id);
       if (!position) {
         return node;
@@ -2477,10 +2571,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return false;
     }
 
+    // 冻结组及其内部节点不参与对齐
+    const lockedIds = collectFrozenLockedNodeIds(state.nodes);
     let changed = false;
     const nextNodes = state.nodes.map((node) => {
       const target = targets.get(node.id);
-      if (!target) {
+      if (!target || lockedIds.has(node.id)) {
         return node;
       }
       let relative = target;
@@ -2527,10 +2623,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return false;
     }
 
+    // 冻结组及其内部节点不参与智能对齐
+    const lockedIds = collectFrozenLockedNodeIds(state.nodes);
     let changed = false;
     const nextNodes = state.nodes.map((node) => {
       const target = targets.get(node.id);
-      if (!target) {
+      if (!target || lockedIds.has(node.id)) {
         return node;
       }
       let relative = target;

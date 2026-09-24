@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ClipboardPaste, Copy, Download, Library, Save, Trash2 } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { ClipboardPaste, Copy, Download, Library, Lock, LockOpen, Save, Trash2 } from "lucide-react";
 
 interface AssetCategoryOption {
   id: string;
@@ -13,6 +14,9 @@ interface CanvasContextMenuProps {
   downloadMediaType?: "image" | "video" | null;
   nodeId?: string | null;
   textContent?: string | null;
+  /** 右键命中的节点是分组时提供冻结/解冻入口 */
+  isGroupNode?: boolean;
+  groupFrozen?: boolean;
   canPaste: boolean;
   categories: AssetCategoryOption[];
   failedNodeCount: number;
@@ -22,6 +26,7 @@ interface CanvasContextMenuProps {
   onPaste: () => void;
   onAddImageToLibrary: (imageUrl: string, categoryId: string) => void;
   onDownloadMedia: (url: string, mediaType: "image" | "video") => void;
+  onToggleGroupFrozen: () => void;
   onClose: () => void;
 }
 
@@ -32,6 +37,8 @@ export function CanvasContextMenu({
   downloadMediaType,
   nodeId,
   textContent,
+  isGroupNode = false,
+  groupFrozen = false,
   canPaste,
   categories,
   failedNodeCount,
@@ -41,8 +48,10 @@ export function CanvasContextMenu({
   onPaste,
   onAddImageToLibrary,
   onDownloadMedia,
+  onToggleGroupFrozen,
   onClose,
 }: CanvasContextMenuProps) {
+  const { t } = useTranslation();
   const menuRef = useRef<HTMLDivElement>(null);
   const [isCategoryPickerOpen, setIsCategoryPickerOpen] = useState(false);
 
@@ -91,6 +100,21 @@ export function CanvasContextMenu({
         >
           <Copy className="h-4 w-4 text-text-muted" />
           <span>复制</span>
+        </button>
+      )}
+
+      {isGroupNode && (
+        <button
+          type="button"
+          onClick={onToggleGroupFrozen}
+          className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
+        >
+          {groupFrozen ? (
+            <LockOpen className="h-4 w-4 text-slate-400" />
+          ) : (
+            <Lock className="h-4 w-4 text-slate-400" />
+          )}
+          <span>{groupFrozen ? t("canvas.contextMenu.unfreezeGroup") : t("canvas.contextMenu.freezeGroup")}</span>
         </button>
       )}
 

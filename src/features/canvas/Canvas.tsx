@@ -42,6 +42,9 @@ import {
   DEFAULT_NODE_WIDTH,
   EXPORT_RESULT_NODE_MIN_HEIGHT,
   EXPORT_RESULT_NODE_MIN_WIDTH,
+  collectFrozenLockedNodeIds,
+  isFrozenGroupNode,
+  isGroupNode,
   isTextAnnotationNode,
 } from "@/features/canvas/domain/canvasNodes";
 import { resolveMinEdgeFittedSize } from "@/features/canvas/application/imageNodeSizing";
@@ -770,6 +773,7 @@ export function Canvas() {
   const deleteNode = useCanvasStore((state) => state.deleteNode);
   const deleteNodes = useCanvasStore((state) => state.deleteNodes);
   const groupNodes = useCanvasStore((state) => state.groupNodes);
+  const setGroupFrozen = useCanvasStore((state) => state.setGroupFrozen);
   const addNodesToGroup = useCanvasStore((state) => state.addNodesToGroup);
   const removeNodesFromGroup = useCanvasStore((state) => state.removeNodesFromGroup);
   const setHoveredGroupId = useCanvasStore((state) => state.setHoveredGroupId);
@@ -798,6 +802,32 @@ export function Canvas() {
     () => nodes.filter(isFailedGenerationResultNode).map((node) => node.id),
     [nodes],
   );
+
+  /**
+   * 冻结组及其内部节点对 React Flow 呈现为不可拖拽(draggable=false)。
+   * 这样在拖拽管线最上游就被拦下, 不会触发对齐辅助线、拖入/拖出组的判定。
+   * 未改变 draggable 状态时复用原对象, 避免每次拖拽都让整张画布重渲染。
+   */
+  const renderedNodes = useMemo(() => {
+    const hasFrozenGroup = nodes.some((node) => isFrozenGroupNode(node));
+    if (!hasFrozenGroup) {
+      return nodes;
+    }
+    const lockedIds = collectFrozenLockedNodeIds(nodes);
+    let changed = false;
+    const nextNodes = nodes.map((node) => {
+      const shouldLock = lockedIds.has(node.id);
+      if (shouldLock === (node.draggable === false)) {
+        return node;
+      }
+      changed = true;
+      return shouldLock
+        ? ({ ...node, draggable: false } as CanvasNode)
+        : ({ ...node, draggable: undefined } as CanvasNode);
+    });
+    return changed ? nextNodes : nodes;
+  }, [nodes]);
+
   const activeAssetLibraryCategories = useMemo(() => {
     const libraryId = activeAssetLibraryId || assetLibraries[0]?.id;
     return libraryId ? assetCategories.filter((category) => category.libraryId === libraryId) : [];
@@ -2425,6 +2455,22 @@ export function Canvas() {
     [nodes, setSelectedNode],
   );
 
+  /** 右键「冻结组 / 解冻组」: 冻结后组与其内部节点位置锁定 */
+  const handleContextToggleGroupFrozen = useCallback(() => {
+    const nodeId = canvasContextMenu?.nodeId;
+    if (!nodeId) {
+      return;
+    }
+    const node = nodes.find((item) => item.id === nodeId);
+    if (!isGroupNode(node)) {
+      setCanvasContextMenu(null);
+      return;
+    }
+    setGroupFrozen(node.id, node.data.frozen !== true);
+    setCanvasContextMenu(null);
+    scheduleCanvasPersist(0);
+  }, [canvasContextMenu, nodes, scheduleCanvasPersist, setGroupFrozen]);
+
   const handleContextPaste = useCallback(() => {
     const context = canvasContextMenu;
     const snapshot = copiedSnapshotRef.current;
@@ -3311,7 +3357,10 @@ export function Canvas() {
 
         const state = useCanvasStore.getState();
         const nodeMap = new Map(state.nodes.map((item) => [item.id, item] as const));
-        const groups = state.nodes.filter((item) => item.type === CANVAS_NODE_TYPES.group);
+        // 冻结组不接受拖入, 不作为命中目标
+        const groups = state.nodes.filter(
+          (item) => item.type === CANVAS_NODE_TYPES.group && !isFrozenGroupNode(item),
+        );
         const draggingNodes = state.nodes.filter((item) => Boolean(item.dragging));
         const targets = draggingNodes.length > 0 ? draggingNodes : [pendingNode];
 
@@ -3478,7 +3527,10 @@ export function Canvas() {
         // 非 Alt 复制拖拽: 检测「拖入组 / 拖出组」
         const state = useCanvasStore.getState();
         const nodeMap = new Map(state.nodes.map((item) => [item.id, item] as const));
-        const groups = state.nodes.filter((item) => item.type === CANVAS_NODE_TYPES.group);
+        // 冻结组不接受拖入, 不作为命中目标
+        const groups = state.nodes.filter(
+          (item) => item.type === CANVAS_NODE_TYPES.group && !isFrozenGroupNode(item),
+        );
         if (groups.length > 0) {
           const draggingNodes = state.nodes.filter((item) => Boolean(item.dragging));
           const targets = draggingNodes.length > 0 ? draggingNodes : [node];
@@ -3860,6 +3912,12 @@ export function Canvas() {
     });
   }, [alignmentGuides, reactFlowInstance]);
 
+  // 右键命中的节点(用于判定是否展示「冻结组 / 解冻组」)
+  const canvasContextMenuNode = useMemo(
+    () => (canvasContextMenu?.nodeId ? nodes.find((node) => node.id === canvasContextMenu.nodeId) ?? null : null),
+    [canvasContextMenu?.nodeId, nodes],
+  );
+
   return (
     <div
       ref={wrapperRef}
@@ -3868,7 +3926,7 @@ export function Canvas() {
       onMouseDownCapture={handleCanvasMouseDownCapture}
     >
       <ReactFlow
-        nodes={nodes}
+        nodes={renderedNodes}
         edges={edges}
         onNodesChange={handleNodesChange}
         onEdgesChange={handleEdgesChange}
@@ -4120,6 +4178,8 @@ export function Canvas() {
           downloadMediaType={canvasContextMenu.downloadMediaType}
           nodeId={canvasContextMenu.nodeId}
           textContent={canvasContextMenu.textContent}
+          isGroupNode={isGroupNode(canvasContextMenuNode)}
+          groupFrozen={isFrozenGroupNode(canvasContextMenuNode)}
           canPaste={Boolean(copiedSnapshotRef.current?.nodes.length)}
           categories={activeAssetLibraryCategories}
           failedNodeCount={failedGenerationNodeIds.length}
@@ -4129,6 +4189,7 @@ export function Canvas() {
           onPaste={handleContextPaste}
           onAddImageToLibrary={handleAddImageToLibrary}
           onDownloadMedia={handleContextDownloadMedia}
+          onToggleGroupFrozen={handleContextToggleGroupFrozen}
           onClose={() => setCanvasContextMenu(null)}
         />
       )}

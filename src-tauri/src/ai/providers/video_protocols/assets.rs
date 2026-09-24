@@ -428,11 +428,18 @@ pub async fn upload_reference_asset_multipart_with_fields(
         form = form.text((*name).to_string(), (*value).to_string());
     }
     let form = form.part("file", part);
-    let response = client
+    // api_key 为空 = 该图床是**匿名可上传**的, 不要发出 `Authorization: Bearer `
+    // (空值)。WGSPAI 的背景机图床 https://wgspai.cn/image-bed/api/upload 就属于
+    // 这一类 —— 官方 curl 示例不带任何鉴权头, 而带上一个空 Bearer 会让部分
+    // 网关直接 401, 反而把本来能用的上传打断。
+    let mut request = client
         .post(upload_url)
-        .bearer_auth(api_key)
         .header("Accept-Encoding", "identity")
-        .multipart(form)
+        .multipart(form);
+    if !api_key.trim().is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| {

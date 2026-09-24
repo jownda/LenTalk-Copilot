@@ -60,7 +60,10 @@ export default defineConfig(async () => ({
   server: {
     port: 1420,
     strictPort: true,
-    host: host || false,
+    // Tauri 探测的是 tauri.conf.json 里的 devUrl(http://127.0.0.1:1420)。
+    // 若这里用 `false`(即 localhost), 在 IPv6 优先解析的机器上 Node 只会绑 [::1],
+    // 导致 Tauri 永远等不到 dev server。显式绑 127.0.0.1 以保证两者一致。
+    host: host || "127.0.0.1",
     hmr: host
       ? {
           protocol: "ws",

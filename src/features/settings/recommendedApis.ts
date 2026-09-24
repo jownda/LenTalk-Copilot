@@ -54,7 +54,7 @@ export interface RecommendedVideoConfig {
   submitPath: string;
   queryPath: string;
   referenceEncoding: 'data_url' | 'raw_base64' | 'url';
-  transport: 'sub2api-video' | 'binghuo-video' | 'zhiniao-video' | 'zhenjian-task-api';
+  transport: 'sub2api-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api';
 }
 
 /** 已确认的 OpenAI Images 平台不通过 OPTIONS 猜测协议。 */
@@ -316,11 +316,11 @@ export const recommendedApis: RecommendedApi[] = [
     name: 'WGSPAI 视频',
     baseUrl: 'https://api.wgspai.cn',
     registerUrl: 'https://api.wgspai.cn',
-    summary: 'OpenAI 兼容视频生成中转平台，服务端异步提交与轮询',
+    summary: 'OpenAI Videos 风格视频中转平台，服务端异步提交与轮询',
     advantages: [
-      '使用 /v1/video/generations 异步提交与轮询任务状态',
-      '支持 Seedance 2.5、Seedance v2、MiniMax、Grok 等视频模型',
-      '复用炳火异步视频协议，参考图按 URL 直传',
+      '走 /v1/videos 提交与轮询（站点文档推荐的正典路径）',
+      '支持 Seedance 2.5、Seedance v2（9 图 / 3 音频 / 3 视频参考）、MiniMax H3 等视频模型',
+      '本地素材自动上传官方图床换取公网 URL，无需手动转存',
     ],
     models: [],
     videoModels: [
@@ -332,10 +332,10 @@ export const recommendedApis: RecommendedApi[] = [
       'grok-imagine-video-6s',
     ],
     videoConfig: {
-      submitPath: '/v1/video/generations',
-      queryPath: '/v1/video/generations/{taskId}',
+      submitPath: '/v1/videos',
+      queryPath: '/v1/videos/{taskId}',
       referenceEncoding: 'url',
-      transport: 'binghuo-video',
+      transport: 'wgspai-video',
     },
   },
   {

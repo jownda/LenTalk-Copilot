@@ -54,9 +54,11 @@ describe('resolveVideoModelProfile', () => {
     const profile = resolveVideoModelProfile('custom:wgspai/seedance2.5');
     expect(profile.id).toBe('wgspai-video');
     expect(profile.status).toBe('verified');
-    expect(profile.submitPath).toBe('/v1/video/generations');
-    expect(profile.queryPath).toBe('/v1/video/generations/{taskId}');
-    expect(profile.referenceImageTarget).toBe('data-url');
+    // 文档三处「推荐统一用 /v1/videos」, 兼容路径 /v1/video/generations 不再作为正典。
+    expect(profile.submitPath).toBe('/v1/videos');
+    expect(profile.queryPath).toBe('/v1/videos/{taskId}');
+    // 本地素材先传官方图床换公网 URL, 不再内联 data URL。
+    expect(profile.referenceImageTarget).toBe('platform-file');
     expect(profile.supportsReferenceImages).toBe(true);
     expect(profile.supportsFirstLast).toBe(true);
     expect(profile.supportsReferenceAudio).toBe(true);

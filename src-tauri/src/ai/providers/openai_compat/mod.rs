@@ -129,7 +129,15 @@ impl OpenAICompatibleProvider {
         fn find(value: &Value) -> Option<String> {
             match value {
                 Value::Object(map) => {
-                    for key in ["failure_reason", "failureReason", "fail_reason", "failReason", "error_message", "errorMessage", "error"] {
+                    // 键序 = 优先级。`message` / `msg` 放在最后: 它们是通用键, 几乎每个网关
+                    // 都在用, 但只有在更具体的失败键都取不到时才该采信。
+                    //
+                    // 补这两个键是必须的 —— WGSPAI / OpenAI Videos 系协议的失败体是
+                    // `{"status":"failed","error":{"message":"上游繁忙","code":"generation_failed"}}`:
+                    // `error` 是**对象**而非字符串, 顶层又没有 fail_reason 系键, 早先的列表
+                    // 递归进 `error` 后一个都匹配不上, 于是理由退化成状态词, 用户看到的
+                    // 是「视频生成失败: FAILED」而不是「视频生成失败: 上游繁忙」。
+                    for key in ["failure_reason", "failureReason", "fail_reason", "failReason", "error_message", "errorMessage", "error", "message", "msg"] {
                         if let Some(reason) = map.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()) {
                             return Some(reason.to_string());
                         }

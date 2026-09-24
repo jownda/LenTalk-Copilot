@@ -1104,12 +1104,12 @@ fn submit_jimeng_command(
                 // 用户才知道能不能自己手动重试, 而不是对着一句英文发呆。
                 ServerTaskProbe::Exists { submit_id, charged, .. } => {
                     let billing = if *charged {
-                        "该记录已产生计费, 请勿重复提交"
+                        "记录已产生计费, 已跳过自动重试以免重复扣费"
                     } else {
-                        "该记录未见计费信息, 未扣费, 可放心手动重试"
+                        "记录未产生计费; 因本次报错无法确认卡在上传阶段, 已跳过自动重试 —— 你可手动重试, 不会重复扣费"
                     };
                     format!(
-                        "即梦 CLI {label}失败(submit_id={submit_id} 已在本地任务库中, {billing}, 已跳过自动重试): {condensed}"
+                        "即梦 CLI {label}失败(submit_id={submit_id} 已在本地任务库中, {billing}): {condensed}"
                     )
                 }
                 _ if failure_reason.starts_with("即梦 CLI") => condensed,

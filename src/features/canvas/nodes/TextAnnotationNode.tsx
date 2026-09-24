@@ -6,7 +6,7 @@ import {
   useState,
   type MouseEvent as ReactMouseEvent,
 } from 'react';
-import { Handle, Position, type NodeProps } from '@xyflow/react';
+import { Handle, Position, type NodeProps, useUpdateNodeInternals } from '@xyflow/react';
 import { FileText } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -45,6 +45,7 @@ export const TextAnnotationNode = memo(({
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const selectedNodeId = useCanvasStore((state) => state.selectedNodeId);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const updateNodeInternals = useUpdateNodeInternals();
   const [isEditing, setIsEditing] = useState(false);
   const content = typeof data.content === 'string' ? data.content : '';
   const [contentDraft, setContentDraft] = useState(content);
@@ -72,6 +73,12 @@ export const TextAnnotationNode = memo(({
       setContentDraft(content);
     }
   }, [content]);
+
+  // 文本节点的 Handle 位置依赖节点尺寸。尺寸来自 React Flow 的测量/缩放结果,
+  // 变化后必须主动刷新内部 bounds, 否则新连线会沿用旧的左右锚点缓存。
+  useEffect(() => {
+    updateNodeInternals(id);
+  }, [id, resolvedHeight, resolvedWidth, updateNodeInternals]);
 
   // 单击(未拖动)进入编辑; 链接/表单控件/标题按钮上的单击不进入编辑
   const handleNodeClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {

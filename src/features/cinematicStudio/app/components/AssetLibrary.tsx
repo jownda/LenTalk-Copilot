@@ -120,8 +120,11 @@ export default function AssetLibrary({ project, scene, dispatch, locale, t, setN
   const editing = (project.assets ?? []).find((asset) => asset.id === editingId);
 
   const addAsset = (kind: AssetKind) => {
-    dispatch({ type: "ADD_ASSET", kind });
-    setNotice(t.assetAdded);
+    // 一步到位：建好资产立刻打开编辑页。
+    // 旧流程是「新建 → 在网格里找到刚生成的新卡片 → 再点一次才进编辑」，多一次点击。
+    const id = crypto.randomUUID();
+    dispatch({ type: "ADD_ASSET", kind, id });
+    setEditingId(id);
   };
 
   return <section className="card asset-card">
@@ -178,6 +181,82 @@ function AssetTile({ asset, locale, t, activeInCurrentScene, projectUsageCount, 
   </div>;
 }
 
+/** 素材库选择弹窗的条目：名称 + 缩略图 + 点击回调（回调在打开时由调用方绑定）。 */
+interface PickerItem {
+  key: string;
+  name: string;
+  /** 缩略图地址；音频条目留空，退化为图标。 */
+  thumb?: string;
+  isAudio?: boolean;
+  /** 分组标题；相邻同名条目会合并到同一组。 */
+  group?: string;
+  onPick(): void;
+}
+
+/**
+ * 素材库选择弹窗：大缩略图卡片网格 + 名称搜索。
+ * 旧实现是把两列 26px 小图的内联列表直接塞进字段里，既难看清又会一路把编辑弹窗撑长。
+ */
+function LibraryPickerModal({ items, emptyHint, t, onClose }: {
+  items: PickerItem[];
+  emptyHint: string;
+  t: Copy;
+  onClose(): void;
+}) {
+  const [query, setQuery] = useState("");
+  const visible = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return items;
+    return items.filter((item) => (item.name || "").toLowerCase().includes(needle));
+  }, [items, query]);
+
+  /** 按 group 切块，标题只在分组首条上方渲染一次。 */
+  const groups = useMemo(() => visible.reduce<{ label: string; items: PickerItem[] }[]>((acc, item) => {
+    const label = item.group ?? "";
+    const last = acc[acc.length - 1];
+    if (last && last.label === label) last.items.push(item);
+    else acc.push({ label, items: [item] });
+    return acc;
+  }, []), [visible]);
+
+  return <div className="asset-picker-overlay" onClick={(event) => { event.stopPropagation(); onClose(); }}>
+    <div
+      className="modal asset-picker-modal"
+      onClick={(event) => event.stopPropagation()}
+      onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); onClose(); } }}
+    >
+      <div className="modal-head">
+        <span className="asset-picker-title">
+          <span className="eyebrow">{t.libraryPickerTitle}</span>
+          <span className="asset-picker-count">{t.libraryPickerCount.replace("{count}", String(visible.length))}</span>
+        </span>
+        <button className="modal-close" onClick={onClose}><X size={14} /></button>
+      </div>
+      <input
+        className="modal-input asset-picker-search"
+        value={query}
+        spellCheck={false}
+        autoFocus
+        placeholder={t.libraryPickerSearch}
+        onChange={(event) => setQuery(event.target.value)}
+      />
+      <div className="asset-picker-body ui-scrollbar">
+        {visible.length === 0 ? <div className="asset-picker-empty">{emptyHint}</div> : groups.map((group, index) => <div className="asset-picker-group-block" key={group.label || `group-${index}`}>
+          {group.label && <div className="asset-picker-group">{group.label}</div>}
+          <div className="asset-picker-grid">
+            {group.items.map((item) => <button type="button" key={item.key} className="asset-picker-tile" title={item.name} onClick={item.onPick}>
+              <span className="asset-picker-thumb">
+                {item.isAudio || !item.thumb ? <AudioLines size={26} /> : <img src={item.thumb} alt={item.name} />}
+              </span>
+              <b>{item.name || "…"}</b>
+            </button>)}
+          </div>
+        </div>)}
+      </div>
+    </div>
+  </div>;
+}
+
 function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, canvasAudioSources, onCreateVariant, onClose }: { project: ProjectV2; scene: SceneV2; asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; canvasAudioSources: CanvasAudioSource[]; onCreateVariant(id: string): void; onClose(): void }) {
   const [imageBusy, setImageBusy] = useState(false);
   const [audioBusy, setAudioBusy] = useState(false);
@@ -228,6 +307,7 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
   /** 素材库选择器：ref = 添加图片；prop = 从图片创建道具；audio = 添加音频资产；voice = 绑定角色声音。 */
   const [libraryPicker, setLibraryPicker] = useState<null | "ref" | "prop" | "audio" | "voice">(null);
   const update = (patch: Partial<Asset>) => dispatch({ type: "UPDATE_ASSET", id: asset.id, patch });
+  const refCount = (asset.referencePaths ?? []).length;
   const attachedPropIds = asset.attachedPropIds ?? [];
   const attachedProps = attachedPropIds.map((id) => (project.assets ?? []).find((candidate) => candidate.id === id && candidate.kind === "prop")).filter((candidate): candidate is Asset => Boolean(candidate));
   const attachableProps = (project.assets ?? []).filter((candidate) => candidate.kind === "prop" && !attachedPropIds.includes(candidate.id));
@@ -449,49 +529,35 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
   const lockLevels: [LockLevel, keyof Copy][] = [["none", "lockNone"], ["soft", "lockSoft"], ["strict", "lockStrict"]];
 
   /**
-   * 素材库选择面板：ref 模式挂在参考图容器内（flex-wrap 换行铺满一行），
-   * prop 模式挂在道具面板内，voice 模式挂在声音音色字段下（只列音频素材）。
+   * 素材库选择弹窗的条目：ref / prop 用图片素材，audio 用音频素材，
+   * voice 同时列出「资产库音频」与「素材库音频」两组。回调在此绑定，弹窗保持无状态。
    */
-  const libraryPickerNode = (target: "ref" | "prop" | "audio" | "voice") => {
-    const isVoice = target === "voice";
-    const items = isVoice || target === "audio" ? libraryAudio : libraryImages;
-    return libraryPicker === target && (
-      <div
-        className="asset-prop-picker"
-        style={target === "ref" ? { flexBasis: "100%" } : target === "voice" || target === "audio" ? { marginTop: 6 } : undefined}
-      >
-        <button type="button" className="asset-prop-picker-back" onClick={() => setLibraryPicker(null)}>{t.cancel}</button>
-        {isVoice && cinematicAudioAssets.length > 0 && <>
-          <div className="hint-text">{t.assetKindAudioRef}</div>
-          <div className="asset-prop-picker-grid" style={{ maxHeight: 180, overflowY: "auto" }}>
-            {cinematicAudioAssets.map((item) => (
-              <button type="button" key={item.id} title={item.name} onClick={() => pickCinematicVoice(item)}>
-                <span><AudioLines size={14} /></span>
-                <b>{item.name}</b>
-              </button>
-            ))}
-          </div>
-        </>}
-        {items.length === 0 && (!isVoice || cinematicAudioAssets.length === 0) ? <span className="hint-text">{isVoice || target === "audio" ? t.voiceLibraryEmpty : t.libraryPickerEmpty}</span> : (
-          <div className="asset-prop-picker-grid" style={{ maxHeight: 220, overflowY: "auto" }}>
-            {items.map((item) => (
-              <button
-                type="button"
-                key={item.id}
-                title={item.name}
-                onClick={() => (isVoice ? pickLibraryVoice(item) : target === "audio" ? pickLibraryAudio(item) : target === "prop" ? createPropFromLibraryImage(item) : pickLibraryReference(item))}
-              >
-                {item.mediaType === "audio"
-                  ? <span><AudioLines size={14} /></span>
-                  : <img src={resolveImageDisplayUrl(item.previewImageUrl || item.sourcePath)} alt={item.name} />}
-                <b>{item.name}</b>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-    );
-  };
+  const pickerItems: PickerItem[] = libraryPicker === "voice"
+    ? [
+        ...cinematicAudioAssets.map((item) => ({
+          key: `asset-${item.id}`,
+          name: item.name || t.assetKindAudioRef,
+          isAudio: true,
+          group: t.assetKindAudioRef,
+          onPick: () => pickCinematicVoice(item),
+        })),
+        ...libraryAudio.map((item) => ({
+          key: `library-${item.id}`,
+          name: item.name,
+          isAudio: true,
+          group: t.assetLibraryShort,
+          onPick: () => pickLibraryVoice(item),
+        })),
+      ]
+    : libraryPicker === "audio"
+      ? libraryAudio.map((item) => ({ key: item.id, name: item.name, isAudio: true, onPick: () => pickLibraryAudio(item) }))
+      : libraryImages.map((item) => ({
+          key: item.id,
+          name: item.name,
+          thumb: resolveImageDisplayUrl(item.previewImageUrl || item.sourcePath),
+          onPick: () => (libraryPicker === "prop" ? createPropFromLibraryImage(item) : pickLibraryReference(item)),
+        }));
+  const pickerEmptyHint = libraryPicker === "voice" || libraryPicker === "audio" ? t.voiceLibraryEmpty : t.libraryPickerEmpty;
   return <div className="modal-overlay" onClick={onClose}>
     <div className="modal asset-modal" onClick={(event) => event.stopPropagation()}>
       <div className="modal-head">
@@ -507,34 +573,44 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
       <div className="asset-modal-grid">
         {/* 左列：用户填写的基础信息 */}
         <div className="asset-modal-left">
-          {asset.kind === "audio-reference" ? <div className="asset-refs">
-            {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref voice-clip" key={index}>
-              <audio controls src={resolveImageDisplayUrl(src)} preload="none" />
-              <button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button>
-            </span>)}
-            <label className="asset-ref-add" title={t.voiceUploadHint}>
-              {audioBusy ? <span className="spin-dot" /> : <AudioLines size={18} />}
-              <span>{t.assetUploadShort}</span>
-              <input className="hidden" type="file" accept="audio/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
-            </label>
-            <button type="button" className="asset-ref-add" title={t.assetPickFromLibrary} onClick={() => setLibraryPicker(libraryPicker === "audio" ? null : "audio")}>
-              <FolderOpen size={18} />
-              <span>{t.assetLibraryShort}</span>
-            </button>
-            {libraryPickerNode("audio")}
+          {asset.kind === "audio-reference" ? <div className="asset-ref-box">
+            <div className="asset-ref-head">
+              <span className="asset-ref-head-title">{t.assetKindAudioRef}<b>{refCount}</b></span>
+              <div className="asset-ref-head-actions">
+                <label className="asset-ref-btn" title={t.voiceUploadHint}>
+                  {audioBusy ? <span className="spin-dot" /> : <AudioLines size={14} />}
+                  <input className="hidden" type="file" accept="audio/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
+                </label>
+                <button type="button" className="asset-ref-btn" title={t.assetPickFromLibrary} onClick={() => setLibraryPicker("audio")}>
+                  <FolderOpen size={14} />
+                </button>
+              </div>
+            </div>
+            <div className="asset-refs audio-refs">
+              {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref voice-clip" key={index}>
+                <audio controls src={resolveImageDisplayUrl(src)} preload="none" />
+                <button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button>
+              </span>)}
+              {refCount === 0 && <span className="asset-ref-empty">{t.assetRefEmpty}</span>}
+            </div>
           </div> : asset.kind === "character" ? <div className="asset-media-split">
-            <div className="asset-refs">
-              {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={resolveImageDisplayUrl(src)} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
-              <label className="asset-ref-add" title={t.uploadCharacterImages}>
-                {imageBusy ? <span className="spin-dot" /> : <ImagePlus size={18} />}
-                <span>{t.assetUploadShort}</span>
-                <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
-              </label>
-              <button type="button" className="asset-ref-add" title={t.assetPickFromLibrary} onClick={() => setLibraryPicker(libraryPicker === "ref" ? null : "ref")}>
-                <FolderOpen size={18} />
-                <span>{t.assetLibraryShort}</span>
-              </button>
-              {libraryPickerNode("ref")}
+            <div className="asset-ref-box">
+              <div className="asset-ref-head">
+                <span className="asset-ref-head-title">{t.referenceImage}<b>{refCount}</b></span>
+                <div className="asset-ref-head-actions">
+                  <label className="asset-ref-btn" title={t.uploadCharacterImages}>
+                    {imageBusy ? <span className="spin-dot" /> : <ImagePlus size={14} />}
+                    <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
+                  </label>
+                  <button type="button" className="asset-ref-btn" title={t.assetPickFromLibrary} onClick={() => setLibraryPicker("ref")}>
+                    <FolderOpen size={14} />
+                  </button>
+                </div>
+              </div>
+              <div className="asset-refs">
+                {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={resolveImageDisplayUrl(src)} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
+                {refCount === 0 && <span className="asset-ref-empty">{t.assetRefEmpty}</span>}
+              </div>
             </div>
             <div className="asset-prop-panel">
               {attachedProps.length > 0 && <div className="asset-prop-linked-list">
@@ -567,23 +643,33 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
                     <span>{t.uploadImage}</span>
                     <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadPropImage(event.target.files?.[0])} />
                   </label>
-                  <button type="button" onClick={() => setLibraryPicker(libraryPicker === "prop" ? null : "prop")}>{t.propFromLibraryCreate}</button>
+                  <button type="button" onClick={() => setLibraryPicker("prop")}>{t.propFromLibraryCreate}</button>
                 </>}
               </div>}
-              {libraryPickerNode("prop")}
             </div>
-          </div> : <div className="asset-refs">
-            {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={resolveImageDisplayUrl(src)} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
-            <label className="asset-ref-add" title={t.referenceImage}>
-              {imageBusy ? <span className="spin-dot" /> : <ImagePlus size={18} />}
-              <span>{t.assetUploadShort}</span>
-              <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
-            </label>
-            <button type="button" className="asset-ref-add" title={t.assetPickFromLibrary} onClick={() => setLibraryPicker(libraryPicker === "ref" ? null : "ref")}>
-              <FolderOpen size={18} />
-              <span>{t.assetLibraryShort}</span>
-            </button>
-            {libraryPickerNode("ref")}
+          </div> : <div className="asset-ref-box">
+            <div className="asset-ref-head">
+              <span className="asset-ref-head-title">{t.referenceImage}<b>{refCount}</b></span>
+            </div>
+            {/* 单图资产（场景 / 道具）：缩略图收成正方框，右侧竖排两个带文字的大按钮。
+                原先两个 26px 图标按钮挤在标题行右侧，点击目标过小。 */}
+            <div className="asset-ref-row">
+              <div className="asset-refs asset-refs-square">
+                {(asset.referencePaths ?? []).map((src, index) => <span className="asset-ref" key={index}><img src={resolveImageDisplayUrl(src)} alt={asset.name} /><button title={t.deleteAsset} onClick={() => removeReference(index)}><X size={10} /></button></span>)}
+                {refCount === 0 && <span className="asset-ref-empty">{t.assetRefEmpty}</span>}
+              </div>
+              <div className="asset-ref-action-col">
+                <label className="asset-ref-action" title={t.uploadImage}>
+                  {imageBusy ? <span className="spin-dot" /> : <ImagePlus size={15} />}
+                  <span>{t.uploadImage}</span>
+                  <input className="hidden" type="file" accept="image/*" onChange={(event) => void uploadReference(event.target.files?.[0])} />
+                </label>
+                <button type="button" className="asset-ref-action" title={t.assetPickFromLibrary} onClick={() => setLibraryPicker("ref")}>
+                  <FolderOpen size={15} />
+                  <span>{t.assetPickFromLibrary}</span>
+                </button>
+              </div>
+            </div>
           </div>}
           <label className="field-label">{t.assetName}<input className="modal-input" value={asset.name} placeholder={t.assetNamePlaceholder} onChange={(event) => update({ name: event.target.value })} /></label>
           <label className="field-label">{t.assetNotes}<textarea className="modal-textarea asset-notes-input" value={locale === "zh" ? (asset.notesZh ?? "") : (asset.notes ?? "")} placeholder={locale === "zh" ? t.assetNotesZhPlaceholder : t.assetNotesPlaceholder} onChange={(event) => update(locale === "zh" ? { notesZh: event.target.value } : { notes: event.target.value })} /></label>
@@ -616,11 +702,10 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
               type="button"
               className="outline-button voice-library-trigger"
               title={t.voiceFromLibrary}
-              onClick={() => setLibraryPicker(libraryPicker === "voice" ? null : "voice")}
+              onClick={() => setLibraryPicker("voice")}
             >
               <AudioLines size={13} /> {t.voiceFromLibrary}
             </button>
-            {libraryPickerNode("voice")}
             {canvasAudioSources.length > 0 ? <div className="voice-canvas-picker">
               <span>{t.voiceCanvasSource}</span>
               <select value="" aria-label={t.voiceCanvasChoose} onChange={(event) => replaceVoiceFromCanvas(event.target.value)}>
@@ -757,6 +842,15 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
         <button className="outline-button" onClick={onClose}>{t.cancel}</button>
         <button className="primary-button" onClick={onClose}>{t.save}</button>
       </div>
+
+      {/* 素材库选择弹窗：固定定位挂在编辑弹窗内部，随编辑弹窗一起进入同一个层叠上下文，
+          不会被 .asset-modal 的 overflow 裁切（其包含块是带 backdrop-filter 的 .modal-overlay）。 */}
+      {libraryPicker && <LibraryPickerModal
+        items={pickerItems}
+        emptyHint={pickerEmptyHint}
+        t={t}
+        onClose={() => setLibraryPicker(null)}
+      />}
     </div>
   </div>;
 }

@@ -42,7 +42,7 @@ export interface CustomApiCapabilities {
   videoQueryPath: string;
   videoReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
   taskProtocol: 'generic' | 'unknown';
-  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'zhiniao-video' | 'zhenjian-task-api';
+  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api';
 }
 
 /** 即梦 CLI 是本地命令行工具，不使用 OpenAI 兼容平台的 API Key 配置。 */
@@ -293,6 +293,8 @@ interface SettingsState {
    */
   lastVoiceByModel: Record<string, string>;
   cinematicAiSelection: CinematicAiSelection;
+  /** 文本节点「AI修改」最后一次使用的 Chat 模型；独立于提示词工作室记忆。 */
+  textNodeAiSelection: CinematicAiSelection;
   jimengCli: JimengCliSettings;
   /** 即梦 CLI 自动检测/安装状态（运行时内存态，不随设置持久化）。 */
   jimengCliAutoInstallStatus: JimengCliAutoInstallStatus;
@@ -356,6 +358,7 @@ interface SettingsState {
   rememberLastVoice: (modelId: string, voice: string) => void;
   removeVoiceProfile: (id: string) => void;
   setCinematicAiSelection: (selection: CinematicAiSelection) => void;
+  setTextNodeAiSelection: (selection: CinematicAiSelection) => void;
   setGrsaiNanoBananaProModel: (model: string) => void;
   setHideProviderGuidePopover: (hide: boolean) => void;
   setDownloadPresetPaths: (paths: string[]) => void;
@@ -810,6 +813,7 @@ export const useSettingsStore = create<SettingsState>()(
       systemVoicePreviews: {},
       lastVoiceByModel: {},
       cinematicAiSelection: { provider: '', model: '', reasoningEffort: '' },
+      textNodeAiSelection: { provider: '', model: '', reasoningEffort: '' },
       jimengCli: { executable: DEFAULT_JIMENG_CLI_EXECUTABLE },
       jimengCliAutoInstallStatus: DEFAULT_JIMENG_CLI_AUTO_INSTALL_STATUS,
       grsaiNanoBananaProModel: DEFAULT_GRSAI_NANO_BANANA_PRO_MODEL,
@@ -954,6 +958,14 @@ export const useSettingsStore = create<SettingsState>()(
       setCinematicAiSelection: (selection) =>
         set({
           cinematicAiSelection: {
+            provider: selection.provider.trim(),
+            model: selection.model.trim(),
+            reasoningEffort: normalizeCinematicReasoningEffort(selection.reasoningEffort),
+          },
+        }),
+      setTextNodeAiSelection: (selection) =>
+        set({
+          textNodeAiSelection: {
             provider: selection.provider.trim(),
             model: selection.model.trim(),
             reasoningEffort: normalizeCinematicReasoningEffort(selection.reasoningEffort),

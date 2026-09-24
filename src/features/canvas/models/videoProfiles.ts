@@ -101,16 +101,25 @@ const BINGHUO_VIDEO_PROFILE: VideoModelProfile = {
 };
 
 /**
- * wgspai 平台链路：提交/轮询端点与炳火同构(/v1/video/generations)，
- * 但平台没有 /v1/assets/uploads 独立上传端点，参考图必须作为 data URL 直接内嵌进请求体。
+ * wgspai 平台链路(api.wgspai.cn)。
+ *
+ * 端点按站点文档取正典路径 —— 四份对接文档三处写明「推荐统一用 /v1/videos」,
+ * `/v1/video/generations` 只是「兼容路径(可选)」, 因此提交与轮询都走 /v1/videos。
+ *
+ * 参考素材走**官方背景机图床**(`https://wgspai.cn/image-bed/api/upload`, 字段 `file`,
+ * 匿名可传), 所以是 `platform-file` 而非 data-url: 文档明确要求参考图是公网可访问
+ * URL, 并对内联 data URL 标注「体积大、易触达请求上限」。
+ *
+ * 参考音视频字段与炳火不同(720p 文档口径): 音频 `audio_urls`、视频 `video_urls`
+ * (视频仅 seedance-v2-*-video 支持); Minimax-h3 文档明确不支持参考音视频。
  */
 const WGSPAI_VIDEO_PROFILE: VideoModelProfile = {
   id: 'wgspai-video',
   status: 'verified',
-  protocolLabel: 'wgspai 异步视频 / 已验证',
-  submitPath: '/v1/video/generations',
-  queryPath: '/v1/video/generations/{taskId}',
-  referenceImageTarget: 'data-url',
+  protocolLabel: 'WGSPAI 异步视频 / 已验证',
+  submitPath: '/v1/videos',
+  queryPath: '/v1/videos/{taskId}',
+  referenceImageTarget: 'platform-file',
   supportsReferenceImages: true,
   supportsFirstLast: true,
   supportsReferenceAudio: true,

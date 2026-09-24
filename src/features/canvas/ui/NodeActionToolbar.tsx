@@ -11,6 +11,7 @@ import {
   PenLine,
   RefreshCw,
   RotateCw,
+  Search,
   Scissors,
   SlidersHorizontal,
   Sparkles,
@@ -32,6 +33,7 @@ import {
   isAudioNode,
   isStoryboardGenNode,
   isStoryboardSplitNode,
+  isTextAnnotationNode,
   isUploadNode,
   type CanvasNode,
   type NodeToolType,
@@ -50,6 +52,7 @@ import {
 } from "@/features/canvas/application/generationErrorReport";
 import { showErrorDialog } from "@/features/canvas/application/errorDialog";
 import { saveMediaSourceWithDialog } from "@/features/canvas/application/mediaDownload";
+import { TextNodeEditDialog } from "./TextNodeEditDialog";
 import { importVideoUrlToAsset } from "@/features/library/importAssets";
 import {
   buildTemplateFromCanvas,
@@ -223,6 +226,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const isVideoMediaNode = isAudioNode(node) && node.data.mediaType === "video";
   const isStoryboardGen = isStoryboardGenNode(node);
   const isStoryboardSplit = isStoryboardSplitNode(node);
+  const isTextAnnotation = isTextAnnotationNode(node);
   const canCopyStoryboardText = isStoryboardGen || isStoryboardSplit;
   const tools = useMemo(() => getNodeToolPlugins(node), [node]);
   const deleteNode = useCanvasStore((state) => state.deleteNode);
@@ -260,6 +264,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isScriptDialogOpen, setIsScriptDialogOpen] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
   const [isTemplateDialogOpen, setIsTemplateDialogOpen] = useState(false);
+  const [textEditDialogMode, setTextEditDialogMode] = useState<"ai" | "find" | null>(null);
   const [templateName, setTemplateName] = useState("");
   const [templateDescription, setTemplateDescription] = useState("");
   const [isSavingTemplate, setIsSavingTemplate] = useState(false);
@@ -736,6 +741,26 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       className={NODE_TOOLBAR_CLASS}
     >
       <UiPanel className="flex items-center gap-1 rounded-full p-1">
+        {!isImageEdit && isTextAnnotation && (
+          <>
+            <UiChipButton
+              key="text-ai-edit"
+              className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+              onClick={() => setTextEditDialogMode("ai")}
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              {t("textNodeEdit.aiButton")}
+            </UiChipButton>
+            <UiChipButton
+              key="text-find"
+              className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+              onClick={() => setTextEditDialogMode("find")}
+            >
+              <Search className="h-3.5 w-3.5" />
+              {t("textNodeEdit.findButton")}
+            </UiChipButton>
+          </>
+        )}
         {!isImageEdit &&
           tools.map((tool) => {
             const Icon = toolIconMap[tool.icon] ?? Crop;
@@ -978,6 +1003,13 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           {t("common.delete")}
         </UiChipButton>
       </UiPanel>
+      {isTextAnnotation && (
+        <TextNodeEditDialog
+          mode={textEditDialogMode}
+          node={node}
+          onClose={() => setTextEditDialogMode(null)}
+        />
+      )}
 
       {!isImageEdit && isScriptDialogOpen && (
         <PajubenQuickExtractDialog node={node} onClose={() => setIsScriptDialogOpen(false)} />
