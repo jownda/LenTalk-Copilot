@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID,
   JIMENG_CLI_PROVIDER_ID,
+  RUNNINGHUB_CLI_PROVIDER_ID,
   getImageModel,
   isApiKeylessProvider,
   listAudioModels,
@@ -118,6 +119,61 @@ describe('listVideoModels', () => {
       expect(seedance25?.defaultDuration).toBe(30);
       expect(seedance25?.resolutions?.map((option) => option.value)).toEqual(['480p', '720p']);
       expect(seedance25?.aspectRatios.map((option) => option.value)).toEqual(['16:9', '9:16']);
+    } finally {
+      useSettingsStore.setState({ customApis: previousCustomApis });
+    }
+  });
+
+  it('gives WGSPAI models their documented duration and aspect options', () => {
+    // 回归: WGSPAI 曾被并进炳火的档位表, 于是 seedance2.5(固定 30 秒按次计费)
+    // 落到默认的 4~15 秒 —— 下拉里选 12 秒, 平台照 30 秒出片。
+    const previousCustomApis = useSettingsStore.getState().customApis;
+    const wgspai: CustomApiProvider = {
+      id: 'wgspai',
+      name: 'WGSPAI 视频',
+      baseUrl: 'https://api.wgspai.cn',
+      apiKey: '',
+      models: [],
+      videoModels: ['seedance2.5', 'seedance-v2-720p', 'Minimax-h3', 'sd-2', 'LongXia-O-sora2-pro-8s-9x16'],
+      audioModels: [],
+      chatModels: [],
+      createdAt: Date.now(),
+      requestMode: 'sync',
+      protocol: 'images',
+      referenceImageField: 'image',
+      referenceImageEncoding: 'url',
+      imageTransport: 'auto',
+    };
+
+    useSettingsStore.setState({ customApis: [wgspai] });
+    try {
+      const models = listVideoModels();
+      const byModel = (suffix: string) => models.find((model) => model.id.endsWith(`/${suffix}`));
+
+      // seedance2.5: 固定 30 秒, 白名单 9:16 / 16:9 / 1:1。
+      expect(byModel('seedance2.5')?.durationOptions).toEqual([30]);
+      expect(byModel('seedance2.5')?.defaultDuration).toBe(30);
+      expect(byModel('seedance2.5')?.aspectRatios.map((option) => option.value)).toEqual([
+        '9:16',
+        '16:9',
+        '1:1',
+      ]);
+
+      // seedance-v2-720p: 4~15 秒整数, 且只给 9:16 / 16:9。
+      expect(byModel('seedance-v2-720p')?.durationOptions).toEqual(
+        [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+      );
+      expect(byModel('seedance-v2-720p')?.aspectRatios.map((option) => option.value)).toEqual(['9:16', '16:9']);
+
+      // Minimax-h3: 4~15 秒, 画幅未限定 → 保留通用枚举。
+      expect(byModel('Minimax-h3')?.durationOptions).toEqual([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+      // sd-2: 文档口径 5~15 秒整数。
+      expect(byModel('sd-2')?.durationOptions).toEqual([5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+      // 时长编在模型名里 → 只给那一个值。
+      expect(byModel('LongXia-O-sora2-pro-8s-9x16')?.durationOptions).toEqual([8]);
+      expect(byModel('LongXia-O-sora2-pro-8s-9x16')?.defaultDuration).toBe(8);
     } finally {
       useSettingsStore.setState({ customApis: previousCustomApis });
     }
@@ -277,6 +333,72 @@ describe('字字动画对口型模型', () => {
     } finally {
       useSettingsStore.setState({ customApis: previousCustomApis });
     }
+  });
+});
+
+describe('RunningHub 音频模型', () => {
+  it('列出 IndexTTS 与标准 Speech/Music 端点', () => {
+    const previousCustomApis = useSettingsStore.getState().customApis;
+    useSettingsStore.setState({
+      customApis: [
+        {
+          id: 'runninghub-cn',
+          name: 'RunningHub 国内版',
+          baseUrl: 'https://www.runninghub.cn',
+          apiKey: '',
+          models: [],
+          videoModels: [],
+          audioModels: [
+            'indextts2_clone',
+            'rhart-audio/text-to-audio/speech-2.8-turbo',
+            'minimax/music-2.6/text-to-music',
+          ],
+          chatModels: [],
+          createdAt: 0,
+          requestMode: 'sync',
+          protocol: 'images',
+          referenceImageField: 'image',
+          referenceImageEncoding: 'auto',
+          imageTransport: 'auto',
+        },
+      ],
+    });
+    try {
+      const models = listAudioModels();
+      expect(models.map((model) => model.id)).toEqual(expect.arrayContaining([
+        'custom:runninghub-cn/indextts2_clone',
+        'custom:runninghub-cn/rhart-audio/text-to-audio/speech-2.8-turbo',
+        'custom:runninghub-cn/minimax/music-2.6/text-to-music',
+        'runninghub-cli/rhart-audio/suno-v5/single',
+      ]));
+      expect(models.find((model) => model.id.endsWith('indextts2_clone'))?.family).toBe('indextts');
+      expect(models.find((model) => model.id.endsWith('music-2.6/text-to-music'))?.audioKind).toBe('music');
+    } finally {
+      useSettingsStore.setState({ customApis: previousCustomApis });
+    }
+  });
+});
+
+describe('RunningHub CLI 模型', () => {
+  it('注册无密钥的视频与音频模型，且 Suno 端点只暴露真实操作', () => {
+    const videoModels = listVideoModels().filter((model) => model.providerId === RUNNINGHUB_CLI_PROVIDER_ID);
+    const audioModels = listAudioModels().filter((model) => model.providerId === RUNNINGHUB_CLI_PROVIDER_ID);
+    expect(videoModels.length).toBeGreaterThan(0);
+    expect(videoModels).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'runninghub-cli/bytedance/seedance-2.5-token/text-to-video',
+        displayName: 'RunningHub CLI · Seedance 2.5 Token 计费',
+      }),
+      expect.objectContaining({
+        id: 'runninghub-cli/minimax/hailuo-h3/text-to-video',
+        displayName: 'RunningHub CLI · MiniMax H3',
+      }),
+    ]));
+    expect(audioModels.some((model) => model.id.endsWith('/rhart-audio/suno-v5.5/single'))).toBe(true);
+    expect(audioModels.find((model) => model.id.endsWith('/rhart-audio/suno-v5.5/single'))?.sunoSupportedOperations).toEqual([
+      'generate',
+    ]);
+    expect(isApiKeylessProvider(RUNNINGHUB_CLI_PROVIDER_ID)).toBe(true);
   });
 });
 

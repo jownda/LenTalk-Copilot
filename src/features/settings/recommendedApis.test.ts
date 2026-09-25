@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { isKnownOpenAiImagesBaseUrl, findRecommendedApiByBaseUrl, listVisibleRecommendedApis, normalizeRecommendedBaseUrl, recommendedApis, visibleRecommendedApiIds } from './recommendedApis';
+import { isKnownOpenAiImagesBaseUrl, findRecommendedApiByBaseUrl, listVisibleRecommendedApis, normalizeRecommendedBaseUrl, recommendedApis, resolveNewRecommendedVideoModels, visibleRecommendedApiIds } from './recommendedApis';
 import { isAudioModelName, isVideoGenerationModelName } from '@/stores/settingsStore';
 import { resolveVideoModelProfile } from '@/features/canvas/models/videoProfiles';
 import { isRjmVideoApiBaseUrl } from '@/commands/videoApi';
+import { RUNNINGHUB_VIDEO_ENDPOINTS, RUNNINGHUB_VIDEO_TRANSPORT } from '@/commands/runningHubProtocol';
 
 const zhiniao = recommendedApis.find((api) => api.id === 'zhiniao');
 const zizidonghua = recommendedApis.find((api) => api.id === 'zizidonghua');
@@ -236,13 +237,56 @@ describe('RunningHub 国际版 / 国内版', () => {
     expect(international?.name).not.toBe(domestic?.name);
   });
 
-  it('预填模型不会被视频/音频启发式抢走(否则保存平台时被静默丢弃)', () => {
+  it('不预填图像模型, 但预填已接通的 RunningHub 音频端点', () => {
     for (const preset of [international, domestic]) {
-      const models = preset?.models ?? [];
-      expect(models.length).toBeGreaterThan(0);
-      expect(models.filter((model) => isVideoGenerationModelName(model))).toEqual([]);
-      expect(models.filter((model) => isAudioModelName(model))).toEqual([]);
+      // 图像端点仍未接入标准图像节点；音频端点已经走 RunningHub v2 任务协议。
+      expect(preset?.models ?? []).toEqual([]);
+      expect(preset?.audioModels).toEqual([
+        'indextts2_clone',
+        'rhart-audio/text-to-audio/speech-2.8-turbo',
+        'rhart-audio/text-to-audio/speech-2.8-hd',
+        'bytedance/doubao-seed-tts-2.0',
+        'minimax/music-2.6/text-to-music',
+        'minimax/music-2.6/text-to-instrumental',
+        'rhart-audio/suno-v5.5/single',
+        'rhart-audio/suno-v5.5/custom',
+      ]);
     }
+  });
+
+  it('预填端点与官方目录快照一一对应(两边都锁死, 不会单方面漂移)', () => {
+    const known = new Set(RUNNINGHUB_VIDEO_ENDPOINTS.map((endpoint) => endpoint.endpoint));
+    const videoModels = international?.videoModels ?? [];
+    expect(videoModels.length).toBeGreaterThan(0);
+    // 预设里的每个 ID 都必须能在目录里查到字段表 —— 查不到就是拼错了,
+    // 提交时会被平台回 "Invalid URL"。
+    expect(videoModels.filter((model) => !known.has(model))).toEqual([]);
+    // 反向: 目录里的每个端点都应被预填, 不留「实现了却选不到」的孤儿。
+    expect([...known].filter((endpoint) => !videoModels.includes(endpoint))).toEqual([]);
+    expect(new Set(videoModels).size).toBe(videoModels.length);
+  });
+
+  it('视频端点 ID 形如 <家族>/<文生|图生> 且不含前导斜杠或空白', () => {
+    for (const model of international?.videoModels ?? []) {
+      // 提交时整串拼在 `/openapi/v2/` 之后, 前导斜杠会拼成双斜杠。
+      expect(model).not.toMatch(/^\/|\s/);
+      // 海螺 02 文生的端点名是 t2v-pro, 多模态端点则使用 multimodal-video。
+      expect(model).toMatch(/to-video|t2v|i2v|multimodal/);
+    }
+  });
+
+  it('两条预设都声明 runninghub-model 协议, 且视频档案按 Base URL 命中', () => {
+    for (const preset of [international, domestic]) {
+      expect(preset?.videoConfig?.transport).toBe(RUNNINGHUB_VIDEO_TRANSPORT);
+      // 查询地址是固定路径 POST body {taskId}, 不是提交路径 + /{taskId}。
+      expect(preset?.videoConfig?.queryPath).toBe('/openapi/v2/query');
+    }
+    expect(
+      resolveVideoModelProfile(
+        'custom:runninghub/kling-v3.0-pro/image-to-video',
+        'https://www.runninghub.cn',
+      ).id,
+    ).toBe('runninghub-model');
   });
 });
 
@@ -304,5 +348,68 @@ describe('推荐平台的余额查询声明', () => {
       // ModelScope 实测该端点返回 404 —— 声明了只会白发请求且永远查不到余额。
       modelscope: null,
     });
+  });
+});
+
+describe('预设视频模型的增量同步', () => {
+  // 「预设加了端点, 但已添加过该平台的用户看不到」—— 平台添加后模型列表就与预设脱钩。
+  // 下面锁定补差集的语义。
+  const presetEndpointIds = RUNNINGHUB_VIDEO_ENDPOINTS.map((item) => item.endpoint);
+    // 老配置: 第二批才补进来的 bytedance/* 端点当时还不存在。
+    const legacyModels = presetEndpointIds.filter((id) => !id.startsWith('bytedance/'));
+
+  it('从未同步过的老配置能把预设新增的端点补出来', () => {
+    const resolved = resolveNewRecommendedVideoModels(
+      'https://www.runninghub.cn',
+      legacyModels,
+      undefined,
+    );
+    expect(resolved).not.toBeNull();
+    expect(resolved?.revision).toBe(3);
+    expect(resolved?.models).toEqual([
+      'bytedance/seedance-2.5-token/text-to-video',
+      'bytedance/seedance-2.5-token/image-to-video',
+      'bytedance/seedance-2.5-token/multimodal-video',
+    ]);
+  });
+
+  it('已对齐的平台是 no-op —— 用户删掉的预设端点不会被反复加回来', () => {
+    expect(
+      resolveNewRecommendedVideoModels('https://www.runninghub.cn', presetEndpointIds, 3),
+    ).toBeNull();
+  });
+
+  it('对齐之后用户删掉某个预设端点, 依然不会复活', () => {
+    const afterUserDeletion = presetEndpointIds.filter((id) => !id.includes('hailuo'));
+    expect(
+      resolveNewRecommendedVideoModels('https://www.runninghub.cn', afterUserDeletion, 3),
+    ).toBeNull();
+  });
+
+  it('用户手加的端点既不会被删, 也不影响差集', () => {
+    const resolved = resolveNewRecommendedVideoModels(
+      'https://www.runninghub.cn',
+      [...legacyModels, 'my-own/private-endpoint'],
+      1,
+    );
+    expect(resolved?.models).toEqual([
+      'bytedance/seedance-2.5-token/text-to-video',
+      'bytedance/seedance-2.5-token/image-to-video',
+      'bytedance/seedance-2.5-token/multimodal-video',
+    ]);
+  });
+
+  it('清单不由代码维护的平台不参与同步', () => {
+    for (const baseUrl of ['https://api.wgspai.cn/v1', 'https://api.grsai.com', 'https://cuai.token6688.com', '']) {
+      expect(resolveNewRecommendedVideoModels(baseUrl, [], undefined)).toBeNull();
+    }
+  });
+
+  it('两条 RunningHub 预设的 revision 必须同步推进', () => {
+    const international = recommendedApis.find((api) => api.id === 'runninghub');
+    const domestic = recommendedApis.find((api) => api.id === 'runninghub-cn');
+    expect(international?.videoModelsRevision).toBe(domestic?.videoModelsRevision);
+    // 低于 3 说明有人改了 videoModels 却忘了 +1 —— 老用户就永远收不到新端点。
+    expect(domestic?.videoModelsRevision).toBeGreaterThanOrEqual(3);
   });
 });

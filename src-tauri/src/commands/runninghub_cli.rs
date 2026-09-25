@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::Serialize;
+use serde::Deserialize;
+use serde_json::Value;
+use std::fs;
 
 /// 默认命令名（pip 安装后注册的命令）。
 const DEFAULT_EXECUTABLE: &str = "rh";
@@ -18,6 +21,18 @@ const DEFAULT_EXECUTABLE: &str = "rh";
 /// RunningHub CLI 没有发布到 PyPI，只能从官方仓库源码安装。
 const INSTALL_COMMAND: &str =
     "python -m pip install --user git+https://github.com/HM-RunningHub/RH_CLI.git";
+
+#[derive(Debug, Deserialize)]
+pub struct RunningHubCliModelRequest {
+    pub executable: String,
+    pub endpoint: String,
+    pub prompt: Option<String>,
+    pub images: Option<Vec<String>>,
+    pub video: Option<String>,
+    pub audio: Option<String>,
+    pub params: Option<Vec<String>>,
+    pub output_kind: String,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -238,6 +253,85 @@ fn run_cli(executable: &Path, arguments: &[&str]) -> Result<std::process::Output
     command
         .output()
         .map_err(|error| format!("无法启动 RunningHub CLI：{error}"))
+}
+
+fn output_dir_for_cli() -> Result<PathBuf, String> {
+    let root = std::env::temp_dir().join(format!("lentalk-runninghub-cli-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).map_err(|error| format!("无法创建 RunningHub CLI 输出目录: {error}"))?;
+    Ok(root)
+}
+
+fn materialize_cli_source(source: &str, root: &Path, index: usize, kind: &str) -> Result<String, String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() { return Err(format!("RunningHub CLI {kind}素材为空")); }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Ok(trimmed.to_string());
+    }
+    if let Some((meta, payload)) = trimmed.split_once(',').filter(|(meta, _)| meta.starts_with("data:")) {
+        let encoded = if meta.to_ascii_lowercase().contains(";base64") {
+            payload.to_string()
+        } else {
+            urlencoding::decode(payload).map_err(|_| format!("无法解码 RunningHub CLI {kind}素材"))?.into_owned()
+        };
+        let bytes = if meta.to_ascii_lowercase().contains(";base64") {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| format!("RunningHub CLI {kind}素材编码无效"))?
+        } else { encoded.into_bytes() };
+        let extension = match kind { "audio" => "mp3", "video" => "mp4", _ => "png" };
+        let path = root.join(format!("input-{index}.{extension}"));
+        fs::write(&path, bytes).map_err(|error| format!("无法写入 RunningHub CLI 素材: {error}"))?;
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    let path = Path::new(trimmed);
+    if path.is_file() { return Ok(path.to_string_lossy().into_owned()); }
+    Err(format!("RunningHub CLI 找不到{kind}素材: {trimmed}"))
+}
+
+fn run_runninghub_cli_blocking(request: RunningHubCliModelRequest) -> Result<String, String> {
+    if request.output_kind != "video" && request.output_kind != "audio" {
+        return Err(format!("RunningHub CLI 不支持的输出类型: {}", request.output_kind));
+    }
+    let executable = resolve_executable(&request.executable)?;
+    let output_dir = output_dir_for_cli()?;
+    let mut owned: Vec<String> = vec!["--json".into(), "model".into(), "run".into(), "--endpoint".into(), request.endpoint.clone()];
+    if let Some(prompt) = request.prompt.as_deref().filter(|value| !value.trim().is_empty()) {
+        owned.extend(["--prompt".into(), prompt.to_string()]);
+    }
+    for (index, source) in request.images.unwrap_or_default().iter().enumerate() {
+        owned.extend(["--image".into(), materialize_cli_source(source, &output_dir, index, "image")?]);
+    }
+    if let Some(source) = request.video.as_deref() {
+        owned.extend(["--video".into(), materialize_cli_source(source, &output_dir, 0, "video")?]);
+    }
+    if let Some(source) = request.audio.as_deref() {
+        owned.extend(["--audio".into(), materialize_cli_source(source, &output_dir, 0, "audio")?]);
+    }
+    for param in request.params.unwrap_or_default() {
+        owned.extend(["--param".into(), param]);
+    }
+    owned.extend(["--output".into(), output_dir.to_string_lossy().into_owned()]);
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let output = run_cli(&executable, &args)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        return Err(format!("RunningHub CLI 生成失败: {}", failure_message(&output)));
+    }
+    let value: Value = serde_json::from_str(&stdout).map_err(|error| format!("RunningHub CLI 返回结果无法解析: {error}; {stdout}"))?;
+    let files = value.get("files").and_then(Value::as_array).and_then(|items| items.iter().find_map(Value::as_str));
+    let texts = value.get("texts").and_then(Value::as_array).and_then(|items| items.iter().find_map(Value::as_str));
+    let result = files.or(texts).ok_or_else(|| format!("RunningHub CLI 已完成但没有产出: {stdout}"))?;
+    let source = Path::new(result);
+    if source.is_file() {
+        return Ok(source.to_string_lossy().into_owned());
+    }
+    Ok(result.to_string())
+}
+
+#[tauri::command]
+pub async fn generate_runninghub_cli_model(request: RunningHubCliModelRequest) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || run_runninghub_cli_blocking(request))
+        .await
+        .map_err(|error| format!("RunningHub CLI 任务中断: {error}"))?
 }
 
 fn output_message(output: &std::process::Output) -> String {

@@ -19,7 +19,7 @@ use crate::ai::providers::video_protocols::assets::{
     ReferenceAsset,
 };
 use crate::ai::providers::video_protocols::{
-    http_error, string_array_param, submission_from_payload, SubmitContext,
+    describe_reqwest_error, http_error, string_array_param, submission_from_payload, SubmitContext,
 };
 use crate::ai::{GenerateVideoRequest, ProviderTaskSubmission};
 
@@ -191,7 +191,7 @@ pub async fn submit(
         .json(&body)
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 视频提交失败(网络): {}", PLATFORM_LABEL, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 视频提交失败(网络): {}", PLATFORM_LABEL, describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);

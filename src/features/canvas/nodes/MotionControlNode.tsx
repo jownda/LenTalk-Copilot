@@ -22,6 +22,10 @@ import { useCanvasStore } from "@/stores/canvasStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { persistLibraryAssetFile, persistLibraryAssetFromFile } from "@/commands/assetLibrary";
 import { isZzdhLipSyncModel } from "@/commands/zzdhApi";
+import {
+  isRunningHubBaseUrl,
+  isRunningHubDedicatedVideoEndpoint,
+} from "@/commands/runningHubProtocol";
 
 type MotionControlNodeProps = NodeProps & {
   id: string;
@@ -89,6 +93,12 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
   const mode: MotionControlMode = data.mode === "lip-sync" ? "lip-sync" : "motion-control";
   const models = useMemo(() => {
     const allVideoModels = listVideoModels();
+    const isRunningHubModel = (model: (typeof allVideoModels)[number]) => {
+      const providerId = model.providerId.replace(/^custom:/, "");
+      const api = customApis.find((item) => item.id === providerId);
+      const endpoint = model.id.split("/").slice(1).join("/");
+      return isRunningHubBaseUrl(api?.baseUrl) && isRunningHubDedicatedVideoEndpoint(endpoint);
+    };
     const klingModels = allVideoModels.filter(
       (model) =>
         model.id.startsWith("custom:") &&
@@ -96,10 +106,18 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
           model.displayName.toLowerCase().includes("kling") ||
           model.displayName.toLowerCase().includes("可灵")),
     );
-    if (mode !== "motion-control") return klingModels;
+    if (mode !== "motion-control") {
+      // RunningHub 的数字人口播端点是专用 RunningHub 协议；其它 Kling 模型继续
+      // 走现有 Kling 对口型端点，避免把普通文生/图生模型误放进对口型页。
+      return klingModels.filter(
+        (model) => isRunningHubModel(model) || isZzdhLipSyncModel(model.id) || !isRunningHubBaseUrl(
+          customApis.find((item) => item.id === model.providerId.replace(/^custom:/, ""))?.baseUrl,
+        ),
+      );
+    }
     return klingModels.filter(
       (model) =>
-        model.id.toLowerCase().includes("motion-control") ||
+        (!isRunningHubModel(model) && model.id.toLowerCase().includes("motion-control")) ||
         model.displayName.toLowerCase().includes("motion control") ||
         model.displayName.toLowerCase().includes("动作控制"),
     );
@@ -107,8 +125,14 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
   const allModels = useMemo(() => {
     if (mode === "motion-control") return models;
     const lipSyncModels = listVideoModels().filter(
-      (model) =>
-        isZzdhLipSyncModel(model.id) || (model.id.startsWith("custom:") && model.id.toLowerCase().includes("kling")),
+      (model) => {
+        if (isZzdhLipSyncModel(model.id)) return true;
+        if (!model.id.startsWith("custom:") || !model.id.toLowerCase().includes("kling")) return false;
+        const providerId = model.providerId.replace(/^custom:/, "");
+        const api = customApis.find((item) => item.id === providerId);
+        const endpoint = model.id.split("/").slice(1).join("/");
+        return !isRunningHubBaseUrl(api?.baseUrl) || isRunningHubDedicatedVideoEndpoint(endpoint);
+      },
     );
     return lipSyncModels;
   }, [customApis, mode, models]);
@@ -118,9 +142,15 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
   const sourceVideo = data.inputVideoSource || inputVideos[0] || null;
   const audioSource = data.audioSource || inputAudio[0] || null;
   const isZzdhLipSync = mode === "lip-sync" && isZzdhLipSyncModel(selectedModelId);
+  const selectedProviderId = selectedModelId.split("/")[0]?.replace(/^custom:/, "") ?? "";
+  const selectedApiBaseUrl = customApis.find((item) => item.id === selectedProviderId)?.baseUrl ?? "";
+  const isRunningHubLipSync =
+    mode === "lip-sync" &&
+    isRunningHubBaseUrl(selectedApiBaseUrl) &&
+    isRunningHubDedicatedVideoEndpoint(selectedModelId.split("/").slice(1).join("/"));
   const lipSyncInput: MotionControlLipSyncInput = data.lipSyncInput === "video" ? "video" : "image";
   const zzdhUsesVideoInput = isZzdhLipSync && lipSyncInput === "video";
-  const lipSyncNeedsSourceVideo = mode === "lip-sync" && !isZzdhLipSync;
+  const lipSyncNeedsSourceVideo = mode === "lip-sync" && !isZzdhLipSync && !isRunningHubLipSync;
   const resolvedWidth = Math.max(360, Math.round(width ?? 420));
   const resolvedHeight = Math.max(460, Math.round(height ?? 560));
 
@@ -190,7 +220,9 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
     if (!motionVideoSource && mode === "motion-control") return setError(t("node.motionControl.needMotionVideo"));
     if (!sourceVideo && (lipSyncNeedsSourceVideo || zzdhUsesVideoInput))
       return setError(t("node.motionControl.needSourceVideo"));
-    if (!imageSource && isZzdhLipSync && !zzdhUsesVideoInput) return setError(t("node.motionControl.needLipSyncImage"));
+    if (!imageSource && (isZzdhLipSync || isRunningHubLipSync) && !zzdhUsesVideoInput) {
+      return setError(t("node.motionControl.needLipSyncImage"));
+    }
     if (!audioSource && mode === "lip-sync") return setError(t("node.motionControl.needAudio"));
     const providerKey = apiKeys[chosenModel.providerId] ?? "";
     if (!providerKey.trim() && !chosenModel.id.startsWith("jimeng-cli/")) {
@@ -222,10 +254,16 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
         aspectRatio: "16:9",
         videoResolution: data.resolution,
         referenceImages:
-          (mode === "motion-control" || (isZzdhLipSync && !zzdhUsesVideoInput)) && imageSource ? [imageSource] : [],
+          (mode === "motion-control" || ((isZzdhLipSync || isRunningHubLipSync) && !zzdhUsesVideoInput)) && imageSource
+            ? [imageSource]
+            : [],
         referenceAudio: mode === "lip-sync" && audioSource ? [audioSource] : [],
         extraParams: {
-          video_transport: isZzdhLipSync ? "zzdh-v8-video" : "kling-control",
+          video_transport: isZzdhLipSync
+            ? "zzdh-v8-video"
+            : isRunningHubLipSync
+              ? "runninghub-model"
+              : "kling-control",
           control_mode: mode,
           character_orientation: data.characterOrientation,
           keep_original_audio: data.keepOriginalAudio,
@@ -264,6 +302,7 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
     id,
     imageSource,
     isZzdhLipSync,
+    isRunningHubLipSync,
     lipSyncNeedsSourceVideo,
     mode,
     motionVideoSource,

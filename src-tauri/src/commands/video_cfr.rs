@@ -360,6 +360,18 @@ pub(crate) fn resolve_ffmpeg_path(app: &tauri::AppHandle) -> Option<PathBuf> {
             return Some(candidate);
         }
     }
+    // 已安装版 LenTalk 的按需下载目录：%LOCALAPPDATA%\LenTalk\bin\ffmpeg.exe。
+    // 开发预览和已安装版可能使用不同的 app_data_dir，显式兼容这个路径。
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let candidate = PathBuf::from(local_app_data)
+            .join("LenTalk")
+            .join("bin")
+            .join(ffmpeg_exe_name());
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join("bin").join(ffmpeg_exe_name());

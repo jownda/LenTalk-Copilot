@@ -25,6 +25,7 @@ import {
 import { resolveNodeDisplayName, isNodeUsingDefaultDisplayName } from "@/features/canvas/domain/nodeDisplay";
 import { resolveVideoNodeModelId } from "@/features/canvas/domain/videoNodeDefaults";
 import { resolveVideoDurationHintFromTexts } from "@/features/canvas/domain/videoDurationHint";
+import { applyVoiceReferenceFormat } from "@/features/canvas/domain/voiceReferenceFormat";
 import { getDefaultVideoModelId, getVideoModel } from "@/features/canvas/models";
 import { graphImageResolver } from "@/features/canvas/application/canvasServices";
 import { CURRENT_RUNTIME_SESSION_ID } from "@/features/canvas/application/generationErrorReport";
@@ -827,7 +828,18 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         source,
         mediaType,
       });
+    // 角色声线的镜像条目：mirror 的 cinematic id 就是所属角色资产 id，且同一条目的
+    // 图片与音频共用电影资产名称 —— 所以这里解出的序号 + 角色 id 就是提示词里
+    // 「哪个 @角色 对应哪条音频参考」。上游接入的音频（`角色音频 N`）没有这层绑定，
+    // 无法判定它是谁的声线，因此不参与规范句。
+    const characterVoicePromptAssets = selectedCharacterVoiceAssets.map(libraryAssetToPromptAsset);
+    const voiceBindings = selectedCharacterVoiceAssets.flatMap((asset, index) => {
+      const audioIndex = characterVoicePromptAssets[index]?.referenceIndex;
+      const characterId = cinematicAssetKey(asset);
+      return typeof audioIndex === "number" && characterId ? [{ audioIndex, characterId }] : [];
+    });
     return {
+      voiceBindings,
       sceneAssets: [
         ...selectedSceneAssets.map(libraryAssetToPromptAsset),
         ...sceneInputMedia.images.map((source, index) => upstreamAsset("scene", "image", source, index)),
@@ -836,7 +848,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       ],
       characterAssets: [
         ...selectedCharacterAssets.map(libraryAssetToPromptAsset),
-        ...selectedCharacterVoiceAssets.map(libraryAssetToPromptAsset),
+        ...characterVoicePromptAssets,
         ...characterInputMedia.images.map((source, index) => upstreamAsset("character", "image", source, index)),
         ...characterInputMedia.audio.map((source, index) => upstreamAsset("character", "audio", source, index)),
         ...characterInputMedia.videos.map((source, index) => upstreamAsset("character", "video", source, index)),
@@ -923,7 +935,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
               ...(description && description !== item.description ? { description } : {}),
             };
           });
-        const prompt = await generateQuickPrompt(
+        const rawPrompt = await generateQuickPrompt(
           {
             style: effectiveQuickStyle,
             synopsis: effectiveQuickSynopsis,
@@ -939,6 +951,18 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           },
           quickPromptLang,
           selectedSettings,
+        );
+        // 人物音频引用统一成人可读的规范句：`使用 @音频N 作为 @角色 的唯一人声参考。`
+        // @音频N 同时是画布的规范标记（视频节点「引用」按钮插入的就是它），
+        // AI 输出里可能写成 [audioN] / @audioN 或旧式「声音参考：」，在落节点前一次收敛。
+        // 角色名走与 ACTIVE REFERENCES 同一套解析（电影工程资产名），保证与 @角色 标签一致。
+        const prompt = applyVoiceReferenceFormat(
+          rawPrompt,
+          quickPromptAssets.voiceBindings.map(({ audioIndex, characterId }) => ({
+            audioIndex,
+            characterName: projectAssetNames.get(characterId) ?? cinematicMirrorNames.get(characterId) ?? "",
+          })),
+          quickPromptLang,
         );
         // 道具参考图续在场景 / 角色之后，既有 [imageN] 顺序完全不变。
         const referenceImages = [...quickPromptAssets.referenceImages, ...stagingContext.referenceImages];

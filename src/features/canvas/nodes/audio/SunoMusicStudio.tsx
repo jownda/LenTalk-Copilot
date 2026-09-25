@@ -105,7 +105,13 @@ export function SunoMusicStudio({
 
   const rawOperation = readString(data.sunoOperation);
   const operation: SunoOperation = normalizeSunoOperation(rawOperation);
-  const spec = SUNO_OPERATION_SPECS[operation];
+  const selectedModel = models.find((model) => model.id === readString(data.model));
+  const supportedOperations = selectedModel?.sunoSupportedOperations;
+  const operationOptions = SUNO_MEDIA_OPERATIONS.filter(
+    (item) => !supportedOperations || supportedOperations.includes(item),
+  );
+  const effectiveOperation = operationOptions.includes(operation) ? operation : (operationOptions[0] ?? "generate");
+  const spec = SUNO_OPERATION_SPECS[effectiveOperation];
   const mode = normalizeSunoMode(readString(data.sunoMode));
   const version = normalizeSunoVersion(readString(data.sunoVersion));
   const vocalGender = normalizeSunoVocalGender(readString(data.sunoVocalGender));
@@ -115,21 +121,25 @@ export function SunoMusicStudio({
   const negativeTags = readString(data.sunoNegativeTags);
   const continueAt = readString(data.sunoContinueAt);
 
-  const clipField = CLIP_FIELD_BY_OPERATION[operation];
+  const clipField = CLIP_FIELD_BY_OPERATION[effectiveOperation];
   const clipValue = clipField ? readString(data[clipField]) : "";
   const clipSource = spec.clipSource;
 
   // 本地校验与链路层**同一个函数** —— UI 显示「能点」而请求被判非法, 或反过来,
   // 都会白扣一次费(平台按提交次数计费)。
   const invalid = validateSunoMusicInput({
-    operation,
+    operation: effectiveOperation,
     prompt: description,
     clipId: readString(data.sunoClipId),
     continueClipId: readString(data.sunoContinueClipId),
     coverClipId: readString(data.sunoCoverClipId),
   });
   const canGenerate = !isBusy && models.length > 0 && invalid === null;
-  const canWriteLyrics = !isBusy && models.length > 0 && description.trim().length > 0;
+  const canWriteLyrics =
+    !isBusy &&
+    models.length > 0 &&
+    description.trim().length > 0 &&
+    (!supportedOperations || supportedOperations.includes("lyrics"));
 
   return (
     <div className="ui-scrollbar nodrag nowheel flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto pr-1.5">
@@ -156,10 +166,10 @@ export function SunoMusicStudio({
           {t("node.audioGen.suno.operation")}
           <select
             className={`${FIELD_CLASS} mt-0.5`}
-            value={operation}
+            value={effectiveOperation}
             onChange={(event) => onChange({ sunoOperation: event.target.value })}
           >
-            {SUNO_MEDIA_OPERATIONS.map((item) => (
+            {operationOptions.map((item) => (
               <option key={item} value={item}>
                 {t(SUNO_OPERATION_LABEL_KEYS[item])}
               </option>
@@ -167,7 +177,7 @@ export function SunoMusicStudio({
           </select>
         </label>
       </div>
-      <p className="text-[10px] leading-4 text-text-muted">{t(SUNO_OPERATION_HINT_KEYS[operation])}</p>
+      <p className="text-[10px] leading-4 text-text-muted">{t(SUNO_OPERATION_HINT_KEYS[effectiveOperation])}</p>
 
       {/* ---- 源 clip：后处理类操作（含 extend / cover）---- */}
       {clipSource && (

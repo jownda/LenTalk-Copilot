@@ -17,6 +17,7 @@ pub mod assets;
 pub mod binghuo;
 pub mod extract;
 pub mod kling;
+pub mod runninghub;
 pub mod sub2api;
 pub mod wgspai;
 pub mod zhenjian;
@@ -37,7 +38,7 @@ use crate::ai::{
 /// **必须与前端 `tauriAiGateway.ts` 的 `needsCompatibilityVideoWorker` 保持一致**:
 /// 不在此列却交给后端的协议会被 `submit_video_task` 直接拒掉(一个请求都不发);
 /// 在此列却仍留在前端的协议则不会走后端。两边同时改。
-pub const BACKEND_VIDEO_TRANSPORTS: [&str; 8] = [
+pub const BACKEND_VIDEO_TRANSPORTS: [&str; 9] = [
     "openai-video",
     "zhiniao-video",
     "wgspai-video",
@@ -46,21 +47,28 @@ pub const BACKEND_VIDEO_TRANSPORTS: [&str; 8] = [
     "zhenjian-task-api",
     "zzdh-v8-video",
     "sub2api-video",
+    "runninghub-model",
 ];
 
 /// 提交时会把 `transport` 写进元数据的协议 —— 轮询阶段据此路由到协议层。
 ///
 /// 其中帧间 / 字子动画 / Sub2API / Kling 有各自专属的解析(相对地址、二进制成片、
-/// 顶层数组), 剩下两个(炳火 / WGSPAI)的查询响应形状与通用协议一致, 落到
-/// `classify` 即可。**不含** openai-video / zhiniao-video: 那两个的元数据里
-/// 没有 transport 字段, 走 `poll_video_task` 里的通用分支。
-const PROTOCOL_TRANSPORTS: [&str; 6] = [
+/// 顶层数组); WGSPAI 的解析也是通用的(`classify`), 只是额外补了一层业务错误包
+/// 判定(族 2 用 `{"code": -1, "message": …}` 回错, 通用归类认不出顶层 `code`);
+/// 炳火的查询响应形状与通用协议完全一致, 落到 `classify` 即可。**不含**
+/// openai-video / zhiniao-video: 那两个的元数据里没有 transport 字段, 走
+/// `poll_video_task` 里的通用分支。
+///
+/// RunningHub 必须在此列: 它的业务错误包用 `errorCode` 而非 `error`, 且
+/// `status` 是**空串** —— 通用 `classify` 只会一直判"还在跑", 直到轮询窗口耗尽。
+const PROTOCOL_TRANSPORTS: [&str; 7] = [
     "kling-control",
     "zhenjian-task-api",
     "zzdh-v8-video",
     "sub2api-video",
     "wgspai-video",
     "binghuo-video",
+    "runninghub-model",
 ];
 
 pub fn is_backend_transport(transport: &str) -> bool {
@@ -116,7 +124,7 @@ pub async fn download_bytes(
         .header("Accept-Encoding", "identity")
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 下载失败(网络): {}", label, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 下载失败(网络): {}", label, describe_reqwest_error(&error))))?;
     let status = response.status();
     if !status.is_success() {
         let raw = response.text().await.unwrap_or_default();
@@ -126,7 +134,7 @@ pub async fn download_bytes(
     let bytes = response
         .bytes()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 下载失败(读取响应体): {}", label, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 下载失败(读取响应体): {}", label, describe_reqwest_error(&error))))?;
     if bytes.is_empty() {
         return Err(AIError::TaskFailed(format!("{} 下载失败: 内容为空 ({})", label, url)));
     }
@@ -390,6 +398,82 @@ pub fn extract_error_reason(raw: &str) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 网络层错误的可诊断文本
+// ---------------------------------------------------------------------------
+
+/// 把 `reqwest::Error` 展开成「外层描述 | 分类 | 成因链 | 代理提示」。
+///
+/// `reqwest::Error` 的 `Display` **只给最外层那一句**
+/// `error sending request for url (…)` —— 究竟是 DNS 解析失败、TCP 被拒、TLS 握手
+/// 失败, 还是连接被中途重置, 全在 `source()` 链里。线上直接 `{}` 打出来等于把
+/// 可行动信息全丢光(报障只能看到「网络错误」, 无从下手)。这里:
+///
+/// - 用 reqwest 自己的分类打标签, 一眼区分「连不上」和「连上了但被掐断」;
+/// - 把整条 `source()` 链拼上(OS 层原文, 含 `os error NNNN`);
+/// - 带上进程环境里的代理变量 —— 同一个平台在「带代理的终端里启动」与「双击图标」
+///   两种情况下走的链路完全不同, 这是最容易漏掉的一条线索。
+pub fn describe_reqwest_error(error: &reqwest::Error) -> String {
+    let mut parts: Vec<String> = vec![error.to_string()];
+    let kind = if error.is_timeout() {
+        "超时"
+    } else if error.is_connect() {
+        "连接失败(DNS / 建连 / TLS)"
+    } else if error.is_body() {
+        "请求体或响应体中断"
+    } else if error.is_redirect() {
+        "重定向策略"
+    } else if error.is_decode() {
+        "响应解析"
+    } else if error.is_builder() {
+        "请求构造"
+    } else {
+        "其它"
+    };
+    parts.push(format!("分类: {}", kind));
+
+    // 成因链: 从外往里走。层数设上限, 避免个别实现写出自引用链导致死循环。
+    let mut cursor = std::error::Error::source(error);
+    for _ in 0..8 {
+        let Some(cause) = cursor else { break };
+        let text = cause.to_string();
+        if !text.trim().is_empty() && !parts.iter().any(|part| part == &text) {
+            parts.push(text);
+        }
+        cursor = cause.source();
+    }
+
+    if let Some(hint) = env_proxy_hint() {
+        parts.push(hint);
+    }
+    parts.join(" | ")
+}
+
+/// 进程环境里是否有代理变量 —— 有的话 reqwest 默认会走它, 排查时必须知道。
+fn env_proxy_hint() -> Option<String> {
+    for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        let Ok(value) = std::env::var(key) else { continue };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        return Some(format!(
+            "进程环境有 {}={} (reqwest 默认会经它转发)",
+            key,
+            redact_proxy(value)
+        ));
+    }
+    None
+}
+
+/// 打掉代理 URL 里的 `user:pass@`, 只留主机端口 —— 错误日志可能被用户贴到群/issue 里。
+fn redact_proxy(value: &str) -> String {
+    match value.rsplit_once('@') {
+        Some((_, host)) => format!("***@{}", host),
+        None => value.to_string(),
+    }
+}
+
 /// 组装一条「可读 + 可分类」的 HTTP 错误。
 ///
 /// 分类规则(与 [`fetch_json`] 同判据):
@@ -484,7 +568,13 @@ pub async fn poll(
         zzdh::TRANSPORT => zzdh::poll(ctx, metadata, handle).await,
         sub2api::TRANSPORT => sub2api::poll(ctx, metadata, handle).await,
         kling::TRANSPORT => kling::poll(ctx, metadata, handle).await,
-        // 炳火 / WGSPAI 的查询响应形状与通用协议一致, 走统一归类即可。
+        // WGSPAI 的族 2(Task)失败体是业务错误包 `{"code": -1, "message": "..."}`,
+        // 通用归类认不出顶层 `code`, 会在 HTTP 200 的业务错误上一直判"还在跑"。
+        wgspai::TRANSPORT => wgspai::poll(ctx, metadata, handle).await,
+        // RunningHub 同属"HTTP 200 + 业务错误包", 但字段名是 `errorCode` 且 `status`
+        // 为空串 —— 通用归类认不出, 必须走协议自己的查询。
+        runninghub::TRANSPORT => runninghub::poll(ctx, metadata, handle).await,
+        // 炳火查询响应形状与通用协议一致, 走统一归类即可。
         _ => {
             let payload = fetch_json(&ctx.client, &ctx.api_key, query_url_of(metadata)?, transport).await?;
             Ok(classify(&payload, handle))
@@ -528,7 +618,7 @@ pub async fn fetch_json(
         .header("Accept-Encoding", "identity")
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 查询失败(网络): {}", label, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 查询失败(网络): {}", label, describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -979,5 +1069,51 @@ mod tests {
                 "{status} 不应判为平台侧抖动"
             );
         }
+    }
+
+    /// 素材上传失败(网络)的消息形状同样不能落进「可自动重提」的判据 —— 那会绕过
+    /// 「不重提可能已计费请求」的保护(上传重试只允许发生在 [`assets`] 内部)。
+    #[test]
+    fn upload_network_failure_is_not_treated_as_retryable_submit() {
+        let error = AIError::Provider(
+            "炳火 API 参考素材上传失败(网络): 已重试 2 次仍未成功 — error sending request for url (https://api.7tai.cc/v1/assets/uploads) | 分类: 连接失败(DNS / 建连 / TLS)"
+                .to_string(),
+        );
+        assert!(!is_retryable_submit_failure(&error));
+    }
+
+    /// `describe_reqwest_error` 必须把成因链带出来: 只有外层那句
+    /// `error sending request for url (…)` 的话, 报障时根本分不清是 DNS、建连
+    /// 还是 TLS 出问题(本次线上「炳火上传失败」就是栽在这里)。
+    #[tokio::test]
+    async fn network_error_description_keeps_root_cause() {
+        // `.invalid` 是 RFC 2606 保留后缀, 永远解析不到 —— 必然得到 DNS 类错误,
+        // 不依赖任何外部服务。no_proxy 是刻意的: 本机若带环境代理(沙箱/终端启动),
+        // 否则这条断言测的就不是本机的解析行为了。
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("client")
+            .post("http://upload.invalid/v1/assets/uploads")
+            .send()
+            .await
+            .expect_err("upload.invalid 不应可解析");
+        let described = describe_reqwest_error(&error);
+        println!("{described}");
+        assert!(described.contains("分类: "), "{described}");
+        // 「外层 | 分类 | 成因」至少三段, 说明 source() 链确实被拼上了。
+        assert!(described.split(" | ").count() >= 3, "{described}");
+        assert!(described.len() > error.to_string().len(), "{described}");
+    }
+
+    /// 代理变量可能带账号密码, 而错误日志常被用户贴进群或 issue —— 必须打码。
+    #[test]
+    fn proxy_credentials_are_redacted() {
+        assert_eq!(
+            redact_proxy("http://user:secret@127.0.0.1:7890"),
+            "***@127.0.0.1:7890"
+        );
+        assert_eq!(redact_proxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
     }
 }

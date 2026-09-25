@@ -155,6 +155,12 @@ export interface AudioModelDefinition {
    * 判定复用 `isSunoMusicModel`，与链路层的分流**同源**，避免 UI 显示 A 协议、
    * 请求发 B 协议。
    */
-  musicProtocol?: "suno" | "generic";
+  musicProtocol?: "suno" | "mureka" | "generic";
+  /** RunningHub/Suno 端点实际支持的操作子集。缺省表示使用完整 Suno 页面。 */
+  sunoSupportedOperations?: string[];
+  /** 特定端点需填写的服务端音色/演讲人 ID 列表。 */
+  endpointVoiceOptions?: string[];
+  /** 豆包 TTS 的额外平台参数表单类型。 */
+  audioUiProtocol?: "doubao-tts";
   pricing?: ModelPricingDefinition;
 }

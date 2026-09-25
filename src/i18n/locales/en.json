@@ -586,6 +586,7 @@
         "doubao": "Doubao Voice",
         "elevenlabs": "ElevenLabs",
         "suno": "Suno Music",
+        "mureka": "Mureka Music",
         "other": "Other voices"
       },
       "needApiKey": "Enter this platform's API key in Settings first",

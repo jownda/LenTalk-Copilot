@@ -4,6 +4,7 @@ import {
   generateSunoLyrics as generateAudioLyrics,
   generateImage,
   generateJimengCliVideo,
+  generateRunningHubCliModel,
   generateVideo,
   getGenerateVideoJob,
   upscaleVideo as upscaleVideoCommand,
@@ -16,10 +17,21 @@ import {
 import { createCompactImageDataUrl, imageUrlToDataUrl } from "@/features/canvas/application/imageData";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { JIMENG_CLI_PROVIDER_ID, resolveVideoModelProfile } from "@/features/canvas/models";
+import { RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
+import { useRunningHubCliStore } from "@/stores/runningHubCliStore";
 import { toVideoGenerationRequest } from "@/features/canvas/application/videoGeneration";
 import { isRjmVideoApiBaseUrl } from "@/commands/videoApi";
 import { isZhenjianProvider } from "@/commands/zhenjianApi";
 import { isZzdhProvider } from "@/commands/zzdhApi";
+import {
+  isRunningHubBaseUrl,
+  RUNNINGHUB_VIDEO_TRANSPORT,
+  buildRunningHubRequestBody,
+  resolveRunningHubVideoEndpointForInput,
+  resolveRunningHubVideoEndpoint,
+  runningHubVideoExtraParams,
+} from "@/commands/runningHubProtocol";
+import { invoke } from "@tauri-apps/api/core";
 
 type LocalVideoJob = { job_id: string; status: string; result: string | null; error: string | null };
 // 本地 CLI 类视频链路(即梦 / Wan)只能在本机跑可执行文件, 仍由前端适配器承载;
@@ -27,8 +39,25 @@ type LocalVideoJob = { job_id: string; status: string; result: string | null; er
 // 状态接口, 画布无需区分轮询方式。
 const compatibilityVideoJobs = new Map<string, LocalVideoJob>();
 
+/** CLI 需要本地文件或 data URL；把画布的 asset/blob 来源先规整成可读的 data URL。 */
+async function normalizeUrlsForCli(
+  sources: string[] | undefined,
+  kind: "image" | "video" | "audio",
+): Promise<string[] | undefined> {
+  if (!sources?.length) return undefined;
+  return await Promise.all(
+    sources.map(async (source) => {
+      const value = source.trim();
+      if (!value || /^https?:\/\//i.test(value) || /^data:/i.test(value)) return value;
+      return kind === "image"
+        ? await imageUrlToDataUrl(value)
+        : await invoke<string>("load_media_data_url", { source: value });
+    }),
+  );
+}
+
 /**
- * 仍需前端兼容 worker 承载的视频协议 —— **只剩本地 CLI 两种**。
+ * 仍需前端兼容 worker 承载的视频协议 —— 本地 CLI 模型。
  *
  * 所有远端视频协议(kling-control / zhenjian-task-api / zzdh-v8-video /
  * sub2api-video / binghuo-video / wgspai-video / zhiniao-video / openai-video)
@@ -43,7 +72,8 @@ const compatibilityVideoJobs = new Map<string, LocalVideoJob>();
  */
 export function needsCompatibilityVideoWorker(payload: GenerateVideoPayload): boolean {
   return (
-    payload.model.startsWith("wan-cli/") || payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`)
+    payload.model.startsWith("wan-cli/") || payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`) ||
+    (payload.model.startsWith(`${RUNNINGHUB_CLI_PROVIDER_ID}/`) && !usesRunningHubCliDirectApi(payload.model))
   );
 }
 
@@ -101,6 +131,41 @@ function isZhiniaoProviderId(providerId: string): boolean {
       .replace(/^custom:/i, "")
       .toLowerCase() === "zhiniao"
   );
+}
+
+/** RunningHub 两条内置预设与 CLI 兼容 provider 的 id。 */
+function isRunningHubProviderId(providerId: string): boolean {
+  const id = providerId.trim().replace(/^custom:/i, "").toLowerCase();
+  return id === "runninghub" || id === "runninghub-cn" || id === RUNNINGHUB_CLI_PROVIDER_ID;
+}
+
+const RUNNINGHUB_CLI_BASE_URL = "https://www.runninghub.cn";
+
+/**
+ * 官网已上线、但 rh-cli 内置 capabilities.json 尚未收录的模型家族。
+ * 这些模型不能交给 `rh model run`，改走项目已有的 RunningHub 标准模型后端协议。
+ */
+export function usesRunningHubCliDirectApi(model: string): boolean {
+  if (!model.startsWith(`${RUNNINGHUB_CLI_PROVIDER_ID}/`)) return false;
+  const endpoint = model.slice(`${RUNNINGHUB_CLI_PROVIDER_ID}/`.length).trim().toLowerCase();
+  return endpoint.startsWith("bytedance/seedance-2.5-token/") || endpoint.startsWith("minimax/hailuo-h3/");
+}
+
+function routeRunningHubCliDirectModel<T extends { model: string }>(payload: T): T {
+  const endpoint = payload.model.slice(`${RUNNINGHUB_CLI_PROVIDER_ID}/`.length);
+  return {
+    ...payload,
+    model: `custom:${RUNNINGHUB_CLI_PROVIDER_ID}/${endpoint}`,
+  };
+}
+
+async function prepareRunningHubCliDirectVideo<T extends { model: string }>(payload: T): Promise<T> {
+  const apiKey = (useSettingsStore.getState().apiKeys[RUNNINGHUB_CLI_PROVIDER_ID] ?? "").trim();
+  if (!apiKey) {
+    throw new Error("请先在 RunningHub CLI 设置中完成授权");
+  }
+  await setApiKey(`custom:${RUNNINGHUB_CLI_PROVIDER_ID}`, apiKey);
+  return routeRunningHubCliDirectModel(payload);
 }
 
 function isZhiniaoBaseUrl(baseUrl: string): boolean {
@@ -269,6 +334,49 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
     providerBaseUrl.includes("api.tokengo.love")
   ) {
     extraParams.video_transport = "zhiniao-video";
+  }
+  // RunningHub: 「模型」就是官方端点 ID(`kling-v3.0-pro/image-to-video`), 而且
+  // **每个端点的参数 schema 都不一样**(参考图字段有 imageUrl / firstImageUrl +
+  // lastImageUrl / firstFrameUrl + lastFrameUrl 三种写法, 画幅有 aspectRatio /
+  // ratio / size 三种), 还有一批必填但不由用户驱动的固定参数。平台对 schema 外的
+  // 键回 PARAMS_INVALID 而**不是忽略**, 所以字段表必须随请求交给后端 ——
+  // `video_protocols/runninghub.rs` 刻意不认识任何具体模型, 只按这份说明装填。
+  // 端点 ID 是模型名里**第一段斜杠之后的全部**(端点自己还带斜杠, 不能按斜杠切段)。
+  if (isRunningHubProviderId(providerId) || isRunningHubBaseUrl(customApi?.baseUrl)) {
+    const videoPayload = payload as T & {
+      referenceImages?: string[];
+      referenceAudio?: string[];
+      imageMode?: "reference" | "first-last";
+    };
+    extraParams.video_transport = RUNNINGHUB_VIDEO_TRANSPORT;
+    if (providerId === RUNNINGHUB_CLI_PROVIDER_ID && extraParams.provider_base_url == null) {
+      extraParams.provider_base_url = RUNNINGHUB_CLI_BASE_URL;
+    }
+    const endpointId = payload.model.split("/").slice(1).join("/").trim();
+    const hasImages = (videoPayload.referenceImages?.length ?? 0) > 0;
+    const hasVideos = Array.isArray(extraParams.reference_videos) && extraParams.reference_videos.length > 0;
+    const hasAudios = (videoPayload.referenceAudio?.length ?? 0) > 0;
+    const inputMode =
+      videoPayload.imageMode === "first-last"
+        ? "first-last"
+        : hasVideos || hasAudios
+          ? "multimodal"
+          : hasImages
+            ? "image"
+            : "text";
+    const resolvedEndpointId = resolveRunningHubVideoEndpointForInput(endpointId, inputMode);
+    const requestEndpointId = resolvedEndpointId ?? endpointId;
+    if (resolvedEndpointId && resolvedEndpointId !== endpointId) {
+      // endpoint 是模型家族的 canonical id；真正请求端点按输入类型选。
+      extraParams.runninghub_endpoint = requestEndpointId;
+    }
+    const spec = runningHubVideoExtraParams(requestEndpointId);
+    if (spec) {
+      extraParams.runninghub_video = spec;
+    }
+    // 查不到说明端点 ID 不在官方目录快照里(用户手填了别的端点), 此时不发说明,
+    // 由后端回落到保守字段映射 —— 能提交就提交, 被平台拒也会带回可读的
+    // errorCode / errorMessage, 比在这里硬拦更利于排查。
   }
   if (extraParams.reference_image_field == null) {
     extraParams.reference_image_field = referenceImageField;
@@ -452,7 +560,13 @@ async function resolveZzdhReferenceDataUrl(
 const referenceDataUrlCache = new Map<string, string>();
 
 export const tauriAiGateway: AiGateway = {
-  setApiKey,
+  setApiKey: async (provider, apiKey) => {
+    if (provider === RUNNINGHUB_CLI_PROVIDER_ID) {
+      await setApiKey(`custom:${RUNNINGHUB_CLI_PROVIDER_ID}`, apiKey);
+      return;
+    }
+    await setApiKey(provider, apiKey);
+  },
   generateImage: async (payload: GenerateImagePayload) => {
     // 显式同步通道(等价 Infinite-Canvas /api/generate): 强制 request_mode=sync,
     // 后端走 generate_image 直出, 不创建异步任务, 避免 poll 不收敛导致的永久转圈。
@@ -521,6 +635,9 @@ export const tauriAiGateway: AiGateway = {
   getGenerateImageJob,
   getGenerateVideoJob: async (jobId: string) => compatibilityVideoJobs.get(jobId) ?? (await getGenerateVideoJob(jobId)),
   submitGenerateVideoJob: async (payload: GenerateVideoPayload) => {
+    const routedPayload = usesRunningHubCliDirectApi(payload.model)
+      ? await prepareRunningHubCliDirectVideo(payload)
+      : payload;
     // 先按平台设置补全协议参数, 再判定由谁承载这次视频任务。
     // 节点上保存的 extraParams 通常只含模型自身字段, video_transport 与
     // provider_base_url 都是由 injectCustomApiRequestMode 从平台配置(Base URL /
@@ -528,15 +645,16 @@ export const tauriAiGateway: AiGateway = {
     // 推导 transport 的平台会被误判成通用 OpenAI 视频协议而投给后端任务执行器;
     // 后者对白名单之外的协议直接返回 InvalidRequest, 连一个网络请求都不会发出
     // —— 表现为「点了生成但平台收不到请求」。
-    const normalized = injectCustomApiRequestMode(payload, "async");
-    if (needsCompatibilityVideoWorker(payload) || needsCompatibilityVideoWorker(normalized)) {
+    const normalized = injectCustomApiRequestMode(routedPayload, "async");
+    if (needsCompatibilityVideoWorker(routedPayload) || needsCompatibilityVideoWorker(normalized)) {
       const jobId = crypto.randomUUID();
       compatibilityVideoJobs.set(jobId, { job_id: jobId, status: "running", result: null, error: null });
       // 这里仍传原始 payload: 注入交给 generateVideo 内部统一处理 —— 它还会顺带
       // 保留「节点显式选择的 transport 优先」的补偿分支(见下 :619), 提前注入会把
-      // 用户的选择覆盖掉。注意本分支现在**只剩本地 CLI 两条**(wan-cli / jimeng-cli):
+      // 用户的选择覆盖掉。注意本分支现在只承载本地 CLI 模型；RunningHub 官网
+      // 新增但 rh-cli 目录尚未同步的模型会在上面改走可恢复的后端协议：
       // 8 条远程协议已全部由后端任务执行器承载, 不再走这里。
-      void tauriAiGateway.generateVideo(payload).then(
+      void tauriAiGateway.generateVideo(routedPayload).then(
         (result: string) =>
           compatibilityVideoJobs.set(jobId, { job_id: jobId, status: "succeeded", result, error: null }),
         (error: unknown) =>
@@ -552,9 +670,9 @@ export const tauriAiGateway: AiGateway = {
     // 复用上面已注入的结果, 不再二次注入。能走到这里说明该平台确实由后端
     // OpenAI 兼容视频任务执行器承载(transport 为空或 openai-video)。
     const injected = normalized;
-    const unifiedRequest = toVideoGenerationRequest(payload);
+    const unifiedRequest = toVideoGenerationRequest(routedPayload);
     const imageResources =
-      payload.imageMode === "first-last"
+      routedPayload.imageMode === "first-last"
         ? [unifiedRequest.firstFrame, unifiedRequest.lastFrame].filter(
             (resource): resource is NonNullable<typeof resource> => Boolean(resource),
           )
@@ -572,13 +690,16 @@ export const tauriAiGateway: AiGateway = {
       duration: unifiedRequest.duration,
       aspect_ratio: unifiedRequest.aspectRatio,
       video_resolution: unifiedRequest.videoResolution,
-      image_mode: payload.imageMode,
+      image_mode: routedPayload.imageMode,
       reference_images: referenceImages,
       reference_audio: unifiedRequest.referenceAudio.map((resource) => resource.source.trim()).filter(Boolean),
       extra_params: injected.extraParams,
     });
   },
   generateVideo: async (payload: GenerateVideoPayload) => {
+    if (usesRunningHubCliDirectApi(payload.model)) {
+      return await tauriAiGateway.generateVideo(await prepareRunningHubCliDirectVideo(payload));
+    }
     if (payload.model.startsWith("wan-cli/")) {
       return generateWanCliVideo({
         client_job_id: payload.clientJobId,
@@ -609,6 +730,47 @@ export const tauriAiGateway: AiGateway = {
         image_mode: payload.imageMode,
         reference_images: referenceImages,
         reference_audio: referenceAudio,
+      });
+    }
+    if (payload.model.startsWith(`${RUNNINGHUB_CLI_PROVIDER_ID}/`)) {
+      const canonicalEndpoint = payload.model.slice(`${RUNNINGHUB_CLI_PROVIDER_ID}/`.length);
+      const sources = await normalizeUrlsForCli(payload.referenceImages, "image");
+      const videos = await normalizeUrlsForCli(
+        payload.extraParams?.reference_videos as string[] | undefined,
+        "video",
+      );
+      const audios = await normalizeUrlsForCli(payload.referenceAudio, "audio");
+      const inputMode = payload.imageMode === "first-last"
+        ? "first-last"
+        : videos?.length || audios?.length
+          ? "multimodal"
+          : sources?.length
+            ? "image"
+            : "text";
+      const endpoint = resolveRunningHubVideoEndpointForInput(canonicalEndpoint, inputMode) ?? canonicalEndpoint;
+      const spec = resolveRunningHubVideoEndpoint(endpoint);
+      const body = spec
+        ? buildRunningHubRequestBody(spec, {
+            prompt: payload.prompt,
+            images: sources ?? [],
+            videos,
+            audios,
+            duration: payload.duration,
+            aspectRatio: payload.aspectRatio,
+            resolution: payload.videoResolution,
+          })
+        : {};
+      return await generateRunningHubCliModel({
+        executable: useRunningHubCliStore.getState().executable,
+        endpoint,
+        prompt: payload.prompt,
+        images: sources,
+        video: videos?.[0],
+        audio: audios?.[0],
+        params: Object.entries(body)
+          .filter(([key]) => key !== (spec?.fields.prompt ?? "prompt") && ![spec?.fields.image, spec?.fields.imageList, spec?.fields.video, spec?.fields.videoList, spec?.fields.audio, spec?.fields.audioList].includes(key))
+          .map(([key, value]) => `${key}=${typeof value === "boolean" ? String(value) : String(value)}`),
+        output_kind: "video",
       });
     }
 
@@ -686,6 +848,30 @@ export const tauriAiGateway: AiGateway = {
    *   - 其余平台        → OpenAI 兼容 /v1/audio/speech
    */
   generateAudio: async (payload: GenerateAudioPayload) => {
+    if (payload.model.startsWith(`${RUNNINGHUB_CLI_PROVIDER_ID}/`)) {
+      const endpoint = payload.model.slice(`${RUNNINGHUB_CLI_PROVIDER_ID}/`.length);
+      const params = [
+        payload.voice && endpoint.includes("speech") ? `voice_id=${payload.voice}` : "",
+        payload.voice && endpoint.includes("doubao") ? `speaker=${payload.voice}` : "",
+        payload.format ? `format=${payload.format}` : "",
+        payload.suno?.title ? `title=${payload.suno.title}` : "",
+        payload.suno?.operation === "generate" ? `description=${payload.prompt}` : "",
+        payload.suno?.operation === "custom" ? `tags=${payload.suno.style ?? ""}` : "",
+        payload.suno?.operation === "custom" ? `title=${payload.suno.title ?? ""}` : "",
+        payload.suno?.operation === "custom" ? `prompt=${payload.lyrics ?? payload.prompt}` : "",
+        endpoint.includes("suno") && endpoint.endsWith("/single")
+          ? `make_instrumental=${payload.suno?.mode === "instrumental"}`
+          : "",
+        endpoint.includes("music-2.6") ? `lyrics=${payload.lyrics ?? payload.prompt}` : "",
+      ].filter(Boolean);
+      return await generateRunningHubCliModel({
+        executable: useRunningHubCliStore.getState().executable,
+        endpoint,
+        prompt: endpoint.includes("speech") || endpoint.includes("doubao") ? payload.prompt : undefined,
+        params,
+        output_kind: "audio",
+      });
+    }
     const injected = injectCustomApiRequestMode(payload);
     return await generateAudio({
       prompt: payload.prompt,

@@ -40,6 +40,7 @@ import {
   resolveAudioFamilyLayout,
 } from "@/features/canvas/models";
 import type { AudioModelDefinition } from "@/features/canvas/models";
+import { RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
 import { resolveModelPriceDisplay } from "@/features/canvas/pricing";
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
 import { NodePriceBadge } from "@/features/canvas/ui/NodePriceBadge";
@@ -286,6 +287,11 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
   const isMmxStudio = layout === "mmx-studio";
   /** 音乐家族里走 Suno 协议的模型(知鸟的 `music`)。协议标记与链路层同源。 */
   const isSunoMusic = selectedModel?.musicProtocol === "suno";
+  const sunoOperationOptions = selectedModel?.sunoSupportedOperations;
+  const effectiveSunoOperation =
+    typeof data.sunoOperation === "string" && (!sunoOperationOptions || sunoOperationOptions.includes(data.sunoOperation))
+      ? data.sunoOperation
+      : (sunoOperationOptions?.[0] ?? "generate");
   const resolvedWidth = Math.max(
     AUDIO_GEN_NODE_MIN_WIDTH,
     Math.round(width ?? AUDIO_GEN_NODE_DEFAULT_WIDTH),
@@ -488,7 +494,7 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
   const resolveProviderContext = useCallback(
     (model: AudioModelDefinition) => {
       const customId = model.providerId.slice("custom:".length);
-      const baseUrl = customApis.find((api) => api.id === customId)?.baseUrl;
+      const baseUrl = model.providerId === RUNNINGHUB_CLI_PROVIDER_ID ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
       return { apiKey: apiKeys[model.providerId] ?? "", baseUrl };
     },
     [apiKeys, customApis],
@@ -536,7 +542,7 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
       if (isSunoMusic) {
         // 提交前就地校验: 平台按**提交次数**计费(⚡0.17/次), 参数不合法也是在扣费之后
         // 才报错(平台的鉴权/校验在计费之后), 所以这一道必须由客户端挡住。
-        const sunoOperation = normalizeSunoOperation(typeof data.sunoOperation === "string" ? data.sunoOperation : "");
+        const sunoOperation = normalizeSunoOperation(effectiveSunoOperation);
         const failure = validateSunoMusicInput({
           operation: sunoOperation,
           prompt,
@@ -548,6 +554,10 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
           setSunoMessage({ tone: "error", text: describeSunoValidation(failure) });
           return;
         }
+        if (selectedModel.sunoSupportedOperations && !selectedModel.sunoSupportedOperations.includes(sunoOperation)) {
+          setSunoMessage({ tone: "error", text: "当前 RunningHub CLI 音乐端点不支持该操作" });
+          return;
+        }
         if (SUNO_OPERATION_SPECS[sunoOperation].output === "text") {
           // `lyrics` 产出的是文本, 走「AI 写词」按钮, 不该出现在生成流程里。
           setSunoMessage({ tone: "error", text: t("node.audioGen.suno.lyricsIsText") });
@@ -555,7 +565,7 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
         }
       }
       const { apiKey, baseUrl } = resolveProviderContext(selectedModel);
-      if (!apiKey) {
+      if (!apiKey && selectedModel.providerId !== RUNNINGHUB_CLI_PROVIDER_ID) {
         const message = "请在设置中填写 API Key";
         setError(message);
         void showErrorDialog(message, t("common.error"));
@@ -626,7 +636,9 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
       setError(null);
       if (isMmxStudio) setCardMessage((current) => ({ ...current, speech: undefined }));
       try {
-        await canvasAiGateway.setApiKey(selectedModel.providerId, apiKey);
+        if (selectedModel.providerId !== RUNNINGHUB_CLI_PROVIDER_ID) {
+          await canvasAiGateway.setApiKey(selectedModel.providerId, apiKey);
+        }
         const audioUrl = await canvasAiGateway.generateAudio({
           prompt,
           model: selectedModel.id,
@@ -646,7 +658,7 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
           // 没在 Suno 页时整块不发, 免得给别的链路塞平台不认的字段。
           suno: isSunoMusic
             ? {
-                operation: normalizeSunoOperation(typeof data.sunoOperation === "string" ? data.sunoOperation : ""),
+                operation: normalizeSunoOperation(effectiveSunoOperation),
                 version: typeof data.sunoVersion === "string" ? data.sunoVersion : undefined,
                 mode: typeof data.sunoMode === "string" ? data.sunoMode : undefined,
                 style: typeof data.sunoStyle === "string" ? data.sunoStyle : undefined,
@@ -827,6 +839,7 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
       data.sunoMode,
       data.sunoNegativeTags,
       data.sunoOperation,
+      effectiveSunoOperation,
       data.sunoStyle,
       data.sunoTitle,
       data.sunoVersion,
@@ -874,13 +887,17 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
   const handleWriteLyrics = useCallback(async () => {
     const model = selectedModel;
     if (!model) return;
+    if (model.sunoSupportedOperations && !model.sunoSupportedOperations.includes("lyrics")) {
+      setSunoMessage({ tone: "error", text: "当前音乐端点不支持 AI 写词" });
+      return;
+    }
     const description = promptDraftRef.current.trim();
     if (!description) {
       setSunoMessage({ tone: "error", text: t("node.audioGen.suno.needPrompt") });
       return;
     }
     const { apiKey } = resolveProviderContext(model);
-    if (!apiKey) {
+    if (!apiKey && model.providerId !== RUNNINGHUB_CLI_PROVIDER_ID) {
       const message = t("node.audioGen.needApiKey");
       setSunoMessage({ tone: "error", text: message });
       return;
@@ -889,7 +906,9 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
     setSunoAction("lyrics");
     setSunoMessage(undefined);
     try {
-      await canvasAiGateway.setApiKey(model.providerId, apiKey);
+      if (model.providerId !== RUNNINGHUB_CLI_PROVIDER_ID) {
+        await canvasAiGateway.setApiKey(model.providerId, apiKey);
+      }
       const generated = await canvasAiGateway.generateAudioLyrics({
         prompt: description,
         model: model.id,

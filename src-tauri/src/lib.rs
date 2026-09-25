@@ -219,6 +219,7 @@ pub fn run() {
             runninghub_cli::runninghub_cli_install,
             runninghub_cli::runninghub_cli_logout,
             runninghub_cli::runninghub_cli_read_clipboard,
+            runninghub_cli::generate_runninghub_cli_model,
             image::persist_image_source,
             image::persist_image_binary,
             image::save_image_source_to_downloads,

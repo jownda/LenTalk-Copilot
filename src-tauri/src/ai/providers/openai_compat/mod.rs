@@ -301,6 +301,12 @@ impl OpenAICompatibleProvider {
         if video_protocols::binghuo::matches(transport, base_url, provider_id) {
             return video_protocols::binghuo::submit(&protocol_ctx, &request).await;
         }
+        // RunningHub 的端点 ID 本身即模型(`kling-v3.0-pro/image-to-video`), 且每个
+        // 端点的字段名 / 枚举 / 必填默认值都不同 —— 全部由前端 `runningHubProtocol.ts`
+        // 通过 `extra_params.runninghub_video` 注入, 协议层只负责按说明装填。
+        if video_protocols::runninghub::matches(transport, base_url, provider_id) {
+            return video_protocols::runninghub::submit(&protocol_ctx, &request).await;
+        }
 
         let is_zhiniao = transport == "zhiniao-video";
 
@@ -505,8 +511,13 @@ impl OpenAICompatibleProvider {
     fn build_client() -> reqwest::Client {
         // 使用 macOS/Windows 系统代理和用户显式配置的环境代理。部分海外自定义
         // 平台只能通过系统代理完成 DNS 解析；未配置代理时 reqwest 自动直连。
+        //
+        // `connect_timeout` 单独设 15s: 只看总超时(180s)的话, 一旦 DNS 卡住或对端
+        // IP 被黑洞(域名解析出多个 A 记录时很常见), 请求会静静地挂满三分钟才报错 ——
+        // 素材上传那边的重试也因此根本来不及发生。建连本身慢到 15s 以上, 重试才有意义。
         reqwest::Client::builder()
             .http1_only()
+            .connect_timeout(std::time::Duration::from_secs(15))
             .timeout(std::time::Duration::from_secs(180))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())

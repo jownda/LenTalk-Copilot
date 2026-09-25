@@ -586,6 +586,7 @@
         "doubao": "豆包语音",
         "elevenlabs": "ElevenLabs",
         "suno": "Suno 音乐",
+        "mureka": "Mureka 音乐",
         "other": "其它语音"
       },
       "needApiKey": "请在设置中填写该平台的 API Key",

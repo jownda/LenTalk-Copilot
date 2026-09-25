@@ -13,8 +13,24 @@ export interface RecommendedApi {
   advantages: string[];
   models: string[];
   videoModels?: string[];
+  /**
+   * `videoModels` 的修订号 —— **每次增删 `videoModels` 都必须 +1**。
+   *
+   * 平台一旦被添加, 它的模型列表就与预设**脱钩**了(`SettingsDialog` 的
+   * `applyRecommendedApi` 优先用 `existing.videoModels`, 刻意不覆盖用户手改过的
+   * 列表)。代价是: 之后往预设里新增的端点, **老用户永远看不到**, 只能删掉平台
+   * 重新添加 —— 这正是「RunningHub 补了 Seedance 2.5 却仍不显示」的原因。
+   *
+   * 有了这个号, 启动时会按差集把新增端点**追加**进已添加的平台(见
+   * `resolveNewRecommendedVideoModels` 与 `settingsStore.syncRecommendedVideoModels`)。
+   *
+   * 未声明此字段的平台不参与同步(说明它的清单不由代码维护)。
+   */
+  videoModelsRevision?: number;
   /** 音频模型（语音合成 / 音色克隆 / 音乐生成），与图片模型分开。 */
   audioModels?: string[];
+  /** `audioModels` 的增量同步版本。 */
+  audioModelsRevision?: number;
   chatModels?: string[];
   /**
    * 价格区间展示（公开平台表范围，参考即可，非实付价）。
@@ -54,7 +70,14 @@ export interface RecommendedVideoConfig {
   submitPath: string;
   queryPath: string;
   referenceEncoding: 'data_url' | 'raw_base64' | 'url';
-  transport: 'sub2api-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api';
+  transport:
+    | 'sub2api-video'
+    | 'binghuo-video'
+    | 'wgspai-video'
+    | 'zhiniao-video'
+    | 'zhenjian-task-api'
+    /** RunningHub: 端点本身即模型(`/openapi/v2/{endpoint}`), 参数表随请求注入。 */
+    | 'runninghub-model';
 }
 
 /** 已确认的 OpenAI Images 平台不通过 OPTIONS 猜测协议。 */
@@ -68,6 +91,103 @@ export function isKnownOpenAiImagesBaseUrl(value: string): boolean {
     || normalized === 'https://cuai.token6688.com'
     || normalized === 'https://api.tokengo.love';
 }
+
+/**
+ * RunningHub 精选视频端点(国际站 / 国内站共用同一份官方目录)。
+ *
+ * **必须是真实端点 ID** —— RunningHub 里「模型」就是端点, 提交时整串拼在
+ * `/openapi/v2/` 之后(`custom:runninghub/kling-v3.0-pro/image-to-video`)。
+ * 端点全清单见官方 CLI 的 `catalog/data/capabilities.json`(356 个, 其中视频 198 个),
+ * 这里只收主流家族。
+ *
+ * ⚠️ **目录是静态快照, 会滞后**。CLI 包里那份的 `version` 是 `2026-06-02`, 且
+ * `rh model list` 只读本地文件、**没有在线刷新**(源码里不存在目录下载 URL)。
+ * 官网 2026-09 的口径是视频 322 / 图像 189 / 音频 47 / 3D 16 个模型, 远多于快照。
+ * 因此**目录里查不到某模型 ≠ LenTalk 链路不通** —— 要核最新清单请查官网 API
+ * 文档站(runninghub.cn/runninghub-api-doc-cn), Seedance 2.5 就是这样补进来的。
+ *
+ * **中文名里的「全能视频X」是 RunningHub 的转售代号, 真身在 `name_en` 字段**:
+ *   `全能视频S`   → `sora-2`                (OpenAI Sora 2)
+ *   `全能视频V3.1` → `google/veo3.1-*`      (Google Veo 3.1)
+ *   `全能视频X`   → `xai/grok-imagine`      (xAI Grok Imagine)
+ *   `全能视频R`   → `runwayml/gen4-turbo`   (Runway Gen-4 Turbo)
+ * 转售用代号是为了规避直接使用厂商商标。LenTalk 的 `label` 一律写**真身名**,
+ * 便于与其它平台的同名模型对账、也避免用户看不懂「全能视频S」是什么。
+ *
+ * 字段名 / 枚举 / 必填默认值由 `@/commands/runningHubProtocol.ts` 随请求注入,
+ * 后端 `video_protocols/runninghub.rs` 只按说明装填, 不认识任何具体模型。
+ */
+const RUNNINGHUB_VIDEO_MODELS: readonly string[] = [
+  // Sora 2(转售代号「全能视频S」; 低价渠道版)
+  'rhart-video-s/text-to-video',
+  'rhart-video-s/image-to-video',
+  // Sora 2(官方稳定版)
+  'rhart-video-s-official/text-to-video',
+  'rhart-video-s-official/image-to-video',
+  // Sora 2 Pro(官方稳定版, 画幅走像素串 size)
+  'rhart-video-s-official/text-to-video-pro',
+  'rhart-video-s-official/image-to-video-pro',
+  // Veo 3.1 Pro(转售代号「全能视频V3.1-pro」)
+  'rhart-video-v3.1-pro/text-to-video',
+  'rhart-video-v3.1-pro/image-to-video',
+  // Seedance 2.5(2026-06 后上线, 不在 CLI 目录快照里; 走 Token 计费故端点带 -token)
+  'bytedance/seedance-2.5-token/text-to-video',
+  'bytedance/seedance-2.5-token/image-to-video',
+  'bytedance/seedance-2.5-token/multimodal-video',
+  // Seedance 2.0(低价渠道版, 端点路径里带一组 sparkvideo-2.0)
+  'rhart-video/sparkvideo-2.0/text-to-video',
+  'rhart-video/sparkvideo-2.0/image-to-video',
+  'rhart-video/sparkvideo-2.0-mini/text-to-video',
+  'rhart-video/sparkvideo-2.0-mini/image-to-video',
+  // 可灵 3.0-pro / 3.0-std / 2.6-pro / o3-pro
+  'kling-v3.0-pro/text-to-video',
+  'kling-v3.0-pro/image-to-video',
+  'kling-v3.0-std/text-to-video',
+  'kling-v3.0-std/image-to-video',
+  'kling-v2.6-pro/text-to-video',
+  'kling-v2.6-pro/image-to-video',
+  'kling-video-o3-pro/text-to-video',
+  'kling-video-o3-pro/image-to-video',
+  // Seedance 1.5-pro
+  'seedance-v1.5-pro/text-to-video',
+  'seedance-v1.5-pro/image-to-video',
+  // 海螺 02 / 2.3-fast(注意 02 文生的端点名不带 text-to-video)
+  'minimax/hailuo-02/t2v-pro',
+  'minimax/hailuo-2.3-fast/image-to-video',
+  'minimax/hailuo-h3/text-to-video',
+  'minimax/hailuo-h3/image-to-video',
+  'minimax/hailuo-h3/multimodal-to-video',
+  // Vidu q3-pro
+  'vidu/text-to-video-q3-pro',
+  'vidu/image-to-video-q3-pro',
+  'vidu/reference-to-video-q3',
+  'vidu/reference-to-video-q3-drama',
+  // 万相 2.7
+  'alibaba/wan-2.7/text-to-video',
+  'alibaba/wan-2.7/image-to-video',
+  'alibaba/wan-3.0/image-to-video',
+  'alibaba/wan-3.0-prime/image-to-video',
+  'alibaba/wan-3.0/reference-to-video',
+  'alibaba/wan-3.0-prime/reference-to-video',
+  // 多图参考与数字人口播
+  'kling-video-o3-pro/reference-to-video',
+  'rhart-video-v3.1-pro-official/reference-to-video',
+  'rhart-video-g-official/reference-to-video-v1.5',
+  'kling-v2-ai-avatar-pro/image-audio-to-video',
+  'kling-v2-ai-avatar-standard/image-audio-to-video',
+];
+
+/** RunningHub 标准音频端点, 由 AI 音频节点通过同一套 OpenAPI v2 任务协议提交。 */
+const RUNNINGHUB_AUDIO_MODELS: readonly string[] = [
+  'indextts2_clone',
+  'rhart-audio/text-to-audio/speech-2.8-turbo',
+  'rhart-audio/text-to-audio/speech-2.8-hd',
+  'bytedance/doubao-seed-tts-2.0',
+  'minimax/music-2.6/text-to-music',
+  'minimax/music-2.6/text-to-instrumental',
+  'rhart-audio/suno-v5.5/single',
+  'rhart-audio/suno-v5.5/custom',
+];
 
 export const recommendedApis: RecommendedApi[] = [
   {
@@ -316,19 +436,35 @@ export const recommendedApis: RecommendedApi[] = [
     name: 'WGSPAI 视频',
     baseUrl: 'https://api.wgspai.cn',
     registerUrl: 'https://api.wgspai.cn',
-    summary: 'OpenAI Videos 风格视频中转平台，服务端异步提交与轮询',
+    summary: '同一个 Base 下提供两族视频接口：Videos 族同步提交、Task 族统一异步任务',
     advantages: [
-      '走 /v1/videos 提交与轮询（站点文档推荐的正典路径）',
-      '支持 Seedance 2.5、Seedance v2（9 图 / 3 音频 / 3 视频参考）、MiniMax H3 等视频模型',
-      '本地素材自动上传官方图床换取公网 URL，无需手动转存',
+      'Videos 族 POST /v1/videos 提交、GET /v1/videos/{id} 轮询（Seedance 2.5、Seedance v2 720p、MiniMax H3）',
+      'Task 族 POST /v1/task/create 提交、GET /v1/task/{id} 轮询（sd-2 / sora2-pro / veo31 / ltx2.3 等）',
+      '参考素材上限按模型区分：Seedance 2.5 图 30 张、Seedance v2 系 9 图 / 3 音频 / 3 视频、MiniMax H3 仅图 9 张',
+      '本地素材自动上传官方背景机图床换取公网 URL，无需手动转存',
+      '提示词里的 @图N / @音频N 引用会自动翻成该模型认的写法（@图片N 或 [imageN] / [audio_1]）',
     ],
     models: [],
     videoModels: [
+      // ── Videos 族（seedance2.5 / seedance-v2-720p / minimax-h3 三份专档）──
       'seedance2.5',
-      'seedance-v2.5-1080p',
       'seedance-v2-720p',
-      'hf-seedance-2.5-1080p',
+      'seedance-v2-720p-video',
       'Minimax-h3',
+      // ── Task 族（总览文档「异步 · 视频类任务」一节）──
+      'seedance-v2-1080p',
+      'sd-2',
+      'sd-2-vip',
+      'LongXia-O-sora2-pro-8s-9x16',
+      'LongXia-O-sora2-pro-12s-16x9',
+      'LongXia-A-veo31-8s-16x9-1080p',
+      'ltx2.3',
+      'VEO-3.1',
+      'flashvsr-restore',
+      'voice-clone',
+      // ── 站点实际提供但四份文档未列出的型号，保持可用 ──
+      'seedance-v2.5-1080p',
+      'hf-seedance-2.5-1080p',
       'grok-imagine-video-6s',
     ],
     videoConfig: {
@@ -598,43 +734,82 @@ export const recommendedApis: RecommendedApi[] = [
     },
   },
   // RunningHub 分国际站 / 国内站两条独立预设 —— 两者是**不同的站点与账号体系**,
-  // Base URL 不同、注册链接不同, 用户按网络情况各取所需。链路判定全部按 Base URL,
-  // 两边共用同一套通用协议, 因此不需要额外的专有 profile。
+  // Base URL 不同、注册链接不同, 用户按网络情况各取所需。
+  //
+  // 它跟别家的链路根本不同: RunningHub **没有 OpenAI 兼容的模型列表接口**
+  // (`GET /v1/models` 实测带有效 Key 仍是 401 空体), 也**不是「固定端点 + 一堆字段」**
+  // —— 每个模型就是一个端点, `POST /openapi/v2/{endpoint}` 里的 `{endpoint}` 本身即
+  // 模型 ID, 而且**每个端点的参数 schema 都不一样**: 参考图字段有的是 `imageUrl`,
+  // 有的是 `firstImageUrl` + `lastImageUrl`, Seedance 2.0 是 `firstFrameUrl` +
+  // `lastFrameUrl`; 画幅字段有的是 `aspectRatio`, 有的是 `ratio`, 万能视频S 官方版
+  // 直接收像素串 `size`(`720x1280`)。还有一批必填但不由用户驱动的固定参数
+  // (可灵的 `sound` / `shotType`, 海螺的 `enablePromptExpansion`, Vidu 的 `style`)。
+  // 平台对 schema 外的字段回 `PARAMS_INVALID` 而**不是忽略**, 所以拿一份通用字段表
+  // 硬套必然失败 —— 参数表只能逐端点对齐, 这就是 `runningHubProtocol.ts` 存在的理由。
+  //
+  // 图像端点仍未接入标准图像节点，暂不填无效图像模型；音频端点已接入标准
+  // RunningHub v2 任务协议，IndexTTS2.5 继续走既有 AI App 工作流。
   {
     id: 'runninghub',
     name: 'RunningHub 国际版',
     baseUrl: 'https://www.runninghub.ai',
     registerUrl: 'https://www.runninghub.ai?inviteCode=gg6f774v',
-    summary: 'RunningHub 国际站(runninghub.ai): 覆盖图像、视频和 LLM 的 OpenAPI',
+    summary: 'RunningHub 国际站(runninghub.ai): 每个模型即一个 OpenAPI 端点, 覆盖可灵 / Seedance / Vidu / 万相 / 海螺',
     // RH 币余额走 /uc/openapi/accountStatus(.ai 与 .cn 接口一致)。
     balanceKind: 'runninghub',
     advantages: [
       '国际站 runninghub.ai',
-      '图像 / 视频 / LLM 全覆盖',
-      'Seedance 视频模型',
-      'OpenAPI 工作流',
+      '视频主流端点: Sora 2、Veo 3.1 Pro、Seedance 2.5 / 2.0 Mini / 1.5-pro、可灵 3.0-pro / 3.0-std / 2.6-pro / o3-pro、海螺 02 / H3、Vidu Q3、万相 2.7 / 3.0',
+      '模型名用真身: RunningHub 官网的「全能视频S」即 Sora 2,「全能视频V3.1」即 Veo 3.1',
+      '文生视频与图生视频各自独立成端点, 参数按官方 schema 逐个对齐, 不混发陌生字段',
+      '本地参考图自动上传 (media/upload/binary) 换取公网 URL 后提交',
+      '提交即落库, 关掉窗口 / 切页 / 重启后仍能续查, 不会白扣费',
       '新用户注册赠 500 RH 币',
     ],
-    models: ['nano-banana'],
-    audioModels: ['indextts2_clone'],
+    models: [],
+    audioModels: [...RUNNINGHUB_AUDIO_MODELS],
+    audioModelsRevision: 2,
+    videoModels: [...RUNNINGHUB_VIDEO_MODELS],
+    // 修订号: 3 = 补进 Seedance 2.5 图生/多模态、H3、万相 3.0、Vidu/Kling 多模态端点，
+    // 并移除官方文档目录中已下架的 Seedance 2.0 Global 别名。
+    videoModelsRevision: 3,
+    videoConfig: {
+      submitPath: '/openapi/v2/{endpoint}',
+      queryPath: '/openapi/v2/query',
+      referenceEncoding: 'url',
+      transport: 'runninghub-model',
+    },
   },
   {
     id: 'runninghub-cn',
     name: 'RunningHub 国内版',
     baseUrl: 'https://www.runninghub.cn',
     registerUrl: 'https://www.runninghub.cn?inviteCode=0cthsuca',
-    summary: 'RunningHub 国内站(runninghub.cn): 覆盖图像、视频和 LLM 的 OpenAPI',
+    summary: 'RunningHub 国内站(runninghub.cn): 每个模型即一个 OpenAPI 端点, 覆盖可灵 / Seedance / Vidu / 万相 / 海螺',
     // RH 币余额走 /uc/openapi/accountStatus(.ai 与 .cn 接口一致)。
     balanceKind: 'runninghub',
     advantages: [
       '国内站 runninghub.cn, 直连无需代理',
-      '图像 / 视频 / LLM 全覆盖',
-      'Seedance 视频模型',
-      'OpenAPI 工作流',
+      '视频主流端点: Sora 2、Veo 3.1 Pro、Seedance 2.5 / 2.0 Mini / 1.5-pro、可灵 3.0-pro / 3.0-std / 2.6-pro / o3-pro、海螺 02 / H3、Vidu Q3、万相 2.7 / 3.0',
+      '模型名用真身: RunningHub 官网的「全能视频S」即 Sora 2,「全能视频V3.1」即 Veo 3.1',
+      '文生视频与图生视频各自独立成端点, 参数按官方 schema 逐个对齐, 不混发陌生字段',
+      '本地参考图自动上传 (media/upload/binary) 换取公网 URL 后提交',
+      '提交即落库, 关掉窗口 / 切页 / 重启后仍能续查, 不会白扣费',
       '新用户注册赠 500 RH 币',
     ],
-    models: ['nano-banana'],
-    audioModels: ['indextts2_clone'],
+    models: [],
+    audioModels: [...RUNNINGHUB_AUDIO_MODELS],
+    audioModelsRevision: 2,
+    videoModels: [...RUNNINGHUB_VIDEO_MODELS],
+    // 修订号: 3 = 补进 Seedance 2.5 图生/多模态、H3、万相 3.0、Vidu/Kling 多模态端点，
+    // 并移除官方文档目录中已下架的 Seedance 2.0 Global 别名。
+    videoModelsRevision: 3,
+    videoConfig: {
+      submitPath: '/openapi/v2/{endpoint}',
+      queryPath: '/openapi/v2/query',
+      referenceEncoding: 'url',
+      transport: 'runninghub-model',
+    },
   },
   {
     id: 'modelscope',
@@ -739,4 +914,39 @@ export function findRecommendedApiByBaseUrl(
     return undefined;
   }
   return all.find((api) => normalizeRecommendedBaseUrl(api.baseUrl) === target);
+}
+
+/**
+ * 找出「预设里新增、而平台配置里还没有」的视频端点。
+ *
+ * 平台添加后模型列表就与预设脱钩了(用户可能手改过), 所以预设的更新**只能增量
+ * 追加**, 不能整体覆盖。语义:
+ *
+ * - **只追加**, 不删除、不重排 —— 用户手加的端点与调整过的顺序全部保留;
+ * - `syncedRevision >= 预设当前 revision` 时返回 `null` —— 所以补完之后用户手动
+ *   删掉某个预设端点, **不会被反复加回来**;
+ * - `syncedRevision` 为 `undefined`(从未同步, 即老用户)时补「预设 − 已有」的差集,
+ *   这是一次性动作: 补完即写入 revision, 之后按上面的规则静止;
+ * - 预设没有 `videoModelsRevision` / `videoModels` 时返回 `null` —— 清单不由代码
+ *   维护的平台不参与同步。
+ *
+ * 返回值里 `models` 可能为空数组, 此时调用方仍应把 `revision` 落库(表示「已对齐」)。
+ */
+export function resolveNewRecommendedVideoModels(
+  baseUrl: string,
+  existingVideoModels: readonly string[],
+  syncedRevision: number | undefined,
+): { models: string[]; revision: number } | null {
+  const preset = findRecommendedApiByBaseUrl(baseUrl);
+  const revision = preset?.videoModelsRevision;
+  const presetModels = preset?.videoModels;
+  if (revision === undefined || !presetModels || presetModels.length === 0) {
+    return null;
+  }
+  if (syncedRevision !== undefined && syncedRevision >= revision) {
+    return null;
+  }
+  const known = new Set(existingVideoModels.map((model) => model.trim().toLowerCase()));
+  const models = presetModels.filter((model) => !known.has(model.trim().toLowerCase()));
+  return { models, revision };
 }

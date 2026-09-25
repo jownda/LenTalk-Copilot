@@ -17,7 +17,7 @@
  */
 
 export type AudioModelFamily =
-  "minimax" | "indextts" | "openai" | "gemini" | "doubao" | "elevenlabs" | "suno" | "other";
+  "minimax" | "indextts" | "openai" | "gemini" | "doubao" | "elevenlabs" | "suno" | "mureka" | "other";
 
 /** 节点主体按家族渲染的布局类型。 */
 export type AudioFamilyLayout =
@@ -47,6 +47,7 @@ const AUDIO_FAMILY_RULES: Array<{ family: AudioModelFamily; pattern: RegExp }> =
   { family: "elevenlabs", pattern: /eleven/ },
   { family: "gemini", pattern: /gemini|(?:^|[-_])gm[-_]/ },
   { family: "doubao", pattern: /doubao|volc|豆包|seed[-_ ]?tts/ },
+  { family: "mureka", pattern: /mureka/ },
   { family: "suno", pattern: /(?:^|[-_./])(?:suno|music)(?:[-_./]|\d|$)/ },
   {
     family: "openai",
@@ -73,6 +74,7 @@ export const AUDIO_FAMILY_LABELS: Record<AudioModelFamily, string> = {
   doubao: "豆包语音",
   elevenlabs: "ElevenLabs",
   suno: "Suno 音乐",
+  mureka: "Mureka 音乐",
   other: "其它语音",
 };
 
@@ -91,6 +93,7 @@ export const AUDIO_FAMILY_LABEL_KEYS: Record<AudioModelFamily, string> = {
   doubao: "node.audioGen.families.doubao",
   elevenlabs: "node.audioGen.families.elevenlabs",
   suno: "node.audioGen.families.suno",
+  mureka: "node.audioGen.families.mureka",
   other: "node.audioGen.families.other",
 };
 
@@ -103,6 +106,7 @@ export const AUDIO_FAMILY_ORDER: AudioModelFamily[] = [
   "doubao",
   "elevenlabs",
   "suno",
+  "mureka",
   "other",
 ];
 

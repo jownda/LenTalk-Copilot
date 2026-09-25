@@ -1,8 +1,13 @@
 import { wanCliVideoProfile } from './wanCli';
 import { isZzdhProvider, ZZDH_VIDEO_QUERY_PATH, ZZDH_VIDEO_SUBMIT_PATH } from '@/commands/zzdhApi';
 import { isZhenjianProvider } from '@/commands/zhenjianApi';
+import {
+  isRunningHubBaseUrl,
+  RUNNINGHUB_API_PREFIX,
+  RUNNINGHUB_QUERY_PATH,
+} from '@/commands/runningHubProtocol';
 
-export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'jimeng-cli' | 'wan-cli';
+export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model' | 'jimeng-cli' | 'wan-cli';
 export type VideoProfileStatus = 'verified' | 'pending-adaptation';
 export type VideoReferenceTarget = 'data-url' | 'public-url' | 'platform-file';
 
@@ -104,7 +109,15 @@ const BINGHUO_VIDEO_PROFILE: VideoModelProfile = {
  * wgspai 平台链路(api.wgspai.cn)。
  *
  * 端点按站点文档取正典路径 —— 四份对接文档三处写明「推荐统一用 /v1/videos」,
- * `/v1/video/generations` 只是「兼容路径(可选)」, 因此提交与轮询都走 /v1/videos。
+ * `/v1/video/generations` 只是「兼容路径(可选)」, 因此这里的默认提交与轮询都走
+ * `/v1/videos`。
+ *
+ * 注意: 该站点在**同一个 Base 下还有第二族接口** —— 总览文档「异步：任务」一节的
+ * `POST /v1/task/create` → `GET /v1/task/{id}`(`sd-2` / `LongXia-*` / `ltx2.3` /
+ * `VEO-3.1` / `flashvsr-restore` / `seedance-v2-1080p` 等, 模型参数包在 `params`
+ * 里)。族别由**模型名**决定, 协议层会自己改端点并改写查询地址, 所以这份 profile
+ * 里写的是族 1 的路径(`src/commands/wgspaiProtocol.ts` 的 `wgspaiSubmitPath` /
+ * `wgspaiQueryPath`, 后端同源实现见 `video_protocols/wgspai.rs`)。
  *
  * 参考素材走**官方背景机图床**(`https://wgspai.cn/image-bed/api/upload`, 字段 `file`,
  * 匿名可传), 所以是 `platform-file` 而非 data-url: 文档明确要求参考图是公网可访问
@@ -156,11 +169,51 @@ const ZHENJIAN_TASK_PROFILE: VideoModelProfile = {
   supportsReferenceAudio: true,
 };
 
+/**
+ * RunningHub(runninghub.cn / runninghub.ai)专有链路。
+ *
+ * 端点形状与其它平台都不同: **模型就是端点**, 提交路径是
+ * `POST /openapi/v2/{endpoint}`(如 `/openapi/v2/kling-v3.0-pro/image-to-video`),
+ * 没有统一的 `/v1/videos`; 查询固定为 `POST /openapi/v2/query` + body `{taskId}`
+ * (**不是** GET, 也不是提交路径 + `/{taskId}`)。
+ *
+ * 参考图: 本地图先走 `POST /openapi/v2/media/upload/binary`(multipart 字段 `file`)
+ * 换公网 URL 再提交 —— 与官方文档口径一致, 所以是 `platform-file`。
+ * 首尾帧支持按端点而异(图生视频端点才有尾帧), 这里给 `supportsFirstLast: true`
+ * 表示「UI 允许选」, 真正的字段名与是否支持由端点 schema 决定。
+ *
+ * `submitPath` 里的 `{endpoint}` 只是形状说明: 真正的绝对地址由后端
+ * `video_protocols/runninghub.rs` 用 `API_PREFIX` + 端点 ID 拼出来。
+ */
+const RUNNINGHUB_VIDEO_PROFILE: VideoModelProfile = {
+  id: 'runninghub-model',
+  status: 'verified',
+  protocolLabel: 'RunningHub 端点 / 已验证',
+  submitPath: `${RUNNINGHUB_API_PREFIX}/{endpoint}`,
+  queryPath: RUNNINGHUB_QUERY_PATH,
+  referenceImageTarget: 'platform-file',
+  supportsReferenceImages: true,
+  supportsFirstLast: true,
+  supportsReferenceAudio: false,
+};
+
 function isZhiniaoVideoProvider(provider: string, providerBaseUrl?: string): boolean {
   const baseUrl = providerBaseUrl?.trim().toLowerCase() ?? '';
   return provider === 'custom:zhiniao'
     || baseUrl.includes('cuai.token6688.com')
     || baseUrl.includes('api.tokengo.love');
+}
+
+/**
+ * RunningHub 的识别。
+ *
+ * 平台 id 可能是用户自建的(按名称生成, 如「RH国际」→ `custom:rh国际`), 所以
+ * **Base URL 才是主判据**, id 只作为预设条目的快捷命中。`.cn` / `.ai` 两个站点
+ * 共用同一套协议, 一并识别。
+ */
+function isRunningHubVideoProvider(provider: string, providerBaseUrl?: string): boolean {
+  const id = provider.trim().toLowerCase().replace(/^custom:/, '');
+  return id === 'runninghub' || id === 'runninghub-cn' || isRunningHubBaseUrl(providerBaseUrl);
 }
 
 export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: string): VideoModelProfile {
@@ -169,6 +222,9 @@ export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: stri
   const model = modelId.split('/').slice(1).join('/').trim().toLowerCase();
   // 即梦 CLI 是本地命令, seedance 系列由 CLI 自行校验, 不套用平台协议适配状态
   if (provider === 'jimeng-cli') return JIMENG_CLI_VIDEO_PROFILE;
+  // RunningHub 必须排在下面的 seedance 正则之前: 它的端点 ID 里就带 seedance
+  // (`seedance-v1.5-pro/text-to-video`), 认成通用 Seedance 平台会挑错协议页签。
+  if (isRunningHubVideoProvider(provider, providerBaseUrl)) return RUNNINGHUB_VIDEO_PROFILE;
   if (isZhiniaoVideoProvider(provider, providerBaseUrl)) return ZHINIAO_VIDEO_PROFILE;
   if (isZhenjianProvider(provider, providerBaseUrl)) return ZHENJIAN_TASK_PROFILE;
   if (/^(?:https?:\/\/)?(?:video|sub2api)\.rjm\.us\.ci(?:[/:]|$)/i.test(providerBaseUrl?.trim() ?? '')
@@ -196,6 +252,7 @@ export function getVideoModelProfile(profileId?: string): VideoModelProfile {
     'wgspai-video': WGSPAI_VIDEO_PROFILE,
     'zhiniao-video': ZHINIAO_VIDEO_PROFILE,
     'zhenjian-task-api': ZHENJIAN_TASK_PROFILE,
+    'runninghub-model': RUNNINGHUB_VIDEO_PROFILE,
     'jimeng-cli': JIMENG_CLI_VIDEO_PROFILE,
   };
   return profiles[profileId as VideoProfileId] ?? OPENAI_VIDEO_PROFILE;

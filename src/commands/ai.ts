@@ -41,6 +41,7 @@ import {
   type SunoMusicBodyInput,
 } from "@/commands/sunoMusic";
 import { createVideoIdempotencyKey, getVideoTaskFailureReason, resolveRjmVideoApiBaseUrl } from "@/commands/videoApi";
+import { isRunningHubBaseUrl, RUNNINGHUB_VIDEO_TRANSPORT } from "@/commands/runningHubProtocol";
 import {
   isZzdhBaseUrl,
   resolveZzdhAspectRatio,
@@ -62,6 +63,15 @@ import {
   extractZhenjianModels,
   isZhenjianProvider,
 } from "@/commands/zhenjianApi";
+import {
+  buildWgspaiRequestBody,
+  describeWgspaiBusinessError,
+  resolveWgspaiModelSpec,
+  wgspaiQueryPath,
+  wgspaiSubmitPath,
+  WGSPAI_IMAGE_BED_PATH,
+  type WgspaiResolvedReferences,
+} from "@/commands/wgspaiProtocol";
 
 export interface GenerateRequest {
   prompt: string;
@@ -112,6 +122,24 @@ interface GenerateJimengCliVideoRequest {
   image_mode?: "reference" | "first-last";
   reference_images?: string[];
   reference_audio?: string[];
+}
+
+interface GenerateRunningHubCliModelRequest {
+  executable: string;
+  endpoint: string;
+  prompt?: string;
+  images?: string[];
+  video?: string;
+  audio?: string;
+  params?: string[];
+  output_kind: "video" | "audio";
+}
+
+export async function generateRunningHubCliModel(request: GenerateRunningHubCliModelRequest): Promise<string> {
+  if (!isTauri()) {
+    throw new Error("RunningHub CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再生成。");
+  }
+  return await invoke<string>("generate_runninghub_cli_model", { request });
 }
 
 /**
@@ -1089,10 +1117,27 @@ async function uploadPlatformReferenceAsset(
       contentType: asset.mimeType,
       bodyBase64: asset.base64,
     });
-  // 网关偶发返回不带公网 URL 的 file 对象(如瞬时限流/风控), 上传本身幂等, 自动重试一次。
+  // 上传重试次数与退避(毫秒)。与后端 `assets.rs` 的 `UPLOAD_ATTEMPTS` 保持一致 ——
+  // 上传幂等、不产生计费单, 所以网络层被拒也值得重试; 而「视频提交」拿到网络错误时
+  // 是不重试的(请求可能已送达并被计费, 重提就是二次扣费)。
+  const UPLOAD_ATTEMPTS = 3;
+  const UPLOAD_RETRY_BACKOFF_MS = [400, 1200];
   let lastPayload: unknown = null;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const response = await uploadAttempt();
+  // 记录「平台根本没回话」的那种失败: 网关偶发返回不带公网 URL 的 file 对象(瞬时限流
+  // /风控), 以及 Windows 原生 DNS/TLS 路径偶发在建连阶段就失败(报错形如
+  // `error sending request for url`)。两者都属瞬时故障, 上传本身幂等, 退避后重试。
+  let lastNetworkError: unknown = null;
+  for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt += 1) {
+    if (attempt > 1) {
+      await new Promise((resolve) => setTimeout(resolve, UPLOAD_RETRY_BACKOFF_MS[attempt - 2] ?? 1200));
+    }
+    let response: ProviderJsonResponse;
+    try {
+      response = await uploadAttempt();
+    } catch (error) {
+      lastNetworkError = error;
+      continue;
+    }
     const rawResponse = await response.text();
     let payload: unknown;
     try {
@@ -1101,6 +1146,7 @@ async function uploadPlatformReferenceAsset(
       throw new Error(`${platformLabel} 参考素材上传失败: 平台返回了非 JSON 响应 (${uploadUrl})`);
     }
     if (!response.ok) {
+      // 平台已经回过话 —— 确定性失败, 重发只会浪费(还可能多留一份素材)。
       throw new Error(
         `${platformLabel} 参考素材上传失败: ${buildHttpErrorSummary(response.status, rawResponse, uploadUrl)}`,
       );
@@ -1108,6 +1154,13 @@ async function uploadPlatformReferenceAsset(
     const url = extractBinghuoAssetUrl(payload);
     if (url) return url;
     lastPayload = payload;
+    lastNetworkError = null;
+  }
+  if (lastNetworkError !== null) {
+    const detail = lastNetworkError instanceof Error ? lastNetworkError.message : String(lastNetworkError);
+    throw new Error(
+      `${platformLabel} 参考素材上传失败(网络): 已重试 ${UPLOAD_ATTEMPTS - 1} 次仍未成功 (${uploadUrl}) — ${detail}`,
+    );
   }
   throw new Error(`${platformLabel} 参考素材上传响应中未找到公网 URL: ${describeVideoResponse(lastPayload)}`);
 }
@@ -1260,65 +1313,27 @@ function resolveWgspaiImageBedBaseUrl(baseUrl: string): string {
 }
 
 /**
- * WGSPAI 各模型的参考素材上限与时长规则。
- * **必须与后端 `wgspai.rs` 的 `model_limits` 保持一致** —— 同一个平台有两条活路径
- * (节点走 submitGenerateVideoJob → 后端; Canvas / 动作控制 / 模板重跑走
- * canvasAiGateway.generateVideo → 本函数), 两边规则不同会出现「同样素材换个入口
- * 就报错」的怪象。
+ * WGSPAI 各模型的参考素材上限、时长规则、画幅白名单与提示词引用方言, 以及提交
+ * 请求体与端点的构造, 全部收敛在 `./wgspaiProtocol`。**必须与后端
+ * `src-tauri/src/ai/providers/video_protocols/wgspai.rs` 保持一致** —— 同一个平台
+ * 有两条活路径(节点走 submitGenerateVideoJob → 后端; Canvas / 动作控制 / 模板重跑
+ * 走 canvasAiGateway.generateVideo → 本文件), 两边规则不同会出现「同样素材换个
+ * 入口就报错」的怪象。规则集中在那一个模块里, 后端那份是 Rust 无法共享代码,
+ * 只能靠同构的测试守住。
  */
-function resolveWgspaiModelLimits(apiModel: string): {
-  maxReferenceImages: number;
-  fixedDuration: boolean;
-  referenceAudio: boolean;
-  referenceVideo: boolean;
-} {
-  const model = apiModel.trim().toLowerCase();
-  // seedance2.5: 固定 30 秒按次计费, 参考图最多 30。
-  if (model.includes("seedance2.5") || model.includes("seedance-2.5")) {
-    return { maxReferenceImages: 30, fixedDuration: true, referenceAudio: true, referenceVideo: true };
-  }
-  // seedance v2 系列: 9 图 / 3 音频 / 3 视频, 视频参考仅 `-video` 后缀模型支持。
-  if (model.includes("seedance-v2")) {
-    return {
-      maxReferenceImages: 9,
-      fixedDuration: false,
-      referenceAudio: true,
-      referenceVideo: model.includes("-video"),
-    };
-  }
-  // Minimax-h3: 图 ≤9, 文档明确「不支持参考音视频」。
-  if (model.includes("minimax-h3")) {
-    return { maxReferenceImages: 9, fixedDuration: false, referenceAudio: false, referenceVideo: false };
-  }
-  return { maxReferenceImages: 30, fixedDuration: false, referenceAudio: true, referenceVideo: true };
-}
-
-/** 画幅比例 → 像素尺寸。文档里 `size` 收像素串; 未覆盖的比例只发 `ratio`。 */
-function wgspaiPixelSize(aspectRatio: string): string | undefined {
-  const table: Record<string, string> = {
-    "16:9": "1280x720",
-    "9:16": "720x1280",
-    "1:1": "1024x1024",
-    "4:3": "1024x768",
-    "3:4": "768x1024",
-  };
-  return table[aspectRatio.trim()];
-}
 
 /**
  * wgspai 平台链路(api.wgspai.cn)。
  *
  * 按站点四份对接文档对齐:
- *   - 提交 `POST /v1/videos` → 查询 `GET /v1/videos/{id}`
- *     (文档三处写明「推荐统一用 /v1/videos」, `/v1/video/generations` 仅为兼容路径)
+ *   - **两族接口**(见 `./wgspaiProtocol`): 族 1 `POST /v1/videos` →
+ *     `GET /v1/videos/{id}`; 族 2 `POST /v1/task/create` → `GET /v1/task/{id}`,
+ *     模型参数包在 `params` 里。族别由模型名决定(`resolveWgspaiModelSpec`)。
  *   - 本地素材先上传**官方背景机图床** `https://wgspai.cn/image-bed/api/upload`
- *     (字段 `file`, 匿名可传), 不再内联 data URL —— 文档明确「请求里的图片须为公网
+ *     (字段 `file`, 匿名可传), 不内联 data URL —— 文档明确「请求里的图片须为公网
  *     可访问 URL, 本地文件先上传本站图床」, 并对 data URL 标注「易触达请求上限」
- *   - 参考音频字段是 `audio_urls`、参考视频是 `video_urls`(720p 文档口径),
- *     不是炳火的 `reference_audios` / `reference_videos`
- *   - 首尾帧用 `images` + `image_usage: "first_frame"`(seedance2.5 文档口径),
- *     文档里没有 `start_frame` / `end_frame`
- *   - 时长用 `seconds` 字符串; 固定时长的模型(seedance2.5)省略
+ *   - 请求体(含时长吸附、画幅吸附、提示词引用方言本地化)全部由
+ *     `buildWgspaiRequestBody` 产出, 本函数只负责「素材上传 → 提交 → 轮询」。
  *
  * 后端同源实现见 `src-tauri/src/ai/providers/video_protocols/wgspai.rs`。
  */
@@ -1328,22 +1343,25 @@ async function generateWgspaiVideo(
   apiModel: string,
   headers: Record<string, string>,
 ): Promise<string> {
-  const limits = resolveWgspaiModelLimits(apiModel);
+  const spec = resolveWgspaiModelSpec(apiModel);
   const isFirstLast = request.image_mode === "first-last";
-  const rawImages = (request.reference_images ?? []).slice(
-    0,
-    isFirstLast ? 2 : limits.maxReferenceImages,
-  );
-  const rawAudios = limits.referenceAudio ? (request.reference_audio ?? []).slice(0, 3) : [];
+  const rawImages = (request.reference_images ?? [])
+    .filter((source) => source.trim().length > 0)
+    .slice(0, isFirstLast ? 2 : spec.maxReferenceImages);
+  const rawAudios = spec.supportsReferenceAudio
+    ? (request.reference_audio ?? [])
+        .filter((source) => source.trim().length > 0)
+        .slice(0, spec.maxReferenceAudio)
+    : [];
   // 参考视频来自 extra_params.reference_videos(URL 列表); 该通道由上游节点写入。
-  const rawVideos = limits.referenceVideo
+  const rawVideos = spec.supportsReferenceVideo
     ? (() => {
         const value = request.extra_params?.reference_videos;
         if (!Array.isArray(value)) return [];
         return value
           .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
           .map((item) => item.trim())
-          .slice(0, 3);
+          .slice(0, spec.maxReferenceVideos);
       })()
     : [];
 
@@ -1351,23 +1369,22 @@ async function generateWgspaiVideo(
   // 图床按文档是匿名可上传的(官方 curl 不带鉴权头), 这里传空 headers, 不转发
   // Authorization —— 带一个空 Bearer 会让部分网关直接 401。
   const upload = (source: string, index: number, label: string): Promise<string> =>
-    uploadPlatformReferenceAsset(source, imageBedBaseUrl, {}, index, label, "/image-bed/api/upload");
+    uploadPlatformReferenceAsset(source, imageBedBaseUrl, {}, index, label, WGSPAI_IMAGE_BED_PATH);
 
-  let imageSources: string[];
-  let audioSources: string[];
-  let videoSources: string[];
+  let references: WgspaiResolvedReferences;
   try {
-    imageSources = await Promise.all(
+    const images = await Promise.all(
       rawImages.map((source, index) => upload(source, index, "WGSPAI 参考图")),
     );
-    audioSources = await Promise.all(
-      rawAudios.map((source, index) => upload(source, imageSources.length + index, "WGSPAI 参考音频")),
+    const audios = await Promise.all(
+      rawAudios.map((source, index) => upload(source, images.length + index, "WGSPAI 参考音频")),
     );
-    videoSources = await Promise.all(
+    const videos = await Promise.all(
       rawVideos.map((source, index) =>
-        upload(source, imageSources.length + audioSources.length + index, "WGSPAI 参考视频"),
+        upload(source, images.length + audios.length + index, "WGSPAI 参考视频"),
       ),
     );
+    references = { images, audios, videos };
   } catch (error) {
     if (error instanceof Error) {
       error.message = translateTransportError(error.message, "WGSPAI 图床");
@@ -1375,34 +1392,17 @@ async function generateWgspaiVideo(
     throw error;
   }
 
-  const body: Record<string, unknown> = {
-    model: apiModel,
+  const body = buildWgspaiRequestBody({
+    apiModel,
     prompt: request.prompt,
-    // 非四份文档字段, 从炳火协议继承下来的兼容字段, 保留以不改变既有行为。
-    generate_audio: true,
-    n: 1,
-  };
-  // 固定时长的模型(seedance2.5 = 30 秒)省略 seconds, 让平台用自己的默认值。
-  if (!limits.fixedDuration) {
-    body.seconds = String(Math.max(1, Math.round(request.duration)));
-  }
-  const aspectRatio = request.aspect_ratio?.trim();
-  if (aspectRatio) {
-    // `ratio` 与 `size` 同传: seedance2.5 / Minimax-h3 认 ratio,
-    // seedance-v2-720p 的正式字段是 size, 只发 ratio 会被它忽略。
-    body.ratio = aspectRatio;
-    const size = wgspaiPixelSize(aspectRatio);
-    if (size) body.size = size;
-  }
-  if (imageSources.length > 0) {
-    body.images = imageSources;
-    if (isFirstLast) body.image_usage = "first_frame";
-  }
-  if (audioSources.length > 0) body.audio_urls = audioSources;
-  if (videoSources.length > 0) body.video_urls = videoSources;
-  if (request.video_resolution?.trim()) body.resolution = request.video_resolution.trim();
+    duration: request.duration,
+    aspectRatio: request.aspect_ratio,
+    videoResolution: request.video_resolution,
+    imageMode: request.image_mode,
+    references,
+  });
 
-  const submitUrl = `${baseUrl}/v1/videos`;
+  const submitUrl = `${baseUrl}${wgspaiSubmitPath(spec)}`;
   const response = await requestProviderJson(submitUrl, {
     method: "POST",
     headers,
@@ -1420,11 +1420,15 @@ async function generateWgspaiVideo(
   }
   const immediateResult = getVideoResultUrl(payload);
   if (immediateResult) return immediateResult;
+  const submitBusinessError = describeWgspaiBusinessError(payload, getVideoTaskStatus(payload));
+  if (submitBusinessError) {
+    throw new Error(`wgspai API 视频请求失败: ${submitBusinessError}`);
+  }
   const taskId = getVideoTaskId(payload);
   if (!taskId) {
     throw new Error(`wgspai API 视频响应中未找到任务 ID: ${describeVideoResponse(payload)}`);
   }
-  const taskUrl = `${baseUrl}/v1/videos/${encodeURIComponent(taskId)}`;
+  const taskUrl = `${baseUrl}${wgspaiQueryPath(spec).replace("{taskId}", encodeURIComponent(taskId))}`;
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 5000));
     const taskResponse = await requestProviderJson(taskUrl, { headers });
@@ -1443,7 +1447,14 @@ async function generateWgspaiVideo(
     if (videoUrl) return videoUrl;
     const status = getVideoTaskStatus(payload);
     if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
-      throw new Error(`wgspai API 视频生成失败: ${describeVideoResponse(payload)}`);
+      const reason = getVideoTaskFailureReason(payload) ?? describeVideoResponse(payload);
+      throw new Error(`wgspai API 视频生成失败: ${reason}`);
+    }
+    // 族 2 的业务错误包(`{"code": -1, "message": ...}`)不一定带 status 字段,
+    // 漏掉这一层会一直轮询到超时。
+    const businessError = describeWgspaiBusinessError(payload, status);
+    if (businessError) {
+      throw new Error(`wgspai API 视频生成失败: ${businessError}`);
     }
   }
 }
@@ -1691,9 +1702,13 @@ export function resolveZhiniaoUpscaleCredentials(
   return null;
 }
 
-function isRunningHubBaseUrl(baseUrl: string): boolean {
-  return /runninghub\.(?:ai|cn)/i.test(baseUrl);
-}
+/**
+ * RunningHub 域名判定统一走协议模块(`@/commands/runningHubProtocol`)。
+ *
+ * 这里原来是一份子串匹配 `/runninghub\.(?:ai|cn)/i`, 会被 `runninghub.cn.evil.com`
+ * 这类伪装域名命中, 从而去取用户的 API Key。协议模块的实现按 **主机名** 精确比对,
+ * RunningHub 视频与 Topaz 超分两条链路现在共用同一个判据。
+ */
 
 /**
  * 解析 RunningHub 视频超分凭证。
@@ -2130,6 +2145,48 @@ async function generateKlingControlVideo(
   }
 }
 
+/**
+ * 前端直发路径上等待 RunningHub 后端任务的观察窗。
+ *
+ * 官方口径 p90 在 55~75 分钟(与知鸟同量级), 给足一小时 —— 窗口太短会把仍在平台
+ * 生成、且已经计费的任务判成"没结果"。超窗只提示去画布看, 不当作失败。
+ */
+const RUNNINGHUB_VIDEO_JOB_WAIT_MS = 60 * 60 * 1000;
+const RUNNINGHUB_VIDEO_JOB_POLL_MS = 3_000;
+
+/**
+ * 把一次 RunningHub 视频请求交给后端任务执行器, 并轮询到出片。
+ *
+ * 判终态的口径与画布 `Canvas.tsx` 的视频恢复逻辑**必须一致**: 只有 `failed`
+ * 才是终态; `running` 一律继续等 —— 后端会把「查询时的网络抖动 / 5xx」显式标成
+ * `transient`, 那时 `error` 里只是诊断文本(`...查询失败(网络): ...`), 拿它的
+ * 文本判终态会把仍在平台跑到一半的付费任务判死。
+ */
+async function runRunningHubVideoViaBackendJob(request: GenerateVideoRequest): Promise<string> {
+  const jobId = await submitGenerateVideoJob(request);
+  const deadline = Date.now() + RUNNINGHUB_VIDEO_JOB_WAIT_MS;
+  // 提交接口返回时任务才刚排上, 立刻查必然是 running —— 先让出一轮再查。
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
+  while (Date.now() < deadline) {
+    const status = await getGenerateVideoJob(jobId);
+    if (status.status === "succeeded") {
+      if (status.result) return status.result;
+      throw new Error("RunningHub 视频任务已完成, 但后端没有返回成片地址");
+    }
+    if (status.status === "failed") {
+      throw new Error(status.error ?? "RunningHub 视频生成失败");
+    }
+    if (status.status === "not_found") {
+      // 本地任务记录丢了(例如应用被重装), 平台侧任务还在跑也无从续查。
+      throw new Error(`RunningHub 视频任务 ${jobId} 的本地记录已丢失, 无法续查结果`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, RUNNINGHUB_VIDEO_JOB_POLL_MS));
+  }
+  throw new Error(
+    "RunningHub 视频任务仍在生成中(已等待 60 分钟), 请稍后在画布上查看结果, 不要重复提交",
+  );
+}
+
 export async function generateVideo(request: GenerateVideoRequest): Promise<string> {
   if (!isCustomModel(request.model)) {
     throw new Error("视频生成仅支持自定义平台(custom:*)模型");
@@ -2170,6 +2227,15 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   }
   if (request.extra_params?.video_transport === "zhiniao-video") {
     return await generateZhiniaoVideo(request, baseUrl, apiModel, headers);
+  }
+  // RunningHub 的协议实现**只在后端**: 端点 ID 即模型、参数 schema 逐端点不同、
+  // 素材还要先上传换公网 URL。这条前端直发路径(画布「重试生成」、模板重跑)如果再
+  // 抄一份 TS 实现, 同一份协议就有两处各自漂移 —— 所以直接把请求交给后端任务
+  // 执行器并等它出片, 与画布正常提交走同一条链路、同一份实现。
+  // 这里**必须早于**下面的通用 OpenAI 视频分支: RunningHub 没有
+  // `/v1/videos/generations`, 落到那里只会拿一个 404/401 回来。
+  if (request.extra_params?.video_transport === RUNNINGHUB_VIDEO_TRANSPORT) {
+    return await runRunningHubVideoViaBackendJob(request);
   }
   const videoImages =
     request.image_mode === "first-last" ? request.reference_images?.slice(0, 2) : request.reference_images;
@@ -2451,6 +2517,93 @@ async function persistAudioSource(source: string, format: string): Promise<strin
   const dataUrl = trimmed.match(/^data:audio\/[a-z0-9.+-]+;base64,(.*)$/i);
   if (!dataUrl) return trimmed;
   return await persistAudioBytes(decodeBase64ToBytes(dataUrl[1]), format);
+}
+
+function isRunningHubStandardAudioModel(baseUrl: string, apiModel: string): boolean {
+  if (!isRunningHubBaseUrl(baseUrl)) return false;
+  return /(?:^|\/)(?:speech-2\.8-(?:turbo|hd)|doubao-seed-tts-2\.0|music-2\.6\/text-to-(?:music|instrumental))$/i.test(
+    apiModel.trim(),
+  );
+}
+
+async function generateRunningHubStandardAudio(
+  request: GenerateAudioRequest,
+  baseUrl: string,
+  apiModel: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const normalized = apiModel.trim().toLowerCase();
+  const isMusic = normalized.includes('music-2.6');
+  const isDoubao = normalized.includes('doubao-seed-tts');
+  const format = request.format?.trim().toLowerCase() || 'mp3';
+  const body: Record<string, unknown> = isMusic
+    ? {
+        ...(request.prompt.trim() ? { prompt: request.prompt.trim() } : {}),
+        ...(request.lyrics?.trim() ? { lyrics: request.lyrics.trim() } : {}),
+        format,
+        isInstrumental: normalized.endsWith('text-to-instrumental'),
+      }
+    : isDoubao
+      ? {
+          text: request.prompt.trim(),
+          speaker: request.voice?.trim() || 'zh_male_shaonianzixin_uranus_bigtts',
+          format,
+        }
+      : {
+          text: request.prompt.trim(),
+          voice_id: request.voice?.trim() || 'Wise_Woman',
+          enable_base64_output: true,
+          english_normalization: true,
+          format,
+          ...(request.emotion ? { emotion: request.emotion } : {}),
+        };
+  if (!String(body.text ?? body.prompt ?? '').trim() && !isMusic) {
+    throw new Error('请输入要生成的音频文本');
+  }
+  const submitUrl = `${baseUrl}/openapi/v2/${apiModel.replace(/^\/+/, '')}`;
+  const response = await requestProviderJson(submitUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`RunningHub 音频请求失败: ${buildHttpErrorSummary(response.status, raw, submitUrl)}`);
+  }
+  let payload: unknown;
+  try {
+    payload = raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new Error('RunningHub 音频响应不是 JSON');
+  }
+  const immediate = findRunningHubAudioUrl(payload);
+  if (immediate) return await persistAudioSource(immediate, format);
+  const taskId = findRunningHubTaskId(payload);
+  if (!taskId) throw new Error(`RunningHub 音频响应中未找到任务 ID: ${describeVideoResponse(payload)}`);
+  const queryUrl = `${baseUrl}/openapi/v2/query`;
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    const result = await requestProviderJson(queryUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ taskId }),
+    });
+    const resultRaw = await result.text();
+    if (!result.ok) throw new Error(`RunningHub 音频查询失败: ${buildHttpErrorSummary(result.status, resultRaw, queryUrl)}`);
+    let resultPayload: unknown;
+    try {
+      resultPayload = resultRaw ? JSON.parse(resultRaw) : {};
+    } catch {
+      continue;
+    }
+    const audio = findRunningHubAudioUrl(resultPayload);
+    if (audio) return await persistAudioSource(audio, format);
+    const status = getVideoTaskStatus(resultPayload);
+    if (['FAILED', 'FAILURE', 'ERROR', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(status)) {
+      throw new Error(`RunningHub 音频生成失败: ${getRunningHubTaskFailureReason(resultPayload) ?? status}`);
+    }
+  }
+  throw new Error('RunningHub 音频任务超时，请稍后重试');
 }
 
 /**
@@ -3282,6 +3435,9 @@ export async function generateAudio(request: GenerateAudioRequest): Promise<stri
   const { baseUrl, apiModel, headers } = resolveAudioCallContext(request);
   if (isRunningHubIndexTts2(baseUrl, apiModel)) {
     return await generateRunningHubIndexTts25(request, baseUrl, headers);
+  }
+  if (isRunningHubStandardAudioModel(baseUrl, apiModel)) {
+    return await generateRunningHubStandardAudio(request, baseUrl, apiModel, headers);
   }
   const mmxOperation = resolveMmxVoiceOperation(apiModel);
   if (mmxOperation === "voice-clone" || mmxOperation === "voice-design") {
@@ -4319,6 +4475,16 @@ export async function fetchProviderModels(
   baseUrl: string,
   apiKey: string,
 ): Promise<{ models: string[]; count: number; prices?: Record<string, number> }> {
+  if (isRunningHubBaseUrl(baseUrl)) {
+    // RunningHub **没有** OpenAI 兼容的模型列表接口: `GET /v1/models` 即使带有效 Key
+    // 也返回 401 空体(那条 401 的含义是「路径不存在」, 不是「Key 无效」),
+    // `POST /openapi/v2/models` 则回 `code:1001 Invalid URL`。
+    // 它的模型目录只存在于官方 CLI 内置的端点清单里, 客户端已把主流端点内置成
+    // 该平台的 videoModels —— 所以这里不必也不能去探测, 直接给出可执行的指引。
+    throw new Error(
+      "RunningHub 不提供 /v1/models 接口(带有效 Key 也会返回 401)。视频模型已按官方端点目录内置, 直接在「视频模型」下拉里选择即可",
+    );
+  }
   if (isZhenjianProvider("", baseUrl)) {
     const normalized = normalizeBaseUrl(baseUrl);
     const response = await requestProviderJson(`${normalized}/v1/models`, {

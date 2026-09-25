@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { JIMENG_CLI_PROVIDER_ID } from "@/features/canvas/models";
+import { JIMENG_CLI_PROVIDER_ID, RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
 import {
   isPubliclyReachableHttpUrl,
   localizeReferenceTokens,
   needsCompatibilityVideoWorker,
+  usesRunningHubCliDirectApi,
   withZhiniaoImageMode,
 } from "./tauriAiGateway";
 
@@ -57,6 +58,19 @@ describe("needsCompatibilityVideoWorker", () => {
   it("本地 CLI 类视频(即梦 / Wan)仍由前端适配器承载", () => {
     expect(needsCompatibilityVideoWorker(withTransport("wan-cli/2.2"))).toBe(true);
     expect(needsCompatibilityVideoWorker(withTransport(`${JIMENG_CLI_PROVIDER_ID}/v3`))).toBe(true);
+  });
+
+  it("CLI 目录缺失的新 RunningHub 模型改走标准模型后端协议", () => {
+    const seedance = `${RUNNINGHUB_CLI_PROVIDER_ID}/bytedance/seedance-2.5-token/text-to-video`;
+    const minimax = `${RUNNINGHUB_CLI_PROVIDER_ID}/minimax/hailuo-h3/text-to-video`;
+    const catalogModel = `${RUNNINGHUB_CLI_PROVIDER_ID}/rhart-video/sparkvideo-2.0/text-to-video`;
+
+    expect(usesRunningHubCliDirectApi(seedance)).toBe(true);
+    expect(usesRunningHubCliDirectApi(minimax)).toBe(true);
+    expect(needsCompatibilityVideoWorker(withTransport(seedance))).toBe(false);
+    expect(needsCompatibilityVideoWorker(withTransport(minimax))).toBe(false);
+    expect(usesRunningHubCliDirectApi(catalogModel)).toBe(false);
+    expect(needsCompatibilityVideoWorker(withTransport(catalogModel))).toBe(true);
   });
 });
 

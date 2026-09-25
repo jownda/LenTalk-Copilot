@@ -21,7 +21,7 @@ use crate::ai::providers::video_protocols::assets::{
 };
 use crate::ai::providers::video_protocols::extract::{self, MediaKind};
 use crate::ai::providers::video_protocols::{
-    download_bytes, http_error, meta_string, persist_media_bytes, queued, video_extension_hint, PollContext,
+    describe_reqwest_error, download_bytes, http_error, meta_string, persist_media_bytes, queued, video_extension_hint, PollContext,
     SubmitContext,
 };
 use crate::ai::{GenerateVideoRequest, ProviderTaskHandle, ProviderTaskPollResult, ProviderTaskSubmission};
@@ -256,7 +256,7 @@ pub async fn submit(ctx: &SubmitContext, request: &GenerateVideoRequest) -> Resu
         .json(&body)
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 视频请求失败(网络): {}", PLATFORM_LABEL, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 视频请求失败(网络): {}", PLATFORM_LABEL, describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -310,7 +310,7 @@ pub async fn poll(
         .header("Accept-Encoding", "identity")
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 任务查询失败(网络): {}", PLATFORM_LABEL, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 任务查询失败(网络): {}", PLATFORM_LABEL, describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);

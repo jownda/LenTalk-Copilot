@@ -9,8 +9,28 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
+use std::time::Duration;
 
+use super::describe_reqwest_error;
 use crate::ai::error::AIError;
+
+/// 素材上传的最大尝试次数。
+///
+/// 上传本身**幂等**(最坏情况是图床上多留一个没人引用的对象), 不产生计费单, 所以
+/// 网络层失败可以放心重试 —— 这与提交阶段「不重试纯网络错误」的规则刻意不同:
+/// 提交可能已送达并被计费, 重提就是二次扣费; 而上传这里, 一次瞬断就让整个视频
+/// 任务作废的代价太高。
+const UPLOAD_ATTEMPTS: usize = 3;
+
+/// 两次重试之间的等待(第 1 次失败后、第 2 次失败后)。指数退避, 避免在对方抖动
+/// 期间连着打三枪。
+const UPLOAD_RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(400), Duration::from_millis(1200)];
+
+/// 单次上传的超时。
+///
+/// 比视频提交的 180s 短得多: 上传只是把素材送出去, 卡住就该尽快失败并交给重试,
+/// 而不是把总超时耗光 —— 否则一次卡死要等三分钟, 重试也来不及发生。
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 一个参考素材的归一化结果。
 #[derive(Debug, Clone)]
@@ -419,44 +439,65 @@ pub async fn upload_reference_asset_multipart_with_fields(
         ReferenceAsset::Url(url) => return Ok(Value::String(url.clone())),
         ReferenceAsset::File { mime_type, bytes, .. } => (mime_type.clone(), bytes.clone()),
     };
-    let part = Part::bytes(bytes)
-        .file_name(filename.to_string())
-        .mime_str(&mime_type)
-        .map_err(|error| AIError::InvalidRequest(format!("{} 上传体构造失败: {}", platform_label, error)))?;
-    let mut form = Form::new();
-    for (name, value) in fields {
-        form = form.text((*name).to_string(), (*value).to_string());
+
+    let mut last_error: Option<reqwest::Error> = None;
+    for attempt in 1..=UPLOAD_ATTEMPTS {
+        // `Form` 会被 `send()` 消费, 所以每次重试都要重新拼一份。上传体构造失败
+        // (非法 MIME)重试多少次都一样, 直接返回。
+        let part = Part::bytes(bytes.clone())
+            .file_name(filename.to_string())
+            .mime_str(&mime_type)
+            .map_err(|error| AIError::InvalidRequest(format!("{} 上传体构造失败: {}", platform_label, error)))?;
+        let mut form = Form::new();
+        for (name, value) in fields {
+            form = form.text((*name).to_string(), (*value).to_string());
+        }
+        let form = form.part("file", part);
+        // api_key 为空 = 该图床是**匿名可上传**的, 不要发出 `Authorization: Bearer `
+        // (空值)。WGSPAI 的背景机图床 https://wgspai.cn/image-bed/api/upload 就属于
+        // 这一类 —— 官方 curl 示例不带任何鉴权头, 而带上一个空 Bearer 会让部分
+        // 网关直接 401, 反而把本来能用的上传打断。
+        let mut request = client
+            .post(upload_url)
+            .header("Accept-Encoding", "identity")
+            .timeout(UPLOAD_TIMEOUT)
+            .multipart(form);
+        if !api_key.trim().is_empty() {
+            request = request.bearer_auth(api_key);
+        }
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let raw = response.text().await.unwrap_or_default();
+                let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                if !status.is_success() {
+                    return Err(AIError::TaskFailed(format!(
+                        "{} 参考素材上传失败: HTTP {} {}",
+                        platform_label,
+                        status,
+                        truncate(&raw, 500)
+                    )));
+                }
+                return Ok(payload);
+            }
+            Err(error) => {
+                // 请求构造类错误(URL / header 非法)重试也不会变好, 其余都当瞬时故障。
+                let worth_retrying = attempt < UPLOAD_ATTEMPTS && !error.is_builder();
+                last_error = Some(error);
+                if !worth_retrying {
+                    break;
+                }
+                tokio::time::sleep(UPLOAD_RETRY_BACKOFF[attempt - 1]).await;
+            }
+        }
     }
-    let form = form.part("file", part);
-    // api_key 为空 = 该图床是**匿名可上传**的, 不要发出 `Authorization: Bearer `
-    // (空值)。WGSPAI 的背景机图床 https://wgspai.cn/image-bed/api/upload 就属于
-    // 这一类 —— 官方 curl 示例不带任何鉴权头, 而带上一个空 Bearer 会让部分
-    // 网关直接 401, 反而把本来能用的上传打断。
-    let mut request = client
-        .post(upload_url)
-        .header("Accept-Encoding", "identity")
-        .multipart(form);
-    if !api_key.trim().is_empty() {
-        request = request.bearer_auth(api_key);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| {
-            AIError::Provider(format!("{} 参考素材上传失败(网络): {}", platform_label, error))
-        })?;
-    let status = response.status();
-    let raw = response.text().await.unwrap_or_default();
-    let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    if !status.is_success() {
-        return Err(AIError::TaskFailed(format!(
-            "{} 参考素材上传失败: HTTP {} {}",
-            platform_label,
-            status,
-            truncate(&raw, 500)
-        )));
-    }
-    Ok(payload)
+    let error = last_error.expect("循环只在拿到错误后才退出, 这里必然有值");
+    Err(AIError::Provider(format!(
+        "{} 参考素材上传失败(网络): 已重试 {} 次仍未成功 — {}",
+        platform_label,
+        UPLOAD_ATTEMPTS - 1,
+        describe_reqwest_error(&error)
+    )))
 }
 
 /// 有些平台的上传端点只收字节(帧间 `/v1/assets`), 不接受公网 URL 透传 ——
@@ -472,7 +513,7 @@ pub async fn download_url_to_asset(
         .header("Accept-Encoding", "identity")
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 参考素材下载失败(网络): {}", platform_label, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 参考素材下载失败(网络): {}", platform_label, describe_reqwest_error(&error))))?;
     let status = response.status();
     if !status.is_success() {
         return Err(AIError::TaskFailed(format!(

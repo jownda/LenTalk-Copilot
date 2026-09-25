@@ -35,6 +35,21 @@ import {
   ZZDH_VIDEO_DURATION_OPTIONS,
 } from "@/commands/zzdhApi";
 import { WAN_CLI_PROVIDER_ID, wanCliProvider, wanCliVideoModels } from "./wanCli";
+import {
+  resolveWgspaiAspectRatioOptions,
+  resolveWgspaiDurationOptions,
+} from "@/commands/wgspaiProtocol";
+import {
+  isRunningHubBaseUrl,
+  resolveRunningHubAspectRatioOptions,
+  resolveRunningHubDurationOptions,
+  resolveRunningHubResolutionOptions,
+  resolveRunningHubVideoEndpoint,
+  resolveRunningHubVideoDisplayName,
+  runningHubEndpointSupportsInput,
+  collapseRunningHubVideoModels,
+  isRunningHubDedicatedVideoEndpoint,
+} from "@/commands/runningHubProtocol";
 
 const providerModules = import.meta.glob<{ provider: ModelProviderDefinition }>("./providers/*.ts", { eager: true });
 const modelModules = import.meta.glob<{ imageModel: ImageModelDefinition }>("./image/**/*.ts", { eager: true });
@@ -60,6 +75,14 @@ const JIMENG_CLI_PROVIDER: ModelProviderDefinition = {
   label: "即梦 CLI",
 };
 
+/** RunningHub 官方 CLI 使用本机 rh 配置中的 Key，模型仍复用官方端点目录。 */
+export const RUNNINGHUB_CLI_PROVIDER_ID = "runninghub-cli";
+const RUNNINGHUB_CLI_PROVIDER: ModelProviderDefinition = {
+  id: RUNNINGHUB_CLI_PROVIDER_ID,
+  name: "RunningHub CLI",
+  label: "RunningHub CLI",
+};
+
 /**
  * 不使用 API Key 的平台: 本地 CLI(即梦 / 万相)靠可执行文件与各自的登录态工作,
  * 「密钥」页里没有可填的密钥。
@@ -67,7 +90,11 @@ const JIMENG_CLI_PROVIDER: ModelProviderDefinition = {
  * 图片模型选择器默认按"是否填过密钥"过滤平台, 必须把这类平台排除在过滤之外,
  * 否则它们的模型永远不会出现在列表里(视频侧不过滤, 所以没暴露这个问题)。
  */
-const API_KEYLESS_PROVIDER_IDS: ReadonlySet<string> = new Set([JIMENG_CLI_PROVIDER_ID, WAN_CLI_PROVIDER_ID]);
+const API_KEYLESS_PROVIDER_IDS: ReadonlySet<string> = new Set([
+  JIMENG_CLI_PROVIDER_ID,
+  WAN_CLI_PROVIDER_ID,
+  RUNNINGHUB_CLI_PROVIDER_ID,
+]);
 
 export function isApiKeylessProvider(providerId: string): boolean {
   return API_KEYLESS_PROVIDER_IDS.has(providerId);
@@ -115,7 +142,7 @@ export function listModelProviders(): ModelProviderDefinition[] {
   if (isWindowsDesktopRuntime()) {
     return buildCustomProviders();
   }
-  return [...providers, ...buildCustomProviders()];
+  return [...providers, RUNNINGHUB_CLI_PROVIDER, ...buildCustomProviders()];
 }
 
 export function getImageModel(modelId: string): ImageModelDefinition {
@@ -161,12 +188,26 @@ function isVideoUpscaleModelName(model: string): boolean {
 }
 
 export function listVideoModels(): VideoModelDefinition[] {
-  const customVideoModels: VideoModelDefinition[] = useSettingsStore.getState().customApis.flatMap((api) =>
-    Array.from(
+  const customVideoModels: VideoModelDefinition[] = useSettingsStore.getState().customApis.flatMap((api) => {
+    const isRunningHubApi =
+      isRunningHubBaseUrl(api.baseUrl) ||
+      ["runninghub", "runninghub-cn"].includes(api.id.trim().toLowerCase());
+    // RunningHub 的文生/图生/多模态是同一个模型家族的不同端点。
+    // 普通视频节点只保留一个 canonical id，提交时根据实际素材选择端点。
+    const configuredVideoModels = isRunningHubApi
+      ? [
+          ...collapseRunningHubVideoModels(api.videoModels),
+          ...api.videoModels.filter((model) => {
+            const endpoint = resolveRunningHubVideoEndpoint(model);
+            return endpoint ? isRunningHubDedicatedVideoEndpoint(endpoint.endpoint) : false;
+          }),
+        ]
+      : api.videoModels;
+    return Array.from(
       new Set([
         ...(isZzdhProvider(api.id, api.baseUrl)
           ? [...api.videoModels, ...ZZDH_LIP_SYNC_MODEL_NAMES]
-          : api.videoModels
+          : configuredVideoModels
         ).filter((model) => !isVideoUpscaleModelName(model)),
         ...api.models.filter(isVideoGenerationModelName),
       ]),
@@ -176,17 +217,48 @@ export function listVideoModels(): VideoModelDefinition[] {
       const normalizedModel = model.trim().toLowerCase();
       const isZzdh = isZzdhProvider(api.id, api.baseUrl);
       const isSub2Api = api.id.trim().toLowerCase() === "sub2api-video" || isRjmVideoApiBaseUrl(api.baseUrl);
-      const isBinghuo =
-        api.id.trim().toLowerCase() === "binghuo" ||
-        api.baseUrl.trim().toLowerCase().includes("api.7tai.cc") ||
+      // WGSPAI 曾经和炳火并在一起共用 `resolveBinghuoVideoOptions`。两家的模型名
+      // 并不重合(那份表是炳火自己的 sd2.5 / quanneng2.0 系列), 于是 WGSPAI 的
+      // `seedance2.5`(固定 30 秒按次计费)会落到默认的 4~15 秒档位 —— 用户在下拉里
+      // 选 12 秒, 平台照 30 秒出片。现在按站点文档单独解析。
+      const isWgspai =
         api.id.trim().toLowerCase() === "wgspai" ||
         api.baseUrl.trim().toLowerCase().includes("api.wgspai.cn");
+      const isBinghuo =
+        api.id.trim().toLowerCase() === "binghuo" ||
+        api.baseUrl.trim().toLowerCase().includes("api.7tai.cc");
       const isZhiniao =
         api.id.trim().toLowerCase() === "zhiniao" ||
         api.baseUrl.trim().toLowerCase().includes("cuai.token6688.com") ||
         api.baseUrl.trim().toLowerCase().includes("api.tokengo.love");
+      // RunningHub: 「模型」就是官方端点 ID(`kling-v3.0-pro/image-to-video`),
+      // 每个端点的时长 / 画幅 / 分辨率枚举都不一样 —— 档位表只能按端点查官方目录。
+      // `.cn` 与 `.ai` 是同一套协议, 一并识别。
+      const isRunningHub =
+        isRunningHubBaseUrl(api.baseUrl) ||
+        ["runninghub", "runninghub-cn"].includes(api.id.trim().toLowerCase());
       const binghuoOptions = isBinghuo ? resolveBinghuoVideoOptions(model) : undefined;
+      const wgspaiOptions = isWgspai
+        ? {
+            durationOptions: resolveWgspaiDurationOptions(
+              model,
+              Array.from({ length: 30 }, (_, index) => index + 1),
+            ),
+            aspectRatios: resolveWgspaiAspectRatioOptions(model, CUSTOM_ASPECT_RATIOS),
+          }
+        : undefined;
       const zhiniaoOptions = isZhiniao ? resolveZhiniaoVideoOptions(model) : undefined;
+      // RunningHub 的档位表逐端点不同。这里的**空数组是有意义的返回值**: 表示该
+      // 端点官方 schema 里没有这个参数(UI 应隐藏该控件), 或它的画幅字段收像素串、
+      // 选项已在提交时折成像素。所以下面每处都先判 `.length` 再取用 —— 直接 `??`
+      // 兜底是错的, 空数组不是 nullish, 会把通用档位表吃掉。
+      const runningHubOptions = isRunningHub
+        ? {
+            durationOptions: resolveRunningHubDurationOptions(model, []),
+            aspectRatios: resolveRunningHubAspectRatioOptions(model, []),
+            resolutionValues: resolveRunningHubResolutionOptions(model, []),
+          }
+        : undefined;
       const sub2ApiDuration =
         normalizedModel === "seedance2.5" ? 30 : normalizedModel === "seedance2.0" ? 15 : undefined;
       const isSub2ApiSeedance = isSub2Api && sub2ApiDuration !== undefined;
@@ -210,24 +282,44 @@ export function listVideoModels(): VideoModelDefinition[] {
           ? zzdhTier
             ? [zzdhTier]
             : ["720p", "1080p"]
-          : zhiniaoOptions?.resolutionValues.length
-            ? zhiniaoOptions.resolutionValues
-            : binghuoOptions?.resolutionValues;
+          : runningHubOptions?.resolutionValues.length
+            ? runningHubOptions.resolutionValues
+            : zhiniaoOptions?.resolutionValues.length
+              ? zhiniaoOptions.resolutionValues
+              : binghuoOptions?.resolutionValues;
       // 字子动画画幅枚举只有 16:9 / 9:16 / 1:1(官方文档), 不要放 21:9 等超纲值。
+      // WGSPAI 的白名单来自 `wgspaiProtocol`(seedance-v2 只认 9:16 / 16:9), 必须排在
+      // 炳火前面 —— 两家现在是各自独立解析的, 顺序只影响可读性。
       const aspectRatios = isSub2ApiSeedance
         ? ["16:9", "9:16"]
         : isZzdh
           ? [...ZZDH_ASPECT_RATIOS]
-          : (zhiniaoOptions?.aspectRatios ?? binghuoOptions?.aspectRatios ?? CUSTOM_ASPECT_RATIOS);
+          : (runningHubOptions?.aspectRatios.length
+              ? runningHubOptions.aspectRatios
+              : (wgspaiOptions?.aspectRatios ??
+                zhiniaoOptions?.aspectRatios ??
+                binghuoOptions?.aspectRatios ??
+                CUSTOM_ASPECT_RATIOS));
       const durationOptions =
         sub2ApiDuration !== undefined
           ? [sub2ApiDuration]
-          : (zhiniaoOptions?.durationOptions ??
-            binghuoOptions?.durationOptions ??
-            zzdhDurationOptions ??
-            Array.from({ length: 30 }, (_, index) => index + 1));
+          : (runningHubOptions?.durationOptions.length
+              ? runningHubOptions.durationOptions
+              : (wgspaiOptions?.durationOptions ??
+                zhiniaoOptions?.durationOptions ??
+                binghuoOptions?.durationOptions ??
+                zzdhDurationOptions ??
+                Array.from({ length: 30 }, (_, index) => index + 1)));
+      // RunningHub 的官方端点有中文名(`可灵图生视频3.0-pro`), 直接当展示名 ——
+      // 端点 ID 里带斜杠, 原样显示在下拉里可读性太差。
+      const runningHubEndpoint = isRunningHub ? resolveRunningHubVideoEndpoint(model) : undefined;
       const displayModelName =
-        normalizedModel === "seedance2.5" ? "Seedance 2.5" : normalizedModel === "seedance2.0" ? "Seedance 2.0" : model;
+        (runningHubEndpoint ? resolveRunningHubVideoDisplayName(model) : undefined) ??
+        (normalizedModel === "seedance2.5"
+          ? "Seedance 2.5"
+          : normalizedModel === "seedance2.0"
+            ? "Seedance 2.0"
+            : model);
       return {
         id: modelId,
         mediaType: "video" as const,
@@ -236,15 +328,22 @@ export function listVideoModels(): VideoModelDefinition[] {
         description: `${api.name} · ${displayModelName}`,
         expectedDurationMs: 180000,
         aspectRatios: aspectRatios.map((value) => ({ value, label: value })),
-        defaultAspectRatio: "16:9",
+        // 默认值必须落在可选档位里: RunningHub 的端点没有 16:9 时(如纯竖屏端点)
+        // 硬写 16:9 会让下拉显示一个不存在的选项。`?? "16:9"` 兜住理论上的空表。
+        defaultAspectRatio: aspectRatios.includes("16:9") ? "16:9" : (aspectRatios[0] ?? "16:9"),
         durationOptions,
+        // 默认时长取该平台档位表的首项, 保证「默认值一定在可选档位里」——
+        // WGSPAI 的 seedance2.5 档位只有 [30], 落到通用的 5 会让下拉显示一个
+        // 并不存在的选项。
         defaultDuration:
           sub2ApiDuration ??
+          runningHubOptions?.durationOptions[0] ??
           (zhiniaoOptions
             ? zhiniaoOptions.durationOptions.includes(5)
               ? 5
               : zhiniaoOptions.durationOptions[0]
             : undefined) ??
+          wgspaiOptions?.durationOptions[0] ??
           binghuoOptions?.durationOptions[0] ??
           5,
         ...(resolutionValues
@@ -262,10 +361,10 @@ export function listVideoModels(): VideoModelDefinition[] {
         profileLabel: profile.protocolLabel,
         profileUnavailableReason: profile.unavailableReason,
       };
-    }),
-  );
+    });
+  });
 
-  return [...customVideoModels, ...buildJimengCliVideoModels(), ...wanCliVideoModels];
+  return [...customVideoModels, ...buildRunningHubCliVideoModels(), ...buildJimengCliVideoModels(), ...wanCliVideoModels];
 }
 
 export function getVideoModel(modelId: string): VideoModelDefinition | undefined {
@@ -337,7 +436,11 @@ function buildCustomAudioModels(): AudioModelDefinition[] {
       // 而音乐模型全部错列在「文字转语音」页。
       const audioKind: AudioModelKind = resolveZzdhAudioKind(model) ?? "speech";
       const normalizedModel = model.trim().toLowerCase();
-      const operation = resolveAudioModelOperation(normalizedModel, audioKind);
+      const isRunningHubSunoSingle = normalizedModel === "rhart-audio/suno-v5.5/single";
+      const isRunningHubSunoCustom = normalizedModel === "rhart-audio/suno-v5.5/custom";
+      const operation = isRunningHubSunoSingle || isRunningHubSunoCustom
+        ? "music"
+        : resolveAudioModelOperation(normalizedModel, audioKind);
       const family = resolveAudioModelFamily(normalizedModel);
       // 音色表按模型解析, 不再所有模型共用一份写死的 6 音色(那是 tts-1 的清单):
       // GM 系列真实有 30 种预置音色且只输出 wav, GT 系列 6 种、支持 6 种输出格式。
@@ -394,6 +497,11 @@ function buildCustomAudioModels(): AudioModelDefinition[] {
                 // 知鸟 Suno: 没有 music_length_ms(曲长由模型定), 换成 8 种 operation 的协议标记。
                 musicProtocol: "suno" as const,
               }
+            : isRunningHubSunoSingle || isRunningHubSunoCustom
+              ? {
+                  musicProtocol: "suno" as const,
+                  sunoSupportedOperations: isRunningHubSunoSingle ? ["generate"] : ["custom"],
+                }
             : {
                 // 字子动画等: 保持原来的「歌词 + 时长」最小集。
                 musicProtocol: "generic" as const,
@@ -407,7 +515,7 @@ function buildCustomAudioModels(): AudioModelDefinition[] {
 }
 
 export function listAudioModels(): AudioModelDefinition[] {
-  return buildCustomAudioModels();
+  return [...buildCustomAudioModels(), ...buildRunningHubCliAudioModels()];
 }
 
 export function getAudioModel(modelId: string): AudioModelDefinition | undefined {
@@ -477,6 +585,103 @@ function buildJimengCliVideoModels(): VideoModelDefinition[] {
         (JIMENG_CLI_VIDEO_POINTS_PER_SECOND[version] ?? 0) * Math.max(1, Number(extraParams?.duration) || 5),
     ),
   }));
+}
+
+/**
+ * RunningHub CLI 与 HTTP 版共用官方端点 ID，但走本机 `rh model run`。
+ * 只注册 CLI 本地 catalog 中存在的端点，避免用户选中 CLI 后才发现端点不可用。
+ */
+function buildRunningHubCliVideoModels(): VideoModelDefinition[] {
+  // The CLI catalog is not bundled into the frontend. Keep a broad fallback for
+  // web preview and use the complete local catalog when the desktop bridge has
+  // exposed it through settings.
+  const endpoints = [
+    "rhart-video-s/text-to-video", "rhart-video-s-official/text-to-video",
+    "rhart-video-s-official/text-to-video-pro", "kling-v3.0-pro/text-to-video",
+    "kling-v3.0-std/text-to-video", "kling-video-o3-pro/text-to-video",
+    "kling-video-o3-std/text-to-video", "kling-video-o1/text-to-video",
+    "kling-v2.6-pro/text-to-video", "kling-v2.5-turbo-pro/text-to-video",
+    "kling-v2.5-turbo-std/text-to-video", "rhart-video-v3.1-pro/text-to-video",
+    "rhart-video-v3.1-fast/text-to-video", "rhart-video-v3.1-pro-official/text-to-video",
+    "rhart-video-v3.1-fast-official/text-to-video", "rhart-video-g/text-to-video",
+    "rhart-video-g-official/text-to-video", "minimax/hailuo-02/t2v-pro",
+    "minimax/hailuo-2.3/t2v-pro", "minimax/hailuo-02/t2v-standard",
+    "minimax/hailuo-2.3/t2v-standard", "vidu/text-to-video-q3-pro",
+    "vidu/text-to-video-q3-turbo", "vidu/text-to-video", "alibaba/wan-2.6/text-to-video",
+    "seedance-v1.5-pro/text-to-video", "seedance-v1.5-pro/text-to-video-fast",
+    "rhart-video/sparkvideo-2.0/text-to-video", "rhart-video/sparkvideo-2.0-fast/text-to-video",
+    "bytedance/seedance-2.5-token/text-to-video", "minimax/hailuo-h3/text-to-video",
+    "alibaba/wan-2.7/text-to-video", "pixverse-v6/text-to-video",
+    "alibaba/wan-2.5-preview/text-to-video", "bytedance/seedance-2.0-global/text-to-video",
+    "alibaba/happyhorse-1.0/text-to-video", "kling-v3-4k/text-to-video",
+    "kling-video-o3-4k/text-to-video", "skyreels-v4/text-to-video-std",
+    "gemini-omni-flash/text-to-video", "pixverse-v5.5/text-to-video",
+    "vidu/text-to-video-q3-pro-fast", "pixverse-v5.6/text-to-video",
+    "minimax/nova-video-2.0/text-to-video", "minimax/nova-video-2.0-fast/text-to-video",
+    "minimax/eva-video-2.0/text-to-video", "minimax/eva-video-2.0-fast/text-to-video",
+  ];
+  const seenFamilies = new Set<string>();
+  return endpoints
+    .map((endpoint) => resolveRunningHubVideoEndpoint(endpoint))
+    .filter((spec): spec is NonNullable<typeof spec> => Boolean(spec))
+    .filter((spec) => runningHubEndpointSupportsInput(spec, "text"))
+    .filter((spec) => {
+      const family = spec.endpoint.replace(/\/text-to-video$/, "");
+      if (seenFamilies.has(family)) return false;
+      seenFamilies.add(family);
+      return true;
+    })
+    .map((spec) => ({
+      id: `${RUNNINGHUB_CLI_PROVIDER_ID}/${spec.endpoint}`,
+      mediaType: "video" as const,
+      displayName: `RunningHub CLI · ${resolveRunningHubVideoDisplayName(spec.endpoint)}`,
+      providerId: RUNNINGHUB_CLI_PROVIDER_ID,
+      description: `RunningHub CLI · ${resolveRunningHubVideoDisplayName(spec.endpoint)}`,
+      expectedDurationMs: 300000,
+      aspectRatios: (spec.ratios.length ? spec.ratios : CUSTOM_ASPECT_RATIOS).map((value) => ({ value, label: value })),
+      defaultAspectRatio: spec.ratios[0] ?? "16:9",
+      durationOptions: spec.durations.length ? spec.durations : Array.from({ length: 30 }, (_, index) => index + 1),
+      defaultDuration: spec.durations[0] ?? 5,
+      ...(spec.resolutions.length
+        ? { resolutions: spec.resolutions.map((value) => ({ value, label: value.toUpperCase() })), defaultResolution: spec.resolutions[0] }
+        : {}),
+      profileId: "runninghub-model",
+      profileStatus: "verified" as const,
+    }));
+}
+
+function buildRunningHubCliAudioModels(): AudioModelDefinition[] {
+  return [
+    ["rhart-audio/text-to-audio/speech-2.8-turbo", "speech"],
+    ["rhart-audio/text-to-audio/speech-2.8-hd", "speech"],
+    ["rhart-audio/text-to-audio/speech-02-turbo", "speech"],
+    ["minimax/music-2.6/text-to-music", "music"],
+    ["minimax/music-2.6/text-to-instrumental", "music"],
+    ["rhart-audio/suno-v5/single", "music"],
+    ["rhart-audio/suno-v5/custom", "music"],
+    ["rhart-audio/suno-v5.5/single", "music"],
+    ["rhart-audio/suno-v5.5/custom", "music"],
+    ["rhart-audio/suno-v4.5/single", "music"],
+    ["rhart-audio/suno-v4.5/custom", "music"],
+  ].map(([model, kind]) => {
+    const audioKind = kind as AudioModelKind;
+    const isSuno = model.includes("/suno-");
+    return {
+      id: `${RUNNINGHUB_CLI_PROVIDER_ID}/${model}`,
+      mediaType: "audio" as const,
+      displayName: `RunningHub CLI · ${model.split("/").pop()}`,
+      providerId: RUNNINGHUB_CLI_PROVIDER_ID,
+      description: `RunningHub CLI · ${model}`,
+      audioKind,
+      family: model.includes("suno") ? "suno" : resolveAudioModelFamily(model),
+      operation: audioKind === "music" ? "music" : "speech",
+      musicProtocol: isSuno ? "suno" : audioKind === "music" ? "generic" : undefined,
+      sunoSupportedOperations: isSuno ? (model.endsWith("/single") ? ["generate"] : ["custom"]) : undefined,
+      audioUiProtocol: model.includes("doubao") ? "doubao-tts" : undefined,
+      formatOptions: audioKind === "speech" ? ["mp3", "wav"] : undefined,
+      defaultFormat: audioKind === "speech" ? "mp3" : undefined,
+    };
+  });
 }
 
 /** 即梦图片的画幅枚举(取自 CLI `--help`), 注意不含自定义平台用的 5:4 / 4:5。 */
@@ -613,6 +818,9 @@ export function getModelProvider(providerId: string): ModelProviderDefinition {
   if (providerId === WAN_CLI_PROVIDER_ID) return wanCliProvider;
   if (providerId === JIMENG_CLI_PROVIDER_ID) {
     return JIMENG_CLI_PROVIDER;
+  }
+  if (providerId === RUNNINGHUB_CLI_PROVIDER_ID) {
+    return RUNNINGHUB_CLI_PROVIDER;
   }
   const builtin = providerMap.get(providerId);
   if (builtin) {

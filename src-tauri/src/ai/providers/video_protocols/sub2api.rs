@@ -18,7 +18,7 @@ use crate::ai::error::AIError;
 use crate::ai::providers::video_protocols::assets::{resolve_reference_asset, truncate, ReferenceAsset};
 use crate::ai::providers::video_protocols::extract;
 use crate::ai::providers::video_protocols::{
-    download_bytes, http_error, meta_string, persist_media_bytes, queued, string_param, PollContext, SubmitContext,
+    describe_reqwest_error, download_bytes, http_error, meta_string, persist_media_bytes, queued, string_param, PollContext, SubmitContext,
 };
 use crate::ai::{GenerateVideoRequest, ProviderTaskHandle, ProviderTaskPollResult, ProviderTaskSubmission};
 
@@ -125,7 +125,7 @@ async fn upload_reference_image(ctx: &SubmitContext, source: &str, index: usize)
         .json(&json!({ "image_b64": encoded }))
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 参考图上传失败(网络): {}", PLATFORM_LABEL, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 参考图上传失败(网络): {}", PLATFORM_LABEL, describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -264,7 +264,7 @@ pub async fn submit(ctx: &SubmitContext, request: &GenerateVideoRequest) -> Resu
         .json(&body)
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 视频请求失败(网络): {}", PLATFORM_LABEL, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 视频请求失败(网络): {}", PLATFORM_LABEL, describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -313,7 +313,7 @@ pub async fn poll(
         .header("Accept-Encoding", "identity")
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 视频查询失败(网络): {}", PLATFORM_LABEL, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 视频查询失败(网络): {}", PLATFORM_LABEL, describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);

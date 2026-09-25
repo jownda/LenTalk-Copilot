@@ -24,7 +24,7 @@ use crate::ai::providers::video_protocols::assets::{
     ReferenceAsset,
 };
 use crate::ai::providers::video_protocols::extract;
-use crate::ai::providers::video_protocols::{http_error, meta_string, queued, string_param, PollContext, SubmitContext};
+use crate::ai::providers::video_protocols::{describe_reqwest_error, http_error, meta_string, queued, string_param, PollContext, SubmitContext};
 use crate::ai::{GenerateVideoRequest, ProviderTaskHandle, ProviderTaskPollResult, ProviderTaskSubmission};
 
 pub const TRANSPORT: &str = "kling-control";
@@ -102,7 +102,7 @@ async fn upload_public_asset(
         }))
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("参考素材上传失败(网络): {}", error)))?;
+        .map_err(|error| AIError::Provider(format!("参考素材上传失败(网络): {}", describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -234,7 +234,7 @@ async fn identify_face(ctx: &SubmitContext, video_url: &str) -> Result<(String, 
         .json(&json!({ "video_url": video_url }))
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 人脸识别失败(网络): {}", PLATFORM_LABEL, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 人脸识别失败(网络): {}", PLATFORM_LABEL, describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -431,7 +431,7 @@ pub async fn submit(ctx: &SubmitContext, request: &GenerateVideoRequest) -> Resu
         .json(&body)
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 请求失败(网络): {}", PLATFORM_LABEL, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 请求失败(网络): {}", PLATFORM_LABEL, describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -481,7 +481,7 @@ pub async fn poll(
         .header("Accept-Encoding", "identity")
         .send()
         .await
-        .map_err(|error| AIError::Provider(format!("{} 任务查询失败(网络): {}", PLATFORM_LABEL, error)))?;
+        .map_err(|error| AIError::Provider(format!("{} 任务查询失败(网络): {}", PLATFORM_LABEL, describe_reqwest_error(&error))))?;
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);

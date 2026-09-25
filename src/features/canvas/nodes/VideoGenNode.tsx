@@ -51,6 +51,7 @@ import {
   getModelProvider,
   getVideoModelProfile,
   JIMENG_CLI_PROVIDER_ID,
+  RUNNINGHUB_CLI_PROVIDER_ID,
   listVideoModels,
 } from "@/features/canvas/models";
 import { resolveModelPriceDisplay } from "@/features/canvas/pricing";
@@ -75,6 +76,13 @@ import { useCanvasStore } from "@/stores/canvasStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { getFloatingPanelPosition, type FloatingPanelPosition } from "@/features/canvas/ui/floatingPanelPosition";
 import { isZzdhLipSyncModel } from "@/commands/zzdhApi";
+import {
+  isRunningHubDedicatedVideoEndpoint,
+  isRunningHubBaseUrl,
+  resolveRunningHubVideoEndpoint,
+  resolveRunningHubVideoEndpointForInput,
+  runningHubEndpointSupportsInput,
+} from "@/commands/runningHubProtocol";
 
 type VideoGenNodeProps = { id: string; data: VideoGenNodeData; selected?: boolean; width?: number; height?: number };
 
@@ -318,6 +326,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const { nodes, edges } = useCanvasInputGraph();
   const inputImages = useMemo(() => graphImageResolver.collectInputImages(id, nodes, edges), [edges, id, nodes]);
   const inputAudio = useMemo(() => graphImageResolver.collectInputAudio(id, nodes, edges), [edges, id, nodes]);
+  const inputVideos = useMemo(() => graphImageResolver.collectInputVideos(id, nodes, edges), [edges, id, nodes]);
   const inputText = useMemo(() => graphImageResolver.collectInputText(id, nodes, edges), [edges, id, nodes]);
   const audioNodes = useMemo(() => nodes.filter((node) => node.type === CANVAS_NODE_TYPES.audio), [nodes]);
   const addNode = useCanvasStore((state) => state.addNode);
@@ -402,14 +411,37 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     updateNodeData,
   });
 
-  const models = useMemo(() => listVideoModels().filter((model) => !isZzdhLipSyncModel(model.id)), [customApis]);
+  const imageMode = data.imageMode === "first-last" ? "first-last" : "reference";
+  const models = useMemo(
+    () =>
+      listVideoModels().filter((model) => {
+        if (isZzdhLipSyncModel(model.id)) return false;
+        const endpoint = model.id.split("/").slice(1).join("/");
+        const normalized = model.id.toLowerCase();
+        const providerId = model.providerId.replace(/^custom:/, "");
+        const api = customApis.find((item) => item.id === providerId);
+        if (isRunningHubBaseUrl(api?.baseUrl) && endpoint) {
+          const spec = resolveRunningHubVideoEndpoint(endpoint);
+          // 普通节点只显示有文生能力的 canonical 家族。图生/多模态由实际输入路由。
+          if (spec && !runningHubEndpointSupportsInput(spec, "text")) return false;
+          if (imageMode === "first-last" && spec && !resolveRunningHubVideoEndpointForInput(endpoint, "first-last")) {
+            return false;
+          }
+        }
+        return !isRunningHubDedicatedVideoEndpoint(endpoint)
+          && !normalized.includes("motion-control")
+          && !normalized.includes("lip-sync")
+          && !normalized.includes("对口型");
+      }),
+    [customApis, imageMode],
+  );
   const selectedModel =
     models.find((model) => model.id === data.model) ??
     models.find((model) => model.id === getDefaultVideoModelId()) ??
     models[0];
-  const imageMode = data.imageMode === "first-last" ? "first-last" : "reference";
   const isJimengCli = selectedModel?.providerId === JIMENG_CLI_PROVIDER_ID;
   const isWanCli = selectedModel?.providerId === "wan-cli";
+  const isRunningHubCli = selectedModel?.providerId === RUNNINGHUB_CLI_PROVIDER_ID;
   const selectedProfile = selectedModel ? getVideoModelProfile(selectedModel.profileId) : null;
   useEffect(() => {
     if (isZzdhLipSyncModel(data.model) && selectedModel && data.model !== selectedModel.id) {
@@ -1117,7 +1149,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       return;
     }
     const apiKey = apiKeys[selectedModel.providerId] ?? "";
-    if (!isJimengCli && !isWanCli && !apiKey) {
+    if (!isJimengCli && !isWanCli && !isRunningHubCli && !apiKey) {
       generationLockRef.current = false;
       const message = "请在设置中填写 API Key";
       setError(message);
@@ -1125,11 +1157,13 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       return;
     }
     const customId = selectedModel.providerId.slice("custom:".length);
-    const baseUrl = isJimengCli || isWanCli ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
+    const baseUrl = isJimengCli || isWanCli || isRunningHubCli ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
+    const manualReferenceVideos = Array.isArray(data.binghuoReferenceVideos)
+      ? data.binghuoReferenceVideos.filter((source): source is string => typeof source === "string" && source.trim().length > 0)
+      : [];
+    const referenceVideos = Array.from(new Set([...inputVideos, ...manualReferenceVideos]));
     const generationExtraParams = {
-      ...(data.binghuoReferenceVideos && data.binghuoReferenceVideos.length > 0
-        ? { reference_videos: data.binghuoReferenceVideos.slice(0, 3) }
-        : {}),
+      ...(referenceVideos.length > 0 ? { reference_videos: referenceVideos.slice(0, 10) } : {}),
       ...(data.binghuoSkipReview === true ? { skip_review: true } : {}),
     };
     const baseGenerationDebugContext: GenerationDebugContext = {
@@ -1205,7 +1239,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     setError(null);
     let submitted = false;
     try {
-      if (!isJimengCli && !isWanCli) {
+      if (!isJimengCli && !isWanCli && !isRunningHubCli) {
         await canvasAiGateway.setApiKey(selectedModel.providerId, apiKey);
       }
       const generationJobId = await canvasAiGateway.submitGenerateVideoJob({
@@ -1286,6 +1320,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     flushPromptCommit,
     id,
     imageMode,
+    inputVideos,
     inputText,
     isGenerating,
     isWanCli,

@@ -8,6 +8,11 @@ import {
   type GrsaiCreditTierId,
   type PriceDisplayCurrencyMode,
 } from '@/features/canvas/pricing/types';
+// `recommendedApis` 是零依赖的纯数据模块, 引它不会与 store 成环。
+import {
+  findRecommendedApiByBaseUrl,
+  resolveNewRecommendedVideoModels,
+} from '@/features/settings/recommendedApis';
 
 export type UiRadiusPreset = 'compact' | 'default' | 'large';
 export type ThemeTonePreset = 'neutral' | 'warm' | 'cool';
@@ -42,8 +47,27 @@ export interface CustomApiCapabilities {
   videoQueryPath: string;
   videoReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
   taskProtocol: 'generic' | 'unknown';
-  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api';
+  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model';
 }
+
+/**
+ * 归一化白名单。
+ *
+ * 写成 `Record<联合类型, true>` 而不是 `||` 链, 是为了让编译器**强制穷举**:
+ * 往 `videoTransport` 联合里加一个协议却忘了加进这里, 会直接编译不过。
+ * 漏掉的后果不轻 —— 持久化往返时该值被静默丢弃, 平台下次启动就退回通用
+ * OpenAI 视频协议, 表现为「设置里明明配了专属链路, 重启后就不生效了」
+ * (此前 `wgspai-video` 就是这么漏掉的)。
+ */
+const VIDEO_TRANSPORT_SET: Record<NonNullable<CustomApiCapabilities['videoTransport']>, true> = {
+  'sub2api-video': true,
+  'zzdh-v8-video': true,
+  'binghuo-video': true,
+  'wgspai-video': true,
+  'zhiniao-video': true,
+  'zhenjian-task-api': true,
+  'runninghub-model': true,
+};
 
 /** 即梦 CLI 是本地命令行工具，不使用 OpenAI 兼容平台的 API Key 配置。 */
 export interface JimengCliSettings {
@@ -203,6 +227,16 @@ export interface CustomApiProvider {
   /** 平台同步的官方模型价格，单位为 CNY 元；用户手动价格保存在 customModelPrices 中并优先显示。 */
   modelPrices?: Record<string, number>;
   capabilities?: CustomApiCapabilities;
+  /**
+   * 上一次从推荐预设同步视频模型时, 预设的 `videoModelsRevision`。
+   *
+   * 平台添加后 `videoModels` 就与预设脱钩了(用户可能手改过), 预设后来新增的端点
+   * 在老配置里根本看不到。启动时按这个号判断要不要补(见 `syncRecommendedVideoModels`):
+   * 小于预设当前值 = 有新增端点待追加; 大于等于 = 已对齐, 此后用户的增删不再被覆盖。
+   */
+  presetVideoModelsRevision?: number;
+  /** 上一次从推荐预设同步音频模型时的版本号。 */
+  presetAudioModelsRevision?: number;
 }
 
 /**
@@ -351,6 +385,15 @@ interface SettingsState {
   addCustomApi: (input: Omit<CustomApiProvider, 'id' | 'createdAt'>) => CustomApiProvider;
   updateCustomApi: (id: string, patch: Partial<Omit<CustomApiProvider, 'id'>>) => void;
   removeCustomApi: (id: string) => void;
+  /**
+   * 把推荐预设里**新增**的视频端点补进已添加的平台(只追加, 不删除、不重排)。
+   *
+   * 平台一旦被添加, 它的模型列表就与预设脱钩了, 预设后来的更新老用户拿不到。
+   * 启动时调一次即可 —— 已对齐的平台是 no-op, 不会反复写盘。
+   */
+  syncRecommendedVideoModels: () => void;
+  /** 把推荐预设新增的音频模型追加到已添加的平台，保留用户已有模型。 */
+  syncRecommendedAudioModels: () => void;
   saveVoiceProfile: (profile: Omit<SavedVoiceProfile, 'id' | 'createdAt'> & Partial<Pick<SavedVoiceProfile, 'id' | 'createdAt'>>) => SavedVoiceProfile;
   /** 记下某个官方系统音色的本地试听音频（首次用该音色合成成功后调用）。 */
   saveSystemVoicePreview: (voiceId: string, audio: string) => void;
@@ -612,8 +655,8 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
       ? videoEncoding
       : 'unknown',
     taskProtocol: taskProtocol === 'unknown' ? 'unknown' : 'generic',
-    ...(videoTransport === 'sub2api-video' || videoTransport === 'zzdh-v8-video' || videoTransport === 'binghuo-video' || videoTransport === 'zhiniao-video' || videoTransport === 'zhenjian-task-api'
-      ? { videoTransport }
+    ...(typeof videoTransport === 'string' && Object.prototype.hasOwnProperty.call(VIDEO_TRANSPORT_SET, videoTransport)
+      ? { videoTransport: videoTransport as NonNullable<CustomApiCapabilities['videoTransport']> }
       : {}),
   };
 }
@@ -697,6 +740,17 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         referenceAssetUploadToken: String(item.referenceAssetUploadToken ?? '').trim() || undefined,
         modelPrices: normalizeOfficialModelPrices(item.modelPrices),
         capabilities: normalizeCustomApiCapabilities(item.capabilities),
+        // 这个号决定「预设新增的端点要不要补进本平台」。它是唯一一个**必须**透传的
+        // 同步游标 —— 丢一次就会让用户已删掉的预设端点被反复加回来。
+        presetVideoModelsRevision:
+          typeof item.presetVideoModelsRevision === 'number' &&
+          Number.isFinite(item.presetVideoModelsRevision)
+            ? item.presetVideoModelsRevision
+            : undefined,
+        presetAudioModelsRevision:
+          typeof item.presetAudioModelsRevision === 'number' && Number.isFinite(item.presetAudioModelsRevision)
+            ? item.presetAudioModelsRevision
+            : undefined,
       };
     })
     .filter((item) => item.id && item.name && item.baseUrl);
@@ -901,6 +955,51 @@ export const useSettingsStore = create<SettingsState>()(
           return { customApis, apiKeys: nextKeys };
         });
       },
+      syncRecommendedVideoModels: () => {
+        let changed = false;
+        const customApis = get().customApis.map((api) => {
+          const resolved = resolveNewRecommendedVideoModels(
+            api.baseUrl,
+            api.videoModels,
+            api.presetVideoModelsRevision
+          );
+          if (!resolved) return api;
+          changed = true;
+          return {
+            ...api,
+            // 只追加, 保留用户手加的端点与原顺序。
+            videoModels: resolved.models.length
+              ? [...api.videoModels, ...resolved.models]
+              : api.videoModels,
+            presetVideoModelsRevision: resolved.revision,
+          };
+        });
+        if (!changed) return;
+        // 统一过一遍 normalize, 免得增量出来的端点绕开既有的去重与归类。
+        set({ customApis: normalizeCustomApis(customApis) });
+      },
+      syncRecommendedAudioModels: () => {
+        let changed = false;
+        const customApis = get().customApis.map((api) => {
+          const preset = findRecommendedApiByBaseUrl(api.baseUrl);
+          const audioModels = preset?.audioModels;
+          const revision = preset?.audioModelsRevision;
+          if (!audioModels?.length || revision === undefined) return api;
+          if (api.presetAudioModelsRevision !== undefined && api.presetAudioModelsRevision >= revision) {
+            return api;
+          }
+          const known = new Set(api.audioModels.map((model) => model.trim().toLowerCase()));
+          const added = audioModels.filter((model) => !known.has(model.trim().toLowerCase()));
+          changed = true;
+          return {
+            ...api,
+            audioModels: added.length ? [...api.audioModels, ...added] : api.audioModels,
+            presetAudioModelsRevision: revision,
+          };
+        });
+        if (!changed) return;
+        set({ customApis: normalizeCustomApis(customApis) });
+      },
       saveVoiceProfile: (profile) => {
         const name = profile.name.trim();
         const voiceId = profile.voiceId.trim();
@@ -1061,6 +1160,11 @@ export const useSettingsStore = create<SettingsState>()(
           // 此时直接访问 useSettingsStore 会触发 TDZ(Cannot access before initialization)
           setTimeout(() => {
             useSettingsStore.setState({ isHydrated: true });
+            // 预设的视频模型清单可能已经扩充(如 RunningHub 后期补进 Seedance 2.5),
+            // 而平台一旦被添加, 它的模型列表就与预设脱钩了 —— 这里按差集把新增端点
+            // 追加进去。已对齐的平台是 no-op, 不会反复写盘。
+            useSettingsStore.getState().syncRecommendedVideoModels();
+            useSettingsStore.getState().syncRecommendedAudioModels();
           }, 0);
         };
       },

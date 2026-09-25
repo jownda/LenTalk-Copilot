@@ -1,4 +1,5 @@
 import type { Locale } from "../i18n";
+import { renderVoiceReferenceSentence } from "@/features/canvas/domain/voiceReferenceFormat";
 
 /** 轻量模式中被明确选中的素材；图片序号与最终提示词的 [imageN] 一一对应。 */
 export interface QuickPromptAsset {
@@ -73,6 +74,25 @@ function renderAsset(asset: QuickPromptAsset, kind: AssetBlockKind): string {
   return `@${asset.name}${reference} (${kind} ${mediaType})${description}`;
 }
 
+/**
+ * 角色声线的引用行：直接给出**成品里要出现的那句话**，让模型照抄，而不是给一个
+ * `@角色声音 [audio1]` 这样的原始标记 —— 成品提示词统一使用
+ * 「使用 @音频N 作为 @角色 的唯一人声参考。」这种可读的绑定句（`@音频N` 也是
+ * 画布视频节点「引用」按钮插入的规范标记）。
+ *
+ * 音频序号缺失（素材没有可上传的源文件）时给不出标记，退化成只有角色名的说明。
+ */
+function renderCharacterVoiceReference(asset: QuickPromptAsset, locale: Locale): string {
+  const description = asset.description?.trim() ? ` — ${asset.description.trim()}` : "";
+  const audioIndex = asset.referenceIndex;
+  if (!audioIndex) return `@${asset.name} (character audio)${description}`;
+  const sentence = renderVoiceReferenceSentence(
+    { audioIndex, characterName: asset.name },
+    locale === "zh" ? "zh" : "en",
+  );
+  return `${sentence}${description}`;
+}
+
 /** 场景站位：只输出有内容的行，避免空标题干扰模型。 */
 function renderStaging(staging: QuickPromptStaging): string[] {
   const lines: string[] = [];
@@ -130,9 +150,13 @@ export function buildQuickPromptRequest(input: QuickPromptInput, locale: Locale)
   const references = allReferenceAssets
     .filter(({ asset }) => asset.mediaType !== "audio")
     .map(({ asset, kind }) => renderAsset(asset, kind));
+  // 角色声线走绑定句（成品里要出现的那句话）；场景 / 道具音频（环境音、音效）保持
+  // 原来的标记写法 —— 它们不是任何人的声线，不该被写成「唯一人声参考」。
   const voiceReferences = allReferenceAssets
     .filter(({ asset }) => asset.mediaType === "audio")
-    .map(({ asset, kind }) => renderAsset(asset, kind));
+    .map(({ asset, kind }) => (kind === "character"
+      ? renderCharacterVoiceReference(asset, locale)
+      : renderAsset(asset, kind)));
   const visualProps = props.filter((asset) => asset.mediaType !== "audio");
   const propByName = new Map(props.map((prop) => [prop.id, prop.name]));
   const stagingLines = input.staging ? renderStaging(input.staging) : [];
@@ -195,6 +219,7 @@ export function buildQuickPromptRequest(input: QuickPromptInput, locale: Locale)
       "SCENE STAGING, CHARACTER PROFILES, and PROP ASSETS are planning context, never output text. Reference them strictly by the story synopsis: bring in a roster character only when the synopsis events actually involve them; keep a character out when the synopsis never places them on screen; use a prop only when the synopsis implies it is visible, carried, or used; apply the spatial anchor, left-to-right order, spacing, and axis to the blocking you write. Visual @asset tags and [imageN] tokens come only from ACTIVE REFERENCES. Audio @asset tags and [audioN] tokens come only from VOICE LOCK REFERENCES, and must be used only in AUDIO for a character who actually speaks.",
       "An ACTING MASTER is an AI-only identity and behavioural baseline for one character: use it to understand who the character is, then write that character's performance for this story moment. Never paste, quote, paraphrase line by line, or expose it as a section, and never output a CHARACTER ACTING heading.",
       "A VOICE LOCK is a per-character vocal formula. Paste it verbatim into AUDIO only for a character who actually speaks a line in the synopsis; omit it for a character who stays silent, and never invent a voice lock for a character who has none.",
+      "Character voice references follow one fixed binding sentence, copied verbatim from VOICE LOCK REFERENCES into AUDIO: `使用 @音频N 作为 @角色 的唯一人声参考。` (English output: `Use @音频N as the only voice reference for @角色.`). Keep the @音频N token and the @角色 tag exactly as supplied. Never emit [audioN], @audioN, a bare 声音参考 / voice reference label, or more than one binding for the same character, and never write an audio token outside AUDIO.",
       "For every active character, follow ACTING SYSTEM: write behavior under immediate pressure, never emotion labels. Give a playable objective directed at a partner, a concrete obstacle or stake, changing action-verb tactics, and two to four visible beats when scene duration supports them. Show thought before words, listening/reaction before a reply, assessment pauses, purposeful physical business, motivated changes in distance and status through the body. Preserve subtext through behavior, not explanation.",
       "Make performance observable: use gaze targets, natural micro-saccades, state-appropriate blinks and live catchlights; eyes lead the thought. Tie posture, center of gravity, breath, tempo, physical habits and speech rhythm to the scene pressure. Use stable playable states rather than vague transition chains. Ensemble reactions must travel in staggered waves, never synchronized; do not put wardrobe, camera, color or generic emotion labels inside performance instructions.",
       "Keep every @asset tag and every [imageN] or [audioN] token exactly as received. A [video input] is an upstream video reference: use it as scene context without inventing a new asset token. Visual reference descriptions belong in ACTIVE REFERENCES; voice reference descriptions belong in VOICE LOCK REFERENCES and must not be moved into ACTIVE REFERENCES. Do not contradict or rename them. Before returning, silently verify active references, voice locks, first frame, spatial logic, gaze, camera side, optics, lighting, physics, timing, dialogue hygiene, continuity, prompt density and acting specificity; fix every failure before output.",
