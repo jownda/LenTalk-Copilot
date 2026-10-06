@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Check, CircleAlert, Copy, Download, GitBranch, LoaderCircle, Pencil, Play, Trash2, Video, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { UiButton, UiIconButton, UiInput, UiPanel, UiTextArea } from '@/components/ui/primitives';
+import { UiButton, UiIconButton, UiInput, UiModal, UiPanel, UiTextArea } from '@/components/ui/primitives';
 import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import { saveMediaSourceWithDialog } from '@/features/canvas/application/mediaDownload';
 import { regenerateTemplate } from './regenerate';
@@ -11,6 +11,9 @@ import { findReferenceTokens } from '@/features/canvas/application/referenceToke
 import { ImageViewerModal } from '@/features/canvas/ui/ImageViewerModal';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useAssetLibraryStore } from '@/features/library/assetStore';
+import { OverlayLayerProvider } from '@/components/ui/overlayLayer';
+import { UI_TEMPLATE_DETAIL_OVERLAY_LAYER_Z } from '@/components/ui/motion';
+import { TemplateDeleteConfirmDialog } from './TemplateDeleteConfirm';
 import { type AssetRef, type Template } from './types';
 
 function applyPromptToGraph(template: Template, nextPrompt: string): Template {
@@ -204,10 +207,28 @@ function VideoHistoryCard({
   );
 }
 
-export function TemplateDetailPage() {
+export type TemplateDetailMode = 'page' | 'dialog';
+
+interface TemplateDetailViewProps {
+  /** 模板 id：页面形态来自路由参数，弹窗形态由调用方传入。 */
+  templateId?: string;
+  /**
+   * 展示形态。`page` = 独立路由页（带返回列表入口与「查看节点」）；
+   * `dialog` = 画布内浮层，去掉这两个会离开画布的入口，其余内容完全一致。
+   */
+  mode: TemplateDetailMode;
+  /** 弹窗形态的关闭回调；页面形态不使用（删除后直接回列表页）。 */
+  onClose?: () => void;
+}
+
+/**
+ * 模板详情主体。详情页与画布内的详情弹窗共用同一份实现，
+ * 避免两处各写一套之后内容漂移。
+ */
+function TemplateDetailView({ templateId, mode, onClose }: TemplateDetailViewProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { templateId } = useParams();
+  const isDialog = mode === 'dialog';
   const [template, setTemplate] = useState<Template | null>(null);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -216,6 +237,8 @@ export function TemplateDetailPage() {
   const [busy, setBusy] = useState(false);
   const [downloadingRunId, setDownloadingRunId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [activeVideo, setActiveVideo] = useState<{ source: string; name: string } | null>(null);
   const imageViewer = useCanvasStore((state) => state.imageViewer);
   const closeImageViewer = useCanvasStore((state) => state.closeImageViewer);
@@ -288,10 +311,29 @@ export function TemplateDetailPage() {
     }
   };
 
-  const handleDelete = async () => {
-    if (!template || !window.confirm(t('templatePage.confirmDelete', { name: template.name }))) return;
-    await browserTemplateRepository.delete(template.id);
-    navigate('/templates');
+  // 删除前只弹一张轻量确认卡片：不再用 window.confirm（各平台形态不一），
+  // 更不会为了删除而把整份提示词铺开。
+  const handleDelete = () => {
+    if (!template) return;
+    setDeleteConfirmOpen(true);
+  };
+
+  const confirmDelete = async () => {
+    if (!template) return;
+    setDeleting(true);
+    try {
+      await browserTemplateRepository.delete(template.id);
+      setDeleteConfirmOpen(false);
+      // 弹窗里删完不能跳模板列表页（会把当前画布整个换掉），只关闭浮层，
+      // 由调用方自行刷新卡片列表。
+      if (isDialog) {
+        onClose?.();
+        return;
+      }
+      navigate('/templates');
+    } finally {
+      setDeleting(false);
+    }
   };
 
   if (!template) {
@@ -328,18 +370,21 @@ export function TemplateDetailPage() {
   };
 
   return (
-    <div className="ui-scrollbar h-full min-h-0 overflow-auto p-4 sm:p-6 lg:p-8">
+    // 弹窗形态下滚动与内边距交给 UiModal 的内容区（它自带 overflow-y-auto + padding），
+    // 这里只负责占满宽度；页面形态仍是整页滚动容器。
+    <div className={isDialog ? 'w-full min-w-0' : 'ui-scrollbar h-full min-h-0 overflow-auto p-4 sm:p-6 lg:p-8'}>
       <div className="mx-auto w-full max-w-[1600px]">
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
           <div className="flex min-w-0 items-center gap-3">
-            <Link to="/templates"><UiIconButton title={t('titleBar.back')} aria-label={t('titleBar.back')}><ArrowLeft className="h-4 w-4" /></UiIconButton></Link>
+            {!isDialog && <Link to="/templates"><UiIconButton title={t('titleBar.back')} aria-label={t('titleBar.back')}><ArrowLeft className="h-4 w-4" /></UiIconButton></Link>}
             {editing ? <UiInput value={name} onChange={(event) => setName(event.target.value)} className="max-w-[420px] text-lg font-semibold" /> : <h1 className="truncate text-2xl font-bold text-text-dark">{template.name}</h1>}
           </div>
           <div className="flex items-center gap-2">
-            {template.graph && <Link to={`/templates/${template.id}/graph`}><UiButton type="button" variant="muted" size="sm" className="gap-2"><GitBranch className="h-4 w-4" />{t('templatePage.viewNodes')}</UiButton></Link>}
+            {/* 「查看节点」会跳走并接管画布 store，画布内弹窗不提供。 */}
+            {!isDialog && template.graph && <Link to={`/templates/${template.id}/graph`}><UiButton type="button" variant="muted" size="sm" className="gap-2"><GitBranch className="h-4 w-4" />{t('templatePage.viewNodes')}</UiButton></Link>}
             {editing ? <UiButton type="button" variant="primary" size="sm" className="gap-2" onClick={() => void handleSave()} disabled={!name.trim() || !prompt.trim()}><Check className="h-4 w-4" />{t('common.save')}</UiButton> : <UiButton type="button" variant="muted" size="sm" className="gap-2" onClick={() => setEditing(true)}><Pencil className="h-4 w-4" />{t('templatePage.edit')}</UiButton>}
             <UiButton type="button" variant="primary" size="sm" className="gap-2" onClick={() => void handleRegenerate()} disabled={busy || template.status === 'broken' || !prompt.trim()}><Video className="h-4 w-4" />{busy ? t('templatePage.regenerating') : t('templatePage.regenerate')}</UiButton>
-            <UiIconButton onClick={() => void handleDelete()} title={t('templatePage.delete')} aria-label={t('templatePage.delete')} className="text-red-400"><Trash2 className="h-4 w-4" /></UiIconButton>
+            <UiIconButton onClick={handleDelete} title={t('templatePage.delete')} aria-label={t('templatePage.delete')} className="text-red-400"><Trash2 className="h-4 w-4" /></UiIconButton>
           </div>
         </div>
         {notice && <p role="status" className="mb-4 text-sm text-emerald-400">{notice}</p>}
@@ -388,6 +433,54 @@ export function TemplateDetailPage() {
           </div>
         </div>
       )}
+      <TemplateDeleteConfirmDialog
+        open={deleteConfirmOpen}
+        templateName={template.name}
+        busy={deleting}
+        onCancel={() => setDeleteConfirmOpen(false)}
+        onConfirm={() => void confirmDelete()}
+      />
     </div>
+  );
+}
+
+/** 模板详情路由页（`/templates/:templateId`）。 */
+export function TemplateDetailPage() {
+  const { templateId } = useParams();
+  return <TemplateDetailView templateId={templateId} mode="page" />;
+}
+
+interface TemplateDetailDialogProps {
+  /** 要查看的模板 id；null 表示关闭。 */
+  templateId: string | null;
+  onClose: () => void;
+}
+
+/**
+ * 画布内模板详情弹窗：双击模板卡片打开。
+ *
+ * 与详情页共用同一份主体，所以内容不会两处漂移；只按形态差异去掉「返回列表」与
+ * 「查看节点」两个会离开画布的入口。
+ */
+export function TemplateDetailDialog({ templateId, onClose }: TemplateDetailDialogProps) {
+  const { t } = useTranslation();
+  // 记住最后一个 id：UiModal 关闭时有一段淡出动画，若立刻把 children 置空，
+  // 面板会在淡出期间只剩标题栏。
+  const [lastTemplateId, setLastTemplateId] = useState<string | null>(templateId);
+  useEffect(() => {
+    if (templateId) setLastTemplateId(templateId);
+  }, [templateId]);
+
+  return (
+    <OverlayLayerProvider value={UI_TEMPLATE_DETAIL_OVERLAY_LAYER_Z}>
+      <UiModal
+        isOpen={Boolean(templateId)}
+        title={t('templatePage.viewDetail', '模板详情')}
+        onClose={onClose}
+        widthClassName="w-[min(1180px,calc(100vw-4rem))]"
+      >
+        {lastTemplateId ? <TemplateDetailView templateId={lastTemplateId} mode="dialog" onClose={onClose} /> : null}
+      </UiModal>
+    </OverlayLayerProvider>
   );
 }

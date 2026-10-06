@@ -57,3 +57,27 @@ export async function syncTemplatesFromShare(sharedRoot: string): Promise<{ impo
   if (!isTauri()) throw new Error('共享盘读取仅支持桌面端');
   return withSyncTimeout(invoke<{ importedCount: number }>('template_sync_from_share', { sharedRoot }));
 }
+
+export interface TemplateUploadResult {
+  /** 共享盘原本没有该模板（新建包目录）；false 表示原地更新了已有包。 */
+  created: boolean;
+  copiedFileCount: number;
+}
+
+/** 单独上传一个模板到共享盘（画布内模板卡片右键）。 */
+export async function uploadTemplateToShare(templateId: string, sharedRoot: string): Promise<TemplateUploadResult> {
+  if (!isTauri()) throw new Error('共享盘上传仅支持桌面端');
+  return withSyncTimeout(invoke<TemplateUploadResult>('template_upload_to_share', { templateId, sharedRoot }));
+}
+
+/**
+ * 取当前生效的共享盘位置：优先用户保存过的设置，没有就用内置默认路径。
+ *
+ * 画布里的右键上传/同步按钮不弹设置窗（改路径仍在模板页的「同步共享盘」里），
+ * 所以这里必须有一个兜底值，否则第一次用会直接报「请输入共享盘文件夹路径」。
+ */
+export async function resolveTemplateShareRoot(): Promise<string> {
+  if (!isTauri()) return DEFAULT_TEMPLATE_SHARE_ROOT;
+  const saved = await loadTemplateShareRoot().catch(() => null);
+  return saved?.trim() || DEFAULT_TEMPLATE_SHARE_ROOT;
+}

@@ -10,6 +10,8 @@ import { UpdateAvailableDialog, type UpdateIgnoreMode } from './components/Updat
 import { GlobalErrorDialog } from './components/GlobalErrorDialog';
 import { ProjectManager } from './features/project/ProjectManager';
 import { useThemeStore } from './stores/themeStore';
+import { useAssetLibraryStore } from './features/library/assetStore';
+import type { LibraryAsset } from './features/library/types';
 import { useProjectStore } from './stores/projectStore';
 import { useSettingsStore } from './stores/settingsStore';
 import { jimengCliDetect, jimengCliInstall } from './commands/ai';
@@ -93,6 +95,36 @@ function AppShell() {
   useEffect(() => {
     void hydrate();
   }, [hydrate]);
+
+  // 浏览器扩展投递进来的素材：后端已经落库，这里只把它合并进内存态，
+  // 否则下一次素材库保存会用旧内存态把服务端刚写的记录覆盖掉。
+  useEffect(() => {
+    if (!isTauri()) return;
+
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+
+    void (async () => {
+      const { listen } = await import('@tauri-apps/api/event');
+      const stop = await listen<LibraryAsset[]>('media-bridge://assets', (event) => {
+        // store 还没 hydrate 时内存里是默认空态，这时候合并再持久化会把已有素材清掉；
+        // 直接跳过即可 —— 记录已经在磁盘上，hydrate 时会读到。
+        const store = useAssetLibraryStore.getState();
+        if (!store.isHydrated) return;
+        store.upsertAssets(event.payload ?? []);
+      });
+      if (cancelled) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+    })();
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     const unsubscribe = subscribeOpenGlobalErrorDialog((detail) => {

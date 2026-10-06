@@ -12,10 +12,10 @@ import {
   validateSunoMusicInput,
 } from "@/commands/sunoMusic";
 import {
+  AUDIO_NODE_DEFAULT_HEIGHT,
+  AUDIO_NODE_DEFAULT_WIDTH,
   CANVAS_NODE_TYPES,
   DEFAULT_ASPECT_RATIO,
-  EXPORT_RESULT_NODE_DEFAULT_WIDTH,
-  EXPORT_RESULT_NODE_LAYOUT_HEIGHT,
   type AudioGenNodeData,
 } from "@/features/canvas/domain/canvasNodes";
 import { resolveNodeDisplayName } from "@/features/canvas/domain/nodeDisplay";
@@ -625,7 +625,7 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
             : {}),
         },
       });
-      updateNodeSize(outputId, EXPORT_RESULT_NODE_DEFAULT_WIDTH, EXPORT_RESULT_NODE_LAYOUT_HEIGHT);
+      updateNodeSize(outputId, AUDIO_NODE_DEFAULT_WIDTH, AUDIO_NODE_DEFAULT_HEIGHT);
       addEdge(id, outputId);
       setIsGenerating(true);
       if (isMmxStudio) setActiveCard("speech");

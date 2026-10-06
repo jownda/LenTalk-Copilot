@@ -28,6 +28,9 @@ export const DEFAULT_NODE_WIDTH = 220;
 // AI 结果节点默认采用紧凑尺寸，避免连续生成时快速占满画布。
 export const EXPORT_RESULT_NODE_DEFAULT_WIDTH = 192;
 export const EXPORT_RESULT_NODE_LAYOUT_HEIGHT = 144;
+// 纯音频节点使用横向波形布局，默认尺寸为 200 × 100。
+export const AUDIO_NODE_DEFAULT_WIDTH = 200;
+export const AUDIO_NODE_DEFAULT_HEIGHT = 100;
 export const EXPORT_RESULT_NODE_MIN_WIDTH = 96;
 export const EXPORT_RESULT_NODE_MIN_HEIGHT = 96;
 /** AI 图片节点允许一次请求的输出数量。 */
@@ -208,7 +211,13 @@ export interface VideoGenNodeData extends NodeDisplayData {
   binghuoReferenceVideos?: string[];
   /** 炳火专用: 跳过真人审核(责任声明, 手册 3.8)。仅 bh 系(bh2.0-*, bh2.04K)生效。 */
   binghuoSkipReview?: boolean;
-  /** 当前视频节点发起的下游媒体任务；任务终态前禁止再次提交。 */
+  /**
+   * 当前视频节点发起的、仍在跑的下游媒体任务 id 列表。
+   * 允许连点后同一个源节点可以同时挂多个任务，故用列表；只用于展示「生成中 / 已提交几个」，
+   * 不再充当提交互斥锁（提交频率由 2s 冷却控制）。
+   */
+  activeGenerationNodeIds?: string[];
+  /** @deprecated 单任务时代的字段。仅用于读取旧工程，读取优先级见 collectActiveGenerationNodeIds。 */
   activeGenerationNodeId?: string | null;
 }
 

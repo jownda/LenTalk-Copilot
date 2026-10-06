@@ -145,8 +145,8 @@ export function TemplatePage() {
         : right.updatedAt.localeCompare(left.updatedAt));
   }, [query, sort, templates]);
 
+  // 不弹确认框：删除入口已经在「…」菜单里，属于两步操作，再拦一层太啰嗦。
   const handleDelete = async (template: Template) => {
-    if (!window.confirm(t('templatePage.confirmDelete', { name: template.name }))) return;
     await browserTemplateRepository.delete(template.id);
     await refresh();
   };

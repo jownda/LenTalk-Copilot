@@ -513,19 +513,22 @@ export function UiModal({
         onClick={onClose}
       />
       <UiPanel
-        className={`relative transition-opacity duration-200 ${isVisible ? 'opacity-100' : 'opacity-0'} ${widthClassName}`}
+        className={`relative flex max-h-[calc(100vh-5rem)] flex-col transition-opacity duration-200 ${isVisible ? 'opacity-100' : 'opacity-0'} ${widthClassName}`}
       >
-        <div className="flex items-center justify-between border-b border-[rgba(255,255,255,0.1)] px-4 py-3">
+        <div className="flex shrink-0 items-center justify-between border-b border-[rgba(255,255,255,0.1)] px-4 py-3">
           <h2 className="text-sm font-medium text-text-dark">{title}</h2>
           <UiGhostIconButton className="h-8 w-8" onClick={onClose}>
             <X className="h-4 w-4" />
           </UiGhostIconButton>
         </div>
 
-        <div className="px-4 py-4">{children}</div>
+        {/* 内容区独立滚动：遮罩层顶部让出了 40px（UI_CONTENT_OVERLAY_INSET_CLASS
+            的 top-10），所以面板限高取 100vh-5rem 才真正落在可视区内。超高时只在
+            中间滚动，标题栏与底部按钮始终可点，避免弹窗长出画面后够不到操作。 */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">{children}</div>
 
         {footer && (
-          <div className="flex justify-end gap-2 border-t border-[rgba(255,255,255,0.1)] px-4 py-3">
+          <div className="flex shrink-0 justify-end gap-2 border-t border-[rgba(255,255,255,0.1)] px-4 py-3">
             {footer}
           </div>
         )}

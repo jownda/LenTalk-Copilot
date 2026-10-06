@@ -9,10 +9,12 @@ use commands::ai as ai_commands;
 use commands::asset_library;
 use commands::balance;
 use commands::cinematic_studio;
+use commands::clipboard;
 use commands::cloud_drive;
 use commands::image;
 use commands::jimeng_cli;
 use commands::media_file;
+use commands::novel;
 use commands::pajuben;
 use commands::wan_cli;
 use commands::project_state;
@@ -24,7 +26,10 @@ use commands::template_sync;
 use commands::update;
 use commands::usage_log;
 use commands::video_cfr;
-use tauri::Manager;
+use commands::video_edit;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, WindowEvent};
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -90,6 +95,44 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// 系统托盘: 关闭按钮之后主窗口只是收起, 靠托盘把窗口叫回来, 并提供真正的退出入口。
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(app, "tray_show", "显示主窗口", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "tray_quit", "退出应用", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+    let builder = TrayIconBuilder::with_id("main-tray")
+        .menu(&menu)
+        .tooltip("LenTalk")
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "tray_show" => show_main_window(app),
+            "tray_quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(&tray.app_handle());
+            }
+        });
+
+    // Windows: 左键单击直接唤起窗口, 右键弹菜单; macOS 保留菜单栏图标默认行为(点击即弹菜单)。
+    #[cfg(target_os = "windows")]
+    let builder = builder.show_menu_on_left_click(false);
+
+    let builder = match app.default_window_icon().cloned() {
+        Some(icon) => builder.icon(icon),
+        None => builder,
+    };
+
+    builder.build(app)?;
+    Ok(())
+}
+
 #[tauri::command]
 fn frontend_ready(app: tauri::AppHandle) {
     info!("frontend_ready received, revealing main window");
@@ -100,7 +143,7 @@ fn frontend_ready(app: tauri::AppHandle) {
 pub fn run() {
     setup_logging();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .on_page_load(|window, _payload| {
             if window.label() != MAIN_WINDOW_LABEL {
                 return;
@@ -108,6 +151,19 @@ pub fn run() {
 
             info!("main page loaded, revealing main window");
             show_main_window(&window.app_handle());
+        })
+        .on_window_event(|window, event| {
+            if window.label() != MAIN_WINDOW_LABEL {
+                return;
+            }
+
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // 关闭按钮不再退出应用: 只收起窗口(hide, 非 minimize), 进程留在后台由托盘唤起。
+                api.prevent_close();
+                if let Err(err) = window.hide() {
+                    warn!("failed to hide main window on close: {err}");
+                }
+            }
         })
         .setup(|app| {
             database::initialize(app.handle())?;
@@ -178,6 +234,17 @@ pub fn run() {
                 }
             });
 
+            // 托盘构建失败不影响主流程(只是关闭后少一个唤起入口), 记日志继续。
+            if let Err(err) = setup_tray(app.handle()) {
+                warn!("failed to build system tray: {err}");
+            }
+
+            // 浏览器扩展投递通道: 端口被占满只是少一个入口, 同样不阻塞启动。
+            match commands::media_bridge::start(app.handle().clone()) {
+                Ok(port) => info!("media bridge listening on 127.0.0.1:{port}"),
+                Err(err) => warn!("failed to start media bridge: {err}"),
+            }
+
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -186,6 +253,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(commands::pajuben::PajubenState::default())
+        .manage(commands::novel::NovelState::default())
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
             database::load_app_setting,
@@ -202,12 +270,14 @@ pub fn run() {
             image::read_storyboard_image_metadata,
             image::embed_storyboard_image_metadata,
             image::load_image,
+            clipboard::read_clipboard_media,
             media_file::resolve_media_file_size,
             media_file::load_media_data_url,
             video_cfr::normalize_video_cfr,
             video_cfr::prepare_video_playback,
             video_cfr::remove_video_playback_file,
             video_cfr::extract_video_frame,
+            video_edit::render_video_edit,
             pajuben::pajuben_probe,
             pajuben::pajuben_run,
             pajuben::pajuben_cancel,
@@ -298,8 +368,34 @@ pub fn run() {
             template_state::delete_template_record,
             template_sync::template_sync_to_share,
             template_sync::template_sync_from_share,
+            template_sync::template_upload_to_share,
             update::get_latest_release_info,
+            novel::novel_environment,
+            novel::novel_server_start,
+            novel::novel_server_stop,
+            novel::novel_server_status,
+            novel::novel_api_get,
+            novel::novel_api_post,
+            novel::novel_asset_data_url,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        // macOS: 窗口收起后点击 Dock 图标, 重新显示主窗口。
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = event {
+            show_main_window(app_handle);
+        }
+
+        // 退出前回收下载器 sidecar，避免留下孤儿进程。
+        if let tauri::RunEvent::Exit = event {
+            if let Some(state) = app_handle.try_state::<commands::novel::NovelState>() {
+                commands::novel::shutdown(&state);
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        let _ = (app_handle, event);
+    });
 }

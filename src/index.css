@@ -207,6 +207,13 @@ html[data-platform='macos'] #root {
     0 8px 22px rgb(var(--accent-rgb) / 0.24) !important;
 }
 
+/* 音频 / 视频媒体节点保持单层描边：选中时仅改变自身 1px 边框颜色，
+   不叠加通用节点的双层外发光。 */
+.react-flow__node.selected > .canvas-media-node {
+  border-color: rgb(var(--accent-rgb) / 0.98) !important;
+  box-shadow: none !important;
+}
+
 .ui-panel {
   background: var(--ui-surface-panel);
   border-color: var(--ui-border-soft);

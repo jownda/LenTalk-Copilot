@@ -87,6 +87,18 @@ function createWaveformBarsFromBuffer(buffer: AudioBuffer, count = 56): number[]
 const blankThumbnailCache = new Set<string>();
 
 /**
+ * 封面自动抽取的配额(键 = `节点id|视频来源`)。
+ *
+ * 抽不出封面时 `previewImageUrl` 会一直是空的, effect 每次依赖变化或节点重新挂载都会再跑
+ * 一遍, 而每一遍至少要启动一次 ffmpeg —— Windows 上就是黑框反复弹出。这里给每个(节点, 来源)
+ * 一份配额, 用完后不再自动重试; 换了来源会得到新键, 配额随之重置。
+ */
+const thumbnailAttemptCounts = new Map<string, number>();
+
+/** 自动抽取的最大尝试次数: 给"首帧尚未提交 → 抽出空白 → 清空重抽"这轮预期内的往返留余量。 */
+const MAX_THUMBNAIL_ATTEMPTS = 3;
+
+/**
  * 判断缩略图是否为空白图。
  *
  * 早期版本在视频帧尚未提交到合成器时就抽帧, 全透明画布被当成缩略图存了下来, 又因为内容
@@ -153,6 +165,9 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
+  // 音频 timeupdate 事件频率较低；波形进度直接用 rAF 驱动 DOM，避免逐格跳动。
+  const audioProgressFillRef = useRef<HTMLDivElement>(null);
+  const audioPlayheadRef = useRef<HTMLDivElement>(null);
   const viewerVideoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   /** 画面上的透明交互层: 承接指针事件并冒泡到节点, 实现"画面任意位置左键拖动节点"。 */
@@ -225,6 +240,8 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     setVideoDuration(0);
     setPlaybackTime(0);
     playbackTimeRef.current = 0;
+    audioProgressFillRef.current?.style.setProperty("clip-path", "inset(0 100% 0 0)");
+    audioPlayheadRef.current?.style.setProperty("left", "0%");
     setIsPlaying(false);
     localVideoFallbackLoadingRef.current = false;
     setLocalVideoFallbackSrc((current) => {
@@ -351,6 +368,14 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     setPlaybackTime(nextTime);
   }, []);
 
+  const updateAudioWaveformProgress = useCallback((time: number, duration: number) => {
+    if (!Number.isFinite(time) || !Number.isFinite(duration) || duration <= 0) return;
+    const percent = Math.max(0, Math.min(100, (time / duration) * 100));
+    // 只写两个轻量 DOM 属性，不让 56 根波形柱在每一帧随 React 重渲染。
+    audioProgressFillRef.current?.style.setProperty("clip-path", `inset(0 ${100 - percent}% 0 0)`);
+    audioPlayheadRef.current?.style.setProperty("left", `${percent}%`);
+  }, []);
+
   const seekAudio = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
       const audio = audioRef.current;
@@ -358,10 +383,27 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       const rect = event.currentTarget.getBoundingClientRect();
       const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
       audio.currentTime = ratio * audio.duration;
+      updateAudioWaveformProgress(audio.currentTime, audio.duration);
       updatePlaybackTime(audio.currentTime, true);
     },
-    [updatePlaybackTime],
+    [updateAudioWaveformProgress, updatePlaybackTime],
   );
+
+  // 浏览器的 timeupdate 通常只有 4～10fps。播放中额外用 requestAnimationFrame 读取
+  // currentTime，让波形遮罩与播放头连续移动；React 状态仍按 0.2 秒节流更新时钟文本。
+  useEffect(() => {
+    if (isVideo || !isPlaying) return;
+    let frameId = 0;
+    const updateFrame = () => {
+      const audio = audioRef.current;
+      if (!audio || audio.paused) return;
+      updateAudioWaveformProgress(audio.currentTime, audio.duration);
+      updatePlaybackTime(audio.currentTime);
+      frameId = requestAnimationFrame(updateFrame);
+    };
+    frameId = requestAnimationFrame(updateFrame);
+    return () => cancelAnimationFrame(frameId);
+  }, [isPlaying, isVideo, updateAudioWaveformProgress, updatePlaybackTime]);
 
   // 视频解码出真实尺寸后, 把宽高比写回节点数据: 拖拽缩放据此保持画面比例。
   // 只是补充元信息, 不参与历史记录, 因此走 transient 写入。
@@ -577,6 +619,11 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     if (!isVideo || !isTauri() || data.previewImageUrl || !sourcePath) {
       return;
     }
+    // 配额用尽就不再自动重试, 避免"抽帧失败/抽出空白 → 清空 → 再抽"无限循环。
+    const thumbnailKey = `${id}|${sourcePath}`;
+    if ((thumbnailAttemptCounts.get(thumbnailKey) ?? 0) >= MAX_THUMBNAIL_ATTEMPTS) {
+      return;
+    }
     let disposed = false;
     const commitThumbnail = (thumbnail: string | null | undefined): boolean => {
       if (disposed || !thumbnail) {
@@ -586,20 +633,27 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       return true;
     };
     void (async () => {
-      const localThumbnail = await extractVideoThumbnail(sourcePath).catch(() => null);
-      if (commitThumbnail(localThumbnail) || disposed) {
-        return;
-      }
       try {
-        const dataUrl = await captureVideoFrame({
-          source: sourcePath,
-          maxWidth: REMOTE_VIDEO_THUMBNAIL_MAX_WIDTH,
-        });
-        const prepared = await prepareNodeImage(dataUrl);
-        commitThumbnail(prepared.previewImageUrl ?? prepared.imageUrl ?? dataUrl);
-      } catch (error) {
-        // 三级取帧都失败时保持 video 播放器显示, 不打断用户。
-        console.warn("[mediaNode] remote video thumbnail fallback failed", error);
+        const localThumbnail = await extractVideoThumbnail(sourcePath).catch(() => null);
+        if (commitThumbnail(localThumbnail) || disposed) {
+          return;
+        }
+        try {
+          const dataUrl = await captureVideoFrame({
+            source: sourcePath,
+            maxWidth: REMOTE_VIDEO_THUMBNAIL_MAX_WIDTH,
+          });
+          const prepared = await prepareNodeImage(dataUrl);
+          commitThumbnail(prepared.previewImageUrl ?? prepared.imageUrl ?? dataUrl);
+        } catch (error) {
+          // 三级取帧都失败时保持 video 播放器显示, 不打断用户。
+          console.warn("[mediaNode] remote video thumbnail fallback failed", error);
+        }
+      } finally {
+        // 因卸载被取消的那次不计数: 组件马上会重新挂载并再试, 不该白白吃掉配额。
+        if (!disposed) {
+          thumbnailAttemptCounts.set(thumbnailKey, (thumbnailAttemptCounts.get(thumbnailKey) ?? 0) + 1);
+        }
       }
     })();
     return () => {
@@ -679,7 +733,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
 
   return (
     <div
-      className={`relative flex h-full w-full flex-col rounded-[var(--node-radius)] border bg-surface-dark/90 p-2 transition-colors duration-150 ${
+      className={`relative flex h-full w-full flex-col rounded-[var(--node-radius)] border bg-surface-dark/90 transition-colors duration-150 canvas-media-node p-0 ${
         hasGenerationError
           ? selected
             ? "border-red-400 shadow-[0_0_0_1px_rgba(248,113,113,0.42)]"
@@ -706,7 +760,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
                 交互约定: 画面任意位置左键拖拽 = 移动节点; 播放/暂停/进度在底部控制条;
                 双击画面(或点放大按钮) 进放大播放器。 */}
             <div
-              className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border border-[rgba(255,255,255,0.1)] bg-black/45"
+              className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-[inherit] bg-black/45"
               onPointerEnter={() => setIsVideoHovered(true)}
               onPointerLeave={() => setIsVideoHovered(false)}
             >
@@ -802,7 +856,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
             <MediaDimensionsLabel dimensions={videoDimensions} fileSize={mediaByteSize} visible={mediaHover.visible} />
           </>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col justify-center gap-3 rounded-lg border border-[rgba(255,255,255,0.1)] bg-bg-dark/45 px-3 py-3">
+          <div className="relative min-h-0 flex-1 overflow-hidden rounded-[inherit]">
             <audio
               ref={audioRef}
               draggable={false}
@@ -817,10 +871,13 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
               onPlay={() => setIsPlaying(true)}
               onPause={() => setIsPlaying(false)}
               onEnded={() => setIsPlaying(false)}
-              onTimeUpdate={(event) => updatePlaybackTime(event.currentTarget.currentTime)}
+              onTimeUpdate={(event) => {
+                updateAudioWaveformProgress(event.currentTarget.currentTime, event.currentTarget.duration);
+                updatePlaybackTime(event.currentTarget.currentTime);
+              }}
             />
             <div
-              className="group relative flex h-16 cursor-pointer items-center gap-[3px] overflow-hidden rounded-md px-1.5"
+              className="group absolute inset-0 flex cursor-pointer items-center gap-[3px] overflow-hidden"
               onClick={seekAudio}
               role="slider"
               aria-label="音频播放进度"
@@ -828,44 +885,51 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
               aria-valuemax={videoDuration || 0}
               aria-valuenow={playbackTime}
             >
-              <div className="absolute inset-0 rounded-md bg-accent/[0.06]" />
-              <div
-                className="pointer-events-none absolute inset-y-0 left-0 rounded-md bg-accent/[0.14] transition-[width]"
-                style={{ width: `${videoDuration > 0 ? Math.min(100, (playbackTime / videoDuration) * 100) : 0}%` }}
-              />
-              {waveformBars.map((height, index) => {
-                const played = videoDuration > 0 && index / waveformBars.length <= playbackTime / videoDuration;
-                return (
+              <div className="absolute inset-0 bg-accent/[0.06]" />
+              <div className="absolute inset-0 flex items-center gap-[3px]">
+                {waveformBars.map((height, index) => (
                   <span
-                    key={`${mediaSrc}-${index}`}
-                    className={`relative z-[1] min-w-[2px] flex-1 rounded-full transition-colors ${
-                      played ? "bg-accent" : "bg-text-muted/45 group-hover:bg-text-muted/65"
-                    }`}
-                    style={{ height: `${Math.round(height * 82)}%` }}
+                    key={`${mediaSrc}-base-${index}`}
+                    className="min-w-[2px] flex-1 rounded-full bg-text-muted/45 transition-colors group-hover:bg-text-muted/65"
+                    style={{ height: `${Math.round(height * 100)}%` }}
                   />
-                );
-              })}
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                className="nodrag nopan flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-white shadow-sm transition-transform hover:scale-105"
-                onClick={toggleAudioPlayback}
-                onMouseDown={(event) => event.stopPropagation()}
-                aria-label={isPlaying ? "暂停音频" : "播放音频"}
+                ))}
+              </div>
+              <div
+                ref={audioProgressFillRef}
+                className="pointer-events-none absolute inset-0 z-[2] flex items-center gap-[3px] overflow-hidden"
+                style={{ clipPath: `inset(0 ${100 - (videoDuration > 0 ? Math.min(100, (playbackTime / videoDuration) * 100) : 0)}% 0 0)` }}
               >
-                {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="ml-0.5 h-3.5 w-3.5" />}
-              </button>
-              <AudioLines className="h-4 w-4 text-accent/80" />
-              <span className="min-w-0 flex-1 truncate text-[11px] text-text-muted">{resolvedTitle}</span>
-              <span className="shrink-0 text-[10px] tabular-nums text-text-muted/80">
-                {formatClock(playbackTime)} / {formatClock(videoDuration)}
-              </span>
+                {waveformBars.map((height, index) => (
+                  <span
+                    key={`${mediaSrc}-played-${index}`}
+                    className="min-w-[2px] flex-1 rounded-full bg-accent"
+                    style={{ height: `${Math.round(height * 100)}%` }}
+                  />
+                ))}
+              </div>
+              <div
+                ref={audioPlayheadRef}
+                className="pointer-events-none absolute inset-y-0 z-[3] w-px bg-accent/90 shadow-[0_0_5px_rgba(59,130,246,0.75)]"
+                style={{ left: `${videoDuration > 0 ? Math.min(100, (playbackTime / videoDuration) * 100) : 0}%` }}
+              />
             </div>
+            <button
+              type="button"
+              className="nodrag nopan absolute bottom-2 left-2 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-accent text-white shadow-md transition-transform hover:scale-105"
+              onClick={toggleAudioPlayback}
+              onMouseDown={(event) => event.stopPropagation()}
+              aria-label={isPlaying ? "暂停音频" : "播放音频"}
+            >
+              {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="ml-0.5 h-3.5 w-3.5" />}
+            </button>
+            <span className="pointer-events-none absolute bottom-2 right-2 z-10 rounded bg-bg-dark/65 px-1.5 py-0.5 text-[10px] tabular-nums text-text-dark/85">
+              {formatClock(playbackTime)} / {formatClock(videoDuration)}
+            </span>
           </div>
         )
       ) : hasGenerationError ? (
-        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-lg border border-red-500/40 bg-[rgba(127,29,29,0.2)] px-4 text-red-300">
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-[inherit] bg-[rgba(127,29,29,0.2)] px-4 text-red-300">
           <AlertTriangle className="h-7 w-7 opacity-90" />
           <span className="text-center text-[12px] font-medium leading-5 text-red-200">生成失败</span>
           <span className="max-h-[88px] overflow-y-auto break-words text-center text-[11px] leading-5 text-red-200/90">
@@ -873,7 +937,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
           </span>
         </div>
       ) : isGenerating ? (
-        <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-2 overflow-hidden rounded-lg border border-[rgba(255,255,255,0.1)] bg-bg-dark/45 p-2 text-text-muted/85">
+        <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-2 overflow-hidden rounded-[inherit] bg-bg-dark/45 p-2 text-text-muted/85">
           <LoaderCircle className="h-7 w-7 animate-spin text-accent/70" />
           <span className="px-4 text-center text-[12px] leading-6">{waitingResultText}</span>
           <div className="pointer-events-none absolute inset-0 overflow-hidden">
@@ -888,7 +952,7 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
         /* 空状态: 点击或拖拽上传媒体 */
         <button
           type="button"
-          className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border-dark text-text-muted transition-colors hover:border-accent/60 hover:bg-accent/5 hover:text-text-dark"
+          className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-[inherit] text-text-muted transition-colors hover:bg-accent/5 hover:text-text-dark"
           onClick={() => void handleUploadClick()}
         >
           {isVideo ? <Video className="h-9 w-9 opacity-60" /> : <AudioLines className="h-9 w-9 opacity-60" />}

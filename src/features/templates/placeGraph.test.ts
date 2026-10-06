@@ -68,6 +68,50 @@ describe('resolveTemplatePlacement', () => {
     expect(placement.videoTemplateNodeId).toBe('a');
   });
 
+  it('carries the node size recorded in the snapshot so the dropped graph keeps its dimensions', () => {
+    // 模板图页正是把这些带 measured 的快照节点直接灌进 React Flow;
+    // 拖入画布也必须带上同一份尺寸, 否则节点会缩回类型默认尺寸。
+    const sized = {
+      ...graphNode('video', -2626, 560),
+      measured: { width: 420, height: 260 },
+    } as CanvasNode;
+
+    const placement = resolveTemplatePlacement(graph([sized]), { x: 300, y: 400 });
+
+    expect(placement.nodes[0].size).toEqual({ width: 420, height: 260 });
+  });
+
+  it('prefers the measured size over the style box written at creation time', () => {
+    const resized = {
+      ...graphNode('a', 0, 0),
+      measured: { width: 500, height: 300 },
+      style: { width: 220, height: 200 },
+    } as CanvasNode;
+
+    expect(resolveTemplatePlacement(graph([resized]), { x: 0, y: 0 }).nodes[0].size).toEqual({
+      width: 500,
+      height: 300,
+    });
+  });
+
+  it('falls back to the style box when the snapshot has no measured size', () => {
+    const numericStyle = { ...graphNode('a', 0, 0), style: { width: 220, height: 200 } } as CanvasNode;
+    const cssStyle = { ...graphNode('b', 0, 0), style: { width: '360px', height: '180px' } } as CanvasNode;
+
+    expect(resolveTemplatePlacement(graph([numericStyle]), { x: 0, y: 0 }).nodes[0].size).toEqual({
+      width: 220,
+      height: 200,
+    });
+    expect(resolveTemplatePlacement(graph([cssStyle]), { x: 0, y: 0 }).nodes[0].size).toEqual({
+      width: 360,
+      height: 180,
+    });
+  });
+
+  it('omits the size when the snapshot recorded none, letting the node type default apply', () => {
+    expect(resolveTemplatePlacement(graph([graphNode('a', 0, 0)]), { x: 0, y: 0 }).nodes[0].size).toBeUndefined();
+  });
+
   it('returns an empty placement for a missing or empty graph', () => {
     expect(resolveTemplatePlacement(undefined, { x: 10, y: 10 })).toEqual({
       nodes: [],

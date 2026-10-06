@@ -346,7 +346,7 @@ export function VideoFrameExtractDialog({ open, onClose }: VideoFrameExtractDial
       isOpen={open}
       title={t("videoFrame.title", "视频帧抽取")}
       onClose={onClose}
-      widthClassName="w-[680px]"
+      widthClassName="w-[min(680px,calc(100vw-32px))]"
       footer={
         <>
           <UiButton variant="muted" onClick={onClose}>

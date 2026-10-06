@@ -61,6 +61,7 @@ import {
 } from "@/features/templates/createTemplate";
 import { UiInput, UiTextArea } from "@/components/ui/primitives";
 import { PajubenQuickExtractDialog } from "@/features/pajuben/PajubenQuickExtractDialog";
+import { VideoEditDialog } from "./VideoEditDialog";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
 import {
   JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID,
@@ -262,6 +263,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
   // 「扒视频」：从视频节点直接跑一次最精简的扒剧本，结果落成右侧文本节点
   const [isScriptDialogOpen, setIsScriptDialogOpen] = useState(false);
+  // 「视频编辑」：剪辑 + 音轨处理，导出成新的视频节点（保留原片）
+  const [isVideoEditDialogOpen, setIsVideoEditDialogOpen] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
   const [isTemplateDialogOpen, setIsTemplateDialogOpen] = useState(false);
   const [textEditDialogMode, setTextEditDialogMode] = useState<"ai" | "find" | null>(null);
@@ -843,18 +846,35 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
         )}
         {!isImageEdit && canHandleMedia && (
           <>
-            {canReuploadMedia && (
+            {isVideoMediaNode && videoSource ? (
+              // 视频节点不再提供「重新上传」：剪辑 / 换音轨都从同一个入口进，
+              // 想换素材直接删掉节点重新拖入更直观。
               <UiChipButton
-                key="media-reupload"
+                key="video-edit"
                 className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
                 onClick={(event) => {
                   event.stopPropagation();
-                  canvasEventBus.publish("upload-node/reupload", { nodeId: node.id });
+                  setIsVideoEditDialogOpen(true);
                 }}
+                title={t("nodeToolbar.videoEditHint")}
               >
-                <RefreshCw className="h-3.5 w-3.5" />
-                {t("nodeToolbar.reupload")}
+                <Scissors className="h-3.5 w-3.5" />
+                {t("nodeToolbar.videoEdit")}
               </UiChipButton>
+            ) : (
+              canReuploadMedia && (
+                <UiChipButton
+                  key="media-reupload"
+                  className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    canvasEventBus.publish("upload-node/reupload", { nodeId: node.id });
+                  }}
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  {t("nodeToolbar.reupload")}
+                </UiChipButton>
+              )
             )}
             <UiChipButton
               key="image-download"
@@ -1013,6 +1033,14 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
 
       {!isImageEdit && isScriptDialogOpen && (
         <PajubenQuickExtractDialog node={node} onClose={() => setIsScriptDialogOpen(false)} />
+      )}
+
+      {!isImageEdit && (
+        <VideoEditDialog
+          open={isVideoEditDialogOpen}
+          node={node}
+          onClose={() => setIsVideoEditDialogOpen(false)}
+        />
       )}
 
       {!isImageEdit && (

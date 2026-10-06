@@ -11,7 +11,7 @@ interface CanvasContextMenuProps {
   position: { x: number; y: number };
   imageUrl?: string | null;
   downloadUrl?: string | null;
-  downloadMediaType?: "image" | "video" | null;
+  downloadMediaType?: "image" | "video" | "audio" | null;
   nodeId?: string | null;
   textContent?: string | null;
   /** 右键命中的节点是分组时提供冻结/解冻入口 */
@@ -24,8 +24,8 @@ interface CanvasContextMenuProps {
   onCopyNode: (nodeId: string) => void;
   onSaveTextToPrompt: () => void;
   onPaste: () => void;
-  onAddImageToLibrary: (imageUrl: string, categoryId: string) => void;
-  onDownloadMedia: (url: string, mediaType: "image" | "video") => void;
+  onAddMediaToLibrary: (url: string, mediaType: "image" | "video" | "audio", categoryId: string) => void;
+  onDownloadMedia: (url: string, mediaType: "image" | "video" | "audio") => void;
   onToggleGroupFrozen: () => void;
   onClose: () => void;
 }
@@ -46,7 +46,7 @@ export function CanvasContextMenu({
   onCopyNode,
   onSaveTextToPrompt,
   onPaste,
-  onAddImageToLibrary,
+  onAddMediaToLibrary,
   onDownloadMedia,
   onToggleGroupFrozen,
   onClose,
@@ -64,16 +64,16 @@ export function CanvasContextMenu({
 
   const handleCategorySelect = useCallback(
     (categoryId: string) => {
-      if (imageUrl) {
-        onAddImageToLibrary(imageUrl, categoryId);
+      if (downloadUrl && downloadMediaType) {
+        onAddMediaToLibrary(downloadUrl, downloadMediaType, categoryId);
       }
     },
-    [imageUrl, onAddImageToLibrary],
+    [downloadMediaType, downloadUrl, onAddMediaToLibrary],
   );
 
   useEffect(() => {
     setIsCategoryPickerOpen(false);
-  }, [imageUrl]);
+  }, [downloadMediaType, downloadUrl]);
 
   useEffect(() => {
     const handlePointerDown = (event: MouseEvent) => {
@@ -109,11 +109,7 @@ export function CanvasContextMenu({
           onClick={onToggleGroupFrozen}
           className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
         >
-          {groupFrozen ? (
-            <LockOpen className="h-4 w-4 text-slate-400" />
-          ) : (
-            <Lock className="h-4 w-4 text-slate-400" />
-          )}
+          {groupFrozen ? <LockOpen className="h-4 w-4 text-slate-400" /> : <Lock className="h-4 w-4 text-slate-400" />}
           <span>{groupFrozen ? t("canvas.contextMenu.unfreezeGroup") : t("canvas.contextMenu.freezeGroup")}</span>
         </button>
       )}
@@ -129,6 +125,7 @@ export function CanvasContextMenu({
           <span>保存到提示词库</span>
         </button>
       )}
+
 
       {!nodeId && (
         <button
@@ -151,11 +148,17 @@ export function CanvasContextMenu({
           className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
         >
           <Download className="h-4 w-4 text-accent" />
-          <span>下载{downloadMediaType === "video" ? "视频" : "图片"}</span>
+          <span>
+            {downloadMediaType === "video"
+              ? t("canvas.contextMenu.downloadVideo")
+              : downloadMediaType === "audio"
+                ? t("canvas.contextMenu.downloadAudio")
+                : t("canvas.contextMenu.downloadImage")}
+          </span>
         </button>
       )}
 
-      {imageUrl ? (
+      {downloadUrl && downloadMediaType ? (
         isCategoryPickerOpen ? (
           <div className="max-h-[224px] overflow-y-auto">
             {categories.map((category) => (
@@ -177,7 +180,7 @@ export function CanvasContextMenu({
             className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
           >
             <Library className="h-4 w-4 text-accent" />
-            <span>添加到素材库</span>
+            <span>{t("canvas.contextMenu.addToAssetLibrary")}</span>
           </button>
         )
       ) : !downloadUrl ? (

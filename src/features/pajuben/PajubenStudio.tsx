@@ -9,9 +9,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { CircleAlert, Clapperboard, FolderOpen, LoaderCircle, Play, ScanFace, Square, X } from "lucide-react";
+import { BookOpen, CircleAlert, Clapperboard, FolderOpen, LoaderCircle, Play, ScanFace, Square, X } from "lucide-react";
 
-import { UI_CONTENT_OVERLAY_INSET_CLASS } from "@/components/ui/motion";
+import { UI_CONTENT_OVERLAY_INSET_CLASS, UI_PAJUBEN_LAYER_Z, UI_PAJUBEN_OVERLAY_LAYER_Z } from "@/components/ui/motion";
+import { OverlayLayerProvider } from "@/components/ui/overlayLayer";
 import { UiButton, UiGhostIconButton } from "@/components/ui/primitives";
 import {
   cancelPajuben,
@@ -24,6 +25,7 @@ import {
   type PajubenEnvironment,
   type PajubenProgressPayload,
 } from "@/commands/pajuben";
+import { NovelDownloader } from "@/features/novel/NovelDownloader";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 import {
@@ -71,6 +73,9 @@ export function PajubenStudio({ onClose }: { onClose: () => void }) {
   const { t } = useTranslation();
   const modelOptions = usePajubenModelOptions();
   const modelGroups = useMemo(() => groupPajubenModelOptions(modelOptions), [modelOptions]);
+
+  /** 工作台下的两个页面：扒剧本（短剧 → 剧本）/ 下载小说（番茄下载器）。 */
+  const [tab, setTab] = useState<"script" | "novel">("script");
 
   const [environment, setEnvironment] = useState<PajubenEnvironment | null>(null);
   const [probing, setProbing] = useState(true);
@@ -427,25 +432,55 @@ export function PajubenStudio({ onClose }: { onClose: () => void }) {
     // onDoubleClick 阻断冒泡：项目管理页靠双击空白处新建项目，工作台内双击不该触发。
     <div
       data-pajuben-studio
-      className={`fixed ${UI_CONTENT_OVERLAY_INSET_CLASS} z-[150] flex flex-col bg-bg-dark`}
+      className={`fixed ${UI_CONTENT_OVERLAY_INSET_CLASS} flex flex-col bg-bg-dark`}
+      style={{ zIndex: UI_PAJUBEN_LAYER_Z }}
       onDoubleClick={(event) => event.stopPropagation()}
     >
-      <header className="flex shrink-0 items-center justify-between border-b border-border-dark px-6 py-3">
-        <div className="flex items-baseline gap-3">
-          <h1 className="text-lg font-medium text-text-dark">{t("pajuben.title", "PAJUBEN / 扒剧本")}</h1>
-          <span className="text-[11px] font-medium uppercase tracking-wider text-accent">
-            {t("pajuben.subtitle", "AI SCRIPT CONTROL")}
-          </span>
+      <header className="flex shrink-0 flex-col border-b border-border-dark px-6">
+        <div className="flex items-center justify-between py-3">
+          <div className="flex items-baseline gap-3">
+            <h1 className="text-lg font-medium text-text-dark">{t("pajuben.title", "PAJUBEN / 扒剧本")}</h1>
+            <span className="text-[11px] font-medium uppercase tracking-wider text-accent">
+              {tab === "novel" ? t("novel.subtitle", "NOVEL DOWNLOADER") : t("pajuben.subtitle", "AI SCRIPT CONTROL")}
+            </span>
+          </div>
+          <div className="flex items-center gap-3">
+            {tab === "script" && <EnvironmentBadge environment={environment} probing={probing} />}
+            <UiGhostIconButton onClick={onClose} title={t("common.close", "关闭")}>
+              <X className="h-4 w-4" />
+            </UiGhostIconButton>
+          </div>
         </div>
-        <div className="flex items-center gap-3">
-          <EnvironmentBadge environment={environment} probing={probing} />
-          <UiGhostIconButton onClick={onClose} title={t("common.close", "关闭")}>
-            <X className="h-4 w-4" />
-          </UiGhostIconButton>
-        </div>
+
+        {/* 两个页面：原本的扒剧本 + 新增的下载小说。 */}
+        <nav className="flex items-center gap-1" role="tablist">
+          {[
+            { id: "script" as const, label: t("pajuben.tabScript", "扒剧本"), icon: Clapperboard },
+            { id: "novel" as const, label: t("pajuben.tabNovel", "下载小说"), icon: BookOpen },
+          ].map((item) => {
+            const Icon = item.icon;
+            const active = tab === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => setTab(item.id)}
+                className={`-mb-px flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm transition-colors ${
+                  active ? "border-accent text-text-dark" : "border-transparent text-text-muted hover:text-text-dark"
+                }`}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {item.label}
+              </button>
+            );
+          })}
+        </nav>
       </header>
 
-      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-6 py-4">
+      {/* 两个页面共用同一个工作台外壳：切页签只切显隐，扒剧本跑到一半的状态不丢。 */}
+      <div className={tab === "script" ? "flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-6 py-4" : "hidden"}>
         {notice && (
           <div
             className={`flex shrink-0 items-start gap-2 rounded-lg border px-3 py-2 text-sm ${
@@ -808,6 +843,14 @@ export function PajubenStudio({ onClose }: { onClose: () => void }) {
           </div>
         </section>
       </div>
+
+      {/* 工作台自身在 UI_PAJUBEN_LAYER_Z 层，内部浮层必须抬到它之上，
+          否则「下载小说」的预览弹窗会被工作台整个盖住，表现为「点了没反应」。 */}
+      {tab === "novel" && (
+        <OverlayLayerProvider value={UI_PAJUBEN_OVERLAY_LAYER_Z}>
+          <NovelDownloader />
+        </OverlayLayerProvider>
+      )}
     </div>
   );
 }

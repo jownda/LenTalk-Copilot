@@ -175,6 +175,55 @@ export async function importImageUrlToAssetDetailed(
   }
 }
 
+/** 将画布音频 URL/本地路径复制为素材库音频，并保留可播放的本地源文件。 */
+export async function importAudioUrlToAsset(
+  audioUrl: string,
+  libraryId: string,
+  categoryId: string | null,
+): Promise<LibraryAsset | null> {
+  try {
+    const source = audioUrl.trim();
+    if (!source) {
+      return null;
+    }
+    const displayUrl =
+      source.startsWith("data:") || /^https?:\/\//i.test(source) ? source : resolveImageDisplayUrl(source);
+    const response = await fetch(displayUrl);
+    if (!response.ok) {
+      return null;
+    }
+    const blob = await response.blob();
+    if (blob.size === 0) {
+      return null;
+    }
+    const sourcePathWithoutParams = source.split(/[?#]/, 1)[0] ?? "";
+    const sourceExtension = sourcePathWithoutParams.includes(".")
+      ? sourcePathWithoutParams.split(".").pop()?.trim().toLowerCase()
+      : undefined;
+    const extension = blob.type.split("/")[1]?.split(";")[0] || sourceExtension || "mp3";
+    const sourcePath = isTauri()
+      ? await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension)
+      : displayUrl;
+    const fileName = `canvas-audio-${Date.now()}.${extension}`;
+    return {
+      id: createAssetId(),
+      libraryId,
+      categoryId,
+      name: `画布音频 ${new Date().toLocaleTimeString()}`,
+      mediaType: "audio",
+      sourcePath,
+      previewImageUrl: null,
+      aspectRatio: null,
+      sourceFileName: fileName,
+      tags: [],
+      createdAt: Date.now(),
+    };
+  } catch (error) {
+    console.warn("[assetLibrary] import audio url failed", audioUrl, error);
+    return null;
+  }
+}
+
 /** 将画布视频 URL/本地路径复制为素材库视频，并保留可播放的本地源文件。 */
 export async function importVideoUrlToAsset(
   videoUrl: string,

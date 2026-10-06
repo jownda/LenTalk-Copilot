@@ -1,9 +1,9 @@
 import {
+  AUDIO_NODE_DEFAULT_HEIGHT,
+  AUDIO_NODE_DEFAULT_WIDTH,
   AUTO_REQUEST_ASPECT_RATIO,
   CANVAS_NODE_TYPES,
   DEFAULT_ASPECT_RATIO,
-  EXPORT_RESULT_NODE_DEFAULT_WIDTH,
-  EXPORT_RESULT_NODE_LAYOUT_HEIGHT,
   type AudioNodeData,
   type AudioGenNodeData,
   type MotionControlNodeData,
@@ -269,7 +269,7 @@ const audioNodeDefinition: CanvasNodeDefinition<AudioNodeData> = {
     mediaType: "audio",
   }),
   // 媒体节点与图片结果节点保持同一紧凑尺寸, 避免本地视频占满画布。
-  defaultSize: { width: EXPORT_RESULT_NODE_DEFAULT_WIDTH, height: EXPORT_RESULT_NODE_LAYOUT_HEIGHT },
+  defaultSize: { width: AUDIO_NODE_DEFAULT_WIDTH, height: AUDIO_NODE_DEFAULT_HEIGHT },
 };
 
 const textAnnotationNodeDefinition: CanvasNodeDefinition<TextAnnotationNodeData> = {

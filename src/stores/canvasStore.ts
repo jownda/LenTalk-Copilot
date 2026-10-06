@@ -928,17 +928,23 @@ function maybeApplyImageAutoResize(node: CanvasNode, patch: Partial<CanvasNodeDa
 /** 组内生成下游节点时的内边距(组扩容时保留的呼吸空间) */
 const GROUP_PADDING = 24;
 
+/** 组内首个下游节点锚在来源节点右侧时的最小间距。 */
+const GROUP_DOWNSTREAM_ANCHOR_GAP = 24;
+
 /** 生成下游节点时，边缘对齐保留的最小像素间距。 */
 const DOWNSTREAM_ALIGNMENT_GAP = 8;
 
 /**
  * 组内生成下游节点: 返回组内相对坐标 + parentId + 可选扩组信息。
- * - 锚定在来源节点右侧(最近 24px), 碰撞检测仅与同组兄弟节点比较;
+ * - 对齐规则与顶层一致: 首个下游锚在来源节点右侧(顶边对齐), 后续叠在末个下游下方
+ *   (左边缘与首个下游对齐); 下方被占时改为与首个下游顶边对齐、左侧回到默认最小位置,
+ *   只沿右侧避让, 不再把对齐基准换成挡板;
+ * - 碰撞检测仅与同组兄弟节点比较; 上面这支都放不下时才回落到列式搜索;
  * - 组内空间不足时返回 groupResize, 由创建节点的调用方在同一个 set 中应用
  *   (与节点创建一起入历史快照, 避免独立扩组快照)。
  */
 function placeNodeInsideGroup(
-  state: { nodes: CanvasNode[] },
+  state: { nodes: CanvasNode[]; edges: CanvasEdge[] },
   groupNode: CanvasNode,
   sourceNode: CanvasNode,
   newNodeWidth: number,
@@ -952,7 +958,12 @@ function placeNodeInsideGroup(
     }
   }
 
-  const collides = (x: number, y: number, width: number, height: number): boolean => {
+  const findCollidingSibling = (
+    x: number,
+    y: number,
+    width: number,
+    height: number
+  ): CanvasNode | null => {
     const margin = 8;
     for (const node of state.nodes) {
       if (!siblingIds.has(node.id)) {
@@ -966,21 +977,92 @@ function placeNodeInsideGroup(
         && y < node.position.y + nodeHeight + margin
         && y + height + margin > node.position.y
       ) {
-        return true;
+        return node;
       }
     }
-    return false;
+    return null;
+  };
+
+  const collides = (x: number, y: number, width: number, height: number): boolean => {
+    return findCollidingSibling(x, y, width, height) !== null;
   };
 
   // 来源节点在组内的相对坐标(position 已是相对组坐标)
   const sourceWidth = sourceNode.measured?.width ?? DEFAULT_NODE_WIDTH;
   const sourceHeight = sourceNode.measured?.height ?? 200;
-  const anchorX = sourceNode.position.x + sourceWidth + 24;
+  const anchorX = sourceNode.position.x + sourceWidth + GROUP_DOWNSTREAM_ANCHOR_GAP;
   const anchorY = sourceNode.position.y;
 
   const stepX = Math.max(newNodeWidth + 16, 110);
   const stepY = Math.max(newNodeHeight + 16, 112);
   const rightSideOffsets = [0, 1, -1, 2, -2];
+
+  // ---- 与顶层一致的确定规则: 首个右侧、后续向下; 下方被占则改为同一行往右 ----
+  const downstreamSiblings: CanvasNode[] = [];
+  for (const edge of state.edges) {
+    if (edge.source !== sourceNode.id) {
+      continue;
+    }
+    const target = state.nodes.find((node) => node.id === edge.target);
+    if (target?.parentId === groupNode.id) {
+      downstreamSiblings.push(target);
+    }
+  }
+
+  /** 只沿水平方向向右避让, y 锁定为对齐基准(不换成挡板的基准)。 */
+  const resolveRowRight = (startX: number, y: number) => {
+    let x = startX;
+    const visited = new Set<string>();
+    for (let index = 0; index <= state.nodes.length; index += 1) {
+      const blocker = findCollidingSibling(x, y, newNodeWidth, newNodeHeight);
+      if (!blocker || visited.has(blocker.id)) {
+        break;
+      }
+      visited.add(blocker.id);
+      x = blocker.position.x + (blocker.measured?.width ?? DEFAULT_NODE_WIDTH) + DOWNSTREAM_ALIGNMENT_GAP;
+    }
+    return { x, y };
+  };
+
+  let planned: { x: number; y: number } | null;
+  if (downstreamSiblings.length === 0) {
+    // 首个下游: 顶边与来源节点对齐, 右侧只留最小间距。
+    planned = { x: anchorX, y: anchorY };
+  } else {
+    const firstDownstream = downstreamSiblings[0];
+    const lastDownstream = downstreamSiblings[downstreamSiblings.length - 1];
+    const lastHeight = lastDownstream.measured?.height ?? 200;
+    const belowLast = {
+      x: firstDownstream.position.x,
+      y: lastDownstream.position.y + lastHeight + DOWNSTREAM_ALIGNMENT_GAP,
+    };
+    // 下方被占 → 与首个下游顶边对齐、左侧回到默认最小位置, 只往右避让。
+    planned = collides(belowLast.x, belowLast.y, newNodeWidth, newNodeHeight)
+      ? resolveRowRight(anchorX, firstDownstream.position.y)
+      : belowLast;
+  }
+
+  if (
+    planned
+    && planned.x >= GROUP_PADDING
+    && planned.y >= GROUP_PADDING
+    && !collides(planned.x, planned.y, newNodeWidth, newNodeHeight)
+  ) {
+    const needRight = planned.x + newNodeWidth;
+    const needBottom = planned.y + newNodeHeight;
+    let groupResize: { id: string; width: number; height: number } | undefined;
+    // 组空间不足 → 自适应扩组(仅扩右下, 保持组左上锚点不动)
+    if (needRight > groupSize.width - GROUP_PADDING || needBottom > groupSize.height - GROUP_PADDING) {
+      groupResize = {
+        id: groupNode.id,
+        width: Math.max(groupSize.width, Math.ceil(needRight + GROUP_PADDING)),
+        height: Math.max(groupSize.height, Math.ceil(needBottom + GROUP_PADDING)),
+      };
+    }
+    return { x: Math.round(planned.x), y: Math.round(planned.y), parentId: groupNode.id, groupResize };
+  }
+
+  // ---- 兜底: 原有的列式搜索(上面这支都放不下时用) ----
   let best: { x: number; y: number; score: number } | null = null;
 
   const evaluate = (x: number, y: number) => {
@@ -1537,8 +1619,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const sourceWidth = sourceNode.measured?.width ?? DEFAULT_NODE_WIDTH;
     // 下游节点采用稳定的“首个右侧、后续向下”布局:
     // 1. 第一个下游节点与母节点顶边对齐, 右侧只留最小间距;
-    // 2. 第二个及后续节点与第一个下游节点左边对齐, 上下只留最小间距;
-    // 3. 目标位置若被其它节点挡住, 就把对齐基准换成挡住的节点, 继续向右/向下吸附。
+    // 2. 第二个及后续节点与第一个下游节点左边对齐, 叠在末个下游节点下方, 只留最小间距;
+    // 3. 下方被占时, 改为与第一个下游节点顶边对齐、左侧回到默认最小位置, 只沿右侧避让。
     // 这段优先于旧的环形搜索, 因而生成结果不会因为附近有节点而跳到较远位置。
     const downstreamNodes = state.edges
       .filter((edge) => edge.source === sourceNodeId)
@@ -1569,6 +1651,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const resolveDownstreamPosition = (
       initial: { x: number; y: number },
       axis: "horizontal" | "vertical",
+      lockCrossAxis = false,
     ) => {
       let position = initial;
       const visited = new Set<string>();
@@ -1582,28 +1665,43 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         const blockerSize = getNodeSize(blocker);
         position =
           axis === "horizontal"
-            ? { x: blocker.position.x + blockerSize.width + DOWNSTREAM_ALIGNMENT_GAP, y: blocker.position.y }
-            : { x: blocker.position.x, y: blocker.position.y + blockerSize.height + DOWNSTREAM_ALIGNMENT_GAP };
+            ? {
+                x: blocker.position.x + blockerSize.width + DOWNSTREAM_ALIGNMENT_GAP,
+                y: lockCrossAxis ? position.y : blocker.position.y,
+              }
+            : {
+                x: lockCrossAxis ? position.x : blocker.position.x,
+                y: blocker.position.y + blockerSize.height + DOWNSTREAM_ALIGNMENT_GAP,
+              };
       }
       return position;
     };
 
+    /** 默认最小左侧: 来源节点右缘 + 最小间距。 */
+    const defaultLeftX = sourceNode.position.x + sourceWidth + DOWNSTREAM_ALIGNMENT_GAP;
+
     if (downstreamNodes.length === 0) {
-      return resolveDownstreamPosition(
-        { x: sourceNode.position.x + sourceWidth + DOWNSTREAM_ALIGNMENT_GAP, y: sourceNode.position.y },
-        "horizontal",
-      );
+      return resolveDownstreamPosition({ x: defaultLeftX, y: sourceNode.position.y }, "horizontal");
     }
 
     const firstDownstream = downstreamNodes[0];
     const lastDownstream = downstreamNodes[downstreamNodes.length - 1];
     const lastSize = getNodeSize(lastDownstream);
+    // 默认: 接在最后一个下游节点下方, 左边缘与第一个下游节点对齐。
+    const belowLastDownstream = {
+      x: firstDownstream.position.x,
+      y: lastDownstream.position.y + lastSize.height + DOWNSTREAM_ALIGNMENT_GAP,
+    };
+    if (!collidingNode(belowLastDownstream.x, belowLastDownstream.y)) {
+      return belowLastDownstream;
+    }
+
+    // 下方被占: 改为与第一个下游节点顶边对齐、左侧回到默认最小位置,
+    // 只沿右侧避让(不再把对齐基准换成挡板, 免得结果被甩到远处)。
     return resolveDownstreamPosition(
-      {
-        x: firstDownstream.position.x,
-        y: lastDownstream.position.y + lastSize.height + DOWNSTREAM_ALIGNMENT_GAP,
-      },
-      "vertical",
+      { x: defaultLeftX, y: firstDownstream.position.y },
+      "horizontal",
+      true,
     );
 
   },

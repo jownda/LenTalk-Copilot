@@ -8,6 +8,9 @@ use tauri::{AppHandle, Manager};
 
 use crate::database;
 
+/// 节点数据里图片的轻量引用前缀(与前端 projectStore 的 encodeImageReference 一致)。
+const IMAGE_REF_PREFIX: &str = "__img_ref__:";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSummaryRecord {
@@ -104,8 +107,6 @@ fn parse_image_pool(history_json: &str) -> Vec<String> {
 }
 
 fn resolve_image_ref(value: &str, image_pool: &[String]) -> Option<String> {
-    const IMAGE_REF_PREFIX: &str = "__img_ref__:";
-
     if let Some(index_text) = value.strip_prefix(IMAGE_REF_PREFIX) {
         let index = index_text.parse::<usize>().ok()?;
         return image_pool.get(index).cloned();
@@ -118,47 +119,69 @@ fn resolve_image_ref(value: &str, image_pool: &[String]) -> Option<String> {
     Some(value.to_string())
 }
 
+/// 判断字符串是否像本地绝对路径(macOS/Linux 的 `/…`、Windows 的 `C:\…` 与 UNC `\\…`)。
+///
+/// 用来把节点数据里的普通文本(提示词、备注、节点名)挡在引用表之外,
+/// 避免 `project_image_refs` 被无意义的字符串撑大。
+fn looks_like_local_path(value: &str) -> bool {
+    if value.starts_with('/') || value.starts_with("\\\\") {
+        return true;
+    }
+    // 盘符后必须紧跟分隔符, 否则 `C: 备注` 这类文本也会被误判成路径。
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+/// 收集节点数据里出现的所有图片路径(已解码)。
+///
+/// 这里刻意递归扫描 `data` 下的任意字符串, 而不是维护一份字段白名单。
+/// 原因是两种失误的代价完全不对称:
+///   * 白名单漏字段 → 仍被引用的图片被资源回收误移走(确实漏过全景的
+///     `outputImageUrl`、无缝拼图的 `outputPreviewImageUrl`、导演台的
+///     `lastCaptureUrl` 等), 用户表现为「图突然变破图」且不可逆;
+///   * 多保护几个路径 → 只是少回收一个文件。
+/// 所以选择保守的一侧。
 fn collect_image_paths_from_nodes(
     nodes: &[serde_json::Value],
     image_pool: &[String],
     paths: &mut HashSet<String>,
 ) {
     for node in nodes {
-        let data = match node.get("data").and_then(|value| value.as_object()) {
-            Some(value) => value,
-            None => continue,
-        };
+        if let Some(data) = node.get("data") {
+            collect_image_paths_from_value(data, image_pool, paths);
+        }
+    }
+}
 
-        for key in [
-            "imageUrl",
-            "previewImageUrl",
-            "firstFrameImageUrl",
-            "firstFramePreviewImageUrl",
-            "lastFrameImageUrl",
-            "lastFramePreviewImageUrl",
-        ] {
-            if let Some(raw_value) = data.get(key).and_then(|value| value.as_str()) {
-                if let Some(path) = resolve_image_ref(raw_value, image_pool) {
+fn collect_image_paths_from_value(
+    value: &serde_json::Value,
+    image_pool: &[String],
+    paths: &mut HashSet<String>,
+) {
+    match value {
+        serde_json::Value::String(raw) => {
+            if raw.starts_with(IMAGE_REF_PREFIX) {
+                if let Some(path) = resolve_image_ref(raw, image_pool) {
                     paths.insert(path);
                 }
+            } else if looks_like_local_path(raw) {
+                paths.insert(raw.clone());
             }
         }
-
-        if let Some(frames) = data.get("frames").and_then(|value| value.as_array()) {
-            for frame in frames {
-                let frame_obj = match frame.as_object() {
-                    Some(value) => value,
-                    None => continue,
-                };
-                for key in ["imageUrl", "previewImageUrl"] {
-                    if let Some(raw_value) = frame_obj.get(key).and_then(|value| value.as_str()) {
-                        if let Some(path) = resolve_image_ref(raw_value, image_pool) {
-                            paths.insert(path);
-                        }
-                    }
-                }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_image_paths_from_value(item, image_pool, paths);
             }
         }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_image_paths_from_value(item, image_pool, paths);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -299,7 +322,10 @@ fn prune_unreferenced_images(app: &AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_asset_library_paths_from_json;
+    use super::{
+        collect_asset_library_paths_from_json, collect_image_paths_from_nodes,
+        extract_project_image_paths,
+    };
     use std::collections::HashSet;
 
     #[test]
@@ -319,6 +345,112 @@ mod tests {
         let mut referenced = HashSet::new();
         collect_asset_library_paths_from_json("not-json", &mut referenced);
         assert!(referenced.is_empty());
+    }
+
+    /// 全景 / 无缝拼图 / 导演台的图片产物字段曾经不在白名单里,
+    /// 导致这些节点仍被引用时图片也会被资源回收移进 .quarantine。
+    #[test]
+    fn media_fields_outside_the_legacy_whitelist_stay_protected() {
+        let nodes: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"id":"pano","type":"panoramaNode","data":{
+                    "outputImageUrl":"/app/images/pano-out.png",
+                    "inputImageUrl":"/app/images/pano-in.png",
+                    "outputPreviewImageUrl":"/app/images/pano-out-thumb.png",
+                    "previewInputImageUrl":"/app/images/pano-in-thumb.png"
+                }},
+                {"id":"mosaic","type":"seamlessMosaicNode","data":{
+                    "outputImageUrl":"/app/images/mosaic.png"
+                }},
+                {"id":"desk","type":"directorDeskNode","data":{
+                    "lastCaptureUrl":"/app/images/desk.png",
+                    "lastCapturePreviewUrl":"/app/images/desk-thumb.png"
+                }},
+                {"id":"storyboard","type":"storyboardSplitNode","data":{
+                    "frames":[
+                        {"imageUrl":"/app/images/f0.png","previewImageUrl":"/app/images/f0-thumb.png"},
+                        {"imageUrl":"/app/images/f1.png"}
+                    ]
+                }}
+            ]"#,
+        )
+        .expect("test fixtures are valid json");
+
+        let mut referenced = HashSet::new();
+        collect_image_paths_from_nodes(&nodes, &[], &mut referenced);
+
+        for path in [
+            "/app/images/pano-out.png",
+            "/app/images/pano-in.png",
+            "/app/images/pano-out-thumb.png",
+            "/app/images/pano-in-thumb.png",
+            "/app/images/mosaic.png",
+            "/app/images/desk.png",
+            "/app/images/desk-thumb.png",
+            "/app/images/f0.png",
+            "/app/images/f0-thumb.png",
+            "/app/images/f1.png",
+        ] {
+            assert!(referenced.contains(path), "{path} 应当被保护");
+        }
+    }
+
+    /// 引用要按 imagePool 解码成真实路径, 否则回收侧永远匹配不上文件名。
+    #[test]
+    fn image_refs_are_decoded_through_the_pool() {
+        let pool = vec![
+            "/app/images/a.png".to_string(),
+            "/app/images/b.png".to_string(),
+        ];
+        let nodes: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"id":"n","type":"imageNode","data":{"imageUrl":"__img_ref__:1"}}]"#,
+        )
+        .expect("test fixtures are valid json");
+
+        let mut referenced = HashSet::new();
+        collect_image_paths_from_nodes(&nodes, &pool, &mut referenced);
+
+        assert!(referenced.contains("/app/images/b.png"));
+        assert!(!referenced.contains("__img_ref__:1"));
+    }
+
+    /// 普通文本(提示词 / 备注 / 节点名)不该被当成图片引用写进引用表。
+    #[test]
+    fn plain_text_fields_are_not_treated_as_image_references() {
+        let nodes: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"id":"t","type":"imageNode","data":{
+                "displayName":"9月6日.png",
+                "prompt":"一张 / 参考图",
+                "note":"C: 这是备注",
+                "imageUrl":"/app/images/real.png"
+            }}]"#,
+        )
+        .expect("test fixtures are valid json");
+
+        let mut referenced = HashSet::new();
+        collect_image_paths_from_nodes(&nodes, &[], &mut referenced);
+
+        assert_eq!(referenced.len(), 1, "只应收集真实路径: {referenced:?}");
+        assert!(referenced.contains("/app/images/real.png"));
+    }
+
+    /// 端到端: nodesJson + historyJson(imagePool) → 引用集合。
+    #[test]
+    fn extract_project_image_paths_decodes_nodes_and_history() {
+        let nodes_json = r#"[{"id":"n","type":"imageNode","data":{"imageUrl":"__img_ref__:0"}}]"#;
+        let history_json = r#"{
+            "past":[{"nodes":[{"id":"old","data":{"previewImageUrl":"/app/images/undone.png"}}]}],
+            "future":[],
+            "imagePool":["/app/images/current.png"]
+        }"#;
+
+        let referenced = extract_project_image_paths(nodes_json, history_json);
+
+        assert!(referenced.contains("/app/images/current.png"));
+        assert!(
+            referenced.contains("/app/images/undone.png"),
+            "撤销栈里的图片也必须保护, 否则撤销回来就是破图"
+        );
     }
 }
 

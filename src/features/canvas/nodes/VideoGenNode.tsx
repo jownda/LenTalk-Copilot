@@ -44,6 +44,7 @@ import {
 } from "@/features/canvas/application/generationErrorReport";
 import { mergeMediaReferenceSources } from "@/features/canvas/application/mediaReferenceSources";
 import { filterExcludedReferences } from "@/features/canvas/application/referenceExclusions";
+import { collectActiveGenerationNodeIds } from "@/features/canvas/application/videoGenActiveTasks";
 import { recordGenerationOutcome } from "@/features/canvas/application/usageRecording";
 import { resolveMinEdgeFittedSize } from "@/features/canvas/application/imageNodeSizing";
 import {
@@ -93,6 +94,12 @@ const VIDEO_GEN_NODE_MAX_HEIGHT = 560;
 const VIDEO_GEN_NODE_DEFAULT_WIDTH = 420;
 const VIDEO_GEN_NODE_DEFAULT_HEIGHT = 360;
 const JIMENG_CLI_MAX_REFERENCE_IMAGES = 9;
+/**
+ * 连点冷却：一次提交成功后 2s 内不再接受新的提交。
+ * 这是「防手滑连点」而不是「防重复扣费」——刻意不再等视频生成完才解禁，
+ * 让用户能连续发起多次生成，各次任务互不影响。
+ */
+const GENERATE_COOLDOWN_MS = 2000;
 
 interface PickerAnchor {
   left: number;
@@ -348,36 +355,55 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const setLastVideoModelId = useSettingsStore((state) => state.setLastVideoModelId);
   const setLastVideoAspectRatio = useSettingsStore((state) => state.setLastVideoAspectRatio);
   const setLastVideoResolution = useSettingsStore((state) => state.setLastVideoResolution);
-  const activeGenerationNodeId = typeof data.activeGenerationNodeId === "string" ? data.activeGenerationNodeId : "";
-  const [isGenerating, setIsGenerating] = useState(Boolean(activeGenerationNodeId));
-  // React state 更新要等当前事件处理结束后才提交；双击/连点可能在 disabled
-  // 生效前再次进入 handleGenerate。这个 ref 是提交入口的同步互斥锁。
-  const generationLockRef = useRef(false);
+  const [isGenerating, setIsGenerating] = useState(() => collectActiveGenerationNodeIds(data).length > 0);
+  /** 在跑的下游任务 id 列表（旧工程里可能是单个 activeGenerationNodeId）。 */
+  const activeGenerationNodeIds = collectActiveGenerationNodeIds(data);
+  const activeGenerationKey = activeGenerationNodeIds.join("\u0000");
+  /** 已提交、还没跑完的任务数——允许连点后会 > 1。 */
+  const activeTaskCount = activeGenerationNodeIds.length;
+  /**
+   * 连点冷却：提交成功后 2s 内不再接受新的提交。
+   * 之所以记「上次提交的时刻」而不是布尔量，是因为一次提交里有 await，
+   * 布尔量要等异步返回才能复位，会让实际冷却变成「2s + 接口耗时」，不可控。
+   */
+  const lastSubmitAtRef = useRef(0);
+  const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
+  const isCoolingDown = cooldownRemainingMs > 0;
+  const cooldownSeconds = Math.max(1, Math.ceil(cooldownRemainingMs / 1000));
 
-  // 下游媒体节点才持有真正的平台任务状态。提交接口返回 job id 后，源视频节点
-  // 仍需保持锁定，直到下游节点进入成功/失败终态，避免慢平台期间再次扣费。
   useEffect(() => {
-    if (!activeGenerationNodeId) {
-      if (!generationLockRef.current) setIsGenerating(false);
-      return;
-    }
+    if (!isCoolingDown) return;
+    const timer = window.setInterval(() => {
+      const left = GENERATE_COOLDOWN_MS - (Date.now() - lastSubmitAtRef.current);
+      setCooldownRemainingMs(left > 0 ? left : 0);
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [isCoolingDown]);
+
+  const beginCooldown = useCallback(() => {
+    lastSubmitAtRef.current = Date.now();
+    setCooldownRemainingMs(GENERATE_COOLDOWN_MS);
+  }, []);
+
+  // 下游媒体节点才持有真正的平台任务状态。连点之后可能同时有多个任务在跑，
+  // 所以逐个核对：已经进入终态（或被删掉）的从列表里摘掉，只要还剩一个就让源节点
+  // 维持「生成中」。这里不再充当提交互斥锁——提交频率由 2s 冷却控制。
+  useEffect(() => {
+    void activeGenerationKey;
     // 下游任务状态更新走 processingRevision，不一定刷新 inputGraphRevision；
-    // 直接读 store 确保慢平台完成/失败后能及时释放源节点锁。
+    // 直接读 store 确保慢平台完成/失败后能及时把源节点摘出「生成中」。
     void processingRevision;
-    const outputNode = useCanvasStore.getState().nodes.find((node) => node.id === activeGenerationNodeId);
-    if (!outputNode) {
-      updateNodeData(id, { activeGenerationNodeId: null });
-      setIsGenerating(false);
-      return;
+    const state = useCanvasStore.getState();
+    const tracked = collectActiveGenerationNodeIds(state.nodes.find((node) => node.id === id)?.data);
+    const stillRunning = tracked.filter((outputId) => {
+      const outputNode = state.nodes.find((node) => node.id === outputId);
+      return outputNode ? (outputNode.data as { isGenerating?: unknown }).isGenerating === true : false;
+    });
+    if (stillRunning.length !== tracked.length) {
+      updateNodeData(id, { activeGenerationNodeIds: stillRunning, activeGenerationNodeId: null });
     }
-    const outputData = outputNode.data as { isGenerating?: unknown };
-    if (outputData.isGenerating === true) {
-      setIsGenerating(true);
-      return;
-    }
-    updateNodeData(id, { activeGenerationNodeId: null });
-    setIsGenerating(false);
-  }, [activeGenerationNodeId, id, nodes, processingRevision, updateNodeData]);
+    setIsGenerating(stillRunning.length > 0);
+  }, [activeGenerationKey, id, nodes, processingRevision, updateNodeData]);
   const [jimengCliStatus, setJimengCliStatus] = useState<JimengCliStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showImagePicker, setShowImagePicker] = useState(false);
@@ -1116,12 +1142,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   );
 
   const handleGenerate = useCallback(async () => {
-    if (generationLockRef.current || isGenerating) {
+    // 冷却期内的连点直接丢弃（按钮此时也是灰的）。校验失败不消耗冷却，
+    // 用户改完提示词/密钥可以立刻重试。
+    if (Date.now() - lastSubmitAtRef.current < GENERATE_COOLDOWN_MS) {
       return;
     }
-    generationLockRef.current = true;
     if (!selectedModel) {
-      generationLockRef.current = false;
       const message = "请先在设置中添加视频模型";
       setError(message);
       void showErrorDialog(message, t("common.error"));
@@ -1131,18 +1157,15 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     flushPromptCommit();
     const prompt = [promptDraftRef.current.trim(), ...inputText].filter(Boolean).join("\n\n").trim();
     if (!prompt) {
-      generationLockRef.current = false;
       return;
     }
     if (imageMode === "first-last" && firstLastFrameImages.length < 2) {
-      generationLockRef.current = false;
       const message = t("node.videoGen.firstLastNeedImages");
       setError(message);
       void showErrorDialog(message, t("common.error"));
       return;
     }
     if (isWanCli && (usableInputAudio.length > 0 || videoReferenceImages.length > 5)) {
-      generationLockRef.current = false;
       const message = t(usableInputAudio.length > 0 ? "wanCli.audioUnsupported" : "wanCli.referenceLimit");
       setError(message);
       void showErrorDialog(message, t("common.error"));
@@ -1150,12 +1173,14 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     }
     const apiKey = apiKeys[selectedModel.providerId] ?? "";
     if (!isJimengCli && !isWanCli && !isRunningHubCli && !apiKey) {
-      generationLockRef.current = false;
       const message = "请在设置中填写 API Key";
       setError(message);
       void showErrorDialog(message, t("common.error"));
       return;
     }
+    // 校验全部通过、即将真正提交——从这里开始同步地占用冷却窗口。
+    // 这段到 addNode 之间没有 await，所以连点不可能插进来重复提交。
+    beginCooldown();
     const customId = selectedModel.providerId.slice("custom:".length);
     const baseUrl = isJimengCli || isWanCli || isRunningHubCli ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
     const manualReferenceVideos = Array.isArray(data.binghuoReferenceVideos)
@@ -1231,13 +1256,15 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         });
       }
     });
-    updateNodeData(id, { activeGenerationNodeId: outputId });
+    // 追加而非覆盖：连点会同时挂多个下游任务，覆盖会让先提交的那个丢掉记账，
+    // 从而在下游还在跑的时候把源节点的「生成中」误清掉。
+    const trackedBefore = collectActiveGenerationNodeIds(useCanvasStore.getState().nodes.find((node) => node.id === id)?.data);
+    updateNodeData(id, { activeGenerationNodeIds: [...trackedBefore, outputId], activeGenerationNodeId: null });
     updateNodeSize(outputId, compactSize.width, compactSize.height);
     addEdge(id, outputId);
     setIsGenerating(true);
     setJimengCliStatus(isJimengCli ? { status: "queued" } : null);
     setError(null);
-    let submitted = false;
     try {
       if (!isJimengCli && !isWanCli && !isRunningHubCli) {
         await canvasAiGateway.setApiKey(selectedModel.providerId, apiKey);
@@ -1259,7 +1286,6 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         generationError: null,
         generationErrorDetails: null,
       });
-      submitted = true;
     } catch (generationError) {
       const resolved = resolveErrorContent(generationError, "视频生成失败");
       setError(resolved.message);
@@ -1288,7 +1314,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         generationClientSessionId: null,
         generationDebugContext,
       });
-      updateNodeData(id, { activeGenerationNodeId: null });
+      // 不用手动从 activeGenerationNodeIds 里摘自己：上面已把下游节点标成终态，
+      // 源节点的核对 effect 会把它清掉（连点场景下也只会摘掉这一个）。
       void showErrorDialog(
         resolved.message,
         t("common.error"),
@@ -1299,18 +1326,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           context: generationDebugContext,
         }),
       );
-    } finally {
-      generationLockRef.current = false;
-      // 成功提交后保持源节点锁定，由下游媒体节点进入终态的 effect 解锁；
-      // 只有提交前失败才立即允许用户修正后重试。
-      if (!submitted) {
-        setIsGenerating(false);
-      }
     }
   }, [
     addEdge,
     addNode,
     apiKeys,
+    beginCooldown,
     customApis,
     data.aspectRatio,
     data.binghuoReferenceVideos,
@@ -1322,7 +1343,6 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     imageMode,
     inputVideos,
     inputText,
-    isGenerating,
     isWanCli,
     selectedDuration,
     selectedModel,
@@ -1977,12 +1997,20 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       )}
       <button
         type="button"
-        disabled={isGenerating || !selectedModel || (!promptDraft.trim() && inputText.length === 0)}
+        disabled={isCoolingDown || !selectedModel || (!promptDraft.trim() && inputText.length === 0)}
         onClick={() => void handleGenerate()}
         className="nodrag mt-auto flex h-8 items-center justify-center gap-1.5 rounded-md bg-accent text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-45"
       >
-        {isGenerating ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-        {isGenerating ? "生成中…" : "生成视频"}
+        {isCoolingDown ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+        {isCoolingDown ? `冷却 ${cooldownSeconds}s` : "生成视频"}
+        {activeTaskCount > 0 && (
+          <span
+            className="rounded-full bg-white/25 px-1.5 text-[10px] leading-4"
+            title={`已提交 ${activeTaskCount} 个任务，生成中`}
+          >
+            {activeTaskCount}
+          </span>
+        )}
       </button>
       <Handle
         id="target"

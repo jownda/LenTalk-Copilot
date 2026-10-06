@@ -37,7 +37,11 @@ fn playback_temp_path() -> PathBuf {
     ))
 }
 
-fn local_or_remote_video_source(source: &str) -> Option<String> {
+/// 把媒体来源统一成 ffmpeg 能直接吃的形式：`http(s)` 原样、`file://` 解码成本地路径、
+/// 其余非协议字符串按本地路径处理。
+///
+/// 同时供视频编辑（`video_edit::render_video_edit`）复用，避免两处各写一份解码逻辑。
+pub(crate) fn local_or_remote_video_source(source: &str) -> Option<String> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return None;
@@ -58,7 +62,9 @@ fn local_or_remote_video_source(source: &str) -> Option<String> {
 }
 
 fn run_ffmpeg_to_mp4(ffmpeg: &Path, input: &str, output: &Path) -> Result<(), String> {
-    let status = Command::new(ffmpeg)
+    let mut command = Command::new(ffmpeg);
+    hide_child_console(&mut command);
+    let status = command
         .args(["-y", "-hide_banner", "-loglevel", "error"])
         .arg("-i")
         .arg(input)
@@ -164,6 +170,7 @@ pub fn extract_video_frame(
         0.05
     };
     let mut command = Command::new(ffmpeg);
+    hide_child_console(&mut command);
     command
         .args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
@@ -325,6 +332,21 @@ fn deltas_are_vfr(deltas: &[u32]) -> bool {
     seen.len() > 1
 }
 
+/// Windows 上给子进程加 CREATE_NO_WINDOW。
+///
+/// Tauri 主进程以 `windows_subsystem = "windows"` 启动，本身没有控制台；不设置这个标志时
+/// 每启动一次 ffmpeg 都会**新建并弹出一个黑色命令行窗口**。转码/抽帧耗时越长，窗口挂得越久。
+pub(crate) fn hide_child_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 fn ffmpeg_exe_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "ffmpeg.exe"
@@ -333,7 +355,64 @@ fn ffmpeg_exe_name() -> &'static str {
     }
 }
 
-/// 定位随应用分发的 ffmpeg：资源目录 → 编译期清单目录（dev）→ 可执行文件同目录。
+/// 探查可执行文件时要试的后缀：Windows 需要显式带后缀，其他平台就是裸名。
+fn executable_suffixes() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &[".exe", ".cmd", ".bat"]
+    }
+    #[cfg(not(windows))]
+    {
+        &[""]
+    }
+}
+
+/// 在 `PATH` 里按顺序找第一个存在的可执行文件。用于复用用户自己装好的工具链。
+pub(crate) fn find_on_path(names: &[&str]) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let suffixes = executable_suffixes();
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for name in names {
+            for suffix in suffixes {
+                let candidate = dir.join(format!("{name}{suffix}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 用户系统里已安装的 ffmpeg。
+///
+/// macOS 上从 Finder / Dock 启动的 App 拿不到登录 shell 的 `PATH`（不含 Homebrew
+/// 的 `/opt/homebrew/bin`），所以 PATH 落空时再补查 Homebrew 的两个默认目录。
+/// 这一步是随包二进制缺失时的兜底：视频缩略图、CFR 归一化、视频编辑都依赖它。
+pub(crate) fn system_ffmpeg_path() -> Option<PathBuf> {
+    if let Some(path) = find_on_path(&["ffmpeg"]) {
+        return Some(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    for candidate in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+/// 定位 ffmpeg：随包资源目录 → 编译期清单目录（dev）→ 应用数据目录（Windows 按需下载）
+/// → 可执行文件同目录 → 系统已安装版本（PATH / Homebrew）。
+///
+/// 最后一档系统回退是必需的：开发预览与部分 macOS 安装包不带 ffmpeg 二进制，
+/// 之前只找随包路径，导致「未找到 ffmpeg」而整条视频链路不可用。
 /// 同时供视频缩略图抽帧（asset_library::extract_video_thumbnail）复用。
 pub(crate) fn resolve_ffmpeg_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
@@ -380,11 +459,13 @@ pub(crate) fn resolve_ffmpeg_path(app: &tauri::AppHandle) -> Option<PathBuf> {
             }
         }
     }
-    None
+    system_ffmpeg_path()
 }
 
 fn run_ffmpeg_normalize(ffmpeg: &Path, input: &Path, output: &Path) -> Result<(), String> {
-    let status = Command::new(ffmpeg)
+    let mut command = Command::new(ffmpeg);
+    hide_child_console(&mut command);
+    let status = command
         .args(["-y", "-hide_banner", "-loglevel", "error"])
         .arg("-i")
         .arg(input)
@@ -469,3 +550,4 @@ pub fn normalize_video_cfr(
         reason: None,
     })
 }
+

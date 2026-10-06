@@ -20,6 +20,8 @@ import { Upload } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import {
+  AUDIO_NODE_DEFAULT_HEIGHT,
+  AUDIO_NODE_DEFAULT_WIDTH,
   CANVAS_NODE_TYPES,
   EXPORT_RESULT_NODE_MIN_HEIGHT,
   EXPORT_RESULT_NODE_MIN_WIDTH,
@@ -73,14 +75,16 @@ function resolveLocalUploadMediaType(file: File): LocalUploadMediaType | null {
   return null;
 }
 
-function resolveDroppedLocalFile(event: DragEvent<HTMLElement>): File | null {
-  const directFile = event.dataTransfer.files?.[0];
-  if (directFile) {
-    return directFile;
+function resolveDroppedLocalFiles(event: DragEvent<HTMLElement>): File[] {
+  const directFiles = Array.from(event.dataTransfer.files ?? []);
+  if (directFiles.length > 0) {
+    return directFiles;
   }
 
-  const item = Array.from(event.dataTransfer.items || []).find((candidate) => candidate.kind === 'file');
-  return item?.getAsFile() ?? null;
+  return Array.from(event.dataTransfer.items || [])
+    .filter((candidate) => candidate.kind === 'file')
+    .map((candidate) => candidate.getAsFile())
+    .filter((file): file is File => Boolean(file));
 }
 
 export const UploadNode = memo(({ id, data, selected, width, height }: UploadNodeProps) => {
@@ -136,11 +140,18 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
     });
   }, []);
 
+  /**
+   * 把单个文件写进当前节点, 并返回写入后该节点的尺寸。
+   *
+   * 返回尺寸是给"同批其余素材"定落点用的: 内容写进来之后节点会按图片比例
+   * 自动放大(媒体则换成紧凑的媒体节点尺寸), 若按写入前的旧尺寸贴右侧排布,
+   * 放大后的节点就会压住新节点。
+   */
   const processFile = useCallback(
-    async (file: File) => {
+    async (file: File): Promise<{ width: number; height: number } | null> => {
       const mediaType = resolveLocalUploadMediaType(file);
       if (!mediaType) {
-        return;
+        return null;
       }
       if (mediaType !== 'image') {
         canvasEventBus.publish('upload-node/convert-media', {
@@ -148,7 +159,8 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
           file,
           mediaType,
         });
-        return;
+        // 视频/音频会被换成媒体节点, 尺寸取该类型的注册默认值(与 replaceNodeType 一致)。
+        return { width: AUDIO_NODE_DEFAULT_WIDTH, height: AUDIO_NODE_DEFAULT_HEIGHT };
       }
 
       const sequence = uploadSequenceRef.current + 1;
@@ -177,10 +189,11 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
 
       try {
         const prepared = await prepareNodeImageFromFile(file);
+        const aspectRatio = prepared.aspectRatio || '1:1';
         const nextData: Partial<UploadImageNodeData> = {
           imageUrl: prepared.imageUrl,
           previewImageUrl: prepared.previewImageUrl,
-          aspectRatio: prepared.aspectRatio || '1:1',
+          aspectRatio,
           sourceFileName: file.name,
         };
         if (useUploadFilenameAsNodeTitle) {
@@ -191,6 +204,11 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
         console.info(
           `[upload-perf][node] processFile success nodeId=${id} name="${file.name}" size=${file.size}B elapsed=${Math.round(performance.now() - started)}ms`
         );
+        // 与 store 里 maybeApplyImageAutoResize 用的同一套算法, 保证算出的落点对得上实际尺寸。
+        return resolveMinEdgeFittedSize(aspectRatio, {
+          minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
+          minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
+        });
       } catch (error) {
         if (uploadSequenceRef.current === sequence) {
           clearTransientPreview();
@@ -203,6 +221,33 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
       }
     },
     [clearTransientPreview, id, updateNodeData, useUploadFilenameAsNodeTitle]
+  );
+
+  /**
+   * 一次选中多个文件时的统一入口。
+   *
+   * 首个文件照旧写进当前节点: 双击的就是这个节点, 把它当作首个素材的落点最符合直觉,
+   * 也保住了节点已有的连线和标题。其余文件交给画布落成新节点 —— 只有画布拿得到
+   * 全部节点坐标, 知道该往哪儿避让, 节点自己算不出不重叠的位置。
+   */
+  const processFiles = useCallback(
+    async (files: File[]) => {
+      const accepted = files.filter((file) => resolveLocalUploadMediaType(file));
+      if (accepted.length === 0) {
+        return;
+      }
+
+      const [first, ...rest] = accepted;
+      const appliedSize = await processFile(first);
+      if (rest.length > 0) {
+        canvasEventBus.publish('upload-node/import-files', {
+          nodeId: id,
+          files: rest,
+          firstFileMinWidth: appliedSize?.width ?? 0,
+        });
+      }
+    },
+    [id, processFile]
   );
 
   const handleImageLoad = useCallback((event: SyntheticEvent<HTMLImageElement>) => {
@@ -256,14 +301,9 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
     async (event: DragEvent<HTMLElement>) => {
       event.preventDefault();
       event.stopPropagation();
-      const file = resolveDroppedLocalFile(event);
-      if (!file || !resolveLocalUploadMediaType(file)) {
-        return;
-      }
-
-      await processFile(file);
+      await processFiles(resolveDroppedLocalFiles(event));
     },
-    [processFile]
+    [processFiles]
   );
 
   const handleDragOver = useCallback((event: DragEvent<HTMLElement>) => {
@@ -272,16 +312,14 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
   }, []);
 
   const handleFileChange = useCallback(
-      async (event: ChangeEvent<HTMLInputElement>) => {
-      const file = event.target.files?.[0];
-      if (!file || !resolveLocalUploadMediaType(file)) {
-        return;
-      }
-
-      await processFile(file);
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.target.files ?? []);
+      // 先清空 value: 已把 FileList 拷成数组, 此时清空不会再丢文件,
+      // 而且清空后连续选同一批文件也能再次触发 change。
       event.target.value = '';
+      await processFiles(files);
     },
-    [processFile]
+    [processFiles]
   );
 
   useEffect(() => {
@@ -394,6 +432,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
         ref={inputRef}
         type="file"
         accept="image/*,video/*,audio/*"
+        multiple
         className="hidden"
         onChange={handleFileChange}
       />

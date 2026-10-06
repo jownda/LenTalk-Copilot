@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft, ChevronRight, Library, RotateCcw, X } from 'lucide-react';
 import { Orbit } from 'lucide-react';
 import { UI_CONTENT_OVERLAY_INSET_CLASS } from '@/components/ui/motion';
 import { useImageViewerTransform } from '../hooks/useImageViewerTransform';
+import { shouldDismissOnClick } from '../application/imageViewerDismiss';
 import { PanoramaViewer } from './PanoramaViewer';
 import { useAssetLibraryStore } from '@/features/library/assetStore';
 import { importImageUrlToAsset } from '@/features/library/importAssets';
@@ -33,6 +34,23 @@ export function ImageViewerModal({
   const [displayImageUrl, setDisplayImageUrl] = useState(imageUrl);
   const [isPanoramaMode, setIsPanoramaMode] = useState(false);
   const closeTimerRef = useRef<number | null>(null);
+  // 记录本次按下的起点，用于区分「点击」与「拖拽平移」
+  const pressStartRef = useRef<{ x: number; y: number } | null>(null);
+
+  const handleOverlayMouseDown = useCallback((e: MouseEvent<HTMLDivElement>) => {
+    pressStartRef.current = { x: e.clientX, y: e.clientY };
+  }, []);
+
+  const handleOverlayClick = useCallback(
+    (e: MouseEvent<HTMLDivElement>) => {
+      const start = pressStartRef.current;
+      pressStartRef.current = null;
+      // 点任意处(含图片本身)都关闭; 仅当这次是拖拽平移时不关。
+      if (!shouldDismissOnClick(start, { x: e.clientX, y: e.clientY })) return;
+      onClose();
+    },
+    [onClose],
+  );
 
   // 添加到素材库
   const libraries = useAssetLibraryStore((state) => state.libraries);
@@ -90,7 +108,6 @@ export function ImageViewerModal({
     handleContainerMouseUp,
     handleImageMouseMove,
     handleImageLoad,
-    isPointOnImageContent,
   } = useImageViewerTransform(open && isVisible);
 
   useEffect(() => {
@@ -186,6 +203,8 @@ export function ImageViewerModal({
         transition: 'opacity 400ms ease',
         pointerEvents: open ? 'auto' : 'none',
       }}
+      onMouseDown={handleOverlayMouseDown}
+      onClick={handleOverlayClick}
     >
       <div
         ref={containerRef}
@@ -194,9 +213,6 @@ export function ImageViewerModal({
         onMouseMove={handleContainerMouseMove}
         onMouseUp={handleContainerMouseUp}
         onMouseLeave={handleContainerMouseUp}
-        onClick={(e) => {
-          if (e.target === e.currentTarget) onClose();
-        }}
       >
         <div className="relative">
           <img
@@ -214,18 +230,14 @@ export function ImageViewerModal({
             onLoad={handleImageLoad}
             onMouseDown={handleImageMouseDown}
             onMouseMove={handleImageMouseMove}
-            onClick={(e) => {
-              if (isPointOnImageContent(e.clientX, e.clientY)) {
-                e.stopPropagation();
-              } else {
-                onClose();
-              }
-            }}
             draggable={false}
           />
         </div>
 
-        <div className="absolute bottom-8 left-1/2 flex -translate-x-1/2 flex-col items-center gap-3">
+        <div
+          className="absolute bottom-8 left-1/2 flex -translate-x-1/2 flex-col items-center gap-3"
+          onClick={(e) => e.stopPropagation()}
+        >
           {imageList.length > 1 && (
             <div className="flex items-center gap-3">
               <button

@@ -295,6 +295,17 @@ export interface CanvasEventMap {
     file: File;
     mediaType: "video" | "audio";
   };
+  /**
+   * 上传节点一次选了多个文件时, 首个文件仍由节点自身消费,
+   * 其余文件通过该事件交给画布落成新节点(按网格对齐排列, 不重叠)。
+   * `firstFileMinWidth` 是首个文件写入后节点至少会有多宽 —— 写内容会让节点
+   * 自动放大, 只看当前尺寸贴右侧排布会被放大后的节点压住。
+   */
+  "upload-node/import-files": {
+    nodeId: string;
+    files: File[];
+    firstFileMinWidth?: number;
+  };
   "group-node/rename": {
     nodeId: string;
   };

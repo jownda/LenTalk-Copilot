@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::commands::video_cfr::find_on_path;
+
 #[cfg(windows)]
 use flate2::read::GzDecoder;
 #[cfg(windows)]
@@ -38,9 +40,38 @@ const ENGINE_DIR_NAME: &str = "pajuben";
 const ENGINE_ENTRY: &str = "pajuben.py";
 /// 失败诊断用：保留最后多少行引擎输出。
 const LOG_TAIL_LIMIT: usize = 60;
-#[cfg(windows)]
-const WINDOWS_FFMPEG_ARCHIVE_URL: &str =
-    "https://github.com/jownda/LenTalk-Copilot/releases/download/bundled-tools/ffmpeg.tar.gz";
+/// FFmpeg 压缩包的候选下载地址，**按顺序尝试**，第一个成功即返回。
+///
+/// 官方 GitHub 在国内直连会被重置（所以才需要代理），因此把国内可直连的 GitHub
+/// 加速镜像排在前面，官方地址只作兜底。镜像是反向代理，回的仍是同一份 Release
+/// 资产——实测三者下载结果与官方**逐字节一致**，解压出的 ffmpeg.exe 都能命中
+/// `WINDOWS_FFMPEG_BINARY_SHA256`。
+///
+/// 每条候选都是「镜像前缀 + 官方地址」拼出来的：只改前缀不够，官方地址那段也得
+/// 跟着改，`ffmpeg_archive_urls_share_one_asset_path` 会盯住这一点。
+///
+/// 这些都是免费公开服务，存活情况会变；任意一个可用即可完成安装，全部失败时
+/// 才会向用户报错。
+#[cfg(any(windows, test))]
+const WINDOWS_FFMPEG_ARCHIVE_URLS: &[&str] = &[
+    // 首选：实测国内直连最快（约 7–11 MB/s），三次复测均稳定
+    concat!(
+        "https://gh-proxy.com/",
+        "https://github.com/jownda/LenTalk-Copilot/releases/download/bundled-tools/ffmpeg.tar.gz"
+    ),
+    // 备用一：实测约 1–3 MB/s，偶发短暂不可用
+    concat!(
+        "https://ghfast.top/",
+        "https://github.com/jownda/LenTalk-Copilot/releases/download/bundled-tools/ffmpeg.tar.gz"
+    ),
+    // 备用二：速度较慢，仅在前两者都不可用时才会走到
+    concat!(
+        "https://ghproxy.net/",
+        "https://github.com/jownda/LenTalk-Copilot/releases/download/bundled-tools/ffmpeg.tar.gz"
+    ),
+    // 兜底：官方源，已配置代理的用户从这里成功
+    "https://github.com/jownda/LenTalk-Copilot/releases/download/bundled-tools/ffmpeg.tar.gz",
+];
 #[cfg(windows)]
 /// 解压后的 ffmpeg.exe SHA256。与 scripts/setup-ffmpeg.mjs 保持一致；
 /// 不能拿这个值直接校验 tar.gz 压缩包本身。
@@ -48,6 +79,12 @@ const WINDOWS_FFMPEG_BINARY_SHA256: &str =
     "04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00";
 #[cfg(windows)]
 const MAX_FFMPEG_ARCHIVE_BYTES: u64 = 200 * 1024 * 1024;
+#[cfg(windows)]
+/// 单个候选地址的下载总时限（含连接与传输）。超时就换下一个候选，
+/// 否则排在前面但已失效的镜像会把安装无限挂住。
+const FFMPEG_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+#[cfg(windows)]
+const FFMPEG_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 从引擎输出尾部提取「给用户看」的失败原因。
 ///
@@ -194,17 +231,6 @@ struct FinishPayload {
     message: String,
 }
 
-fn executable_suffixes() -> &'static [&'static str] {
-    #[cfg(windows)]
-    {
-        &[".exe", ".cmd", ".bat"]
-    }
-    #[cfg(not(windows))]
-    {
-        &[""]
-    }
-}
-
 /// 引擎目录：打包后在资源目录，开发时回退到 src-tauri/resources。
 fn engine_dir(app: &AppHandle) -> Option<PathBuf> {
     if let Ok(dir) = app.path().resource_dir() {
@@ -222,12 +248,12 @@ fn engine_dir(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
-/// ffmpeg 所在目录：优先使用 LenTalk 随包的二进制，开发/旧版 macOS 安装则复用系统版本。
+/// ffmpeg 所在目录：随包/系统版本由 `resolve_ffmpeg_path` 统一裁决（含系统 PATH 回退），
+/// 这里只额外兜一次 Windows 按需下载目录。
 fn ffmpeg_dir(app: &AppHandle) -> Option<PathBuf> {
     crate::commands::video_cfr::resolve_ffmpeg_path(app)
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .or_else(|| downloaded_ffmpeg_path(app).and_then(|path| path.parent().map(Path::to_path_buf)))
-        .or_else(|| system_ffmpeg_path().and_then(|path| path.parent().map(Path::to_path_buf)))
 }
 
 #[cfg(windows)]
@@ -238,42 +264,6 @@ fn downloaded_ffmpeg_path(app: &AppHandle) -> Option<PathBuf> {
 
 #[cfg(not(windows))]
 fn downloaded_ffmpeg_path(_app: &AppHandle) -> Option<PathBuf> {
-    None
-}
-
-fn find_on_path(names: &[&str]) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let suffixes = executable_suffixes();
-    for dir in std::env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        for name in names {
-            for suffix in suffixes {
-                let candidate = dir.join(format!("{name}{suffix}"));
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn system_ffmpeg_path() -> Option<PathBuf> {
-    if let Some(path) = find_on_path(&["ffmpeg"]) {
-        return Some(path);
-    }
-
-    // 从 Finder / Dock 启动的 macOS App 常常拿不到 shell PATH；补查 Homebrew 的两个默认目录。
-    #[cfg(target_os = "macos")]
-    for candidate in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-
     None
 }
 
@@ -328,6 +318,64 @@ fn unpack_windows_ffmpeg_archive(archive: &[u8]) -> Result<Vec<u8>, String> {
     Err("FFmpeg 下载包内未找到 ffmpeg.exe".to_string())
 }
 
+/// 按 `WINDOWS_FFMPEG_ARCHIVE_URLS` 的顺序逐个尝试，返回第一个完整读到的压缩包。
+///
+/// 镜像一律 `no_proxy()` **直连**——挑它们正是因为国内可以直连，没必要再套一层
+/// 代理；最后一跳（官方 GitHub）保留系统代理设置，因为国内用户往往只有通过代理
+/// 才够得着它。这样「有代理」和「没代理」两种环境都能走通。
+#[cfg(windows)]
+fn fetch_ffmpeg_archive() -> Result<Vec<u8>, String> {
+    let official_index = WINDOWS_FFMPEG_ARCHIVE_URLS.len().saturating_sub(1);
+    let size_limit_mb = MAX_FFMPEG_ARCHIVE_BYTES / 1024 / 1024;
+    let mut failures: Vec<String> = Vec::new();
+
+    for (index, url) in WINDOWS_FFMPEG_ARCHIVE_URLS.iter().enumerate() {
+        let mut builder = reqwest::blocking::Client::builder()
+            .connect_timeout(FFMPEG_CONNECT_TIMEOUT)
+            .timeout(FFMPEG_DOWNLOAD_TIMEOUT);
+        if index != official_index {
+            builder = builder.no_proxy();
+        }
+        let client = match builder.build() {
+            Ok(client) => client,
+            Err(error) => {
+                failures.push(format!("{url}\n    无法建立下载连接：{error}"));
+                continue;
+            }
+        };
+
+        match client.get(*url).send().and_then(|response| response.error_for_status()) {
+            Ok(response) => {
+                if response
+                    .content_length()
+                    .is_some_and(|size| size > MAX_FFMPEG_ARCHIVE_BYTES)
+                {
+                    failures.push(format!("{url}\n    压缩包超过 {size_limit_mb} MB 上限"));
+                    continue;
+                }
+                match response.bytes() {
+                    Ok(bytes) if bytes.len() as u64 <= MAX_FFMPEG_ARCHIVE_BYTES => {
+                        return Ok(bytes.to_vec());
+                    }
+                    Ok(_) => {
+                        failures.push(format!("{url}\n    压缩包超过 {size_limit_mb} MB 上限"));
+                    }
+                    Err(error) => {
+                        failures.push(format!("{url}\n    读取下载内容失败：{error}"));
+                    }
+                }
+            }
+            Err(error) => failures.push(format!("{url}\n    请求失败：{error}")),
+        }
+    }
+
+    Err(format!(
+        "下载 FFmpeg 失败，已尝试 {} 个地址：\n{}",
+        failures.len(),
+        failures.join("\n")
+    ))
+}
+
 #[cfg(windows)]
 fn download_windows_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
     let tools_dir = app
@@ -341,19 +389,7 @@ fn download_windows_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
         return Ok(target);
     }
 
-    let response = reqwest::blocking::get(WINDOWS_FFMPEG_ARCHIVE_URL)
-        .map_err(|error| format!("下载 FFmpeg 失败：{error}"))?
-        .error_for_status()
-        .map_err(|error| format!("下载 FFmpeg 失败：{error}"))?;
-    if response.content_length().is_some_and(|size| size > MAX_FFMPEG_ARCHIVE_BYTES) {
-        return Err("FFmpeg 下载包过大，已取消安装".to_string());
-    }
-    let archive = response
-        .bytes()
-        .map_err(|error| format!("读取 FFmpeg 下载包失败：{error}"))?;
-    if archive.len() as u64 > MAX_FFMPEG_ARCHIVE_BYTES {
-        return Err("FFmpeg 下载包过大，已取消安装".to_string());
-    }
+    let archive = fetch_ffmpeg_archive()?;
     let binary = unpack_windows_ffmpeg_archive(&archive)?;
     let digest = format!("{:x}", Sha256::digest(&binary));
     if digest != WINDOWS_FFMPEG_BINARY_SHA256 {
@@ -372,7 +408,8 @@ fn download_windows_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
 ///
 /// Windows 正常由安装包附带二进制；macOS 的历史安装包未随包时，自动通过 Homebrew
 /// 补装，避免 Python 引擎启动后才要求用户手动执行 `brew install ffmpeg`。
-fn ensure_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
+/// 视频编辑同样复用：随包缺失时会走到这里补齐，而不是直接失败。
+pub(crate) fn ensure_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
     if let Some(dir) = ffmpeg_dir(app) {
         return Ok(dir);
     }
@@ -1201,5 +1238,35 @@ mod tests {
         let lines = vec!["开始".to_string(), "   ".to_string(), "ImportError: cv2".to_string()];
         assert_eq!(failure_detail(&lines), "ImportError: cv2");
         assert_eq!(failure_detail(&[]), "");
+    }
+
+    #[test]
+    fn ffmpeg_archive_urls_share_one_asset_path() {
+        // 候选地址是「镜像前缀 + 官方地址」拼出来的：前缀写错只是连不通，路径写错却
+        // 可能下到别的东西，而两者在运行时都只表现为超时，很难排查。这里把「所有候选
+        // 指向同一份资产」和「官方地址排最后兜底」固定下来。
+        const ASSET: &str =
+            "github.com/jownda/LenTalk-Copilot/releases/download/bundled-tools/ffmpeg.tar.gz";
+        const OFFICIAL: &str = concat!(
+            "https://",
+            "github.com/jownda/LenTalk-Copilot/releases/download/bundled-tools/ffmpeg.tar.gz"
+        );
+        assert!(
+            WINDOWS_FFMPEG_ARCHIVE_URLS.len() >= 2,
+            "至少要有镜像与官方两个候选，否则换源没有意义"
+        );
+        for url in WINDOWS_FFMPEG_ARCHIVE_URLS {
+            assert!(url.ends_with(ASSET), "候选地址未指向同一份资产：{url}");
+        }
+        assert_eq!(
+            WINDOWS_FFMPEG_ARCHIVE_URLS.last().copied(),
+            Some(OFFICIAL),
+            "官方地址必须放在最后兜底"
+        );
+        // 至少有一条国内可直连的镜像排在最前，否则「不挂代理」这个前提不成立。
+        assert!(
+            WINDOWS_FFMPEG_ARCHIVE_URLS[0].starts_with("https://gh-proxy.com/"),
+            "第一条候选应当是实测最快的国内可直连镜像"
+        );
     }
 }

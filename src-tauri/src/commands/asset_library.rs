@@ -77,7 +77,10 @@ fn legacy_state_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join("asset-library.json"))
 }
 
-fn default_state() -> AssetLibraryStateRecord {
+/// 素材库整体状态在 `app_settings` 里的键。媒体桥接模块也要读写同一份数据。
+pub(crate) const ASSET_LIBRARY_SETTING_KEY: &str = "asset-library";
+
+pub(crate) fn default_state() -> AssetLibraryStateRecord {
     let library = AssetLibraryRecord {
         id: "library-default".to_string(),
         name: "我的素材库".to_string(),
@@ -116,7 +119,7 @@ fn default_state() -> AssetLibraryStateRecord {
     }
 }
 
-fn normalize_state(mut state: AssetLibraryStateRecord) -> AssetLibraryStateRecord {
+pub(crate) fn normalize_state(mut state: AssetLibraryStateRecord) -> AssetLibraryStateRecord {
     if state.libraries.is_empty() {
         return default_state();
     }
@@ -205,7 +208,7 @@ fn restore_quarantined_asset_files(
 #[tauri::command]
 pub fn load_asset_library_state(app: AppHandle) -> Result<AssetLibraryStateRecord, String> {
     let conn = database::open(&app)?;
-    if let Some(value) = database::get_setting(&conn, "asset-library")? {
+    if let Some(value) = database::get_setting(&conn, ASSET_LIBRARY_SETTING_KEY)? {
         let state = serde_json::from_str::<AssetLibraryStateRecord>(&value)
             .map_err(|error| format!("Failed to parse asset library: {error}"))?;
         restore_quarantined_asset_files(&app, &state)?;
@@ -222,7 +225,7 @@ pub fn load_asset_library_state(app: AppHandle) -> Result<AssetLibraryStateRecor
         let state = normalize_state(parsed_state);
         let value = serde_json::to_string(&state)
             .map_err(|error| format!("Failed to encode asset library: {error}"))?;
-        database::put_setting(&conn, "asset-library", &value)?;
+        database::put_setting(&conn, ASSET_LIBRARY_SETTING_KEY, &value)?;
         let backup = path.with_extension(format!("json.migrated-{}.bak", std::process::id()));
         std::fs::rename(&path, backup)
             .map_err(|error| format!("Failed to archive legacy asset library: {error}"))?;
@@ -240,11 +243,11 @@ pub fn save_asset_library_state(
     let value = serde_json::to_string(&normalized)
         .map_err(|error| format!("Failed to encode asset library: {error}"))?;
     let conn = database::open(&app)?;
-    database::put_setting(&conn, "asset-library", &value)?;
+    database::put_setting(&conn, ASSET_LIBRARY_SETTING_KEY, &value)?;
     Ok(normalized)
 }
 
-fn safe_extension(extension: &str) -> String {
+pub(crate) fn safe_extension(extension: &str) -> String {
     let normalized: String = extension
         .trim()
         .trim_start_matches('.')
@@ -435,7 +438,10 @@ pub fn extract_video_thumbnail(
             return Ok(None);
         };
         // 宽度限制 480: 节点封面用不到全分辨率, 也避免 4K 源抽出上千万像素的 PNG。
-        let status = std::process::Command::new(ffmpeg)
+        let mut command = std::process::Command::new(ffmpeg);
+        // Windows 下不隐藏会弹出黑框命令行窗口。
+        crate::commands::video_cfr::hide_child_console(&mut command);
+        let status = command
             .args(["-y", "-hide_banner", "-loglevel", "error"])
             .args(["-ss", "0.1"])
             .arg("-i")

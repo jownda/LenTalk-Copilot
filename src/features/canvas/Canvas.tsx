@@ -39,6 +39,8 @@ import {
   type CanvasEdge,
   type CanvasNode,
   type CanvasNodeType,
+  AUDIO_NODE_DEFAULT_HEIGHT,
+  AUDIO_NODE_DEFAULT_WIDTH,
   DEFAULT_NODE_WIDTH,
   EXPORT_RESULT_NODE_MIN_HEIGHT,
   EXPORT_RESULT_NODE_MIN_WIDTH,
@@ -48,6 +50,11 @@ import {
   isTextAnnotationNode,
 } from "@/features/canvas/domain/canvasNodes";
 import { resolveMinEdgeFittedSize } from "@/features/canvas/application/imageNodeSizing";
+import {
+  collectCanvasOccupiedRects,
+  resolveUploadBatchPositions,
+  UPLOAD_BATCH_GAP,
+} from "@/features/canvas/application/uploadBatchPlacement";
 import { prepareNodeImage, prepareNodeImageFromFile } from "@/features/canvas/application/imageData";
 import {
   buildGenerationErrorReport,
@@ -62,6 +69,7 @@ import {
 } from "@/features/canvas/domain/nodeRegistry";
 import { embedStoryboardImageMetadata } from "@/commands/image";
 import { persistLibraryAssetFromFile } from "@/commands/assetLibrary";
+import { readClipboardMediaSnapshot, type ClipboardMediaSnapshot } from "@/commands/clipboard";
 import {
   ALIGNMENT_GUIDE_SNAP_THRESHOLD,
   computeDragAlignment,
@@ -74,11 +82,18 @@ import { edgeTypes } from "./edges";
 const MAX_RECOVERY_POLLERS = 4;
 const MAX_RECOVERY_DURATION_MS = 30 * 60 * 1000;
 import { NodeSelectionMenu } from "./NodeSelectionMenu";
-import { CANVAS_NODE_DRAG_DATA_TYPE, NodePaletteSidebar, NodePaletteToggle } from "./NodePaletteSidebar";
+import { CANVAS_NODE_DRAG_DATA_TYPE } from "./NodePaletteSidebar";
+import { NodeManagerSidebar, NodeManagerToggle } from "./NodeManagerSidebar";
+import {
+  collectCanvasMediaEntries,
+  type CanvasMediaEntry,
+} from "./application/canvasMediaIndex";
+import { resolveImageDisplayUrl } from "./application/imageData";
 import { CanvasContextMenu } from "./CanvasContextMenu";
 import { SelectedNodeOverlay } from "./ui/SelectedNodeOverlay";
 import { NodeToolDialog } from "./ui/NodeToolDialog";
 import { ImageViewerModal } from "./ui/ImageViewerModal";
+import { VideoViewerModal } from "./ui/VideoViewerModal";
 import { saveMediaSourceWithDialog } from "./application/mediaDownload";
 import { shouldFailRunningVideoJob } from "./application/videoJobPolling";
 import { VideoFrameExtractDialog } from "./ui/VideoFrameExtractDialog";
@@ -88,7 +103,9 @@ import { AgentPanel } from "@/features/agent/AgentPanel";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
 import {
   ASSET_DRAG_DATA_TYPE,
+  importAudioUrlToAsset,
   importImageUrlToAssetDetailed,
+  importVideoUrlToAsset,
   parseAssetDragPayload,
   PROMPT_DRAG_DATA_TYPE,
   parsePromptDragPayload,
@@ -193,7 +210,7 @@ function resolveContextMenuImageUrl(node: CanvasNode): string | null {
   );
 }
 
-function resolveContextMenuMedia(node: CanvasNode): { url: string; mediaType: "image" | "video" } | null {
+function resolveContextMenuMedia(node: CanvasNode): { url: string; mediaType: "image" | "video" | "audio" } | null {
   const data = node.data as {
     imageUrl?: unknown;
     outputImageUrl?: unknown;
@@ -201,9 +218,9 @@ function resolveContextMenuMedia(node: CanvasNode): { url: string; mediaType: "i
     sourcePath?: unknown;
     mediaType?: unknown;
   };
-  if (node.type === CANVAS_NODE_TYPES.audio && data.mediaType === "video") {
+  if (node.type === CANVAS_NODE_TYPES.audio && (data.mediaType === "video" || data.mediaType === "audio")) {
     return typeof data.sourcePath === "string" && data.sourcePath.trim()
-      ? { url: data.sourcePath.trim(), mediaType: "video" }
+      ? { url: data.sourcePath.trim(), mediaType: data.mediaType }
       : null;
   }
   const url = [data.imageUrl, data.outputImageUrl, data.inputImageUrl].find(
@@ -394,35 +411,347 @@ function isDirectorDeskOpen(): boolean {
   return typeof document !== "undefined" && document.querySelector("[data-director-desk]") !== null;
 }
 
-function resolveClipboardImageFile(event: ClipboardEvent): File | null {
-  const clipboardItems = event.clipboardData?.items;
-  if (!clipboardItems) {
+function normalizeClipboardMediaFile(file: File, mediaType: LocalUploadMediaType, clipboardMimeType?: string): File {
+  const existingName = typeof file.name === "string" ? file.name.trim() : "";
+  if (existingName) {
+    return file;
+  }
+
+  const fallbackExtension = mediaType === "image" ? "png" : mediaType === "video" ? "mp4" : "mp3";
+  const subtype = (file.type || clipboardMimeType || "").split("/")[1]?.split("+")[0] || fallbackExtension;
+  return new File([file], `pasted-${mediaType}.${subtype}`, {
+    type: file.type || clipboardMimeType,
+    lastModified: Date.now(),
+  });
+}
+
+/**
+ * 同一次复制在系统剪贴板里往往带多种等价表示(典型: macOS 截图的 png + tiff)，
+ * 若把它们全部读出来，一次粘贴就会创建多个重复节点。这里按优先级只取一种表示。
+ */
+const CLIPBOARD_MEDIA_MIME_PRIORITY = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "image/bmp",
+  "image/tiff",
+  "video/mp4",
+  "video/quicktime",
+  "video/webm",
+  "audio/mpeg",
+  "audio/mp4",
+  "audio/wav",
+  "audio/aac",
+  "audio/ogg",
+];
+
+function pickClipboardMediaMimeType(types: readonly string[]): string | null {
+  const mediaMimeTypes = types.filter((mimeType) => /^(image|video|audio)\//i.test(mimeType));
+  if (mediaMimeTypes.length === 0) {
     return null;
   }
 
-  for (const item of Array.from(clipboardItems)) {
-    if (!item.type.startsWith("image/")) {
-      continue;
+  for (const preferred of CLIPBOARD_MEDIA_MIME_PRIORITY) {
+    const matched = mediaMimeTypes.find((mimeType) => mimeType.toLowerCase().startsWith(preferred));
+    if (matched) {
+      return matched;
     }
-
-    const file = item.getAsFile();
-    if (!file) {
-      continue;
-    }
-
-    const existingName = typeof file.name === "string" ? file.name.trim() : "";
-    if (existingName) {
-      return file;
-    }
-
-    const subtype = item.type.split("/")[1]?.split("+")[0] || "png";
-    return new File([file], `pasted-image.${subtype}`, {
-      type: file.type || item.type,
-      lastModified: Date.now(),
-    });
   }
 
-  return null;
+  return mediaMimeTypes[0];
+}
+
+/** 从系统剪贴板中提取图片、视频和音频文件；兼容截图等没有文件名的图片数据。 */
+function resolveClipboardMediaFiles(event: ClipboardEvent): File[] {
+  const clipboardData = event.clipboardData;
+  if (!clipboardData) {
+    return [];
+  }
+
+  const resolvedFiles: File[] = [];
+  const seen = new Set<string>();
+  const addFile = (file: File | null, clipboardMimeType?: string) => {
+    if (!file) return;
+    const mediaType = resolveLocalUploadMediaType(file);
+    if (!mediaType) return;
+    const normalized = normalizeClipboardMediaFile(file, mediaType, clipboardMimeType);
+    // 不能用 lastModified 参与去重: 没有文件名的截图会在归一化时各自生成一次时间戳，
+    // 导致同一份数据从 files 和 items 各进来一次时被当成两个文件，粘贴出两个节点。
+    const key = `${normalized.name}|${normalized.type}|${normalized.size}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    resolvedFiles.push(normalized);
+  };
+
+  for (const file of Array.from(clipboardData.files)) {
+    addFile(file);
+  }
+  // files 已经拿到媒体文件就不再扫 items: 两者是同一份数据的两种视图，
+  // 同时读取会让一次粘贴出现两份内容(尤其图片带多种格式表示时)。
+  if (resolvedFiles.length === 0) {
+    for (const item of Array.from(clipboardData.items)) {
+      if (item.kind === "file") {
+        addFile(item.getAsFile(), item.type);
+      }
+    }
+  }
+
+  return collapseClipboardMediaFiles(resolvedFiles);
+}
+
+/**
+ * 一次复制在剪贴板里可能带多种等价表示(典型: macOS 截图的 png + tiff)，
+ * 浏览器会把它们当成多个文件吐出来。带原生路径的文件一定是真的多选复制，全部保留；
+ * 没有路径的位图表示只留第一份，保证一次粘贴只落下一张图。
+ */
+function collapseClipboardMediaFiles(files: File[]): File[] {
+  const kept: File[] = [];
+  let keptPathlessImage = false;
+
+  for (const file of files) {
+    const mediaType = resolveLocalUploadMediaType(file);
+    if (!mediaType) {
+      continue;
+    }
+
+    const nativePath = (file as File & { path?: unknown }).path;
+    const hasNativePath = typeof nativePath === "string" && nativePath.trim().length > 0;
+    if (!hasNativePath && mediaType === "image") {
+      if (keptPathlessImage) {
+        continue;
+      }
+      keptPathlessImage = true;
+    }
+
+    kept.push(file);
+  }
+
+  return kept;
+}
+
+/**
+ * 两次右键粘贴的最小间隔: 菜单的卸载是异步的，手快连点两下会连续触发两次粘贴，
+ * 一次点击落两份内容。低于这个间隔的重复触发直接忽略(重开菜单再粘不受影响)。
+ */
+const CONTEXT_PASTE_MIN_INTERVAL_MS = 250;
+
+/** 本地媒体后缀 → MIME：右键粘贴拿到的只有文件路径，要据此还原 File 的类型。 */
+const CLIPBOARD_MEDIA_MIME_BY_EXTENSION: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+  bmp: "image/bmp",
+  tif: "image/tiff",
+  tiff: "image/tiff",
+  avif: "image/avif",
+  heic: "image/heic",
+  heif: "image/heif",
+  mp4: "video/mp4",
+  mov: "video/quicktime",
+  m4v: "video/x-m4v",
+  webm: "video/webm",
+  avi: "video/x-msvideo",
+  mkv: "video/x-matroska",
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  wav: "audio/wav",
+  aac: "audio/aac",
+  flac: "audio/flac",
+  ogg: "audio/ogg",
+};
+
+function resolveFileNameFromPath(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const name = normalized.slice(normalized.lastIndexOf("/") + 1);
+  return name || "clipboard-media";
+}
+
+function resolveMimeTypeFromName(name: string): string {
+  const extension = name.split(".").pop()?.toLowerCase() ?? "";
+  return CLIPBOARD_MEDIA_MIME_BY_EXTENSION[extension] ?? "";
+}
+
+/**
+ * 用剪贴板里的本地文件路径构造 File。
+ *
+ * 故意不把文件内容读进 JS：Tauri 会按 File 上的原生 path 走「路径直读」
+ * (图片走 prepareNodeImage 的 path 模式，视频/音频由 Rust 直接拷贝)，
+ * 几百 MB 的视频不必再经 IPC 搬一趟。
+ */
+function createClipboardPathFile(path: string): File {
+  const name = resolveFileNameFromPath(path);
+  const file = new File([], name, { type: resolveMimeTypeFromName(name) });
+  Object.defineProperty(file, "path", { value: path, configurable: true });
+  return file;
+}
+
+/** 少数平台复制文件时只在剪贴板里留文本，这里把 file:// 或绝对路径还原成本地媒体路径。 */
+function resolveClipboardTextFilePaths(text: string | null | undefined): string[] {
+  if (!text) {
+    return [];
+  }
+
+  const paths: string[] = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    let candidate = rawLine.trim().replace(/^["'<]|["'>]$/g, "");
+    if (!candidate) {
+      continue;
+    }
+
+    if (/^file:\/\//i.test(candidate)) {
+      try {
+        candidate = decodeURIComponent(candidate.replace(/^file:\/\//i, ""));
+      } catch {
+        continue;
+      }
+      // Windows 的 file:///C:/xx.png 会多出一个前导斜杠。
+      if (/^\/[A-Za-z]:\//.test(candidate)) {
+        candidate = candidate.slice(1);
+      }
+    }
+
+    if (!/^(?:[A-Za-z]:[\\/]|\/)/.test(candidate)) {
+      continue;
+    }
+
+    if (resolveMimeTypeFromName(resolveFileNameFromPath(candidate))) {
+      paths.push(candidate);
+    }
+  }
+
+  return paths;
+}
+
+/** 剪贴板里的位图(截图等) → File，命名与 Ctrl+V 粘贴保持一致。 */
+function createClipboardBitmapFile(imageBase64: string): File | null {
+  try {
+    const binary = window.atob(imageBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return new File([bytes], "pasted-image.png", { type: "image/png" });
+  } catch (error) {
+    console.warn("[clipboard] 剪贴板位图解码失败", error);
+    return null;
+  }
+}
+
+/** 剪贴板内容指纹：只关心「有哪些本地文件 + 有没有位图」，用来判断剪贴板是否换过内容。 */
+function buildClipboardMediaSignature(snapshot: ClipboardMediaSnapshot): string {
+  return [snapshot.filePaths.join("|"), snapshot.hasImage ? "image" : ""].join("#");
+}
+
+interface ClipboardMediaReadResult {
+  files: File[];
+  /** 剪贴板指纹；null 表示这次拿不到指纹(浏览器兜底或读取失败)，判定时按「未知」处理。 */
+  signature: string | null;
+}
+
+/**
+ * 浏览器兜底：Async Clipboard API 只能看到图片表示，看不到复制的文件路径。
+ * 若系统/WebView 不授予读取权限，返回 null。
+ *
+ * 只取第一份媒体：剪贴板里的一个内容常同时带多种等价表示(典型: 截图的 png + tiff)，
+ * 它们在这里是**多个 ClipboardItem**，全读出来一次粘贴就会落下两张图。
+ */
+async function readWebClipboardMediaFiles(): Promise<File[] | null> {
+  if (!navigator.clipboard?.read) {
+    return null;
+  }
+
+  try {
+    const clipboardItems = await navigator.clipboard.read();
+
+    for (const item of clipboardItems) {
+      // 同一个条目里也按优先级只取一种媒体表示。
+      const mimeType = pickClipboardMediaMimeType(item.types);
+      if (!mimeType) {
+        continue;
+      }
+
+      let blob: Blob;
+      try {
+        blob = await item.getType(mimeType);
+      } catch {
+        continue;
+      }
+
+      // 名字留空: 交给 normalizeClipboardMediaFile 按 MIME 生成 pasted-<type>.<ext>，
+      // 与 Ctrl+V 粘贴出来的媒体保持同一套命名(也保证视频/音频有正确后缀)。
+      const provisionalFile = new File([blob], "", { type: blob.type || mimeType });
+      const mediaType = resolveLocalUploadMediaType(provisionalFile);
+      if (!mediaType) {
+        continue;
+      }
+
+      return [normalizeClipboardMediaFile(provisionalFile, mediaType, mimeType)];
+    }
+
+    return [];
+  } catch (error) {
+    console.warn("[clipboard] unable to read system media", error);
+    return null;
+  }
+}
+
+/**
+ * 读取系统剪贴板里的媒体文件。
+ *
+ * 桌面端优先走 Rust：只有它能拿到访达 / 资源管理器里复制的文件路径，也能拿到截图位图。
+ */
+async function readSystemClipboardMedia(): Promise<ClipboardMediaReadResult> {
+  const snapshot = await readClipboardMediaSnapshot(true);
+  if (snapshot) {
+    const files: File[] = [];
+    const seen = new Set<string>();
+    const pushFile = (file: File | null) => {
+      if (!file || !resolveLocalUploadMediaType(file)) {
+        return;
+      }
+      const key = `${file.name}|${file.type}`;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      files.push(file);
+    };
+
+    for (const path of snapshot.filePaths) {
+      pushFile(createClipboardPathFile(path));
+    }
+    // 复制的文件已经拿到就不再读位图/文本: 它们常是同一份内容的另一种表示。
+    if (files.length === 0) {
+      for (const path of resolveClipboardTextFilePaths(snapshot.text)) {
+        pushFile(createClipboardPathFile(path));
+      }
+    }
+    if (files.length === 0 && snapshot.imageBase64) {
+      pushFile(createClipboardBitmapFile(snapshot.imageBase64));
+    }
+
+    return { files, signature: buildClipboardMediaSignature(snapshot) };
+  }
+
+  // 桌面端读原生剪贴板失败时不再回退到 Async Clipboard API: 那套接口会把同一份内容
+  // 拆成多种表示(png/tiff…)，兜底回来就是一次粘贴落两张图。宁可当作「剪贴板里没有媒体」。
+  if (isTauri()) {
+    console.warn("[clipboard] 原生剪贴板读取不可用，跳过浏览器兜底");
+    return { files: [], signature: null };
+  }
+
+  const webFiles = await readWebClipboardMediaFiles();
+  if (!webFiles || webFiles.length === 0) {
+    return { files: [], signature: null };
+  }
+
+  return {
+    files: webFiles,
+    signature: webFiles.map((file) => `${file.name}|${file.type}|${file.size}`).join("|"),
+  };
 }
 
 function resolveAllowedNodeTypes(handleType: HandleType): CanvasNodeType[] {
@@ -497,15 +826,18 @@ export function Canvas() {
   // macOS 的 contextmenu 在按下瞬间就派发，只能先压住，等 pointerup 判定「没拖动」
   // 再用这个回调把菜单补弹一次（详见框选 effect 里的注释）。
   const canvasContextMenuRef = useRef<((event: MouseEvent | ReactMouseEvent) => void) | null>(null);
+  /** 同一次右键手势可能被「真实 contextmenu」和「macOS 补弹」各触发一次，记录上一次弹菜单位置用于去重。 */
+  const lastContextMenuOpenRef = useRef<{ at: number; x: number; y: number; nodeId: string | null } | null>(null);
 
   const [showNodeMenu, setShowNodeMenu] = useState(false);
-  const [isNodePaletteOpen, setIsNodePaletteOpen] = useState(true);
+  const [isNodeManagerOpen, setIsNodeManagerOpen] = useState(true);
+  const [videoViewerUrl, setVideoViewerUrl] = useState<string | null>(null);
   const [canvasContextMenu, setCanvasContextMenu] = useState<{
     position: { x: number; y: number };
     flowPosition: { x: number; y: number };
     imageUrl: string | null;
     downloadUrl: string | null;
-    downloadMediaType: "image" | "video" | null;
+    downloadMediaType: "image" | "video" | "audio" | null;
     nodeId: string | null;
     textContent: string | null;
   } | null>(null);
@@ -554,8 +886,19 @@ export function Canvas() {
   const isRestoringCanvasRef = useRef(true);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copiedSnapshotRef = useRef<ClipboardSnapshot | null>(null);
+  /**
+   * 记录「上一次复制的是画布节点」，并顺手取一份当时的系统剪贴板指纹。
+   *
+   * 节点复制只存在内存里、不写系统剪贴板，所以光看剪贴板判断不出先后；把复制节点那一刻的
+   * 剪贴板指纹留在这里，右键粘贴时再比一次，就知道用户之后有没有又复制了本地文件。
+   */
+  const nodeCopyIntentRef = useRef<{ at: number; clipboardProbe: Promise<string | null> } | null>(null);
   const pasteIterationRef = useRef(0);
   const pasteImageHandledRef = useRef(false);
+  /** 右键「粘贴」读系统剪贴板是异步的，防抖避免重复触发时粘贴出两份内容。 */
+  const contextPasteRunningRef = useRef(false);
+  /** 上一次右键粘贴完成的时间，用于吃掉「菜单还没卸载就被再点一次」的重复触发。 */
+  const lastContextPasteAtRef = useRef(0);
   const activeGenerationPollNodeIdsRef = useRef(new Set<string>());
   const activeVideoRecoveryNodeIdsRef = useRef(new Set<string>());
   const recoveryPollerCountRef = useRef(0);
@@ -788,6 +1131,7 @@ export function Canvas() {
   const setViewportState = useCanvasStore((state) => state.setViewportState);
   const setCanvasViewportSize = useCanvasStore((state) => state.setCanvasViewportSize);
   const imageViewer = useCanvasStore((state) => state.imageViewer);
+  const openImageViewer = useCanvasStore((state) => state.openImageViewer);
   const closeImageViewer = useCanvasStore((state) => state.closeImageViewer);
   const navigateImageViewer = useCanvasStore((state) => state.navigateImageViewer);
   const apiKeys = useSettingsStore((state) => state.apiKeys);
@@ -866,6 +1210,125 @@ export function Canvas() {
       }, delayMs);
     },
     [persistCanvasSnapshot],
+  );
+
+  /** 统一处理文件拖入和系统剪贴板粘贴，按媒体类型创建对应画布节点。 */
+  /**
+   * 把本地文件(图片 + 视频/音频)落成画布节点。
+   *
+   * 排列统一走 uploadBatchPlacement: 先按批次内的最大宽高定出统一单元格,
+   * 再按行优先填格, 因此行列都严格对齐; 整块与既有节点干涉时整块下移,
+   * 不会出现叠在一起的节点。旧实现是逐个游标推进且不看已有节点, 会压到别人身上。
+   */
+  const addLocalMediaFilesToCanvas = useCallback(
+    async (candidateFiles: File[], basePosition: { x: number; y: number }) => {
+      const files = candidateFiles.filter((file) => resolveLocalUploadMediaType(file));
+      if (files.length === 0) {
+        return;
+      }
+
+      const imageDefinition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.upload);
+      const mediaDefinition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.audio);
+      const fallbackImageSize = resolveMinEdgeFittedSize("1:1", {
+        minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
+        minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
+      });
+
+      type PendingPlacement = {
+        file: File;
+        width: number;
+        height: number;
+        image?: Awaited<ReturnType<typeof prepareNodeImageFromFile>>;
+        sourcePath?: string;
+        mediaType?: "video" | "audio";
+      };
+      // 网格要先用尺寸定单元格, 所以素材得全部备好再落点(图片要解码、媒体要落盘)。
+      const pending: PendingPlacement[] = [];
+
+      for (const file of files) {
+        const mediaType = resolveLocalUploadMediaType(file);
+        if (mediaType === "image") {
+          try {
+            const image = await prepareNodeImageFromFile(file);
+            const size = resolveMinEdgeFittedSize(image.aspectRatio ?? "1:1", {
+              minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
+              minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
+            });
+            pending.push({ file, image, width: size.width, height: size.height });
+          } catch (error) {
+            console.warn("[localUpload] image import failed", error);
+            void showErrorDialog(
+              "本地图片导入失败",
+              "上传失败",
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+          continue;
+        }
+        if (mediaType !== "video" && mediaType !== "audio") {
+          continue;
+        }
+        try {
+          const sourcePath = await persistLocalMediaFile(file, mediaType);
+          const size = mediaDefinition.defaultSize ?? {
+            width: AUDIO_NODE_DEFAULT_WIDTH,
+            height: AUDIO_NODE_DEFAULT_HEIGHT,
+          };
+          pending.push({ file, sourcePath, mediaType, width: size.width, height: size.height });
+        } catch (error) {
+          console.warn("[localUpload] media import failed", error);
+          void showErrorDialog(
+            "本地媒体导入失败",
+            "上传失败",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+
+      if (pending.length === 0) {
+        return;
+      }
+
+      const positions = resolveUploadBatchPositions({
+        anchor: basePosition,
+        items: pending.map((item) => ({ width: item.width, height: item.height })),
+        occupied: collectCanvasOccupiedRects(
+          useCanvasStore.getState().nodes,
+          fallbackImageSize.width,
+          fallbackImageSize.height,
+        ),
+      });
+
+      let lastNodeId: string | null = null;
+      pending.forEach((item, index) => {
+        const position = positions[index];
+        if (item.image) {
+          lastNodeId = addNode(CANVAS_NODE_TYPES.upload, position, {
+            ...imageDefinition.createDefaultData(),
+            imageUrl: item.image.imageUrl,
+            previewImageUrl: item.image.previewImageUrl ?? item.image.imageUrl,
+            aspectRatio: item.image.aspectRatio ?? "1:1",
+            sourceFileName: item.file.name,
+            displayName: item.file.name.replace(/\.[^.]+$/, ""),
+          });
+          return;
+        }
+        if (item.sourcePath && item.mediaType) {
+          lastNodeId = addNode(CANVAS_NODE_TYPES.audio, position, {
+            ...mediaDefinition.createDefaultData(),
+            sourcePath: item.sourcePath,
+            mediaType: item.mediaType,
+            displayName: item.file.name.replace(/\.[^.]+$/, "").trim() || item.file.name,
+          });
+        }
+      });
+
+      if (lastNodeId) {
+        setSelectedNode(lastNodeId);
+        scheduleCanvasPersist(0);
+      }
+    },
+    [addNode, scheduleCanvasPersist, setSelectedNode],
   );
 
   /** 打开模板侧边栏: 先把当前画布快照落盘(取消未触发的延迟保存), 画布本身不离开 */
@@ -2200,31 +2663,59 @@ export function Canvas() {
     }
   }, [selectedNodeId, selectedNodeIds, setSelectedNode]);
 
+  /**
+   * 记录「刚复制了画布节点」，同时记下这一刻系统剪贴板里的媒体指纹。
+   *
+   * 之后右键粘贴时把当前指纹和它比一次：一样 → 上一步就是复制节点；不一样 → 说明复制节点
+   * 之后用户又复制了本地文件，那次才是上一步。
+   */
+  const rememberCopiedNodes = useCallback((snapshot: ClipboardSnapshot) => {
+    copiedSnapshotRef.current = snapshot;
+    nodeCopyIntentRef.current = {
+      at: Date.now(),
+      clipboardProbe: readClipboardMediaSnapshot(false)
+        .then((probe) => (probe ? buildClipboardMediaSignature(probe) : null))
+        .catch(() => null),
+    };
+  }, []);
+
+  /** 本地媒体是「上一步」时，画布节点槽位立即作废——两个槽位互斥，只可能粘出一份内容。 */
+  const forgetCopiedNodes = useCallback(() => {
+    copiedSnapshotRef.current = null;
+    nodeCopyIntentRef.current = null;
+  }, []);
+
   useEffect(() => {
     const handlePaste = (event: ClipboardEvent) => {
       pasteImageHandledRef.current = false;
-      if (!selectedUploadNodeId || isTypingTarget(event.target)) {
+      if (isTypingTarget(event.target) || isDirectorDeskOpen()) {
         return;
       }
 
-      const imageFile = resolveClipboardImageFile(event);
-      if (!imageFile) {
+      const files = resolveClipboardMediaFiles(event);
+      if (files.length === 0) {
         return;
       }
 
       event.preventDefault();
       pasteImageHandledRef.current = true;
-      canvasEventBus.publish("upload-node/paste-image", {
-        nodeId: selectedUploadNodeId,
-        file: imageFile,
-      });
+      const imageFile = files.length === 1 && resolveLocalUploadMediaType(files[0]) === "image" ? files[0] : null;
+      if (selectedUploadNodeId && imageFile) {
+        canvasEventBus.publish("upload-node/paste-image", {
+          nodeId: selectedUploadNodeId,
+          file: imageFile,
+        });
+        return;
+      }
+
+      void addLocalMediaFilesToCanvas(files, resolveViewportCenterPosition());
     };
 
     document.addEventListener("paste", handlePaste);
     return () => {
       document.removeEventListener("paste", handlePaste);
     };
-  }, [selectedUploadNodeId]);
+  }, [addLocalMediaFilesToCanvas, selectedUploadNodeId]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2247,36 +2738,29 @@ export function Canvas() {
         }
         event.preventDefault();
         const selectedIdSet = new Set(selectedNodeIds);
-        copiedSnapshotRef.current = {
+        rememberCopiedNodes({
           nodes: nodes.filter((node) => selectedIdSet.has(node.id)),
           edges: edges.filter((edge) => selectedIdSet.has(edge.source) && selectedIdSet.has(edge.target)),
-        };
+        });
         return;
       }
 
       if (isPaste) {
-        if (selectedUploadNodeId) {
-          pasteImageHandledRef.current = false;
-          window.setTimeout(() => {
-            if (pasteImageHandledRef.current) {
-              pasteImageHandledRef.current = false;
-              return;
-            }
+        // Clipboard paste is delivered after keydown. Defer node duplication so image/video/audio
+        // files copied from the OS can claim the shortcut and create media nodes instead.
+        pasteImageHandledRef.current = false;
+        window.setTimeout(() => {
+          if (pasteImageHandledRef.current) {
+            pasteImageHandledRef.current = false;
+            return;
+          }
 
-            if (!copiedSnapshotRef.current || copiedSnapshotRef.current.nodes.length === 0) {
-              return;
-            }
+          if (!copiedSnapshotRef.current || copiedSnapshotRef.current.nodes.length === 0) {
+            return;
+          }
 
-            void duplicateNodesRef.current?.(copiedSnapshotRef.current.nodes.map((node) => node.id));
-          }, 0);
-          return;
-        }
-
-        if (!copiedSnapshotRef.current || copiedSnapshotRef.current.nodes.length === 0) {
-          return;
-        }
-        event.preventDefault();
-        void duplicateNodesRef.current?.(copiedSnapshotRef.current.nodes.map((node) => node.id));
+          void duplicateNodesRef.current?.(copiedSnapshotRef.current.nodes.map((node) => node.id));
+        }, 0);
         return;
       }
 
@@ -2329,6 +2813,7 @@ export function Canvas() {
     deleteNodes,
     groupNodes,
     handleGroupSelected,
+    rememberCopiedNodes,
     undo,
     redo,
     scheduleCanvasPersist,
@@ -2395,6 +2880,20 @@ export function Canvas() {
         return;
       }
 
+      // 一次右键只允许弹一个菜单：真实 contextmenu 与 macOS 补弹若落在同一位置，忽略后到的那次。
+      const now = performance.now();
+      const lastOpen = lastContextMenuOpenRef.current;
+      if (
+        lastOpen &&
+        nodeId === lastOpen.nodeId &&
+        now - lastOpen.at < 200 &&
+        Math.abs(event.clientX - lastOpen.x) < 4 &&
+        Math.abs(event.clientY - lastOpen.y) < 4
+      ) {
+        return;
+      }
+      lastContextMenuOpenRef.current = { at: now, x: event.clientX, y: event.clientY, nodeId };
+
       setShowNodeMenu(false);
       setMenuAllowedTypes(undefined);
       setPendingConnectStart(null);
@@ -2448,11 +2947,11 @@ export function Canvas() {
     (nodeId: string) => {
       const node = nodes.find((item) => item.id === nodeId);
       if (!node) return;
-      copiedSnapshotRef.current = { nodes: [node], edges: [] };
+      rememberCopiedNodes({ nodes: [node], edges: [] });
       setSelectedNode(nodeId);
       setCanvasContextMenu(null);
     },
-    [nodes, setSelectedNode],
+    [nodes, rememberCopiedNodes, setSelectedNode],
   );
 
   /** 右键「冻结组 / 解冻组」: 冻结后组与其内部节点位置锁定 */
@@ -2471,22 +2970,66 @@ export function Canvas() {
     scheduleCanvasPersist(0);
   }, [canvasContextMenu, nodes, scheduleCanvasPersist, setGroupFrozen]);
 
-  const handleContextPaste = useCallback(() => {
+  const handleContextPaste = useCallback(async () => {
     const context = canvasContextMenu;
-    const snapshot = copiedSnapshotRef.current;
-    if (!context || !snapshot || snapshot.nodes.length === 0) return;
-    duplicateNodesRef.current?.(
-      snapshot.nodes.map((node) => node.id),
-      {
-        targetPosition: context.flowPosition,
-        disableOffsetIteration: true,
-      },
-    );
+    if (!context) {
+      return;
+    }
+
+    // 先收起菜单: 后面读系统剪贴板是异步的(可能申请权限/耗时)，菜单不该挂在画布上。
     setCanvasContextMenu(null);
-  }, [canvasContextMenu]);
+
+    // 一次粘贴只落实一份内容: 读剪贴板期间、以及刚粘完的极短时间内(菜单还没卸载就被再点一次)
+    // 的重复触发一律忽略，避免一次点击落下两份。
+    if (
+      contextPasteRunningRef.current ||
+      performance.now() - lastContextPasteAtRef.current < CONTEXT_PASTE_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+    contextPasteRunningRef.current = true;
+    try {
+      const media = await readSystemClipboardMedia();
+      const nodeSnapshot = copiedSnapshotRef.current;
+      const hasNodeSnapshot = Boolean(nodeSnapshot?.nodes.length);
+      // 「上一步」判断: 复制节点时会记下当时的剪贴板指纹，如果现在的指纹和它不一样，
+      // 说明用户复制完节点之后又复制了本地媒体文件 → 那次才是上一步，要粘媒体。
+      const copiedClipboardSignature = nodeCopyIntentRef.current
+        ? await nodeCopyIntentRef.current.clipboardProbe
+        : null;
+      const mediaIsLatestStep =
+        media.files.length > 0 &&
+        (!hasNodeSnapshot ||
+          (copiedClipboardSignature !== null && copiedClipboardSignature !== media.signature));
+
+      // 画布节点和本地媒体共用一个剪贴板槽: 谁对上「上一步」就粘谁，另一个立即作废，
+      // 不会出现「节点一份 + 本地文件一份」两张图同时落下的情况。
+      if (mediaIsLatestStep) {
+        forgetCopiedNodes();
+        await addLocalMediaFilesToCanvas(media.files, context.flowPosition);
+        return;
+      }
+
+      if (hasNodeSnapshot) {
+        duplicateNodesRef.current?.(
+          nodeSnapshot!.nodes.map((node) => node.id),
+          {
+            targetPosition: context.flowPosition,
+            disableOffsetIteration: true,
+          },
+        );
+        return;
+      }
+
+      void showErrorDialog("剪贴板没有可粘贴的图片、视频或音频", "无法粘贴", "请先在本地复制媒体文件后重试。");
+    } finally {
+      contextPasteRunningRef.current = false;
+      lastContextPasteAtRef.current = performance.now();
+    }
+  }, [addLocalMediaFilesToCanvas, canvasContextMenu, forgetCopiedNodes]);
 
   const handleContextDownloadMedia = useCallback(
-    (url: string, mediaType: "image" | "video") => {
+    (url: string, mediaType: "image" | "video" | "audio") => {
       const context = canvasContextMenu;
       if (!context) return;
       setCanvasContextMenu(null);
@@ -2497,8 +3040,12 @@ export function Canvas() {
       }).catch((error) => {
         console.error("Failed to save media from context menu", error);
         void showErrorDialog(
-          mediaType === "video" ? "视频下载失败" : "图片下载失败",
-          "下载失败",
+          mediaType === "video"
+            ? t("canvas.contextMenu.downloadVideoFailed")
+            : mediaType === "audio"
+              ? t("canvas.contextMenu.downloadAudioFailed")
+              : t("canvas.contextMenu.downloadImageFailed"),
+          t("canvas.contextMenu.downloadFailed"),
           error instanceof Error ? error.message : String(error),
         );
       });
@@ -2542,26 +3089,51 @@ export function Canvas() {
     setSaveTextPromptDialog(null);
   }, [saveTextPromptDialog, t]);
 
-  const handleAddImageToLibrary = useCallback(async (imageUrl: string, categoryId: string) => {
-    setCanvasContextMenu(null);
-    const assetLibraryState = useAssetLibraryStore.getState();
-    const libraryId = assetLibraryState.activeLibraryId || assetLibraryState.libraries[0]?.id;
-    if (!libraryId) {
-      return;
-    }
+  const handleAddMediaToLibrary = useCallback(
+    async (url: string, mediaType: "image" | "video" | "audio", categoryId: string) => {
+      setCanvasContextMenu(null);
+      const assetLibraryState = useAssetLibraryStore.getState();
+      const libraryId = assetLibraryState.activeLibraryId || assetLibraryState.libraries[0]?.id;
+      if (!libraryId) {
+        return;
+      }
 
-    const { asset, failure } = await importImageUrlToAssetDetailed(imageUrl, libraryId, categoryId);
-    if (asset) {
-      useAssetLibraryStore.getState().addAssets([asset]);
-      return;
-    }
+      if (mediaType === "audio" || mediaType === "video") {
+        const asset =
+          mediaType === "audio"
+            ? await importAudioUrlToAsset(url, libraryId, categoryId)
+            : await importVideoUrlToAsset(url, libraryId, categoryId);
+        if (asset) {
+          useAssetLibraryStore.getState().addAssets([asset]);
+          return;
+        }
+        void showErrorDialog(
+          t(
+            mediaType === "audio"
+              ? "canvas.contextMenu.addAudioToLibraryFailed"
+              : "canvas.contextMenu.addVideoToLibraryFailed",
+          ),
+          t("canvas.contextMenu.addToLibraryFailed"),
+        );
+        return;
+      }
 
-    void showErrorDialog(
-      failure?.reason ? `无法将该图片添加到素材库：${failure.reason}` : "无法将该图片添加到素材库",
-      "添加失败",
-      failure?.details,
-    );
-  }, []);
+      const { asset, failure } = await importImageUrlToAssetDetailed(url, libraryId, categoryId);
+      if (asset) {
+        useAssetLibraryStore.getState().addAssets([asset]);
+        return;
+      }
+
+      void showErrorDialog(
+        failure?.reason
+          ? `${t("canvas.contextMenu.addImageToLibraryFailed")}：${failure.reason}`
+          : t("canvas.contextMenu.addImageToLibraryFailed"),
+        t("canvas.contextMenu.addToLibraryFailed"),
+        failure?.details,
+      );
+    },
+    [t],
+  );
 
   const handleAssetLibraryDragOver = useCallback((event: ReactDragEvent) => {
     const types = event.dataTransfer.types;
@@ -2576,13 +3148,51 @@ export function Canvas() {
     }
   }, []);
 
-  const handlePaletteNodeSelect = useCallback(
-    (type: CanvasNodeType) => {
-      const nodeId = addNode(type, resolveViewportCenterPosition());
-      setSelectedNode(nodeId);
-      scheduleCanvasPersist(0);
+  // 节点管理工具栏: 收纳画布内所有图片 / 视频节点。
+  const mediaEntries = useMemo(() => collectCanvasMediaEntries(nodes), [nodes]);
+
+  // 点击缩略图: 图片走大图查看器(同节点多张图可翻页), 视频走全屏播放器。
+  // 索引里的图片是落盘绝对路径, 而 ImageViewerModal 只接收可直接渲染的 URL
+  // (节点双击、模板页也都是先转换再传), 所以这里补上转换; 视频不动 ——
+  // VideoViewerModal 内部自己转换, 且播放失败要拿原始路径去后端转码。
+  const handleMediaEntryPreview = useCallback(
+    (entry: CanvasMediaEntry) => {
+      const target = entry.previewUrl?.trim();
+      if (!target) {
+        return;
+      }
+      if (entry.kind === "video") {
+        setVideoViewerUrl(target);
+        return;
+      }
+      const displayUrl = resolveImageDisplayUrl(target);
+      const previewList = (entry.previewList.length > 0 ? entry.previewList : [target]).map((item) =>
+        resolveImageDisplayUrl(item),
+      );
+      openImageViewer(displayUrl, previewList);
     },
-    [addNode, scheduleCanvasPersist, setSelectedNode],
+    [openImageViewer],
+  );
+
+  // 点击条目: 平滑移动视口到该节点(组内子节点按累加后的绝对坐标定位)。
+  const handleMediaEntryLocate = useCallback(
+    (nodeId: string) => {
+      const target = nodes.find((node) => node.id === nodeId);
+      if (!target) {
+        return;
+      }
+      const nodeMap = new Map(nodes.map((node) => [node.id, node] as const));
+      const absolute = resolveCanvasNodeAbsolutePosition(nodeId, nodeMap);
+      const size = resolveCanvasNodeSize(target);
+      const zoom = Math.max(reactFlowInstance.getZoom(), 0.75);
+      void reactFlowInstance.setCenter(
+        absolute.x + size.width / 2,
+        absolute.y + size.height / 2,
+        { zoom, duration: 420 },
+      );
+      setSelectedNode(nodeId);
+    },
+    [nodes, reactFlowInstance, setSelectedNode],
   );
 
   // 本地上传节点收到视频/音频后替换为媒体节点, 保留原节点 ID 和已有连线。
@@ -2610,6 +3220,29 @@ export function Canvas() {
     });
   }, [replaceNodeType, scheduleCanvasPersist, setSelectedNode]);
 
+  /**
+   * 本地上传节点一次选了多个文件时, 首个文件留在原节点, 其余在这里落成新节点。
+   * 基准点取源节点右缘外侧一个标准间距, 与「下游节点在右侧」的既有约定一致;
+   * 具体位置(含避让已有节点)由 addLocalMediaFilesToCanvas 统一算。
+   */
+  useEffect(() => {
+    return canvasEventBus.subscribe("upload-node/import-files", ({ nodeId, files, firstFileMinWidth }) => {
+      const state = useCanvasStore.getState();
+      const sourceNode = state.nodes.find((node) => node.id === nodeId);
+      let basePosition = resolveViewportCenterPosition();
+      if (sourceNode) {
+        const nodeMap = new Map(state.nodes.map((node) => [node.id, node] as const));
+        const absolute = resolveCanvasNodeAbsolutePosition(nodeId, nodeMap);
+        const size = resolveCanvasNodeSize(sourceNode);
+        // measured/width 此刻还是写入内容之前的旧值(React Flow 尚未重新测量),
+        // 直接用它贴右侧会被"已经放大"的源节点压住, 所以取首个文件写入后的宽度兜底。
+        const anchorWidth = Math.max(size.width, firstFileMinWidth ?? 0);
+        basePosition = { x: absolute.x + anchorWidth + UPLOAD_BATCH_GAP, y: absolute.y };
+      }
+      void addLocalMediaFilesToCanvas(files, basePosition);
+    });
+  }, [addLocalMediaFilesToCanvas]);
+
   const handleAssetLibraryDrop = useCallback(
     (event: ReactDragEvent) => {
       const types = event.dataTransfer.types;
@@ -2629,9 +3262,10 @@ export function Canvas() {
             if (placement.nodes.length === 0) return;
 
             // 节点 id 由 addNode 内部重新生成(uuid), 因此同模板可重复拖入, 只需记录新旧映射。
+            // 尺寸取保存模板时的快照值, 让落图结果与保存时的样子一致(缺失时 addNode 回落到类型默认尺寸)。
             const idMap = new Map<string, string>();
             for (const node of placement.nodes) {
-              const newId = addNode(node.type, node.position, node.data);
+              const newId = addNode(node.type, node.position, node.data, node.size);
               idMap.set(node.templateNodeId, newId);
             }
             for (const edge of placement.edges) {
@@ -2719,7 +3353,7 @@ export function Canvas() {
     [addEdge, addNode, reactFlowInstance, scheduleCanvasPersist, setSelectedNode],
   );
 
-  // 从系统文件管理器拖入本地文件 → 按类型创建图片或媒体节点。
+  // 从系统文件管理器拖入本地文件 → 复用剪贴板媒体导入流程。
   const handleFileDrop = useCallback(
     async (event: ReactDragEvent) => {
       const files = Array.from(event.dataTransfer?.files ?? []).filter((file) => resolveLocalUploadMediaType(file));
@@ -2728,104 +3362,12 @@ export function Canvas() {
       }
       event.preventDefault();
       event.stopPropagation();
-
-      const basePosition = reactFlowInstance.screenToFlowPosition({
-        x: event.clientX,
-        y: event.clientY,
-      });
-
-      const imageFiles = files.filter((file) => resolveLocalUploadMediaType(file) === "image");
-      const mediaFiles = files.filter((file) => {
-        const type = resolveLocalUploadMediaType(file);
-        return type === "video" || type === "audio";
-      });
-      const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.upload);
-
-      // 先处理所有文件拿到宽高比, 再按网格对齐排列(每行 3 张, 行列对齐)
-      const prepared = [];
-      for (const file of imageFiles) {
-        prepared.push(await prepareNodeImageFromFile(file));
-      }
-
-      const GAP = 24;
-      const COLS = 3;
-      const sizeFor = (aspectRatio: string) =>
-        resolveMinEdgeFittedSize(aspectRatio, {
-          minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
-          minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
-        });
-
-      let cursorX = basePosition.x;
-      let cursorY = basePosition.y;
-      let rowMaxHeight = 0;
-      let lastNodeId: string | null = null;
-
-      for (let index = 0; index < prepared.length; index += 1) {
-        const item = prepared[index];
-        const file = imageFiles[index];
-        const size = sizeFor(item.aspectRatio ?? "1:1");
-        if (index > 0 && index % COLS === 0) {
-          // 换行: x 回到起点, y 下移上一行最大高度 + 间距
-          cursorX = basePosition.x;
-          cursorY += rowMaxHeight + GAP;
-          rowMaxHeight = 0;
-        }
-        const nodeId = addNode(
-          CANVAS_NODE_TYPES.upload,
-          { x: cursorX, y: cursorY },
-          {
-            ...definition.createDefaultData(),
-            imageUrl: item.imageUrl,
-            previewImageUrl: item.previewImageUrl ?? item.imageUrl,
-            aspectRatio: item.aspectRatio ?? "1:1",
-            sourceFileName: file.name,
-            displayName: file.name.replace(/\.[^.]+$/, ""),
-          },
-        );
-        lastNodeId = nodeId;
-        cursorX += size.width + GAP;
-        rowMaxHeight = Math.max(rowMaxHeight, size.height);
-      }
-
-      // 视频/音频使用媒体节点, 从图片网格下方开始排列避免重叠。
-      if (mediaFiles.length > 0) {
-        const mediaDefinition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.audio);
-        let mediaX = basePosition.x;
-        const mediaY = imageFiles.length > 0 ? cursorY + rowMaxHeight + GAP : basePosition.y;
-        for (const file of mediaFiles) {
-          const mediaType = resolveLocalUploadMediaType(file);
-          if (mediaType !== "video" && mediaType !== "audio") continue;
-          try {
-            const sourcePath = await persistLocalMediaFile(file, mediaType);
-            const mediaNodeId = addNode(
-              CANVAS_NODE_TYPES.audio,
-              { x: mediaX, y: mediaY },
-              {
-                ...mediaDefinition.createDefaultData(),
-                sourcePath,
-                mediaType,
-                displayName: file.name.replace(/\.[^.]+$/, "").trim() || file.name,
-              },
-            );
-            lastNodeId = mediaNodeId;
-            mediaX += 344;
-          } catch (error) {
-            console.warn("[localUpload] file drop failed", error);
-            void showErrorDialog(
-              "本地媒体导入失败",
-              "上传失败",
-              error instanceof Error ? error.message : String(error),
-            );
-          }
-        }
-      }
-
-      if (lastNodeId) {
-        setSelectedNode(lastNodeId);
-      }
-      scheduleCanvasPersist(0);
+      await addLocalMediaFilesToCanvas(
+        files,
+        reactFlowInstance.screenToFlowPosition({ x: event.clientX, y: event.clientY }),
+      );
     },
-    [addNode, reactFlowInstance, scheduleCanvasPersist, setSelectedNode],
+    [addLocalMediaFilesToCanvas, reactFlowInstance],
   );
 
   const handleCanvasDrop = useCallback(
@@ -3358,9 +3900,7 @@ export function Canvas() {
         const state = useCanvasStore.getState();
         const nodeMap = new Map(state.nodes.map((item) => [item.id, item] as const));
         // 冻结组不接受拖入, 不作为命中目标
-        const groups = state.nodes.filter(
-          (item) => item.type === CANVAS_NODE_TYPES.group && !isFrozenGroupNode(item),
-        );
+        const groups = state.nodes.filter((item) => item.type === CANVAS_NODE_TYPES.group && !isFrozenGroupNode(item));
         const draggingNodes = state.nodes.filter((item) => Boolean(item.dragging));
         const targets = draggingNodes.length > 0 ? draggingNodes : [pendingNode];
 
@@ -3528,9 +4068,7 @@ export function Canvas() {
         const state = useCanvasStore.getState();
         const nodeMap = new Map(state.nodes.map((item) => [item.id, item] as const));
         // 冻结组不接受拖入, 不作为命中目标
-        const groups = state.nodes.filter(
-          (item) => item.type === CANVAS_NODE_TYPES.group && !isFrozenGroupNode(item),
-        );
+        const groups = state.nodes.filter((item) => item.type === CANVAS_NODE_TYPES.group && !isFrozenGroupNode(item));
         if (groups.length > 0) {
           const draggingNodes = state.nodes.filter((item) => Boolean(item.dragging));
           const targets = draggingNodes.length > 0 ? draggingNodes : [node];
@@ -3914,7 +4452,7 @@ export function Canvas() {
 
   // 右键命中的节点(用于判定是否展示「冻结组 / 解冻组」)
   const canvasContextMenuNode = useMemo(
-    () => (canvasContextMenu?.nodeId ? nodes.find((node) => node.id === canvasContextMenu.nodeId) ?? null : null),
+    () => (canvasContextMenu?.nodeId ? (nodes.find((node) => node.id === canvasContextMenu.nodeId) ?? null) : null),
     [canvasContextMenu?.nodeId, nodes],
   );
 
@@ -4006,14 +4544,16 @@ export function Canvas() {
         </svg>
       )}
 
-      {isNodePaletteOpen ? (
-        <NodePaletteSidebar
-          open={isNodePaletteOpen}
-          onToggle={() => setIsNodePaletteOpen(false)}
-          onSelect={handlePaletteNodeSelect}
+      {isNodeManagerOpen ? (
+        <NodeManagerSidebar
+          open={isNodeManagerOpen}
+          entries={mediaEntries}
+          onToggle={() => setIsNodeManagerOpen(false)}
+          onPreview={handleMediaEntryPreview}
+          onLocate={handleMediaEntryLocate}
         />
       ) : (
-        <NodePaletteToggle onClick={() => setIsNodePaletteOpen(true)} />
+        <NodeManagerToggle onClick={() => setIsNodeManagerOpen(true)} />
       )}
 
       {dragSelectRect && (
@@ -4180,14 +4720,18 @@ export function Canvas() {
           textContent={canvasContextMenu.textContent}
           isGroupNode={isGroupNode(canvasContextMenuNode)}
           groupFrozen={isFrozenGroupNode(canvasContextMenuNode)}
-          canPaste={Boolean(copiedSnapshotRef.current?.nodes.length)}
+          canPaste={
+            Boolean(copiedSnapshotRef.current?.nodes.length) ||
+            isTauri() ||
+            Boolean(navigator.clipboard?.read)
+          }
           categories={activeAssetLibraryCategories}
           failedNodeCount={failedGenerationNodeIds.length}
           onClearFailedNodes={handleClearFailedNodes}
           onCopyNode={handleContextCopyNode}
           onSaveTextToPrompt={handleContextSaveTextToPrompt}
           onPaste={handleContextPaste}
-          onAddImageToLibrary={handleAddImageToLibrary}
+          onAddMediaToLibrary={handleAddMediaToLibrary}
           onDownloadMedia={handleContextDownloadMedia}
           onToggleGroupFrozen={handleContextToggleGroupFrozen}
           onClose={() => setCanvasContextMenu(null)}
@@ -4203,6 +4747,12 @@ export function Canvas() {
         currentIndex={imageViewer.currentIndex}
         onClose={closeImageViewer}
         onNavigate={navigateImageViewer}
+      />
+
+      <VideoViewerModal
+        open={videoViewerUrl !== null}
+        videoUrl={videoViewerUrl ?? ""}
+        onClose={() => setVideoViewerUrl(null)}
       />
 
       <AssetLibraryPanel

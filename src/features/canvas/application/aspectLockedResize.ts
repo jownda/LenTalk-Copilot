@@ -71,7 +71,7 @@ export const VIDEO_MEDIA_RESIZE_BOUNDS: AspectLockedResizeBounds = {
 /** 纯音频节点(不显示画面)的缩放边界, 保持原有取值。 */
 export const AUDIO_ONLY_RESIZE_BOUNDS: AspectLockedResizeBounds = {
   minWidth: 180,
-  minHeight: 150,
+  minHeight: 100,
   maxWidth: 520,
   maxHeight: 400,
 };
