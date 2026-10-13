@@ -1,11 +1,14 @@
-use std::path::PathBuf;
+use std::path::Path;
 use std::collections::HashSet;
-use std::time::{Duration, SystemTime};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+use tracing::warn;
 
+use crate::commands::media_output::{self, MediaKind};
 use crate::database;
 
 /// 节点数据里图片的轻量引用前缀(与前端 projectStore 的 encodeImageReference 一致)。
@@ -213,16 +216,53 @@ fn extract_project_image_paths(nodes_json: &str, history_json: &str) -> HashSet<
     paths
 }
 
-fn resolve_images_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
+/// 未被引用的文件先移到这里，给误判留一个可恢复的窗口，而不是当场删除。
+const MEDIA_QUARANTINE_DIR: &str = ".quarantine";
 
-    let images_dir = app_data_dir.join("images");
-    std::fs::create_dir_all(&images_dir)
-        .map_err(|e| format!("Failed to create images dir: {}", e))?;
-    Ok(images_dir)
+/// 新文件在这个宽限期内一律不动。
+///
+/// 落盘和「把引用写进 `project_image_refs`」是两次独立的 IPC，中间还夹着一次工程自动保存；
+/// 没有宽限期的话，刚生成完、引用还没落库的文件会被当成垃圾搬走。
+const MEDIA_GRACE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// 移进暂存区后保留多久才真正删除。
+///
+/// 暂存区本身也是磁盘占用 —— 只进不出的暂存区等于「换个目录继续涨」，可用空间还是越来越少，
+/// 所以必须有过期回收，这一步才是真正把空间还给用户的动作。
+const MEDIA_QUARANTINE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// 自动清理的最小间隔。
+///
+/// 工程每次自动保存都会走到这里，而 `videos/` 动辄上千个文件，每次都全扫一遍会把保存拖慢。
+const AUTO_MEDIA_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+static LAST_AUTO_MEDIA_PRUNE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+/// 单个落盘目录的清理结果。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaCleanupKindReport {
+    /// `images` / `videos` / `audio`
+    pub kind: String,
+    pub dir: String,
+    /// 目录里当前实际存在的文件数与总字节（含仍被引用的文件）。
+    pub total_file_count: usize,
+    pub total_bytes: u64,
+    pub quarantined_file_count: usize,
+    pub quarantined_bytes: u64,
+    pub purged_file_count: usize,
+    pub purged_bytes: u64,
+}
+
+/// 一次媒体清理的结果（「设置 → 通用 → 清理未引用文件」用它展示成效）。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaCleanupReport {
+    pub kinds: Vec<MediaCleanupKindReport>,
+    pub quarantined_file_count: usize,
+    pub quarantined_bytes: u64,
+    pub purged_file_count: usize,
+    pub purged_bytes: u64,
 }
 
 fn collect_asset_library_paths_from_json(raw: &str, referenced: &mut HashSet<String>) {
@@ -263,8 +303,14 @@ fn collect_asset_library_paths(
     Ok(())
 }
 
-fn prune_unreferenced_images(app: &AppHandle) -> Result<(), String> {
-    let conn = open_db(app)?;
+/// 收集「仍然被引用」的本地媒体路径。
+///
+/// 来源有两处：
+///   * `project_image_refs` —— 每次保存工程时按节点数据重建。虽然表名带 image，
+///     它存的其实是节点 `data` 下**所有像本地路径的字符串**（视频、音频、封面都在内），
+///     所以视频/音频的引用天然已经覆盖；
+///   * `asset-library` 里更老的记录，可能指向同一个目录，一并保护。
+fn collect_referenced_media_paths(conn: &Connection) -> Result<HashSet<String>, String> {
     let mut stmt = conn
         .prepare("SELECT DISTINCT path FROM project_image_refs")
         .map_err(|e| format!("Failed to prepare image refs query: {}", e))?;
@@ -278,55 +324,240 @@ fn prune_unreferenced_images(app: &AppHandle) -> Result<(), String> {
         let path = path_result.map_err(|e| format!("Failed to decode image ref row: {}", e))?;
         referenced.insert(path);
     }
-    // Older asset-library records may point into the shared images directory.
-    // Keep those files protected even after their source canvas node is gone.
-    collect_asset_library_paths(&conn, &mut referenced)?;
+    collect_asset_library_paths(conn, &mut referenced)?;
+    Ok(referenced)
+}
 
-    let images_dir = resolve_images_dir(app)?;
-    // Image persistence and project-reference persistence are separate IPC
-    // operations. Keep a generous grace period and quarantine files instead of
-    // deleting them immediately so an in-flight save cannot lose an image.
-    const IMAGE_GRACE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
-    let quarantine_dir = images_dir.join(".quarantine");
+/// 文件「年龄」；取不到修改时间时返回 `None`，调用方一律按「还年轻」处理（保守一侧）。
+fn media_entry_age(path: &Path) -> Option<Duration> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+}
+
+fn media_file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0)
+}
+
+/// 清理一个落盘目录：先清过期暂存文件，再把没人引用且放够久的文件移进暂存区。
+///
+/// 与 `AppHandle` 解耦，方便直接在临时目录上做单测。
+fn cleanup_media_dir_at(
+    dir: &Path,
+    referenced: &HashSet<String>,
+    report: &mut MediaCleanupKindReport,
+) -> Result<(), String> {
+    let quarantine_dir = dir.join(MEDIA_QUARANTINE_DIR);
     std::fs::create_dir_all(&quarantine_dir)
-        .map_err(|e| format!("Failed to create image quarantine dir: {}", e))?;
-    let entries = std::fs::read_dir(&images_dir)
-        .map_err(|e| format!("Failed to read images dir: {}", e))?;
+        .map_err(|e| format!("Failed to create media quarantine dir: {}", e))?;
 
-    for entry_result in entries {
-        let entry = entry_result.map_err(|e| format!("Failed to iterate images dir: {}", e))?;
+    // 1) 过期暂存文件直接删除 —— 真正把空间还给用户的一步。
+    let quarantine_entries = std::fs::read_dir(&quarantine_dir)
+        .map_err(|e| format!("Failed to read media quarantine dir: {}", e))?;
+    for entry_result in quarantine_entries {
+        let entry = entry_result.map_err(|e| format!("Failed to iterate quarantine dir: {}", e))?;
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
+        let expired =
+            media_entry_age(&path).is_some_and(|age| age >= MEDIA_QUARANTINE_RETENTION);
+        if !expired {
+            continue;
+        }
+        let size = media_file_size(&path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                report.purged_file_count += 1;
+                report.purged_bytes += size;
+            }
+            // 被占用/无权限时跳过，不要因为一个文件让整轮清理失败。
+            Err(error) => warn!("无法删除过期暂存文件 {}: {error}", path.display()),
+        }
+    }
+
+    // 2) 主目录里没人引用、又放够久的文件移进暂存区。
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("Failed to read media dir: {}", e))?;
+    for entry_result in entries {
+        let entry = entry_result.map_err(|e| format!("Failed to iterate media dir: {}", e))?;
+        let path = entry.path();
+        // 目录一律跳过 —— `.quarantine` 就是这么被排除在外的。
+        if !path.is_file() {
+            continue;
+        }
+
+        let size = media_file_size(&path);
+        report.total_file_count += 1;
+        report.total_bytes += size;
 
         let path_string = path.to_string_lossy().to_string();
-        let is_old_enough = std::fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age >= IMAGE_GRACE_PERIOD);
-        if !referenced.contains(&path_string) && is_old_enough {
-            let Some(file_name) = path.file_name() else { continue; };
-            let target = quarantine_dir.join(file_name);
-            if target.exists() {
-                continue;
+        if referenced.contains(&path_string) {
+            continue;
+        }
+        let is_old_enough = media_entry_age(&path).is_some_and(|age| age >= MEDIA_GRACE_PERIOD);
+        if !is_old_enough {
+            continue;
+        }
+        let Some(file_name) = path.file_name() else { continue; };
+        let target = quarantine_dir.join(file_name);
+        if target.exists() {
+            continue;
+        }
+        match std::fs::rename(&path, &target) {
+            Ok(()) => {
+                report.quarantined_file_count += 1;
+                report.quarantined_bytes += size;
             }
-            std::fs::rename(&path, &target)
-                .map_err(|e| format!("Failed to quarantine unreferenced image: {}", e))?;
+            Err(error) => warn!("无法移出未引用媒体 {}: {error}", path.display()),
         }
     }
 
     Ok(())
 }
 
+fn cleanup_media_dir(
+    app: &AppHandle,
+    kind: MediaKind,
+    referenced: &HashSet<String>,
+    report: &mut MediaCleanupKindReport,
+) -> Result<(), String> {
+    let dir = media_output::media_dir(app, kind)?;
+    report.kind = kind.subdirectory().to_string();
+    report.dir = dir.to_string_lossy().to_string();
+    cleanup_media_dir_at(&dir, referenced, report)
+}
+
+/// 媒体资源回收：把落盘目录里已经没人引用的文件移进暂存区，并清掉过期的暂存文件。
+///
+/// 之前只扫 `images/`，`videos/` 与 `audio/` 完全没有回收 —— 生成的视频会一直躺在那里，
+/// 磁盘只涨不降。现在按 `MediaKind::ALL` 逐个目录处理，并且**必须**用
+/// `media_output::media_dir` 解析路径：落盘位置可以在「设置 → 通用」里改，
+/// GC 如果还盯着旧的硬编码目录，既清不到新目录，又可能去动一个已经不再使用的位置。
+fn prune_unreferenced_media(app: &AppHandle) -> Result<MediaCleanupReport, String> {
+    let conn = open_db(app)?;
+    let referenced = collect_referenced_media_paths(&conn)?;
+
+    let mut report = MediaCleanupReport::default();
+    for kind in MediaKind::ALL {
+        let mut kind_report = MediaCleanupKindReport::default();
+        cleanup_media_dir(app, kind, &referenced, &mut kind_report)?;
+        report.quarantined_file_count += kind_report.quarantined_file_count;
+        report.quarantined_bytes += kind_report.quarantined_bytes;
+        report.purged_file_count += kind_report.purged_file_count;
+        report.purged_bytes += kind_report.purged_bytes;
+        report.kinds.push(kind_report);
+    }
+    Ok(report)
+}
+
+/// 保存/删除工程时顺手清理一次，失败只记日志。
+///
+/// 清理失败不能让保存失败 —— 保存关乎数据安全，清理只是腾空间。
+fn auto_prune_unreferenced_media(app: &AppHandle) {
+    let slot = LAST_AUTO_MEDIA_PRUNE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        if let Some(last) = guard.as_ref() {
+            if last.elapsed() < AUTO_MEDIA_PRUNE_MIN_INTERVAL {
+                return;
+            }
+        }
+        *guard = Some(Instant::now());
+    }
+    if let Err(error) = prune_unreferenced_media(app) {
+        warn!("媒体资源清理失败: {error}");
+    }
+}
+
+/// 「设置 → 通用 → 清理未引用文件」：立刻回收一次，并把结果报给界面。
+#[tauri::command]
+pub fn cleanup_unreferenced_media(app: AppHandle) -> Result<MediaCleanupReport, String> {
+    prune_unreferenced_media(&app)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_asset_library_paths_from_json, collect_image_paths_from_nodes,
-        extract_project_image_paths,
+        cleanup_media_dir_at, collect_asset_library_paths_from_json, collect_image_paths_from_nodes,
+        extract_project_image_paths, MediaCleanupKindReport, MEDIA_QUARANTINE_DIR,
     };
     use std::collections::HashSet;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
+    /// 把文件修改时间往前拨，模拟「已经放了很久」。没有它就只能等 24 小时才能测。
+    fn age_file(path: &Path, age: Duration) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("file must be writable");
+        file.set_modified(SystemTime::now() - age)
+            .expect("mtime must be settable");
+    }
+
+    /// 媒体清理是「只扫 images」的老实现扩出来的：视频/音频过去完全没有回收，
+    /// 磁盘只涨不降。这条用例把四种文件一起放进一个目录验证判定边界。
+    #[test]
+    fn cleanup_quarantines_only_stale_unreferenced_files() {
+        let root = std::env::temp_dir().join(format!(
+            "lentalk-media-gc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir must be creatable");
+
+        let old = Duration::from_secs(48 * 60 * 60);
+
+        // 仍被引用的旧文件：必须留下。
+        let referenced_file = root.join("referenced.mp4");
+        std::fs::write(&referenced_file, b"keep").expect("write");
+        age_file(&referenced_file, old);
+
+        // 没人引用的旧文件：移进暂存区。
+        let orphan_file = root.join("orphan.mp4");
+        std::fs::write(&orphan_file, b"orphan-bytes").expect("write");
+        age_file(&orphan_file, old);
+
+        // 刚生成、引用还没落库的新文件：宽限期内不动。
+        let fresh_file = root.join("fresh.mp4");
+        std::fs::write(&fresh_file, b"fresh").expect("write");
+
+        let quarantine = root.join(MEDIA_QUARANTINE_DIR);
+        std::fs::create_dir_all(&quarantine).expect("quarantine dir must be creatable");
+
+        // 过期暂存文件：真正删除。
+        let expired = quarantine.join("expired.mp4");
+        std::fs::write(&expired, b"expired-bytes").expect("write");
+        age_file(&expired, Duration::from_secs(40 * 24 * 60 * 60));
+
+        // 未到期的暂存文件：保留（用户还有机会搬回来）。
+        let young = quarantine.join("young.mp4");
+        std::fs::write(&young, b"young").expect("write");
+
+        let mut referenced = HashSet::new();
+        referenced.insert(referenced_file.to_string_lossy().to_string());
+
+        let mut report = MediaCleanupKindReport::default();
+        cleanup_media_dir_at(&root, &referenced, &mut report).expect("cleanup must succeed");
+
+        assert!(referenced_file.exists(), "被引用的文件不能被搬走");
+        assert!(fresh_file.exists(), "宽限期内的新文件不能被搬走");
+        assert!(!orphan_file.exists(), "未引用的旧文件应被移出主目录");
+        assert!(quarantine.join("orphan.mp4").exists(), "应落进暂存区而不是被删");
+        assert!(!expired.exists(), "过期暂存文件应被真正删除");
+        assert!(young.exists(), "未到期的暂存文件不能删");
+
+        assert_eq!(report.quarantined_file_count, 1);
+        assert_eq!(report.quarantined_bytes, 12);
+        assert_eq!(report.purged_file_count, 1);
+        assert_eq!(report.purged_bytes, 13);
+        // 暂存区不计入主目录统计（它是目录，被 is_file 过滤掉）。
+        assert_eq!(report.total_file_count, 3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn asset_library_paths_are_protected_from_project_image_pruning() {
@@ -607,7 +838,7 @@ pub fn upsert_project_record(app: AppHandle, record: ProjectRecord) -> Result<()
     tx.commit()
         .map_err(|e| format!("Failed to commit upsert transaction: {}", e))?;
 
-    prune_unreferenced_images(&app)?;
+    auto_prune_unreferenced_media(&app);
     Ok(())
 }
 
@@ -660,6 +891,6 @@ pub fn delete_project_record(app: AppHandle, project_id: String) -> Result<(), S
     tx.commit()
         .map_err(|e| format!("Failed to commit delete transaction: {}", e))?;
 
-    prune_unreferenced_images(&app)?;
+    auto_prune_unreferenced_media(&app);
     Ok(())
 }

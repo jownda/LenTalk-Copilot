@@ -52,7 +52,6 @@ import {
 } from "@/features/canvas/application/generationErrorReport";
 import { showErrorDialog } from "@/features/canvas/application/errorDialog";
 import { saveMediaSourceWithDialog } from "@/features/canvas/application/mediaDownload";
-import { TextNodeEditDialog } from "./TextNodeEditDialog";
 import { importVideoUrlToAsset } from "@/features/library/importAssets";
 import {
   buildTemplateFromCanvas,
@@ -232,6 +231,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const tools = useMemo(() => getNodeToolPlugins(node), [node]);
   const deleteNode = useCanvasStore((state) => state.deleteNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const openTextEditDialog = useCanvasStore((state) => state.openTextEditDialog);
   const canvasNodes = useCanvasStore((state) => state.nodes);
   const canvasEdges = useCanvasStore((state) => state.edges);
   const ungroupNode = useCanvasStore((state) => state.ungroupNode);
@@ -267,7 +267,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isVideoEditDialogOpen, setIsVideoEditDialogOpen] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
   const [isTemplateDialogOpen, setIsTemplateDialogOpen] = useState(false);
-  const [textEditDialogMode, setTextEditDialogMode] = useState<"ai" | "find" | null>(null);
   const [templateName, setTemplateName] = useState("");
   const [templateDescription, setTemplateDescription] = useState("");
   const [isSavingTemplate, setIsSavingTemplate] = useState(false);
@@ -749,7 +748,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             <UiChipButton
               key="text-ai-edit"
               className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
-              onClick={() => setTextEditDialogMode("ai")}
+              onClick={() => openTextEditDialog({ nodeId: node.id, mode: "ai" })}
             >
               <Sparkles className="h-3.5 w-3.5" />
               {t("textNodeEdit.aiButton")}
@@ -757,7 +756,7 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
             <UiChipButton
               key="text-find"
               className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
-              onClick={() => setTextEditDialogMode("find")}
+              onClick={() => openTextEditDialog({ nodeId: node.id, mode: "find" })}
             >
               <Search className="h-3.5 w-3.5" />
               {t("textNodeEdit.findButton")}
@@ -1023,13 +1022,6 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
           {t("common.delete")}
         </UiChipButton>
       </UiPanel>
-      {isTextAnnotation && (
-        <TextNodeEditDialog
-          mode={textEditDialogMode}
-          node={node}
-          onClose={() => setTextEditDialogMode(null)}
-        />
-      )}
 
       {!isImageEdit && isScriptDialogOpen && (
         <PajubenQuickExtractDialog node={node} onClose={() => setIsScriptDialogOpen(false)} />

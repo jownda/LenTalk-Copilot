@@ -37,6 +37,36 @@ export interface QueryUsageRecordsOptions {
   kind?: 'image' | 'video' | 'audio';
 }
 
+/** 按天聚合的用量(SQL 全表 GROUP BY, 不受记录条数上限影响)。 */
+export interface UsageDailyBucket {
+  /** 本地时区日期, 形如 `2026-10-08`。 */
+  day: string;
+  total: number;
+  succeeded: number;
+  failed: number;
+  image: number;
+  video: number;
+  audio: number;
+  cost: number;
+  imageCost: number;
+  videoCost: number;
+  audioCost: number;
+}
+
+/** 按模型聚合的用量排行项。 */
+export interface UsageModelBreakdown {
+  modelId: string;
+  modelName: string;
+  providerName: string;
+  total: number;
+  succeeded: number;
+  failed: number;
+  image: number;
+  video: number;
+  audio: number;
+  cost: number;
+}
+
 /**
  * 估算一次生成的费用(统一换算为 CNY)。
  * 无定价定义或无法估算时返回 0。
@@ -100,6 +130,36 @@ export async function queryUsageRecords(
     });
   } catch (error) {
     console.warn('[UsageLog] query failed', error);
+    return [];
+  }
+}
+
+/** 按天聚合的用量(升序, 覆盖全部历史)。非 Tauri 环境返回空数组。 */
+export async function queryUsageDaily(
+  kind?: 'image' | 'video' | 'audio'
+): Promise<UsageDailyBucket[]> {
+  if (!isTauri()) {
+    return [];
+  }
+  try {
+    return await invoke<UsageDailyBucket[]>('query_usage_daily', {
+      kind: kind ?? null,
+    });
+  } catch (error) {
+    console.warn('[UsageLog] daily query failed', error);
+    return [];
+  }
+}
+
+/** 按模型聚合的用量排行(次数降序, 覆盖全部历史)。 */
+export async function queryUsageBreakdown(limit = 10): Promise<UsageModelBreakdown[]> {
+  if (!isTauri()) {
+    return [];
+  }
+  try {
+    return await invoke<UsageModelBreakdown[]>('query_usage_breakdown', { limit });
+  } catch (error) {
+    console.warn('[UsageLog] breakdown query failed', error);
     return [];
   }
 }

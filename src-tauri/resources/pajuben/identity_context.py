@@ -4,11 +4,28 @@ import re
 
 
 def covers_timestamp(text, timestamp):
+    """文本里是否有场景覆盖这个时间点（秒）。
+
+    场景头的时间标注有两种写法，都要认：
+    - 旧格式 `时间：MM:SS-MM:SS` —— 起止时间码直接写着，最精确，优先用；
+    - 新格式 `总时长：N秒` —— 只有长度没有起点，按剧本的时间顺序累加推出各场区间
+      （剧本严格按播放顺序输出，闪回也落在它真实占用的时段里，所以累加成立）。
+    """
     if timestamp is None or "未找到匹配时间段" in text:
         return False
-    for a, b, c, d in re.findall(r"时间[：:]\s*(\d+):(\d+)\s*[-–—]\s*(\d+):(\d+)", text):
-        if int(a) * 60 + int(b) <= float(timestamp) <= int(c) * 60 + int(d):
+    moment = float(timestamp)
+    spans = [
+        (int(a) * 60 + int(b), int(c) * 60 + int(d))
+        for a, b, c, d in re.findall(r"时间[：:]\s*(\d+):(\d+)\s*[-–—]\s*(\d+):(\d+)", text)
+    ]
+    if spans:
+        return any(lo <= moment <= hi for lo, hi in spans)
+    cursor = 0.0
+    for raw in re.findall(r"总时长[：:]\s*(\d+(?:\.\d+)?)\s*秒", text):
+        end = cursor + float(raw)
+        if cursor <= moment <= end:
             return True
+        cursor = end
     return False
 
 

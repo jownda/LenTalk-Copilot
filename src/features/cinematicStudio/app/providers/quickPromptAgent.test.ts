@@ -103,4 +103,23 @@ describe('buildQuickPromptRequest', () => {
     expect(zhSystem).not.toContain('Write in clear cinematic English.');
     expect(buildQuickPromptRequest(input, 'en').system).toContain('Write in clear cinematic English.');
   });
+
+  it('forbids aspect ratio, duration and frame rate inside FORMAT MODE', () => {
+    const { system, user } = buildQuickPromptRequest({
+      style: '胶片颗粒',
+      synopsis: '侦探穿过雨夜的站台。',
+      sceneAssets: [{ id: 'loc', name: '站台', mediaType: 'image', referenceIndex: 1 }],
+      characterAssets: [],
+    }, 'zh');
+
+    // 画幅 / 秒数 / 帧率是生成时才选的平台参数，不能进提示词正文的 FORMAT MODE 段。
+    expect(system).toContain('Keep FORMAT MODE to generation organization only');
+    expect(system).toContain('must never state an aspect ratio');
+    expect(system).toContain('a second count or a timecode');
+    expect(system).toContain('or a frame rate (for example 24fps)');
+    // 段落清单里也要就地标注，模型读输出契约时不会再顺手补上平台参数。
+    expect(user).toContain(
+      'FORMAT MODE (generation organization only — never aspect ratio, resolution, duration in seconds, or frame rate)',
+    );
+  });
 });

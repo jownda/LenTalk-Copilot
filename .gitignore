@@ -40,3 +40,10 @@ output/
 # 本机构建临时目录:setup-ffmpeg / setup-pajuben 的离线缓存会落在这里(约 100MB+),
 # 一旦被 git add -A 带进提交,Git Data API 推送会因大文件直接失败。
 .build-tmp/
+
+# Python 字节码缓存(扒剧本引擎在 resources/pajuben/ 下运行会生成)
+__pycache__/
+*.pyc
+
+# 本地备份文件(如改价格表前留的 registry.ts.bak-YYYYMMDD-<用途>)
+*.bak-*

@@ -9,7 +9,7 @@
  * - 音频计划：复用 AudioPlanEditor
  * 底部保留「导演分镜规划器 / 最终生成」按钮与 AI 错误展示。
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ProjectV2, SceneStaging, SceneV2 } from "../../shared-types";
 import { Check, ChevronDown, Clapperboard, Copy, Film, Plus, RefreshCw, Sparkles, Trash2, X } from "lucide-react";
 import type { CopyZh, Locale } from "../i18n";
@@ -17,7 +17,10 @@ import type { LenTalkChatModelOption, ReasoningEffort } from "../providers/aiSet
 import type { SceneCompileProgress } from "../providers/ai";
 import AudioPlanEditor from "./AudioPlanEditor";
 import StagingEditor from "./StagingEditor";
-import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import {
+  QuickAssetPickerCard,
+  type QuickAssetPickerItem,
+} from "@/features/canvas/ui/QuickAssetPicker";
 import type { CanvasImageSource } from "./DirectorLayersCard";
 import { directorIntentRefinementText, getStyle, localizedStyleBrief, MASTER_STYLES, styleBriefDescription } from "../../engine";
 import type { CinematicStudioUpstreamText } from "../quickStudioSync";
@@ -121,6 +124,8 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
     upstreamText,
   } = props;
   const [pickingCharacter, setPickingCharacter] = useState(false);
+  // 「场景角色候选」的 + 按钮：候选卡片是 portal 浮层，落点按这个按钮的实时位置算。
+  const characterPickerAnchorRef = useRef<HTMLButtonElement>(null);
   const [audioOpen, setAudioOpen] = useState(false);
   const [stylePresetOpen, setStylePresetOpen] = useState(false);
   const [busySeconds, setBusySeconds] = useState(0);
@@ -188,7 +193,8 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
   const addRosterCharacter = (id: string) => {
     if (roster.includes(id)) return;
     onUpdateStaging({ characterRoster: [...roster, id] });
-    setPickingCharacter(false);
+    // 不在这里收起卡片：候选列表本来就会把已加入的角色滤掉，连着点几个更顺手
+    // （与画布节点上的候选浮层同一套交互）。
   };
   const removeRosterCharacter = (id: string) =>
     onUpdateStaging({
@@ -309,38 +315,38 @@ export default function DirectorBriefCard(props: DirectorBriefCardProps) {
               </span>
             ))}
             <button
+              ref={characterPickerAnchorRef}
               type="button"
               className="scene-character-add"
               title={t.stagingAddCharacter}
               aria-label={t.stagingAddCharacter}
+              aria-haspopup="dialog"
+              aria-expanded={pickingCharacter}
               onClick={() => setPickingCharacter((value) => !value)}
             >
               <Plus size={16} />
             </button>
             <span className="scene-character-add-hint">{t.stagingAddCharacter}</span>
           </div>
-          {pickingCharacter && (
-            <div className="staging-location-picker">
-              {characterCandidates.length === 0 ? (
-                <p className="hint-text">
-                  {characterAssets.length === 0 ? t.stagingNoCharacterHint : t.stagingAllCharactersAdded}
-                </p>
-              ) : (
-                <div className="staging-location-picker-grid">
-                  {characterCandidates.map((asset) => (
-                    <button key={asset.id} onClick={() => addRosterCharacter(asset.id)}>
-                      {asset.referencePaths?.[0] ? (
-                        <img src={resolveImageDisplayUrl(asset.referencePaths[0])} alt={asset.name} />
-                      ) : (
-                        <span className="staging-location-fallback">{asset.name.slice(0, 1)}</span>
-                      )}
-                      <span>{asset.name}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+          <QuickAssetPickerCard
+            open={pickingCharacter}
+            anchorRef={characterPickerAnchorRef}
+            variant="studio"
+            preferredWidth={400}
+            title={t.stagingAddCharacter}
+            emptyHint={characterAssets.length === 0 ? t.stagingNoCharacterHint : t.stagingAllCharactersAdded}
+            items={characterCandidates.map(
+              (asset): QuickAssetPickerItem => ({
+                id: asset.id,
+                name: asset.name,
+                // 原始参考图地址：卡片内部会换成小缩略图，别在这里提前转展示地址。
+                source: asset.referencePaths?.[0] ?? "",
+                active: roster.includes(asset.id),
+              }),
+            )}
+            onToggleItem={addRosterCharacter}
+            onClose={() => setPickingCharacter(false)}
+          />
           <p className="hint-text">{t.sceneCharacterRosterHint}</p>
         </div>
       </div>

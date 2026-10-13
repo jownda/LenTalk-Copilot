@@ -15,6 +15,7 @@ import type {
   CharacterPerformancePlan, LightingDirection, LockLevel, Optics, PerformanceBeat, PerformancePlan, PhysicsAnchor, ProjectV2, SceneV2, ShotParticipant, ShotV2,
 } from "../../shared-types";
 import { isRemoteConfigured, loadAISettings, normalizeBaseUrl, openAICompatibleBaseUrl, type AISettings } from "./aiSettings";
+import { describeProviderFailure, isUpstreamPromptPolicyRejection } from "@/commands/providerError";
 import type { Locale } from "../i18n";
 import { buildQuickPromptRequest, type QuickPromptInput } from "./quickPromptAgent";
 import { cameraMoveTemplateLibrary } from "../cameraMoveTemplates";
@@ -485,8 +486,17 @@ async function chatCompletionsJSON(
     }
   }
   if (!response.ok) {
+    // 上游输入内容预检是偶发判定（与提示词长度相关性高、随模型和时段波动）：原样重发
+    // 一次，命中率不低；被预检拦下的请求根本没执行，重发不会产生额外计费。
+    const raw = await response.clone().text().catch(() => "");
+    if (isUpstreamPromptPolicyRejection(raw)) {
+      onProgress?.("waiting");
+      response = await request(true);
+    }
+  }
+  if (!response.ok) {
     const raw = await response.text().catch(() => "");
-    throw new Error(`HTTP ${response.status}${raw ? `：${raw.slice(0, 260)}` : ""}`);
+    throw new Error(describeProviderFailure(response.status, { raw, model: settings.model }));
   }
   try {
     const content = await readChatCompletionText(
@@ -673,11 +683,16 @@ async function chatCompletionsTextRaw(settings: AISettings, system: string, user
     const raw = await response.clone().text().catch(() => "");
     if ((response.status === 400 || response.status === 422) && STREAM_UNSUPPORTED_RE.test(raw)) {
       response = await request(false);
+    } else if (isUpstreamPromptPolicyRejection(raw)) {
+      // 上游输入内容预检是偶发判定（与提示词长度相关性高、随模型和时段波动）：原样
+      // 重发一次，命中率不低；被预检拦下的请求根本没执行，重发不会产生额外计费。
+      onProgress?.("waiting");
+      response = await request(true);
     }
   }
   if (!response.ok) {
     const raw = await response.text().catch(() => "");
-    throw new Error(`HTTP ${response.status}${raw ? `：${raw.slice(0, 260)}` : ""}`);
+    throw new Error(describeProviderFailure(response.status, { raw, model: settings.model }));
   }
   try {
     const content = (await readChatCompletionText(response, (receivedChars) => onProgress?.("streaming", receivedChars))).trim();

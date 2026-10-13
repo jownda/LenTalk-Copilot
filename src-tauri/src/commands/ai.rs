@@ -25,6 +25,25 @@ static REGISTRY: std::sync::OnceLock<ProviderRegistry> = std::sync::OnceLock::ne
 static ACTIVE_NON_RESUMABLE_JOB_IDS: std::sync::OnceLock<Arc<RwLock<HashSet<String>>>> =
     std::sync::OnceLock::new();
 
+/// 「请求还没送达平台」的在飞表 —— 只有在这个窗口里取消才拦得住。
+///
+/// 每个在飞的视频提交挂一个 watch 通道。`cancel_generate_video_job` 把值置 `true`
+/// (或直接把 sender 摘掉), 提交侧的 `select!` 就放弃继续等 provider: 底层 HTTP 请求
+/// 随 future 一起被丢弃, 平台收不到完整请求, 不会建任务、不会计费。
+///
+/// provider 一返回(平台受理 / 拿到 task_id), 表项立刻移除 —— 前端轮询看到
+/// `cancelable: false`, 「取消生成」入口随之消失。
+///
+/// **只在内存里**: 应用重启后拦不住上一个进程已经发出的请求, 这与事实一致, 不能让
+/// 落库状态撒谎说"还能取消"。
+static VIDEO_JOB_CANCEL_SENDERS: std::sync::OnceLock<
+    Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+> = std::sync::OnceLock::new();
+
+/// 取消成功后落在任务表 `error` 列上的说明。前端按 `status == "canceled"` 自己出文案,
+/// 这条主要是给日志与排查用的。
+const VIDEO_JOB_CANCELED_MESSAGE: &str = "已取消生成（请求未送达模型平台）";
+
 fn get_registry() -> &'static ProviderRegistry {
     REGISTRY.get_or_init(|| {
         let mut registry = ProviderRegistry::new();
@@ -37,6 +56,26 @@ fn get_registry() -> &'static ProviderRegistry {
 
 fn active_non_resumable_job_ids() -> &'static Arc<RwLock<HashSet<String>>> {
     ACTIVE_NON_RESUMABLE_JOB_IDS.get_or_init(|| Arc::new(RwLock::new(HashSet::new())))
+}
+
+fn video_job_cancel_senders(
+) -> &'static Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>> {
+    VIDEO_JOB_CANCEL_SENDERS.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+/// 这个任务现在还能不能取消(请求还没送达平台)。
+async fn video_job_is_cancelable(job_id: &str) -> bool {
+    video_job_cancel_senders().read().await.contains_key(job_id)
+}
+
+/// 等「用户取消」信号。sender 被显式摘除(取消命令的正常路径)同样算取消。
+async fn wait_video_job_cancel(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    let already_canceled = *rx.borrow();
+    if already_canceled {
+        return;
+    }
+    // sender 被丢弃时 `changed()` 返回 Err —— 那正是"取消命令把表项摘了"的情形。
+    let _ = rx.changed().await;
 }
 
 /// 视频任务的「任务类别」标识 —— 落在 `ai_generation_jobs.provider_id` 上。
@@ -118,6 +157,13 @@ pub struct GenerationJobStatusDto {
     /// 只有后端知道「这个 Err 是可重试的」, 所以由后端显式声明, 前端不再猜。
     #[serde(default)]
     pub transient: bool,
+    /// `true` ⇒ 这次提交的请求**还没送到平台**, 此刻 `cancel_generate_video_job` 能拦住。
+    ///
+    /// 视频任务一旦被平台受理(拿到 task_id 开始出片), 中止只会丢掉已经计费的结果,
+    /// 所以那时必须回落成 `false` —— 前端据此收掉「取消生成」入口。判据是后端的
+    /// 在飞表(`VIDEO_JOB_CANCEL_SENDERS`), 前端不猜。
+    #[serde(default)]
+    pub cancelable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -350,6 +396,7 @@ fn dto_from_record(record: &GenerationJobRecord) -> GenerationJobStatusDto {
         result: record.result.clone(),
         error: record.error.clone(),
         transient: false,
+        cancelable: false,
     }
 }
 
@@ -969,7 +1016,15 @@ pub async fn submit_generate_video_job(
     // 这样应用重启后 get_generate_video_job 仍能凭 task_id 续查到成片, 而不是把
     // 仍在平台生成(且已计费)的任务判成「中断」逼用户重新提交、二次扣费。
     let use_resumable_video_task = provider.supports_video_task_resume();
+    // 打开「可取消窗口」: 从这一刻到 provider 返回为止, 用户取消都能真的拦住请求。
+    // 必须在 spawn 之前建表 —— 命令的用户可能比任务轮询还快。
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    video_job_cancel_senders()
+        .write()
+        .await
+        .insert(spawned_job_id.clone(), cancel_tx);
     tauri::async_runtime::spawn(async move {
+        let mut cancel_rx = cancel_rx;
         let update = if use_resumable_video_task {
             // 平台侧抖动(5xx / 408 / 429)时重试提交。实机 2026-09-23 13:49 炳火提交返回
             // HTTP 503「服务暂时不可用，请稍后重试」—— 提交侧原先对任何 Err 都直接落
@@ -979,15 +1034,28 @@ pub async fn submit_generate_video_job(
             // 纯网络层错误不重试: 请求可能已经送达并被计费。
             let mut attempt = 0usize;
             let mut submission = Err(AIError::TaskFailed("视频任务提交未执行".to_string()));
+            let mut canceled_by_user = false;
             while attempt < VIDEO_SUBMIT_MAX_ATTEMPTS {
                 attempt += 1;
-                submission = tokio::time::timeout(
-                    Duration::from_secs(30 * 60),
-                    provider.submit_video_task(native_request.clone()),
-                )
-                .await
-                .map_err(|_| AIError::TaskFailed("视频任务提交超时(30 分钟)".to_string()))
-                .and_then(|result| result);
+                // `biased;` 让"真实结果"优先被检查: 请求已经返回就绝不能被同时到达的
+                // 取消信号抢走 —— 那会把平台已经建好(且已计费)的任务丢掉, 成片永久
+                // 收不回。只有在请求确实还没完成时, 取消才生效(future 被丢弃 ⇒
+                // 底层 HTTP 请求中断 ⇒ 平台收到的是残缺请求, 不会建任务)。
+                tokio::select! {
+                    biased;
+                    outcome = tokio::time::timeout(
+                        Duration::from_secs(30 * 60),
+                        provider.submit_video_task(native_request.clone()),
+                    ) => {
+                        submission = outcome
+                            .map_err(|_| AIError::TaskFailed("视频任务提交超时(30 分钟)".to_string()))
+                            .and_then(|result| result);
+                    }
+                    _ = wait_video_job_cancel(&mut cancel_rx) => {
+                        canceled_by_user = true;
+                        break;
+                    }
+                }
                 match &submission {
                     Err(error)
                         if attempt < VIDEO_SUBMIT_MAX_ATTEMPTS
@@ -1006,45 +1074,81 @@ pub async fn submit_generate_video_job(
                     _ => break,
                 }
             }
-            // 重试过的瞬时错误不再以 `Provider error: …` 的形式抛给用户(那是内部措辞),
-            // 换成一条直的说明, 并注明重试过几次。
-            let submission = match submission {
-                Err(AIError::Provider(message)) => Err(AIError::TaskFailed(if attempt > 1 {
-                    format!("{}（平台侧抖动，已自动重试 {} 次仍失败）", message, attempt - 1)
-                } else {
-                    message
-                })),
-                other => other,
-            };
-            match submission {
-                Ok(ProviderTaskSubmission::Succeeded(video_url)) => {
-                    update_generation_job(&app_handle, &spawned_job_id, "succeeded", Some(&video_url), None)
-                }
-                Ok(ProviderTaskSubmission::Queued(handle)) => {
-                    let meta_json = handle
-                        .metadata
-                        .as_ref()
-                        .and_then(|value| serde_json::to_string(value).ok());
-                    mark_generation_job_resumable(
-                        &app_handle,
-                        spawned_job_id.as_str(),
-                        handle.task_id.as_str(),
-                        meta_json.as_deref(),
-                    )
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    update_generation_job(&app_handle, &spawned_job_id, "failed", None, Some(message.as_str()))
+            if canceled_by_user {
+                info!("视频任务 {} 在送达平台前被用户取消", spawned_job_id);
+                update_generation_job(
+                    &app_handle,
+                    &spawned_job_id,
+                    "canceled",
+                    None,
+                    Some(VIDEO_JOB_CANCELED_MESSAGE),
+                )
+            } else {
+                // 重试过的瞬时错误不再以 `Provider error: …` 的形式抛给用户(那是内部措辞),
+                // 换成一条直的说明, 并注明重试过几次。
+                let submission = match submission {
+                    Err(AIError::Provider(message)) => Err(AIError::TaskFailed(if attempt > 1 {
+                        format!("{}（平台侧抖动，已自动重试 {} 次仍失败）", message, attempt - 1)
+                    } else {
+                        message
+                    })),
+                    other => other,
+                };
+                match submission {
+                    Ok(ProviderTaskSubmission::Succeeded(video_url)) => {
+                        update_generation_job(&app_handle, &spawned_job_id, "succeeded", Some(&video_url), None)
+                    }
+                    Ok(ProviderTaskSubmission::Queued(handle)) => {
+                        let meta_json = handle
+                            .metadata
+                            .as_ref()
+                            .and_then(|value| serde_json::to_string(value).ok());
+                        mark_generation_job_resumable(
+                            &app_handle,
+                            spawned_job_id.as_str(),
+                            handle.task_id.as_str(),
+                            meta_json.as_deref(),
+                        )
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        update_generation_job(&app_handle, &spawned_job_id, "failed", None, Some(message.as_str()))
+                    }
                 }
             }
         } else {
-            let result = provider.generate_video(native_request).await;
-            match result {
-                Ok(video_url) => update_generation_job(&app_handle, &spawned_job_id, "succeeded", Some(&video_url), None),
-                Err(error) => update_generation_job(&app_handle, &spawned_job_id, "failed", None, Some(&error.to_string())),
+            let mut canceled_by_user = false;
+            let mut result = Err(AIError::TaskFailed("视频任务提交未执行".to_string()));
+            // 同样的取舍: `biased;` 先看真实结果, 只有请求确实还没完成时取消才生效。
+            tokio::select! {
+                biased;
+                outcome = provider.generate_video(native_request) => {
+                    result = outcome;
+                }
+                _ = wait_video_job_cancel(&mut cancel_rx) => {
+                    canceled_by_user = true;
+                }
+            }
+            if canceled_by_user {
+                info!("视频任务 {} 在送达平台前被用户取消", spawned_job_id);
+                update_generation_job(
+                    &app_handle,
+                    &spawned_job_id,
+                    "canceled",
+                    None,
+                    Some(VIDEO_JOB_CANCELED_MESSAGE),
+                )
+            } else {
+                match result {
+                    Ok(video_url) => update_generation_job(&app_handle, &spawned_job_id, "succeeded", Some(&video_url), None),
+                    Err(error) => update_generation_job(&app_handle, &spawned_job_id, "failed", None, Some(&error.to_string())),
+                }
             }
         };
         if let Err(error) = update { info!("Failed to update video generation job: {}", error); }
+        // 关掉「可取消窗口」: provider 已返回(平台受理)或任务已结束, 再取消只会丢掉
+        // 已经计费的结果。摘表后前端下一次轮询就会拿到 `cancelable: false`。
+        video_job_cancel_senders().write().await.remove(&spawned_job_id);
         active_non_resumable_job_ids().write().await.remove(&spawned_job_id);
     });
     Ok(job_id)
@@ -1054,7 +1158,34 @@ pub async fn submit_generate_video_job(
 pub async fn get_generate_video_job(app: AppHandle, job_id: String) -> Result<GenerationJobStatusDto, String> {
     // 视频任务与图片共用同一套任务表, 但可恢复任务的续查通道不同: 视频必须走
     // poll_video_task, 否则拿图片的轮询实现去查视频 task_id 只会得到错误。
-    get_generation_job_status(app, job_id, true).await
+    let mut dto = get_generation_job_status(app, job_id.clone(), true).await?;
+    // 「取消生成」只在请求还没送达平台时有意义 —— 判据完全由后端的在飞表说了算,
+    // 前端不猜。任务一被平台受理(或已结束), 这里就是 false, 取消入口随之消失。
+    dto.cancelable = dto.status == "running" && video_job_is_cancelable(job_id.as_str()).await;
+    Ok(dto)
+}
+
+/// 中止一次**还没送达平台**的视频任务。
+///
+/// 返回 `"canceled"` 表示确实拦下来了(提交侧会在 provider 调用前放弃等待, 请求随
+/// future 一起中断); 返回 `"too_late"` 表示平台已经受理或任务已结束 —— 调用方必须
+/// 据此收掉取消入口, **不能谎报成功**, 否则用户以为取消了、平台照跑照计费。
+#[tauri::command]
+pub async fn cancel_generate_video_job(job_id: String) -> Result<String, String> {
+    let sender = video_job_cancel_senders()
+        .read()
+        .await
+        .get(job_id.as_str())
+        .cloned();
+    let Some(sender) = sender else {
+        return Ok("too_late".to_string());
+    };
+    // 摘表 + 置位双保险: 提交侧 `changed()` 在"收到 true"和"sender 被丢弃"两种情况下
+    // 都会立刻返回, 无论它此刻落在哪一个分支上都能拦下来。
+    video_job_cancel_senders().write().await.remove(job_id.as_str());
+    let _ = sender.send(true);
+    info!("视频任务 {} 的取消请求被接受(请求尚未送达平台)", job_id);
+    Ok("canceled".to_string())
 }
 
 #[tauri::command]
@@ -1079,10 +1210,13 @@ async fn get_generation_job_status(
             result: None,
             error: Some("job not found".to_string()),
             transient: false,
+            cancelable: false,
         });
     };
 
-    if record.status == "succeeded" || record.status == "failed" {
+    // `canceled` 同样是终态: 漏掉它会导致下面「非可恢复任务 + 不在在飞表」的分支把
+    // 刚刚取消掉的任务改写成「应用退出时任务中断」。
+    if record.status == "succeeded" || record.status == "failed" || record.status == "canceled" {
         return Ok(dto_from_record(&record));
     }
 
@@ -1171,6 +1305,7 @@ async fn get_generation_job_status(
                 result: Some(image_source),
                 error: None,
                 transient: false,
+                cancelable: false,
             })
         }
         Ok(ProviderTaskPollResult::Failed(message)) => {
@@ -1187,6 +1322,7 @@ async fn get_generation_job_status(
                 result: None,
                 error: Some(message),
                 transient: false,
+                cancelable: false,
             })
         }
         Err(AIError::TaskFailed(message))
@@ -1206,6 +1342,7 @@ async fn get_generation_job_status(
                 result: None,
                 error: Some(message),
                 transient: false,
+                cancelable: false,
             })
         }
         // 可重试错误(网络抖动 / 5xx / 平台回话慢): 任务保持 running, 交给下一轮轮询。
@@ -1217,6 +1354,7 @@ async fn get_generation_job_status(
             result: None,
             error: Some(error.to_string()),
             transient: true,
+            cancelable: false,
         }),
     }
 }
@@ -1251,9 +1389,15 @@ pub async fn list_models() -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{request_explicitly_uses_async_mode, resolve_job_provider, VIDEO_JOB_PROVIDER_ID};
+    use super::{
+        cancel_generate_video_job, request_explicitly_uses_async_mode, resolve_job_provider,
+        video_job_cancel_senders, video_job_is_cancelable, wait_video_job_cancel,
+        VIDEO_JOB_PROVIDER_ID,
+    };
     use serde_json::json;
     use std::collections::HashMap;
+    use std::time::Duration;
+    use uuid::Uuid;
 
     /// 视频任务行落的是「任务类别」`video-openai-compatible`, 注册表里只有
     /// `openai-compatible`。这条归一化缺失时, 每一次视频续查都会在这里返回 None,
@@ -1296,5 +1440,101 @@ mod tests {
         assert!(!request_explicitly_uses_async_mode(Some(&HashMap::from([
             ("request_mode".to_string(), json!(true)),
         ]))));
+    }
+
+    // ------------------------------------------------------------------
+    // 「可取消窗口」
+    //
+    // 产品要求: 请求还没送到平台时可以取消, 平台一受理按钮就消失。后端这一侧的关键
+    // 性质只有两条 —— **取消必须立刻叫醒等待中的提交**(否则按下去要等 provider 自己
+    // 超时, 那是 30 分钟), 以及**窗口关掉之后不能再谎报取消成功**。
+    // ------------------------------------------------------------------
+
+    fn unique_job_id(prefix: &str) -> String {
+        format!("{prefix}-{}", Uuid::new_v4())
+    }
+
+    #[tokio::test]
+    async fn cancel_command_wakes_the_pending_submit_immediately() {
+        let job_id = unique_job_id("cancel-test");
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        video_job_cancel_senders()
+            .write()
+            .await
+            .insert(job_id.clone(), sender);
+        assert!(video_job_is_cancelable(job_id.as_str()).await);
+
+        // 提交侧正在 provider 调用上等待。
+        let pending = tokio::spawn(async move {
+            let mut receiver = receiver;
+            wait_video_job_cancel(&mut receiver).await;
+        });
+
+        assert_eq!(cancel_generate_video_job(job_id.clone()).await.unwrap(), "canceled");
+        // 窗口立刻关闭 —— 前端下一次轮询就会拿到 `cancelable: false` 并收掉按钮。
+        assert!(!video_job_is_cancelable(job_id.as_str()).await);
+        tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("取消必须立刻唤醒等待中的提交, 而不是等 provider 自己超时")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn second_cancel_attempt_is_too_late() {
+        let job_id = unique_job_id("cancel-twice");
+        let (sender, _receiver) = tokio::sync::watch::channel(false);
+        video_job_cancel_senders()
+            .write()
+            .await
+            .insert(job_id.clone(), sender);
+
+        assert_eq!(cancel_generate_video_job(job_id.clone()).await.unwrap(), "canceled");
+        // 第二次必须回 too_late: 调用方据此收掉入口, 不能重复告诉用户"已取消"。
+        assert_eq!(cancel_generate_video_job(job_id).await.unwrap(), "too_late");
+    }
+
+    #[tokio::test]
+    async fn cancel_command_reports_too_late_for_jobs_outside_the_window() {
+        // 从没登记过的任务(平台已受理 / 应用重启后上个进程的任务): 必须如实回 too_late。
+        assert_eq!(
+            cancel_generate_video_job(unique_job_id("unknown")).await.unwrap(),
+            "too_late"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiter_returns_immediately_when_already_canceled() {
+        let (_sender, mut receiver) = tokio::sync::watch::channel(true);
+        tokio::time::timeout(Duration::from_secs(1), wait_video_job_cancel(&mut receiver))
+            .await
+            .expect("已经取消过的任务不该让等待侧再挂住");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_sender_also_wakes_the_waiter() {
+        // 提交流水线正常收尾时会把表项摘掉(sender 被丢弃) —— 等待侧不能因此永久挂住。
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), wait_video_job_cancel(&mut receiver))
+            .await
+            .expect("sender 被丢弃也必须唤醒等待侧");
+    }
+
+    #[tokio::test]
+    async fn cancel_survives_concurrent_requests_for_distinct_jobs() {
+        let first = unique_job_id("cancel-a");
+        let second = unique_job_id("cancel-b");
+        let (first_sender, _first_receiver) = tokio::sync::watch::channel(false);
+        let (second_sender, _second_receiver) = tokio::sync::watch::channel(false);
+        {
+            let mut senders = video_job_cancel_senders().write().await;
+            senders.insert(first.clone(), first_sender);
+            senders.insert(second.clone(), second_sender);
+        }
+
+        assert_eq!(cancel_generate_video_job(first.clone()).await.unwrap(), "canceled");
+        // 取消 A 不能顺手把 B 的窗口也关掉(连点会同时挂多个下游任务)。
+        assert!(video_job_is_cancelable(second.as_str()).await);
+        assert_eq!(cancel_generate_video_job(second.clone()).await.unwrap(), "canceled");
     }
 }

@@ -33,6 +33,10 @@ import {
 } from "./pajubenModels";
 import { guessEpisodeFromVideoName } from "./pajubenEpisode";
 import { isLocalVideoPath } from "./pajubenLocalPath";
+import {
+  PAJUBEN_QUALITY_TIERS,
+  resolvePajubenQualityPreset,
+} from "./pajubenQuality";
 
 /** 剧本正文节点的初始版面：文本节点默认 300×180，读整集剧本太挤。 */
 const SCRIPT_NODE_WIDTH = 460;
@@ -68,6 +72,10 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
   const modelGroups = useMemo(() => groupPajubenModelOptions(modelOptions), [modelOptions]);
   const modelKey = useSettingsStore((state) => state.pajubenModelKey) ?? "";
   const setModelKey = useSettingsStore((state) => state.setPajubenModelKey);
+  const qualityTier = useSettingsStore((state) => state.pajubenQualityTier);
+  const setQualityTier = useSettingsStore((state) => state.setPajubenQualityTier);
+  // 脏值/缺省由 resolve 兜底；档位同时决定 fps / 清晰度 / 每集帧数上限。
+  const qualityPreset = useMemo(() => resolvePajubenQualityPreset(qualityTier), [qualityTier]);
   const addNode = useCanvasStore((state) => state.addNode);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
 
@@ -254,10 +262,10 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
         provider: "",
         proxy: "",
         episode,
-        // 与「扒剧本」工作台的单集默认参数完全一致；这里只是把成功结果自动落为文本节点。
-        fps: 1,
-        resolution: "low",
-        maxFrames: 120,
+        // 抽帧参数取自画质档位(快速/标准/精细)；这里只是把成功结果自动落为文本节点。
+        fps: qualityPreset.fps,
+        resolution: qualityPreset.resolution,
+        maxFrames: qualityPreset.maxFrames,
         workers: 3,
         audio: isPajubenAudioInputModel(selectedOption.model) || Boolean(audioFallbackOption),
         animeMode: false,
@@ -296,7 +304,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
       setRunning(false);
       setNotice(error instanceof Error ? error.message : String(error));
     }
-  }, [audioFallbackOption, canExtract, episode, running, selectedOption, t, videoPath]);
+  }, [audioFallbackOption, canExtract, episode, qualityPreset, running, selectedOption, t, videoPath]);
 
   const handleCancel = useCallback(async () => {
     try {
@@ -387,6 +395,40 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
             {t(
               "pajuben.quickAudioModelHint",
               "支持音频的模型直接听声；普通视觉模型优先使用同渠道音频模型，没有音频模型时改用视频字幕提取台词。",
+            )}
+          </p>
+        </div>
+
+        <div>
+          <span className="mb-1.5 block text-xs font-medium text-text-muted">
+            {t("pajuben.qualityLabel", "画质档位")}
+          </span>
+          <div className="grid grid-cols-3 gap-1.5">
+            {PAJUBEN_QUALITY_TIERS.map((tier) => {
+              const active = qualityPreset.tier === tier;
+              return (
+                <button
+                  key={tier}
+                  type="button"
+                  className={`nodrag nowheel h-9 rounded-lg border text-xs transition-colors ${
+                    active
+                      ? "border-accent text-accent"
+                      : "border-border-dark bg-bg-dark text-text-muted hover:text-text-dark"
+                  }`}
+                  disabled={running}
+                  onClick={() => setQualityTier(tier)}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onMouseDown={(event) => event.stopPropagation()}
+                >
+                  {t(`pajuben.qualityTier.${tier}`)}
+                </button>
+              );
+            })}
+          </div>
+          <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">
+            {t(
+              "pajuben.qualityHint",
+              "档位决定抽帧密度与画面清晰度：标准档已明显提升情节完整度与场景细节，精细档更清晰但更耗时。",
             )}
           </p>
         </div>

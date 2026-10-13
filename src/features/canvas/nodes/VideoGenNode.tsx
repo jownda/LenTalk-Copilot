@@ -45,6 +45,12 @@ import {
 import { mergeMediaReferenceSources } from "@/features/canvas/application/mediaReferenceSources";
 import { filterExcludedReferences } from "@/features/canvas/application/referenceExclusions";
 import { collectActiveGenerationNodeIds } from "@/features/canvas/application/videoGenActiveTasks";
+import {
+  closeVideoCancellationWindow,
+  isVideoCancellationRequested,
+  isVideoGenerationCanceledError,
+  openVideoCancellationWindow,
+} from "@/features/canvas/application/videoGenerationCancel";
 import { recordGenerationOutcome } from "@/features/canvas/application/usageRecording";
 import { resolveMinEdgeFittedSize } from "@/features/canvas/application/imageNodeSizing";
 import {
@@ -72,6 +78,7 @@ import {
   resolveReferenceAwareDeleteRange,
 } from "@/features/canvas/application/referenceTokenEditing";
 import { useDebouncedNodeTextCommit } from "@/features/canvas/application/useDebouncedNodeTextCommit";
+import { readLiveInputText } from "@/features/canvas/application/liveInputText";
 import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
 import { useCanvasStore } from "@/stores/canvasStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -367,6 +374,20 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
    * 布尔量要等异步返回才能复位，会让实际冷却变成「2s + 接口耗时」，不可控。
    */
   const lastSubmitAtRef = useRef(0);
+  /**
+   * 本节点开出去的「可取消窗口」(下游结果节点 id)。
+   *
+   * 窗口是模块级内存态, 不该被节点卸载悄悄漏掉 —— 卸载时统一收干净, 否则一个早就
+   * 没有入口的窗口会一直挂在表里。
+   */
+  const cancelWindowNodeIdsRef = useRef<Set<string>>(new Set());
+  useEffect(
+    () => () => {
+      for (const outputId of cancelWindowNodeIdsRef.current) closeVideoCancellationWindow(outputId);
+      cancelWindowNodeIdsRef.current.clear();
+    },
+    [],
+  );
   const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
   const isCoolingDown = cooldownRemainingMs > 0;
   const cooldownSeconds = Math.max(1, Math.ceil(cooldownRemainingMs / 1000));
@@ -401,6 +422,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     });
     if (stillRunning.length !== tracked.length) {
       updateNodeData(id, { activeGenerationNodeIds: stillRunning, activeGenerationNodeId: null });
+    }
+    // 下游节点被删掉时顺手收掉它的取消窗口, 免得在模块表里长期占着一个没人能点的入口。
+    for (const outputId of tracked) {
+      if (state.nodes.some((node) => node.id === outputId)) continue;
+      cancelWindowNodeIdsRef.current.delete(outputId);
+      closeVideoCancellationWindow(outputId);
     }
     setIsGenerating(stillRunning.length > 0);
   }, [activeGenerationKey, id, nodes, processingRevision, updateNodeData]);
@@ -1155,7 +1182,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     }
     setLastVideoDuration(selectedDuration);
     flushPromptCommit();
-    const prompt = [promptDraftRef.current.trim(), ...inputText].filter(Boolean).join("\n\n").trim();
+    // 上游文本节点的编辑同样是防抖提交的: 先补交欠账, 再从 store 现取一次。
+    // 直接用 render 期的 inputText 会在「上游文本刚改完」时把上一版内容拼进提示词。
+    const liveInputText = readLiveInputText(id);
+    const prompt = [promptDraftRef.current.trim(), ...liveInputText].filter(Boolean).join("\n\n").trim();
     if (!prompt) {
       return;
     }
@@ -1262,6 +1292,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     updateNodeData(id, { activeGenerationNodeIds: [...trackedBefore, outputId], activeGenerationNodeId: null });
     updateNodeSize(outputId, compactSize.width, compactSize.height);
     addEdge(id, outputId);
+    // 打开「可取消窗口」: 从这一刻到平台受理为止, 下游节点上显示「取消生成」。
+    // 必须在第一个 await 之前开 —— 后面的素材规整/上传才是这个窗口的主要内容。
+    openVideoCancellationWindow(outputId);
+    cancelWindowNodeIdsRef.current.add(outputId);
     setIsGenerating(true);
     setJimengCliStatus(isJimengCli ? { status: "queued" } : null);
     setError(null);
@@ -1269,24 +1303,62 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       if (!isJimengCli && !isWanCli && !isRunningHubCli) {
         await canvasAiGateway.setApiKey(selectedModel.providerId, apiKey);
       }
-      const generationJobId = await canvasAiGateway.submitGenerateVideoJob({
-        clientJobId,
-        prompt,
-        model: selectedModel.id,
-        duration: selectedDuration,
-        aspectRatio: data.aspectRatio,
-        videoResolution: selectedVideoResolution,
-        imageMode,
-        referenceImages: videoReferenceImages,
-        referenceAudio: usableInputAudio,
-        extraParams: generationExtraParams,
-      });
+      const { jobId: generationJobId, cancelable } = await canvasAiGateway.submitGenerateVideoJob(
+        {
+          clientJobId,
+          prompt,
+          model: selectedModel.id,
+          duration: selectedDuration,
+          aspectRatio: data.aspectRatio,
+          videoResolution: selectedVideoResolution,
+          imageMode,
+          referenceImages: videoReferenceImages,
+          referenceAudio: usableInputAudio,
+          extraParams: generationExtraParams,
+        },
+        { cancellationNodeId: outputId },
+      );
       updateNodeData(outputId, {
         generationJobId,
         generationError: null,
         generationErrorDetails: null,
       });
+      // 本地 CLI 类平台(jimeng / wan / runninghub)拦不住已经交出去的进程, 窗口到此为止。
+      if (!cancelable) {
+        closeVideoCancellationWindow(outputId);
+        cancelWindowNodeIdsRef.current.delete(outputId);
+        return;
+      }
+      // 竞态: 用户点取消时请求已经交出去了, 检查点来不及拦。立刻让后端中止 ——
+      // 若后端回 too_late(平台已受理), 就收掉按钮让任务正常跑完。
+      if (isVideoCancellationRequested(outputId)) {
+        const outcome = await canvasAiGateway.cancelGenerateVideoJob(generationJobId).catch(() => "too_late" as const);
+        if (outcome !== "canceled") {
+          closeVideoCancellationWindow(outputId);
+          cancelWindowNodeIdsRef.current.delete(outputId);
+        }
+      }
     } catch (generationError) {
+      // 用户主动取消不是失败: 下游节点要显示「已取消」而不是红色报错, 更不能弹错误框。
+      if (isVideoGenerationCanceledError(generationError)) {
+        closeVideoCancellationWindow(outputId);
+        cancelWindowNodeIdsRef.current.delete(outputId);
+        // CLI 链路的状态靠引擎回推事件更新; 这次提交根本没跑出去, 没有事件会回来,
+        // 不清掉就会在源节点上留一个永不消失的「排队中」。
+        setJimengCliStatus(null);
+        updateNodeData(outputId, {
+          isGenerating: false,
+          generationStartedAt: null,
+          generationJobId: null,
+          generationClientSessionId: null,
+          generationCanceled: true,
+          generationError: null,
+          generationErrorDetails: null,
+        });
+        return;
+      }
+      closeVideoCancellationWindow(outputId);
+      cancelWindowNodeIdsRef.current.delete(outputId);
       const resolved = resolveErrorContent(generationError, "视频生成失败");
       setError(resolved.message);
       recordGenerationOutcome({

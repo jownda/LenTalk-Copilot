@@ -5,6 +5,7 @@ import { X } from 'lucide-react';
 
 import { UI_CONTENT_OVERLAY_INSET_CLASS } from '@/components/ui/motion';
 import { resolveImageDisplayUrl } from '../application/imageData';
+import { isVideoTrackUndecoded } from '../application/videoPlayback';
 
 export interface VideoViewerModalProps {
   open: boolean;
@@ -109,6 +110,21 @@ export function VideoViewerModal({ open, videoUrl, title, onClose }: VideoViewer
       });
   }, [isPreparing, videoUrl]);
 
+  /**
+   * HEVC/ProRes 这类没有解码器的视频轨在 WebView2 上**不会报 error**，只会被静默丢掉，
+   * 只剩声音。此时只能靠「时长已就绪、尺寸仍为 0」识别，否则转码兜底永远不会触发。
+   */
+  const handlePlaybackMetadata = useCallback(() => {
+    const video = videoRef.current;
+    // 已经在放 H.264 代理就不再重复转码（纯音频容器换成代理后尺寸依然是 0）。
+    if (!video || tempPathRef.current) {
+      return;
+    }
+    if (isVideoTrackUndecoded(video)) {
+      handlePlaybackError();
+    }
+  }, [handlePlaybackError]);
+
   if (!open) {
     return null;
   }
@@ -146,6 +162,7 @@ export function VideoViewerModal({ open, videoUrl, title, onClose }: VideoViewer
             autoPlay
             playsInline
             className="max-h-[78vh] max-w-[92vw] rounded-lg bg-black shadow-2xl"
+            onLoadedMetadata={handlePlaybackMetadata}
             onError={handlePlaybackError}
           />
         ) : null}

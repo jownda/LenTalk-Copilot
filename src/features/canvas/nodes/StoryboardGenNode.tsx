@@ -31,6 +31,7 @@ import {
   graphImageResolver,
 } from '@/features/canvas/application/canvasServices';
 import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
+import { readLiveInputText } from '@/features/canvas/application/liveInputText';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
 import {
   detectAspectRatio,
@@ -602,10 +603,6 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     () => graphImageResolver.collectInputImages(id, nodes, edges),
     [id, nodes, edges]
   );
-  const incomingText = useMemo(
-    () => graphImageResolver.collectInputText(id, nodes, edges),
-    [edges, id, nodes]
-  );
   const incomingImageItems = useMemo(
     () =>
       incomingImages.map((imageUrl, index) => ({
@@ -1075,7 +1072,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
       return;
     }
 
-    const prompt = [buildPrompt(), ...incomingText].filter(Boolean).join('\n\n').trim();
+    // 上游文本节点的编辑是防抖提交的: 现取一次(补交欠账 + 直读 store), 避免用到上一版文本。
+    const prompt = [buildPrompt(), ...readLiveInputText(id)].filter(Boolean).join('\n\n').trim();
     if (!prompt) {
       const errorMessage = '请填写至少一个分镜内容描述';
       setError(errorMessage);
@@ -1269,7 +1267,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     providerApiKey,
     nodeData,
     incomingImages,
-    incomingText,
+    id,
     requestResolution.requestModel,
     effectiveExtraParams,
     selectedModel.expectedDurationMs,

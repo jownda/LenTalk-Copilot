@@ -17,6 +17,7 @@ import {
   openAICompatibleBaseUrl,
   type AISettings,
 } from "@/features/cinematicStudio/app/providers/aiSettings";
+import { describeProviderFailure } from "@/commands/providerError";
 
 import { createSseChatParser } from "./sseParser";
 import type { AgentChatTurn } from "./types";
@@ -76,9 +77,16 @@ function decodeBase64Chunk(value: string): Uint8Array {
   return bytes;
 }
 
-function httpErrorText(status: number, raw: string): string {
-  const detail = raw.trim();
-  return `模型返回 HTTP ${status}${detail ? `：${detail.slice(0, 300)}` : ""}`;
+/**
+ * 上游失败文案统一由 `@/commands/providerError` 生成（它认得 OpenAI 推理模型的
+ * 输入内容预检 `invalid_prompt`，会换成可执行的中文），这里只负责把模型名从请求体
+ * 里取出来，好在提示里点名。
+ */
+function httpErrorText(status: number, raw: string, body: Record<string, unknown>): string {
+  return describeProviderFailure(status, {
+    raw,
+    model: typeof body.model === "string" ? body.model : undefined,
+  });
 }
 
 /**
@@ -194,7 +202,7 @@ async function streamViaTauri(options: TransportOptions): Promise<StreamChatResu
   }
 
   if (failure) throw failure;
-  if (status >= 400) throw new Error(httpErrorText(status, parser.text));
+  if (status >= 400) throw new Error(httpErrorText(status, parser.text, body));
   return { text: parser.text, status };
 }
 
@@ -216,7 +224,7 @@ async function streamViaFetch(options: TransportOptions): Promise<StreamChatResu
     const raw = await response.text();
     parser.push(raw);
     parser.flush();
-    if (!response.ok) throw new Error(httpErrorText(response.status, raw));
+    if (!response.ok) throw new Error(httpErrorText(response.status, raw, body));
     return { text: parser.text, status: response.status };
   }
 
@@ -233,6 +241,6 @@ async function streamViaFetch(options: TransportOptions): Promise<StreamChatResu
   parser.push(decoder.decode());
   parser.flush();
 
-  if (!response.ok) throw new Error(httpErrorText(response.status, raw));
+  if (!response.ok) throw new Error(httpErrorText(response.status, raw, body));
   return { text: parser.text, status: response.status };
 }

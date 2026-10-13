@@ -14,6 +14,7 @@ import {
 import { nodeCatalog } from "@/features/canvas/application/nodeCatalog";
 import { prepareNodeImage, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import { captureVideoFrame } from "@/features/canvas/application/videoFrameCapture";
+import { isVideoTrackUndecoded } from "@/features/canvas/application/videoPlayback";
 import { resolveMinEdgeFittedSize } from "@/features/canvas/application/imageNodeSizing";
 import { resolveFrameInsertPositions } from "@/features/canvas/application/videoFramePlacement";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
@@ -200,12 +201,6 @@ export function VideoFrameExtractDialog({ open, onClose }: VideoFrameExtractDial
     [setSelectedVideo],
   );
 
-  const handleLoadedMetadata = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    setVideoDuration(video.duration || 0);
-  }, []);
-
   const handleVideoError = useCallback(() => {
     if (!isTauri() || !videoSource || playbackTempPathRef.current) return;
     void invoke<string>("prepare_video_playback", { source: videoSource })
@@ -217,6 +212,17 @@ export function VideoFrameExtractDialog({ open, onClose }: VideoFrameExtractDial
         console.warn("[videoFrame] playback compatibility fallback failed", error);
       });
   }, [videoSource]);
+
+  const handleLoadedMetadata = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    setVideoDuration(video.duration || 0);
+    // HEVC/ProRes 的素材在 WebView2 上不报错、只被静默丢轨(取不到帧也是同一个原因),
+    // 靠「时长已就绪但尺寸为 0」补一次 H.264 代理, 否则抽帧会一直失败。
+    if (isVideoTrackUndecoded(video)) {
+      handleVideoError();
+    }
+  }, [handleVideoError]);
 
   const handleSeek = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const video = videoRef.current;

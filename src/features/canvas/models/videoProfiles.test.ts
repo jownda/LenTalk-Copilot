@@ -82,4 +82,32 @@ describe('resolveVideoModelProfile', () => {
     expect(resolveVideoModelProfile('custom:my-relay/veo-3.1', 'https://api.tokengo.love/v1').id)
       .toBe('zhiniao-video');
   });
+
+  it('routes 炳火 through the async video profile', () => {
+    const profile = resolveVideoModelProfile('custom:binghuo/bh2.0-720p');
+    expect(profile.id).toBe('binghuo-video');
+    expect(profile.status).toBe('verified');
+    // 提交与轮询都不是「通用路径 + /{taskId}」之外的东西, 但字段与通用档案不同。
+    expect(profile.submitPath).toBe('/v1/video/generations');
+    expect(profile.queryPath).toBe('/v1/video/generations/{taskId}');
+    expect(profile.referenceImageTarget).toBe('public-url');
+    expect(profile.supportsReferenceAudio).toBe(true);
+  });
+
+  it('recognizes the 炳火 base URL even when the custom platform id differs', () => {
+    // 推荐卡片连上后 id 由平台名生成(「炳火 API」→ `custom:炳火-api`), 只认
+    // 字面量 binghuo 会让节点页签显示成「OpenAI Video / 已验证」。
+    expect(resolveVideoModelProfile('custom:炳火-api/bh2.0-720p', 'https://api.7tai.cc/v1').id)
+      .toBe('binghuo-video');
+    expect(resolveVideoModelProfile('custom:my-relay/bh2.0-720p', 'https://api.7tai.cc').id)
+      .toBe('binghuo-video');
+  });
+
+  it('炳火自售的 seedance 系模型不会被通用 Seedance 档案抢走', () => {
+    // 炳火的 'seedance-2.0-480p' 命中下面的 /^seedance.../ 正则, 必须由前面的
+    // Base URL 判据拦下来 —— 两个档案的参考素材目标与音频支持都不同。
+    expect(
+      resolveVideoModelProfile('custom:炳火-api/seedance-2.0-480p', 'https://api.7tai.cc/v1').id,
+    ).toBe('binghuo-video');
+  });
 });

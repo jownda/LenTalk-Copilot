@@ -102,6 +102,26 @@ describe('图片模型不被视频厂商前缀抢走（拉取模型的分类回�
       expect(isVideoGenerationModelName(model), model).toBe(true);
     }
   });
+
+  it('Grok Imagine 是双模态: 带 image 的出图, 其余出视频', () => {
+    // 知鸟 AI 的同名双模态 —— 都带图片标记 imagine, 靠「后面是不是 image」区分。
+    // grok-imagine-1-5-7tu-special 曾经被判成图片/对话模型, 视频节点里选不到。
+    for (const model of ['grok-imagine-image', 'grok-imagine-image-2.0']) {
+      expect(isVideoGenerationModelName(model), model).toBe(false);
+      expect(isChatCompletionModelName(model), model).toBe(false);
+    }
+    for (const model of [
+      'grok-imagine-1.5',
+      'grok-imagine-1-5-7tu-special',
+      'grok-imagine-1.5-special',
+      'grok-imagine-video',
+      'grok-imagine-video-special',
+    ]) {
+      expect(isVideoGenerationModelName(model), model).toBe(true);
+      expect(isChatCompletionModelName(model), model).toBe(false);
+      expect(isAudioModelName(model), model).toBe(false);
+    }
+  });
 });
 
 describe('启动时同步推荐预设的视频模型', () => {
@@ -182,5 +202,21 @@ describe('启动时同步推荐预设的视频模型', () => {
     useSettingsStore.getState().syncRecommendedVideoModels();
     expect(currentApi().videoModels).toEqual(['veo3']);
     expect(currentApi().presetVideoModelsRevision).toBeUndefined();
+  });
+});
+
+describe('扒视频画质档位 setPajubenQualityTier', () => {
+  it('接受三档合法值', () => {
+    const { setPajubenQualityTier } = useSettingsStore.getState();
+    for (const tier of ['fast', 'standard', 'fine'] as const) {
+      setPajubenQualityTier(tier);
+      expect(useSettingsStore.getState().pajubenQualityTier).toBe(tier);
+    }
+  });
+
+  it('非法档位回落到默认 standard，不写入脏值', () => {
+    const { setPajubenQualityTier } = useSettingsStore.getState();
+    setPajubenQualityTier('turbo' as never);
+    expect(useSettingsStore.getState().pajubenQualityTier).toBe('standard');
   });
 });

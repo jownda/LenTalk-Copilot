@@ -1,4 +1,13 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type SyntheticEvent } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type SyntheticEvent,
+} from "react";
 import { createPortal } from "react-dom";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -6,6 +15,7 @@ import { Handle, Position } from "@xyflow/react";
 import {
   AlertTriangle,
   AudioLines,
+  CircleSlash,
   LoaderCircle,
   Maximize2,
   Music2,
@@ -26,10 +36,18 @@ import {
   useMediaByteSize,
   type MediaDimensions,
 } from "@/features/canvas/ui/MediaDimensions";
-import { canvasEventBus } from "@/features/canvas/application/canvasServices";
+import { canvasAiGateway, canvasEventBus } from "@/features/canvas/application/canvasServices";
+import {
+  closeVideoCancellationWindow,
+  isVideoCancellationRequested,
+  isVideoCancellationWindowOpen,
+  requestVideoCancellation,
+  subscribeVideoCancellation,
+} from "@/features/canvas/application/videoGenerationCancel";
 import { prepareNodeImage, reduceAspectRatio, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import { resolveMediaNodeResizeBounds } from "@/features/canvas/application/aspectLockedResize";
 import { captureVideoFrame, createObjectUrlFromDataUrl } from "@/features/canvas/application/videoFrameCapture";
+import { isVideoTrackUndecoded } from "@/features/canvas/application/videoPlayback";
 import { showErrorDialog } from "@/features/canvas/application/errorDialog";
 import { extractVideoThumbnail, persistLibraryAssetFile, persistLibraryAssetFromFile } from "@/commands/assetLibrary";
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -204,6 +222,48 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const isGenerating = typeof data.isGenerating === "boolean" ? data.isGenerating : false;
   const generationError = typeof data.generationError === "string" ? data.generationError.trim() : "";
   const hasGenerationError = isGenerating === false && !mediaSrc && generationError.length > 0;
+  const generationCanceled = data.generationCanceled === true;
+  const hasGenerationCanceled = isGenerating === false && !mediaSrc && generationCanceled;
+  /**
+   * 「取消生成」入口只在**请求还没送到平台**这一段显示。
+   *
+   * 窗口由提交流水线(前端准备/上传)与后端在飞表共同决定, 见 videoGenerationCancel.ts:
+   * 平台一受理, 后端就把窗口关掉, 按钮随之消失 —— 那时取消只会丢掉已经计费的结果。
+   */
+  const cancelWindowOpen = useSyncExternalStore(
+    subscribeVideoCancellation,
+    () => isVideoCancellationWindowOpen(id),
+    () => false,
+  );
+  const cancelRequested = useSyncExternalStore(
+    subscribeVideoCancellation,
+    () => isVideoCancellationRequested(id),
+    () => false,
+  );
+
+  /**
+   * 取消这次生成。
+   *
+   * 分两段处理, 与窗口的两段一一对应:
+   *  - 请求还没 invoke 出去(前端准备/上传阶段): 只置位, 提交流水线会在下一个检查点
+   *    中止并把节点落成「已取消」;
+   *  - 已经交到后端、请求还在飞: 让后端把在飞请求丢掉(`cancelGenerateVideoJob`)。
+   *    后端回 `too_late` 说明平台已经受理 —— 收掉入口, 让任务照常跑完, 不留一个
+   *    点了没反应的按钮。
+   */
+  const handleCancelGeneration = useCallback(() => {
+    if (!requestVideoCancellation(id)) return;
+    const jobId = typeof data.generationJobId === "string" ? data.generationJobId : "";
+    if (!jobId) return;
+    void canvasAiGateway
+      .cancelGenerateVideoJob(jobId)
+      .then((outcome) => {
+        if (outcome !== "canceled") closeVideoCancellationWindow(id);
+      })
+      .catch(() => {
+        closeVideoCancellationWindow(id);
+      });
+  }, [data.generationJobId, id]);
   const generationStartedAt = typeof data.generationStartedAt === "number" ? data.generationStartedAt : null;
   const generationDurationMs = typeof data.generationDurationMs === "number" ? data.generationDurationMs : 180000;
   // 有封面的视频平时只显示图片，不占用解码器。悬停、播放、打开查看器时才按需挂载。
@@ -322,16 +382,25 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
       });
   }, [data.sourcePath, isVideo]);
 
-  const handleVideoMetadata = useCallback((event: SyntheticEvent<HTMLVideoElement>) => {
-    const video = event.currentTarget;
-    if (video.videoWidth > 0 && video.videoHeight > 0) {
-      setVideoDimensions({ width: video.videoWidth, height: video.videoHeight });
-    }
-    // 时长用于控制条进度: 流式/未探测到时长时 duration 为 NaN 或 Infinity, 需挡掉。
-    if (Number.isFinite(video.duration) && video.duration > 0) {
-      setVideoDuration(video.duration);
-    }
-  }, []);
+  const handleVideoMetadata = useCallback(
+    (event: SyntheticEvent<HTMLVideoElement>) => {
+      const video = event.currentTarget;
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        setVideoDimensions({ width: video.videoWidth, height: video.videoHeight });
+      }
+      // 时长用于控制条进度: 流式/未探测到时长时 duration 为 NaN 或 Infinity, 需挡掉。
+      if (Number.isFinite(video.duration) && video.duration > 0) {
+        setVideoDuration(video.duration);
+      }
+      // HEVC/ProRes 的素材在 WebView2 里不会触发 error, 只会被静默丢掉视频轨 ——
+      // 表现为「只有声音、没有画面」。这种情况只能靠「时长已就绪但尺寸仍为 0」识别,
+      // 识别到就立刻走 H.264 播放代理, 否则整条 onError 兜底永远不会被调用。
+      if (isVideoTrackUndecoded(video)) {
+        handleLocalVideoLoadError();
+      }
+    },
+    [handleLocalVideoLoadError],
+  );
 
   /** 控制条播放/暂停按钮。播放失败(自动播放策略/源不可用)时保持暂停, 不打断用户。 */
   const toggleVideoPlayback = useCallback(() => {
@@ -936,10 +1005,30 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
             {generationError}
           </span>
         </div>
+      ) : hasGenerationCanceled ? (
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-1.5 rounded-[inherit] bg-bg-dark/35 px-4 text-text-muted">
+          <CircleSlash className="h-7 w-7 opacity-70" />
+          <span className="text-center text-[12px] font-medium leading-5">已取消生成</span>
+          <span className="text-center text-[11px] leading-5 text-text-muted/80">请求未送达模型平台</span>
+        </div>
       ) : isGenerating ? (
-        <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-2 overflow-hidden rounded-[inherit] bg-bg-dark/45 p-2 text-text-muted/85">
+        <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-1.5 overflow-hidden rounded-[inherit] bg-bg-dark/45 p-2 text-text-muted/85">
           <LoaderCircle className="h-7 w-7 animate-spin text-accent/70" />
-          <span className="px-4 text-center text-[12px] leading-6">{waitingResultText}</span>
+          <span className="px-4 text-center text-[12px] leading-6">
+            {cancelWindowOpen ? "正在准备提交…" : waitingResultText}
+          </span>
+          {cancelWindowOpen && (
+            <button
+              type="button"
+              className="nodrag nopan relative z-10 flex items-center gap-1 rounded-full border border-white/20 bg-bg-dark/70 px-2.5 py-1 text-[11px] leading-none text-text-dark/90 transition-colors hover:bg-bg-dark hover:text-text-dark disabled:cursor-default disabled:opacity-60"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={handleCancelGeneration}
+              disabled={cancelRequested}
+            >
+              <X className="h-3 w-3" />
+              {cancelRequested ? "正在取消…" : "取消生成"}
+            </button>
+          )}
           <div className="pointer-events-none absolute inset-0 overflow-hidden">
             <div className="absolute inset-0 bg-bg-dark/30" />
             <div

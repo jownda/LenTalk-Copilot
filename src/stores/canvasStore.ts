@@ -27,6 +27,7 @@ import {
   type NodeToolType,
   type StoryboardExportOptions,
   type StoryboardFrameItem,
+  type TextEditDialogState,
   collectFrozenLockedNodeIds,
   isStoryboardSplitNode,
 } from '@/features/canvas/domain/canvasNodes';
@@ -58,6 +59,7 @@ export type {
   CanvasNodeType,
   NodeToolType,
   StoryboardFrameItem,
+  TextEditDialogState,
 };
 
 export interface CanvasHistorySnapshot {
@@ -93,6 +95,11 @@ interface CanvasState {
   inputGraphRevision: number;
   selectedNodeId: string | null;
   activeToolDialog: ActiveToolDialog | null;
+  /**
+   * 文本节点的 AI 修改 / 查找替换弹窗。挂在画布级而不是选中节点的工具栏上：
+   * 其他节点生成完成会自动选中新节点，工具栏会改渲染新节点，弹窗将被动关闭。
+   */
+  textEditDialog: TextEditDialogState | null;
   history: CanvasHistoryState;
   dragHistorySnapshot: CanvasHistorySnapshot | null;
   /** 拖拽悬停的目标分组 id(高亮用, 不持久化) */
@@ -195,6 +202,8 @@ interface CanvasState {
 
   openToolDialog: (dialog: ActiveToolDialog) => void;
   closeToolDialog: () => void;
+  openTextEditDialog: (dialog: TextEditDialogState) => void;
+  closeTextEditDialog: () => void;
   setViewportState: (viewport: Viewport) => void;
   setCanvasViewportSize: (size: { width: number; height: number }) => void;
   openImageViewer: (imageUrl: string, imageList?: string[]) => void;
@@ -1212,6 +1221,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   inputGraphRevision: 0,
   selectedNodeId: null,
   activeToolDialog: null,
+  textEditDialog: null,
   history: { past: [], future: [] },
   dragHistorySnapshot: null,
   hoveredGroupId: null,
@@ -1394,6 +1404,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       inputGraphRevision: get().inputGraphRevision + 1,
       selectedNodeId: null,
       activeToolDialog: null,
+      textEditDialog: null,
       history: normalizeHistory(history),
       dragHistorySnapshot: null,
     });
@@ -1610,8 +1621,11 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     // ---- 组内生成: 下游节点保持在组内, 组空间不足自动扩组 ----
     if (sourceNode.parentId) {
       const groupNode = state.nodes.find((n) => n.id === sourceNode.parentId && n.type === CANVAS_NODE_TYPES.group);
-      // 冻结组不吸收新节点: 否则新节点一诞生就被锁死, 也无法自动扩组
-      if (groupNode && (groupNode.data as GroupNodeData).frozen !== true) {
+      // 冻结组同样吸收「生成」出来的下游节点: 这类节点是从组内节点派生出来的,
+      // 一旦按顶层节点定位就会落到组外(用组内相对坐标当绝对坐标算), 看起来就是"跑出去了"。
+      // 落位后它会自然进入冻结锁定, 与组内其它成员行为一致。
+      // 注意这里只管「生成」; 用户手动把节点拖进冻结组仍被 addNodesToGroup 拒绝。
+      if (groupNode) {
         return placeNodeInsideGroup(state, groupNode, sourceNode, newNodeWidth, newNodeHeight);
       }
     }
@@ -2488,7 +2502,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       (node) => node.id === groupId && node.type === CANVAS_NODE_TYPES.group
     );
     if (!groupNode || (groupNode.data as GroupNodeData).frozen === true) {
-      // 冻结组不接受新节点: 否则新节点会被就地锁死, 用户无法再调整位置
+      // 手动拖入/并入冻结组一律拒绝: 新节点会被就地锁死, 用户无法再调整位置。
+      // (自动「生成」出来的下游节点走 findNodePosition, 不受此限 —— 它们本就属于该组)
       return false;
     }
 
@@ -2816,6 +2831,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     set({ activeToolDialog: null });
   },
 
+  openTextEditDialog: (dialog) => {
+    set({ textEditDialog: dialog });
+  },
+
+  closeTextEditDialog: () => {
+    set({ textEditDialog: null });
+  },
+
   undo: () => {
     const state = get();
     const target = state.history.past[state.history.past.length - 1];
@@ -2890,6 +2913,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         inputGraphRevision: state.inputGraphRevision + 1,
         selectedNodeId: null,
         activeToolDialog: null,
+        textEditDialog: null,
         history: {
           past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
           future: [],

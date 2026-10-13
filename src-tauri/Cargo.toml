@@ -1,6 +1,6 @@
 [package]
 name = "storyboard-copilot"
-version = "1.2.28"
+version = "1.2.29"
 description = "分镜助手 - AI图像生成与分镜工具"
 authors = ["you"]
 edition = "2021"
@@ -11,6 +11,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# 见下方 [dependencies] 里的同名说明: 主机侧依赖图也需要打开 indexmap 的 std。
+indexmap = { version = "1.9.3", features = ["std"], default-features = false }
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset", "devtools", "macos-private-api", "tray-icon", "image-png"] }
@@ -19,6 +21,9 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
+# 单实例互斥(多开时只留一个进程)。**必须用 `~` 锁在小版本内**: 2.5+ 要求 tauri ^2.12,
+# 会把整个 tauri 栈从 2.10.2 顶到 2.12.x(连带 wry / tauri-runtime-wry 全量重编)。
+tauri-plugin-single-instance = "~2.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = "0.25"
@@ -38,6 +43,19 @@ async-trait = "0.1"
 automod = "1.0"
 inventory = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# 只为修掉一个依赖编译问题而声明的传递依赖，业务代码里不使用，升级 tauri 后可删。
+#
+# tauri-build / tauri-plugin 打开了 schemars 0.8.22 的 `preserve_order`，于是 schemars 的
+# `Map<K, V>` 别名指向 indexmap 1.9.3 的 `IndexMap<K, V>` —— 它依赖那个带默认哈希参数的
+# `std` 版本。而 indexmap 1.9.3 的 build.rs 是这么判断的：
+#   设了 CARGO_FEATURE_STD  -> 直接 emit `has_std`
+#   否则                    -> 用 autocfg 去探测 sysroot 里有没有 std
+# 在 rustc 1.98 上这个探测会失败（构建脚本只 emit 了 check-cfg，没 emit 真正的 cfg），
+# 于是走 `#[cfg(not(has_std))]` 那条分支，`IndexMap` 变成必须显式传三个泛型参数，
+# schemars 报 E0107，整个项目连编译都进不去（本地和 CI 都会挂）。
+# 显式打开 std 特性就能让它走前一条稳妥分支。上面 [build-dependencies] 里也声明了一份，
+# 因为 resolver v2 下主机侧与目标侧的依赖图是分开做特性解析的。
+indexmap = { version = "1.9.3", features = ["std"], default-features = false }
 md5 = "0.7"
 arboard = "3.4"
 fast_image_resize = "6.0.0"

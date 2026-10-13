@@ -174,6 +174,13 @@ function resolveMediaEntry(node: CanvasNode): CanvasMediaEntry | null {
   return null;
 }
 
+/**
+ * 收集画布里的媒体节点, **倒序**返回(最后创建的排最前)。
+ *
+ * 节点数组按创建顺序追加(`addNode` 永远 push 到尾部), 节点本身上又没有可靠的
+ * 时间戳字段, 所以创建顺序是唯一可用的「新鲜度」信号 —— 倒过来正好等于
+ * 「最新生成的排最上面」, 新出的图 / 视频一眼就能在侧栏顶部看到。
+ */
 export function collectCanvasMediaEntries(
   nodes: readonly CanvasNode[],
 ): CanvasMediaEntry[] {
@@ -184,5 +191,5 @@ export function collectCanvasMediaEntries(
       entries.push(entry);
     }
   }
-  return entries;
+  return entries.reverse();
 }

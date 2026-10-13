@@ -12,6 +12,7 @@ import {
   type CanvasNode,
 } from "@/features/canvas/domain/canvasNodes";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { isVideoTrackUndecoded } from "@/features/canvas/application/videoPlayback";
 import { showErrorDialog } from "@/features/canvas/application/errorDialog";
 import { renderVideoEdit, type VideoEditAudioMode } from "@/commands/videoEdit";
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -192,19 +193,6 @@ export function VideoEditDialog({ open, node, onClose }: VideoEditDialogProps) {
   }, []);
 
   /** 元数据到位前 duration 为 0，时间轴用的是占位时长；拿到真实值后重算整段区间。 */
-  const handleLoadedMetadata = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    const nextDuration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
-    if (nextDuration <= 0) return;
-    setState((current) =>
-      current.duration === nextDuration
-        ? current
-        : { ...current, duration: nextDuration, trim: createFullTrimRange(nextDuration) },
-    );
-    setCurrentTime(video.currentTime || 0);
-  }, []);
-
   /** 原生播放器解不了的编码（HEVC/ProRes/MOV）统一转成 H.264 播放代理。 */
   const handleVideoError = useCallback(() => {
     if (!isTauri() || !sourcePath || playbackTempPathRef.current) {
@@ -222,6 +210,24 @@ export function VideoEditDialog({ open, node, onClose }: VideoEditDialogProps) {
         setPlaybackError(t("videoEdit.playbackFailed"));
       });
   }, [sourcePath, t]);
+
+  const handleLoadedMetadata = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const nextDuration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+    if (nextDuration <= 0) return;
+    setState((current) =>
+      current.duration === nextDuration
+        ? current
+        : { ...current, duration: nextDuration, trim: createFullTrimRange(nextDuration) },
+    );
+    setCurrentTime(video.currentTime || 0);
+    // HEVC/ProRes 的素材在 WebView2 上不报错、只被静默丢轨, 光等 onError 会一直停在
+    // 「只有声音」; 靠「时长已就绪但尺寸为 0」补一次 H.264 代理。
+    if (isVideoTrackUndecoded(video)) {
+      handleVideoError();
+    }
+  }, [handleVideoError]);
 
   const secondsFromPointer = useCallback(
     (clientX: number) => {

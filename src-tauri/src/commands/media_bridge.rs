@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::commands::asset_library::{
@@ -43,6 +43,9 @@ const HEADER_LIMIT_BYTES: usize = 16 * 1024;
 const BODY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+/// accept 失败后的退避。std 的 `Incoming` 迭代器出错后不会终止，`continue` 会立刻重试 ——
+/// 句柄耗尽那类持续性错误会变成满核空转，把整个界面一起拖慢。
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// HLS 下载的时限：超过就杀掉 ffmpeg，免得一个永不结束的流把线程一直占着。
 const HLS_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -78,17 +81,50 @@ pub fn start(app: AppHandle) -> Result<u16, String> {
 }
 
 fn serve(app: AppHandle, listener: TcpListener) {
+    let mut accept_failures: u32 = 0;
     for incoming in listener.incoming() {
-        let Ok(stream) = incoming else {
-            continue;
+        let stream = match incoming {
+            Ok(stream) => {
+                accept_failures = 0;
+                stream
+            }
+            Err(error) => {
+                accept_failures = accept_failures.saturating_add(1);
+                // 出错会一直重试，按次幂采样，免得持续故障时把日志刷爆。
+                if accept_failures == 1 || accept_failures.is_power_of_two() {
+                    warn!("[media-bridge] accept failed (#{accept_failures}): {error}");
+                }
+                std::thread::sleep(ACCEPT_RETRY_DELAY);
+                continue;
+            }
         };
         let app = app.clone();
         // 每个连接一个线程：上传大视频时不会被其它请求堵住。
         std::thread::spawn(move || {
-            if let Err(error) = handle_connection(&app, stream) {
-                warn!("[media-bridge] request failed: {error}");
+            // 这里兜住 panic 是有意的：GUI 进程没有控制台，panic 默认只写 stderr，
+            // 用户看到的现象就是「扩展忽然连不上应用」，而日志里一行都没有。
+            // 真实的现场（哪个请求、什么原因）必须留下，否则只能靠猜。
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle_connection(&app, stream)
+            })) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!("[media-bridge] request failed: {error}"),
+                Err(payload) => {
+                    error!("[media-bridge] handler panicked: {}", panic_text(payload.as_ref()))
+                }
             }
         });
+    }
+}
+
+/// panic 的载荷只有 `&str`（`panic!("...")`）与 `String`（`panic_any`）两种常见形态。
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "未知的 panic 载荷".to_string()
     }
 }
 
@@ -1395,7 +1431,11 @@ fn respond_empty(
     );
     if let Some(origin) = origin {
         head.push_str(&format!(
-            "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Max-Age: 600\r\n"
+            // Allow-Private-Network 是给 Chrome 的「本地网络访问」检查用的：扩展属于
+            // 公网来源，去访问 127.0.0.1 会被要求先过这一关。缺了它，预检就会被拒，
+            // 表现成 fetch 直接抛错 —— 也就是「扩展突然检测不到应用」。
+            // 服务端只绑回环地址、且只认扩展来源，放开这一步不会扩大攻击面。
+            "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: content-type, access-control-request-private-network\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 600\r\n"
         ));
     }
     head.push_str("\r\n");

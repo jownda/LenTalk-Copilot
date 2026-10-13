@@ -843,28 +843,245 @@ export function getModelProvider(providerId: string): ModelProviderDefinition {
 const CUSTOM_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "21:9", "5:4", "4:5", "3:2", "2:3", "4:3", "3:4"] as const;
 
 /**
- * 知鸟 AI(TokenGo)视频模型的档位清单, 直接取自平台 GET /v1/logical-models 的
- * param_schema(enum)。平台会按模型校验 duration / resolution, 传枚举外的值会被拒,
- * 所以这里按模型族给出真实可选值, 而不是统一放开 1~30 秒。
+ * 知鸟 AI(TokenGo)视频模型的档位清单。
+ *
+ * 数据源: 官方文档 2026-10-07《模型清单与参数约束》里 **每个模型卡的**
+ * duration / resolution / aspect_ratio 枚举。平台逐模型校验这三个字段, 传枚举外的
+ * 值会被直接拒; 而且**按秒计费**的模型(文档里绝大多数)实付价 = 单价 × 秒数,
+ * 时长枚举本身就是价格档位 —— 所以这里逐模型照抄文档, 不再只按模型族粗分。
+ *
+ * 文档未逐一列出的变体 SKU / 后续新增端点, 回落到函数末尾的模型族兜底。
+ * 文档标注的计费方式(按秒 / 按次)决定时长是否可选: 按次模型把 duration 锁成
+ * 文档给的那一档(如 seedance-2-5-special=30s 一口价), 免得用户改秒数却按原价结算。
  */
+const ZHINIAO_DEFAULT_ASPECTS = ["16:9", "9:16", "1:1"];
+/** 文档未声明 duration 的模型(数字人 / 对口型 / 视频编辑 / 超分, 时长由参考素材决定)。 */
+const ZHINIAO_FALLBACK_DURATIONS = [5, 8, 10, 15, 20, 30];
+
+const ZHINIAO_VIDEO_OPTION_TABLE: Record<
+  string,
+  { aspectRatios: string[]; durationOptions: number[]; resolutionValues: string[] }
+> = {
+  // Seedance 2.5 · 官方直连(按秒) / 特价按秒 / 特价按次(30s 一口价)
+  "seedance-2-5": {
+    aspectRatios: ["16:9", "9:16", "21:9", "3:4", "1:1", "4:3"],
+    durationOptions: [4, 5, 6, 8, 10, 12, 15, 20, 25, 29, 30],
+    resolutionValues: ["480p", "720p", "1080p"],
+  },
+  "seedance-2-5-promo": {
+    aspectRatios: ["16:9", "9:16", "21:9", "3:4", "1:1", "4:3"],
+    durationOptions: [4, 5, 6, 8, 10, 12, 15, 20, 25, 29, 30],
+    resolutionValues: ["480p", "720p", "1080p", "2k", "4k"],
+  },
+  "seedance-2-5-special": {
+    aspectRatios: ["9:16", "16:9", "1:1", "4:3", "3:4"],
+    durationOptions: [30],
+    resolutionValues: ["720p", "1080p"],
+  },
+  // Seedance 2.0 · 官方直连(按秒, 4~15s) / 特价按秒 / 特价按次(15s 一口价)
+  "seedance-2-0-official": {
+    aspectRatios: ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"],
+    durationOptions: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    resolutionValues: ["480p", "720p", "1080p", "4k"],
+  },
+  "seedance-2-0-promo": {
+    aspectRatios: ["9:16", "16:9", "1:1", "4:3", "3:4", "21:9"],
+    durationOptions: [4, 5, 6, 7, 8, 9, 10, 12, 15],
+    resolutionValues: ["480p", "720p", "1080p", "2k", "4k"],
+  },
+  "seedance-2-0-special": {
+    aspectRatios: ["9:16", "16:9", "21:9", "1:1", "4:3", "3:4"],
+    durationOptions: [15],
+    resolutionValues: ["480p", "720p"],
+  },
+  "seedance-2-0-ecom-special": {
+    aspectRatios: ["9:16", "16:9", "1:1"],
+    durationOptions: [5, 10, 15],
+    resolutionValues: [],
+  },
+  "seedance-2-0-9tu-special": {
+    aspectRatios: ["9:16", "16:9"],
+    durationOptions: [5, 10, 15],
+    resolutionValues: ["480p", "720p"],
+  },
+  "seedance-video-edit": {
+    aspectRatios: [],
+    durationOptions: [],
+    resolutionValues: [],
+  },
+  // Veo / Sora
+  "veo-3.1": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [8],
+    resolutionValues: ["720p", "1080p"],
+  },
+  "veo-3-1-manju-special": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [8],
+    resolutionValues: [],
+  },
+  "veo-4-omni": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [3, 4, 5, 6, 7, 8, 9, 10],
+    resolutionValues: ["720p", "1080p"],
+  },
+  "veo-4-omni-v2v": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [],
+    resolutionValues: [],
+  },
+  "sora-2-official": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [4, 8, 12],
+    resolutionValues: [],
+  },
+  // 可灵 Kling(含运动控制 / 数字人 / 对口型)
+  "kling-v3": {
+    aspectRatios: ["16:9", "9:16", "1:1"],
+    durationOptions: [5, 10, 15],
+    resolutionValues: ["720p", "1080p"],
+  },
+  "kling-v3-omni-cankao": {
+    aspectRatios: ["16:9", "9:16", "1:1"],
+    durationOptions: [5, 6, 10, 15],
+    resolutionValues: [],
+  },
+  "kling-v3-motion-control": {
+    aspectRatios: ["16:9", "9:16", "1:1"],
+    durationOptions: [],
+    resolutionValues: ["720p", "1080p"],
+  },
+  "kling-3.0-turbo": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [3, 5, 8, 10, 15],
+    resolutionValues: ["720p"],
+  },
+  "kling-avatar": {
+    aspectRatios: [],
+    durationOptions: [],
+    resolutionValues: [],
+  },
+  "kling-lip-sync": {
+    aspectRatios: [],
+    durationOptions: [],
+    resolutionValues: [],
+  },
+  // MiniMax / Wan / Vidu / PixVerse / HappyHorse
+  "minimax-h3": {
+    aspectRatios: ["16:9", "9:16", "21:9", "4:3", "1:1", "3:4"],
+    durationOptions: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    resolutionValues: ["768p", "2k"],
+  },
+  "minimax-hailuo-2-3": {
+    aspectRatios: [],
+    durationOptions: [6, 10],
+    resolutionValues: ["768p", "1080p"],
+  },
+  "wan-3-0": {
+    aspectRatios: ["16:9", "9:16", "3:4", "4:3", "1:1"],
+    durationOptions: [
+      4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+    ],
+    resolutionValues: ["480p", "720p", "1080p"],
+  },
+  "wan-3-0-special": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [5, 10, 15, 20, 25, 30],
+    resolutionValues: ["720p", "1080p"],
+  },
+  "wan2.7-video": {
+    aspectRatios: ["16:9", "9:16", "1:1", "4:3", "3:4"],
+    durationOptions: [2, 3, 4, 5, 6, 8, 10, 12, 15],
+    resolutionValues: ["720p", "1080p"],
+  },
+  viduq3: {
+    aspectRatios: ["16:9", "9:16", "4:3", "3:4", "1:1"],
+    durationOptions: [4, 5, 8, 12, 16],
+    resolutionValues: ["540p", "720p", "1080p"],
+  },
+  "pixverse-v6": {
+    aspectRatios: ["16:9", "9:16", "1:1"],
+    durationOptions: [5, 8],
+    resolutionValues: ["720p", "1080p"],
+  },
+  "pixverse-c1": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [5, 8],
+    resolutionValues: ["720p", "1080p"],
+  },
+  "happyhorse-1-1": {
+    aspectRatios: ["16:9", "9:16", "1:1", "4:3", "3:4", "4:5", "5:4", "9:21", "21:9"],
+    durationOptions: [3, 5, 10, 15],
+    resolutionValues: ["720p", "1080p"],
+  },
+  // xAI Grok Imagine 视频族 —— 曾因名字含 imagine 被判成图片, 这里给出各自档位
+  "grok-imagine-1.5": {
+    aspectRatios: ["16:9", "9:16", "1:1"],
+    durationOptions: [4, 6, 8, 10, 12, 15, 20, 30],
+    resolutionValues: ["480p", "720p", "1080p"],
+  },
+  "grok-imagine-1-5-7tu-special": {
+    aspectRatios: ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3"],
+    durationOptions: [3, 5, 6, 8, 10, 12, 15],
+    resolutionValues: ["480p", "720p"],
+  },
+  "grok-imagine-1.5-special": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [6, 15],
+    resolutionValues: ["720p"],
+  },
+  "grok-imagine-video": {
+    aspectRatios: ["16:9", "9:16", "1:1"],
+    durationOptions: [3, 4, 5, 6, 8, 10, 15, 20, 30],
+    resolutionValues: ["480p", "720p"],
+  },
+  "grok-imagine-video-special": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [6, 10],
+    resolutionValues: ["720p"],
+  },
+  // 其它
+  "omni-flash-1-1": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [10],
+    resolutionValues: ["720p"],
+  },
+  "aliyun-video-superres": {
+    aspectRatios: [],
+    durationOptions: [],
+    resolutionValues: [],
+  },
+};
+
 function resolveZhiniaoVideoOptions(model: string): {
   aspectRatios: string[];
   durationOptions: number[];
   resolutionValues: string[];
 } {
   const normalized = model.trim().toLowerCase();
-  const DEFAULT_ASPECTS = ["16:9", "9:16", "1:1"];
+  const exact = ZHINIAO_VIDEO_OPTION_TABLE[normalized];
+  if (exact) {
+    return {
+      // 文档没给画幅的模型(数字人 / 对口型 / 超分…)回落到通用三档, 不让控件空掉;
+      // 时长同理(这类模型时长由参考素材决定)。
+      aspectRatios: exact.aspectRatios.length ? exact.aspectRatios : ZHINIAO_DEFAULT_ASPECTS,
+      durationOptions: exact.durationOptions.length ? exact.durationOptions : ZHINIAO_FALLBACK_DURATIONS,
+      // 分辨率保持空数组: 注册表把「空」当作「该模型没有这个参数」, 直接隐藏控件。
+      resolutionValues: exact.resolutionValues,
+    };
+  }
+  // 未逐一登记的变体 SKU: 按模型族兜底。
   if (normalized.includes("seedance")) {
     return {
       aspectRatios: ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"],
-      durationOptions: [4, 5, 6, 8, 10, 12, 15, 20, 25, 30],
+      durationOptions: [4, 5, 6, 8, 10, 12, 15, 20, 25, 29, 30],
       resolutionValues: ["480p", "720p", "1080p"],
     };
   }
   if (normalized.startsWith("veo")) {
     return {
       aspectRatios: ["16:9", "9:16"],
-      durationOptions: [8],
+      durationOptions: [3, 4, 5, 6, 7, 8, 9, 10],
       resolutionValues: ["720p", "1080p"],
     };
   }
@@ -878,8 +1095,8 @@ function resolveZhiniaoVideoOptions(model: string): {
   if (normalized.startsWith("kling")) {
     return {
       aspectRatios: ["16:9", "9:16", "1:1"],
-      durationOptions: [5, 10, 15],
-      resolutionValues: ["720p", "1080p", "4k"],
+      durationOptions: [3, 5, 6, 8, 10, 15],
+      resolutionValues: ["720p", "1080p"],
     };
   }
   if (normalized.startsWith("minimax")) {
@@ -892,16 +1109,27 @@ function resolveZhiniaoVideoOptions(model: string): {
   if (normalized.startsWith("wan-3") || normalized.startsWith("wan3")) {
     return {
       aspectRatios: ["16:9", "9:16", "3:4", "4:3", "1:1"],
-      durationOptions: [5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30],
+      durationOptions: Array.from({ length: 27 }, (_, index) => index + 4),
       resolutionValues: ["480p", "720p", "1080p"],
     };
   }
+  if (normalized.startsWith("grok-imagine")) {
+    return {
+      aspectRatios: ["16:9", "9:16", "1:1"],
+      durationOptions: [3, 4, 5, 6, 8, 10, 12, 15, 20, 30],
+      resolutionValues: ["480p", "720p"],
+    };
+  }
   if (normalized.startsWith("pixverse") || normalized.startsWith("vidu") || normalized.startsWith("happyhorse")) {
-    return { aspectRatios: DEFAULT_ASPECTS, durationOptions: [5, 8, 10, 15], resolutionValues: ["720p", "1080p"] };
+    return {
+      aspectRatios: ZHINIAO_DEFAULT_ASPECTS,
+      durationOptions: [3, 5, 8, 10, 15],
+      resolutionValues: ["720p", "1080p"],
+    };
   }
   return {
-    aspectRatios: DEFAULT_ASPECTS,
-    durationOptions: [5, 8, 10, 15, 20, 30],
+    aspectRatios: ZHINIAO_DEFAULT_ASPECTS,
+    durationOptions: ZHINIAO_FALLBACK_DURATIONS,
     resolutionValues: ["720p", "1080p"],
   };
 }
@@ -937,6 +1165,13 @@ function resolveBinghuoVideoOptions(model: string): {
   } else if (["sd2.5-480p", "sd2.5-1080p", "sd2.5-backup", "sd2.5-720p-ch2"].includes(normalized)) {
     durationOptions = Array.from({ length: 26 }, (_, index) => index + 4);
   } else if (normalized.includes("sd2.5") || normalized.includes("rd2.5") || normalized.includes("gz-sd2.5")) {
+    durationOptions = Array.from({ length: 27 }, (_, index) => index + 4);
+  } else if (normalized.includes("bh2.5")) {
+    // bh2.5 全系(bh2.5-1080p / bh2.5-720p …)平台口径是 **4~30 秒逐秒**(用户 2026-10-13 核对文档确认)。
+    // 之前这一族没有任何登记, 于是和函数末尾的默认值撞在一起 —— 默认恰好也是 4~15, 而 UI 是用
+    // `durationOptions` 的头/尾夹滑杆的, 症状就是「模型只能最高 15 秒」。**不能删这条去蹭默认值**:
+    // 默认值将来若调整, bh2.5 会跟着漂。注意判据写 `bh2.5` 而不是 `sd2.5` —— 名字里是 `bh` 不是 `sd`,
+    // 下面那条 `includes("sd2.5")` 兜不住它。
     durationOptions = Array.from({ length: 27 }, (_, index) => index + 4);
   } else if (normalized === "minimax-h3-pro-2k" || normalized === "hailuo-h3-2k") {
     durationOptions = normalized === "hailuo-h3-2k" ? [6, 10] : Array.from({ length: 12 }, (_, index) => index + 4);
@@ -1013,6 +1248,22 @@ type BinghuoVideoPrice =
   | { type: "per-run"; amount: number; durationThreshold?: number; thresholdAmount?: number };
 
 const BINGHUO_VIDEO_PRICES: Record<string, BinghuoVideoPrice> = {
+  // ── 2026-10-13 价格表同步（平台公开表格 gid=0）────────────────────────────
+  // 新增渠道前缀：`db-`（56 折直连）/ `hs-`（官方直连）。原表这两族是本次新上架。
+  "db-sd2.5-720p": { type: "per-second", amount: 0.85 },
+  "db-sd2.5-1080p": { type: "per-second", amount: 2.15 },
+  "hs-sd2.0-480p": { type: "per-second", amount: 0.42 },
+  "hs-sd2.0-720p": { type: "per-second", amount: 0.58 },
+  "hs-sd2.0-1080p": { type: "per-second", amount: 1.43 },
+  "hs-sd2.0-4k": { type: "per-second", amount: 4.6 },
+  "hs-sd2.5-480p": { type: "per-second", amount: 0.62 },
+  "hs-sd2.5-720p": { type: "per-second", amount: 0.84 },
+  "hs-sd2.5-1080p": { type: "per-second", amount: 2.19 },
+  "hs-sd2.0-mini-480p": { type: "per-second", amount: 0.086 },
+  "hs-sd2.0-mini-720p": { type: "per-second", amount: 0.18 },
+  "hs-sd2.0-fast-480p": { type: "per-second", amount: 0.26 },
+  "hs-sd2.0-fast-720p": { type: "per-second", amount: 0.46 },
+  // 官转稳定
   "gz-sd480p": { type: "per-second", amount: 0.28 },
   "gz-sd720p": { type: "per-second", amount: 0.5 },
   "gz-sd1080p": { type: "per-second", amount: 1.15 },
@@ -1020,47 +1271,49 @@ const BINGHUO_VIDEO_PRICES: Record<string, BinghuoVideoPrice> = {
   "gz-sd2.5-480p": { type: "per-second", amount: 0.46 },
   "gz-sd2.5-720p": { type: "per-second", amount: 0.92 },
   "gz-sd2.5-1080p": { type: "per-second", amount: 2.2 },
-  // 2026-09-11 价格表同步
-  "sd2.5-720p-ch2": { type: "per-second", amount: 0.69 },
-  "sd2.5-720p-ch3": { type: "per-second", amount: 0.59 },
-  "rd2.5-480p": { type: "per-second", amount: 0.425 },
-  "rd2.5-720p": { type: "per-second", amount: 0.95 },
-  "rd2.0-480p": { type: "per-second", amount: 0.28 },
-  "rd2.0-480pfast": { type: "per-second", amount: 0.3 },
-  "rd2.0-720p": { type: "per-second", amount: 0.58 },
-  "rd2.0-1080p": { type: "per-second", amount: 1.39 },
-  sdvip720p: { type: "per-second", amount: 0.39 },
-  sdvip1080p: { type: "per-second", amount: 0.68 },
-  sdvip4k: { type: "per-second", amount: 3.85 },
-  "sd2.5-480p": { type: "per-second", amount: 0.58 },
-  "sd2.5-720p": { type: "per-second", amount: 0.85 },
-  "sd2.5-1080p": { type: "per-second", amount: 1.59 },
+  "sdvip720p": { type: "per-second", amount: 0.39 },
+  "sdvip1080p": { type: "per-second", amount: 0.68 },
+  "sdvip4k": { type: "per-second", amount: 3.85 },
+  "sd2.5-720p-ch2": { type: "per-second", amount: 0.89 },
+  "sd2.5-720p-ch3": { type: "per-second", amount: 0.75 },
+  "sd2.5-480p": { type: "per-second", amount: 0.59 },
+  // ⚠️ 计价方式变了：表里 720p 是「3.99 元/条（30 秒）」，480p/1080p 仍是元/秒。
+  "sd2.5-720p": { type: "per-run", amount: 3.99 },
+  "sd2.5-1080p": { type: "per-second", amount: 1.39 },
   "sd2.5-backup": { type: "per-second", amount: 0.65 },
   "sd2.5-cf-720p": { type: "per-second", amount: 0.46 },
-  "sd2.5-480p-ch1": { type: "per-second", amount: 0.42 },
-  "wan3.0-480p": { type: "per-second", amount: 0.25 },
+  "sd2.5-cf-1080p": { type: "per-run", amount: 4.9 },
+  "sd2.5-480p-ch1": { type: "per-run", amount: 7.5 },
+  "sd2.5-720p-ch1": { type: "per-run", amount: 3.5 },
+  "sd2.5-福利": { type: "per-run", amount: 11.8 },
+  "rd2.5-480p": { type: "per-second", amount: 0.62 },
+  "rd2.5-720p": { type: "per-second", amount: 0.73 },
+  "rd2.0-480p": { type: "per-second", amount: 0.28 },
+  "rd2.0-480pfast": { type: "per-second", amount: 0.3 },
+  "rd2.0-720p": { type: "per-run", amount: 5.6 },
+  "rd2.0-1080p": { type: "per-run", amount: 8.8 },
+  "wan3.0-480p": { type: "per-second", amount: 0.31 },
   "wan3.0-720p": { type: "per-second", amount: 0.4 },
   "wan3.0-1080p": { type: "per-second", amount: 0.7 },
-  "tj-wan3.0-1080p": { type: "per-second", amount: 0.36 },
+  "tj-wan3.0-1080p": { type: "per-second", amount: 0.41 },
   "tj-wan3.0-720p": { type: "per-second", amount: 0.31 },
-  "tj-wan3-720p": { type: "per-second", amount: 0.31 },
-  "minimax-h3-pro-768p": { type: "per-second", amount: 0.05 },
+  "tj-wan3-720p": { type: "per-second", amount: 0.36 },
+  "minimax-h3-pro-768p": { type: "per-run", amount: 2.5 },
   "minimax-h3-pro-2k": { type: "per-run", amount: 0.25 },
   "minimax-h3-4k": { type: "per-second", amount: 0.36 },
   "hailuo-h3-2k": { type: "per-run", amount: 2.8 },
-  "sp2.5-720p": { type: "per-run", amount: 4.9, durationThreshold: 15, thresholdAmount: 6.1 },
+  "sp2.5-720p": { type: "per-run", amount: 8.99 },
   "sp2.5-720p-15s": { type: "per-run", amount: 4.9 },
   "sp2.5-720p-30s": { type: "per-run", amount: 6.1 },
-  "sd2.5-720p-ch1": { type: "per-run", amount: 2.5 },
   "tj-sp2.5": { type: "per-run", amount: 3.85 },
   "sd2-vip720p": { type: "per-run", amount: 3.55 },
   "quanneng2.0": { type: "per-run", amount: 5.9 },
-  "quanneng2.0-9tu": { type: "per-run", amount: 1.58 },
-  "b-quannengship2.0": { type: "per-run", amount: 6.35 },
+  "quanneng2.0-9tu": { type: "per-run", amount: 3.5 },
+  "b-quannengship2.0": { type: "per-run", amount: 2.9 },
   "sdquan-2-miao": { type: "per-second", amount: 0.38 },
-  "sd2-福利": { type: "per-run", amount: 0.35 },
+  "sd2-福利": { type: "per-second", amount: 0.4 },
   "sd2-fast福利": { type: "per-run", amount: 2.85 },
-  "sd2.0-720p": { type: "per-run", amount: 1.5 },
+  "sd2.0-720p": { type: "per-run", amount: 1.8 },
   "sd2.0-480p": { type: "per-run", amount: 1.99 },
   "sd2.0-720p-fast": { type: "per-run", amount: 4.65 },
   "kuaile1.1": { type: "per-second", amount: 0.18 },
@@ -1069,7 +1322,10 @@ const BINGHUO_VIDEO_PRICES: Record<string, BinghuoVideoPrice> = {
   "kuaile1.0": { type: "per-run", amount: 1.85 },
   "grok-imagine-video": { type: "per-run", amount: 1.5 },
   "grok-imagine-video-1.5-preview": { type: "per-run", amount: 1.5 },
-  "bh2.0-720p": { type: "per-second", amount: 0.49 },
+  "sora-v4-pro": { type: "per-second", amount: 0.45 },
+  "bh2.5-720p": { type: "per-second", amount: 0.78 },
+  "bh2.5-1080p": { type: "per-second", amount: 1.06 },
+  "bh2.0-720p": { type: "per-second", amount: 0.55 },
   "bh2.0-480p": { type: "per-second", amount: 0.39 },
   "bh2.0-1080p": { type: "per-second", amount: 0.69 },
   "bh2.0-fast-480p": { type: "per-second", amount: 0.29 },
@@ -1080,17 +1336,29 @@ const BINGHUO_VIDEO_PRICES: Record<string, BinghuoVideoPrice> = {
   "bh2.04k": { type: "per-second", amount: 3.68 },
 };
 
-/** 炳火图片模型按张计价（全分辨率同价，2026-09-11 价格表）。 */
+/** 炳火图片模型按张计价（全分辨率同价，2026-10-13 价格表同步）。 */
 const BINGHUO_IMAGE_PRICES: Record<string, number> = {
   image4k: 0.18,
   image2k4k: 0.11,
-  "image2-high": 0.13,
+  "image2-high": 0.2,
   image2: 0.035,
+  "image2.5": 0.02,
+  "image-2.5-flare": 0.02,
+  "image-2.5-sunburst": 0.02,
+  "gpt-image-2.5": 0.25,
+  "gpt-image-2.5-flare": 0.25,
+  "gpt-image-2.5-sunburst": 0.25,
+  "nano-banana-pro": 0.2,
+  "nano-banana-2": 0.12,
+  "grok-imagine-image-2.0": 0.16,
+  "grok-imagine-image": 0.12,
   "gemini-3-pro-image-preview": 0.15,
   "gemini-3.1-flash-image-preview": 0.15,
+  "gemini-3.1-flash-image": 0.13,
   "by-image1k": 0.03,
   "by-image2k4k": 0.15,
   "cf-image4k": 0.06,
+  midjourney: 0.056,
 };
 
 /** 字子动画图片按次计价(来源: 平台 /api/pricing, `price_display_unit=call`)。 */

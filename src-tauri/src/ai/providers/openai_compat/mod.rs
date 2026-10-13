@@ -27,6 +27,25 @@ pub struct OpenAICompatibleProvider {
     custom_api_keys: Arc<RwLock<HashMap<String, String>>>,
 }
 
+/// OpenAI 系推理模型(o 系 / gpt-5 及更新型号)会在**模型执行前**先跑一遍输入内容预检,
+/// 命中即拒:
+///
+/// `{"error":{"code":"invalid_prompt","message":"Invalid prompt: your prompt was flagged
+///   as potentially violating our usage policy...","type":"invalid_request_error"}}`
+///
+/// 它是**审核判定**而不是参数/格式错误: 官方社区反馈它和提示词**长度**的相关性高于内容
+/// 本身, 且随模型 / 账号 / 时段波动 —— 同一段提示词换个模型或再点一次往往就能过。
+/// 直译这串英文给用户没有任何可操作信息, 所以补一句中文指引。
+fn prompt_policy_hint(body: &str) -> &'static str {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("invalid_prompt") || lower.contains("flagged as potentially violating") {
+        "（上游输入内容预检拦截：不是参数错误，与提示词长度相关性较高、随模型和时段偶发；\
+可以原样重试一次，或把 Chat 模型换成非 OpenAI 推理模型，或精简风格/故事梗概后再试）"
+    } else {
+        ""
+    }
+}
+
 impl OpenAICompatibleProvider {
     pub fn new() -> Self {
         Self {
@@ -685,7 +704,12 @@ impl OpenAICompatibleProvider {
                         body_text.chars().take(400).collect()
                     }
                 });
-            return Err(AIError::TaskFailed(format!("HTTP {}: {}", status, message)));
+            return Err(AIError::TaskFailed(format!(
+                "HTTP {}: {}{}",
+                status,
+                message,
+                prompt_policy_hint(&body_text)
+            )));
         }
 
         payload
@@ -2293,9 +2317,19 @@ impl AIProvider for OpenAICompatibleProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::OpenAICompatibleProvider;
+    use super::{prompt_policy_hint, OpenAICompatibleProvider};
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// OpenAI 推理模型的输入内容预检拒绝: 必须补上可操作的中文指引, 其它错误保持原样。
+    #[test]
+    fn prompt_policy_rejection_gets_an_actionable_hint() {
+        let rejection = r#"{"error":{"code":"invalid_prompt","message":"Invalid prompt: your prompt was flagged as potentially violating our usage policy. Please try again with a different prompt: https://platform.openai.com/docs/guides/reasoning#advice-on-prompting","param":null,"type":"invalid_request_error"}}"#;
+        assert!(prompt_policy_hint(rejection).contains("重试"));
+        assert!(prompt_policy_hint(rejection).contains("非 OpenAI 推理模型"));
+        assert_eq!(prompt_policy_hint(r#"{"error":{"message":"invalid api key"}}"#), "");
+        assert_eq!(prompt_policy_hint(""), "");
+    }
 
     #[test]
     fn retries_alternate_reference_field_for_supported_reference_errors() {

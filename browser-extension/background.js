@@ -9,9 +9,17 @@
  *      请求由页面发出，所以自带页面的 Referer，同源资源还带 cookie。
  *      很多站点「把链接复制到别处打开就 403」的资源，只有这条路能拿到。
  *      代价是字节要经 base64 穿过注入边界，所以只用于小文件。
- *   2. **后台直取 + 流式转发** —— 由 service worker 发起，没有页面身份，
- *      但可以把响应体直接当作上传的请求体转出去（`duplex: 'half'`），
- *      全程不把文件读进内存。大文件走这条。
+ *   2. **后台直取**（service worker 发起）—— 没有页面身份，但不受注入边界的体积限制，
+ *      大文件走这条。**整块下载完再整块上传**，不是边下边传：
+ *      流式转发（`duplex: 'half'` + chunked）会在本机桥上被读超时掐死，成因见
+ *      `importStreamed` 末尾的长注释 —— 改回去之前务必先读那段。
+ *
+ *      ⚠️ 这条**依赖 manifest 里的全站 host 权限**（`host_permissions` 里的远端通配项）。
+ *      service worker 的跨域 fetch 没有该权限时会被浏览器按 CORS 直接拦下，抛出来的
+ *      只有一句 `Failed to fetch`（看不出是没权限、还是防盗链、还是网络不通）。
+ *      真实踩过：>16 MB 的视频在页面通道超限后全部落到这里，于是全军覆没在
+ *      一句 `Failed to fetch` 上 —— 现象就是 popup 里「1 项没能入库：Failed to fetch」。
+ *      所以「只给小文件用页面通道」这个设计，前提就是后台这条路真的能走通。
  *
  * 为什么取字节必须在浏览器里做、而不是把地址直接交给 LenTalk：
  * 很多图片和视频依赖站点登录态、Referer 或时效签名，离开浏览器上下文就是 403。
@@ -23,11 +31,14 @@ const PORT_SCAN_END = 17899;
 
 /**
  * 走「页面上下文」通道的体积上限。
- * 这条路的字节要经 base64 穿过注入边界（体积会涨三分之一），超了改走流式。
+ * 这条路的字节要经 base64 穿过注入边界（体积会涨三分之一），超了改走后台直取。
  */
 const INLINE_LIMIT_BYTES = 16 * 1024 * 1024;
 
-/** 单个素材上限。超过就跳过：再大就不适合由浏览器中转。 */
+/**
+ * 单个素材上限。超过就跳过。
+ * ⚠️ 后台直取是**整块下载**（不再边下边传），所以这个值同时是内存 / Blob 存储的峰值量级。
+ */
 const MAX_ASSET_BYTES = 300 * 1024 * 1024;
 
 /** 探测成功过的端口缓存。service worker 被回收后会自动重置，不影响正确性。 */
@@ -293,54 +304,135 @@ async function uploadBlob(uploadUrl, blob) {
 }
 
 /**
- * 后台直取并**流式**转发：把下载响应的 body 直接当作上传请求体交给 LenTalk，
- * 服务端按 chunked 边收边落盘，中间不产生整份文件的内存副本。
+ * 后台直取：整块下载 → 整块上传。
+ *
+ * 曾经这里是「边下边传」（`duplex: 'half'`，服务端按 chunked 边收边落盘）。
+ * 那个设计在本机桥上是必然失败的，成因与证据见本函数末尾的长注释。
  */
 async function importStreamed(uploadUrl, item) {
-  const response = await fetch(item.url);
+  // ① 拉源文件。这一步失败最常见 —— 跨域被 CORS 拦下、或网络不通，现象都是一句
+  //    没头没尾的 `Failed to fetch`。所以带上「是哪一步」的前缀（见 describeBackgroundFailure）。
+  let response;
+  try {
+    response = await fetch(item.url);
+  } catch (error) {
+    throw new Error(`拉取源文件失败：${describeBackgroundFailure(error)}`);
+  }
   if (!response.ok) {
-    throw new Error(`抓取被拒绝（HTTP ${response.status}）`);
+    throw new Error(`拉取源文件被拒绝（HTTP ${response.status}）`);
   }
   const declared = Number(response.headers.get('content-length') || 0);
   if (declared > MAX_ASSET_BYTES) {
     throw new Error(`超过 ${Math.round(MAX_ASSET_BYTES / 1024 / 1024)} MB 上限`);
   }
-  if (!response.body) {
-    return await uploadBlob(uploadUrl, await response.blob());
+
+  // ② 整份读进内存。
+  //    源站慢只影响这一步（浏览器与 CDN 之间），**不会**拖累本机桥的读超时 ——
+  //    见下面「为什么不再流式」的长注释。
+  const startedAt = Date.now();
+  let blob;
+  try {
+    blob = await response.blob();
+  } catch (error) {
+    const waited = Math.round((Date.now() - startedAt) / 1000);
+    throw new Error(
+      `下载源文件内容失败（已等待 ${waited} 秒：${describeBackgroundFailure(error)}）`
+    );
+  }
+  const seconds = Math.round((Date.now() - startedAt) / 1000);
+  if (blob.size === 0) {
+    // 签名 URL 失效、或源站只回了空体时，最容易在这里露馅：拿到 200 但一个字节都没有。
+    throw new Error(`下载到 0 字节（等待 ${seconds} 秒，源站可能已让链接失效）`);
   }
 
-  let upload;
+  // ③ 整块上传：与小文件**完全同一条**路径，只是体积大一些。
   try {
-    upload = await fetch(uploadUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: response.body,
-      duplex: 'half',
-    });
-  } catch {
-    // 环境不支持流式请求体（或中转途中断了）：重新取一次，整块上传兜底。
-    const retry = await fetch(item.url);
-    if (!retry.ok) {
-      throw new Error(`抓取被拒绝（HTTP ${retry.status}）`);
-    }
-    return await uploadBlob(uploadUrl, await retry.blob());
+    return await uploadBlob(uploadUrl, blob);
+  } catch (error) {
+    const mb = (blob.size / 1024 / 1024).toFixed(1);
+    throw new Error(
+      `已下载 ${mb} MB（耗时 ${seconds} 秒）但入库失败：${describeBackgroundFailure(error)}`
+    );
   }
-  return await readOutcome(upload, declared);
 }
+
+/*
+ * 为什么不再「边下边传」（2026-10-13 实测，别再改回去）
+ *
+ * 这里原本是流式转发：把下载响应的 body 直接当上传请求体交给 LenTalk（`duplex: 'half'`），
+ * 让服务端按 chunked 边收边落盘、省一份内存副本。设计没错，但在本机桥上是**必然失败**的，
+ * 而且失败形态极其隐蔽 —— 两端看到的表象完全不同：
+ *
+ *   · 本机桥 `media_bridge.rs` 每 60 秒打一条
+ *     `[media-bridge] request failed: 读取请求失败: … (os error 10060)`；
+ *   · 浏览器侧只有一句 `Failed to fetch`。
+ *
+ * 两个现象是**同一件事**：**请求头送到了桥，但 chunked 的第一个分块始终没到。**
+ * 桥侧的 `read_line()` 卡在等分块长度行上，直到 `IO_TIMEOUT`（60 秒）读超时才放弃、
+ * 关掉连接；浏览器就把这次 fetch 判成失败。
+ *
+ * 而分块为什么不来的原因是关键：**浏览器要等源站响应流吐出第一块数据才会发分块。**
+ * 快手这类 CDN 的冷数据（`kcdntag` 里的 `h:COLD`，即未命中边缘缓存、需要回源）
+ * 首字节可能远超 60 秒。也就是说：**「源站慢」被直接转嫁成了「本机桥读超时」**，
+ * 而桥的 60 秒是固定的，改不掉。
+ *
+ * 整块下载把这件事彻底解耦：慢的部分只发生在浏览器与 CDN 之间（那边没有 60 秒这种
+ * 紧超时），等下载完，上传体已经是内存里的 Blob（浏览器会自动算好 Content-Length），
+ * localhost 上一次推送就结束 —— 正是小文件一直在走、且一直成功的那条路径。
+ * 代价是一份内存副本，上限由 MAX_ASSET_BYTES 兜住。
+ */
 
 /**
  * 后台直取的错误翻译。
  *
- * 后台 fetch 抛 TypeError 基本都是跨域被 CORS 拦下（扩展没申请该站点的访问权限），
- * 而原始信息只有一句 "Failed to fetch"，看不出是被防盗链、被登录墙还是被 CORS 拦的，
- * 所以补一句说明，免得用户以为功能坏了。
+ * 后台 fetch 抛 TypeError 基本都是请求在浏览器/站点那一侧被拦下了 ——
+ * 原始信息只有一句 "Failed to fetch"，看不出是 CORS、防盗链、还是网络不通，
+ * 所以补一句"可能的方向"，免得用户以为功能坏了。
+ *
+ * 注意：manifest 已经申请了全站 host 权限，正常情况下不再有「站点未授权」这一说，
+ * 所以这里给的是排查方向，而不是断言原因。
  */
+/** 后台 fetch 被拦下时补的排查方向。抽成常量，好让翻译**幂等**（见下）。 */
+const BACKGROUND_FAILURE_HINT = '浏览器或站点拦下了这次请求：CORS / 防盗链 / 网络不通';
+
 function describeBackgroundFailure(error) {
   const message = error && error.message ? error.message : String(error);
-  if (/failed to fetch|networkerror|load failed/i.test(message)) {
-    return `${message}（跨域且该站点未授权扩展访问）`;
+  if (!/failed to fetch|networkerror|load failed/i.test(message)) return message;
+  // 幂等：调用链上可能已经翻译过（importStreamed 内部翻一次、importOne 再翻一次），
+  // 不判重就会叠成「Failed to fetch（…）（…）」，还会把后面的诊断信息挤出角标长度上限。
+  if (message.includes(BACKGROUND_FAILURE_HINT)) return message;
+  return `${message}（${BACKGROUND_FAILURE_HINT}）`;
+}
+
+/**
+ * ⚠️ 曾经试图在这里给后台 fetch 补 Referer（页面通道能取到、后台取不到，差别就在它），
+ * 但**实验证明这条路走不通**：`fetch(url, { referrer, referrerPolicy })` 只在 referrer
+ * 与发起方**同源**时生效；跨源一律被浏览器丢弃，实际发出去的仍是发起方自己的来源。
+ * 实测（Chrome 155，从 example.com 请求，referrer 设为 kuaishou 的地址）：
+ *   不传 referrer            → Referer: https://example.com/
+ *   referrer=第三方+unsafe-url → Referer: https://example.com/   ← 被忽略
+ * 扩展 service worker 的来源是 chrome-extension://<id>/，和 CDN 天然不同源，所以补不上。
+ * 要真正改写 Referer 只能用 declarativeNetRequest 的 modifyHeaders（且同样依赖主机权限被授予）。
+ * 顺带测出一个事实：页面自己发请求时，默认策略也只送**来源**（https://www.kuaishou.com/），
+ * 不是完整页面地址。
+ */
+
+/**
+ * 探测「远端站点访问权限」到底有没有真的授予。
+ *
+ * manifest 里写了全站 host 权限不等于浏览器就给了 —— 扩展详情页的「网站访问权限」
+ * 若停在「点击时」，跨域 fetch 同样会被拦成 `Failed to fetch`，与防盗链、网络不通
+ * 的现象**一模一样**。把这一项直接写进失败信息，省掉一轮猜。
+ */
+async function remoteAccessNote() {
+  try {
+    const granted = await chrome.permissions.contains({ origins: ['*://*/*'] });
+    return granted
+      ? '远端访问权限：已授予'
+      : '远端访问权限：未授予 —— 到 chrome://extensions 该扩展的「详情」里把「网站访问权限」改成「在所有网站上」';
+  } catch (error) {
+    return `远端访问权限：查询失败（${error && error.message ? error.message : error}）`;
   }
-  return message;
 }
 
 /**
@@ -349,6 +441,11 @@ function describeBackgroundFailure(error) {
  * 顺序固定：先在页面上下文试（能带 Referer 与 cookie，成功率高得多），
  * 体积超限或注入失败再退回后台直取。失败信息会把两次的原因都带上，
  * 免得只显示"失败"却看不出是被防的还是被 CORS 拦的。
+ *
+ * ⚠️ 「体积超限」也必须走下面同一条 try/catch。以前它是提前 `return` 的，
+ * 而后台 fetch 一旦抛错（跨域被拦 / 网络不通）就**裸抛**一句 `Failed to fetch`，
+ * 传不到这里的翻译环节。> 16 MB 的视频正好全部走这条路，于是用户只看到
+ * 「1 项没能入库：Failed to fetch」，既不知道是体积问题、也不知道下一步做什么。
  */
 async function importOne(bridge, item, categoryId, tabId) {
   // HLS(m3u8) 是「一张清单 + 一堆分片」，字节没法像普通素材那样整块递过去 ——
@@ -363,15 +460,18 @@ async function importOne(bridge, item, categoryId, tabId) {
   if (inPage.ok) {
     return await uploadBlob(uploadUrl, base64ToBlob(inPage.base64, inPage.contentType));
   }
-  if (inPage.tooLarge) {
-    return await importStreamed(uploadUrl, item);
-  }
 
+  // 页面通道没拿到：要么文件超过内联上限（tooLarge），要么注入/取字节本身失败。
+  // 两种都只能回落后台直取（整块下载 → 整块上传，见 importStreamed 的长注释）。
   try {
     return await importStreamed(uploadUrl, item);
   } catch (error) {
     const message = describeBackgroundFailure(error);
-    throw new Error(`${inPage.error || '页面内取字节失败'}；后台直取也失败（${message}）`);
+    const head = inPage.tooLarge
+      ? `文件超过 ${Math.round(INLINE_LIMIT_BYTES / 1024 / 1024)} MB，页面通道只走小文件`
+      : inPage.error || '页面内取字节失败';
+    // 末尾附上主机权限的真实状态：manifest 写了不等于浏览器给了，两者现象一模一样。
+    throw new Error(`${head}；后台直取也失败（${message}）；${await remoteAccessNote()}`);
   }
 }
 
@@ -507,7 +607,7 @@ safeRegister('消息通道', () => {
  *
  * 目的很单纯 —— 用户在图片上点右键就想存下来，不该先点扩展图标、等扫描、
  * 再从一堆图里找到它。所以右键路径直接拿 `info.srcUrl` 去走同一条
- * `importOne` 通道（页面上下文取字节 → 流式回落），分类则给两个入口：
+ * `importOne` 通道（页面上下文取字节 → 后台直取回落），分类则给两个入口：
  * 一下子点掉的「用上次的分类」和展开选的「指定分类」。
  * ------------------------------------------------------------------ */
 
@@ -977,7 +1077,7 @@ async function saveFromContext(info, tab, explicitCategory) {
     flashBadge('✓', '#16a34a', parts.join(' · '));
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
-    flashBadge('!', '#dc2626', `入库失败：${clip(message, 120)}`);
+    flashBadge('!', '#dc2626', `入库失败：${clip(message, 200)}`);
   }
 }
 

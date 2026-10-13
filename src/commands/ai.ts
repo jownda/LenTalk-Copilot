@@ -109,6 +109,13 @@ export interface VideoGenerationJobStatus {
    * 「查询失败(网络)」这类带「失败」二字的措辞。
    */
   transient?: boolean;
+  /**
+   * 后端声明: 这次提交的请求**还没送达平台**, 此刻 `cancel_generate_video_job` 能拦下来。
+   *
+   * 平台一受理(拿到 task_id 开始出片)就变 `false` —— 之后取消只会丢掉已经计费的结果,
+   * 前端必须把「取消生成」入口收掉。旧版后端不带这个字段, 按 `false` 处理。
+   */
+  cancelable?: boolean;
 }
 
 interface GenerateJimengCliVideoRequest {
@@ -2330,6 +2337,18 @@ export async function getGenerateVideoJob(jobId: string): Promise<VideoGeneratio
     throw new Error("get_generate_video_job returned invalid payload");
   }
   return result;
+}
+
+/**
+ * 中止一次**还没送达平台**的视频任务。
+ *
+ * 窗口很窄: 请求一旦被平台受理(拿到 task_id 开始出片), 再中止只会把已计费的结果
+ * 丢掉 —— 后端这时会回 `too_late`, 调用方必须把「取消生成」入口收掉, 不能谎报成功。
+ */
+export async function cancelGenerateVideoJob(jobId: string): Promise<"canceled" | "too_late"> {
+  if (!isTauri()) return "too_late";
+  const outcome = await invoke<string>("cancel_generate_video_job", { jobId });
+  return outcome === "canceled" ? "canceled" : "too_late";
 }
 
 // ---------------------------------------------------------------------------

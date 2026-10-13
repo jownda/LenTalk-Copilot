@@ -87,13 +87,13 @@ describe('collectCanvasMediaEntries', () => {
     expect(entries[0].thumbnailUrl).toBeNull();
   });
 
-  it('保持画布中的节点顺序, 并把无媒体节点排在列表之外', () => {
+  it('倒序输出(最新创建的排最前), 并把无媒体节点排在列表之外', () => {
     const entries = collectCanvasMediaEntries([
       makeNode(CANVAS_NODE_TYPES.upload, { imageUrl: 'first.png' }, 'first'),
       makeNode(CANVAS_NODE_TYPES.textAnnotation, { content: '纯文本' }, 'text'),
       makeNode(CANVAS_NODE_TYPES.exportImage, { imageUrl: 'second.png' }, 'second'),
     ]);
 
-    expect(entries.map((entry) => entry.nodeId)).toEqual(['first', 'second']);
+    expect(entries.map((entry) => entry.nodeId)).toEqual(['second', 'first']);
   });
 });

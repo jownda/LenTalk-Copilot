@@ -17,10 +17,40 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 use tracing::info;
 
+use super::media_output;
+
 const STORYBOARD_METADATA_PNG_TEXT_KEY: &str = "StoryboardCopilotMetadata";
 const FAST_PREVIEW_BYPASS_MAX_BYTES: usize = 2_000_000;
 const FAST_PREVIEW_BYPASS_MAX_DIMENSION: u32 = 2048;
 const REMOTE_IMAGE_DOWNLOAD_ATTEMPTS: usize = 3;
+
+/// 远端媒体的下载预算。
+///
+/// 图片和视频不能用同一套参数：图片小、要快，且生成服务的 CDN 在压缩传输或 HTTP/2
+/// 连接复用期间会中断响应体，所以限 HTTP/1.1 + 短超时 + 多试几次；视频动辄几十 MB，
+/// 45 秒和 HTTP/1.1 都会把它自己掐断，必须放宽时长、允许 HTTP/2、少重试
+/// （重试一次要再花一份流量）。
+#[derive(Clone, Copy)]
+struct DownloadBudget {
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+    http1_only: bool,
+    attempts: usize,
+}
+
+const IMAGE_DOWNLOAD_BUDGET: DownloadBudget = DownloadBudget {
+    connect_timeout: std::time::Duration::from_secs(10),
+    request_timeout: std::time::Duration::from_secs(45),
+    http1_only: true,
+    attempts: REMOTE_IMAGE_DOWNLOAD_ATTEMPTS,
+};
+
+const VIDEO_DOWNLOAD_BUDGET: DownloadBudget = DownloadBudget {
+    connect_timeout: std::time::Duration::from_secs(15),
+    request_timeout: std::time::Duration::from_secs(600),
+    http1_only: false,
+    attempts: 2,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1085,31 +1115,38 @@ pub async fn merge_storyboard_images(
     })
 }
 
+/// 图片的落盘目录。
+///
+/// 位置本身由 [`media_output`] 决定（「设置 → 通用 → 默认落盘位置」，默认
+/// `<系统下载文件夹>/LenTalk/images`）。这里只保留函数名，避免动到十几个调用点。
 fn resolve_images_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
+    media_output::media_dir(app, media_output::MediaKind::Image)
+}
 
-    let images_dir = app_data_dir.join("images");
-    std::fs::create_dir_all(&images_dir)
-        .map_err(|e| format!("Failed to create images dir: {}", e))?;
+/// 把字节写进指定目录，文件名取内容 md5（同一份内容只落一次）。
+fn persist_bytes_into(dir: &Path, bytes: &[u8], extension: &str) -> Result<String, String> {
+    let digest = md5::compute(bytes);
+    let filename = format!("{:x}.{}", digest, normalize_extension(extension));
+    let output_path = dir.join(filename);
 
-    Ok(images_dir)
+    if !output_path.exists() {
+        std::fs::write(&output_path, bytes)
+            .map_err(|e| format!("Failed to persist generated media: {}", e))?;
+    }
+
+    Ok(output_path.to_string_lossy().to_string())
 }
 
 fn persist_image_bytes(app: &AppHandle, bytes: &[u8], extension: &str) -> Result<String, String> {
     let images_dir = resolve_images_dir(app)?;
-    let digest = md5::compute(bytes);
-    let filename = format!("{:x}.{}", digest, normalize_extension(extension));
-    let output_path = images_dir.join(filename);
+    persist_bytes_into(&images_dir, bytes, extension)
+}
 
-    if !output_path.exists() {
-        std::fs::write(&output_path, bytes)
-            .map_err(|e| format!("Failed to persist generated image: {}", e))?;
-    }
-
-    Ok(output_path.to_string_lossy().to_string())
+/// 按扩展名把字节写进对应的媒体子目录（图片 `images/`、视频 `videos/`、音频 `audio/`）。
+fn persist_media_bytes(app: &AppHandle, bytes: &[u8], extension: &str) -> Result<String, String> {
+    let kind = media_output::kind_for_extension(extension);
+    let dir = media_output::media_dir(app, kind)?;
+    persist_bytes_into(&dir, bytes, extension)
 }
 
 fn normalize_extension(raw_ext: &str) -> String {
@@ -1277,23 +1314,34 @@ fn encode_png_with_storyboard_metadata(
 }
 
 async fn resolve_source_bytes(source: &str) -> Result<(Vec<u8>, String), String> {
+    resolve_source_bytes_with_budget(source, IMAGE_DOWNLOAD_BUDGET).await
+}
+
+async fn resolve_source_bytes_with_budget(
+    source: &str,
+    budget: DownloadBudget,
+) -> Result<(Vec<u8>, String), String> {
     if source.starts_with("data:") {
         return parse_data_url(source);
     }
 
     if source.starts_with("http://") || source.starts_with("https://") {
         // 生成服务的 CDN 有时会在压缩传输或 HTTP/2 连接复用期间中断响应体。
-        // 图片下载量很小，使用 HTTP/1.1、原始内容编码并作有限重试更可靠。
-        let client = reqwest::Client::builder()
+        // 图片下载量很小，使用 HTTP/1.1、原始内容编码并作有限重试更可靠；
+        // 视频用另一套预算（见 DownloadBudget），这里不能写死。
+        let mut builder = reqwest::Client::builder()
             .no_proxy()
-            .http1_only()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(45))
+            .connect_timeout(budget.connect_timeout)
+            .timeout(budget.request_timeout);
+        if budget.http1_only {
+            builder = builder.http1_only();
+        }
+        let client = builder
             .build()
-            .map_err(|e| format!("Failed to build image download client: {}", e))?;
+            .map_err(|e| format!("Failed to build media download client: {}", e))?;
 
         let mut last_error = String::new();
-        for attempt in 1..=REMOTE_IMAGE_DOWNLOAD_ATTEMPTS {
+        for attempt in 1..=budget.attempts {
             let response = match client
                 .get(source)
                 .header(reqwest::header::ACCEPT_ENCODING, "identity")
@@ -1303,7 +1351,7 @@ async fn resolve_source_bytes(source: &str) -> Result<(Vec<u8>, String), String>
                 Ok(response) => response,
                 Err(error) => {
                     last_error = format!("request error: {}", error);
-                    if attempt < REMOTE_IMAGE_DOWNLOAD_ATTEMPTS {
+                    if attempt < budget.attempts {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             300 * attempt as u64,
                         ))
@@ -1357,7 +1405,7 @@ async fn resolve_source_bytes(source: &str) -> Result<(Vec<u8>, String), String>
                 }
             }
 
-            if attempt < REMOTE_IMAGE_DOWNLOAD_ATTEMPTS {
+            if attempt < budget.attempts {
                 tokio::time::sleep(std::time::Duration::from_millis(
                     300 * attempt as u64,
                 ))
@@ -1366,8 +1414,8 @@ async fn resolve_source_bytes(source: &str) -> Result<(Vec<u8>, String), String>
         }
 
         return Err(format!(
-            "Failed to download remote image after {} attempts: {}",
-            REMOTE_IMAGE_DOWNLOAD_ATTEMPTS, last_error
+            "Failed to download remote media after {} attempts: {}",
+            budget.attempts, last_error
         ));
     }
 
@@ -1434,23 +1482,86 @@ pub async fn embed_storyboard_image_metadata(
 
 #[tauri::command]
 pub async fn persist_image_source(app: AppHandle, source: String) -> Result<String, String> {
+    persist_media_source(app, source, media_output::MediaKind::Image).await
+}
+
+/// 视频生成结果的本地化。
+///
+/// 存在的意义：API 平台回的是自家 CDN 的**临时**链接（阿里云 OSS 上 `reference-assets/`
+/// 这类目录会被定期清理）。不落盘的话，模板同步、跨机分享、离线预览全都押在一条随时会
+/// 失效的外部链接上 —— 链接一断，画布上那个节点就永久坏了，换任何网络都救不回来。
+#[tauri::command]
+pub async fn persist_video_source(app: AppHandle, source: String) -> Result<String, String> {
+    persist_media_source(app, source, media_output::MediaKind::Video).await
+}
+
+/// 类型未知的媒体本地化（存量节点/模板批量修复用）。
+///
+/// 生成链路知道自己拿到的是图片还是视频，所以走 `persist_image_source` /
+/// `persist_video_source` 就能选对预算。但**存量数据**是一堆混在一起的来源：同一个
+/// 节点树上可能同时挂着图片、视频、音频，调用方根本不知道手上这个字符串是什么。
+///
+/// 这里按 URL 后缀先猜一次：像图片的用快速预算（HTTP/1.1 + 短超时，对生成服务的 CDN
+/// 更稳），其余（视频/音频/认不出来）用宽松预算。猜错（后缀像图片、实际是几十 MB 的
+/// 视频）时再用宽松预算补一次，不会因为一次误判就把素材判死。
+///
+/// 落盘目录一律以**下载后的真实扩展名**（响应 content-type 优先）为准，
+/// 不依赖调用方的猜测。
+#[tauri::command]
+pub async fn persist_media_source_auto(app: AppHandle, source: String) -> Result<String, String> {
+    let trimmed = source.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Media source is empty".to_string());
+    }
+
+    let guessed_image = matches!(
+        extension_from_path_like(&trimmed)
+            .map(|extension| media_output::kind_for_extension(&extension)),
+        Some(media_output::MediaKind::Image)
+    );
+
+    let budget = if guessed_image {
+        IMAGE_DOWNLOAD_BUDGET
+    } else {
+        VIDEO_DOWNLOAD_BUDGET
+    };
+
+    match resolve_source_bytes_with_budget(&trimmed, budget).await {
+        Ok((bytes, extension)) => persist_media_bytes(&app, &bytes, &extension),
+        Err(primary_error) if guessed_image => {
+            let (bytes, extension) =
+                resolve_source_bytes_with_budget(&trimmed, VIDEO_DOWNLOAD_BUDGET)
+                    .await
+                    .map_err(|retry_error| {
+                        format!("{primary_error}; 放宽预算重试后仍失败: {retry_error}")
+                    })?;
+            persist_media_bytes(&app, &bytes, &extension)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 下载远端/内联/本机的媒体并落盘，返回本地绝对路径。
+///
+/// 与 `persist_image_source` 是同一条实现，差别只在下载预算（视频比图片大得多，见
+/// `DownloadBudget`）和落到哪个子目录。
+async fn persist_media_source(
+    app: AppHandle,
+    source: String,
+    kind: media_output::MediaKind,
+) -> Result<String, String> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
-        return Err("Image source is empty".to_string());
+        return Err("Media source is empty".to_string());
     }
 
-    let (bytes, extension) = resolve_source_bytes(trimmed).await?;
-    let images_dir = resolve_images_dir(&app)?;
-    let digest = md5::compute(&bytes);
-    let filename = format!("{:x}.{}", digest, extension);
-    let output_path = images_dir.join(filename);
-
-    if !output_path.exists() {
-        std::fs::write(&output_path, bytes)
-            .map_err(|e| format!("Failed to persist image source: {}", e))?;
-    }
-
-    Ok(output_path.to_string_lossy().to_string())
+    let budget = match kind {
+        media_output::MediaKind::Video => VIDEO_DOWNLOAD_BUDGET,
+        _ => IMAGE_DOWNLOAD_BUDGET,
+    };
+    let (bytes, extension) = resolve_source_bytes_with_budget(trimmed, budget).await?;
+    let dir = media_output::media_dir(&app, kind)?;
+    persist_bytes_into(&dir, &bytes, &extension)
 }
 
 #[tauri::command]
@@ -1482,9 +1593,9 @@ pub async fn persist_image_binary(
 /// 供 `video_protocols` 注入的媒体落盘实现。
 ///
 /// AI 层刻意不依赖 tauri, 所以「把平台返回的二进制成片写进本地媒体目录」这一步
-/// 由命令层提供: 与 `persist_image_binary` 写同一个目录(`<app_data>/images`),
-/// 返回的也是本地绝对路径 —— 前端 `resolveImageDisplayUrl` 会对本地路径做
-/// convertFileSrc, 与迁移前前端自己 `persistImageBinary` 的结果形态完全一致。
+/// 由命令层提供: 写进当前生效的落盘位置（见 [`media_output`]），返回本地绝对路径
+/// —— 前端 `resolveImageDisplayUrl` 会对本地路径做 convertFileSrc, 与迁移前前端
+/// 自己 `persistImageBinary` 的结果形态完全一致。
 pub fn make_media_persister(
     app: AppHandle,
 ) -> Box<dyn Fn(&[u8], &str) -> Result<String, String> + Send + Sync> {
@@ -1492,7 +1603,9 @@ pub fn make_media_persister(
         if bytes.is_empty() {
             return Err("媒体字节为空".to_string());
         }
-        persist_image_bytes(&app, bytes, &normalize_extension(extension))
+        // 按扩展名路由：有些视频协议（sub2api / 震剪）会直接把成片字节交到这里，
+        // 以前无条件写进 images/ ，现在 mp4 进 videos/ 、mp3 进 audio/ 。
+        persist_media_bytes(&app, bytes, &normalize_extension(extension))
     })
 }
 

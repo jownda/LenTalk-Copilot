@@ -179,6 +179,76 @@ describe('listVideoModels', () => {
     }
   });
 
+  it('gives 知鸟AI models their documented duration / resolution / aspect tiers', () => {
+    // 2026-10-07 官方文档《模型清单与参数约束》: 逐模型照抄 duration/resolution/aspect,
+    // 按次模型把时长锁成文档那一档(一口价)。旧实现只按模型族粗分 —— grok-imagine 视频族
+    // 落到默认 [5,8,10,15,20,30], 30s 一口价的模型还能选 5~30 秒; 对按秒计费的模型,
+    // 时长档位就是价格档位, 分错等于报价错。
+    const previousCustomApis = useSettingsStore.getState().customApis;
+    const zhiniao = recommendedApis.find((api) => api.id === 'zhiniao');
+    const zhiniaoApi: CustomApiProvider = {
+      id: 'zhiniao',
+      name: '知鸟AI',
+      baseUrl: 'https://cuai.token6688.com',
+      apiKey: '',
+      models: [],
+      videoModels: zhiniao?.videoModels ?? [],
+      audioModels: [],
+      chatModels: [],
+      createdAt: Date.now(),
+      requestMode: 'sync',
+      protocol: 'images',
+      referenceImageField: 'images',
+      referenceImageEncoding: 'url',
+      imageTransport: 'generations_json',
+    };
+
+    useSettingsStore.setState({ customApis: [zhiniaoApi] });
+    try {
+      const models = listVideoModels();
+      const byModel = (suffix: string) => models.find((model) => model.id.endsWith(`/${suffix}`));
+      const durations = (suffix: string) => byModel(suffix)?.durationOptions;
+      const resolutions = (suffix: string) => byModel(suffix)?.resolutions?.map((option) => option.value);
+      const aspects = (suffix: string) => byModel(suffix)?.aspectRatios.map((option) => option.value);
+
+      // 按秒: 时长枚举照抄文档, 也就是价格档位。
+      expect(durations('seedance-2-5')).toEqual([4, 5, 6, 8, 10, 12, 15, 20, 25, 29, 30]);
+      expect(resolutions('seedance-2-5')).toEqual(['480p', '720p', '1080p']);
+      expect(aspects('seedance-2-5')).toEqual(['16:9', '9:16', '21:9', '3:4', '1:1', '4:3']);
+      // Seedance 2.0 官方直连只有 4~15 秒(与 2.5 的 4~30 不同)。
+      expect(durations('seedance-2-0-official')).toEqual([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+      // 按次一口价: 时长锁成唯一一档。
+      expect(durations('seedance-2-5-special')).toEqual([30]);
+      expect(durations('seedance-2-0-special')).toEqual([15]);
+      expect(durations('veo-3.1')).toEqual([8]);
+      expect(durations('veo-3-1-manju-special')).toEqual([8]);
+      expect(durations('wan-3-0-special')).toEqual([5, 10, 15, 20, 25, 30]);
+      expect(durations('omni-flash-1-1')).toEqual([10]);
+
+      // Grok Imagine 视频族: 之前按默认档位兜底, 现在各自成档。
+      expect(durations('grok-imagine-1-5-7tu-special')).toEqual([3, 5, 6, 8, 10, 12, 15]);
+      expect(resolutions('grok-imagine-1-5-7tu-special')).toEqual(['480p', '720p']);
+      expect(durations('grok-imagine-1.5')).toEqual([4, 6, 8, 10, 12, 15, 20, 30]);
+      expect(durations('grok-imagine-video')).toEqual([3, 4, 5, 6, 8, 10, 15, 20, 30]);
+      expect(resolutions('grok-imagine-video-special')).toEqual(['720p']);
+
+      // 文档未声明分辨率的模型 → 直接隐藏分辨率控件(resolutions 不下发)。
+      expect(resolutions('sora-2-official')).toBeUndefined();
+      expect(durations('sora-2-official')).toEqual([4, 8, 12]);
+      expect(resolutions('seedance-video-edit')).toBeUndefined();
+
+      // 画幅/分辨率严格按文档收敛。
+      expect(aspects('kling-3.0-turbo')).toEqual(['16:9', '9:16']);
+      expect(resolutions('kling-3.0-turbo')).toEqual(['720p']);
+      expect(resolutions('viduq3')).toEqual(['540p', '720p', '1080p']);
+      expect(resolutions('minimax-h3')).toEqual(['768p', '2k']);
+      expect(aspects('happyhorse-1-1')).toContain('9:21');
+    } finally {
+      useSettingsStore.setState({ customApis: previousCustomApis });
+    }
+  });
+
   it('applies the RJM profile and restrictions to a manually added platform URL', () => {
     const previousCustomApis = useSettingsStore.getState().customApis;
     const customRjm: CustomApiProvider = {
@@ -217,7 +287,16 @@ describe('listVideoModels', () => {
       baseUrl: 'https://api.7tai.cc/v1',
       apiKey: '',
       models: [],
-      videoModels: ['gz-sd720p', 'tj-sp2.5', 'minimax-h3-pro-768p', 'minimax-h3-pro-2k'],
+      videoModels: [
+        'gz-sd720p',
+        'tj-sp2.5',
+        'minimax-h3-pro-768p',
+        'minimax-h3-pro-2k',
+        'bh2.5-1080p',
+        'db-sd2.5-720p',
+        'hs-sd2.0-720p',
+        'sora-v4-pro',
+      ],
       audioModels: [],
       chatModels: [],
       createdAt: Date.now(),
@@ -235,6 +314,10 @@ describe('listVideoModels', () => {
       const fixed = models.find((model) => model.id.endsWith('/tj-sp2.5'));
       const minimax768 = models.find((model) => model.id.endsWith('/minimax-h3-pro-768p'));
       const minimax2k = models.find((model) => model.id.endsWith('/minimax-h3-pro-2k'));
+      const bh25 = models.find((model) => model.id.endsWith('/bh2.5-1080p'));
+      const dbSd = models.find((model) => model.id.endsWith('/db-sd2.5-720p'));
+      const hsSd = models.find((model) => model.id.endsWith('/hs-sd2.0-720p'));
+      const sora = models.find((model) => model.id.endsWith('/sora-v4-pro'));
 
       expect(standard?.durationOptions).toEqual(Array.from({ length: 12 }, (_, index) => index + 4));
       expect(standard?.resolutions?.map((option) => option.value)).toEqual(['720P']);
@@ -256,11 +339,43 @@ describe('listVideoModels', () => {
       expect(minimax768?.resolutions?.map((option) => option.value)).toEqual(['768P']);
       expect(minimax2k?.resolutions?.map((option) => option.value)).toEqual(['2K']);
       expect(minimax2k?.durationOptions).toEqual(Array.from({ length: 12 }, (_, index) => index + 4));
+      // bh2.5 全系是 4~30 秒逐秒(平台文档口径)。回归钉子: 之前没登记, 落到默认 4~15,
+      // UI 滑杆被夹到 15 秒 —— 用户报的就是「bh2.5-1080p 只能最高 15 秒」。
+      expect(bh25?.durationOptions).toEqual(Array.from({ length: 27 }, (_, index) => index + 4));
+      expect(bh25?.durationOptions[0]).toBe(4);
+      expect(bh25?.durationOptions[bh25.durationOptions.length - 1]).toBe(30);
+      expect(bh25?.resolutions?.map((option) => option.value)).toEqual(['1080P']);
+      expect(bh25?.defaultDuration).toBe(4);
+      expect(bh25?.profileId).toBe('binghuo-video');
+      // 2026-10-13 价格表: minimax-h3-pro-768p 由「0.05 元/秒」改为「2.5 元/条」，
+      // 断言随之从 0.50 变 2.50 —— 计价方式变更必须被测试钉住，否则会静默按秒低估。
       expect(resolveModelPriceDisplay(minimax768!, {
         resolution: '768P',
         extraParams: { duration: 10 },
         language: 'zh-CN',
-      })?.label).toContain('0.50');
+      })?.label).toContain('2.50');
+      // bh2.5-1080p 1.06 元/秒（新登记，此前价格徽标为空）。
+      expect(resolveModelPriceDisplay(bh25!, {
+        resolution: '1080P',
+        extraParams: { duration: 10 },
+        language: 'zh-CN',
+      })?.label).toContain('10.60');
+      // 本次新上架渠道：db-（56 折直连）/ hs-（官方直连）。
+      expect(resolveModelPriceDisplay(dbSd!, {
+        resolution: '720P',
+        extraParams: { duration: 10 },
+        language: 'zh-CN',
+      })?.label).toContain('8.50');
+      expect(resolveModelPriceDisplay(hsSd!, {
+        resolution: '720P',
+        extraParams: { duration: 10 },
+        language: 'zh-CN',
+      })?.label).toContain('5.80');
+      expect(resolveModelPriceDisplay(sora!, {
+        resolution: '720P',
+        extraParams: { duration: 10 },
+        language: 'zh-CN',
+      })?.label).toContain('4.50');
       expect(resolveModelPriceDisplay(minimax2k!, {
         resolution: '2K',
         extraParams: { duration: 10 },

@@ -1,6 +1,7 @@
 use std::fs;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -9,11 +10,22 @@ use tauri::{AppHandle, Manager};
 
 use crate::database;
 
+/// 单个素材搬运失败的原因（不中断整体同步，只在结果里回报）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateAssetFailure {
+    pub source: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TemplateSyncResult {
     pub template_count: usize,
     pub copied_file_count: usize,
+    /// 本次因源失效/网络不可达而没能搬运的素材数。
+    pub failed_file_count: usize,
+    pub failures: Vec<TemplateAssetFailure>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +40,8 @@ pub struct TemplateUploadResult {
     /// 共享盘上原本没有该模板 -> true（新建包目录）；已有 -> false（原地更新）。
     pub created: bool,
     pub copied_file_count: usize,
+    pub failed_file_count: usize,
+    pub failures: Vec<TemplateAssetFailure>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -357,37 +371,138 @@ fn write_template_payload(
         .map_err(|error| format!("写入模板 JSON 失败: {error}"))
 }
 
-async fn download_remote_if_missing(
-    root: &Path,
-    target: &Path,
-    source: &str,
-) -> Result<bool, String> {
+/// 单个素材的网络搬运预算。
+///
+/// 远端素材下载的重试 / 超时参数。
+///
+/// 旧实现直接用 `reqwest::get`：没有超时、没有 UA、没有重试，并且默认会带上系统/环境
+/// 变量代理。三者叠加的后果是——代理不可用时请求根本发不出去，错误只剩下
+/// `error sending request for url (...)` 一句，看不出是代理问题还是源站问题。
+///
+/// 前端 `TEMPLATE_SYNC_TIMEOUT_MS`（5 分钟）是整批同步的兜底。如果按
+/// 「尝试次数 × 通道数 × 单次超时」自由累加，一条卡死的连接就能把前端拖到超时，
+/// 用户只看到「同步超时」，看不出到底是哪个素材坏了。所以每个素材给一个**总预算**，
+/// 到点就记账跳过，继续跑下一个。
+const ASSET_TOTAL_BUDGET: Duration = Duration::from_secs(150);
+const ASSET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const ASSET_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const ASSET_MAX_ATTEMPTS: usize = 2;
+
+/// 「直连优先 → 系统代理兜底」两条通道。
+///
+/// 素材 CDN（阿里云 OSS 等）国内直连即可，且用户系统代理挂掉时直连是唯一活路；
+/// 反过来在必须走代理的网络里，直连失败后还能靠第二条通道救回来。
+fn asset_clients() -> Vec<(reqwest::Client, &'static str)> {
+    let mut clients = Vec::new();
+    if let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(ASSET_CONNECT_TIMEOUT)
+        .timeout(ASSET_REQUEST_TIMEOUT)
+        .build()
+    {
+        clients.push((client, "直连"));
+    }
+    if let Ok(client) = reqwest::Client::builder()
+        .connect_timeout(ASSET_CONNECT_TIMEOUT)
+        .timeout(ASSET_REQUEST_TIMEOUT)
+        .build()
+    {
+        clients.push((client, "系统代理"));
+    }
+    clients
+}
+
+fn describe_remote_status(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        404 | 410 => format!("{status}（素材已在源站被删除或过期清理）"),
+        403 => format!("{status}（源站拒绝访问，可能已过期或需要授权）"),
+        _ => status.to_string(),
+    }
+}
+
+/// 下载远端素材到共享盘；返回 `true` 表示本次真的写入了文件。
+///
+/// 素材源失效属于常态：模板里存的多是第三方 CDN 的临时链接，会被定期清理。所以这里
+/// 只回报失败原因，由调用方跳过该素材继续跑完其余文件，保证一个过期链接不会
+/// 让整批模板同步失败。
+async fn download_remote_to_path(root: &Path, target: &Path, source: &str) -> Result<bool, String> {
     validate_shared_write_path(root, target)?;
     if target.exists() {
         return Ok(false);
     }
-    let response = reqwest::get(source)
-        .await
-        .map_err(|error| format!("下载模板视频失败: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("下载模板视频失败: {error}"))?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("读取模板视频失败: {error}"))?;
-    validate_shared_write_path(root, target)?;
-    fs::write(target, bytes).map(|_| true).map_err(|error| format!("写入模板视频失败: {error}"))
+    let clients = asset_clients();
+    if clients.is_empty() {
+        return Err("无法创建 HTTP 客户端".to_string());
+    }
+    match tokio::time::timeout(
+        ASSET_TOTAL_BUDGET,
+        download_remote_attempts(&clients, root, target, source),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!("下载超时（超过 {} 秒）", ASSET_TOTAL_BUDGET.as_secs())),
+    }
+}
+
+/// 「直连 → 系统代理」两条通道依次试，整轮失败后最多重试 `ASSET_MAX_ATTEMPTS` 轮。
+async fn download_remote_attempts(
+    clients: &[(reqwest::Client, &'static str)],
+    root: &Path,
+    target: &Path,
+    source: &str,
+) -> Result<bool, String> {
+    let mut last_error = String::from("请求未发出");
+    for attempt in 1..=ASSET_MAX_ATTEMPTS {
+        for (client, channel) in clients {
+            let request = client
+                .get(source)
+                .header(reqwest::header::USER_AGENT, "LenTalk/1.0 (template-sync)");
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_client_error() {
+                        // 4xx 是素材自身的问题（已删除/无权限），换通道或重试都没有意义。
+                        return Err(describe_remote_status(status));
+                    }
+                    if !status.is_success() {
+                        last_error = format!("{channel} {status}");
+                        continue;
+                    }
+                    match response.bytes().await {
+                        Ok(bytes) => {
+                            validate_shared_write_path(root, target)?;
+                            fs::write(target, &bytes)
+                                .map_err(|error| format!("写入共享盘失败: {error}"))?;
+                            return Ok(true);
+                        }
+                        Err(error) => last_error = format!("{channel} 读取响应失败: {error}"),
+                    }
+                }
+                Err(error) => last_error = format!("{channel} {error}"),
+            }
+        }
+        if attempt < ASSET_MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(400 * attempt as u64)).await;
+        }
+    }
+    Err(last_error)
 }
 
 /// 把一个模板打包写进共享盘：`template.json` + `videos/` + `media-map.json`。
 ///
 /// 返回本次真正写入的文件数。调用方决定"要不要写"——批量同步跳过共享盘已有的 ID，
 /// 单模板上传由用户显式触发、允许原地更新，所以这里只负责写，不做去重判断。
+struct PackagePushOutcome {
+    copied_file_count: usize,
+    failures: Vec<TemplateAssetFailure>,
+}
+
 async fn push_template_package(
     root: &Path,
     package_dir: &Path,
     record: &TemplateStorageRecord,
-) -> Result<usize, String> {
+) -> Result<PackagePushOutcome, String> {
     let payload: Value = serde_json::from_str(&record.payload_json).map_err(|error| format!("模板 {} 数据无效: {error}", record.id))?;
     let videos_dir = package_dir.join("videos");
     validate_shared_write_path(root, package_dir)?;
@@ -399,15 +514,36 @@ async fn push_template_package(
     let mut manifest = HashMap::<String, String>::new();
     let mut used_names = HashSet::<String>::new();
     let mut copied_file_count = 0;
+    let mut failures = Vec::<TemplateAssetFailure>::new();
     for source in asset_sources(&payload) {
         let file_name = allocate_media_file_name(&source, &mut used_names);
         let target = videos_dir.join(&file_name);
         validate_shared_write_path(root, &target)?;
+        // 单个素材搬不动只记账、不打断整批：模板里的远端链接会被源站定期清理，
+        // 一个过期视频不该让其余模板全部同步失败。
         let copied = if is_remote_source(&source) {
-            download_remote_if_missing(root, &target, &source).await?
+            match download_remote_to_path(root, &target, &source).await {
+                Ok(copied) => copied,
+                Err(reason) => {
+                    failures.push(TemplateAssetFailure { source: source.clone(), reason });
+                    continue;
+                }
+            }
         } else {
-            let source_path = source_to_local_path(&source).ok_or_else(|| format!("模板媒体不可读取: {source}"))?;
-            copy_if_local_newer(&source_path, &target)?
+            let Some(source_path) = source_to_local_path(&source) else {
+                failures.push(TemplateAssetFailure {
+                    source: source.clone(),
+                    reason: "本机文件已不存在".to_string(),
+                });
+                continue;
+            };
+            match copy_if_local_newer(&source_path, &target) {
+                Ok(copied) => copied,
+                Err(reason) => {
+                    failures.push(TemplateAssetFailure { source: source.clone(), reason });
+                    continue;
+                }
+            }
         };
         if copied {
             copied_file_count += 1;
@@ -437,7 +573,7 @@ async fn push_template_package(
         copied_file_count += 1;
     }
 
-    Ok(copied_file_count)
+    Ok(PackagePushOutcome { copied_file_count, failures })
 }
 
 /// 批量同步：共享盘没有的模板才上传，已有同 ID 的完全不碰（不覆盖共享盘现有内容）。
@@ -451,6 +587,7 @@ pub async fn template_sync_to_share(app: AppHandle, shared_root: String) -> Resu
     let existing_shared_ids = shared_template_ids(&templates_root)?;
     let mut template_count = 0;
     let mut copied_file_count = 0;
+    let mut failures = Vec::<TemplateAssetFailure>::new();
 
     for record in &records {
         // 共享盘已有同 ID 模板时完全跳过, 不覆盖共享盘现有内容。
@@ -462,11 +599,18 @@ pub async fn template_sync_to_share(app: AppHandle, shared_root: String) -> Resu
         if package_dir.exists() {
             continue;
         }
-        copied_file_count += push_template_package(&root, &package_dir, record).await?;
+        let outcome = push_template_package(&root, &package_dir, record).await?;
+        copied_file_count += outcome.copied_file_count;
+        failures.extend(outcome.failures);
         template_count += 1;
     }
 
-    Ok(TemplateSyncResult { template_count, copied_file_count })
+    Ok(TemplateSyncResult {
+        template_count,
+        copied_file_count,
+        failed_file_count: failures.len(),
+        failures,
+    })
 }
 
 /// 单模板上传到共享盘（画布内右键菜单触发）。
@@ -490,9 +634,14 @@ pub async fn template_upload_to_share(app: AppHandle, template_id: String, share
     let created = existing_dir.is_none();
     let package_dir = existing_dir
         .unwrap_or_else(|| templates_root.join(format!("{}-{}", safe_name(&record.name), safe_name(&record.id))));
-    let copied_file_count = push_template_package(&root, &package_dir, &record).await?;
+    let outcome = push_template_package(&root, &package_dir, &record).await?;
 
-    Ok(TemplateUploadResult { created, copied_file_count })
+    Ok(TemplateUploadResult {
+        created,
+        copied_file_count: outcome.copied_file_count,
+        failed_file_count: outcome.failures.len(),
+        failures: outcome.failures,
+    })
 }
 
 #[tauri::command]

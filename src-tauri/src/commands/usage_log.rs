@@ -43,6 +43,43 @@ pub struct UsageLogSummary {
     pub month_cost: f64,
 }
 
+/// 按天聚合的用量桶(本地时区)。供「创作历程」热力图与统计卡片使用。
+///
+/// 与 `query_usage_records` 的 1000 条上限不同, 这里是 SQL 侧 GROUP BY 全表聚合,
+/// 不会因为记录数超过上限而漏统计。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDailyBucket {
+    /// 本地时区日期, 形如 `2026-10-08`。
+    pub day: String,
+    pub total: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub image: i64,
+    pub video: i64,
+    pub audio: i64,
+    pub cost: f64,
+    pub image_cost: f64,
+    pub video_cost: f64,
+    pub audio_cost: f64,
+}
+
+/// 按模型聚合的用量(全表), 用于「常用模型」排行。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageModelBreakdown {
+    pub model_id: String,
+    pub model_name: String,
+    pub provider_name: String,
+    pub total: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub image: i64,
+    pub video: i64,
+    pub audio: i64,
+    pub cost: f64,
+}
+
 fn ensure_usage_log_table(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         r#"
@@ -179,6 +216,132 @@ pub fn query_usage_records(
         records.push(record);
     }
     Ok(records)
+}
+
+/// 按天聚合的用量统计(升序), 覆盖全部历史记录。
+///
+/// `kind` 传空/不传时统计全部媒体类型。
+#[tauri::command]
+pub fn query_usage_daily(app: AppHandle, kind: Option<String>) -> Result<Vec<UsageDailyBucket>, String> {
+    let conn = open_connection(&app)?;
+    let kind_filter = kind.unwrap_or_default();
+    let kind_filter = kind_filter.trim().to_string();
+
+    let where_clause = if kind_filter.is_empty() {
+        String::new()
+    } else {
+        "WHERE kind = ?1".to_string()
+    };
+    let params_vec: Vec<rusqlite::types::Value> = if kind_filter.is_empty() {
+        Vec::new()
+    } else {
+        vec![rusqlite::types::Value::Text(kind_filter)]
+    };
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS day,
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'image' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'video' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'audio' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(estimated_cost), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'image' THEN estimated_cost ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'video' THEN estimated_cost ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'audio' THEN estimated_cost ELSE 0 END), 0)
+             FROM usage_log
+             {where_clause}
+             GROUP BY day
+             ORDER BY day ASC"
+        ))
+        .map_err(|e| format!("Failed to prepare daily usage query: {}", e))?;
+
+    let mut rows = stmt
+        .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
+            Ok(UsageDailyBucket {
+                day: row.get(0)?,
+                total: row.get(1)?,
+                succeeded: row.get(2)?,
+                failed: row.get(3)?,
+                image: row.get(4)?,
+                video: row.get(5)?,
+                audio: row.get(6)?,
+                cost: row.get(7)?,
+                image_cost: row.get(8)?,
+                video_cost: row.get(9)?,
+                audio_cost: row.get(10)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query daily usage: {}", e))?;
+
+    let mut buckets = Vec::new();
+    while let Some(bucket) = rows
+        .next()
+        .transpose()
+        .map_err(|e| format!("Failed to read daily usage row: {}", e))?
+    {
+        // 理论上 day 不会为空, 兜底跳过避免脏数据污染前端热力图的日期解析。
+        if !bucket.day.is_empty() {
+            buckets.push(bucket);
+        }
+    }
+    Ok(buckets)
+}
+
+/// 按模型聚合的用量排行(生成次数降序), 覆盖全部历史记录。
+#[tauri::command]
+pub fn query_usage_breakdown(
+    app: AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<UsageModelBreakdown>, String> {
+    let conn = open_connection(&app)?;
+    let safe_limit = limit.unwrap_or(10).clamp(1, 50);
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT model_id, model_name, provider_name,
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'image' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'video' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'audio' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(estimated_cost), 0)
+             FROM usage_log
+             GROUP BY model_id, model_name, provider_name
+             ORDER BY COUNT(*) DESC, model_name ASC
+             LIMIT ?1",
+        )
+        .map_err(|e| format!("Failed to prepare breakdown query: {}", e))?;
+
+    let mut rows = stmt
+        .query_map([safe_limit], |row| {
+            Ok(UsageModelBreakdown {
+                model_id: row.get(0)?,
+                model_name: row.get(1)?,
+                provider_name: row.get(2)?,
+                total: row.get(3)?,
+                succeeded: row.get(4)?,
+                failed: row.get(5)?,
+                image: row.get(6)?,
+                video: row.get(7)?,
+                audio: row.get(8)?,
+                cost: row.get(9)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query model breakdown: {}", e))?;
+
+    let mut items = Vec::new();
+    while let Some(item) = rows
+        .next()
+        .transpose()
+        .map_err(|e| format!("Failed to read breakdown row: {}", e))?
+    {
+        items.push(item);
+    }
+    Ok(items)
 }
 
 /// 用量汇总: 总次数/成功数/失败数/总费用 + 当前自然月次数与费用。

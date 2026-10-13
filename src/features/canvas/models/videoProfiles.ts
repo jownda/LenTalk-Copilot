@@ -205,6 +205,21 @@ function isZhiniaoVideoProvider(provider: string, providerBaseUrl?: string): boo
 }
 
 /**
+ * 炳火(api.7tai.cc)的识别。
+ *
+ * 与知鸟同一个坑: 平台 id 是按**名称**生成的, 推荐卡片连上后是「炳火 API」→
+ * `custom:炳火-api`, 只认字面量 `custom:binghuo` 就会掉到通用 OpenAI Video 档案
+ * (节点页签显示错误的协议名, 参考音频开关等 UI 判定也跟着错)。**Base URL 才是主判据**。
+ *
+ * 必须排在下面的通用 seedance 正则之前: 炳火自己也卖 `seedance-2.0-480p`,
+ * 那段模型名会命中 Seedance 档案(referenceImageTarget / 参考音频支持全不同)。
+ */
+function isBinghuoVideoProvider(provider: string, providerBaseUrl?: string): boolean {
+  const baseUrl = providerBaseUrl?.trim().toLowerCase() ?? '';
+  return provider === 'custom:binghuo' || baseUrl.includes('api.7tai.cc');
+}
+
+/**
  * RunningHub 的识别。
  *
  * 平台 id 可能是用户自建的(按名称生成, 如「RH国际」→ `custom:rh国际`), 所以
@@ -234,7 +249,7 @@ export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: stri
   // 字子动画的识别必须同时看 id 与 Base URL: 用户自建平台时 id 常是中文「字子动画」,
   // 只认 'custom:zizidonghua' 会掉到通用 OpenAI Video 档案(节点页签显示错误的协议)。
   if (isZzdhProvider(provider, providerBaseUrl)) return ZZDH_V8_VIDEO_PROFILE;
-  if (provider === 'custom:binghuo') return BINGHUO_VIDEO_PROFILE;
+  if (isBinghuoVideoProvider(provider, providerBaseUrl)) return BINGHUO_VIDEO_PROFILE;
   if (provider === 'custom:wgspai') return WGSPAI_VIDEO_PROFILE;
   if (/^seedance(?:[-_.]?v?2|2(?:[._-]|$))/.test(model)) return SEEDANCE_V2_PROFILE;
   return OPENAI_VIDEO_PROFILE;

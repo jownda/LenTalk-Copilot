@@ -218,6 +218,18 @@ export interface VideoGenerationRequest {
   lastFrame?: VideoReferenceResource;
 }
 
+/**
+ * 视频任务提交结果。
+ *
+ * `cancelable` 说明这次提交**背后有没有可取消的窗口**: 走后端任务执行器的平台在
+ * 请求真正送达前都能被 `cancelGenerateVideoJob` 拦下来(本地 CLI 进程不行 —— 进程
+ * 已经跑出去了)。节点据此决定交出去之后还要不要留着「取消生成」按钮。
+ */
+export interface SubmittedVideoJob {
+  jobId: string;
+  cancelable: boolean;
+}
+
 export interface AiGateway {
   setApiKey: (provider: string, apiKey: string) => Promise<void>;
   generateImage: (payload: GenerateImagePayload) => Promise<string>;
@@ -228,7 +240,21 @@ export interface AiGateway {
     result?: string | null;
     error?: string | null;
   }>;
-  submitGenerateVideoJob: (payload: GenerateVideoPayload) => Promise<string>;
+  /**
+   * `cancellationNodeId` 是下游结果节点 id —— 提交流水线在几个耗时检查点(素材规整、
+   * 上传换 URL、真正 invoke 之前)用它查「用户是否已点取消」, 是就中止本次提交。
+   */
+  submitGenerateVideoJob: (
+    payload: GenerateVideoPayload,
+    options?: { cancellationNodeId?: string },
+  ) => Promise<SubmittedVideoJob>;
+  /**
+   * 中止一次**尚未送达平台**的视频任务。
+   *
+   * 返回 `"canceled"` 表示确实拦下来了(后端还没把请求发出去); `"too_late"` 表示平台
+   * 已经受理 —— 此时调用方必须关掉取消入口, 不能谎报取消成功。
+   */
+  cancelGenerateVideoJob: (jobId: string) => Promise<"canceled" | "too_late">;
   getGenerateVideoJob: (jobId: string) => Promise<{
     job_id: string;
     status: string;
@@ -236,6 +262,8 @@ export interface AiGateway {
     error: string | null;
     /** 后端声明: 本次 `error` 只是诊断文本(网络抖动 / 5xx), 任务仍在平台侧生成。 */
     transient?: boolean;
+    /** 后端声明: 请求还没送达平台, 此刻取消拦得住(拿到 task_id 后即为 false)。 */
+    cancelable?: boolean;
   }>;
   generateVideo: (payload: GenerateVideoPayload) => Promise<string>;
   /** 视频超分：本地视频先上传换 URL，提交后轮询取片。 */

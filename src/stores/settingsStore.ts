@@ -13,6 +13,11 @@ import {
   findRecommendedApiByBaseUrl,
   resolveNewRecommendedVideoModels,
 } from '@/features/settings/recommendedApis';
+import {
+  DEFAULT_PAJUBEN_QUALITY_TIER,
+  isPajubenQualityTier,
+  type PajubenQualityTier,
+} from '@/features/pajuben/pajubenQuality';
 
 export type UiRadiusPreset = 'compact' | 'default' | 'large';
 export type ThemeTonePreset = 'neutral' | 'warm' | 'cool';
@@ -102,9 +107,16 @@ const IMAGE_MODEL_MARKER =
 /**
  * 出现这些词时一定是视频，图片标记不能翻案
  * （image-to-video、happyhorse-1.0-video-edit、wan2.7-video…）。
+ *
+ * 知鸟 AI 的 Grok Imagine 是**同名双模态**：`grok-imagine-image` 出图，而
+ * `grok-imagine-1.5` / `grok-imagine-1-5-7tu-special` / `grok-imagine-video` /
+ * `grok-imagine-video-special` 出视频。它们都带图片标记 `imagine`，只有名字里
+ * 带 `image` 的那个才是图片 —— 所以用否定前瞻把「grok-imagine- 后面不是 image」
+ * 的一律钉死为视频。少了这条，这些视频模型会被 `imagine` 抢先判成图片/对话模型，
+ * 视频节点下拉里根本选不到（`grok-imagine-1-5-7tu-special` 就是这么漏的）。
  */
 const HARD_VIDEO_MARKER =
-  /video|[-_]to[-_]video|(?:^|[-_.])(?:t2v|i2v|r2v|kf2v|flf2v|videoedit)(?:[-_.]|\d|$)/i;
+  /video|[-_]to[-_]video|grok-imagine-(?!image)|(?:^|[-_.])(?:t2v|i2v|r2v|kf2v|flf2v|videoedit)(?:[-_.]|\d|$)/i;
 
 /** 视频模型必须与图片模型分开注册，避免通用模型拉取结果污染图片节点。 */
 export function isVideoGenerationModelName(model: string): boolean {
@@ -156,7 +168,9 @@ export function isVideoGenerationModelName(model: string): boolean {
     // 也没有 t2v（happyhorse-1-0、omni-flash-1-1），只能显式列出。
     /(?:^|[-_.])happyhorse(?:[-_.]|\d|$)/,
     /(?:^|[-_.])omni-flash(?:[-_.]|\d|$)/,
-    /grok-imagine-video/,
+    // Grok Imagine 视频系(grok-imagine-1.5 / -1-5-7tu-special / -video / -video-special);
+    // 带 image 的是图片, 已在 IMAGE_MODEL_MARKER 那边拦下, 这里用否定前瞻排除。
+    /grok-imagine-(?!image)/,
     /xb-sora/,
     /me-kuaile/,
   ].some((marker) => marker.test(value));
@@ -378,7 +392,13 @@ interface SettingsState {
    * 记住它是为了「关掉页面再打开不用重新选模型」。
    */
   pajubenModelKey: string | null;
+  /**
+   * 「扒视频」画质档位(fast / standard / fine)。
+   * 决定 fps、画面清晰度与每集帧数上限；快速模式与工作台共用，默认 standard。
+   */
+  pajubenQualityTier: PajubenQualityTier;
   setPajubenModelKey: (key: string | null) => void;
+  setPajubenQualityTier: (tier: PajubenQualityTier) => void;
   setProviderApiKey: (providerId: string, key: string) => void;
   setJimengCliExecutable: (executable: string) => void;
   setJimengCliAutoInstallStatus: (status: JimengCliAutoInstallStatus) => void;
@@ -902,8 +922,12 @@ export const useSettingsStore = create<SettingsState>()(
       customModelPrices: {},
       usableModelIds: [],
       pajubenModelKey: null,
+      pajubenQualityTier: DEFAULT_PAJUBEN_QUALITY_TIER,
       setPajubenModelKey: (key) =>
         set({ pajubenModelKey: normalizeOptionalSettingString(key) }),
+      // 持久化里可能残留脏字符串，非法值一律回落默认档。
+      setPajubenQualityTier: (tier) =>
+        set({ pajubenQualityTier: isPajubenQualityTier(tier) ? tier : DEFAULT_PAJUBEN_QUALITY_TIER }),
       setProviderApiKey: (providerId, key) =>
         set((state) => ({
           apiKeys: {

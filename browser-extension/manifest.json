@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "LenTalk 素材捕手",
-  "version": "1.5.4",
+  "version": "1.6.2",
   "description": "把网页上的图片、视频和 HLS 流一键存进素材库，可直接指定分类。以页面身份抓取，登录可见与防盗链资源同样能取到。",
   "permissions": ["activeTab", "scripting", "storage", "contextMenus"],
-  "host_permissions": ["http://127.0.0.1/*"],
+  "host_permissions": ["http://127.0.0.1:*/*", "*://*/*"],
   "background": {
     "service_worker": "background.js"
   },

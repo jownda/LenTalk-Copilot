@@ -47,6 +47,20 @@ function jsonResponse(payload, status = 200) {
 }
 
 /**
+ * 造一个「远端媒体」响应，供 `importStreamed` 的后台直取使用。
+ * 不带 `body`（浏览器不支持流式请求体时会走整块上传的兜底），但要能给 blob。
+ */
+function mediaResponse(bytes) {
+  return {
+    ok: true,
+    status: 200,
+    headers: { get: (name) => (String(name).toLowerCase() === 'content-length' ? String(bytes) : null) },
+    body: null,
+    blob: async () => new Blob([new Uint8Array(bytes)]),
+  };
+}
+
+/**
  * 造一个假的扩展环境。只实现被测代码真正用到的那几个 API。
  *
  * 两个刻意的设定，都来自真实踩过的坑：
@@ -65,10 +79,20 @@ function makeHarness({
   streamsThrows = false,
   /** 让 /hls 返回 404，模拟"应用还是老版本、没这个接口"。 */
   hlsStatus = 200,
+  /** 远端媒体（`fetch(item.url)`）的响应 `{ url, response }`；不给就走不到「后台直取」。 */
+  remoteMedia = null,
+  /** 远端媒体地址；设成某个 URL 则该地址的 fetch 直接抛 `TypeError('Failed to fetch')`。 */
+  remoteThrows = '',
+  /** `chrome.permissions.contains` 的返回值：主机权限（全站远端访问）是否真的授予。 */
+  remoteAccessGranted = true,
+  /** 让上传到本机桥（`/assets?`）的那次 fetch 抛 `Failed to fetch`，用来测「下载成了但入库失败」。 */
+  uploadThrows = false,
 } = {}) {
   const menus = new Map();
   const store = { ...stored };
   const fetches = [];
+  /** 每次 fetch 的完整入参，用来断言 referrer 之类的选项有没有真的传下去。 */
+  const fetchInits = [];
   /** HLS 走的是 `/hls`（JSON 请求体），单独记下来方便断言递了哪些字段。 */
   const hlsRequests = [];
   const badge = { text: '', title: '' };
@@ -97,6 +121,11 @@ function makeHarness({
 
   const chrome = {
     contextMenus,
+    permissions: {
+      // 后台 fetch 被拦成 Failed to fetch 的两种成因（防盗链 vs 主机权限没给）现象一模一样，
+      // 所以失败信息里要把这一项的真实状态带出来。这里按用例可切换。
+      contains: async () => remoteAccessGranted,
+    },
     runtime: {
       lastError: undefined,
       onInstalled: { addListener: subscribe('installed') },
@@ -139,9 +168,11 @@ function makeHarness({
   const fetchMock = async (url, init) => {
     const target = String(url);
     fetches.push(target);
+    fetchInits.push({ url: target, init });
     if (target.endsWith('/ping')) return jsonResponse({ ok: true, app: 'LenTalk', version: '1.2.0' });
     if (target.endsWith('/library')) return jsonResponse(LIBRARY);
     if (target.includes('/assets?')) {
+      if (uploadThrows) throw new TypeError('Failed to fetch');
       return jsonResponse({ ok: true, bytes: 2, assetId: 'asset-1', name: '火车头' });
     }
     if (target.endsWith('/hls')) {
@@ -149,6 +180,13 @@ function makeHarness({
       if (hlsStatus !== 200) return jsonResponse({ ok: false, error: '未知接口' }, hlsStatus);
       return jsonResponse({ ok: true, bytes: 4096, assetId: 'asset-hls', name: 'HLS 片子' });
     }
+    // 「后台直取」那条路：由 service worker 去下载远端媒体。
+    // 跨域被 CORS 拦下时浏览器抛出的就是一句 `TypeError('Failed to fetch')` ——
+    // 正是用户看到的那条裸错误，这里按需复现。
+    if (remoteThrows && target === remoteThrows) {
+      throw new TypeError('Failed to fetch');
+    }
+    if (remoteMedia && target === remoteMedia.url) return remoteMedia.response;
     throw new Error(`自检里没预料到的请求：${target}`);
   };
 
@@ -169,7 +207,7 @@ function makeHarness({
   vm.runInContext(readFileSync(join(here, 'background.js'), 'utf8'), sandbox, { filename: 'background.js' });
 
   // clicked 保留一个别名，下面的用例直接用它。
-  return { sandbox, menus, listeners, clicked: listeners.clicked, store, fetches, hlsRequests, badge };
+  return { sandbox, menus, listeners, clicked: listeners.clicked, store, fetches, fetchInits, hlsRequests, badge };
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -507,6 +545,187 @@ async function main() {
     );
     await waitFor(() => fine.badge.text === '✓');
     check('普通 mp4（带查询串）照常入库', fine.badge.text === '✓', fine.badge.title);
+  }
+
+  // ── 11. 大文件（超过页面通道上限）必须回落后台直取 ────────────────────
+  // 用户实际报的就是这一条：视频超过 16 MB 时页面通道超限（base64 穿过注入边界太贵），
+  // 只能由 service worker 去下载。以前这个分支的异常是**裸抛**的 —— popup 里就只剩
+  // 「1 项没能入库：Failed to fetch」，既看不出是体积问题、也看不出下一步做什么。
+  //
+  // ⚠️ 2026-10-13 的关键修正：后台直取**不能**再走「边下边传」。
+  // 流式转发（`duplex: 'half'` + chunked）会让本机桥卡在等第一个分块上，直到 60 秒读超时
+  // （`media_bridge.rs` 的 `IO_TIMEOUT`）掐断连接；浏览器侧只看到 `Failed to fetch`，
+  // 桥侧同时留下 `[media-bridge] request failed: 读取请求失败: … (os error 10060)`。
+  // 成因是冷 CDN 回源慢、而分块必须等源站首字节 —— 「源站慢」被转嫁成了「桥读超时」。
+  // 所以下面既有「能入库」的正例，也有**钉死不许改回流式**的负例。
+  {
+    const bigUrl = 'https://cdn.test/big.mp4';
+    const pageTab = { id: 6, url: 'https://www.kuaishou.com/short-video/abc123' };
+    /** 「响应头拿到了、body 行为可控」的远端响应，用来复现下载阶段的各种失败。 */
+    const remoteResponse = (blob) => ({
+      ok: true,
+      status: 200,
+      headers: { get: (name) => (String(name).toLowerCase() === 'content-length' ? '2048' : null) },
+      body: null,
+      blob,
+    });
+
+    // (a) 正常情况：页面通道超限 → 整块下载 → 整块上传，成功入库。
+    const fallback = makeHarness({
+      inPageResult: { ok: false, tooLarge: true },
+      remoteMedia: { url: bigUrl, response: mediaResponse(2048) },
+    });
+    await fallback.sandbox.buildContextMenus({ force: true });
+    fallback.listeners.clicked[0]({ menuItemId: 'lentalk-save-quick', mediaType: 'video', srcUrl: bigUrl }, pageTab);
+    await waitFor(() => fallback.badge.text === '✓' || fallback.badge.text === '!');
+    check(
+      '超过 16MB 的视频回落后台直取后能入库',
+      fallback.badge.text === '✓',
+      `${fallback.badge.text} ${fallback.badge.title}`
+    );
+    check(
+      '确实走了「先下载后上传」而不是页面通道',
+      fallback.fetches.includes(bigUrl) && fallback.fetches.some((url) => url.includes('/assets?')),
+      JSON.stringify(fallback.fetches)
+    );
+    // 核心钉子 ①：源站**只请求一次**。旧实现失败时会在流式失败后再整块重取一次，
+    // 那既慢、又容易踩第二次被 CDN 拒 / 限流；换成一次下载后必须保持只请求一次。
+    check(
+      '只向源站请求一次（不再有「流式失败后整块重取」的第二跳）',
+      fallback.fetches.filter((url) => url === bigUrl).length === 1,
+      JSON.stringify(fallback.fetches)
+    );
+    // 核心钉子 ②：上传体必须是整块 Blob（有确定长度），且请求**不带 duplex**。
+    // 这条直接锁死「不要再改回边下边传」—— 那是 2026-10-13 那个 bug 的根源。
+    const uploadInit = fallback.fetchInits.find((call) => call.url.includes('/assets?'));
+    const uploadBody = uploadInit && uploadInit.init && uploadInit.init.body;
+    check(
+      '上传用的是整块 Blob（不是流式 body）',
+      Boolean(uploadBody) &&
+        typeof uploadBody.getReader !== 'function' &&
+        typeof uploadBody.size === 'number',
+      uploadBody ? `size=${uploadBody.size}` : '(没有上传体)'
+    );
+    check(
+      '上传请求不带 duplex（改回流式就会在这里挂）',
+      Boolean(uploadInit) && uploadInit.init.duplex === undefined,
+      JSON.stringify(uploadInit && uploadInit.init)
+    );
+    // 钉子：**不要**再试着在这里伪造 Referer。实测（Chrome 155）跨源 referrer 会被浏览器
+    // 直接丢弃，`{ referrer, referrerPolicy }` 写了等于没写，只会造成「已修复」的错觉。
+    // 真要改写 Referer 得上 declarativeNetRequest 的 modifyHeaders，且同样依赖主机权限。
+    const downloadInit = fallback.fetchInits.find((call) => call.url === bigUrl);
+    check(
+      '下载保持裸 fetch（跨源 referrer 会被丢弃，不是修复点）',
+      Boolean(downloadInit) && downloadInit.init === undefined,
+      JSON.stringify(downloadInit && downloadInit.init)
+    );
+
+    // (b) 后台直取被拦（防盗链 / 网络不通）→ 提示必须说清「哪一步」「体积」「下一步」。
+    const blocked = makeHarness({
+      inPageResult: { ok: false, tooLarge: true },
+      remoteThrows: bigUrl,
+    });
+    await blocked.sandbox.buildContextMenus({ force: true });
+    blocked.listeners.clicked[0]({ menuItemId: 'lentalk-save-quick', mediaType: 'video', srcUrl: bigUrl }, pageTab);
+    await waitFor(() => blocked.badge.text === '!');
+    const blockedTitle = blocked.badge.title || '';
+    check('后台直取被拦时反馈是失败', blocked.badge.text === '!', blockedTitle);
+    check('失败提示说明了体积原因（不再没头没尾）', blockedTitle.includes('16 MB'), blockedTitle);
+    check(
+      '失败提示带上了后台那一步的真实原因',
+      blockedTitle.includes('后台直取也失败') && blockedTitle.includes('Failed to fetch'),
+      blockedTitle
+    );
+    check('失败提示指明了具体是哪一步挂的', blockedTitle.includes('拉取源文件失败'), blockedTitle);
+    check('失败提示带上了主机权限的真实状态', blockedTitle.includes('远端访问权限：已授予'), blockedTitle);
+    // 回归钉子：以前这条路是裸抛的，标题里就只剩一句 Failed to fetch。
+    check(
+      '不再出现「只有一句 Failed to fetch」的裸提示',
+      !/^LenTalk 素材捕手 — 入库失败：Failed to fetch$/.test(blockedTitle),
+      blockedTitle
+    );
+    check('失败时不会留下半截入库请求', !blocked.fetches.some((url) => url.includes('/assets?')));
+
+    // (c) 主机权限没真的授予 —— 现象与防盗链完全一样，所以必须能在提示里区分出来。
+    const noPerm = makeHarness({
+      inPageResult: { ok: false, tooLarge: true },
+      remoteThrows: bigUrl,
+      remoteAccessGranted: false,
+    });
+    await noPerm.sandbox.buildContextMenus({ force: true });
+    noPerm.listeners.clicked[0]({ menuItemId: 'lentalk-save-quick', mediaType: 'video', srcUrl: bigUrl }, pageTab);
+    await waitFor(() => noPerm.badge.text === '!');
+    check(
+      '主机权限未授予时提示会直接点出来（含修复指引）',
+      (noPerm.badge.title || '').includes('远端访问权限：未授予') &&
+        (noPerm.badge.title || '').includes('在所有网站上'),
+      noPerm.badge.title
+    );
+
+    // (d) 页面地址缺失（老版本 popup 传来的条目 / 拿不到 tab）时也不能崩，照常入库。
+    const noPage = makeHarness({
+      inPageResult: { ok: false, tooLarge: true },
+      remoteMedia: { url: bigUrl, response: mediaResponse(2048) },
+    });
+    await noPage.sandbox.buildContextMenus({ force: true });
+    noPage.listeners.clicked[0]({ menuItemId: 'lentalk-save-quick', mediaType: 'video', srcUrl: bigUrl }, { id: 6 });
+    await waitFor(() => noPage.badge.text === '✓' || noPage.badge.text === '!');
+    check('拿不到页面地址时大文件照常入库（不依赖 pageUrl）', noPage.badge.text === '✓', noPage.badge.title);
+
+    // (e) 响应头拿到了、但读 body 时断了 —— 这正是「冷 CDN 回源太慢」的真实形态：
+    //     旧实现会让本机桥干等 60 秒读超时（os error 10060），而浏览器只看到一句
+    //     `Failed to fetch`，两边都定位不到这一层。新实现把等待留在浏览器侧，
+    //     并且**说得出等了多少秒**。
+    const bodyBroken = makeHarness({
+      inPageResult: { ok: false, tooLarge: true },
+      remoteMedia: {
+        url: bigUrl,
+        response: remoteResponse(async () => {
+          throw new TypeError('Failed to fetch');
+        }),
+      },
+    });
+    await bodyBroken.sandbox.buildContextMenus({ force: true });
+    bodyBroken.listeners.clicked[0]({ menuItemId: 'lentalk-save-quick', mediaType: 'video', srcUrl: bigUrl }, pageTab);
+    await waitFor(() => bodyBroken.badge.text === '!');
+    check(
+      '下载中途断了能指明是「读内容」这一步、并报出已等待时长',
+      (bodyBroken.badge.title || '').includes('下载源文件内容失败') &&
+        (bodyBroken.badge.title || '').includes('已等待'),
+      bodyBroken.badge.title
+    );
+
+    // (f) 下载成了、但入库那一步被拦 → 必须报出「已下载多少 MB」，好与「根本没下到」区分开。
+    //     以前这两种情况的提示完全一样（都是一句 Failed to fetch），只能靠猜。
+    const uploadFailed = makeHarness({
+      inPageResult: { ok: false, tooLarge: true },
+      remoteMedia: { url: bigUrl, response: mediaResponse(2048) },
+      uploadThrows: true,
+    });
+    await uploadFailed.sandbox.buildContextMenus({ force: true });
+    uploadFailed.listeners.clicked[0]({ menuItemId: 'lentalk-save-quick', mediaType: 'video', srcUrl: bigUrl }, pageTab);
+    await waitFor(() => uploadFailed.badge.text === '!');
+    check(
+      '下载成了但入库失败时，提示会报出已下载的体积',
+      (uploadFailed.badge.title || '').includes('已下载') &&
+        (uploadFailed.badge.title || '').includes('但入库失败'),
+      uploadFailed.badge.title
+    );
+
+    // (g) 拿到 200 但一个字节都没有（签名 URL 失效的典型形态）→ 单列一条，别让它伪装成别的失败。
+    const emptyBody = makeHarness({
+      inPageResult: { ok: false, tooLarge: true },
+      remoteMedia: { url: bigUrl, response: remoteResponse(async () => new Blob([])) },
+    });
+    await emptyBody.sandbox.buildContextMenus({ force: true });
+    emptyBody.listeners.clicked[0]({ menuItemId: 'lentalk-save-quick', mediaType: 'video', srcUrl: bigUrl }, pageTab);
+    await waitFor(() => emptyBody.badge.text === '!');
+    check(
+      '下载到 0 字节时会单独说明（不混进网络失败）',
+      (emptyBody.badge.title || '').includes('0 字节'),
+      emptyBody.badge.title
+    );
   }
 
   console.log(`\n通过 ${PASS.length} 项，失败 ${FAIL.length} 项`);

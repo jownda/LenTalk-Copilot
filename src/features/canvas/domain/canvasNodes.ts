@@ -423,6 +423,15 @@ export interface AudioNodeData extends NodeDisplayData {
   generationProviderId?: string | null;
   generationModel?: string | null;
   providerBaseUrl?: string | null;
+  /** 后端任务 id。**没有**它表示请求还没交出去(前端准备/上传阶段), 此时可取消。 */
+  generationJobId?: string | null;
+  /**
+   * 用户在「请求送达平台之前」主动取消了这次生成。
+   *
+   * 与 `generationError` 是两回事: 取消是用户意图, 不是故障, 节点上显示中性提示而不是
+   * 红色报错, 也不该弹错误框。
+   */
+  generationCanceled?: boolean;
   /** AI 生成完成后保留结果, 撤销时不会恢复为生成中或删除结果。 */
   generationResultProtected?: boolean;
   generationRequest?: PersistedGenerationRequest;
@@ -653,6 +662,16 @@ export type NodeToolType = (typeof NODE_TOOL_TYPES)[keyof typeof NODE_TOOL_TYPES
 export interface ActiveToolDialog {
   nodeId: string;
   toolType: NodeToolType;
+}
+
+/**
+ * 文本节点的「AI 修改文本 / 查找替换」弹窗状态。
+ * 提升到画布级是为了让它不依附于选中节点：其他节点（如自动生成的 AI 视频节点）
+ * 生成完成时会把选中切到新节点，工具栏随之改渲染新节点，弹窗就会被动消失。
+ */
+export interface TextEditDialogState {
+  nodeId: string;
+  mode: 'ai' | 'find';
 }
 
 export function isUploadNode(

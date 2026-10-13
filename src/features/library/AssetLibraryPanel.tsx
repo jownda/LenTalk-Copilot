@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import {
   AudioLines,
+  Boxes,
   ChevronDown,
   ChevronRight,
   Download,
@@ -65,6 +66,9 @@ export interface CinematicAssetLibraryBridge {
   canvasAudioSources: CinematicCanvasAudioSource[];
 }
 
+/** 面板内的三个分区(素材库 tab 的取值)。 */
+export type AssetLibrarySection = "assets" | "prompts" | "cinematic";
+
 export interface AssetLibraryPanelProps {
   open: boolean;
   onClose: () => void;
@@ -74,6 +78,18 @@ export interface AssetLibraryPanelProps {
   /** 画布入口传入,提示词「应用」回调(素材库内嵌提示词 tab 时用) */
   onApplyPrompt?: (template: PromptTemplate, mode: "positive" | "full") => void;
   cinematicAssetLibrary?: CinematicAssetLibraryBridge | null;
+  /**
+   * 打开面板时定位到的分区(默认 assets)。
+   * 面板是常驻挂载靠 transform 滑入滑出的, 所以每次 open 都会重新落到这里指定的分区 ——
+   * 「素材库」「资产库」两个工具栏入口共用同一个面板实例, 靠它区分进哪一页。
+   */
+  initialSection?: AssetLibrarySection;
+  /**
+   * 不渲染「资产库」tab。
+   * 画布把资产库拆成了工具栏里的独立入口(素材库右边), 那边点进来就是资产库本身,
+   * 再留一个 tab 反而是两条并行的入口。
+   */
+  hideCinematicTab?: boolean;
 }
 
 const PANEL_WIDTH = 360;
@@ -161,7 +177,7 @@ function MediaPreview({ asset }: { asset: LibraryAsset }) {
 }
 
 export const AssetLibraryPanel = memo(
-  ({ open, onClose, fullscreen = false, anchorTop, onApplyPrompt, cinematicAssetLibrary }: AssetLibraryPanelProps) => {
+  ({ open, onClose, fullscreen = false, anchorTop, onApplyPrompt, cinematicAssetLibrary, initialSection = "assets", hideCinematicTab = false }: AssetLibraryPanelProps) => {
     const { t } = useTranslation();
     const hydrate = useAssetLibraryStore((state) => state.hydrate);
     const isHydrated = useAssetLibraryStore((state) => state.isHydrated);
@@ -214,7 +230,7 @@ export const AssetLibraryPanel = memo(
     const [backupError, setBackupError] = useState<string | null>(null);
     const [backupNotice, setBackupNotice] = useState<string | null>(null);
     const backupInputRef = useRef<HTMLInputElement>(null);
-    const [activeSection, setActiveSection] = useState<"assets" | "prompts" | "cinematic">("assets");
+    const [activeSection, setActiveSection] = useState<AssetLibrarySection>(initialSection);
     const [showCategoryManager, setShowCategoryManager] = useState(false);
     /** 缩略图卡片尺寸(px, 由滑杆调节) */
     const [thumbSize, setThumbSize] = useState(132);
@@ -249,6 +265,13 @@ export const AssetLibraryPanel = memo(
         setPanelVisible(false);
       };
     }, [open]);
+
+    // 面板常驻挂载, 分区不能只在初始化时读一次: 每次打开(或调用方改了目标分区)都归位到
+    // initialSection,「素材库 → 图片素材」与「资产库」两个入口才会各自进对应页。
+    useEffect(() => {
+      if (!open) return;
+      setActiveSection(initialSection);
+    }, [open, initialSection]);
 
     useEffect(() => {
       void hydrate();
@@ -716,6 +739,9 @@ export const AssetLibraryPanel = memo(
       </div>
     );
 
+    // 画布把资产库拆成独立入口时: 资产库分区单独成页(标题换成「资产库」, 不显示 tab 切换)。
+    const cinematicStandalone = hideCinematicTab && activeSection === "cinematic";
+
     const cinematicAssetGrid = cinematicProps ? (
       // cinematic-studio-app class 提供工作室主题 CSS 变量(--surface/--text 等),
       // 侧边栏内嵌时同样需要;组件内部新增/编辑/AI 填写/表演母版全部可用。
@@ -1057,34 +1083,42 @@ export const AssetLibraryPanel = memo(
           >
             <header className="flex items-center justify-between border-b border-border-dark px-5 py-3">
               <div className="flex items-center gap-2">
-                <Library className="h-5 w-5 text-accent" />
-                <h2 className="text-base font-semibold text-text-dark">{t("assetLibrary.title", "素材库")}</h2>
-                <span className="text-xs text-text-muted">{visibleAssets.length}</span>
+                {cinematicStandalone
+                  ? <Boxes className="h-5 w-5 text-accent" />
+                  : <Library className="h-5 w-5 text-accent" />}
+                <h2 className="text-base font-semibold text-text-dark">
+                  {cinematicStandalone ? t("assetLibrary.cinematicTab", "资产库") : t("assetLibrary.title", "素材库")}
+                </h2>
+                {!cinematicStandalone && <span className="text-xs text-text-muted">{visibleAssets.length}</span>}
               </div>
-              {/* 图片素材 / 提示词库 tab */}
-              <div className="flex items-center gap-1 rounded-lg border border-border-dark bg-bg-dark/50 p-0.5">
-                <button
-                  type="button"
-                  className={`rounded-md px-3 py-1 text-xs transition-colors ${activeSection === "assets" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
-                  onClick={() => setActiveSection("assets")}
-                >
-                  {t("assetLibrary.assetsTab", "图片素材")}
-                </button>
-                <button
-                  type="button"
-                  className={`rounded-md px-3 py-1 text-xs transition-colors ${activeSection === "prompts" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
-                  onClick={() => setActiveSection("prompts")}
-                >
-                  {t("assetLibrary.promptsTab", "提示词库")}
-                </button>
-                <button
-                  type="button"
-                  className={`rounded-md px-3 py-1 text-xs transition-colors ${activeSection === "cinematic" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
-                  onClick={() => setActiveSection("cinematic")}
-                >
-                  {t("assetLibrary.cinematicTab", "资产库")}
-                </button>
-              </div>
+              {/* 图片素材 / 提示词库 tab(资产库独立成页时整组不渲染) */}
+              {!cinematicStandalone && (
+                <div className="flex items-center gap-1 rounded-lg border border-border-dark bg-bg-dark/50 p-0.5">
+                  <button
+                    type="button"
+                    className={`rounded-md px-3 py-1 text-xs transition-colors ${activeSection === "assets" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
+                    onClick={() => setActiveSection("assets")}
+                  >
+                    {t("assetLibrary.assetsTab", "图片素材")}
+                  </button>
+                  <button
+                    type="button"
+                    className={`rounded-md px-3 py-1 text-xs transition-colors ${activeSection === "prompts" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
+                    onClick={() => setActiveSection("prompts")}
+                  >
+                    {t("assetLibrary.promptsTab", "提示词库")}
+                  </button>
+                  {!hideCinematicTab && (
+                    <button
+                      type="button"
+                      className={`rounded-md px-3 py-1 text-xs transition-colors ${activeSection === "cinematic" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
+                      onClick={() => setActiveSection("cinematic")}
+                    >
+                      {t("assetLibrary.cinematicTab", "资产库")}
+                    </button>
+                  )}
+                </div>
+              )}
               <div className="flex items-center gap-1">
                 {backupControls}
                 <UiGhostIconButton onClick={onClose} title={t("common.close", "关闭")}>
@@ -1147,33 +1181,41 @@ export const AssetLibraryPanel = memo(
         >
           <header className="flex items-center justify-between border-b border-border-dark px-4 py-3">
             <div className="flex items-center gap-2">
-              <Library className="h-4 w-4 text-text-muted" />
-              <h2 className="text-sm font-medium text-text-dark">{t("assetLibrary.title", "素材库")}</h2>
+              {cinematicStandalone
+                ? <Boxes className="h-4 w-4 text-text-muted" />
+                : <Library className="h-4 w-4 text-text-muted" />}
+              <h2 className="text-sm font-medium text-text-dark">
+                {cinematicStandalone ? t("assetLibrary.cinematicTab", "资产库") : t("assetLibrary.title", "素材库")}
+              </h2>
             </div>
             <div className="flex items-center gap-2">
-              <div className="flex items-center gap-0.5 rounded-lg border border-border-dark bg-bg-dark/50 p-0.5">
-                <button
-                  type="button"
-                  className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === "assets" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
-                  onClick={() => setActiveSection("assets")}
-                >
-                  {t("assetLibrary.assetsTab", "图片素材")}
-                </button>
-                <button
-                  type="button"
-                  className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === "prompts" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
-                  onClick={() => setActiveSection("prompts")}
-                >
-                  {t("assetLibrary.promptsTab", "提示词库")}
-                </button>
-                <button
-                  type="button"
-                  className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === "cinematic" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
-                  onClick={() => setActiveSection("cinematic")}
-                >
-                  {t("assetLibrary.cinematicTab", "资产库")}
-                </button>
-              </div>
+              {!cinematicStandalone && (
+                <div className="flex items-center gap-0.5 rounded-lg border border-border-dark bg-bg-dark/50 p-0.5">
+                  <button
+                    type="button"
+                    className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === "assets" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
+                    onClick={() => setActiveSection("assets")}
+                  >
+                    {t("assetLibrary.assetsTab", "图片素材")}
+                  </button>
+                  <button
+                    type="button"
+                    className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === "prompts" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
+                    onClick={() => setActiveSection("prompts")}
+                  >
+                    {t("assetLibrary.promptsTab", "提示词库")}
+                  </button>
+                  {!hideCinematicTab && (
+                    <button
+                      type="button"
+                      className={`rounded-md px-2.5 py-1 text-[11px] transition-colors ${activeSection === "cinematic" ? "bg-accent/20 text-text-dark" : "text-text-muted hover:text-text-dark"}`}
+                      onClick={() => setActiveSection("cinematic")}
+                    >
+                      {t("assetLibrary.cinematicTab", "资产库")}
+                    </button>
+                  )}
+                </div>
+              )}
               {backupControls}
               <UiGhostIconButton onClick={onClose} title={t("common.close", "关闭")}>
                 <X className="h-4 w-4" />

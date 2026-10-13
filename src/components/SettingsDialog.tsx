@@ -13,6 +13,14 @@ import {
 } from '@/commands/balance';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import {
+  chooseMediaOutputDir,
+  cleanupUnreferencedMedia,
+  loadMediaOutputDirSetting,
+  resolveDefaultMediaOutputDir,
+  saveMediaOutputDir,
+} from '@/commands/mediaOutput';
+import { runExistingMediaLocalization } from '@/features/mediaMaintenance/localizeMedia';
+import {
   findRecommendedApiByBaseUrl,
   listVisibleRecommendedApis,
   visibleRecommendedApiIds,
@@ -107,6 +115,21 @@ function SettingsCheckboxCard({
       </div>
     </div>
   );
+}
+
+/** 把字节数写成人看的体积（清理结果里用）。 */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  // 到了 MB 以上保留一位小数，否则大数字看着没概念。
+  const digits = unitIndex >= 2 ? 1 : 0;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
 export function SettingsDialog({
@@ -260,6 +283,16 @@ export function SettingsDialog({
     autoCheckAppUpdateOnLaunch
   );
   const [localEnableUpdateDialog, setLocalEnableUpdateDialog] = useState(enableUpdateDialog);
+  // 生成媒体的落盘位置。空串 = 用默认位置（<系统下载文件夹>/LenTalk）。
+  // 它存在 app_settings 表里而不是 settingsStore：Rust 每次落盘都要读它，
+  // 放表里就不必把路径一路当参数传进每个落盘调用。
+  const [localMediaOutputDir, setLocalMediaOutputDir] = useState('');
+  const [defaultMediaOutputDir, setDefaultMediaOutputDir] = useState('');
+  const [mediaOutputError, setMediaOutputError] = useState<string | null>(null);
+  const [isLocalizingMedia, setIsLocalizingMedia] = useState(false);
+  const [mediaLocalizeStatus, setMediaLocalizeStatus] = useState<string | null>(null);
+  const [isCleaningMedia, setIsCleaningMedia] = useState(false);
+  const [mediaCleanupStatus, setMediaCleanupStatus] = useState<string | null>(null);
   const [checkUpdateStatus, setCheckUpdateStatus] = useState<'' | 'checking' | 'has-update' | 'up-to-date' | 'failed'>('');
   const [revealedApiKeys, setRevealedApiKeys] = useState<Record<string, boolean>>({});
   // 推荐平台卡片上直接填 Key 的状态(只有正在连接的卡片会用到)。
@@ -1224,6 +1257,22 @@ export function SettingsDialog({
     setCheckUpdateStatus('');
     setRevealedApiKeys({});
 
+    // 落盘位置不在 settingsStore 里，得单独从 app_settings 表读；
+    // 同时取一次默认值，好在输入框里当作 placeholder 显示。
+    setMediaOutputError(null);
+    void (async () => {
+      try {
+        const [configured, fallback] = await Promise.all([
+          loadMediaOutputDirSetting(),
+          resolveDefaultMediaOutputDir(),
+        ]);
+        setLocalMediaOutputDir(configured);
+        setDefaultMediaOutputDir(fallback);
+      } catch (error) {
+        console.warn('[SettingsDialog] 读取默认落盘位置失败', error);
+      }
+    })();
+
     // 面板内的弹窗/表单状态也要复位：设置面板只是 return null，state 并不会随关闭清空。
     // 不重置的话，上次没关干净的「新增/编辑平台」弹窗会在下次打开设置、切到「密钥」时自己弹出来。
     setShowAddCustomApi(false);
@@ -1258,29 +1307,141 @@ export function SettingsDialog({
     setShowJimengCliSettings(false);
   }, [activeCategory]);
 
+  /** 用系统目录选择器挑落盘位置；只挑不改，真正落库在「保存」时。 */
+  const handleChooseMediaOutputDir = useCallback(async () => {
+    try {
+      const picked = await chooseMediaOutputDir();
+      if (!picked) return;
+      setLocalMediaOutputDir(picked);
+      setMediaOutputError(null);
+    } catch (error) {
+      setMediaOutputError(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
+
+  /**
+   * 把存量节点/模板里指向第三方临时链接的素材搬回本地。
+   *
+   * 会**先把界面上（可能刚改过、还没保存）的落盘位置落库** —— 否则刚下载下来的文件
+   * 会写进旧目录，用户在自己选的文件夹里找不到。路径不合法时直接报错退出，
+   * 不会留下改一半的中间状态。
+   */
+  const handleLocalizeExistingMedia = useCallback(async () => {
+    if (isLocalizingMedia) return;
+    setIsLocalizingMedia(true);
+    setMediaLocalizeStatus(null);
+    try {
+      await saveMediaOutputDir(localMediaOutputDir);
+      const report = await runExistingMediaLocalization({
+        onProgress: ({ phase, label, done, total }) => {
+          setMediaLocalizeStatus(
+            t('settings.mediaLocalizeProgress', {
+              phase:
+                phase === 'templates'
+                  ? t('settings.mediaLocalizePhaseTemplates')
+                  : t('settings.mediaLocalizePhaseProjects'),
+              label: label || '—',
+              done: Math.min(done + 1, total),
+              total,
+            }),
+          );
+        },
+      });
+      setMediaLocalizeStatus(
+        report.failed.length > 0
+          ? t('settings.mediaLocalizeDonePartial', {
+              localized: report.localized,
+              templates: report.templatesChanged,
+              projects: report.projectsChanged,
+              failed: report.failed.length,
+            })
+          : t('settings.mediaLocalizeDone', {
+              localized: report.localized,
+              templates: report.templatesChanged,
+              projects: report.projectsChanged,
+            }),
+      );
+    } catch (error) {
+      setMediaLocalizeStatus(
+        t('settings.mediaLocalizeFailed', {
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } finally {
+      setIsLocalizingMedia(false);
+    }
+  }, [isLocalizingMedia, localMediaOutputDir, t]);
+
+  /**
+   * 把落盘目录里已经没人引用的文件清掉（图片/视频/音频都清）。
+   *
+   * 未被引用的文件先移进 `.quarantine`，放满保留期才真正删除 —— 所以这一步的即时收益
+   * 显示为「移出多少」，而「释放多少」是暂存区里过期被删掉的部分。
+   */
+  const handleCleanupMedia = useCallback(async () => {
+    if (isCleaningMedia) return;
+    setIsCleaningMedia(true);
+    setMediaCleanupStatus(null);
+    try {
+      const report = await cleanupUnreferencedMedia();
+      const movedText = t('settings.mediaCleanupMoved', {
+        count: report.quarantinedFileCount,
+        size: formatBytes(report.quarantinedBytes),
+      });
+      const purgedText = t('settings.mediaCleanupPurged', {
+        count: report.purgedFileCount,
+        size: formatBytes(report.purgedBytes),
+      });
+      if (report.quarantinedFileCount === 0 && report.purgedFileCount === 0) {
+        setMediaCleanupStatus(t('settings.mediaCleanupNothing'));
+      } else {
+        setMediaCleanupStatus(t('settings.mediaCleanupDone', { moved: movedText, purged: purgedText }));
+      }
+    } catch (error) {
+      setMediaCleanupStatus(
+        t('settings.mediaCleanupFailed', {
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } finally {
+      setIsCleaningMedia(false);
+    }
+  }, [isCleaningMedia, t]);
+
   const handleSave = useCallback(() => {
-    providers.forEach((provider) => {
-      setProviderApiKey(provider.id, localApiKeys[provider.id] ?? '');
-    });
-    setUseUploadFilenameAsNodeTitle(localUseUploadFilenameAsNodeTitle);
-    setStoryboardGenKeepStyleConsistent(localStoryboardGenKeepStyleConsistent);
-    setStoryboardGenDisableTextInImage(localStoryboardGenDisableTextInImage);
-    setStoryboardGenAutoInferEmptyFrame(localStoryboardGenAutoInferEmptyFrame);
-    setIgnoreAtTagWhenCopyingAndGenerating(localIgnoreAtTagWhenCopyingAndGenerating);
-    setEnableStoryboardGenGridPreviewShortcut(localEnableStoryboardGenGridPreviewShortcut);
-    setShowStoryboardGenAdvancedRatioControls(localShowStoryboardGenAdvancedRatioControls);
-    setShowNodePrice(localShowNodePrice);
-    setPriceDisplayCurrencyMode(localPriceDisplayCurrencyMode);
-    setUsdToCnyRate(Number(localUsdToCnyRate));
-    setUiRadiusPreset(localUiRadiusPreset);
-    setThemeTonePreset(localThemeTonePreset);
-    setAccentColor(localAccentColor);
-    setCanvasEdgeRoutingMode(localCanvasEdgeRoutingMode);
-    setAutoCheckAppUpdateOnLaunch(localAutoCheckAppUpdateOnLaunch);
-    setEnableUpdateDialog(localEnableUpdateDialog);
-    onClose();
+    // 落盘位置先保存：它是唯一会失败的一项（路径要建得出来、写得进去）。
+    // 放到最后才做的话，路径报错时其余设置已经写进去了、弹窗却还开着，
+    // 用户会以为整次保存都没生效。失败就把错误留在弹窗里，不关。
+    void saveMediaOutputDir(localMediaOutputDir).then(
+      () => {
+        providers.forEach((provider) => {
+          setProviderApiKey(provider.id, localApiKeys[provider.id] ?? '');
+        });
+        setUseUploadFilenameAsNodeTitle(localUseUploadFilenameAsNodeTitle);
+        setStoryboardGenKeepStyleConsistent(localStoryboardGenKeepStyleConsistent);
+        setStoryboardGenDisableTextInImage(localStoryboardGenDisableTextInImage);
+        setStoryboardGenAutoInferEmptyFrame(localStoryboardGenAutoInferEmptyFrame);
+        setIgnoreAtTagWhenCopyingAndGenerating(localIgnoreAtTagWhenCopyingAndGenerating);
+        setEnableStoryboardGenGridPreviewShortcut(localEnableStoryboardGenGridPreviewShortcut);
+        setShowStoryboardGenAdvancedRatioControls(localShowStoryboardGenAdvancedRatioControls);
+        setShowNodePrice(localShowNodePrice);
+        setPriceDisplayCurrencyMode(localPriceDisplayCurrencyMode);
+        setUsdToCnyRate(Number(localUsdToCnyRate));
+        setUiRadiusPreset(localUiRadiusPreset);
+        setThemeTonePreset(localThemeTonePreset);
+        setAccentColor(localAccentColor);
+        setCanvasEdgeRoutingMode(localCanvasEdgeRoutingMode);
+        setAutoCheckAppUpdateOnLaunch(localAutoCheckAppUpdateOnLaunch);
+        setEnableUpdateDialog(localEnableUpdateDialog);
+        onClose();
+      },
+      (error: unknown) => {
+        setMediaOutputError(error instanceof Error ? error.message : String(error));
+      },
+    );
   }, [
     localApiKeys,
+    localMediaOutputDir,
     localUseUploadFilenameAsNodeTitle,
     localStoryboardGenKeepStyleConsistent,
     localStoryboardGenDisableTextInImage,
@@ -2620,6 +2781,115 @@ export function SettingsDialog({
                     title={t('settings.useUploadFilenameAsNodeTitle')}
                     description={t('settings.useUploadFilenameAsNodeTitleDesc')}
                   />
+
+                  {/* 默认落盘位置：生成的图片/视频会落到这里 */}
+                  <div className="rounded-lg border border-border-dark bg-bg-dark p-4 space-y-3">
+                    <div>
+                      <p className="text-sm font-medium text-text-dark">
+                        {t('settings.mediaOutputDir')}
+                      </p>
+                      <p className="mt-1 text-xs text-text-muted">
+                        {t('settings.mediaOutputDirDesc')}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={localMediaOutputDir}
+                        placeholder={defaultMediaOutputDir}
+                        onChange={(event) => {
+                          setLocalMediaOutputDir(event.target.value);
+                          setMediaOutputError(null);
+                        }}
+                        spellCheck={false}
+                        className="min-w-0 flex-1 rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark placeholder:text-text-muted focus:border-accent focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleChooseMediaOutputDir();
+                        }}
+                        className="shrink-0 rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark transition-colors hover:bg-bg-dark"
+                      >
+                        {t('settings.mediaOutputDirChoose')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLocalMediaOutputDir('');
+                          setMediaOutputError(null);
+                        }}
+                        disabled={!localMediaOutputDir.trim()}
+                        className="shrink-0 rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {t('settings.mediaOutputDirReset')}
+                      </button>
+                    </div>
+                    <p className="text-xs text-text-muted">
+                      {localMediaOutputDir.trim()
+                        ? t('settings.mediaOutputDirCustom', { path: localMediaOutputDir.trim() })
+                        : defaultMediaOutputDir
+                          ? t('settings.mediaOutputDirUsingDefault', { path: defaultMediaOutputDir })
+                          : t('settings.mediaOutputDirLoading')}
+                    </p>
+                    {mediaOutputError && (
+                      <p className="text-xs text-red-400">{mediaOutputError}</p>
+                    )}
+                  </div>
+
+                  {/* 存量素材本地化：把还挂在第三方临时链接上的节点/模板搬回本地 */}
+                  <div className="rounded-lg border border-border-dark bg-bg-dark p-4 space-y-3">
+                    <div>
+                      <p className="text-sm font-medium text-text-dark">
+                        {t('settings.mediaLocalize')}
+                      </p>
+                      <p className="mt-1 text-xs text-text-muted">
+                        {t('settings.mediaLocalizeDesc')}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void handleLocalizeExistingMedia();
+                      }}
+                      disabled={isLocalizingMedia}
+                      className="rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {isLocalizingMedia
+                        ? t('settings.mediaLocalizeRunning')
+                        : t('settings.mediaLocalizeStart')}
+                    </button>
+                    {mediaLocalizeStatus && (
+                      <p className="text-xs text-text-muted">{mediaLocalizeStatus}</p>
+                    )}
+                  </div>
+
+                  {/* 未引用文件回收：生成的图片/视频/音频里已经没人用的那些 */}
+                  <div className="rounded-lg border border-border-dark bg-bg-dark p-4 space-y-3">
+                    <div>
+                      <p className="text-sm font-medium text-text-dark">
+                        {t('settings.mediaCleanup')}
+                      </p>
+                      <p className="mt-1 text-xs text-text-muted">
+                        {t('settings.mediaCleanupDesc')}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void handleCleanupMedia();
+                      }}
+                      disabled={isCleaningMedia}
+                      className="rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {isCleaningMedia
+                        ? t('settings.mediaCleanupRunning')
+                        : t('settings.mediaCleanupStart')}
+                    </button>
+                    {mediaCleanupStatus && (
+                      <p className="text-xs text-text-muted">{mediaCleanupStatus}</p>
+                    )}
+                  </div>
 
                   {/* 更新(原「关于」页移入) */}
                   <div className="rounded-lg border border-border-dark bg-bg-dark p-4 space-y-3">

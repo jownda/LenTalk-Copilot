@@ -1,4 +1,5 @@
 import {
+  cancelGenerateVideoJob,
   generateAudio,
   generateAudioAsset,
   generateSunoLyrics as generateAudioLyrics,
@@ -15,11 +16,13 @@ import {
   uploadZhiniaoReferenceAsset,
 } from "@/commands/ai";
 import { createCompactImageDataUrl, imageUrlToDataUrl } from "@/features/canvas/application/imageData";
+import { throwIfVideoSubmissionCanceled } from "@/features/canvas/application/videoGenerationCancel";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { JIMENG_CLI_PROVIDER_ID, resolveVideoModelProfile } from "@/features/canvas/models";
 import { RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
 import { useRunningHubCliStore } from "@/stores/runningHubCliStore";
 import { toVideoGenerationRequest } from "@/features/canvas/application/videoGeneration";
+import { persistVideoLocally } from "@/features/canvas/application/mediaPersistence";
 import { isRjmVideoApiBaseUrl } from "@/commands/videoApi";
 import { isZhenjianProvider } from "@/commands/zhenjianApi";
 import { isZzdhProvider } from "@/commands/zzdhApi";
@@ -633,11 +636,27 @@ export const tauriAiGateway: AiGateway = {
     });
   },
   getGenerateImageJob,
-  getGenerateVideoJob: async (jobId: string) => compatibilityVideoJobs.get(jobId) ?? (await getGenerateVideoJob(jobId)),
-  submitGenerateVideoJob: async (payload: GenerateVideoPayload) => {
+  getGenerateVideoJob: async (jobId: string) => {
+    const localJob = compatibilityVideoJobs.get(jobId);
+    // 本地 CLI 任务没有后端可取消的窗口(进程已经跑出去了), 所以对前端一律声明
+    // cancelable: false —— 下游节点会立刻收掉「取消生成」入口。
+    return localJob ? { ...localJob, cancelable: false } : await getGenerateVideoJob(jobId);
+  },
+  cancelGenerateVideoJob: async (jobId: string) => {
+    // 本地兼容任务(jimeng / wan / runninghub CLI)没有中止通道: 进程已经交出去了。
+    if (compatibilityVideoJobs.has(jobId)) return "too_late" as const;
+    return await cancelGenerateVideoJob(jobId);
+  },
+  submitGenerateVideoJob: async (payload: GenerateVideoPayload, options?: { cancellationNodeId?: string }) => {
+    // 提交流水线里的取消检查点。窗口由下游节点持有, 这里只读; 已经取消就抛哨兵,
+    // 由调用方走「已取消」分支(不发请求、不报错弹窗)。
+    const cancellationNodeId = options?.cancellationNodeId;
+    const checkCanceled = () => throwIfVideoSubmissionCanceled(cancellationNodeId);
+    checkCanceled();
     const routedPayload = usesRunningHubCliDirectApi(payload.model)
       ? await prepareRunningHubCliDirectVideo(payload)
       : payload;
+    checkCanceled();
     // 先按平台设置补全协议参数, 再判定由谁承载这次视频任务。
     // 节点上保存的 extraParams 通常只含模型自身字段, video_transport 与
     // provider_base_url 都是由 injectCustomApiRequestMode 从平台配置(Base URL /
@@ -646,6 +665,7 @@ export const tauriAiGateway: AiGateway = {
     // 后者对白名单之外的协议直接返回 InvalidRequest, 连一个网络请求都不会发出
     // —— 表现为「点了生成但平台收不到请求」。
     const normalized = injectCustomApiRequestMode(routedPayload, "async");
+    checkCanceled();
     if (needsCompatibilityVideoWorker(routedPayload) || needsCompatibilityVideoWorker(normalized)) {
       const jobId = crypto.randomUUID();
       compatibilityVideoJobs.set(jobId, { job_id: jobId, status: "running", result: null, error: null });
@@ -665,7 +685,8 @@ export const tauriAiGateway: AiGateway = {
             error: error instanceof Error ? error.message : String(error),
           }),
       );
-      return jobId;
+      // 本地 CLI 进程拦不住, 窗口到此为止。
+      return { jobId, cancelable: false };
     }
     // 复用上面已注入的结果, 不再二次注入。能走到这里说明该平台确实由后端
     // OpenAI 兼容视频任务执行器承载(transport 为空或 openai-video)。
@@ -680,11 +701,15 @@ export const tauriAiGateway: AiGateway = {
     const imageSources = imageResources.map((resource) => resource.source);
     // 知鸟只收公网 URL(videoReferenceEncoding: url): 本地素材先经 /v1/files 换成 URL
     // 再交给后端任务执行器; 其余平台仍走通用规整。
+    //
+    // 这两步是本链路最长的「还没送到平台」阶段(读本地文件 / 压图 / 上传换 URL),
+    // 也是「取消生成」最该起作用的窗口 —— 前后各查一次。
     const referenceImages =
       injected.extraParams?.video_transport === "zhiniao-video"
         ? await resolveZhiniaoImageReferences(imageSources, payload.model.split("/")[0] ?? "")
         : await normalizeVideoReferenceImages(imageSources, injected.extraParams);
-    return await submitGenerateVideoJob({
+    checkCanceled();
+    const jobId = await submitGenerateVideoJob({
       prompt: unifiedRequest.prompt,
       model: unifiedRequest.modelId,
       duration: unifiedRequest.duration,
@@ -695,6 +720,9 @@ export const tauriAiGateway: AiGateway = {
       reference_audio: unifiedRequest.referenceAudio.map((resource) => resource.source.trim()).filter(Boolean),
       extra_params: injected.extraParams,
     });
+    // 后端已落任务、请求还在飞 —— 取消窗口继续开着, 等 `get_generate_video_job`
+    // 报 cancelable: false(平台受理)时由画布关窗。
+    return { jobId, cancelable: true };
   },
   generateVideo: async (payload: GenerateVideoPayload) => {
     if (usesRunningHubCliDirectApi(payload.model)) {
@@ -810,7 +838,7 @@ export const tauriAiGateway: AiGateway = {
       .map((resource) => resource.source)
       .map((audioUrl) => audioUrl.trim())
       .filter(Boolean);
-    return await generateVideo({
+    const generatedUrl = await generateVideo({
       prompt: unifiedRequest.prompt,
       model: unifiedRequest.modelId,
       duration: unifiedRequest.duration,
@@ -821,6 +849,10 @@ export const tauriAiGateway: AiGateway = {
       reference_audio: referenceAudio,
       extra_params: injected.extraParams,
     });
+    // 平台回的是自家 CDN 的**临时**链接，这里统一抓成本地文件再交给上层。
+    // 本地 CLI 分支（即梦 / Wan / RunningHub）本来返回的就是本地路径，
+    // persistVideoLocally 会原样放行；落盘失败也会回退远端 URL，不会丢结果。
+    return await persistVideoLocally(generatedUrl);
   },
   upscaleVideo: async (payload: UpscaleVideoPayload) => {
     const api = useSettingsStore
@@ -830,13 +862,15 @@ export const tauriAiGateway: AiGateway = {
       typeof payload.extraParams?.provider_base_url === "string"
         ? payload.extraParams.provider_base_url
         : (api?.baseUrl ?? "");
-    return await upscaleVideoCommand({
+    const upscaledUrl = await upscaleVideoCommand({
       videoSource: payload.videoSource,
       model: payload.model,
       tier: payload.tier,
       bitRate: payload.bitRate,
       extra_params: { ...payload.extraParams, provider_base_url: providerBaseUrl },
     });
+    // 超分成片同样是平台 CDN 上的临时链接，落盘规则与普通生成一致。
+    return await persistVideoLocally(upscaledUrl);
   },
   /**
    * 音频生成(语音合成 / 音效 / 音乐)。

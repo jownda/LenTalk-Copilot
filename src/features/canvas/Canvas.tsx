@@ -25,7 +25,7 @@ import {
 } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
 import { isTauri } from "@tauri-apps/api/core";
-import { AlignJustify, Bot, Crosshair, Film, Keyboard, LayoutTemplate, Library } from "lucide-react";
+import { AlignJustify, Bot, Boxes, Crosshair, Film, Keyboard, LayoutTemplate, Library } from "lucide-react";
 import "@xyflow/react/dist/style.css";
 
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -56,6 +56,7 @@ import {
   UPLOAD_BATCH_GAP,
 } from "@/features/canvas/application/uploadBatchPlacement";
 import { prepareNodeImage, prepareNodeImageFromFile } from "@/features/canvas/application/imageData";
+import { persistVideoLocally } from "@/features/canvas/application/mediaPersistence";
 import {
   buildGenerationErrorReport,
   CURRENT_RUNTIME_SESSION_ID,
@@ -92,13 +93,15 @@ import { resolveImageDisplayUrl } from "./application/imageData";
 import { CanvasContextMenu } from "./CanvasContextMenu";
 import { SelectedNodeOverlay } from "./ui/SelectedNodeOverlay";
 import { NodeToolDialog } from "./ui/NodeToolDialog";
+import { TextNodeEditDialogHost } from "./ui/TextNodeEditDialogHost";
 import { ImageViewerModal } from "./ui/ImageViewerModal";
 import { VideoViewerModal } from "./ui/VideoViewerModal";
 import { saveMediaSourceWithDialog } from "./application/mediaDownload";
 import { shouldFailRunningVideoJob } from "./application/videoJobPolling";
+import { closeVideoCancellationWindow } from "./application/videoGenerationCancel";
 import { VideoFrameExtractDialog } from "./ui/VideoFrameExtractDialog";
 import { ShortcutSettingsDialog } from "./ui/ShortcutSettingsDialog";
-import { AssetLibraryPanel } from "@/features/library/AssetLibraryPanel";
+import { AssetLibraryPanel, type AssetLibrarySection } from "@/features/library/AssetLibraryPanel";
 import { AgentPanel } from "@/features/agent/AgentPanel";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
 import {
@@ -855,7 +858,10 @@ export function Canvas() {
   // position after the visual snap has already been applied. Keep the latest
   // snapped position around so that final change cannot undo the snap.
   const activeDragAlignmentRef = useRef<Map<string, { x: number; y: number }>>(new Map());
-  const [isLibraryOpen, setIsLibraryOpen] = useState(false);
+  // 素材库 / 资产库共用同一个面板实例(工具栏两个入口), 这里只记「打开的是哪一分区」;
+  // null = 关闭。分开两个布尔量会出现两个 fixed 面板同时贴在右边、互相叠在一起。
+  const [librarySection, setLibrarySection] = useState<AssetLibrarySection | null>(null);
+  const isLibraryOpen = librarySection !== null;
   const [isTemplateOpen, setIsTemplateOpen] = useState(false);
   const [cinematicAssetLibrary, setCinematicAssetLibrary] = useState<CinematicAssetLibraryBridge | null>(null);
   const [isVideoExtractOpen, setIsVideoExtractOpen] = useState(false);
@@ -915,7 +921,7 @@ export function Canvas() {
 
   // Cinematic Studio reuses the canvas library as its sole asset entry point.
   useEffect(() => {
-    const openLibrary = () => setIsLibraryOpen(true);
+    const openLibrary = () => setLibrarySection("assets");
     const registerCinematicLibrary = (event: Event) => {
       const detail = (event as CustomEvent<CinematicAssetLibraryBridge>).detail;
       if (detail?.project && detail?.scene) setCinematicAssetLibrary(detail);
@@ -1964,6 +1970,23 @@ export function Canvas() {
               await sleep(2_000);
               continue;
             }
+            // 后端是「还能不能取消」的唯一判据: 请求一被平台受理就报 cancelable: false,
+            // 下游节点上的「取消生成」入口随之收掉(窗口是模块级内存态, 不落库)。
+            if (status.cancelable !== true) closeVideoCancellationWindow(pendingNode.id);
+            // 用户在请求送达平台前取消。既不是失败也不是成功 —— 节点上给中性提示,
+            // 不能落进下面的失败分支弹红字(那会把"用户主动反悔"说成"生成失败")。
+            if (status.status === "canceled") {
+              updateNodeDataTransient(pendingNode.id, {
+                isGenerating: false,
+                generationStartedAt: null,
+                generationJobId: null,
+                generationClientSessionId: null,
+                generationCanceled: true,
+                generationError: null,
+                generationErrorDetails: null,
+              });
+              return;
+            }
             if (status.status === "running" || status.status === "queued") {
               // 后端已把「任务仍在跑, 这次查询只是临时失败(网络抖动 / 5xx)」显式标成
               // transient —— 此时 `error` 里是**诊断文本**, 不是终态依据, 只能继续等。
@@ -1999,6 +2022,15 @@ export function Canvas() {
               continue;
             }
             if (status.status === "succeeded" && status.result) {
+              // 先落盘再写节点：平台回的是自家 CDN 的**临时**链接，不落盘的话节点、
+              // 模板导出、共享盘 template.json 里存的都是一条随时会失效的外部地址
+              // （阿里云 OSS 的 reference-assets/ 会被定期清理）。落盘失败会回退远端
+              // URL，所以已经生成好的视频不会丢。
+              const localVideoPath = await persistVideoLocally(status.result);
+              const nodeAfterPersist = useCanvasStore.getState().nodes.find((item) => item.id === pendingNode.id);
+              const dataAfterPersist = nodeAfterPersist?.data as Record<string, unknown> | undefined;
+              // 下载期间节点可能已被取消/删除，别把结果写回去把它"复活"。
+              if (!nodeAfterPersist || dataAfterPersist?.isGenerating !== true) return;
               const request = data.generationRequest as
                 | { model?: unknown; videoResolution?: unknown; duration?: unknown; referenceImages?: unknown }
                 | undefined;
@@ -2013,7 +2045,7 @@ export function Canvas() {
                 status: "succeeded",
               });
               updateNodeDataTransient(pendingNode.id, {
-                sourcePath: status.result,
+                sourcePath: localVideoPath,
                 generationResultProtected: true,
                 isGenerating: false,
                 generationStartedAt: null,
@@ -2207,7 +2239,7 @@ export function Canvas() {
       cancelPendingViewportPersist();
       // 用户主动平移/缩放画布时收起素材库/模板栏; 程序化 setViewport 的 event 为 null, 不误伤
       if (event) {
-        setIsLibraryOpen(false);
+        setLibrarySection(null);
         setIsTemplateOpen(false);
       }
     },
@@ -2848,7 +2880,7 @@ export function Canvas() {
   const handlePaneClick = useCallback(
     (event: ReactMouseEvent) => {
       // 点击画布区域自动收起素材库/模板侧边栏(面板内部点击不会走到 pane, 不误伤)
-      setIsLibraryOpen(false);
+      setLibrarySection(null);
       setIsTemplateOpen(false);
       setIsAgentOpen(false);
 
@@ -3662,7 +3694,7 @@ export function Canvas() {
       setAlignmentGuides([]);
       activeDragAlignmentRef.current.clear();
       // 拖拽画布节点也视为画布区交互, 收起素材库/模板侧边栏
-      setIsLibraryOpen(false);
+      setLibrarySection(null);
       setIsTemplateOpen(false);
       if (groupDragFeedbackTimerRef.current !== null) {
         window.clearTimeout(groupDragFeedbackTimerRef.current);
@@ -4479,7 +4511,7 @@ export function Canvas() {
         onPaneClick={handlePaneClick}
         // 点击画布上的节点同样收起素材库/模板侧边栏
         onNodeClick={() => {
-          setIsLibraryOpen(false);
+          setLibrarySection(null);
           setIsTemplateOpen(false);
           setIsAgentOpen(false);
         }}
@@ -4645,12 +4677,29 @@ export function Canvas() {
           <span className="hidden sm:inline">{t("canvas.toolbar.templates", "模板")}</span>
         </button>
         <button
-          onClick={() => setIsLibraryOpen(true)}
-          className="flex h-9 items-center gap-1.5 rounded-lg border border-border-dark bg-surface-dark px-3 text-sm font-medium text-text-dark shadow-lg transition-colors hover:bg-bg-dark"
+          onClick={() => setLibrarySection("assets")}
+          className={`flex h-9 items-center gap-1.5 rounded-lg border px-3 text-sm font-medium shadow-lg transition-colors ${
+            librarySection === "assets" || librarySection === "prompts"
+              ? "border-accent bg-accent/15 text-accent"
+              : "border-border-dark bg-surface-dark text-text-dark hover:bg-bg-dark"
+          }`}
           title={t("canvas.toolbar.library", "素材库")}
         >
           <Library className="h-4 w-4 text-text-muted" />
           <span className="hidden sm:inline">{t("canvas.toolbar.library", "素材库")}</span>
+        </button>
+        {/* 资产库: 从素材库里独立出来, 紧挨着素材库放在它右边(面板内不再有资产库 tab) */}
+        <button
+          onClick={() => setLibrarySection("cinematic")}
+          className={`flex h-9 items-center gap-1.5 rounded-lg border px-3 text-sm font-medium shadow-lg transition-colors ${
+            librarySection === "cinematic"
+              ? "border-accent bg-accent/15 text-accent"
+              : "border-border-dark bg-surface-dark text-text-dark hover:bg-bg-dark"
+          }`}
+          title={t("canvas.toolbar.cinematicLibrary", "资产库")}
+        >
+          <Boxes className="h-4 w-4 text-text-muted" />
+          <span className="hidden sm:inline">{t("canvas.toolbar.cinematicLibrary", "资产库")}</span>
         </button>
         <button
           type="button"
@@ -4740,6 +4789,8 @@ export function Canvas() {
 
       <NodeToolDialog />
 
+      <TextNodeEditDialogHost />
+
       <ImageViewerModal
         open={imageViewer.isOpen}
         imageUrl={imageViewer.currentImageUrl || ""}
@@ -4755,9 +4806,13 @@ export function Canvas() {
         onClose={() => setVideoViewerUrl(null)}
       />
 
+      {/* 素材库与资产库共用这一个面板: 工具栏两个按钮只切换打开的分区。
+          hideCinematicTab —— 画布把资产库提到了独立入口, 面板里就不再留资产库 tab。 */}
       <AssetLibraryPanel
         open={isLibraryOpen}
-        onClose={() => setIsLibraryOpen(false)}
+        onClose={() => setLibrarySection(null)}
+        initialSection={librarySection ?? "assets"}
+        hideCinematicTab
         onApplyPrompt={handleApplyPromptTemplate}
         cinematicAssetLibrary={cinematicAssetLibrary}
       />

@@ -14,9 +14,21 @@
  * 预览同理：直链带不带 Referer、`<video>` 遇 403 会不会触发 error 事件、
  * 回落后的 blob 能不能解码，这些都只有真浏览器说了算。
  *
- * 依赖 playwright-core + 一个带完整扩展支持的 Chrome（headless shell 不支持扩展），
- * 以及 ffmpeg（现场生成一个 8 KB 的 VP8 视频当素材；没有就跳过预览用例）。
+ * 依赖 playwright-core + 一个**能加载未打包扩展的 Chromium**（见下）+ ffmpeg
+ * （现场生成一个 8 KB 的 VP8 视频当素材；没有就跳过预览用例）。
  * 可用环境变量覆盖：LENTALK_EXT_DIR / PLAYWRIGHT_CORE / CHROME_EXEC。
+ *
+ * ⚠️ 不能用品牌版 Chrome（`C:\Program Files\Google\Chrome\...`）：
+ *    Chrome 137 起以安全为由**移除了 `--load-extension`**，Chrome ≥142 连
+ *    `--disable-features=DisableLoadExtensionCommandLineSwitch` 这个后门也失效。
+ *    症状是「service worker 没起来」，看起来像扩展写错了，其实是浏览器根本不加载它。
+ *    （真实踩过：本机 Chrome 155 上折腾半天，最后发现是这条。）
+ *    要跑这个脚本，先装一份 Chromium：`npx playwright install chromium`
+ *    —— Playwright 的 Chromium 属于非品牌构建，`--load-extension` 照旧可用。
+ *
+ * ⚠️ 还必须 `ignoreDefaultArgs: ['--disable-extensions']`：Playwright 的 chromium
+ *    启动器**默认就会塞 `--disable-extensions`**，会把我们的 `--load-extension` 顶掉。
+ *    它自己的 test runner 也是靠这个忽略项才装得上扩展的。
  *
  * 用法：node verify-in-chrome.mjs
  */
@@ -26,31 +38,80 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync }
 import { createServer } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-/** 从 playwright 的浏览器缓存里找一个能加载扩展的完整 Chrome。 */
-function findChrome() {
-  if (process.env.CHROME_EXEC) return process.env.CHROME_EXEC;
-  const cache = join(homedir(), 'Library', 'Caches', 'ms-playwright');
-  if (!existsSync(cache)) return null;
-  for (const entry of readdirSync(cache)) {
-    if (!entry.startsWith('chromium-')) continue;
-    const root = join(cache, entry);
-    for (const arch of readdirSync(root)) {
-      const candidate = join(
-        root,
-        arch,
-        'Google Chrome for Testing.app',
-        'Contents',
-        'MacOS',
-        'Google Chrome for Testing'
-      );
-      if (existsSync(candidate)) return candidate;
+/** Playwright 下载浏览器的位置（与 PLAYWRIGHT_BROWSERS_PATH 的语义一致）。 */
+function playwrightCacheDirs() {
+  if (process.env.PLAYWRIGHT_BROWSERS_PATH) return [process.env.PLAYWRIGHT_BROWSERS_PATH];
+  const home = homedir();
+  if (process.platform === 'win32') {
+    return [join(process.env.LOCALAPPDATA || join(home, 'AppData', 'Local'), 'ms-playwright')];
+  }
+  if (process.platform === 'darwin') return [join(home, 'Library', 'Caches', 'ms-playwright')];
+  return [join(home, '.cache', 'ms-playwright')];
+}
+
+/**
+ * 在 ms-playwright 缓存里找 **Chromium**（非品牌构建）。
+ * 只认 `chromium-<版本>`：`chromium_headless_shell-*` 是精简壳，**不支持扩展**，必须跳过。
+ */
+function findPlaywrightChromium() {
+  const layouts = {
+    win32: [
+      ['chrome-win', 'chrome.exe'],
+      ['chrome-win64', 'chrome.exe'],
+    ],
+    darwin: [
+      ['chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'],
+      ['chrome-mac-arm64', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'],
+    ],
+    linux: [['chrome-linux', 'chrome']],
+  }[process.platform];
+  if (!layouts) return null;
+
+  for (const cache of playwrightCacheDirs()) {
+    if (!existsSync(cache)) continue;
+    // 版本号从大到小，优先用新装的那份。
+    const dirs = readdirSync(cache)
+      .filter((entry) => /^chromium-\d+$/.test(entry))
+      .sort()
+      .reverse();
+    for (const dir of dirs) {
+      for (const parts of layouts) {
+        const candidate = join(cache, dir, ...parts);
+        if (existsSync(candidate)) return candidate;
+      }
     }
   }
   return null;
+}
+
+/** 品牌版 Chrome：装了也没用（≥137 起命令行不再加载扩展），只在实在没别的可用时兜底。 */
+function findBrandedChrome() {
+  if (process.platform === 'win32') {
+    const candidates = [
+      join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ];
+    return candidates.find((candidate) => candidate && existsSync(candidate)) || null;
+  }
+  if (process.platform === 'darwin') {
+    const candidate = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    return existsSync(candidate) ? candidate : null;
+  }
+  return null;
+}
+
+/** 判据：路径里带 Google Chrome（品牌构建）。 */
+const isBrandedChrome = (path) => /(?:^|[/\\])Google[ /\\]?Chrome/i.test(path) || /Google Chrome\.app/.test(path);
+
+/** 找一个能加载未打包扩展的浏览器。优先 Playwright 的 Chromium，品牌版 Chrome 只作兜底。 */
+function findChrome() {
+  if (process.env.CHROME_EXEC) return process.env.CHROME_EXEC;
+  return findPlaywrightChromium() || findBrandedChrome();
 }
 
 /** playwright-core 的入口文件。ESM 不认 NODE_PATH，只能按路径引。 */
@@ -70,12 +131,30 @@ if (!playwrightPath) {
   process.exit(1);
 }
 if (!chromePath) {
-  console.error('找不到可加载扩展的 Chrome，请设置 CHROME_EXEC 指向可执行文件');
+  console.error(
+    '找不到可加载扩展的浏览器。请先装一份 Chromium：\n' +
+      '  npx playwright install chromium\n' +
+      '或设置 CHROME_EXEC 指向一个 **非品牌版** 的可执行文件（品牌版 Chrome ≥137 不认 --load-extension）'
+  );
   process.exit(1);
+}
+console.log(`浏览器：${chromePath}`);
+if (isBrandedChrome(chromePath)) {
+  console.warn(
+    '\n⚠️  这是品牌版 Google Chrome。Chrome 137 起以安全为由移除了 --load-extension，\n' +
+      '    扩展不会被加载，下面的用例会全部失败 —— 那是浏览器行为，不是扩展的问题。\n' +
+      '    请改用 Playwright 的 Chromium：npx playwright install chromium\n'
+  );
 }
 
 // playwright-core 是 CJS，ESM 下要取 default 再解构。
-const { chromium } = (await import(playwrightPath)).default;
+// ⚠️ Windows 上不能把 `C:\...` 原样丢给 import —— ESM 只认 `file://` URL，
+// 否则抛 ERR_UNSUPPORTED_ESM_URL_SCHEME（真实踩过）。绝对路径统一转成 file URL，
+// 包名（裸标识符）原样透传。
+const specifier = /^[a-zA-Z]:[\\/]|^\//.test(playwrightPath)
+  ? pathToFileURL(playwrightPath).href
+  : playwrightPath;
+const { chromium } = (await import(specifier)).default;
 
 const EXT = process.env.LENTALK_EXT_DIR || HERE;
 const EXEC = chromePath;
@@ -261,7 +340,8 @@ function report() {
 }
 
 try {
-  // 127.0.0.1 恰好是扩展唯一有 host 权限的域，不需要 activeTab 也能注入。
+  // 测试页刻意放在 127.0.0.1：扩展的 host 权限覆盖它（`http://127.0.0.1:*/*` + `*://*/*`），
+  // 所以没有 activeTab 也能注入 —— 否则 executeScript 会因「没有该页面的访问权限」直接失败。
   server = createServer((request, response) => {
     if (request.url === '/hls.min.js') {
       // 对照实验用：把扩展里的 hls.js 原样递给页面，好在**页面身份**下试同一份流。
@@ -393,6 +473,9 @@ try {
   context = await chromium.launchPersistentContext(profile, {
     executablePath: EXEC,
     headless: false,
+    // Playwright 的 chromium 启动器默认会塞 --disable-extensions，把 --load-extension 顶掉。
+    // 不忽略它，扩展永远装不上（而且症状是「service worker 没起来」，极难查）。
+    ignoreDefaultArgs: ['--disable-extensions'],
     args: [
       '--headless=new',
       `--disable-extensions-except=${EXT}`,
@@ -412,7 +495,16 @@ try {
   if (!worker) {
     worker = await context.waitForEvent('serviceworker', { timeout: 20000 }).catch(() => null);
   }
-  check('service worker 已启动', Boolean(worker), worker ? worker.url() : '没等到 serviceworker 事件');
+  check(
+    'service worker 已启动',
+    Boolean(worker),
+    worker
+      ? worker.url()
+      : `没等到 serviceworker 事件（${EXEC}）。` +
+        (isBrandedChrome(EXEC)
+          ? '品牌版 Chrome ≥137 不加载命令行指定的扩展 —— 换成 npx playwright install chromium 装的 Chromium 再跑。'
+          : 'manifest 可能被拒，或启动参数没生效。')
+  );
 
   if (!worker) {
     report();

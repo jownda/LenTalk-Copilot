@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type UIEvent as ReactUIEvent } from 'react';
 import { Handle, Position, useUpdateNodeInternals, type NodeProps } from '@xyflow/react';
 import { Check, Copy, ScanSearch, Sparkles, Wand2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -16,6 +16,7 @@ import { graphImageResolver } from '@/features/canvas/application/canvasServices
 import { findReferenceTokens, insertReferenceToken } from '@/features/canvas/application/referenceTokenEditing';
 import { imageUrlToDataUrl, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
+import { clampTextViewScrollTop } from '@/features/canvas/application/textViewScroll';
 import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
@@ -390,6 +391,18 @@ export const PromptOptimizerNode = memo(({
   const isPurposeComposingRef = useRef(false);
   const purposeDraftRef = useRef(purposeDraft);
   const optimizedPromptDraftRef = useRef(optimizedPromptDraft);
+
+  // ---- 结果区「编辑态 / 预览态」的视图位置搬运 ----
+  // 编辑态是 `<textarea>`、预览态是那个 `overflow-auto` 的 div —— 两个独立的滚动容器,
+  // 新挂载的从 scrollTop = 0 开始, 于是「往下翻着改完 → 点别处退出编辑」会跳回第一行。
+  const resultTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const resultPreviewRef = useRef<HTMLDivElement | null>(null);
+  // `null` = 本次会话还没编辑过; 首次进编辑态要让浏览器按原生行为把光标放文末并滚到底。
+  const editorScrollTopRef = useRef<number | null>(null);
+  const pendingEditorCaretRef = useRef<number | null>(null);
+  const handleResultEditorScroll = useCallback((event: ReactUIEvent<HTMLTextAreaElement>) => {
+    editorScrollTopRef.current = event.currentTarget.scrollTop;
+  }, []);
   const { cancelCommit: cancelPurposeCommit, flushCommit: flushPurposeCommit, scheduleCommit: schedulePurposeCommit } =
     useDebouncedNodeTextCommit({
       nodeId: id,
@@ -441,6 +454,40 @@ export const PromptOptimizerNode = memo(({
     optimizedPromptDraftRef.current = optimizedPrompt;
     setOptimizedPromptDraft(optimizedPrompt);
   }, [isEditingResult, optimizedPrompt]);
+
+  /**
+   * 切换 编辑态 ⇄ 预览态 时把视图位置搬到新挂载的容器上。
+   *
+   * 必须走 **layout 阶段**: 用 useEffect 会先绘出一帧「第一行」再跳过去, 那正是用户看到的
+   * 「重置」。偏移量按目标容器自己的可滚范围钳一次(见 `clampTextViewScrollTop`)。
+   */
+  useLayoutEffect(() => {
+    if (isEditingResult) {
+      const textarea = resultTextareaRef.current;
+      if (!textarea || editorScrollTopRef.current === null) {
+        // 首次进编辑态: 交给浏览器原生行为(光标在文末、视图在文末), 不干预。
+        return;
+      }
+      const caret = pendingEditorCaretRef.current;
+      if (caret !== null) {
+        // 顺序不能反: setSelectionRange 会把光标位置滚进视野, 后写 scrollTop 才压得住。
+        const position = Math.max(0, Math.min(caret, textarea.value.length));
+        textarea.setSelectionRange(position, position);
+        pendingEditorCaretRef.current = null;
+      }
+      textarea.scrollTop = clampTextViewScrollTop(
+        editorScrollTopRef.current,
+        textarea.scrollHeight - textarea.clientHeight,
+      );
+      return;
+    }
+    const preview = resultPreviewRef.current;
+    if (!preview) return;
+    preview.scrollTop = clampTextViewScrollTop(
+      editorScrollTopRef.current ?? 0,
+      preview.scrollHeight - preview.clientHeight,
+    );
+  }, [isEditingResult]);
 
   const chatModelOptions = useMemo(() => {
     const options: Array<{ providerId: string; model: string; label: string }> = [];
@@ -1048,6 +1095,7 @@ export const PromptOptimizerNode = memo(({
 
             {isEditingResult ? (
               <textarea
+                ref={resultTextareaRef}
                 autoFocus
                 value={optimizedPromptDraft}
                 onChange={(event) => {
@@ -1056,7 +1104,12 @@ export const PromptOptimizerNode = memo(({
                   setOptimizedPromptDraft(nextValue);
                   scheduleOptimizedPromptCommit();
                 }}
-                onBlur={() => {
+                onScroll={handleResultEditorScroll}
+                onBlur={(event) => {
+                  // 退出前把「滚到哪 + 光标在哪」钉死: onScroll 只是兜底, 还可能有程序化滚动。
+                  // 此刻 textarea 仍在 DOM 里, 读得到真实值 —— 再晚一帧它就被卸载了。
+                  editorScrollTopRef.current = event.currentTarget.scrollTop;
+                  pendingEditorCaretRef.current = event.currentTarget.selectionStart;
                   flushOptimizedPromptCommit();
                   setIsEditingResult(false);
                 }}
@@ -1064,6 +1117,7 @@ export const PromptOptimizerNode = memo(({
               />
             ) : (
               <div
+                ref={resultPreviewRef}
                 className="nodrag min-h-[80px] w-full flex-1 cursor-text whitespace-pre-wrap overflow-auto rounded-md bg-black/20 px-2 py-1.5 text-sm leading-5 text-text-dark"
                 onClick={(event) => {
                   event.stopPropagation();

@@ -4,11 +4,9 @@ import { useTranslation } from "react-i18next";
 import { Handle, Position, useUpdateNodeInternals, type NodeProps } from "@xyflow/react";
 import {
   AudioLines,
-  Check,
   ChevronDown,
   Clapperboard,
   LoaderCircle,
-  Plus,
   Settings2,
   Sparkles,
   Video,
@@ -28,12 +26,17 @@ import { resolveVideoDurationHintFromTexts } from "@/features/canvas/domain/vide
 import { applyVoiceReferenceFormat } from "@/features/canvas/domain/voiceReferenceFormat";
 import { getDefaultVideoModelId, getVideoModel } from "@/features/canvas/models";
 import { graphImageResolver } from "@/features/canvas/application/canvasServices";
+import { readLiveInputText } from "@/features/canvas/application/liveInputText";
 import { CURRENT_RUNTIME_SESSION_ID } from "@/features/canvas/application/generationErrorReport";
 import { isQuickGenerationRunActive } from "@/features/canvas/application/quickGenerationRunState";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
 import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
+import {
+  QuickAssetPicker,
+  type QuickAssetPickerItem,
+} from "@/features/canvas/ui/QuickAssetPicker";
 import { ImagePromptOptimizerPanel } from "@/features/canvas/nodes/ImagePromptOptimizerPanel";
 import {
   cinematicAssetDescription,
@@ -478,8 +481,16 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           ? {
               // 回写的应当是节点手输的原文；早期版本会把「上游 + 本地」合并后再写进工程，
               // 这里顺手剥掉可能残留的上游块，避免它被当成用户输入长期留在输入框里。
-              quickStyle: stripUpstreamText(snapshot.quickSync.styleBrief, upstreamStyleTexts),
-              quickSynopsis: stripUpstreamText(snapshot.quickSync.storySynopsis, upstreamSynopsisTexts),
+              // 必须用**实时**上游文本：用 render 期快照会在「文本刚改完、防抖还没落库」
+              // 时剥不掉，块就被永久烧进 quickStyle/quickSynopsis，之后换文本也会一直带着旧内容。
+              quickStyle: stripUpstreamText(
+                snapshot.quickSync.styleBrief,
+                readLiveInputText(id, QUICK_INPUT_HANDLES.style),
+              ),
+              quickSynopsis: stripUpstreamText(
+                snapshot.quickSync.storySynopsis,
+                readLiveInputText(id, QUICK_INPUT_HANDLES.synopsis),
+              ),
               quickStaging: snapshot.quickSync.staging,
               quickSyncInitialized: true,
               quickStudioSceneId: snapshot.quickSync.sceneId ?? "",
@@ -487,7 +498,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           : {}),
       });
     },
-    [id, updateNodeData, upstreamStyleTexts, upstreamSynopsisTexts],
+    [id, updateNodeData],
   );
 
   const handleSendToVideo = useCallback(
@@ -544,9 +555,15 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
 
   const quickStyle = typeof data.quickStyle === "string" ? data.quickStyle : "";
   const quickSynopsis = typeof data.quickSynopsis === "string" ? data.quickSynopsis : "";
-  // 上游接入的文本在前、节点里手输的在后，合并成一份 —— 只给本地生成用。
-  const effectiveQuickStyle = mergeUpstreamText(upstreamStyleTexts, quickStyle);
-  const effectiveQuickSynopsis = mergeUpstreamText(upstreamSynopsisTexts, quickSynopsis);
+  /**
+   * 「风格 / 质量」「故事梗概」两条口子**当前**的内容（上游接入的文本 + 节点里手输的）。
+   * 上游那一半走 `readLiveInputText`（补交防抖中的编辑 + 现取 store），不用 render 期快照 ——
+   * 否则「文本改完立刻点生成」会拿到上一版文本。节点里手输的字段是即时落库的，可直接用。
+   */
+  const resolveQuickInputs = useCallback(() => ({
+    style: mergeUpstreamText(readLiveInputText(id, QUICK_INPUT_HANDLES.style), quickStyle),
+    synopsis: mergeUpstreamText(readLiveInputText(id, QUICK_INPUT_HANDLES.synopsis), quickSynopsis),
+  }), [id, quickStyle, quickSynopsis]);
   // 上游文本单独走一条通道进高级编辑，在输入框下方作灰色只读回显（不进工程文件）。
   const quickSyncUpstream = useMemo<CinematicStudioUpstreamText>(
     () => ({
@@ -685,6 +702,36 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     () => propAssets.filter((asset) => !propAssetIds.includes(cinematicAssetKey(asset))),
     [propAssetIds.join("|"), propAssets],
   );
+  /**
+   * 候选卡片的列表数据。
+   *
+   * 单独 memo 是因为卡片要按批渲染缩略图：列表数组每次都是新对象的话，滚动补批的
+   * 判定就会跟着失效，几百个角色又会退回「展开那一下全量挂载」。
+   */
+  const quickPickerItems = useMemo(() => {
+    const build = (assets: LibraryAsset[], chosenIds: string[]): QuickAssetPickerItem[] =>
+      assets.map((asset) => ({
+        id: asset.id,
+        name: cinematicDisplayName(asset, cinematicAssetNames),
+        // 传原始地址：卡片内部会换成 Rust 生成的小缩略图。这里若先转成展示地址，
+        // 「本地原图」和「http 直链」就分不出来了，卡片只能退回解码上百 MB 的原图。
+        source: asset.previewImageUrl || asset.sourcePath,
+        active: chosenIds.includes(cinematicAssetKey(asset)),
+      }));
+    return {
+      scene: build(locationAssets, sceneAssetIds),
+      character: build(characterCandidates, characterAssetIds),
+      prop: build(propCandidates, propAssetIds),
+    };
+  }, [
+    cinematicAssetNames,
+    characterAssetIds.join("|"),
+    characterCandidates,
+    locationAssets,
+    propAssetIds.join("|"),
+    propCandidates,
+    sceneAssetIds.join("|"),
+  ]);
   const selectedCharacterVoiceAssets = useMemo(() => {
     const selectedCharacterIds = new Set(characterAssetIds);
     const seenSources = new Set<string>();
@@ -876,9 +923,10 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     async (event: React.MouseEvent) => {
       event.stopPropagation();
       if (quickGenerationLockRef.current || quickGenerating) return;
-      // 校验放在取锁之前: 这条分支直接 return, 以前会把互斥锁永久留在手上,
-      // 之后每次点击都被 quickGenerationLockRef.current 静默吃掉, 像按钮点了没反应。
-      if (!effectiveQuickStyle || !effectiveQuickSynopsis) {
+      // 先取一份「当前」的风格 / 梗概：补交防抖中的文本节点编辑，再从 store 现算。
+      // 必须在取锁之前完成 —— 下面这条分支会直接 return，以前会把互斥锁永久留在手上。
+      const quickInputs = resolveQuickInputs();
+      if (!quickInputs.style || !quickInputs.synopsis) {
         setQuickError("请先填写风格/质量和故事梗概。");
         return;
       }
@@ -937,8 +985,8 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           });
         const rawPrompt = await generateQuickPrompt(
           {
-            style: effectiveQuickStyle,
-            synopsis: effectiveQuickSynopsis,
+            style: quickInputs.style,
+            synopsis: quickInputs.synopsis,
             sceneAssets: withProjectMetadata(quickPromptAssets.sceneAssets),
             characterAssets: withProjectMetadata(quickPromptAssets.characterAssets),
             ...(stagingContext.staging ? { staging: stagingContext.staging } : {}),
@@ -982,7 +1030,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           referenceAudio,
           // Agent 的输出语言未必保留用户原话里的「5秒」，所以把自己写的故事梗概 /
           // 风格也一起找一遍；两者都已并上上游接进来的文本。
-          durationHintSources: [effectiveQuickSynopsis, effectiveQuickStyle],
+          durationHintSources: [quickInputs.synopsis, quickInputs.style],
         });
       } catch (error) {
         setQuickError(error instanceof Error ? error.message : "生成提示词失败，请稍后重试。");
@@ -996,8 +1044,6 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     [
       cinematicMirrorNames,
       defaultChatSettings,
-      effectiveQuickStyle,
-      effectiveQuickSynopsis,
       handleSendToVideo,
       hasQuickStagingData,
       id,
@@ -1008,6 +1054,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       quickPromptAssets,
       quickPromptLang,
       quickStaging,
+      resolveQuickInputs,
       studioProjectId,
       updateNodeData,
     ],
@@ -1150,7 +1197,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                 "选择地点资产",
                 QUICK_INPUT_HANDLES.sceneAssets,
                 selectedSceneAssets,
-                locationAssets,
+                quickPickerItems.scene,
                 sceneInputMedia,
               ],
               [
@@ -1160,7 +1207,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                 "选择角色加入场景角色候选",
                 QUICK_INPUT_HANDLES.characterAssets,
                 selectedCharacterAssets,
-                characterCandidates,
+                quickPickerItems.character,
                 characterInputMedia,
               ],
               [
@@ -1170,11 +1217,11 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                 "选择道具加入本场",
                 QUICK_INPUT_HANDLES.propAssets,
                 selectedPropAssets,
-                propCandidates,
+                quickPickerItems.prop,
                 propInputMedia,
               ],
             ] as const
-          ).map(([kind, label, sourceLabel, pickerLabel, inputHandleId, chosen, availableAssets, connectedMedia]) => (
+          ).map(([kind, label, sourceLabel, pickerLabel, inputHandleId, chosen, pickerItems, connectedMedia]) => (
             <div
               key={kind}
               data-quick-popover
@@ -1253,82 +1300,26 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                     </button>
                   </div>
                 ))}
-                <button
-                  type="button"
-                  aria-label={`添加${label}`}
-                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded border border-dashed text-text-muted transition-colors hover:border-accent hover:bg-accent/10 hover:text-accent ${activeAssetPicker === kind ? "border-accent bg-accent/10 text-accent" : "border-white/25"}`}
-                  onClick={() => setActiveAssetPicker((current) => (current === kind ? null : kind))}
-                >
-                  <Plus className="h-4 w-4" />
-                </button>
+                <QuickAssetPicker
+                  addLabel={`添加${label}`}
+                  active={activeAssetPicker === kind}
+                  onToggleOpen={(next) => setActiveAssetPicker(next ? kind : null)}
+                  title={pickerLabel}
+                  emptyHint={
+                    kind === "character" && characterAssets.length
+                      ? "所有角色都已加入场景角色候选"
+                      : kind === "prop" && propAssets.length
+                        ? "所有道具都已加入本场"
+                        : `资产库「${sourceLabel}」中暂无资产`
+                  }
+                  items={pickerItems}
+                  onToggleItem={(assetId) => toggleQuickAsset(kind, assetId)}
+                />
                 {chosen.length === 0 &&
                 connectedMedia.images.length + connectedMedia.audio.length + connectedMedia.videos.length === 0 ? (
                   <span className="whitespace-nowrap text-[9px] text-text-muted/70">接入媒体或点击 + 选择</span>
                 ) : null}
               </div>
-
-              {activeAssetPicker === kind ? (
-                <div
-                  className="absolute left-0 top-[calc(100%+6px)] z-40 w-[min(360px,calc(100vw-40px))] rounded-lg border border-white/15 bg-[#171b25] p-2 shadow-2xl"
-                  onPointerDown={(event) => event.stopPropagation()}
-                  onWheel={(event) => event.stopPropagation()}
-                >
-                  <div className="mb-2 flex items-center justify-between gap-2">
-                    <span className="text-xs font-medium text-text">{pickerLabel}</span>
-                    <button
-                      type="button"
-                      className="rounded p-0.5 text-text-muted hover:bg-white/10 hover:text-white"
-                      onClick={() => setActiveAssetPicker(null)}
-                      aria-label="关闭选择器"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                  {/* Compact six-column cards keep the picker usable with a large asset library.
-                      The fixed-height panel deliberately scrolls inside the popover instead of
-                      overflowing the canvas viewport. */}
-                  <div className="grid h-56 grid-cols-6 content-start gap-1 overflow-y-auto overscroll-contain pr-0.5">
-                    {availableAssets.length ? (
-                      availableAssets.map((asset) => {
-                        const active = (
-                          kind === "scene" ? sceneAssetIds : kind === "character" ? characterAssetIds : propAssetIds
-                        ).includes(cinematicAssetKey(asset));
-                        return (
-                          <button
-                            key={asset.id}
-                            type="button"
-                            className={`relative overflow-hidden rounded border text-left transition-colors ${active ? "border-accent ring-1 ring-accent" : "border-white/15 hover:border-white/40"}`}
-                            onClick={() => toggleQuickAsset(kind, asset.id)}
-                            title={cinematicDisplayName(asset, cinematicAssetNames)}
-                          >
-                            <img
-                              className="aspect-square w-full object-cover"
-                              src={resolveImageDisplayUrl(asset.previewImageUrl || asset.sourcePath)}
-                              alt={cinematicDisplayName(asset, cinematicAssetNames)}
-                            />
-                            <span className="block truncate bg-black/70 px-0.5 py-0.5 text-[8px] text-white">
-                              {cinematicDisplayName(asset, cinematicAssetNames)}
-                            </span>
-                            {active ? (
-                              <span className="absolute right-0.5 top-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-accent text-white">
-                                <Check className="h-2.5 w-2.5" />
-                              </span>
-                            ) : null}
-                          </button>
-                        );
-                      })
-                    ) : (
-                      <p className="col-span-6 py-4 text-center text-[10px] text-text-muted">
-                        {kind === "character" && characterAssets.length
-                          ? "所有角色都已加入场景角色候选"
-                          : kind === "prop" && propAssets.length
-                            ? "所有道具都已加入本场"
-                            : `资产库「${sourceLabel}」中暂无资产`}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              ) : null}
             </div>
           ))}
         </div>

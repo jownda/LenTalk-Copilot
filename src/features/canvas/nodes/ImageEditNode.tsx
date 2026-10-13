@@ -54,6 +54,7 @@ import {
   resolveReferenceAwareDeleteRange,
 } from '@/features/canvas/application/referenceTokenEditing';
 import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
+import { readLiveInputText } from '@/features/canvas/application/liveInputText';
 import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import {
   DEFAULT_IMAGE_MODEL_ID,
@@ -756,7 +757,8 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
 
     const prompt = [
       promptDraftRef.current.replace(/@(?=图\d+)/g, '').trim(),
-      ...incomingText,
+      // 上游文本节点的编辑是防抖提交的: 现取一次(补交欠账 + 直读 store), 避免用到上一版文本。
+      ...readLiveInputText(id),
     ].filter(Boolean).join('\n\n').trim();
     if (!prompt) {
       const errorMessage = t('node.imageEdit.promptRequired');
@@ -949,7 +951,6 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     addEdge,
     providerApiKey,
     findNodePosition,
-    incomingText,
     effectiveExtraParams,
     flushPromptCommit,
     id,

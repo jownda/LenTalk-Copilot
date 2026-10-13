@@ -34,15 +34,21 @@ describe('知鸟AI 推荐平台', () => {
   });
 
   it('价格区间按图片/视频/音频返回 min~max, < 0.01 全部归 0.01', () => {
-    // 锁住公开价格表基线(2026-09-13 抓自 /api/v1/models):
+    // 锁住积分标价快照基线(2026-09-13 抓自 /api/v1/models):
     //   图片 24 个: min ⚡0.0056 (aliyun-image-superres) → 0.01; max ⚡0.1687 → 0.17
     //   视频 49 个: min ⚡0.0009 (aliyun-video-superres) → 0.01; max ⚡1.36
-    //   音频 9 个 : max ⚡2.2 (voice-clone; 停服已剔除)
+    //   音频 9 个 : max ⚡2.2 (voice-clone)
+    // 2026-10-07 起该接口只返回 chat 目录, 媒体单价必须带密钥走
+    // GET /v1/skills/models/{model}/pricing, 故这份区间只作兜底、不随文档清单同步。
     expect(zhiniao?.pricingRange).toEqual({
       image: '⚡0.01 ~ 0.17 / 张',
       video: '⚡0.01 ~ 1.36 / 次',
       audio: '⚡0.01 ~ 2.2 / 次',
     });
+  });
+
+  it('卡片提供官方定价页直达入口(价格链路)', () => {
+    expect(zhiniao?.pricingUrl).toBe('https://cuai.token6688.com/pricing');
   });
 
   it('预填的图片模型不会被视频模型名启发式误判成视频', () => {
@@ -70,6 +76,24 @@ describe('知鸟AI 推荐平台', () => {
     expect(chatModels.length).toBeGreaterThan(0);
     const all = [...models, ...videoModels, ...audioModels, ...chatModels];
     expect(new Set(all).size).toBe(all.length);
+  });
+
+  it('预填的视频模型都能被视频启发式识别(含 Grok Imagine 视频系)', () => {
+    // grok-imagine-1.5 / grok-imagine-1-5-7tu-special 名字里只有 imagine、没有 video，
+    // 旧实现把它们判成图片/对话模型 —— 视频节点下拉里就选不到。这里锁住「预填的
+    // 视频模型必须都能被识别为视频」。
+    const videoModels = zhiniao?.videoModels ?? [];
+    expect(videoModels.length).toBeGreaterThan(0);
+    expect(videoModels.filter((model) => !isVideoGenerationModelName(model))).toEqual([]);
+  });
+
+  it('Grok Imagine 只有带 image 的变体是图片, 视频变体留在视频清单', () => {
+    const models = zhiniao?.models ?? [];
+    const videoModels = zhiniao?.videoModels ?? [];
+    expect(models).toContain('grok-imagine-image');
+    expect(models).not.toContain('grok-imagine-1.5');
+    expect(models).not.toContain('grok-imagine-1-5-7tu-special');
+    expect(videoModels).toContain('grok-imagine-1-5-7tu-special');
   });
 });
 
@@ -123,6 +147,43 @@ describe('字子动画 推荐平台', () => {
   });
 });
 
+describe('炳火 API 推荐平台', () => {
+  const binghuo = recommendedApis.find((api) => api.id === 'binghuo');
+
+  it('以 api.7tai.cc 作为 Base URL, 并带上 /v1', () => {
+    expect(binghuo).toBeDefined();
+    expect(binghuo?.baseUrl).toBe('https://api.7tai.cc/v1');
+    expect(binghuo?.name).toBe('炳火 API');
+  });
+
+  it('注册链接是带推荐码的落地页, 不再是登录页', () => {
+    // 2026-10-13 起用带 aff 的推荐链接; 旧值 /console/log 是控制台登录页,
+    // 新用户点进去只能看到登录框, 还得自己找注册入口。
+    expect(binghuo?.registerUrl).toBe('https://api.7tai.cc/register?aff=T1TT');
+    expect(binghuo?.registerUrl).not.toContain('/console/');
+  });
+
+  it('已在密钥页可见白名单里(不在白名单的卡片根本不渲染)', () => {
+    expect(visibleRecommendedApiIds).toContain('binghuo');
+    expect(listVisibleRecommendedApis().some((api) => api.id === 'binghuo')).toBe(true);
+  });
+
+  it('专属链路按 Base URL 就能命中, 不依赖自定义平台 id', () => {
+    // 卡片连上后 id 由名称生成(「炳火 API」→ custom:炳火-api), 所以 Base URL 兜底
+    // 必须成立, 否则节点会退化成通用 OpenAI Video 协议。
+    expect(
+      resolveVideoModelProfile('custom:炳火-api/bh2.0-720p', 'https://api.7tai.cc/v1').id,
+    ).toBe('binghuo-video');
+  });
+
+  it('预填的图片模型不会被视频/音频启发式误判', () => {
+    const models = binghuo?.models ?? [];
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.filter((model) => isVideoGenerationModelName(model))).toEqual([]);
+    expect(models.filter((model) => isAudioModelName(model))).toEqual([]);
+  });
+});
+
 describe('isKnownOpenAiImagesBaseUrl', () => {
   it('把知鸟/TokeGo 域名判定为已知 OpenAI Images 平台', () => {
     expect(isKnownOpenAiImagesBaseUrl('https://cuai.token6688.com')).toBe(true);
@@ -139,6 +200,7 @@ describe('推荐平台可见白名单(密钥页展示内置推荐平台)', () =>
   it('界面只渲染白名单平台, 顺序与白名单一致', () => {
     expect(listVisibleRecommendedApis().map((api) => api.id)).toEqual([
       'zhiniao',
+      'binghuo',
       'runninghub',
       'runninghub-cn',
       'modelscope',
@@ -164,7 +226,8 @@ describe('推荐平台可见白名单(密钥页展示内置推荐平台)', () =>
     const hiddenIds = hidden.map((api) => api.id);
     expect(hiddenIds).toContain('zizidonghua');
     expect(hiddenIds).toContain('sub2api-video');
-    expect(hiddenIds).toContain('binghuo');
+    // 炳火 2026-10-13 起进入白名单(卡片可见), 不再属于隐藏条目。
+    expect(hiddenIds).not.toContain('binghuo');
     // 帧间 API 按用户要求从界面隐藏, 但它带着 zhenjian-task-api 专属链路 ——
     // 条目必须留在清单里, 否则手工用同一 Base URL 建的平台会命中不到链路。
     expect(hiddenIds).toContain('zhenjian');
@@ -343,6 +406,8 @@ describe('推荐平台的余额查询声明', () => {
     expect(kinds).toEqual({
       // TokenGo 是 One-API 系网关: /v1/dashboard/billing/subscription 存在(未授权时 401 而非 404)。
       zhiniao: 'openai-billing',
+      // 炳火没有实测过的额度接口 —— 宁可不显示余额, 也不猜一个数字出来。
+      binghuo: null,
       runninghub: 'runninghub',
       'runninghub-cn': 'runninghub',
       // ModelScope 实测该端点返回 404 —— 声明了只会白发请求且永远查不到余额。
@@ -400,9 +465,15 @@ describe('预设视频模型的增量同步', () => {
   });
 
   it('清单不由代码维护的平台不参与同步', () => {
-    for (const baseUrl of ['https://api.wgspai.cn/v1', 'https://api.grsai.com', 'https://cuai.token6688.com', '']) {
+    for (const baseUrl of ['https://api.wgspai.cn/v1', 'https://api.grsai.com', '']) {
       expect(resolveNewRecommendedVideoModels(baseUrl, [], undefined)).toBeNull();
     }
+  });
+
+  it('知鸟已纳入同步: 老配置能把 2026-10-07 新增的视频模型补出来', () => {
+    const resolved = resolveNewRecommendedVideoModels('https://cuai.token6688.com', [], undefined);
+    expect(resolved?.revision).toBe(1);
+    expect(resolved?.models).toContain('grok-imagine-1-5-7tu-special');
   });
 
   it('两条 RunningHub 预设的 revision 必须同步推进', () => {

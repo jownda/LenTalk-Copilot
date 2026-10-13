@@ -35,6 +35,10 @@ import {
   usePajubenModelOptions,
 } from "./pajubenModels";
 import { describeEpisodeGuess } from "./pajubenEpisode";
+import {
+  DEFAULT_PAJUBEN_QUALITY_TIER,
+  resolvePajubenQualityPreset,
+} from "./pajubenQuality";
 
 const LOG_LIMIT = 600;
 const VIDEO_EXTENSIONS = ["mp4", "mkv", "mov", "avi", "flv", "ts", "m4v", "wmv"];
@@ -61,6 +65,8 @@ const CARD_CLASS = "rounded-xl border border-border-dark bg-surface-dark p-4";
 const FIELD_CLASS =
   "h-9 w-full rounded-lg border border-border-dark bg-bg-dark px-3 text-sm text-text-dark outline-none transition-colors placeholder:text-text-muted focus:border-accent";
 const LABEL_CLASS = "text-xs font-medium text-text-muted";
+// 工作台的单集默认档 = 共享的「标准」画质档，避免与「扒视频」快速模式的默认值漂移。
+const DEFAULT_QUALITY_PRESET = resolvePajubenQualityPreset(DEFAULT_PAJUBEN_QUALITY_TIER);
 
 function toNumber(value: string): number | null {
   const trimmed = value.trim();
@@ -96,9 +102,9 @@ export function PajubenStudio({ onClose }: { onClose: () => void }) {
   // 会被下面那个 effect 清掉，避免带着一个不存在的模型去跑。
   const modelKey = useSettingsStore((state) => state.pajubenModelKey) ?? "";
   const setModelKey = useSettingsStore((state) => state.setPajubenModelKey);
-  const [fps, setFps] = useState("1");
-  const [resolution, setResolution] = useState("low");
-  const [maxFrames, setMaxFrames] = useState("120");
+  const [fps, setFps] = useState(String(DEFAULT_QUALITY_PRESET.fps));
+  const [resolution, setResolution] = useState<string>(DEFAULT_QUALITY_PRESET.resolution);
+  const [maxFrames, setMaxFrames] = useState(String(DEFAULT_QUALITY_PRESET.maxFrames));
   const [workers, setWorkers] = useState("3");
   const [outputDir, setOutputDir] = useState("");
   const [roleSheet, setRoleSheet] = useState("");

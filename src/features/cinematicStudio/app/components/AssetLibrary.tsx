@@ -116,7 +116,9 @@ function projectUsageCount(project: ProjectV2, assetId: string): number {
 export default function AssetLibrary({ project, scene, dispatch, locale, t, setNotice, canvasAudioSources }: AssetLibraryProps) {
   const [tab, setTab] = useState<AssetKind>("character");
   const [editingId, setEditingId] = useState<string | null>(null);
-  const assets = (project.assets ?? []).filter((asset) => asset.kind === tab);
+  // 资产按创建顺序追加(ADD_ASSET 永远 push 到尾部), 这里倒序展示,
+  // 让最新新建的资产排在网格最前面(与素材库「图片素材」列表的排序一致)。
+  const assets = (project.assets ?? []).filter((asset) => asset.kind === tab).reverse();
   const editing = (project.assets ?? []).find((asset) => asset.id === editingId);
 
   const addAsset = (kind: AssetKind) => {

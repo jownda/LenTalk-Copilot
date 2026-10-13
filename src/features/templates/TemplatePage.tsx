@@ -8,6 +8,7 @@ import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData'
 import { browserTemplateRepository } from './storage/templateRepository';
 import { templateCoverSource, templateIsBroken, type Template } from './types';
 import { DEFAULT_TEMPLATE_SHARE_ROOT, TemplateSyncTimeoutError, loadTemplateShareRoot, saveTemplateShareRoot, syncTemplatesFromShare, syncTemplatesToShare } from '@/commands/templateSync';
+import { localizeAllTemplateMedia } from '@/features/mediaMaintenance/localizeMedia';
 
 type TemplateSort = 'updatedAt' | 'name';
 
@@ -179,9 +180,24 @@ export function TemplatePage() {
       const root = shareRoot.trim();
       if (!root) throw new Error(t('templatePage.sharePathRequired'));
       await saveTemplateShareRoot(root);
+      // 先把模板里的第三方临时链接（阿里云 OSS 等）搬回本地：共享盘随后复制的是本地
+      // 文件，源链接过期也不会让模板在别的机器上坏掉。本地化失败不阻断同步。
+      try {
+        await localizeAllTemplateMedia();
+      } catch (error) {
+        console.warn('[template-sync] 模板素材本地化失败，继续同步', error);
+      }
       const result = await syncTemplatesToShare(root);
+      // 同步前做过一次素材本地化，模板里的 sourcePath 可能已经变了 —— 刷新列表，
+      // 否则页面还拿着旧的远端链接渲染封面。
+      await refresh();
       setShareDialogOpen(false);
-      setNotice(t('templatePage.syncSuccess', { templates: result.templateCount, files: result.copiedFileCount }));
+      const base = t('templatePage.syncSuccess', { templates: result.templateCount, files: result.copiedFileCount });
+      setNotice(
+        result.failedFileCount > 0
+          ? `${base}${t('templatePage.syncPartial', { count: result.failedFileCount })}`
+          : base,
+      );
     } catch (error) {
       setNotice(describeSyncError(error));
     } finally {

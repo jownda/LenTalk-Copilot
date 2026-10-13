@@ -48,9 +48,24 @@ export async function saveTemplateShareRoot(root: string): Promise<void> {
   await invoke('save_app_setting', { key: TEMPLATE_SHARE_SETTING_KEY, value: root });
 }
 
-export async function syncTemplatesToShare(sharedRoot: string): Promise<{ templateCount: number; copiedFileCount: number }> {
+export interface TemplateAssetFailure {
+  /** 原始素材地址（远端 URL 或本机路径）。 */
+  source: string;
+  /** 失败原因，可直接展示给用户。 */
+  reason: string;
+}
+
+export interface TemplateSyncResult {
+  templateCount: number;
+  copiedFileCount: number;
+  /** 因源站已删除/过期/网络不可达而没能搬运的素材数。 */
+  failedFileCount: number;
+  failures: TemplateAssetFailure[];
+}
+
+export async function syncTemplatesToShare(sharedRoot: string): Promise<TemplateSyncResult> {
   if (!isTauri()) throw new Error('共享盘同步仅支持桌面端');
-  return withSyncTimeout(invoke<{ templateCount: number; copiedFileCount: number }>('template_sync_to_share', { sharedRoot }));
+  return withSyncTimeout(invoke<TemplateSyncResult>('template_sync_to_share', { sharedRoot }));
 }
 
 export async function syncTemplatesFromShare(sharedRoot: string): Promise<{ importedCount: number }> {
@@ -62,6 +77,9 @@ export interface TemplateUploadResult {
   /** 共享盘原本没有该模板（新建包目录）；false 表示原地更新了已有包。 */
   created: boolean;
   copiedFileCount: number;
+  /** 源已失效、没能搬上共享盘的素材数。 */
+  failedFileCount: number;
+  failures: TemplateAssetFailure[];
 }
 
 /** 单独上传一个模板到共享盘（画布内模板卡片右键）。 */

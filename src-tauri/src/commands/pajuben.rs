@@ -803,6 +803,25 @@ pub fn pajuben_run(
         .stderr(Stdio::piped());
     // 密钥走环境变量：命令行参数会出现在进程列表里，同机其他进程可读。
     command.env("PAJUBEN_API_KEY", request.api_key.trim());
+    // 宿主注入的代理会一路污染到引擎发起的模型请求上：引擎用 `curl` 子进程发
+    // 请求（见 pajuben.py 的 `curl_post_json`），而 curl 会自动读 `http_proxy` /
+    // `https_proxy` 这类环境变量，把本该直连的请求转到一个本机转发代理上。
+    // 最典型的触发方式是从带代理的终端 / 中转工具里启动 LenTalk —— 此时父进程
+    // 带着 `HTTPS_PROXY=http://127.0.0.1:xxxxx`，子进程原样继承，扒取整段失败在
+    // 「响应中断」（`curl: (56) Recv failure: Connection was aborted`），
+    // 而同样一段视频用桌面快捷方式启动的同一份代码却完全正常，极难排查。
+    // 引擎的代理只认 `--proxy`（前端「扒剧本」当前传空 = 直连），所以这里把宿主
+    // 代理变量清掉：走不走代理完全由显式配置决定，不再受启动环境影响。
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(key);
+    }
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let mut paths = vec![ffmpeg];
     paths.extend(std::env::split_paths(&existing));

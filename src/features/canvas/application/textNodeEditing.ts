@@ -33,3 +33,7 @@ export function replaceAllText(text: string, query: string, replacement: string,
   });
   return result + text.slice(cursor);
 }
+
+// 滚动位置搬运的纯函数已抽到 `./textViewScroll`(编辑态 ⇄ 预览态通用), 这里重新导出,
+// 兼容既有调用方与测试。
+export { clampTextViewScrollTop } from './textViewScroll';

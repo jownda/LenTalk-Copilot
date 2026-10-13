@@ -26,6 +26,8 @@ const SAMPLE_URL =
 
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 let failed = 0;
+/** 需要联网才能跑的断言数（公网不可达时跳过，避免整份套件被一次超时带走）。 */
+let skipped = 0;
 const check = (label, ok, detail = '') => {
   console.log(`${ok ? '✅' : '❌'} ${label}${detail ? ` — ${detail}` : ''}`);
   if (!ok) failed += 1;
@@ -121,18 +123,31 @@ function stripCommentsAndStrings(code) {
     small.ok ? `${small.size} bytes / ${small.contentType}` : small.error,
   );
 
-  const response = await fetch(SAMPLE_URL);
-  const expected = new Uint8Array(await response.arrayBuffer());
-  const large = await grabInPage(SAMPLE_URL, 16 * 1024 * 1024);
-  const largeBytes = large.ok ? new Uint8Array(Buffer.from(large.base64, 'base64')) : null;
-  check(
-    '跨域图片（1.5 MB，走流式累加分支）：返回 ok 且逐字节一致',
-    large.ok === true && largeBytes !== null && sha(largeBytes) === sha(expected),
-    large.ok ? `${large.size} bytes / ${large.contentType}` : large.error,
-  );
+  // 下面两条断言要真的从公网下一张图（验证「流式累加」分支拿到的字节逐字节一致）。
+  // 网络/代理不通时**跳过而不是崩** —— 否则一次 CONNECT_TIMEOUT 会把后面所有
+  // 不依赖网络的断言（DOM 扫描、HLS 找回）一起带走，看起来像代码坏了。
+  let sample = null;
+  try {
+    const response = await fetch(SAMPLE_URL, { signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    sample = new Uint8Array(await response.arrayBuffer());
+  } catch (error) {
+    skipped += 1;
+    console.log(`⏭️  跳过「跨域图片流式累加」两条断言 —— 公网取不到样例图（${error.message}）`);
+  }
 
-  const capped = await grabInPage(SAMPLE_URL, 64 * 1024);
-  check('超过内联上限时返回 tooLarge（改走后台流式通道）', capped.ok === false && capped.tooLarge === true);
+  if (sample) {
+    const large = await grabInPage(SAMPLE_URL, 16 * 1024 * 1024);
+    const largeBytes = large.ok ? new Uint8Array(Buffer.from(large.base64, 'base64')) : null;
+    check(
+      '跨域图片（1.5 MB，走流式累加分支）：返回 ok 且逐字节一致',
+      large.ok === true && largeBytes !== null && sha(largeBytes) === sha(sample),
+      large.ok ? `${large.size} bytes / ${large.contentType}` : large.error,
+    );
+
+    const capped = await grabInPage(SAMPLE_URL, 64 * 1024);
+    check('超过内联上限时返回 tooLarge（改走后台流式通道）', capped.ok === false && capped.tooLarge === true);
+  }
 }
 
 // ── 2. popup.js :: scanPageMedia（只提供页面应有的全局，跑到返回为止）──
@@ -312,5 +327,6 @@ function makeStreamContext({ nodes = [], entries = [] } = {}) {
   }
 }
 
-console.log(failed === 0 ? '\n全部通过' : `\n${failed} 项失败`);
+const tail = skipped ? `，跳过 ${skipped} 组（需联网）` : '';
+console.log(failed === 0 ? `\n全部通过${tail}` : `\n${failed} 项失败${tail}`);
 process.exit(failed === 0 ? 0 : 1);

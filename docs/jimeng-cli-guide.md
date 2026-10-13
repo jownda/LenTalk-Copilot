@@ -25,9 +25,12 @@ curl -fsSL https://jimeng.jianying.com/cli | bash
 
 安装脚本会：
 
-1. 从字节 CDN 下载 `dreamina` 可执行文件；
-2. 安装到 `~/.dreamina_cli/`，并把目录写入你的 shell 启动文件（`~/.zshrc` / `~/.bashrc`）；
-3. 同时下载官方 `SKILL.md` 到 `~/.dreamina_cli/dreamina/SKILL.md`。
+1. 按 `uname -m` 选架构，从字节 CDN 下载对应平台的 `dreamina` 可执行文件；
+2. 安装到 **`~/.local/bin/dreamina`**（可用 `DREAMINA_INSTALL_DIR` 覆盖），并把该目录写进你的 shell 启动文件（zsh → `~/.zshrc`；bash → `~/.bashrc` / `~/.bash_profile`）；
+3. 下载官方 `SKILL.md`（落在 `~/.dreamina_cli/dreamina/SKILL.md`）与 `version.json`（落在 `~/.dreamina_cli/version.json`）；
+4. macOS 上顺带清掉隔离属性（`xattr -d com.apple.quarantine`），避免 Gatekeeper 拦住执行。
+
+> bin 在 `~/.local/bin`，**不在** `~/.dreamina_cli/` —— 后者只放 SKILL.md / version.json / 日志。
 
 安装完成后**重新打开终端**（或执行 `source ~/.zshrc`），验证：
 
@@ -35,11 +38,109 @@ curl -fsSL https://jimeng.jianying.com/cli | bash
 dreamina -h
 ```
 
-看到命令列表即安装成功。当前最新版本：1.4.17（2026-08-18 发布，Seedance 2.5 支持 1080p）。
+看到命令列表即安装成功。当前最新版本：**1.4.19**（2026-10-03 发布；`--ratio` 参数需 1.4.18 起）。
 
 > 你的机器已安装（`/Users/job/.local/bin/dreamina`，8/17 构建版本），可跳过本步。
 >
 > 升级到最新版：重新执行一次上面的安装命令即可。
+
+---
+
+### 1.1 应用内「自动安装」的行为（已自动识别系统）
+
+Rust 侧 `jimeng_cli_install` 会**先识别当前平台**再下载对应产物，与官方脚本
+`detect_platform()` 逐字同源（`JimengCliPlatform::detect()`）：
+
+| 平台 | 下载文件 | 落地路径 | 附加处理 |
+|---|---|---|---|
+| Windows (x64) | `dreamina_cli_windows_amd64.exe` | `%USERPROFILE%\bin\dreamina.exe` | 用 PowerShell 写**用户级** PATH |
+| macOS (Apple 芯片) | `dreamina_cli_darwin_arm64` | `~/.local/bin/dreamina` | `chmod 755` + 清 `com.apple.quarantine` |
+| macOS (Intel) | `dreamina_cli_darwin_amd64` | 同上 | 同上 |
+| Linux (x64 / arm64) | `dreamina_cli_linux_amd64` / `_arm64` | 同上 | `chmod 755` |
+
+细节说明：
+
+- **Apple 芯片判定**走 `sysctl -n hw.optional.arm64`，因为 Rosetta 下 `uname -m` 会谎报 `x86_64`。
+- PATH 写入：Windows 改用户级环境变量；macOS/Linux 把 `export PATH="…:$PATH"` 追加到当前 shell
+  的启动文件（zsh → `${ZDOTDIR:-$HOME}/.zshrc`；bash → `.bashrc` / `.bash_profile`；其它 → `.profile`）。
+  `$SHELL` 缺失时优先落已存在的 `~/.zshrc` 而不是 `~/.profile`（后者 zsh 根本不读）。
+- 装完会**自动复检**：`common_locations` 的首批候选里就含 `~/.local/bin` 与 Windows 的
+  `%USERPROFILE%\bin`，所以复检能立刻命中；复检失败时返回带平台名的可读提示，不抛致命错误。
+- 不支持的平台（如 32 位）返回「暂不支持自动安装」，不会下错产物。
+
+> **旧版本遗留提醒**：只服务 Windows 的那一版（`ensure_windows_user_path` 在非 Windows 上是空实现）
+> 在 mac 上点它会下到一个跑不起来的 Windows PE，写到 `~/bin/dreamina.exe`（约 32MB），且不改 PATH。
+> 如果你在旧版本点过，先清掉它：`rm -f ~/bin/dreamina.exe`。
+
+### 1.2 macOS / Linux 手动安装（自动安装仍失败时）
+
+**方式 A：官方一键脚本（首选）**
+
+```bash
+curl -fsSL https://jimeng.jianying.com/cli | bash
+```
+
+脚本带 `set -euo pipefail`，任何一步失败都会整体中止，常见原因见下面的排查表。
+
+**方式 B：脚本跑不通就手动下二进制（整段可复制）**
+
+```bash
+# 1) 选架构：M 系列 = arm64，Intel = x86_64
+ARCH=darwin_amd64
+case "$(uname -m)" in arm64 | aarch64) ARCH=darwin_arm64 ;; esac
+BASE="https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/dreamina_cli_beta"
+
+# 2) 下载并安装到 ~/.local/bin/dreamina
+mkdir -p ~/.local/bin
+curl -fL --progress-bar "$BASE/dreamina_cli_$ARCH" -o ~/.local/bin/dreamina
+
+# 3) 赋执行权限 + 去掉 Gatekeeper 隔离标记
+chmod +x ~/.local/bin/dreamina
+xattr -d com.apple.quarantine ~/.local/bin/dreamina 2>/dev/null || true
+
+# 4) 写进 PATH（zsh；用 bash 的改成 ~/.bash_profile）
+grep -qF '.local/bin' ~/.zshrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+
+# 5) 补 SKILL.md / version.json（可选，供 agent 用）
+mkdir -p ~/.dreamina_cli/dreamina
+curl -fsSL "$BASE/SKILL.md" -o ~/.dreamina_cli/dreamina/SKILL.md
+curl -fsSL "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/version.json" \
+  -o ~/.dreamina_cli/version.json
+
+# 6) 验证
+exec zsh -l
+which dreamina && dreamina -h && dreamina user_credit
+```
+
+体积参考（2026-10-09 实测）：`darwin_arm64` 27,648,066 字节、`darwin_amd64` 32,206,480 字节。
+下下来明显小于 1MB 说明拿到的是错误页而不是二进制。
+
+**方式 C：让 LenTalk 找到它**
+
+设置 → 密钥 → 即梦 CLI → 「可执行命令」填**完整路径**：
+
+```
+/Users/job/.local/bin/dreamina
+```
+
+（`job` 换成你的用户名。应用从 Finder 启动时不继承终端 PATH，填绝对路径最稳。）
+
+**方式 B 常见失败点**
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 脚本跑完仍 `dreamina: command not found` | `$SHELL` 为空（或不是 zsh/bash）时脚本把 PATH 写进了 `~/.profile`，而 zsh 不读它 → 手动把 `export PATH="$HOME/.local/bin:$PATH"` 加进 `~/.zshrc` |
+| `curl: (60) SSL certificate problem` | 公司网络 / 代理做了 TLS 拦截 → 换网络（手机热点）对照，或临时 `curl --insecure` |
+| `zsh: killed`、弹「无法验证开发者」 | 隔离属性没清干净：`xattr -cr ~/.local/bin/dreamina` 后再试 |
+| M 系列机器却下到 amd64 | 官方脚本按 `uname -m` 判断，Rosetta 终端会误判成 x86_64（能跑但更慢）；用方式 B 强制 arm64。应用内自动安装改用 `sysctl hw.optional.arm64` 判定，不受此影响 |
+| 应用内仍报「无法启动即梦 CLI」 | 填的是命令名但 PATH 里没有；改填完整路径，并**重启应用**（PATH 在启动时读取） |
+
+装好后照常登录：
+
+```bash
+dreamina login          # 浏览器里输 user_code 完成授权
+dreamina user_credit    # 看到积分 = 可用
+```
 
 ---
 

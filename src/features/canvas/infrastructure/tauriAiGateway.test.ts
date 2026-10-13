@@ -4,9 +4,18 @@ import {
   isPubliclyReachableHttpUrl,
   localizeReferenceTokens,
   needsCompatibilityVideoWorker,
+  tauriAiGateway,
   usesRunningHubCliDirectApi,
   withZhiniaoImageMode,
 } from "./tauriAiGateway";
+import {
+  VideoGenerationCanceledError,
+  closeVideoCancellationWindow,
+  isVideoCancellationRequested,
+  openVideoCancellationWindow,
+  requestVideoCancellation,
+  throwIfVideoSubmissionCanceled,
+} from "@/features/canvas/application/videoGenerationCancel";
 
 describe("needsCompatibilityVideoWorker", () => {
   const withTransport = (model: string, transport?: string) =>
@@ -198,5 +207,39 @@ describe("isPubliclyReachableHttpUrl", () => {
     expect(isPubliclyReachableHttpUrl("data:image/png;base64,AAAA")).toBe(false);
     expect(isPubliclyReachableHttpUrl("/Users/job/a.png")).toBe(false);
     expect(isPubliclyReachableHttpUrl("")).toBe(false);
+  });
+});
+
+describe("submitGenerateVideoJob 的取消检查点", () => {
+  /**
+   * 这条护的是「取消生成」的**接线**: 窗口记账本身由
+   * `application/videoGenerationCancel.test.ts` 覆盖, 但如果没有人在提交流水线里读它,
+   * 用户点取消按钮就会看起来毫无反应(素材照样规整、请求照样发出去、照样计费)。
+   */
+  it("窗口内已点取消时, 提交在碰平台配置之前就中止", async () => {
+    const nodeId = "cancel-checkpoint-node";
+    openVideoCancellationWindow(nodeId);
+    requestVideoCancellation(nodeId);
+    try {
+      await expect(
+        tauriAiGateway.submitGenerateVideoJob(
+          { model: "custom:relay/m", prompt: "p", duration: 5, aspectRatio: "16:9" } as never,
+          { cancellationNodeId: nodeId },
+        ),
+      ).rejects.toBeInstanceOf(VideoGenerationCanceledError);
+    } finally {
+      closeVideoCancellationWindow(nodeId);
+    }
+  });
+
+  it("窗口已关闭(平台已受理)时不再拦提交", () => {
+    const nodeId = "cancel-window-closed-node";
+    try {
+      // 关掉的窗口读出来必须是"没取消" —— 否则平台受理后仍会在检查点把请求掐掉。
+      expect(isVideoCancellationRequested(nodeId)).toBe(false);
+      expect(() => throwIfVideoSubmissionCanceled(nodeId)).not.toThrow();
+    } finally {
+      closeVideoCancellationWindow(nodeId);
+    }
   });
 });

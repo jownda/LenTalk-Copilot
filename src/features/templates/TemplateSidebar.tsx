@@ -15,6 +15,7 @@ import {
   uploadTemplateToShare,
 } from '@/commands/templateSync';
 import { TEMPLATE_DRAG_DATA_TYPE, templateDragPayload } from '@/features/templates/templateDrag';
+import { localizeTemplateMediaById } from '@/features/mediaMaintenance/localizeMedia';
 import { useTemplateLibrary } from '@/features/templates/useTemplateLibrary';
 import { TemplateDetailDialog } from '@/features/templates/TemplateDetailPage';
 import { TemplateDeleteConfirmDialog } from '@/features/templates/TemplateDeleteConfirm';
@@ -201,13 +202,26 @@ export function TemplateSidebar({ open, onClose }: TemplateSidebarProps) {
     setNotice({ kind: 'info', text: t('templateSidebar.uploading', '上传中…') });
     try {
       const root = await resolveTemplateShareRoot();
+      // 先把该模板里的第三方临时链接搬回本地，再去共享盘复制本地文件 ——
+      // 源链接过期只影响这一个素材，不会让整次上传失败。本地化失败同样继续上传。
+      try {
+        await localizeTemplateMediaById(templateId);
+      } catch (error) {
+        console.warn('[template-upload] 模板素材本地化失败，继续上传', error);
+      }
       const result = await uploadTemplateToShare(templateId, root);
+      const base = result.created
+        ? t('templateSidebar.uploaded', '已上传到共享盘')
+        : t('templateSidebar.uploadedUpdated', '已更新共享盘上的模板');
       setNotice({
-        kind: 'ok',
-        text: result.created
-          ? t('templateSidebar.uploaded', '已上传到共享盘')
-          : t('templateSidebar.uploadedUpdated', '已更新共享盘上的模板'),
+        kind: result.failedFileCount > 0 ? 'error' : 'ok',
+        text:
+          result.failedFileCount > 0
+            ? `${base}${t('templateSidebar.uploadPartial', { count: result.failedFileCount })}`
+            : base,
       });
+      // 上传前做过素材本地化，sourcePath 可能已变 —— 刷新列表，避免继续用旧的远端封面。
+      await refresh();
     } catch (error) {
       setNotice({ kind: 'error', text: describeShareError(error) });
     } finally {

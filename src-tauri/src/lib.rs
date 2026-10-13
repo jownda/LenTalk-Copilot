@@ -14,6 +14,7 @@ use commands::cloud_drive;
 use commands::image;
 use commands::jimeng_cli;
 use commands::media_file;
+use commands::media_output;
 use commands::novel;
 use commands::pajuben;
 use commands::wan_cli;
@@ -23,6 +24,7 @@ use commands::runninghub_cli;
 use commands::system;
 use commands::template_state;
 use commands::template_sync;
+use commands::thumbnail;
 use commands::update;
 use commands::usage_log;
 use commands::video_cfr;
@@ -87,11 +89,36 @@ fn show_main_window(app: &tauri::AppHandle) {
         if let Err(err) = main_window.show() {
             warn!("failed to show main window: {err}");
         }
+        // `show()` 对最小化的窗口不保证还原(Windows 上等价于 SW_SHOW, 可能只是取消隐藏),
+        // 而托盘唤起、以及「重复启动应用时把已有实例叫到前台」都要求它真的回到正常尺寸。
+        if let Err(err) = main_window.unminimize() {
+            warn!("failed to unminimize main window: {err}");
+        }
         if let Err(err) = main_window.set_focus() {
             warn!("failed to focus main window: {err}");
         }
     } else {
         warn!("main window not found while trying to reveal UI");
+    }
+}
+
+/// 单实例互斥：同一时间只允许一个正式运行的应用进程。
+///
+/// 「桌面端预览」(`tauri dev`) **刻意排除在外** —— 开发时要能和已安装的正式版并存，
+/// 也要能同时开多个实例做对比调试；`tauri dev` 的构建里 `is_dev()` 为 true，
+/// 正式构建(`tauri build`)为 false，所以这一个判据就够了。
+///
+/// 正式构建下，第二个进程会把命令行参数转交给已在运行的实例后自己退出，
+/// 这里必须把已有窗口叫到前台 —— 否则用户双击图标看到的现象是「什么都没发生」
+/// (窗口在关闭按钮之后只是被收进了托盘, 进程一直活着)。
+fn with_single_instance(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    if tauri::is_dev() {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            info!("duplicate launch forwarded to the running instance, revealing main window");
+            show_main_window(app);
+        }))
     }
 }
 
@@ -143,7 +170,7 @@ fn frontend_ready(app: tauri::AppHandle) {
 pub fn run() {
     setup_logging();
 
-    let app = tauri::Builder::default()
+    let app = with_single_instance(tauri::Builder::default())
         .on_page_load(|window, _payload| {
             if window.label() != MAIN_WINDOW_LABEL {
                 return;
@@ -167,6 +194,22 @@ pub fn run() {
         })
         .setup(|app| {
             database::initialize(app.handle())?;
+
+            // 让 WebView 的 asset:// 协议一开始就覆盖当前生效的落盘目录。
+            //
+            // 不能只依赖落盘那一刻才登记：重启后打开已有工程、还没生成任何新东西时，
+            // 画布上已有的图片/视频会因为目录不在作用域内而读不出来 —— convertFileSrc
+            // 出的 asset:// 被协议处理器拒绝，表现为黑屏/空白，而且没有任何报错。
+            // 这里失败不阻断启动：最坏情况只是旧工程里的素材暂时显示不出来。
+            if let Err(error) = media_output::register_asset_scope(app.handle()) {
+                warn!("媒体落盘目录未加入 asset 协议作用域: {error}");
+            }
+
+            // 候选卡片的缩略图缓存目录同理。失败不阻断启动：最坏情况是缩略图
+            // 生成成功但显示不出来，前端会回落原图。
+            if let Err(error) = thumbnail::register_asset_scope(app.handle()) {
+                warn!("缩略图缓存目录未加入 asset 协议作用域: {error}");
+            }
 
             // 专有视频协议里有一部分成片只能带鉴权下载回来(帧间 / Sub2API 等),
             // 后端要把字节落盘再把本地路径交回画布。AI 层不依赖 tauri, 因此落盘
@@ -291,6 +334,11 @@ pub fn run() {
             runninghub_cli::runninghub_cli_read_clipboard,
             runninghub_cli::generate_runninghub_cli_model,
             image::persist_image_source,
+            image::persist_video_source,
+            image::persist_media_source_auto,
+            media_output::resolve_default_media_output_dir,
+            media_output::resolve_media_output_dir,
+            media_output::save_media_output_dir,
             image::persist_image_binary,
             image::save_image_source_to_downloads,
             image::save_image_source_to_path,
@@ -304,6 +352,7 @@ pub fn run() {
             asset_library::persist_library_asset_file,
             asset_library::write_library_backup,
             asset_library::extract_video_thumbnail,
+            thumbnail::ensure_image_thumbnail,
             cinematic_studio::project_save,
             cinematic_studio::project_load,
             cinematic_studio::prompt_save,
@@ -324,6 +373,7 @@ pub fn run() {
             ai_commands::get_generate_image_job,
             ai_commands::submit_generate_video_job,
             ai_commands::get_generate_video_job,
+            ai_commands::cancel_generate_video_job,
             ai_commands::generate_image,
             jimeng_cli::generate_jimeng_cli_video,
             jimeng_cli::generate_jimeng_cli_image,
@@ -347,6 +397,7 @@ pub fn run() {
             project_state::update_project_viewport_record,
             project_state::rename_project_record,
             project_state::delete_project_record,
+            project_state::cleanup_unreferenced_media,
             project_archive::export_project_bundle,
             project_archive::import_project_bundle,
             cloud_drive::cloud_drive_begin_authorize,
@@ -360,6 +411,8 @@ pub fn run() {
             cloud_drive::cloud_drive_restore_project,
             usage_log::append_usage_record,
             usage_log::query_usage_records,
+            usage_log::query_usage_daily,
+            usage_log::query_usage_breakdown,
             usage_log::query_usage_summary,
             system::get_runtime_system_info,
             template_state::list_template_records,

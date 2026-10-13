@@ -158,6 +158,22 @@ describe('resolveVideoDurationHintFromTexts', () => {
     ).toBe(8);
   });
 
+  it('扒剧本每场的「总时长：N秒」取开头那一场', () => {
+    // 扒剧本的场景头是「总时长：N秒」（不再写起止时间码），一集里每场各不相同，
+    // 靠「值唯一就直接采用」走不通，必须收窄到开头区域拿到第一场。
+    const script = [
+      '# 第1集',
+      '1-1场 日 内 客厅',
+      '总时长：15秒',
+      '人物：甲，乙',
+      '场面调度：甲站在画面左侧；乙坐在沙发上。',
+      '△【00:03】景别：中景｜甲弯腰拿起杯子。',
+      '1-2场 夜 外 街道',
+      '总时长：40秒',
+    ].join('\n');
+    expect(resolveVideoDurationHint(buildModel(), script)).toBe(15);
+  });
+
   it('都没写秒数时返回 null', () => {
     expect(resolveVideoDurationHintFromTexts(buildModel(), ['雨夜街头', ''])).toBeNull();
   });

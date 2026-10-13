@@ -195,6 +195,8 @@ export const recommendedApis: RecommendedApi[] = [
     name: '知鸟AI',
     baseUrl: 'https://cuai.token6688.com',
     registerUrl: 'https://cuai.token6688.com/signup?ref=C53QQRYBP563YEPD',
+    // 官方定价页(2026-10 实测 /pricing → /zh-CN/pricing 200), 卡片上给「价格」直达入口。
+    pricingUrl: 'https://cuai.token6688.com/pricing',
     summary: 'TokenGo 网关: 语言/图片/视频/音频统一 OpenAI 兼容入口, 密钥 sk- 开头',
     // TokenGo 是 One-API 系网关, 支持标准额度查询接口(实测未授权时返回 401 而非 404)。
     balanceKind: 'openai-billing',
@@ -225,75 +227,138 @@ export const recommendedApis: RecommendedApi[] = [
       'flux-kontext',
       'grok-imagine-image-2.0',
       'grok-imagine-image',
+      'kling-image-o3',
       'mj_imagine',
       'aliyun-image-superres',
       'face-repaint',
     ],
     videoModels: [
+      // Seedance 系列: 官方直连 / 特价按次·按秒 / 电商特价 / 九图特价 / 视频编辑
       'seedance-2-5',
       'seedance-2-5-promo',
       'seedance-2-5-special',
       'seedance-2-0-official',
       'seedance-2-0-promo',
+      'seedance-2-0-special',
       'seedance-2-0-ecom-special',
       'seedance-2-0-9tu-special',
+      'seedance-video-edit',
+      // Google Veo / Omni
       'veo-3.1',
+      'veo-3-1-manju-special',
       'veo-4-omni',
+      'veo-4-omni-v2v',
+      // OpenAI Sora
       'sora-2-official',
+      // 可灵 Kling(含数字人 / 对口型)
       'kling-v3',
       'kling-v3-omni-cankao',
       'kling-v3-motion-control',
       'kling-3.0-turbo',
+      'kling-avatar',
+      'kling-lip-sync',
+      // MiniMax / Wan / Vidu / PixVerse / HappyHorse
       'minimax-h3',
       'minimax-hailuo-2-3',
       'wan-3-0',
-      'wan-2-6',
+      'wan-3-0-special',
       'wan2.7-video',
-      'grok-imagine-1.5',
-      'grok-imagine-video',
-      'omni-flash-1-1',
-      'pixverse-v6',
       'viduq3',
+      'pixverse-v6',
+      'pixverse-c1',
       'happyhorse-1-1',
-      'doubao-seedance-1-5-pro',
+      // xAI Grok Imagine(视频): 只有带 image 的那个是图片, 其余都是视频
+      'grok-imagine-1.5',
+      'grok-imagine-1-5-7tu-special',
+      'grok-imagine-1.5-special',
+      'grok-imagine-video',
+      'grok-imagine-video-special',
+      // 其它
+      'omni-flash-1-1',
       'aliyun-video-superres',
     ],
+    // 2026-10-07 按官方文档(119 模型)重排: 补齐 Grok Imagine 视频系 / Veo 4 Omni v2v /
+    // Seedance 2.0 特价按次 / PixVerse C1 / Kling 数字人·对口型, 并移除文档中已不存在的
+    // wan-2-6 / doubao-seedance-1-5-pro。revision=1 让已添加过知鸟的老配置也能把新视频
+    // 模型**增量补进来**(只追加, 不覆盖用户手改)。
+    videoModelsRevision: 1,
     chatModels: [
+      // OpenAI(GT)
       'gpt-6-astra',
+      'gpt-6-sol',
       'gpt-5.6-terra',
       'gpt-5.6-luna',
+      'gpt-5.6-sol',
       'gpt-5.5',
       'gpt-5.4',
       'gpt-5.4-mini',
+      'gpt-5.4-nano',
       'gpt-5.3-codex',
+      'codex-auto-review',
+      // Anthropic(CL)
+      'claude-opus-5-5',
       'claude-opus-5',
       'claude-opus-4-8',
+      'claude-opus-4-7',
+      'claude-opus-4-6',
       'claude-sonnet-5',
       'claude-sonnet-4-6',
       'claude-haiku-4-5',
-      'gemini-3.1-pro',
+      'claude-fable-5-1',
+      'claude-fable-5',
+      // Google(GM)
       'gemini-3.8-flash',
+      'gemini-3.7-flash',
+      'gemini-3.6-flash',
+      'gemini-3.5-flash',
+      'gemini-3.5-flash-lite',
+      'gemini-3.1-pro',
+      'gemini-3.1-flash-lite',
+      'gemini-3-pro',
+      'gemini-3-flash',
+      // 国产 / 其它
       'deepseek-v4-pro',
+      'deepseek-v4-pro-0813',
       'deepseek-v4-flash',
+      'deepseek-v4.1-flash',
       'kimi-k3',
       'glm-5.3',
+      'glm-5.3-flash',
+      'glm-5.2',
       'qwen3.8-max',
-      'doubao-seed-2-0-pro',
+      'qwen3.8-flash',
+      'qwen3.7-max',
+      'qwen3.7-plus',
+      'qwen3.7-flash',
+      'qwen3.6-plus',
+      'qwen3-max',
       'minimax-m3',
+      'doubao-seed-2-0-pro',
+      // xAI(GK)
+      'grok-4.7',
       'grok-4.6',
       'grok-4.5',
+      'grok-4-20-non-reasoning',
     ],
     audioModels: [
+      // MiniMax 海螺: 语音合成 / 音色克隆 / 音色设计
       'speech-2.8',
-      'voice-design',
       'voice-clone',
+      'voice-design',
+      // OpenAI / Google / 豆包 TTS
       'gpt-4o-mini-tts',
       'tts-1-hd',
       'tts-1',
+      'doubao-tts-2.0',
       'gemini-3.1-flash-tts',
       'gemini-2.5-pro-tts',
+      // Suno 音乐
       'music',
     ],
+    // 2026-10-07 按官方文档补 doubao-tts-2.0。whisper-1 虽被文档归为 audio, 但它是
+    // **语音转写**(ASR)不是生成 —— 混进音频节点的「文字转语音」下拉只会让用户选中后报错,
+    // 故不放进这份「音频生成」预设(isAudioModelName 仍认得它, 拉取时照常归到音频)。
+    audioModelsRevision: 1,
     imageConfig: {
       protocol: 'images',
       referenceImageField: 'images',
@@ -306,11 +371,16 @@ export const recommendedApis: RecommendedApi[] = [
       referenceEncoding: 'url',
       transport: 'zhiniao-video',
     },
-    // 公开价格表（2026-09-13 拉自 https://cuai.token6688.com/api/v1/models）：
-    //   图片 24 个模型: min ⚡0.0056 (aliyun-image-superres) ~ max ⚡0.1687 (gpt-image-2-official)
-    //   视频 49 个模型: min ⚡0.0009 (aliyun-video-superres) ~ max ⚡1.36   (kling-3.0-turbo)
-    //   音频 9 个模型 : min ⚡0      (tts-1-hd 限时免费)   ~ max ⚡2.2    (voice-clone; 停服已剔除)
-    // < 0.01 全部归一为 0.01（min 与 max 都按此规则），是平台积分标价、不是实付价。
+    // 价格区间是**积分标价快照**(2026-09-13 抓取)，仅作参考、不是实付价。注意 2026-10-07
+    // 起 https://cuai.token6688.com/api/v1/models 只返回 chat 目录, 媒体单价必须带密钥走
+    // GET /v1/skills/models/{model}/pricing —— 所以这里是区间兜底, 与模型清单不互相同步。
+    // 文档口径的计费方式(2026-10-07)：图片按次 · 音频按次(tts 按字符) · 视频按秒为主
+    // (seedance-2-5-special / wan-3-0-special / veo-3.1 / omni-flash-1-1 等为按次一口价),
+    // 故视频实付随「单价 × 秒数」浮动，节点下拉里的时长档位即价格档位。
+    //   图片 min ⚡0.0056 (aliyun-image-superres) ~ max ⚡0.1687 (gpt-image-2-official)
+    //   视频 min ⚡0.0009 (aliyun-video-superres) ~ max ⚡1.36   (kling-3.0-turbo)
+    //   音频 min ⚡0      ~ max ⚡2.2 (voice-clone)
+    // < 0.01 全部归一为 0.01（min 与 max 都按此规则）。
     pricingRange: {
       image: '⚡0.01 ~ 0.17 / 张',
       video: '⚡0.01 ~ 1.36 / 次',
@@ -321,7 +391,10 @@ export const recommendedApis: RecommendedApi[] = [
     id: 'binghuo',
     name: '炳火 API',
     baseUrl: 'https://api.7tai.cc/v1',
-    registerUrl: 'https://api.7tai.cc/console/log',
+    // 注册走带 aff 参数的推荐链接(2026-10-13) —— 原来填的是 `/console/log`(登录页),
+    // 新用户点进去只会看到登录框, 还是要自己找注册入口。aff 换成推荐码, 落地页直接
+    // 是注册表单。
+    registerUrl: 'https://api.7tai.cc/register?aff=T1TT',
     summary: '统一提供图片、异步视频、LLM 与音频接口的 OpenAI 兼容平台',
     advantages: [
       '图片使用 /v1/images/generations，兼容文生图与参考图生图',
@@ -869,6 +942,12 @@ export const recommendedApis: RecommendedApi[] = [
  */
 export const visibleRecommendedApiIds: readonly string[] = [
   'zhiniao',
+  // 炳火(api.7tai.cc) 2026-10-13 从「隐藏」转为**展示** —— 它的链路(binghuo-video /
+  // /v1/assets/uploads / bh 系跳过审核)早已完整接通, 只是卡片一直被白名单挡住。
+  // 放进白名单即可, **不要改 id / name**: 名称会经 `deriveCustomApiId` 生成自定义平台
+  // id(「炳火 API」→ `custom:炳火-api`), 而 videoProfiles 的炳火档案是按 Base URL 判定的,
+  // 改名不影响链路但会让已连接用户的记录与新预设对不上。
+  'binghuo',
   'runninghub',
   'runninghub-cn',
   'modelscope',

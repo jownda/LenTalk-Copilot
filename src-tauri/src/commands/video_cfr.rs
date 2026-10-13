@@ -68,7 +68,9 @@ fn run_ffmpeg_to_mp4(ffmpeg: &Path, input: &str, output: &Path) -> Result<(), St
         .args(["-y", "-hide_banner", "-loglevel", "error"])
         .arg("-i")
         .arg(input)
-        .args(["-map", "0:v:0", "-map", "0:a?"])
+        // 影像轨可选：调用方也会在「时长已就绪但 videoWidth=0」时进来（HEVC 被 WebView2
+        // 静默丢轨）。若源本身就没有视频轨，不应在这里硬失败，产出一条纯音频代理即可。
+        .args(["-map", "0:v:0?", "-map", "0:a?"])
         .args([
             "-c:v",
             "libx264",
@@ -101,7 +103,11 @@ fn run_ffmpeg_to_mp4(ffmpeg: &Path, input: &str, output: &Path) -> Result<(), St
 /// 为 WebView2 生成一个 H.264/AAC 播放代理。
 ///
 /// MOV 容器本身不是问题，实际不稳定的通常是 HEVC、ProRes 或相机生成的时间轴。
-/// 只有原生播放器触发 error 时才调用此命令，因此正常的 MP4/MOV 不会额外转码。
+///
+/// 前端有两条触发路径，都只对**已经确认播不了**的素材生效，正常 MP4/MOV 不会额外转码：
+/// 1. 原生播放器触发 `error`；
+/// 2. 时长已解析、但 `videoWidth/videoHeight` 仍为 0 —— WebView2 遇到无解码器的视频轨
+///    （HEVC/H.265、ProRes）不报错，只把视频轨静默丢掉、声音照播，只能靠尺寸识别。
 #[tauri::command]
 pub fn prepare_video_playback(
     app: tauri::AppHandle,

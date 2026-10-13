@@ -37,6 +37,12 @@ PROVIDERS = {
 
 # low/high 大致对应的抽帧长边像素（控制 token 消耗）
 RES_LONGEDGE = {"low": 512, "medium": 768, "high": 1024}
+# 单次模型请求最多携带的帧数。画质档位(快速/标准/精细)靠 fps 决定总帧数,
+# 每段帧数则不超过这个上限 —— 所以「每集帧数上限」调到 120 以上不会再增加单次负担,
+# 只会多切几段。plan_segments 与 segment_frame_settings 必须共用这一常量, 否则
+# 切段预算与单请求上限不一致, 调大帧数上限会变成空操作(旧版即踩过: 切段按 120,
+# 单请求却压到 60)。
+PER_REQUEST_FRAME_CAP = 120
 SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".ass", ".ssa")
 SUBTITLE_TIME_RE = re.compile(
     r"(?P<start>(?:\d{1,2}:)?\d{1,2}:\d{2}[,.]\d{1,3})\s*-->\s*"
@@ -161,14 +167,18 @@ def probe_duration(video_path):
 
 def plan_segments(duration, fps, max_frames, max_segments):
     """把一集划成若干段：返回 [(起点秒, 段长秒, 段内有效fps), ...]。
-    帧数装得下就单段（段长 0 表示整片，维持旧行为）；装不下按 max_frames 切段，
-    长视频自动增加分段；max_segments 仅兼容旧配置，不再限制长视频。"""
-    if duration <= 0 or not max_frames or fps * duration <= max_frames:
+
+    每段帧数受单请求上限(PER_REQUEST_FRAME_CAP)约束；fps*duration 装得下就单段
+    （段长 0 表示整片）。装不下时按「单请求上限」切段 —— 用 min(max_frames, 上限)
+    作预算，这样切段与 segment_frame_settings 的收紧口径完全一致，调高 fps 会真实
+    增加总帧数（而不是被单请求旧上限 60 悄悄吃掉）。长视频自动增加分段；
+    max_segments 仅兼容旧配置，不再限制长视频。"""
+    budget = max(1, min(PER_REQUEST_FRAME_CAP, int(max_frames or PER_REQUEST_FRAME_CAP)))
+    if duration <= 0 or fps * duration <= budget:
         return [(0.0, 0.0, fps)]
-    n = math.ceil(fps * duration / max_frames)
+    n = math.ceil(fps * duration / budget)
     # 约75秒一段，避免十几分钟视频被压成仅4段；短视频逻辑不变。
     n = max(n, math.ceil(duration / 75.0))
-    capped = False
     seg_dur = duration / n
     eff_fps = fps
     return [(i * seg_dur, seg_dur, eff_fps) for i in range(n)]
@@ -430,7 +440,8 @@ def gemini_native_request(messages):
                              "parts": parts})
     body = {
         "contents": contents,
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 32000},
+        # 与 OpenAI 兼容分支一致: 低温更忠实画面(0.3 → 0.2)。
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 32000},
     }
     if system_parts:
         body["systemInstruction"] = {"parts": system_parts}
@@ -438,9 +449,13 @@ def gemini_native_request(messages):
 
 
 def segment_frame_settings(max_frames, segment_count, covered_duration, requested_fps):
-    """限制单次最多60帧，并让抽帧均匀覆盖整段而非只截取开头。"""
-    # 分段后每次独立请求可使用完整的单请求预算，不能再除以总段数。
-    limit = max(1, min(60, int(max_frames or 60)))
+    """限制单次不超过 PER_REQUEST_FRAME_CAP 帧，并让抽帧均匀覆盖整段而非只截取开头。
+
+    旧版这里硬编码 60，而 plan_segments 按 max_frames 切段 —— 两者不一致导致
+    「每集帧数上限」调大后单请求仍被压到 60 帧。现在统一用 PER_REQUEST_FRAME_CAP。
+    分段后每次独立请求可用完整的单请求预算，不能再除以总段数。
+    """
+    limit = max(1, min(PER_REQUEST_FRAME_CAP, int(max_frames or PER_REQUEST_FRAME_CAP)))
     fps = min(requested_fps, limit / covered_duration) if covered_duration else requested_fps
     return limit, fps
 
@@ -450,7 +465,8 @@ def build_messages(prompt_text, ep_num, known_roles, frames, detail, audio_path=
     prompt_filled = prompt_text.replace("{ep_num}", str(ep_num)).replace(
         "{known_roles}", known_roles or ""
     )
-    tip = ("\n\n下面按时间顺序给出该集的关键帧，每帧前标了时间戳（分:秒）。"
+    tip = ("\n\n下面按时间顺序给出该集的关键帧，每帧前标了时间戳（分:秒）。这些帧中属于同一个镜头的"
+           "要合并成一条△：只在该镜头开始的那一秒起一条△并写清景别，同一镜头内的连续画面不拆行。"
            "请顺着时间线推进，画面没实质变化就不要重复输出同一句台词或△。\n")
     if anime_mode:
         tip += ("这是3D AI动漫画面：不要使用真人人脸相似度判断角色。综合发型、发色、眼睛、"
@@ -469,6 +485,9 @@ def build_messages(prompt_text, ep_num, known_roles, frames, detail, audio_path=
                 "旁白或内心独白。\n")
     if subtitle_text:
         tip += f"\n【本段视频字幕】\n{subtitle_text}\n"
+    # OpenAI 兼容接口的 image_url.detail 只认 low/high/auto。画质档位的 medium/high
+    # 都要走高精度, 否则 medium 会被判非法或被静默降级, 等于白提高清晰度。
+    api_image_detail = "low" if str(detail).lower() == "low" else "high"
     content = [{"type": "text", "text": prompt_filled + tip}]
     if audio_path:
         content.append({
@@ -484,7 +503,7 @@ def build_messages(prompt_text, ep_num, known_roles, frames, detail, audio_path=
             "type": "image_url",
             "image_url": {
                 "url": f"data:image/jpeg;base64,{b64_file(fp)}",
-                "detail": detail,
+                "detail": api_image_detail,
             },
         })
     return [{"role": "user", "content": content}]
@@ -548,7 +567,8 @@ def call_api(base_url, api_key, model, messages, proxy, timeout=420, attempts=3,
         body = json.dumps({
             "model": model,
             "messages": messages,
-            "temperature": 0.3,
+            # 扒剧本要「看到什么写什么」, 温度越低越贴画面、越少润色加戏(0.3 → 0.2)。
+            "temperature": 0.2,
             # 该模型强制思考且思考质量对"听音频、守角色表"很关键，所以不砍思考，
             # 而是把总预算给足，让思考+正文都装得下、不被截断
             "max_tokens": max_output_tokens,
@@ -956,7 +976,9 @@ def continue_truncated_script(S, source_messages, script_text, ep, segment_label
             "role": "user",
             "content": (
                 "上一段剧本因输出长度限制在中途截断。请从最后一个未完成的句子接着写，"
-                "不要重复已经输出的内容；继续按原格式覆盖后续时间线，最后必须输出完整“角色表”。"
+                "不要重复已经输出的内容；继续按原格式覆盖后续时间线，每条△仍写成"
+                "“△【MM:SS】景别：X｜动作与表情”，一个镜头一条、只标镜头开始的秒数，"
+                "不要按秒拆行，最后必须输出完整“角色表”。"
             ),
         })
         addition = call_api(

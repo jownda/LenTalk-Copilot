@@ -4,13 +4,17 @@
  * 并生成简短描述。点击后在弹窗中调整画面参数（地点资产缩略图选择、180° 轴方向、
  * 左到右排序、人物间距、空间锚点）。
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Asset, SceneStaging, SceneV2, ProjectV2 } from "../../shared-types";
 import { ChevronDown, ChevronLeft, ChevronRight, GripVertical, ImagePlus, MapPin, Plus, Upload, X } from "lucide-react";
 import type { CopyZh } from "../i18n";
 import type { CanvasImageSource } from "./DirectorLayersCard";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import {
+  QuickAssetPickerCard,
+  type QuickAssetPickerItem,
+} from "@/features/canvas/ui/QuickAssetPicker";
 
 interface StagingEditorProps {
   project: ProjectV2;
@@ -51,6 +55,8 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
   const [open, setOpen] = useState(false);
   const [pickingLocation, setPickingLocation] = useState(false);
   const [pickingCharacter, setPickingCharacter] = useState(false);
+  // 「添加角色」按钮：候选卡片是 portal 浮层，落点按这个按钮的实时位置算。
+  const characterPickerAnchorRef = useRef<HTMLButtonElement>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [stagingReferenceBusy, setStagingReferenceBusy] = useState(false);
   const [stagingReferencePickerOpen, setStagingReferencePickerOpen] = useState(false);
@@ -209,21 +215,31 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
             ))}
           </div>
           <div className="staging-order-add-row">
-            <button className="staging-order-add" onClick={() => setPickingCharacter((value) => !value)}><Plus size={13} /> {t.stagingAddCharacter}</button>
+            <button
+              ref={characterPickerAnchorRef}
+              className="staging-order-add"
+              aria-haspopup="dialog"
+              aria-expanded={pickingCharacter}
+              onClick={() => setPickingCharacter((value) => !value)}
+            ><Plus size={13} /> {t.stagingAddCharacter}</button>
           </div>
-          {pickingCharacter && <div className="staging-location-picker">
-            <span className="hint-text">{t.stagingChooseCharacter}</span>
-            {characterCandidates.length === 0
-              ? (characterAssets.length === 0 ? <p className="hint-text">{t.stagingNoCharacterHint}</p> : <p className="hint-text">{t.stagingAllCharactersAdded}</p>)
-              : <div className="staging-location-picker-grid">
-                  {characterCandidates.map((asset: Asset) => (
-                    <button key={asset.id} onClick={() => { addCharacter(asset.id); setPickingCharacter(false); }}>
-                      {asset.referencePaths?.[0] ? <img src={resolveImageDisplayUrl(asset.referencePaths[0])} alt={asset.name} /> : <span className="staging-location-fallback">{asset.name.slice(0, 1)}</span>}
-                      <span>{asset.name}</span>
-                    </button>
-                  ))}
-                </div>}
-          </div>}
+          <QuickAssetPickerCard
+            open={pickingCharacter}
+            anchorRef={characterPickerAnchorRef}
+            variant="studio"
+            preferredWidth={400}
+            title={t.stagingChooseCharacter}
+            emptyHint={characterAssets.length === 0 ? t.stagingNoCharacterHint : t.stagingAllCharactersAdded}
+            items={characterCandidates.map((asset: Asset): QuickAssetPickerItem => ({
+              id: asset.id,
+              name: asset.name,
+              // 原始参考图地址：卡片内部会换成小缩略图，别在这里提前转展示地址。
+              source: asset.referencePaths?.[0] ?? "",
+              active: order.includes(asset.id),
+            }))}
+            onToggleItem={addCharacter}
+            onClose={() => setPickingCharacter(false)}
+          />
           <span className="hint-text">{t.dragHint}</span>
         </div>
 

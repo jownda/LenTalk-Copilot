@@ -88,14 +88,16 @@ const TRANSIENT_SUBMIT_FAILURE_PATTERNS: &[&str] = &[
     "gateway timeout",
 ];
 
-/// 即梦 CLI 官方 Windows 安装包下载前缀（与官方安装脚本 `https://jimeng.jianying.com/cli` 同源）。
+/// 即梦 CLI 官方二进制下载前缀（与官方安装脚本 `https://jimeng.jianying.com/cli` 同源，
+/// Windows / macOS / Linux 各平台产物都在同一目录下）。
 /// 仅在用户明确触发「自动安装」时使用；域名为白名单内固定地址，不做任何动态拼接。
 const JIMENG_CLI_DOWNLOAD_BASE: &str =
     "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/dreamina_cli_beta";
 const JIMENG_CLI_VERSION_URL: &str =
     "https://lf3-static.bytednsdoc.com/obj/eden-cn/psj_hupthlyk/ljhwZthlaukjlkulzlp/version.json";
 /// 下载后文件必须大于该阈值才认为有效，避免把错误页/极小残片当安装包。
-const JIMENG_CLI_MIN_EXE_BYTES: u64 = 1024 * 1024;
+/// 各平台官方产物都在 26MB 以上，1MB 只是兜底下限。
+const JIMENG_CLI_MIN_BINARY_BYTES: u64 = 1024 * 1024;
 
 /// Windows: 阻止控制台子进程弹出终端窗口。
 /// 即梦 CLI 一次任务会反复调用（提交 + 每 3 秒 query_result + queue_count），
@@ -2099,6 +2101,201 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
         assert!(!JIMENG_CLI_VERSION_URL.contains("dreamina_cli_beta"));
     }
 
+    // --- 平台自动识别（Windows / macOS / Linux 与官方安装脚本同源） ---
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lentalk-jimeng-test-{label}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn platform_download_files_match_official_script() {
+        // 必须与官方脚本 detect_platform() 中的 DOWNLOAD_FILE 逐字一致
+        assert_eq!(
+            JimengCliPlatform::WindowsAmd64.download_file(),
+            "dreamina_cli_windows_amd64.exe"
+        );
+        assert_eq!(
+            JimengCliPlatform::DarwinAmd64.download_file(),
+            "dreamina_cli_darwin_amd64"
+        );
+        assert_eq!(
+            JimengCliPlatform::DarwinArm64.download_file(),
+            "dreamina_cli_darwin_arm64"
+        );
+        assert_eq!(
+            JimengCliPlatform::LinuxAmd64.download_file(),
+            "dreamina_cli_linux_amd64"
+        );
+        assert_eq!(
+            JimengCliPlatform::LinuxArm64.download_file(),
+            "dreamina_cli_linux_arm64"
+        );
+    }
+
+    #[test]
+    fn only_windows_binary_carries_exe_suffix() {
+        assert!(JimengCliPlatform::WindowsAmd64.is_windows());
+        assert_eq!(JimengCliPlatform::WindowsAmd64.binary_name(), "dreamina.exe");
+        assert_eq!(JimengCliPlatform::WindowsAmd64.binary_suffix(), ".exe");
+        for platform in [
+            JimengCliPlatform::DarwinAmd64,
+            JimengCliPlatform::DarwinArm64,
+            JimengCliPlatform::LinuxAmd64,
+            JimengCliPlatform::LinuxArm64,
+        ] {
+            assert!(!platform.is_windows(), "{} 不该带 .exe", platform.label());
+            assert_eq!(platform.binary_name(), "dreamina");
+            assert_eq!(platform.binary_suffix(), "");
+        }
+    }
+
+    #[test]
+    fn install_bin_dir_matches_official_layout() {
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            install_bin_dir(home, JimengCliPlatform::WindowsAmd64),
+            home.join("bin")
+        );
+        for platform in [
+            JimengCliPlatform::DarwinAmd64,
+            JimengCliPlatform::DarwinArm64,
+            JimengCliPlatform::LinuxAmd64,
+            JimengCliPlatform::LinuxArm64,
+        ] {
+            assert_eq!(
+                install_bin_dir(home, platform),
+                home.join(".local").join("bin")
+            );
+        }
+    }
+
+    #[test]
+    fn detected_platform_matches_the_host_os() {
+        let platform = JimengCliPlatform::detect().expect("本机应为受支持的平台");
+        let expected_prefix = if cfg!(target_os = "windows") {
+            "dreamina_cli_windows_"
+        } else if cfg!(target_os = "macos") {
+            "dreamina_cli_darwin_"
+        } else {
+            "dreamina_cli_linux_"
+        };
+        assert!(
+            platform.download_file().starts_with(expected_prefix),
+            "{} 应下载 {expected_prefix}* 产物，实际为 {}",
+            platform.label(),
+            platform.download_file()
+        );
+        assert_eq!(platform.is_windows(), cfg!(target_os = "windows"));
+    }
+
+    #[test]
+    fn install_bin_dir_is_discoverable_after_install() {
+        // 装完必须能被 detect_executable 的候选目录扫到，否则复检必然失败。
+        // common_locations 本身是平台相关的（只在 Windows 收 ~/bin），故只校验本机平台。
+        let home = current_user_home().unwrap_or_else(|| PathBuf::from("/home/tester"));
+        let candidates = common_locations("dreamina")
+            .into_iter()
+            .map(|path| path.replace('\\', "/"))
+            .collect::<Vec<_>>();
+        let platform = JimengCliPlatform::detect().expect("本机应为受支持的平台");
+        let dir = install_bin_dir(&home, platform)
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.starts_with(&dir)),
+            "{} 的安装目录 {dir} 不在探测候选里",
+            platform.label()
+        );
+    }
+
+    // --- Unix PATH 写入（启动文件选择 + 幂等追加） ---
+
+    #[test]
+    fn zsh_rc_honours_zdotdir() {
+        let home = Path::new("/Users/tester");
+        assert_eq!(
+            pick_unix_rc_file(Some("/bin/zsh"), home, None),
+            home.join(".zshrc")
+        );
+        assert_eq!(
+            pick_unix_rc_file(Some("/usr/local/bin/zsh"), home, None),
+            home.join(".zshrc")
+        );
+        assert_eq!(
+            pick_unix_rc_file(Some("/bin/zsh"), home, Some("/Users/tester/.config/zsh")),
+            Path::new("/Users/tester/.config/zsh").join(".zshrc")
+        );
+        // 空串 ZDOTDIR 视为未设置
+        assert_eq!(
+            pick_unix_rc_file(Some("/bin/zsh"), home, Some("")),
+            home.join(".zshrc")
+        );
+    }
+
+    #[test]
+    fn bash_rc_pick_matches_official_rule() {
+        let home = unique_temp_dir("bash-home");
+        // 没有 .bash_profile → .bashrc
+        assert_eq!(
+            pick_unix_rc_file(Some("/bin/bash"), &home, None),
+            home.join(".bashrc")
+        );
+        fs::write(home.join(".bash_profile"), "").expect("seed bash_profile");
+        assert_eq!(
+            pick_unix_rc_file(Some("/bin/bash"), &home, None),
+            home.join(".bash_profile")
+        );
+        fs::write(home.join(".bashrc"), "").expect("seed bashrc");
+        assert_eq!(
+            pick_unix_rc_file(Some("/bin/bash"), &home, None),
+            home.join(".bashrc")
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn unknown_shell_prefers_existing_zshrc_over_profile() {
+        let home = unique_temp_dir("unknown-shell-home");
+        // 没有 ~/.zshrc 时退到 ~/.profile
+        assert_eq!(pick_unix_rc_file(None, &home, None), home.join(".profile"));
+        assert_eq!(
+            pick_unix_rc_file(Some("/bin/fish"), &home, None),
+            home.join(".profile")
+        );
+        // macOS 默认 zsh：~/.zshrc 存在时必须落它，否则 zsh 不读 .profile
+        fs::write(home.join(".zshrc"), "").expect("seed zshrc");
+        assert_eq!(pick_unix_rc_file(None, &home, None), home.join(".zshrc"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn appends_path_line_only_once() {
+        let dir = unique_temp_dir("rc-append");
+        let rc = dir.join(".zshrc");
+        let line = "export PATH=\"/Users/tester/.local/bin:$PATH\"";
+
+        assert!(append_line_if_missing(&rc, line).expect("first append"));
+        assert!(!append_line_if_missing(&rc, line).expect("second append is a no-op"));
+        let contents = fs::read_to_string(&rc).expect("read rc");
+        assert_eq!(contents.matches(line).count(), 1);
+        assert_eq!(contents, format!("{line}\n"));
+
+        // 已有内容且末尾没有换行时也不能把两行粘连
+        let other = dir.join(".bashrc");
+        fs::write(&other, "# keep me").expect("seed file");
+        assert!(append_line_if_missing(&other, line).expect("append to existing"));
+        assert_eq!(
+            fs::read_to_string(&other).expect("read bashrc"),
+            format!("# keep me\n{line}\n")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn output_summary_truncates_chinese_without_panicking() {
         let output = format!("{}车后续输出", "a".repeat(498));
@@ -2639,11 +2836,128 @@ pub struct JimengCliInstallResult {
     pub message: String,
 }
 
-/// 自动安装即梦 CLI（仅 Windows）：
+/// 官方安装脚本（https://jimeng.jianying.com/cli）支持的平台。
+/// 每个变体对应脚本 `detect_platform()` 里的一组 `PLATFORM` / `DOWNLOAD_FILE`，
+/// 从而保证「识别系统」这件事与官方脚本口径完全一致。
+///
+/// 这张表是全平台描述性的：任一编译目标只会构造其中一个变体，
+/// 其余变体仍要保留给 match / 单测，所以整体允许 dead_code。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JimengCliPlatform {
+    WindowsAmd64,
+    DarwinAmd64,
+    DarwinArm64,
+    LinuxAmd64,
+    LinuxArm64,
+}
+
+impl JimengCliPlatform {
+    /// 识别当前运行平台；不支持的平台返回 None，由调用方给出可读提示。
+    fn detect() -> Option<Self> {
+        #[cfg(target_os = "windows")]
+        {
+            return Some(Self::WindowsAmd64);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return Some(if macos_is_apple_silicon() {
+                Self::DarwinArm64
+            } else {
+                Self::DarwinAmd64
+            });
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return Some(if cfg!(target_arch = "aarch64") {
+                Self::LinuxArm64
+            } else {
+                Self::LinuxAmd64
+            });
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+
+    /// 官方二进制文件名（与脚本 `DOWNLOAD_FILE` 逐字一致）。
+    fn download_file(self) -> &'static str {
+        match self {
+            Self::WindowsAmd64 => "dreamina_cli_windows_amd64.exe",
+            Self::DarwinAmd64 => "dreamina_cli_darwin_amd64",
+            Self::DarwinArm64 => "dreamina_cli_darwin_arm64",
+            Self::LinuxAmd64 => "dreamina_cli_linux_amd64",
+            Self::LinuxArm64 => "dreamina_cli_linux_arm64",
+        }
+    }
+
+    /// 落地后的文件名：只有 Windows 需要 `.exe` 后缀才能被直接执行。
+    fn binary_name(self) -> &'static str {
+        if self.is_windows() {
+            "dreamina.exe"
+        } else {
+            "dreamina"
+        }
+    }
+
+    /// 临时文件后缀，与落地文件名保持同一约定。
+    fn binary_suffix(self) -> &'static str {
+        if self.is_windows() {
+            ".exe"
+        } else {
+            ""
+        }
+    }
+
+    fn is_windows(self) -> bool {
+        matches!(self, Self::WindowsAmd64)
+    }
+
+    /// 人类可读的平台名，用于安装结果与失败提示。
+    fn label(self) -> &'static str {
+        match self {
+            Self::WindowsAmd64 => "Windows (x64)",
+            Self::DarwinArm64 => "macOS (Apple 芯片)",
+            Self::DarwinAmd64 => "macOS (Intel)",
+            Self::LinuxAmd64 => "Linux (x64)",
+            Self::LinuxArm64 => "Linux (arm64)",
+        }
+    }
+}
+
+/// 判定是否为 Apple 芯片。
+/// Rosetta 下 `uname -m` 会谎报 `x86_64`，而 `sysctl -n hw.optional.arm64`
+/// 在 Apple Silicon 上始终返回 1，所以优先用它；探测失败时退回编译目标架构。
+#[cfg(target_os = "macos")]
+fn macos_is_apple_silicon() -> bool {
+    match Command::new("sysctl")
+        .args(["-n", "hw.optional.arm64"])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim() == "1"
+        }
+        _ => cfg!(target_arch = "aarch64"),
+    }
+}
+
+/// 安装目录：Windows 沿用官方安装器的 `%USERPROFILE%\bin`，
+/// macOS/Linux 与官方脚本一致用 `~/.local/bin`。
+/// 两者都已经在 `common_locations` 的首批候选里，所以装完立刻能被探测到。
+fn install_bin_dir(home: &Path, platform: JimengCliPlatform) -> PathBuf {
+    if platform.is_windows() {
+        home.join("bin")
+    } else {
+        home.join(".local").join("bin")
+    }
+}
+
+/// 自动安装即梦 CLI（自动识别 Windows / macOS / Linux，与官方安装脚本同源）：
 /// 1. 已安装 → 直接返回 installed=false（不重复安装）；
-/// 2. 下载官方 Windows 安装包到 %USERPROFILE%\bin\dreamina.exe；
-/// 3. 尽力补齐 %USERPROFILE%\.dreamina_cli 下的 SKILL.md / version.json（失败不阻塞）；
-/// 4. 将 %USERPROFILE%\bin 追加到当前用户 PATH（User 级，失败不阻塞）；
+/// 2. 按当前平台下载官方二进制（Windows → `%USERPROFILE%\bin\dreamina.exe`；
+///    macOS/Linux → `~/.local/bin/dreamina`），Unix 下补可执行位并清 quarantine；
+/// 3. 尽力补齐 `~/.dreamina_cli` 下的 SKILL.md / version.json（失败不阻塞）；
+/// 4. 把安装目录写进用户 PATH（Windows 用户级环境变量 / Unix shell 启动文件，失败不阻塞）；
 /// 5. 复检；所有失败路径均返回可读 message，不向上抛致命错误。
 #[tauri::command]
 pub async fn jimeng_cli_install() -> Result<JimengCliInstallResult, String> {
@@ -2653,6 +2967,18 @@ pub async fn jimeng_cli_install() -> Result<JimengCliInstallResult, String> {
 }
 
 fn jimeng_cli_install_blocking() -> Result<JimengCliInstallResult, String> {
+    let Some(platform) = JimengCliPlatform::detect() else {
+        return Ok(JimengCliInstallResult {
+            success: false,
+            installed: false,
+            resolved_path: None,
+            message: format!(
+                "当前系统（{}）暂不支持自动安装即梦 CLI，请参考 docs/jimeng-cli-guide.md 手动安装",
+                std::env::consts::OS
+            ),
+        });
+    };
+
     let detection = detect_executable("dreamina");
     if detection.found {
         return Ok(JimengCliInstallResult {
@@ -2663,42 +2989,76 @@ fn jimeng_cli_install_blocking() -> Result<JimengCliInstallResult, String> {
         });
     }
 
-    let home = current_user_home()
-        .ok_or_else(|| "无法定位用户主目录（%USERPROFILE%），请手动安装即梦 CLI".to_string())?;
-    let bin_dir = home.join("bin");
-    let exe_path = bin_dir.join("dreamina.exe");
+    let home = current_user_home().ok_or_else(|| {
+        format!(
+            "无法定位用户主目录，请手动安装即梦 CLI（{}）",
+            platform.label()
+        )
+    })?;
+    let bin_dir = install_bin_dir(&home, platform);
+    let binary_path = bin_dir.join(platform.binary_name());
     fs::create_dir_all(&bin_dir)
         .map_err(|error| format!("无法创建安装目录 {}: {error}", bin_dir.display()))?;
 
-    let curl = find_curl().ok_or_else(|| "未找到 curl.exe，请手动安装即梦 CLI".to_string())?;
+    let curl = find_curl().ok_or_else(|| {
+        format!(
+            "未找到 curl，无法下载即梦 CLI（{}），请手动安装",
+            platform.label()
+        )
+    })?;
 
-    let exe_url = format!("{JIMENG_CLI_DOWNLOAD_BASE}/dreamina_cli_windows_amd64.exe");
-    let tmp_path = std::env::temp_dir().join(format!("lentalk-jimeng-install-{}.exe", Uuid::new_v4()));
-    download_with_curl(&curl, &exe_url, &tmp_path).map_err(|error| {
+    let binary_url = format!("{JIMENG_CLI_DOWNLOAD_BASE}/{}", platform.download_file());
+    let tmp_path = std::env::temp_dir().join(format!(
+        "lentalk-jimeng-install-{}{}",
+        Uuid::new_v4(),
+        platform.binary_suffix()
+    ));
+    download_with_curl(&curl, &binary_url, &tmp_path).map_err(|error| {
         let _ = fs::remove_file(&tmp_path);
         error
     })?;
     let size = fs::metadata(&tmp_path).map(|meta| meta.len()).unwrap_or(0);
-    if size < JIMENG_CLI_MIN_EXE_BYTES {
+    if size < JIMENG_CLI_MIN_BINARY_BYTES {
         let _ = fs::remove_file(&tmp_path);
         return Ok(JimengCliInstallResult {
             success: false,
             installed: false,
             resolved_path: None,
-            message: format!("下载的即梦 CLI 文件异常（仅 {size} 字节），安装中止，请手动安装"),
+            message: format!(
+                "下载的即梦 CLI 文件异常（{}，仅 {size} 字节），安装中止，请手动安装",
+                platform.label()
+            ),
         });
     }
-    if exe_path.exists() {
+    if binary_path.exists() {
         // 只覆盖本次自动安装写入的目标文件；绝不触碰用户手动配置的其它路径。
-        let _ = fs::remove_file(&exe_path);
+        let _ = fs::remove_file(&binary_path);
     }
-    fs::rename(&tmp_path, &exe_path)
-        .or_else(|_| fs::copy(&tmp_path, &exe_path).map(|_| ()))
+    fs::rename(&tmp_path, &binary_path)
+        .or_else(|_| fs::copy(&tmp_path, &binary_path).map(|_| ()))
         .map_err(|error| {
             let _ = fs::remove_file(&tmp_path);
-            format!("无法写入安装目录 {}: {error}", exe_path.display())
+            format!("无法写入安装目录 {}: {error}", binary_path.display())
         })?;
     let _ = fs::remove_file(&tmp_path);
+
+    // Unix 下 curl 落盘的二进制没有可执行位，且 macOS 可能带上隔离属性，
+    // 缺失会让后续 `Command::new(dreamina)` 报 "Permission denied"/"已损坏"。
+    #[cfg(unix)]
+    {
+        if let Err(error) = make_unix_executable(&binary_path) {
+            return Ok(JimengCliInstallResult {
+                success: false,
+                installed: false,
+                resolved_path: None,
+                message: format!(
+                    "已下载即梦 CLI 但无法设置可执行权限（{error}），请手动执行 chmod +x {}",
+                    binary_path.display()
+                ),
+            });
+        }
+        clear_macos_quarantine(&binary_path);
+    }
 
     let mut warnings: Vec<String> = Vec::new();
     let dot_dir = home.join(".dreamina_cli");
@@ -2718,7 +3078,7 @@ fn jimeng_cli_install_blocking() -> Result<JimengCliInstallResult, String> {
     ) {
         warnings.push(format!("version.json 下载失败: {error}"));
     }
-    if let Err(error) = ensure_windows_user_path(&bin_dir) {
+    if let Err(error) = ensure_user_path(&bin_dir) {
         warnings.push(format!("写入用户 PATH 失败（不影响本软件直接使用）: {error}"));
     }
 
@@ -2742,12 +3102,17 @@ fn jimeng_cli_install_blocking() -> Result<JimengCliInstallResult, String> {
             success: false,
             installed: false,
             resolved_path: None,
-            message: format!("安装后仍未检测到即梦 CLI，请手动安装{suffix}"),
+            message: format!(
+                "安装后仍未检测到即梦 CLI（{}），请参考 docs/jimeng-cli-guide.md 手动安装{suffix}",
+                platform.label()
+            ),
         }),
     }
 }
 
-/// 定位 curl.exe：优先 Windows 系统自带，其次当前进程 PATH。
+/// 定位 curl：优先系统自带的固定路径，其次当前进程 PATH。
+/// Windows 用 `C:\Windows\System32\curl.exe`，macOS/Linux 用 `/usr/bin/curl`
+/// —— GUI 应用从 Finder/桌面启动时拿不到登录 shell 的 PATH，直查固定路径最稳。
 #[cfg(target_os = "windows")]
 fn find_curl() -> Option<PathBuf> {
     let system_curl = PathBuf::from(r"C:\Windows\System32\curl.exe");
@@ -2759,10 +3124,14 @@ fn find_curl() -> Option<PathBuf> {
 
 #[cfg(not(target_os = "windows"))]
 fn find_curl() -> Option<PathBuf> {
+    let system_curl = PathBuf::from("/usr/bin/curl");
+    if system_curl.is_file() {
+        return Some(system_curl);
+    }
     find_in_path("curl").map(PathBuf::from)
 }
 
-/// 用 curl.exe 下载文件到目标路径；失败返回可读错误。
+/// 用 curl 下载文件到目标路径；失败返回可读错误。
 fn download_with_curl(curl: &Path, url: &str, target: &Path) -> Result<(), String> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
@@ -2772,7 +3141,7 @@ fn download_with_curl(curl: &Path, url: &str, target: &Path) -> Result<(), Strin
         .args(["-fsSL", url, "-o"])
         .arg(target)
         .output()
-        .map_err(|error| format!("无法启动 curl.exe: {error}"))?;
+        .map_err(|error| format!("无法启动 curl: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let trimmed = stderr.trim();
@@ -2788,39 +3157,156 @@ fn download_with_curl(curl: &Path, url: &str, target: &Path) -> Result<(), Strin
     Ok(())
 }
 
-/// 将 bin_dir 追加到当前用户 PATH（User 级环境变量，不触碰系统 PATH）。
+/// Unix 下补可执行位（curl 落盘默认是 0644）。
+#[cfg(unix)]
+fn make_unix_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("无法读取 {}: {error}", path.display()))?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("无法设置可执行权限: {error}"))
+}
+
+/// macOS 会记录「从网络下载」的隔离属性，带该属性的二进制首次执行会被 Gatekeeper 拦截。
+/// 官方安装脚本同样会在安装后清一次。
+#[cfg(target_os = "macos")]
+fn clear_macos_quarantine(target: &Path) {
+    let _ = Command::new("xattr")
+        .args(["-d", "com.apple.quarantine"])
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn clear_macos_quarantine(_target: &Path) {}
+
+/// 把安装目录写入用户 PATH。
+/// - Windows：改当前用户 PATH 环境变量（PowerShell，User 级，不触碰系统 PATH）；
+/// - macOS/Linux：把 `export PATH="…:$PATH"` 追加到当前 shell 的启动文件。
 /// 失败不致命：返回 Err 由调用方转成提示，不影响已完成的安装。
-#[cfg(target_os = "windows")]
-fn ensure_windows_user_path(bin_dir: &Path) -> Result<(), String> {
-    let dir = bin_dir.to_string_lossy().to_string();
-    let escaped = dir.replace('\'', "''");
-    let script = format!(
-        "$p=[Environment]::GetEnvironmentVariable('Path','User'); \
-         if ($p -and ($p -split ';' -contains '{escaped}')) {{ exit 0 }}; \
-         $new=if ($p) {{ $p.TrimEnd(';') + ';' + '{escaped}' }} else {{ '{escaped}' }}; \
-         [Environment]::SetEnvironmentVariable('Path',$new,'User')"
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("无法启动 powershell.exe: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
+fn ensure_user_path(bin_dir: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let dir = bin_dir.to_string_lossy().to_string();
+        let escaped = dir.replace('\'', "''");
+        let script = format!(
+            "$p=[Environment]::GetEnvironmentVariable('Path','User'); \
+             if ($p -and ($p -split ';' -contains '{escaped}')) {{ exit 0 }}; \
+             $new=if ($p) {{ $p.TrimEnd(';') + ';' + '{escaped}' }} else {{ '{escaped}' }}; \
+             [Environment]::SetEnvironmentVariable('Path',$new,'User')"
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|error| format!("无法启动 powershell.exe: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let trimmed = stderr.trim();
-        Err(if trimmed.is_empty() {
+        return Err(if trimmed.is_empty() {
             "PowerShell 执行失败".to_string()
         } else {
             trimmed.to_string()
-        })
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        ensure_unix_path(bin_dir)
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn ensure_windows_user_path(_bin_dir: &Path) -> Result<(), String> {
-    Ok(())
+fn ensure_unix_path(bin_dir: &Path) -> Result<(), String> {
+    if let Some(path) = std::env::var_os("PATH") {
+        if std::env::split_paths(&path).any(|entry| entry.as_path() == bin_dir) {
+            return Ok(());
+        }
+    }
+    let home = current_user_home().ok_or_else(|| "无法定位用户主目录".to_string())?;
+    let shell = std::env::var("SHELL").ok();
+    let zdotdir = std::env::var("ZDOTDIR").ok();
+    let rc_file = pick_unix_rc_file(shell.as_deref(), &home, zdotdir.as_deref());
+    let line = format!(
+        "export PATH=\"{}:$PATH\"",
+        bin_dir.to_string_lossy().replace('"', "\\\"")
+    );
+    append_line_if_missing(&rc_file, &line).map(|_| ())
+}
+
+/// 按官方安装脚本 `pick_unix_rc_file` 的规则挑选启动文件：
+/// zsh → `${ZDOTDIR:-$HOME}/.zshrc`；bash → 优先 `.bashrc`（存在，或没有 `.bash_profile` 时）；
+/// 其它 shell → `~/.profile`。
+///
+/// 与官方脚本的唯一差别：`$SHELL` 缺失时不盲写 `~/.profile` —— zsh 不读它，
+/// 会出现「脚本说装好了但 `dreamina: command not found`」。macOS 默认 zsh，
+/// 所以优先落到已存在的 `~/.zshrc`，否则再退 `~/.profile`。
+///
+/// 保持平台无关（只用 PathBuf / fs），这样在任意开发机上都有单测覆盖。
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn pick_unix_rc_file(shell: Option<&str>, home: &Path, zdotdir: Option<&str>) -> PathBuf {
+    let shell_name = shell
+        .map(|value| {
+            value
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    match shell_name.as_str() {
+        "zsh" => zdotdir
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| home.to_path_buf())
+            .join(".zshrc"),
+        "bash" => {
+            let bashrc = home.join(".bashrc");
+            if bashrc.is_file() || !home.join(".bash_profile").is_file() {
+                bashrc
+            } else {
+                home.join(".bash_profile")
+            }
+        }
+        _ => {
+            let zshrc = home.join(".zshrc");
+            if zshrc.is_file() {
+                zshrc
+            } else {
+                home.join(".profile")
+            }
+        }
+    }
+}
+
+/// 向文件追加一行（文件不存在则创建）；已存在完全相同的行时不再重复追加。
+/// 返回是否发生了写入。同样保持平台无关，便于在任意开发机上覆盖。
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn append_line_if_missing(file: &Path, line: &str) -> Result<bool, String> {
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建目录 {}: {error}", parent.display()))?;
+    }
+    let existing = fs::read_to_string(file).unwrap_or_default();
+    if existing.lines().any(|current| current.trim() == line) {
+        return Ok(false);
+    }
+    let mut next = existing;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(line);
+    next.push('\n');
+    fs::write(file, next).map_err(|error| format!("无法写入 {}: {error}", file.display()))?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
