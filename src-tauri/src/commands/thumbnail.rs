@@ -26,8 +26,9 @@ use crate::database::app_data_dir;
 /// 缩略图缓存目录（位于 app data 下，落在这里才能被 `asset://` 协议读到：
 /// `tauri.conf.json` 的 `assetProtocol.scope` 已放开了 `$APPDATA/**`）。
 const THUMBNAIL_DIR: &str = "thumbnails";
-/// 目标长边像素。卡片格子最宽约 92px（工作台侧），192 已经足够 2x 屏。
-const DEFAULT_MAX_EDGE: u32 = 192;
+/// 目标长边像素的兜底值（前端显式传值，见 `thumbnailCache.ts` 的 `THUMBNAIL_MAX_EDGE`）。
+/// 候选卡片格子放大到约 108px 后，2x 屏需要约 216px，所以两处都对齐到 256。
+const DEFAULT_MAX_EDGE: u32 = 256;
 const MIN_MAX_EDGE: u32 = 32;
 const MAX_MAX_EDGE: u32 = 1024;
 const JPEG_QUALITY: u8 = 80;

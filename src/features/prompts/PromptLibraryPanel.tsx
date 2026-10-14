@@ -23,6 +23,7 @@ import { UiButton, UiGhostIconButton, UiInput, UiSelect } from '@/components/ui/
 import { RenameDialog } from '@/features/project/RenameDialog';
 import { PROMPT_DRAG_DATA_TYPE, promptDragPayload } from '@/features/library/importAssets';
 import { PromptCategoryManageDialog } from './PromptCategoryManageDialog';
+import { ALL_PROMPT_LIBRARIES_ID, resolveRevealFilters } from './promptReveal';
 import {
   usePromptLibraryStore,
   type PromptLibrary,
@@ -54,7 +55,7 @@ const EMPTY_DRAFT: PromptDraft = {
 };
 
 /** 「全部」词库的特殊 id:聚合所有词库的提示词 */
-const ALL_LIBRARIES_ID = '__all__';
+const ALL_LIBRARIES_ID = ALL_PROMPT_LIBRARIES_ID;
 
 /** 英文分类 → 中文显示(内置词库分类映射;未知分类原样返回) */
 const CATEGORY_LABELS: Record<string, string> = {
@@ -240,6 +241,12 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
     if (!targetId) {
       const created = addLibrary(t('promptLibrary.defaultLib', '我的提示词'));
       if (!created) {
+        // 以前这里是静默 return —— 点「新增」会毫无反应。改成把表单打开并给出原因。
+        setEditingId(null);
+        setIsCreating(true);
+        setCreateTargetLibraryId(null);
+        setDraft({ ...EMPTY_DRAFT });
+        setDraftError(t('promptLibrary.saveNoLibrary', '请先选择一个可编辑的提示词库'));
         return;
       }
       targetId = created.id;
@@ -271,6 +278,32 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
     setDraftError(null);
   }, [activeLibrary, libraries]);
 
+  /**
+   * 保存成功后让新条目**一定可见**。
+   *
+   * 新建时的目标词库可能不是当前正在看的那个(例如停在只读内置库),分类过滤与搜索词也可能把它挡住
+   * —— 那样列表里不会有任何变化,用户会以为「保存没成功」并反复点。判定与列表过滤共用同一套规则。
+   */
+  const revealTemplate = useCallback((template: PromptTemplate, libraryId: string) => {
+    const patch = resolveRevealFilters(
+      { libraryId: activeLibraryId, category: activeCategory, search },
+      template,
+      libraryId
+    );
+    if (!patch) {
+      return;
+    }
+    if (patch.libraryId !== undefined) {
+      setActiveLibraryId(patch.libraryId);
+    }
+    if (patch.category !== undefined) {
+      setActiveCategory(patch.category);
+    }
+    if (patch.search !== undefined) {
+      setSearch(patch.search);
+    }
+  }, [activeCategory, activeLibraryId, search]);
+
   const saveDraft = useCallback(() => {
     const targetLibraryId = createTargetLibraryId ?? activeLibrary?.id ?? null;
     if (!targetLibraryId) {
@@ -287,30 +320,36 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
       setDraftError(t('promptLibrary.positiveRequired', '请输入正向提示词内容'));
       return;
     }
+    const payload = {
+      name,
+      scene: draft.scene.trim(),
+      positive,
+      negative: draft.negative.trim(),
+      category: draft.category.trim() || 'custom',
+    };
+
     if (isCreating) {
-      addTemplate(targetLibraryId, {
-        name,
-        scene: draft.scene.trim(),
-        positive,
-        negative: draft.negative.trim(),
-        category: draft.category.trim() || 'custom',
-      });
+      const created = addTemplate(targetLibraryId, payload);
+      if (!created) {
+        // 词库在表单打开期间被删掉/不存在: 以前这里是静默 return —— 点「保存」毫无反应
+        setDraftError(t('promptLibrary.saveNoLibrary', '请先选择一个可编辑的提示词库'));
+        return;
+      }
+      revealTemplate(created, targetLibraryId);
+      setSelectedTemplateId(created.id);
       setIsCreating(false);
       setCreateTargetLibraryId(null);
     } else if (editingId) {
-      updateTemplate(targetLibraryId, editingId, {
-        name,
-        scene: draft.scene.trim(),
-        positive,
-        negative: draft.negative.trim(),
-        category: draft.category.trim() || 'custom',
-      });
+      if (!updateTemplate(targetLibraryId, editingId, payload)) {
+        setDraftError(t('promptLibrary.saveNoLibrary', '请先选择一个可编辑的提示词库'));
+        return;
+      }
       setEditingId(null);
       setCreateTargetLibraryId(null);
     }
     setDraft(EMPTY_DRAFT);
     setDraftError(null);
-  }, [activeLibrary, addTemplate, createTargetLibraryId, draft, editingId, isCreating, t, updateTemplate]);
+  }, [activeLibrary, addTemplate, createTargetLibraryId, draft, editingId, isCreating, revealTemplate, t, updateTemplate]);
 
   const closeDraft = useCallback(() => {
     setIsCreating(false);
@@ -730,11 +769,18 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
               closeDraft();
             }}
           >
+            {/*
+              三段式: 表头(固定) / 字段区(可滚动) / 页脚(固定)。
+              ⚠️ 千万别把页脚塞回滚动区: 这个面板只有 360px 宽, 表单实测 608px 高,
+              小窗口 / 放大过 WebView 时表单比可视区还高 —— 页脚会被裁到浮层滚动区**之外**,
+              而落在那块区域上的点击命中的是背景遮罩(onClick = closeDraft),
+              结果就是「点保存反而把表单关掉、什么都没存」。
+            */}
             <div
-              className="ui-scrollbar max-h-full w-full max-w-md overflow-y-auto rounded-xl border border-border-dark bg-surface-dark p-4 shadow-2xl"
+              className="flex max-h-full w-full max-w-md flex-col overflow-hidden rounded-xl border border-border-dark bg-surface-dark shadow-2xl"
               onClick={(event) => event.stopPropagation()}
             >
-              <div className="mb-3 flex items-center justify-between">
+              <div className="flex shrink-0 items-center justify-between border-b border-border-dark px-4 py-3">
                 <span className="text-sm font-medium text-text-dark">
                   {isCreating ? t('promptLibrary.newPrompt', '新增提示词') : t('promptLibrary.editPrompt', '编辑提示词')}
                 </span>
@@ -745,9 +791,12 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
                   <X className="h-4 w-4" />
                 </UiGhostIconButton>
               </div>
-              <div className="space-y-3">
+              <div className="ui-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-text-muted">{t('promptLibrary.name', '名称')}</span>
+                  <span className="mb-1 block text-[11px] text-text-muted">
+                    {t('promptLibrary.name', '名称')}
+                    <span className="ml-0.5 text-red-300">*</span>
+                  </span>
                   <UiInput
                     value={draft.name}
                     onChange={(event) => {
@@ -770,7 +819,10 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
                   />
                 </label>
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-text-muted">{t('promptLibrary.positive', '正向提示词')}</span>
+                  <span className="mb-1 block text-[11px] text-text-muted">
+                    {t('promptLibrary.positive', '正向提示词')}
+                    <span className="ml-0.5 text-red-300">*</span>
+                  </span>
                   <textarea
                     value={draft.positive}
                     onChange={(event) => {
@@ -809,24 +861,30 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
                   </UiSelect>
                 </label>
               </div>
-              <div className="mt-4 flex justify-end gap-2">
-                {draftError && <p className="text-[11px] text-red-300" role="alert">{draftError}</p>}
-                <UiButton
-                  variant="ghost"
-                  size="sm"
-                  type="button"
-                  onClick={closeDraft}
-                >
-                  {t('common.cancel', '取消')}
-                </UiButton>
-                <UiButton
-                  variant="primary"
-                  size="sm"
-                  type="button"
-                  onClick={saveDraft}
-                >
-                  {t('common.save', '保存')}
-                </UiButton>
+              <div className="flex shrink-0 items-center justify-between gap-2 border-t border-border-dark px-4 py-3">
+                <div className="min-w-0 flex-1">
+                  {draftError && (
+                    <p className="text-[11px] leading-4 text-red-500 dark:text-red-300" role="alert">{draftError}</p>
+                  )}
+                </div>
+                <div className="flex shrink-0 items-center gap-3">
+                  <UiButton
+                    variant="ghost"
+                    size="sm"
+                    type="button"
+                    onClick={closeDraft}
+                  >
+                    {t('common.cancel', '取消')}
+                  </UiButton>
+                  <UiButton
+                    variant="primary"
+                    size="sm"
+                    type="button"
+                    onClick={saveDraft}
+                  >
+                    {t('common.save', '保存')}
+                  </UiButton>
+                </div>
               </div>
             </div>
           </div>
@@ -1193,13 +1251,19 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
                 </UiGhostIconButton>
               </div>
             </div>
-            <div className="ui-scrollbar flex-1 space-y-3 overflow-y-auto p-4">
-              {draftError && <p className="text-[11px] text-red-300" role="alert">{draftError}</p>}
+            <div className="ui-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+              {draftError && <p className="text-[11px] text-red-500 dark:text-red-300" role="alert">{draftError}</p>}
               <label className="block">
-                <span className="mb-1 block text-[11px] text-text-muted">{t('promptLibrary.name', '名称')}</span>
+                <span className="mb-1 block text-[11px] text-text-muted">
+                  {t('promptLibrary.name', '名称')}
+                  <span className="ml-0.5 text-red-300">*</span>
+                </span>
                 <input
                   value={draft.name}
-                  onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                  onChange={(event) => {
+                    setDraft({ ...draft, name: event.target.value });
+                    setDraftError(null);
+                  }}
                   placeholder={t('promptLibrary.namePlaceholder', '提示词名称')}
                   className={inputClass}
                 />
@@ -1215,10 +1279,16 @@ export function PromptLibraryPanel({ open, onClose, onApply, embedded = false }:
                 />
               </label>
               <label className="block">
-                <span className="mb-1 block text-[11px] text-text-muted">{t('promptLibrary.positive', '正向提示词')}</span>
+                <span className="mb-1 block text-[11px] text-text-muted">
+                  {t('promptLibrary.positive', '正向提示词')}
+                  <span className="ml-0.5 text-red-300">*</span>
+                </span>
                 <textarea
                   value={draft.positive}
-                  onChange={(event) => setDraft({ ...draft, positive: event.target.value })}
+                  onChange={(event) => {
+                    setDraft({ ...draft, positive: event.target.value });
+                    setDraftError(null);
+                  }}
                   placeholder={t('promptLibrary.positivePlaceholder', '正向提示词内容')}
                   rows={8}
                   className={`${inputClass} resize-none font-mono leading-5`}

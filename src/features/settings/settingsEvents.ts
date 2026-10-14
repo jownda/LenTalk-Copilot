@@ -3,7 +3,6 @@ export type SettingsCategory =
   | 'pricing'
   | 'appearance'
   | 'general'
-  | 'experimental'
   | 'about';
 
 interface OpenSettingsEventDetail {

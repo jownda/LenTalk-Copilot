@@ -12,7 +12,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
-import { Handle, Position, useUpdateNodeInternals } from "@xyflow/react";
+import { Handle, Position, useStore, useUpdateNodeInternals } from "@xyflow/react";
 import {
   AudioLines,
   ChevronDown,
@@ -67,6 +67,12 @@ import { NodePriceBadge } from "@/features/canvas/ui/NodePriceBadge";
 import { resolveRecommendedApiPriceBadge } from "./nodePriceBadge";
 import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
 import { CanvasNodeImage } from "@/features/canvas/ui/CanvasNodeImage";
+import { NodeReferencePicker } from "@/features/canvas/ui/NodeReferencePicker";
+import {
+  PICKER_FALLBACK_ANCHOR,
+  resolvePickerAnchor,
+  type PickerAnchor,
+} from "@/features/canvas/ui/nodeReferencePickerLayout";
 import { prepareNodeImageFromFile, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import {
   findReferenceTokens,
@@ -108,11 +114,6 @@ const JIMENG_CLI_MAX_REFERENCE_IMAGES = 9;
  */
 const GENERATE_COOLDOWN_MS = 2000;
 
-interface PickerAnchor {
-  left: number;
-  top: number;
-}
-
 interface ReferencePickerItem {
   kind: "image" | "audio";
   index: number;
@@ -140,68 +141,6 @@ type JimengCliStatus = {
   queueCount?: number | null;
   message?: string | null;
 };
-
-const PICKER_FALLBACK_ANCHOR: PickerAnchor = { left: 8, top: 8 };
-const PICKER_Y_OFFSET_PX = 20;
-
-function getTextareaCaretOffset(textarea: HTMLTextAreaElement, caretIndex: number): PickerAnchor {
-  const mirror = document.createElement("div");
-  const computed = window.getComputedStyle(textarea);
-  const mirrorStyle = mirror.style;
-
-  mirrorStyle.position = "absolute";
-  mirrorStyle.visibility = "hidden";
-  mirrorStyle.pointerEvents = "none";
-  mirrorStyle.whiteSpace = "pre-wrap";
-  mirrorStyle.overflowWrap = "break-word";
-  mirrorStyle.wordBreak = "break-word";
-  mirrorStyle.boxSizing = computed.boxSizing;
-  mirrorStyle.width = `${textarea.clientWidth}px`;
-  mirrorStyle.font = computed.font;
-  mirrorStyle.lineHeight = computed.lineHeight;
-  mirrorStyle.letterSpacing = computed.letterSpacing;
-  mirrorStyle.padding = computed.padding;
-  mirrorStyle.border = computed.border;
-  mirrorStyle.textTransform = computed.textTransform;
-  mirrorStyle.textIndent = computed.textIndent;
-
-  mirror.textContent = textarea.value.slice(0, caretIndex);
-
-  const marker = document.createElement("span");
-  marker.textContent = textarea.value.slice(caretIndex, caretIndex + 1) || " ";
-  mirror.appendChild(marker);
-
-  document.body.appendChild(mirror);
-
-  const left = marker.offsetLeft - textarea.scrollLeft;
-  const top = marker.offsetTop - textarea.scrollTop;
-
-  document.body.removeChild(mirror);
-
-  return {
-    left: Math.max(0, left),
-    top: Math.max(0, top),
-  };
-}
-
-function resolvePickerAnchor(
-  container: HTMLDivElement | null,
-  textarea: HTMLTextAreaElement,
-  caretIndex: number,
-): PickerAnchor {
-  if (!container) {
-    return PICKER_FALLBACK_ANCHOR;
-  }
-
-  const containerRect = container.getBoundingClientRect();
-  const textareaRect = textarea.getBoundingClientRect();
-  const caretOffset = getTextareaCaretOffset(textarea, caretIndex);
-
-  return {
-    left: Math.max(0, textareaRect.left - containerRect.left + caretOffset.left),
-    top: Math.max(0, textareaRect.top - containerRect.top + caretOffset.top + PICKER_Y_OFFSET_PX),
-  };
-}
 
 /** 缩略图轻量预览浮层状态: 图片地址 + 鼠标点击位置(用于定位) */
 interface ReferencePreviewState {
@@ -442,6 +381,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const promptHighlightRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  // 画布缩放：@ 候选面板的锚点换算与视觉间距都要靠它折算。
+  // 用 useStore 选择器而不是 useViewport —— 后者在平移画布时也会触发重渲染，拖画布会变卡。
+  const zoom = useStore((state) => state.transform[2]);
   const modelTriggerRef = useRef<HTMLDivElement>(null);
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const [modelPickerPosition, setModelPickerPosition] = useState<FloatingPanelPosition | null>(null);
@@ -1090,7 +1032,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       if (isAtKey && !event.ctrlKey && !event.metaKey && !event.altKey && referencePickerItems.length > 0) {
         event.preventDefault();
         const cursor = event.currentTarget.selectionStart ?? promptDraftRef.current.length;
-        setPickerAnchor(resolvePickerAnchor(rootRef.current, event.currentTarget, cursor));
+        setPickerAnchor(resolvePickerAnchor(rootRef.current, event.currentTarget, cursor, zoom));
         setPickerCursor(cursor);
         setPickerActiveIndex(0);
         setShowImagePicker(true);
@@ -1107,6 +1049,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       showImagePicker,
       usableInputAudio.length,
       updateNodeData,
+      zoom,
     ],
   );
 
@@ -1529,43 +1472,27 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           )}
         </div>
         {showImagePicker && referencePickerItems.length > 0 && (
-          <div
-            className="nowheel absolute z-30 w-[120px] overflow-hidden rounded-xl border border-[rgba(255,255,255,0.16)] bg-surface-dark shadow-xl"
-            style={{ left: pickerAnchor.left, top: pickerAnchor.top }}
-            onMouseDown={(event) => event.stopPropagation()}
-            onWheelCapture={(event) => event.stopPropagation()}
-          >
-            {referencePickerItems.map((item, index) => (
-              <button
-                key={`${item.kind}-${item.source}-${index}`}
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  insertReference(item);
-                }}
-                onMouseEnter={() => setPickerActiveIndex(index)}
-                className={`flex w-full items-center gap-2 border border-transparent bg-bg-dark/70 px-2 py-2 text-left text-xs text-text-dark transition-colors hover:border-[rgba(255,255,255,0.18)] ${
-                  pickerActiveIndex === index ? "border-[rgba(255,255,255,0.24)] bg-bg-dark" : ""
-                }`}
-              >
-                {item.kind === "image" ? (
-                  <CanvasNodeImage
-                    src={inputImageDisplayUrls[item.index]}
-                    alt={item.label}
-                    viewerSourceUrl={resolveImageDisplayUrl(item.source)}
-                    viewerImageList={inputImageViewerList}
-                    className="h-7 w-7 rounded object-cover"
-                    draggable={false}
-                  />
-                ) : (
-                  <span className="flex h-7 w-7 items-center justify-center rounded bg-accent/15 text-accent">
-                    <AudioLines className="h-4 w-4" />
-                  </span>
-                )}
-                <span>{item.label}</span>
-              </button>
-            ))}
-          </div>
+          <NodeReferencePicker
+            anchor={pickerAnchor}
+            containerRef={rootRef}
+            zoom={zoom}
+            entries={referencePickerItems.map((item, index) => ({
+              key: `${item.kind}-${item.source}-${index}`,
+              kind: item.kind,
+              label: item.label,
+              thumbUrl: item.kind === "image" ? inputImageDisplayUrls[item.index] : null,
+              viewerSourceUrl: item.kind === "image" ? resolveImageDisplayUrl(item.source) : null,
+              viewerImageList: inputImageViewerList,
+            }))}
+            activeIndex={pickerActiveIndex}
+            onSelect={(index) => {
+              const item = referencePickerItems[index];
+              if (item) {
+                insertReference(item);
+              }
+            }}
+            onHover={setPickerActiveIndex}
+          />
         )}
       </div>
       {referenceTiles.length > 0 && (

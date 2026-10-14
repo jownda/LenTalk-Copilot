@@ -24,13 +24,50 @@ const UPLOAD_ATTEMPTS: usize = 3;
 
 /// 两次重试之间的等待(第 1 次失败后、第 2 次失败后)。指数退避, 避免在对方抖动
 /// 期间连着打三枪。
-const UPLOAD_RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(400), Duration::from_millis(1200)];
-
-/// 单次上传的超时。
 ///
-/// 比视频提交的 180s 短得多: 上传只是把素材送出去, 卡住就该尽快失败并交给重试,
-/// 而不是把总超时耗光 —— 否则一次卡死要等三分钟, 重试也来不及发生。
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+/// 从 400 / 1200ms 加大到 800 / 2400ms: 实测超时类失败里有一类是「网关先收完整个
+/// body 才回响应」, 失败后立刻重发只会让对端更挤 —— 退避要给足。
+const UPLOAD_RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(800), Duration::from_millis(2400)];
+
+/// 单次上传的超时**基础**部分。
+///
+/// 上传耗时正比于字节数, 一个固定的超时对大素材天然不公平: 原先统一 60s, 国内到
+/// 境外的链路上 4K 图 / 音频经常传不完 —— 三次尝试全部卡在 `operation timed out`
+/// (2026-10-14 用户实报: 6 张参考图 + 1 段参考音频在炳火 api.7tai.cc 整体失败)。
+/// 所以改成「基础时长 + 按估算上行速度折算的传输时长」。
+const UPLOAD_TIMEOUT_BASE: Duration = Duration::from_secs(45);
+
+/// 估算上行速度。取 128 KB/s 这一偏保守的值(略慢于国内到境外的常见上行):
+/// 多给一点时间, 好过让一个素材卡在超时上把整个视频任务作废。
+const UPLOAD_ASSUMED_BYTES_PER_SEC: u64 = 128 * 1024;
+
+/// 单次上传的超时**上限**, 与 client 的 180s 总超时对齐 —— 再大外层会先失败。
+const UPLOAD_TIMEOUT_CEIL: Duration = Duration::from_secs(180);
+
+/// 按素材大小算单次上传的超时预算(45s ~ 180s)。
+///
+/// 45s 覆盖建连 / TLS / 对端慢响应; 传输部分按 128 KB/s 折算。举例: 1MB → 53s、
+/// 8MB → 109s、32MB 以上钳到 180s。
+pub fn upload_timeout_for_size(bytes: usize) -> Duration {
+    let transfer = Duration::from_secs((bytes as u64).div_ceil(UPLOAD_ASSUMED_BYTES_PER_SEC));
+    let budget = UPLOAD_TIMEOUT_BASE + transfer;
+    budget.min(UPLOAD_TIMEOUT_CEIL).max(UPLOAD_TIMEOUT_BASE)
+}
+
+/// 人类可读的素材大小, 写进上传失败信息。
+///
+/// 少了它, 超时类报错只剩一个 URL —— 无法判断是「大素材传不完」还是「对端不响应」,
+/// 也看不出失败的是 6 个素材里的哪一个。
+fn human_size(bytes: usize) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if (bytes as f64) >= MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else if bytes >= 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{} B", bytes)
+    }
+}
 
 /// 一个参考素材的归一化结果。
 #[derive(Debug, Clone)]
@@ -426,6 +463,8 @@ pub async fn upload_reference_asset_multipart(
 ///
 /// 帧间的 `/v1/assets` 要求同时带上 `model` 与 `kind`(image / video / audio),
 /// 少了它们平台无法把素材归到对应模型上, 会直接 400。
+///
+/// 单次超时按素材大小算(`upload_timeout_for_size`) —— 见那里的注释。
 pub async fn upload_reference_asset_multipart_with_fields(
     client: &reqwest::Client,
     upload_url: &str,
@@ -434,6 +473,35 @@ pub async fn upload_reference_asset_multipart_with_fields(
     asset: &ReferenceAsset,
     platform_label: &str,
     fields: &[(&str, &str)],
+) -> Result<Value, AIError> {
+    let bytes_len = match asset {
+        ReferenceAsset::Url(url) => return Ok(Value::String(url.clone())),
+        ReferenceAsset::File { bytes, .. } => bytes.len(),
+    };
+    upload_reference_asset_multipart_with_timeout(
+        client,
+        upload_url,
+        api_key,
+        filename,
+        asset,
+        platform_label,
+        fields,
+        upload_timeout_for_size(bytes_len),
+    )
+    .await
+}
+
+/// 实体实现。超时用参数传进来而不是在函数内取值, 是为了让测试能塞一个几百毫秒的
+/// 超时进来看「超时后到底报什么、报的是哪个素材」—— 否则那条路径只能靠真等三分钟验证。
+async fn upload_reference_asset_multipart_with_timeout(
+    client: &reqwest::Client,
+    upload_url: &str,
+    api_key: &str,
+    filename: &str,
+    asset: &ReferenceAsset,
+    platform_label: &str,
+    fields: &[(&str, &str)],
+    timeout: Duration,
 ) -> Result<Value, AIError> {
     let (mime_type, bytes) = match asset {
         ReferenceAsset::Url(url) => return Ok(Value::String(url.clone())),
@@ -460,7 +528,7 @@ pub async fn upload_reference_asset_multipart_with_fields(
         let mut request = client
             .post(upload_url)
             .header("Accept-Encoding", "identity")
-            .timeout(UPLOAD_TIMEOUT)
+            .timeout(timeout)
             .multipart(form);
         if !api_key.trim().is_empty() {
             request = request.bearer_auth(api_key);
@@ -493,9 +561,11 @@ pub async fn upload_reference_asset_multipart_with_fields(
     }
     let error = last_error.expect("循环只在拿到错误后才退出, 这里必然有值");
     Err(AIError::Provider(format!(
-        "{} 参考素材上传失败(网络): 已重试 {} 次仍未成功 — {}",
+        "{} 参考素材上传失败(网络): 已重试 {} 次仍未成功 — 素材 {} / 单次超时 {}s — {}",
         platform_label,
         UPLOAD_ATTEMPTS - 1,
+        human_size(bytes.len()),
+        timeout.as_secs(),
         describe_reqwest_error(&error)
     )))
 }
@@ -651,5 +721,75 @@ mod tests {
     fn finds_asset_url_in_nested_payload() {
         let payload = serde_json::json!({ "data": { "file": { "public_url": "https://x/y.png" } } });
         assert_eq!(extract_asset_url(&payload).as_deref(), Some("https://x/y.png"));
+    }
+
+    /// 上传超时必须随素材大小走 —— 固定 60s 曾让 8MB 级别的素材三次尝试全部超时。
+    #[test]
+    fn scales_upload_timeout_with_asset_size() {
+        // 极小素材只吃基础预算(建连 / TLS / 对端慢响应)。
+        assert_eq!(upload_timeout_for_size(0), Duration::from_secs(45));
+        assert_eq!(upload_timeout_for_size(1024), Duration::from_secs(46));
+        // 1MB → 45 + 8 = 53s; 8MB → 45 + 64 = 109s(原来固定 60s, 正是用户实报的量级)。
+        assert_eq!(upload_timeout_for_size(1024 * 1024), Duration::from_secs(53));
+        assert_eq!(upload_timeout_for_size(8 * 1024 * 1024), Duration::from_secs(109));
+        // 超大素材钳到 180s(与 client 总超时对齐), 不会无限膨胀。
+        assert_eq!(upload_timeout_for_size(512 * 1024 * 1024), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn renders_human_readable_asset_size() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2 KB");
+        assert_eq!(human_size(6 * 1024 * 1024), "6.0 MB");
+    }
+
+    /// 对端收下请求却永不回响应时: 必须在预算内失败, 且报错里能看出是哪个素材、
+    /// 多大、单次超时给到多久 —— 这三样缺一个, 用户贴出来的报错就没法定位。
+    #[tokio::test]
+    async fn reports_asset_identity_when_upstream_stalls() {
+        use tokio::io::AsyncReadExt;
+
+        // 一个「accept 之后只读一点、永不回响应」的对端。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 512];
+                    let _ = stream.read(&mut buffer).await;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        let asset = ReferenceAsset::File {
+            mime_type: "image/png".to_string(),
+            extension: "png".to_string(),
+            bytes: vec![7u8; 2048],
+        };
+        // no_proxy(): 本机系统代理会把 127.0.0.1 也劫持成 502, 那样测不到「对端不回响应」。
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let error = upload_reference_asset_multipart_with_timeout(
+            &client,
+            &format!("http://{}/v1/assets/uploads", address),
+            "sk-test",
+            "reference-1.png",
+            &asset,
+            "炳火 API #1",
+            &[],
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("对端不回响应必须失败");
+
+        let text = error.to_string();
+        assert!(text.contains("炳火 API #1"), "{text}");
+        assert!(text.contains("已重试 2 次"), "{text}");
+        assert!(text.contains("素材 2 KB"), "{text}");
+        assert!(text.contains("单次超时 1s"), "{text}");
+        assert!(text.contains("分类: 超时"), "{text}");
     }
 }

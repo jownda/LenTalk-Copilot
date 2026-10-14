@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  QUICK_ASSET_CANVAS_LIST_HEIGHT,
+  QUICK_ASSET_GRID_COLUMNS,
   QUICK_ASSET_LIST_HEIGHT,
   QUICK_ASSET_PANEL_CHROME_HEIGHT,
   QUICK_ASSET_PANEL_MIN_WIDTH,
   QUICK_ASSET_PANEL_WIDTH,
   QUICK_ASSET_RENDER_BATCH,
+  QUICK_ASSET_THUMB_ASPECT_RATIO,
   QUICK_ASSET_VIEWPORT_MARGIN,
   nextQuickAssetRenderCount,
   resolveQuickAssetPanelSize,
@@ -53,6 +56,51 @@ describe("resolveQuickAssetPanelSize", () => {
     expect(resolveQuickAssetPanelSize({ width: 320, height: 900 }, 440).width).toBe(
       320 - QUICK_ASSET_VIEWPORT_MARGIN * 2,
     );
+  });
+
+  it("honours a taller preferred list height (canvas grid) but still clamps it", () => {
+    const roomy = resolveQuickAssetPanelSize(
+      { width: 1600, height: 900 },
+      QUICK_ASSET_PANEL_WIDTH,
+      QUICK_ASSET_CANVAS_LIST_HEIGHT,
+    );
+
+    // 画布侧格子更大，可视区比工作台高，否则一屏只剩两行。
+    expect(QUICK_ASSET_CANVAS_LIST_HEIGHT).toBeGreaterThan(QUICK_ASSET_LIST_HEIGHT);
+    expect(roomy.listHeight).toBe(QUICK_ASSET_CANVAS_LIST_HEIGHT);
+
+    // 矮窗口下依旧不许超出视口。
+    const shortViewport = 300;
+    const short = resolveQuickAssetPanelSize(
+      { width: 1600, height: shortViewport },
+      QUICK_ASSET_PANEL_WIDTH,
+      QUICK_ASSET_CANVAS_LIST_HEIGHT,
+    );
+    expect(short.listHeight + QUICK_ASSET_PANEL_CHROME_HEIGHT + QUICK_ASSET_VIEWPORT_MARGIN * 2).toBeLessThanOrEqual(
+      shortViewport,
+    );
+  });
+});
+
+describe("canvas grid geometry", () => {
+  /** 面板左右内边距（`p-2`）+ 列表给滚动条留的 2px。 */
+  const PANEL_HORIZONTAL_CHROME = 18;
+  /** `gap-1`。 */
+  const GRID_GAP = 4;
+
+  it("keeps each canvas cell large enough to recognise a character", () => {
+    const cell =
+      (QUICK_ASSET_PANEL_WIDTH - PANEL_HORIZONTAL_CHROME - GRID_GAP * (QUICK_ASSET_GRID_COLUMNS - 1)) /
+      QUICK_ASSET_GRID_COLUMNS;
+
+    // 单格宽度才是关键：最早 360 配六列只有约 54px，人脸看不出是谁；现在六列也要保证 96px 以上。
+    expect(cell).toBeGreaterThanOrEqual(96);
+  });
+
+  it("pins the thumbnail box to 4:3 for all three candidate pickers", () => {
+    const [width, height] = QUICK_ASSET_THUMB_ASPECT_RATIO.split("/").map((part) => Number(part.trim()));
+
+    expect(width / height).toBeCloseTo(4 / 3, 5);
   });
 });
 

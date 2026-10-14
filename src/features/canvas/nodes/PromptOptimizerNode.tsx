@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type UIEvent as ReactUIEvent } from 'react';
-import { Handle, Position, useUpdateNodeInternals, type NodeProps } from '@xyflow/react';
+import { Handle, Position, useStore, useUpdateNodeInternals, type NodeProps } from '@xyflow/react';
 import { Check, Copy, ScanSearch, Sparkles, Wand2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { createPortal } from 'react-dom';
@@ -20,7 +20,12 @@ import { clampTextViewScrollTop } from '@/features/canvas/application/textViewSc
 import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
-import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
+import { NodeReferencePicker } from '@/features/canvas/ui/NodeReferencePicker';
+import {
+  PICKER_FALLBACK_ANCHOR,
+  resolvePickerAnchor,
+  type PickerAnchor,
+} from '@/features/canvas/ui/nodeReferencePickerLayout';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { chatCompletion, type ChatCompletionContentPart } from '@/commands/ai';
@@ -38,13 +43,6 @@ const MIN_HEIGHT = 220;
 const MAX_WIDTH = 820;
 const MAX_HEIGHT = 900;
 
-interface PickerAnchor {
-  left: number;
-  top: number;
-}
-
-const PICKER_FALLBACK_ANCHOR: PickerAnchor = { left: 8, top: 8 };
-const PICKER_Y_OFFSET_PX = 20;
 
 function stripThinkingBlock(text: string): string {
   const trimmed = text.trim();
@@ -67,68 +65,6 @@ function stripThinkingBlock(text: string): string {
   }
 
   return trimmed;
-}
-
-function getTextareaCaretOffset(
-  textarea: HTMLTextAreaElement,
-  caretIndex: number
-): PickerAnchor {
-  const mirror = document.createElement('div');
-  const computed = window.getComputedStyle(textarea);
-  const mirrorStyle = mirror.style;
-
-  mirrorStyle.position = 'absolute';
-  mirrorStyle.visibility = 'hidden';
-  mirrorStyle.pointerEvents = 'none';
-  mirrorStyle.whiteSpace = 'pre-wrap';
-  mirrorStyle.overflowWrap = 'break-word';
-  mirrorStyle.wordBreak = 'break-word';
-  mirrorStyle.boxSizing = computed.boxSizing;
-  mirrorStyle.width = `${textarea.clientWidth}px`;
-  mirrorStyle.font = computed.font;
-  mirrorStyle.lineHeight = computed.lineHeight;
-  mirrorStyle.letterSpacing = computed.letterSpacing;
-  mirrorStyle.padding = computed.padding;
-  mirrorStyle.border = computed.border;
-  mirrorStyle.textTransform = computed.textTransform;
-  mirrorStyle.textIndent = computed.textIndent;
-
-  mirror.textContent = textarea.value.slice(0, caretIndex);
-
-  const marker = document.createElement('span');
-  marker.textContent = textarea.value.slice(caretIndex, caretIndex + 1) || ' ';
-  mirror.appendChild(marker);
-
-  document.body.appendChild(mirror);
-
-  const left = marker.offsetLeft - textarea.scrollLeft;
-  const top = marker.offsetTop - textarea.scrollTop;
-
-  document.body.removeChild(mirror);
-
-  return {
-    left: Math.max(0, left),
-    top: Math.max(0, top),
-  };
-}
-
-function resolvePickerAnchor(
-  container: HTMLDivElement | null,
-  textarea: HTMLTextAreaElement,
-  caretIndex: number
-): PickerAnchor {
-  if (!container) {
-    return PICKER_FALLBACK_ANCHOR;
-  }
-
-  const containerRect = container.getBoundingClientRect();
-  const textareaRect = textarea.getBoundingClientRect();
-  const caretOffset = getTextareaCaretOffset(textarea, caretIndex);
-
-  return {
-    left: Math.max(0, textareaRect.left - containerRect.left + caretOffset.left),
-    top: Math.max(0, textareaRect.top - containerRect.top + caretOffset.top + PICKER_Y_OFFSET_PX),
-  };
 }
 
 interface ReferencePreviewState {
@@ -386,6 +322,9 @@ export const PromptOptimizerNode = memo(({
   const [optimizedPromptDraft, setOptimizedPromptDraft] = useState(optimizedPrompt);
 
   const rootRef = useRef<HTMLDivElement>(null);
+  // 画布缩放：@ 候选面板的锚点换算与视觉间距都要靠它折算。
+  // 用 useStore 选择器而不是 useViewport —— 后者在平移画布时也会触发重渲染，拖画布会变卡。
+  const zoom = useStore((state) => state.transform[2]);
   const purposeTextareaRef = useRef<HTMLTextAreaElement>(null);
   const purposeHighlightRef = useRef<HTMLDivElement>(null);
   const isPurposeComposingRef = useRef(false);
@@ -854,7 +793,7 @@ export const PromptOptimizerNode = memo(({
     if (isAtKey && !event.ctrlKey && !event.metaKey && !event.altKey && incomingImages.length > 0) {
       event.preventDefault();
       const cursor = event.currentTarget.selectionStart ?? purposeDraftRef.current.length;
-      setPickerAnchor(resolvePickerAnchor(rootRef.current, event.currentTarget, cursor));
+      setPickerAnchor(resolvePickerAnchor(rootRef.current, event.currentTarget, cursor, zoom));
       setPickerCursor(cursor);
       setShowImagePicker(true);
       setPickerActiveIndex(0);
@@ -1149,44 +1088,22 @@ export const PromptOptimizerNode = memo(({
         ) : null}
       </div>
       {showImagePicker && incomingImageItems.length > 0 && (
-        <div
-          className="nowheel absolute z-30 w-[120px] overflow-hidden rounded-xl border border-[rgba(255,255,255,0.16)] bg-surface-dark shadow-xl"
-          style={{ left: pickerAnchor.left, top: pickerAnchor.top }}
-          onMouseDown={(event) => event.stopPropagation()}
-          onWheelCapture={(event) => event.stopPropagation()}
-        >
-          <div
-            className="ui-scrollbar nowheel max-h-[180px] overflow-y-auto"
-            onWheelCapture={(event) => event.stopPropagation()}
-          >
-            {incomingImageItems.map((item, index) => (
-              <button
-                key={`${item.imageUrl}-${index}`}
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  insertImageReference(index);
-                }}
-                onMouseEnter={() => setPickerActiveIndex(index)}
-                className={`flex w-full items-center gap-2 border border-transparent bg-bg-dark/70 px-2 py-2 text-left text-sm text-text-dark transition-colors hover:border-[rgba(255,255,255,0.18)] ${
-                  pickerActiveIndex === index
-                    ? 'border-[rgba(255,255,255,0.24)] bg-bg-dark'
-                    : ''
-                }`}
-              >
-                <CanvasNodeImage
-                  src={item.displayUrl}
-                  alt={item.label}
-                  viewerSourceUrl={resolveImageDisplayUrl(item.imageUrl)}
-                  viewerImageList={incomingImageViewerList}
-                  className="h-8 w-8 rounded object-cover"
-                  draggable={false}
-                />
-                <span>{item.label}</span>
-              </button>
-            ))}
-          </div>
-        </div>
+        <NodeReferencePicker
+          anchor={pickerAnchor}
+          containerRef={rootRef}
+          zoom={zoom}
+          entries={incomingImageItems.map((item, index) => ({
+            key: `${item.imageUrl}-${index}`,
+            kind: 'image',
+            label: item.label,
+            thumbUrl: item.displayUrl,
+            viewerSourceUrl: resolveImageDisplayUrl(item.imageUrl),
+            viewerImageList: incomingImageViewerList,
+          }))}
+          activeIndex={pickerActiveIndex}
+          onSelect={insertImageReference}
+          onHover={setPickerActiveIndex}
+        />
       )}
       {previewState && createPortal(
         <>

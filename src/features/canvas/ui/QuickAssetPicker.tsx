@@ -6,13 +6,17 @@ import { Check, Plus, X } from "lucide-react";
 import { useOverlayLayerFloor } from "@/components/ui/overlayLayer";
 import { getFloatingPanelPosition } from "@/features/canvas/ui/floatingPanelPosition";
 import {
+  QUICK_ASSET_CANVAS_LIST_HEIGHT,
+  QUICK_ASSET_GRID_COLUMNS,
   QUICK_ASSET_LIST_HEIGHT,
   QUICK_ASSET_PANEL_CHROME_HEIGHT,
   QUICK_ASSET_PANEL_WIDTH,
   QUICK_ASSET_RENDER_BATCH,
+  QUICK_ASSET_THUMB_ASPECT_RATIO,
   nextQuickAssetRenderCount,
   resolveQuickAssetPanelSize,
 } from "@/features/canvas/ui/quickAssetPickerLayout";
+import { sortQuickAssetItemsNewestFirst } from "@/features/canvas/ui/quickAssetPickerSorting";
 import { useAssetThumbnails } from "@/features/canvas/ui/useAssetThumbnails";
 import {
   canGenerateThumbnail,
@@ -58,6 +62,8 @@ export interface QuickAssetPickerCardProps {
   variant?: QuickAssetPickerVariant;
   /** 卡片理想宽度；仍会被视口夹取。 */
   preferredWidth?: number;
+  /** 列表滚动区理想高度；仍会被视口夹取。画布侧格子大，要的比工作台高。 */
+  preferredListHeight?: number;
 }
 
 export interface QuickAssetPickerProps {
@@ -76,6 +82,19 @@ const PANEL_WIDTH = QUICK_ASSET_PANEL_WIDTH;
 const RENDER_BATCH = QUICK_ASSET_RENDER_BATCH;
 /** 列表之外的高度（标题行 + 内边距），只用于估算下翻还是上翻。 */
 const PANEL_CHROME_HEIGHT = QUICK_ASSET_PANEL_CHROME_HEIGHT;
+/**
+ * 画布侧网格：列数由常量决定，不要在这里另写一份 `grid-cols-N`（会跟宽度脱节）。
+ *
+ * ⚠️ `gridAutoRows: max-content` 不能省。列表是「固定高度 + overflow-y-auto」的 grid，
+ * 行轨道默认是 `auto` —— 候选超过一屏时，auto 轨道会被**压扁**去填那个固定高度
+ * （30 个候选 6 行时行高被压到 46.65px，而图要 74px），格子里的图随之被
+ * `overflow-hidden` 裁掉下半截，看起来就是「又小又挤、看不清是谁」。
+ * 改成 `max-content` 后行高只认内容，超出的部分正常滚动。
+ */
+const CANVAS_GRID_STYLE = {
+  gridTemplateColumns: `repeat(${QUICK_ASSET_GRID_COLUMNS}, minmax(0, 1fr))`,
+  gridAutoRows: "max-content",
+} as const;
 
 /**
  * 候选卡片浮层 —— 画布节点与工作台面板共用同一套行为。
@@ -100,6 +119,7 @@ export function QuickAssetPickerCard({
   onClose,
   variant = "canvas",
   preferredWidth = PANEL_WIDTH,
+  preferredListHeight = QUICK_ASSET_LIST_HEIGHT,
 }: QuickAssetPickerCardProps) {
   const overlayFloor = useOverlayLayerFloor();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -110,9 +130,18 @@ export function QuickAssetPickerCard({
     left: 0,
     top: 0,
     width: preferredWidth,
-    listHeight: QUICK_ASSET_LIST_HEIGHT,
+    listHeight: preferredListHeight,
   });
   const [renderCount, setRenderCount] = useState(RENDER_BATCH);
+  /**
+   * 列表展示顺序：**最新创建的排在最上面**。
+   *
+   * `items` 是调用方按创建顺序给的（最旧在前），这里统一倒过来 —— 规则只有
+   * `quickAssetPickerSorting.ts` 一处，别在各自的构建处再排一遍。
+   * 放在最前面（而不是渲染前）是因为下面的补批 `useEffect` 依赖它算长度：
+   * `const` 有 TDZ，声明位置必须早于任何在渲染期求值的引用。
+   */
+  const sortedItems = useMemo(() => sortQuickAssetItemsNewestFirst(items), [items]);
 
   const updateLayout = useCallback(() => {
     const anchor = anchorRef.current;
@@ -120,6 +149,7 @@ export function QuickAssetPickerCard({
     const { width, listHeight } = resolveQuickAssetPanelSize(
       { width: window.innerWidth, height: window.innerHeight },
       preferredWidth,
+      preferredListHeight,
     );
     const next = getFloatingPanelPosition(anchor, panelRef.current, {
       align: "start",
@@ -137,7 +167,7 @@ export function QuickAssetPickerCard({
         ? current
         : { left: next.left, top: next.top, width, listHeight },
     );
-  }, [anchorRef, preferredWidth]);
+  }, [anchorRef, preferredWidth, preferredListHeight]);
 
   /**
    * 把落点重算合并到下一帧。
@@ -206,23 +236,23 @@ export function QuickAssetPickerCard({
 
   // 滚到列表末尾再补下一批 —— 几百个角色时首屏只挂几十张缩略图。
   useEffect(() => {
-    if (!open || renderCount >= items.length) return;
+    if (!open || renderCount >= sortedItems.length) return;
     const scrollElement = scrollRef.current;
     const sentinel = sentinelRef.current;
     if (!scrollElement || !sentinel || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) {
-          setRenderCount((current) => nextQuickAssetRenderCount(current, items.length, RENDER_BATCH));
+          setRenderCount((current) => nextQuickAssetRenderCount(current, sortedItems.length, RENDER_BATCH));
         }
       },
       { root: scrollElement },
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [open, items.length, renderCount]);
+  }, [open, sortedItems.length, renderCount]);
 
-  const visibleItems = useMemo(() => items.slice(0, renderCount), [items, renderCount]);
+  const visibleItems = useMemo(() => sortedItems.slice(0, renderCount), [sortedItems, renderCount]);
   /** 只为当前这批准备缩略图；卡片收起时不再发起新任务。 */
   const visibleSources = useMemo(
     () => visibleItems.map((item) => item.source),
@@ -234,12 +264,14 @@ export function QuickAssetPickerCard({
 
   const isStudio = variant === "studio";
   const panelClassName = `${isStudio ? "quick-asset-picker--studio" : "border border-white/15 bg-[#171b25]"} fixed rounded-lg p-2 ${isStudio ? "" : "shadow-2xl"}`;
-  const gridClassName = isStudio ? "quick-asset-picker__grid grid" : "grid grid-cols-6";
-  const titleClassName = isStudio ? "quick-asset-picker__title" : "text-text";
+  const gridClassName = isStudio ? "quick-asset-picker__grid grid" : "grid";
+  const titleClassName = isStudio ? "quick-asset-picker__title text-xs" : "text-text text-[13px]";
   const closeClassName = isStudio
     ? "quick-asset-picker__close rounded p-0.5"
     : "rounded p-0.5 text-text-muted hover:bg-white/10 hover:text-white";
-  const thumbClassName = isStudio ? "quick-asset-picker__thumb object-contain object-top" : "bg-black/40 object-contain object-top";
+  const thumbClassName = isStudio
+    ? "quick-asset-picker__thumb object-cover object-top"
+    : "bg-black/40 object-cover object-top";
   const fallbackClassName = isStudio
     ? "quick-asset-picker__fallback text-sm font-semibold"
     : "bg-black/40 text-sm font-semibold text-text-muted";
@@ -264,17 +296,20 @@ export function QuickAssetPickerCard({
       onWheel={(event) => event.stopPropagation()}
     >
       <div className="mb-2 flex items-center justify-between gap-2">
-        <span className={`text-xs font-medium ${titleClassName}`}>{title}</span>
+        <span className={`font-medium ${titleClassName}`}>{title}</span>
         <button type="button" className={closeClassName} onClick={onClose} aria-label="关闭选择器">
           <X className="h-3.5 w-3.5" />
         </button>
       </div>
-      {/* 固定格 + 横屏 4:3 缩略图：格子尺寸恒定，图片整体缩放（object-contain）不裁切，
-          并贴顶居中（object-top）—— 宽幅素材的留白落在格子底部。 */}
+      {/* 缩略图格子统一是 4:3 横屏，图片 `object-cover` **裁切铺满**（贴顶 `object-top`，
+          竖构图的角色参考图优先保留头部），三个候选框共用同一套呈现。
+          ⚠️ 不要改回 `object-contain`：超宽素材（角色三视图那种横幅）在 4:3 盒子里会缩成
+          一条扁带 + 一大片留白，看起来又小又花。
+          比例走 `QUICK_ASSET_THUMB_ASPECT_RATIO` 内联下发，不依赖 Tailwind 生成 `aspect-[4/3]`。 */}
       <div
         ref={scrollRef}
         className={`ui-scrollbar content-start gap-1 overflow-y-auto overscroll-contain pr-0.5 ${gridClassName}`}
-        style={{ height: layout.listHeight }}
+        style={isStudio ? { height: layout.listHeight } : { height: layout.listHeight, ...CANVAS_GRID_STYLE }}
       >
         {visibleItems.map((item) => {
           const itemClassName = isStudio
@@ -298,7 +333,8 @@ export function QuickAssetPickerCard({
             >
               {displayUrl ? (
                 <img
-                  className={`aspect-[4/3] w-full ${thumbClassName}`}
+                  className={`w-full ${thumbClassName}`}
+                  style={{ aspectRatio: QUICK_ASSET_THUMB_ASPECT_RATIO }}
                   src={displayUrl}
                   alt={item.name}
                   loading="lazy"
@@ -307,12 +343,15 @@ export function QuickAssetPickerCard({
               ) : (
                 <span
                   aria-hidden="true"
-                  className={`flex aspect-[4/3] w-full items-center justify-center ${waitingForThumbnail ? skeletonClassName : fallbackClassName}`}
+                  className={`flex w-full items-center justify-center ${waitingForThumbnail ? skeletonClassName : fallbackClassName}`}
+                  style={{ aspectRatio: QUICK_ASSET_THUMB_ASPECT_RATIO }}
                 >
                   {item.name.slice(0, 1)}
                 </span>
               )}
-              <span className="block truncate bg-black/70 px-0.5 py-0.5 text-[8px] text-white">{item.name}</span>
+              <span className="line-clamp-2 bg-black/70 px-1 py-0.5 text-[10px] leading-tight text-white">
+                {item.name}
+              </span>
               {item.active ? (
                 <span className="absolute right-0.5 top-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-accent text-white">
                   <Check className="h-2.5 w-2.5" />
@@ -321,10 +360,10 @@ export function QuickAssetPickerCard({
             </button>
           );
         })}
-        {items.length === 0 ? (
+        {sortedItems.length === 0 ? (
           <p className="col-span-full py-4 text-center text-[10px] text-text-muted">{emptyHint}</p>
         ) : null}
-        {renderCount < items.length ? (
+        {renderCount < sortedItems.length ? (
           <div ref={sentinelRef} aria-hidden="true" className="col-span-full h-px" />
         ) : null}
       </div>
@@ -372,6 +411,8 @@ export function QuickAssetPicker({
         items={items}
         onToggleItem={onToggleItem}
         onClose={() => onToggleOpen(false)}
+        // 画布侧格子比工作台大，可视区也要更高，否则只剩两行可选。
+        preferredListHeight={QUICK_ASSET_CANVAS_LIST_HEIGHT}
       />
     </>
   );

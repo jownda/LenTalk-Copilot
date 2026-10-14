@@ -34,6 +34,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { matchesBinding, useKeyboardShortcutStore } from "@/stores/keyboardShortcutStore";
 import { canvasAiGateway, canvasEventBus } from "@/features/canvas/application/canvasServices";
 import { nodeCatalog } from "@/features/canvas/application/nodeCatalog";
+import { buildBatchConnections, resolveBatchAnchorCandidates } from "@/features/canvas/application/batchNodeConnection";
 import {
   CANVAS_NODE_TYPES,
   type CanvasEdge,
@@ -79,6 +80,7 @@ import {
 } from "@/features/canvas/application/canvasLayout";
 import { nodeTypes } from "./nodes";
 import { edgeTypes } from "./edges";
+import { BatchConnectionLine } from "./ui/BatchConnectionLine";
 
 const MAX_RECOVERY_POLLERS = 4;
 const MAX_RECOVERY_DURATION_MS = 30 * 60 * 1000;
@@ -114,6 +116,11 @@ import {
   parsePromptDragPayload,
 } from "@/features/library/importAssets";
 import { usePromptLibraryStore, type PromptTemplate } from "@/features/prompts/promptLibraryStore";
+import {
+  appendPromptText,
+  composePromptText,
+  type PromptApplyMode,
+} from "@/features/prompts/promptApply";
 import { UiButton, UiInput, UiModal } from "@/components/ui";
 import type { CinematicAssetLibraryBridge } from "@/features/library/AssetLibraryPanel";
 import { TemplateSidebar } from "@/features/templates/TemplateSidebar";
@@ -315,8 +322,15 @@ interface PendingConnectStart {
   };
 }
 
-interface PreviewConnectionVisual {
+interface PreviewConnectionPath {
   d: string;
+  /** 幽灵线（同一批里除主锚点外的那些）—— 画得淡一档，与拖拽过程中的预览保持一致。 */
+  ghost: boolean;
+}
+
+interface PreviewConnectionVisual {
+  /** 画序：幽灵线在前，主连线最后（压在最上面）。 */
+  paths: PreviewConnectionPath[];
   stroke: string;
   strokeWidth: number;
   strokeLinecap: "butt" | "round" | "square";
@@ -786,6 +800,42 @@ function getClientPosition(event: MouseEvent | TouchEvent): { x: number; y: numb
   return { x: touch.clientX, y: touch.clientY };
 }
 
+/**
+ * 取某节点端口在「画布容器坐标系」里的中点 —— 供落点菜单的静态预览线用（与拖拽过程中
+ * BatchConnectionLine 用 flow 坐标不同，这里的 svg 铺在容器上，必须用容器相对坐标）。
+ * 端口元素找不到时退回节点右/左边中点，与 handleConnectEnd 里既有写法一致。
+ */
+function resolveNodeHandlePoint(
+  container: HTMLElement | null,
+  nodeId: string,
+  handleType: HandleType,
+  containerRect: DOMRect,
+): { x: number; y: number } | null {
+  const nodeElement = container?.querySelector<HTMLElement>(`.react-flow__node[data-id="${nodeId}"]`);
+  if (!nodeElement) {
+    return null;
+  }
+
+  // React Flow 给 Handle 挂的是 `.source` / `.target` 裸类名（没有 `react-flow__handle-source`），
+  // 早先按 handleType 拼类名一直匹配不上、静默退化成「节点边缘中点」。
+  const handleElement = nodeElement.querySelector<HTMLElement>(
+    handleType === "source" ? ".react-flow__handle.source" : ".react-flow__handle.target",
+  );
+  if (handleElement) {
+    const handleRect = handleElement.getBoundingClientRect();
+    return {
+      x: handleRect.left - containerRect.left + handleRect.width / 2,
+      y: handleRect.top - containerRect.top + handleRect.height / 2,
+    };
+  }
+
+  const nodeRect = nodeElement.getBoundingClientRect();
+  return {
+    x: (handleType === "source" ? nodeRect.right : nodeRect.left) - containerRect.left,
+    y: nodeRect.top - containerRect.top + nodeRect.height / 2,
+  };
+}
+
 function createPreviewPath(line: PreviewConnectionLine): string {
   const { start, end, handleType } = line;
   const deltaX = end.x - start.x;
@@ -1109,6 +1159,7 @@ export function Canvas() {
   const applyNodesChange = useCanvasStore((state) => state.onNodesChange);
   const applyEdgesChange = useCanvasStore((state) => state.onEdgesChange);
   const connectNodes = useCanvasStore((state) => state.onConnect);
+  const connectManyNodes = useCanvasStore((state) => state.onConnectMany);
   const setCanvasData = useCanvasStore((state) => state.setCanvasData);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const updateNodeDataTransient = useCanvasStore((state) => state.updateNodeDataTransient);
@@ -2202,15 +2253,62 @@ export function Canvas() {
     event.stopPropagation();
   }, []);
 
+  /**
+   * 落地一条「用户拖出来的连接」，但它可能只是框选批量的其中一条。
+   *
+   * 框选多个素材节点后，用户只需要从任意一个选中节点拉线：
+   * 线落在哪个目标上，选中的那一批就一起接到那个目标（反向拖则是同一个源接到多个选中目标）。
+   * 判定与展开逻辑在 application/batchNodeConnection 里（纯函数、有回归）。
+   *
+   * 只有 1 条时走原来的单条路径，行为与加这个功能之前完全一致。
+   */
+  const connectWithBatch = useCallback(
+    ({
+      anchorNodeId,
+      peerNodeId,
+      anchorHandleType,
+      fallback,
+      candidates,
+    }: {
+      anchorNodeId: string;
+      peerNodeId: string;
+      anchorHandleType: "source" | "target";
+      fallback: Connection;
+      candidates: CanvasNode[];
+    }) => {
+      const connections = buildBatchConnections({
+        anchorNodeId,
+        peerNodeId,
+        anchorHandleType,
+        nodes: candidates,
+      });
+
+      if (connections.length > 1) {
+        connectManyNodes(connections);
+        return;
+      }
+
+      connectNodes(fallback);
+    },
+    [connectManyNodes, connectNodes],
+  );
+
   const handleConnect = useCallback(
     (connection: Connection) => {
       if (!canNodeBeManualConnectionSource(connection.source, nodes)) {
         return;
       }
-      connectNodes(connection);
+      connectWithBatch({
+        anchorNodeId: connection.source,
+        peerNodeId: connection.target,
+        // React Flow 的 onConnect 一定按 source → target 归一，所以这里恒为正向。
+        anchorHandleType: "source",
+        fallback: connection,
+        candidates: nodes,
+      });
       scheduleCanvasPersist(0);
     },
-    [connectNodes, nodes, scheduleCanvasPersist],
+    [connectWithBatch, nodes, scheduleCanvasPersist],
   );
 
   const handleMoveEnd = useCallback(
@@ -3328,11 +3426,8 @@ export function Canvas() {
         const template = allLibraries.flatMap((lib) => lib.items).find((item) => item.id === promptId);
         if (!template) return;
 
-        const positive = (template.positive || "").trim();
-        const negative = (template.negative || "").trim();
-        const mergedText = negative
-          ? [positive, `Negative prompt:\n${negative}`].filter(Boolean).join("\n\n")
-          : positive;
+        // 拖进来的节点还没有输入框内容，等价于「空输入框 + 完整模式」。
+        const mergedText = composePromptText(template, "full");
 
         const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.imageEdit);
         const position = reactFlowInstance.screenToFlowPosition({ x: event.clientX, y: event.clientY });
@@ -3422,21 +3517,16 @@ export function Canvas() {
   );
 
   const handleApplyPromptTemplate = useCallback(
-    (template: PromptTemplate, mode: "positive" | "full" = "full") => {
-      // 对齐 Infinite Canvas:完整应用时把正向 + 负向合并成一段文本输出
-      // 格式: [正向]\n\nNegative prompt:\n[负向]
-      const positive = (template.positive || "").trim();
-      const negative = (template.negative || "").trim();
-      const mergedText =
-        mode === "full" && negative
-          ? [positive, `Negative prompt:\n${negative}`].filter(Boolean).join("\n\n")
-          : positive;
+    (template: PromptTemplate, mode: PromptApplyMode = "full") => {
+      // 合并规则与追加规则统一在 prompts/promptApply：
+      // 素材库提示词 tab、拖拽提示词到画布、节点里的「提示词模板」按钮共用同一份。
+      const mergedText = composePromptText(template, mode);
 
       const selectedNode = useCanvasStore.getState().nodes.find((node) => node.id === selectedNodeId);
       if (selectedNode?.type === CANVAS_NODE_TYPES.imageEdit) {
-        const currentPrompt = String((selectedNode.data as Record<string, unknown>).prompt ?? "").trim();
+        const currentPrompt = String((selectedNode.data as Record<string, unknown>).prompt ?? "");
         updateNodeData(selectedNode.id, {
-          prompt: currentPrompt ? `${currentPrompt}\n\n${mergedText}` : mergedText,
+          prompt: appendPromptText(currentPrompt, mergedText),
         });
         scheduleCanvasPersist(0);
         return;
@@ -3458,21 +3548,21 @@ export function Canvas() {
     (type: CanvasNodeType) => {
       const newNodeId = addNode(type, flowPosition);
       if (pendingConnectStart) {
-        if (pendingConnectStart.handleType === "source") {
-          connectNodes({
-            source: pendingConnectStart.nodeId,
-            target: newNodeId,
-            sourceHandle: "source",
-            targetHandle: "target",
-          });
-        } else {
-          connectNodes({
-            source: newNodeId,
-            target: pendingConnectStart.nodeId,
-            sourceHandle: "source",
-            targetHandle: "target",
-          });
-        }
+        const anchorNodeId = pendingConnectStart.nodeId;
+        const anchorHandleType = pendingConnectStart.handleType;
+        // addNode 刚把新节点写进 store，闭包里的 nodes 仍是旧的（找不到它）；
+        // 直接读一次最新状态。addNode 不改旧节点的 selected，框选快照依然有效。
+        const latestNodes = useCanvasStore.getState().nodes;
+        connectWithBatch({
+          anchorNodeId,
+          peerNodeId: newNodeId,
+          anchorHandleType,
+          fallback:
+            anchorHandleType === "source"
+              ? { source: anchorNodeId, target: newNodeId, sourceHandle: "source", targetHandle: "target" }
+              : { source: newNodeId, target: anchorNodeId, sourceHandle: "source", targetHandle: "target" },
+          candidates: latestNodes,
+        });
       }
 
       scheduleCanvasPersist(0);
@@ -3481,7 +3571,7 @@ export function Canvas() {
       setPendingConnectStart(null);
       setPreviewConnectionVisual(null);
     },
-    [addNode, connectNodes, flowPosition, pendingConnectStart, scheduleCanvasPersist, setPreviewConnectionVisual],
+    [addNode, connectWithBatch, flowPosition, pendingConnectStart, scheduleCanvasPersist, setPreviewConnectionVisual],
   );
 
   const duplicateNodes = useCallback(
@@ -4356,11 +4446,17 @@ export function Canvas() {
           nodeHasSourceHandle(sourceNode.type) &&
           nodeHasTargetHandle(targetNode.type)
         ) {
-          connectNodes({
-            source: sourceNode.id,
-            target: targetNode.id,
-            sourceHandle: "source",
-            targetHandle: "target",
+          connectWithBatch({
+            anchorNodeId: pendingConnectStart.nodeId,
+            peerNodeId: dropNodeId,
+            anchorHandleType: pendingConnectStart.handleType,
+            fallback: {
+              source: sourceNode.id,
+              target: targetNode.id,
+              sourceHandle: "source",
+              targetHandle: "target",
+            },
+            candidates: nodes,
           });
           scheduleCanvasPersist(0);
           setPendingConnectStart(null);
@@ -4382,23 +4478,15 @@ export function Canvas() {
       let startY: number | null = pendingConnectStart.start?.y ?? null;
 
       if (startX === null || startY === null) {
-        const nodeElement = wrapperRef.current?.querySelector<HTMLElement>(
-          `.react-flow__node[data-id="${pendingConnectStart.nodeId}"]`,
+        const handlePoint = resolveNodeHandlePoint(
+          wrapperRef.current,
+          pendingConnectStart.nodeId,
+          pendingConnectStart.handleType,
+          containerRect,
         );
-        const handleElement = nodeElement?.querySelector<HTMLElement>(
-          `.react-flow__handle-${pendingConnectStart.handleType}`,
-        );
-        if (handleElement) {
-          const handleRect = handleElement.getBoundingClientRect();
-          startX = handleRect.left - containerRect.left + handleRect.width / 2;
-          startY = handleRect.top - containerRect.top + handleRect.height / 2;
-        } else if (nodeElement) {
-          const nodeRect = nodeElement.getBoundingClientRect();
-          startX =
-            pendingConnectStart.handleType === "source"
-              ? nodeRect.right - containerRect.left
-              : nodeRect.left - containerRect.left;
-          startY = nodeRect.top - containerRect.top + nodeRect.height / 2;
+        if (handlePoint) {
+          startX = handlePoint.x;
+          startY = handlePoint.y;
         } else if (connectionState.from) {
           startX = connectionState.from.x;
           startY = connectionState.from.y;
@@ -4408,12 +4496,50 @@ export function Canvas() {
       if (startX === null || startY === null) {
         setPreviewConnectionVisual(null);
       } else {
+        // 批量：同一批里其余节点的线也一并画上 —— 与拖拽过程中看到的条数保持一致，
+        // 免得「松手、菜单弹出来之后才知道会连好几个」。
+        const ghostPaths: PreviewConnectionPath[] = [];
+        const batchCandidates = resolveBatchAnchorCandidates({
+          anchorNodeId: pendingConnectStart.nodeId,
+          anchorHandleType: pendingConnectStart.handleType,
+          nodes,
+        });
+
+        for (const candidate of batchCandidates) {
+          if (candidate.id === pendingConnectStart.nodeId) {
+            continue;
+          }
+          const point = resolveNodeHandlePoint(
+            wrapperRef.current,
+            candidate.id,
+            pendingConnectStart.handleType,
+            containerRect,
+          );
+          if (!point) {
+            continue;
+          }
+          ghostPaths.push({
+            d: createPreviewPath({
+              start: point,
+              end: { x: endX, y: endY },
+              handleType: pendingConnectStart.handleType,
+            }),
+            ghost: true,
+          });
+        }
+
         setPreviewConnectionVisual({
-          d: createPreviewPath({
-            start: { x: startX, y: startY },
-            end: { x: endX, y: endY },
-            handleType: pendingConnectStart.handleType,
-          }),
+          paths: [
+            ...ghostPaths,
+            {
+              d: createPreviewPath({
+                start: { x: startX, y: startY },
+                end: { x: endX, y: endY },
+                handleType: pendingConnectStart.handleType,
+              }),
+              ghost: false,
+            },
+          ],
           stroke: "rgba(255,255,255,0.9)",
           strokeWidth: 1,
           strokeLinecap: "round",
@@ -4434,7 +4560,20 @@ export function Canvas() {
       suppressNextPaneClickRef.current = true;
       setShowNodeMenu(true);
     },
-    [connectNodes, nodes, pendingConnectStart, reactFlowInstance, scheduleCanvasPersist],
+    [connectWithBatch, nodes, pendingConnectStart, reactFlowInstance, scheduleCanvasPersist],
+  );
+
+  /**
+   * 框选里「可以当连线起点」的节点数（组不算：它体积大、容易被圈进来，但不参与批量连接）。
+   * ≥2 时在画布顶部提示：从任意一个拉线就能一次把它们全接到同一个目标。
+   */
+  const batchConnectSourceCount = useMemo(
+    () =>
+      nodes.filter(
+        (node) =>
+          node.selected && node.type !== CANVAS_NODE_TYPES.group && nodeHasSourceHandle(node.type),
+      ).length,
+    [nodes],
   );
 
   const emptyHint = useMemo(
@@ -4526,6 +4665,8 @@ export function Canvas() {
         defaultEdgeOptions={{ type: "disconnectableEdge" }}
         // 让拖拽中的连接线在距离目标 Handle 36px 内自动吸附。
         connectionRadius={36}
+        // 框选多个节点后拉线：拉出来就是好几条（每个选中节点一条），而不是松手后才变多条。
+        connectionLineComponent={BatchConnectionLine}
         defaultViewport={DEFAULT_VIEWPORT}
         minZoom={0.1}
         maxZoom={5}
@@ -4722,6 +4863,15 @@ export function Canvas() {
 
       {nodes.length === 0 && emptyHint}
 
+      {batchConnectSourceCount >= 2 && (
+        <div className="pointer-events-none absolute left-1/2 top-3 z-30 -translate-x-1/2 rounded-full border border-border-dark bg-surface-dark/95 px-3 py-1 text-xs text-text-muted shadow-lg">
+          {t("canvas.batchConnectHint", {
+            count: batchConnectSourceCount,
+            defaultValue: "已选 {{count}} 个节点 · 从任意一个拉线即可一次接入同一目标",
+          })}
+        </div>
+      )}
+
       {showNodeMenu && previewConnectionVisual && (
         <svg
           className="pointer-events-none absolute z-40 overflow-visible"
@@ -4734,14 +4884,18 @@ export function Canvas() {
           width={previewConnectionVisual.width}
           height={previewConnectionVisual.height}
         >
-          <path
-            className="pointer-events-none"
-            d={previewConnectionVisual.d}
-            fill="none"
-            stroke={previewConnectionVisual.stroke}
-            strokeWidth={previewConnectionVisual.strokeWidth}
-            strokeLinecap={previewConnectionVisual.strokeLinecap}
-          />
+          {previewConnectionVisual.paths.map((path, index) => (
+            <path
+              key={index}
+              className="pointer-events-none"
+              d={path.d}
+              fill="none"
+              stroke={previewConnectionVisual.stroke}
+              strokeWidth={previewConnectionVisual.strokeWidth}
+              strokeLinecap={previewConnectionVisual.strokeLinecap}
+              strokeOpacity={path.ghost ? 0.45 : 1}
+            />
+          ))}
         </svg>
       )}
 

@@ -11,6 +11,7 @@ import { CANVAS_NODE_TYPES, type CanvasNode, type CinematicStudioNodeData } from
 import { optimizeLiraPrompt } from "@/features/canvas/domain/liraRules";
 import { reversePromptSystemPrompt, reversePromptUserMessage } from "@/features/canvas/domain/reversePrompt";
 import { usePromptLibraryStore } from "@/features/prompts/promptLibraryStore";
+import { appendPromptText, composePromptText } from "@/features/prompts/promptApply";
 import { loadAISettings } from "@/features/cinematicStudio/app/providers/aiSettings";
 import { useCanvasStore } from "@/stores/canvasStore";
 
@@ -180,7 +181,8 @@ export function ImagePromptOptimizerPanel({ nodeId, data, onOpenChange }: ImageP
   const handleApplyPreset = () => {
     const template = presetTemplates.find((item) => item.id === selectedPresetId);
     if (!template) return;
-    const nextDraft = [promptDraft.trim(), template.positive.trim()].filter(Boolean).join("\n\n");
+    // 只取正向、追加到已有草稿后面 —— 与画布其它「应用提示词」入口同一套规则。
+    const nextDraft = appendPromptText(promptDraft, composePromptText(template, "positive"));
     updateNodeData(nodeId, { imagePromptDraft: nextDraft });
   };
 

@@ -10,7 +10,7 @@ import {
   useLayoutEffect,
   useRef,
 } from 'react';
-import { Handle, Position, useUpdateNodeInternals, type NodeProps } from '@xyflow/react';
+import { Handle, Position, useStore, useUpdateNodeInternals, type NodeProps } from '@xyflow/react';
 import { createPortal } from 'react-dom';
 import { Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -68,12 +68,20 @@ import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import {
   NODE_CONTROL_CHIP_CLASS,
   NODE_CONTROL_ICON_CLASS,
-  NODE_CONTROL_MODEL_CHIP_CLASS,
+  NODE_CONTROL_MODEL_CHIP_NARROW_CLASS,
   NODE_CONTROL_PARAMS_CHIP_CLASS,
   NODE_CONTROL_PRIMARY_BUTTON_CLASS,
 } from '@/features/canvas/ui/nodeControlStyles';
 import { ModelParamsControls } from '@/features/canvas/ui/ModelParamsControls';
-import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
+import { NodeReferencePicker } from '@/features/canvas/ui/NodeReferencePicker';
+import { PromptTemplatePicker } from '@/features/canvas/ui/PromptTemplatePicker';
+import {
+  PICKER_FALLBACK_ANCHOR,
+  resolvePickerAnchor,
+  type PickerAnchor,
+} from '@/features/canvas/ui/nodeReferencePickerLayout';
+import { appendPromptText, composePromptText, type PromptApplyMode } from '@/features/prompts/promptApply';
+import type { PromptTemplate } from '@/features/prompts/promptLibraryStore';
 import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
 import { resolveRecommendedApiPriceBadge } from './nodePriceBadge';
 import { UiButton } from '@/components/ui';
@@ -91,81 +99,12 @@ interface AspectRatioChoice {
   label: string;
 }
 
-interface PickerAnchor {
-  left: number;
-  top: number;
-}
-
-const PICKER_FALLBACK_ANCHOR: PickerAnchor = { left: 8, top: 8 };
-const PICKER_Y_OFFSET_PX = 20;
 const IMAGE_EDIT_NODE_MIN_WIDTH = 390;
 const IMAGE_EDIT_NODE_MIN_HEIGHT = 180;
 const IMAGE_EDIT_NODE_MAX_WIDTH = 1400;
 const IMAGE_EDIT_NODE_MAX_HEIGHT = 1000;
 const IMAGE_EDIT_NODE_DEFAULT_WIDTH = 520;
 const IMAGE_EDIT_NODE_DEFAULT_HEIGHT = 320;
-
-function getTextareaCaretOffset(
-  textarea: HTMLTextAreaElement,
-  caretIndex: number
-): PickerAnchor {
-  const mirror = document.createElement('div');
-  const computed = window.getComputedStyle(textarea);
-  const mirrorStyle = mirror.style;
-
-  mirrorStyle.position = 'absolute';
-  mirrorStyle.visibility = 'hidden';
-  mirrorStyle.pointerEvents = 'none';
-  mirrorStyle.whiteSpace = 'pre-wrap';
-  mirrorStyle.overflowWrap = 'break-word';
-  mirrorStyle.wordBreak = 'break-word';
-  mirrorStyle.boxSizing = computed.boxSizing;
-  mirrorStyle.width = `${textarea.clientWidth}px`;
-  mirrorStyle.font = computed.font;
-  mirrorStyle.lineHeight = computed.lineHeight;
-  mirrorStyle.letterSpacing = computed.letterSpacing;
-  mirrorStyle.padding = computed.padding;
-  mirrorStyle.border = computed.border;
-  mirrorStyle.textTransform = computed.textTransform;
-  mirrorStyle.textIndent = computed.textIndent;
-
-  mirror.textContent = textarea.value.slice(0, caretIndex);
-
-  const marker = document.createElement('span');
-  marker.textContent = textarea.value.slice(caretIndex, caretIndex + 1) || ' ';
-  mirror.appendChild(marker);
-
-  document.body.appendChild(mirror);
-
-  const left = marker.offsetLeft - textarea.scrollLeft;
-  const top = marker.offsetTop - textarea.scrollTop;
-
-  document.body.removeChild(mirror);
-
-  return {
-    left: Math.max(0, left),
-    top: Math.max(0, top),
-  };
-}
-
-function resolvePickerAnchor(
-  container: HTMLDivElement | null,
-  textarea: HTMLTextAreaElement,
-  caretIndex: number
-): PickerAnchor {
-  if (!container) {
-    return PICKER_FALLBACK_ANCHOR;
-  }
-
-  const containerRect = container.getBoundingClientRect();
-  const textareaRect = textarea.getBoundingClientRect();
-  const caretOffset = getTextareaCaretOffset(textarea, caretIndex);
-
-  return {
-    left: Math.max(0, textareaRect.left - containerRect.left + caretOffset.left),
-    top: Math.max(0, textareaRect.top - containerRect.top + caretOffset.top + PICKER_Y_OFFSET_PX),
-  };
-}
 
 /** 缩略图轻量预览浮层状态: 图片地址 + 鼠标点击位置(用于定位) */
 interface ReferencePreviewState {
@@ -435,6 +374,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const generationLockRef = useRef(false);
 
   const rootRef = useRef<HTMLDivElement>(null);
+  // 画布缩放：@ 候选面板的锚点换算与视觉间距都要靠它折算。
+  // 用 useStore 选择器而不是 useViewport —— 后者在平移画布时也会触发重渲染，拖画布会变卡。
+  const zoom = useStore((state) => state.transform[2]);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const promptHighlightRef = useRef<HTMLDivElement>(null);
   const [promptDraft, setPromptDraft] = useState(() => data.prompt ?? '');
@@ -1090,6 +1032,30 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     setPickerActiveIndex(0);
   }, [commitPromptDraft, pickerCursor]);
 
+  /**
+   * 从「提示词模板」卡片填入一段文本。
+   *
+   * 合并规则与追加规则都走 `prompts/promptApply`：素材库提示词 tab 的「正向 / 完整」、
+   * 拖拽提示词到画布、画布右键「应用到选中节点」用的是同一份纯函数 ——
+   * 同一个模板不管从哪条路进去，落进输入框的文字都完全一样。
+   *
+   * 填入位置是文末：光标跟到新内容末尾，并把视图带到底部
+   * （`scrollTop` 写一个极大值，浏览器会夹到最大滚动位置，正好是末尾）。
+   */
+  const handleApplyPromptTemplate = useCallback((
+    template: PromptTemplate,
+    mode: PromptApplyMode
+  ) => {
+    const nextPrompt = appendPromptText(promptDraftRef.current, composePromptText(template, mode));
+
+    pendingPromptCaretRef.current = {
+      cursor: nextPrompt.length,
+      scrollTop: Number.MAX_SAFE_INTEGER,
+    };
+    setPromptDraft(nextPrompt);
+    commitPromptDraft(nextPrompt);
+  }, [commitPromptDraft]);
+
   const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     // 只要用户开始敲键盘，就由浏览器接管光标，不再回钉插入位置。
     clearPendingPromptCaret();
@@ -1183,7 +1149,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     if (isAtKey && !event.ctrlKey && !event.metaKey && !event.altKey && incomingImages.length > 0) {
       event.preventDefault();
       const cursor = event.currentTarget.selectionStart ?? promptDraftRef.current.length;
-      setPickerAnchor(resolvePickerAnchor(rootRef.current, event.currentTarget, cursor));
+      setPickerAnchor(resolvePickerAnchor(rootRef.current, event.currentTarget, cursor, zoom));
       setPickerCursor(cursor);
       setShowImagePicker(true);
       setPickerActiveIndex(0);
@@ -1293,59 +1259,38 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
             >
               {incomingText.slice(0, 3).map((text, index) => (
                 <div
- key={`incoming-text-${index}`}
- className="overflow-hidden text-ellipsis whitespace-nowrap"
- title={text}
- >
- {text}
- </div>
+                  key={`incoming-text-${index}`}
+                  className="overflow-hidden text-ellipsis whitespace-nowrap"
+                  title={text}
+                >
+                  {text}
+                </div>
               ))}
             </div>
           )}
         </div>
 
         {showImagePicker && incomingImageItems.length > 0 && (
-          <div
-            className="nowheel absolute z-30 w-[120px] overflow-hidden rounded-xl border border-[rgba(255,255,255,0.16)] bg-surface-dark shadow-xl"
-            style={{ left: pickerAnchor.left, top: pickerAnchor.top }}
-            onMouseDown={(event) => event.stopPropagation()}
-            onWheelCapture={(event) => event.stopPropagation()}
-          >
-            <div
-              className="ui-scrollbar nowheel max-h-[180px] overflow-y-auto"
-              onWheelCapture={(event) => event.stopPropagation()}
-            >
-              {incomingImageItems.map((item, index) => (
-                <button
-                  key={`${item.imageUrl}-${index}`}
-                  type="button"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    insertImageReference(index);
-                  }}
-                  onMouseEnter={() => setPickerActiveIndex(index)}
-                  className={`flex w-full items-center gap-2 border border-transparent bg-bg-dark/70 px-2 py-2 text-left text-sm text-text-dark transition-colors hover:border-[rgba(255,255,255,0.18)] ${pickerActiveIndex === index
-                      ? 'border-[rgba(255,255,255,0.24)] bg-bg-dark'
-                      : ''
-                    }`}
-                >
-                  <CanvasNodeImage
-                    src={item.displayUrl}
-                    alt={item.label}
-                    viewerSourceUrl={resolveImageDisplayUrl(item.imageUrl)}
-                    viewerImageList={incomingImageViewerList}
-                    className="h-8 w-8 rounded object-cover"
-                    draggable={false}
-                  />
-                  <span>{item.label}</span>
-                </button>
-              ))}
-            </div>
-          </div>
+          <NodeReferencePicker
+            anchor={pickerAnchor}
+            containerRef={rootRef}
+            zoom={zoom}
+            entries={incomingImageItems.map((item, index) => ({
+              key: `${item.imageUrl}-${index}`,
+              kind: 'image',
+              label: item.label,
+              thumbUrl: item.displayUrl,
+              viewerSourceUrl: resolveImageDisplayUrl(item.imageUrl),
+              viewerImageList: incomingImageViewerList,
+            }))}
+            activeIndex={pickerActiveIndex}
+            onSelect={insertImageReference}
+            onHover={setPickerActiveIndex}
+          />
         )}
       </div>
 
-      <div className="mt-2 flex shrink-0 items-center gap-1">
+      <div className="mt-2 flex shrink-0 items-center gap-1.5">
         <ModelParamsControls
           imageModels={imageModels}
           selectedModel={selectedModel}
@@ -1394,11 +1339,19 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
             })
           }
           triggerSize="sm"
+          // 模型 chip 只留模型名：平台名（KIE / PPIO / 即梦…）在这一格里是冗余信息
+          // —— 模型选择面板本来就按平台分组，展开就能看到。去掉后这一排宽松不少。
+          showProviderName={false}
           chipClassName={NODE_CONTROL_CHIP_CLASS}
-          modelChipClassName={NODE_CONTROL_MODEL_CHIP_CLASS}
+          modelChipClassName={NODE_CONTROL_MODEL_CHIP_NARROW_CLASS}
           paramsChipClassName={NODE_CONTROL_PARAMS_CHIP_CLASS}
         />
 
+        {/* 提示词模板：只显示图标，点开弹出「素材库 → 提示词库」的条目卡片。
+            紧跟在模型 / 参数后面，和左边那一组同一条基线对齐（右侧只剩生成按钮）。 */}
+        <PromptTemplatePicker onApply={handleApplyPromptTemplate} />
+
+        {/* 撑开中间的空档，把生成按钮顶到最右。 */}
         <div className="ml-auto" />
 
         <UiButton

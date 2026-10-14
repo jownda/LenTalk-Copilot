@@ -120,6 +120,11 @@ interface CanvasState {
   onNodesChange: (changes: NodeChange<CanvasNode>[]) => void;
   onEdgesChange: (changes: EdgeChange<CanvasEdge>[]) => void;
   onConnect: (connection: Connection) => void;
+  /**
+   * 一次建立多条连接（框选多个节点后统一拉线）。
+   * 与逐条调用 onConnect 的区别只在历史：这里**只压一个快照**，撤销一次就能回到连线前。
+   */
+  onConnectMany: (connections: Connection[]) => void;
 
   setCanvasData: (nodes: CanvasNode[], edges: CanvasEdge[], history?: CanvasHistoryState) => void;
   addNode: (
@@ -1381,6 +1386,45 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
           { ...connection, sourceHandle, targetHandle, type: 'disconnectableEdge' },
           state.edges
         ),
+        history: {
+          past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
+          future: [],
+        },
+        dragHistorySnapshot: null,
+        inputGraphRevision: state.inputGraphRevision + 1,
+      };
+    });
+  },
+
+  onConnectMany: (connections) => {
+    if (connections.length === 0) {
+      return;
+    }
+
+    set((state) => {
+      let nextNodes = state.nodes;
+      let nextEdges = state.edges;
+
+      for (const connection of connections) {
+        const sourceHandle = normalizeHandleId(connection.sourceHandle) ?? 'source';
+        const targetHandle = normalizeHandleId(connection.targetHandle) ?? 'target';
+        nextNodes = applyCinematicStudioPromptToTarget(nextNodes, connection.source, connection.target);
+        // addEdge 自身会去重（同一对 source/target/handle 已存在时原样返回），
+        // 所以「框选里混进已经连过的节点」不会产生重复边。
+        nextEdges = addEdge<CanvasEdge>(
+          { ...connection, sourceHandle, targetHandle, type: 'disconnectableEdge' },
+          nextEdges
+        );
+      }
+
+      // 一条都没落地（全是重复边）时不压快照，免得用户白撤一次。
+      if (nextEdges === state.edges && nextNodes === state.nodes) {
+        return {};
+      }
+
+      return {
+        nodes: nextNodes,
+        edges: nextEdges,
         history: {
           past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
           future: [],

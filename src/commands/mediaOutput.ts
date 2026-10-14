@@ -118,3 +118,37 @@ export async function cleanupUnreferencedMedia(): Promise<MediaCleanupReport> {
   }
   return invoke<MediaCleanupReport>('cleanup_unreferenced_media');
 }
+
+/** 一次「旧素材迁移」的结果。 */
+export interface MediaMigrationReport {
+  /** 当前生效的落盘位置（迁移目标）。 */
+  targetRoot: string;
+  /** 参与迁移的旧位置（不含目标本身）。 */
+  sourceRoots: string[];
+  copiedFiles: number;
+  copiedBytes: number;
+  /** 新位置里已有同名文件而跳过 —— 文件名就是内容 md5，同名即同内容。 */
+  skippedFiles: number;
+  failedFiles: number;
+}
+
+/**
+ * 把旧落盘位置里的素材复制到当前位置。
+ *
+ * 是**复制**不是移动：画布/工程里存的是绝对路径，文件一旦离开旧目录，那些引用立刻失效
+ * —— 刚经历过「原来的图片全变成损坏图标」的人不该再赌第二次。原文件一律保留，
+ * 确认新位置无误后可由用户自行清理旧目录。
+ */
+export async function migrateMediaOutputFiles(): Promise<MediaMigrationReport> {
+  if (!isTauri()) {
+    return {
+      targetRoot: '',
+      sourceRoots: [],
+      copiedFiles: 0,
+      copiedBytes: 0,
+      skippedFiles: 0,
+      failedFiles: 0,
+    };
+  }
+  return invoke<MediaMigrationReport>('migrate_media_output_files');
+}

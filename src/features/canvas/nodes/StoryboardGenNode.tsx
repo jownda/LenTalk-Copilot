@@ -9,7 +9,7 @@ import {
   useEffect,
   useRef,
 } from 'react';
-import { Handle, Position, useUpdateNodeInternals, useViewport } from '@xyflow/react';
+import { Handle, Position, useStore, useUpdateNodeInternals } from '@xyflow/react';
 import { Minus, Plus, Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -64,7 +64,13 @@ import {
 } from '@/features/canvas/models';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { ModelParamsControls } from '@/features/canvas/ui/ModelParamsControls';
-import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
+import { NodeReferencePicker } from '@/features/canvas/ui/NodeReferencePicker';
+import {
+  PICKER_FALLBACK_ANCHOR,
+  resolvePickerAnchor,
+  resolvePointerAnchor,
+  type PickerAnchor,
+} from '@/features/canvas/ui/nodeReferencePickerLayout';
 import {
   UiButton,
 } from '@/components/ui';
@@ -93,16 +99,10 @@ interface AspectRatioChoice {
   label: string;
 }
 
-interface PickerAnchor {
-  left: number;
-  top: number;
-}
-
 const AUTO_ASPECT_RATIO_OPTION: AspectRatioChoice = {
   value: AUTO_REQUEST_ASPECT_RATIO,
   label: '自动',
 };
-const PICKER_FALLBACK_ANCHOR: PickerAnchor = { left: 8, top: 8 };
 
 const STORYBOARD_NODE_HORIZONTAL_PADDING_PX = 24;
 const STORYBOARD_GRID_GAP_PX = 2;
@@ -145,89 +145,6 @@ const FRIENDLY_ASPECT_RATIO_CANDIDATES = [
   '5:4',
   '4:5',
 ];
-
-function getTextareaCaretOffset(
-  textarea: HTMLTextAreaElement,
-  caretIndex: number
-): PickerAnchor {
-  const mirror = document.createElement('div');
-  const computed = window.getComputedStyle(textarea);
-  const mirrorStyle = mirror.style;
-
-  mirrorStyle.position = 'absolute';
-  mirrorStyle.visibility = 'hidden';
-  mirrorStyle.pointerEvents = 'none';
-  mirrorStyle.whiteSpace = 'pre-wrap';
-  mirrorStyle.overflowWrap = 'break-word';
-  mirrorStyle.wordBreak = 'break-word';
-  mirrorStyle.boxSizing = computed.boxSizing;
-  mirrorStyle.width = `${textarea.clientWidth}px`;
-  mirrorStyle.font = computed.font;
-  mirrorStyle.lineHeight = computed.lineHeight;
-  mirrorStyle.letterSpacing = computed.letterSpacing;
-  mirrorStyle.padding = computed.padding;
-  mirrorStyle.border = computed.border;
-  mirrorStyle.textTransform = computed.textTransform;
-  mirrorStyle.textIndent = computed.textIndent;
-
-  mirror.textContent = textarea.value.slice(0, caretIndex);
-
-  const marker = document.createElement('span');
-  marker.textContent = textarea.value.slice(caretIndex, caretIndex + 1) || ' ';
-  mirror.appendChild(marker);
-
-  document.body.appendChild(mirror);
-
-  const left = marker.offsetLeft - textarea.scrollLeft;
-  const top = marker.offsetTop - textarea.scrollTop;
-
-  document.body.removeChild(mirror);
-
-  return {
-    left: Math.max(0, left),
-    top: Math.max(0, top),
-  };
-}
-
-function resolvePickerAnchor(
-  container: HTMLDivElement | null,
-  textarea: HTMLTextAreaElement,
-  caretIndex: number,
-  zoom: number
-): PickerAnchor {
-  if (!container) {
-    return PICKER_FALLBACK_ANCHOR;
-  }
-
-  const containerRect = container.getBoundingClientRect();
-  const textareaRect = textarea.getBoundingClientRect();
-  const caretOffset = getTextareaCaretOffset(textarea, caretIndex);
-  const safeZoom = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
-
-  return {
-    left: Math.max(0, (textareaRect.left - containerRect.left) / safeZoom + caretOffset.left),
-    top: Math.max(0, (textareaRect.top - containerRect.top) / safeZoom + caretOffset.top),
-  };
-}
-
-function resolvePointerAnchor(
-  container: HTMLDivElement | null,
-  clientX: number,
-  clientY: number,
-  zoom: number
-): PickerAnchor {
-  if (!container) {
-    return PICKER_FALLBACK_ANCHOR;
-  }
-
-  const containerRect = container.getBoundingClientRect();
-  const safeZoom = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
-
-  return {
-    left: Math.max(0, (clientX - containerRect.left) / safeZoom),
-    top: Math.max(0, (clientY - containerRect.top) / safeZoom),
-  };
-}
 
 function resolveReferenceIndexFromDescription(
   description: string,
@@ -540,8 +457,10 @@ function generateGridImageDataUrl(
 
 export const StoryboardGenNode = memo(({ id, data, selected, width, height }: StoryboardGenNodeProps) => {
   const { t, i18n } = useTranslation();
-  const { zoom } = useViewport();
   const updateNodeInternals = useUpdateNodeInternals();
+  // 画布缩放：@ 候选面板的锚点换算与视觉间距都要靠它折算。
+  // 用 useStore 选择器而不是 useViewport —— 后者在平移画布时也会触发重渲染，拖画布会变卡。
+  const zoom = useStore((state) => state.transform[2]);
   const [isGenerating, setIsGenerating] = useState(false);
   const generationLockRef = useRef(false);
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
@@ -1641,42 +1560,22 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
       </div>
 
       {showImagePicker && incomingImageItems.length > 0 && (
-        <div
-          className="nowheel absolute z-30 w-[120px] overflow-hidden rounded-xl border border-[rgba(255,255,255,0.16)] bg-surface-dark shadow-xl"
-          style={{ left: pickerAnchor.left, top: pickerAnchor.top }}
-          onMouseDown={(event) => event.stopPropagation()}
-          onWheelCapture={(event) => event.stopPropagation()}
-        >
-          <div
-            className="ui-scrollbar nowheel max-h-[180px] overflow-y-auto"
-            onWheelCapture={(event) => event.stopPropagation()}
-          >
-            {incomingImageItems.map((item, imageIndex) => (
-              <button
-                key={`${item.imageUrl}-${imageIndex}`}
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  insertImageReference(imageIndex);
-                }}
-                onMouseEnter={() => setPickerActiveIndex(imageIndex)}
-                className={`flex w-full items-center gap-2 border border-transparent bg-bg-dark/70 px-2 py-2 text-left text-sm text-text-dark transition-colors hover:border-[rgba(255,255,255,0.18)] ${pickerActiveIndex === imageIndex
-                  ? 'border-[rgba(255,255,255,0.24)] bg-bg-dark'
-                  : ''
-                  }`}
-              >
-                <CanvasNodeImage
-                  src={item.displayUrl}
-                  alt={item.label}
-                  viewerSourceUrl={resolveImageDisplayUrl(item.imageUrl)}
-                  viewerImageList={incomingImageViewerList}
-                  className="h-8 w-8 rounded object-cover"
-                />
-                <span>{item.label}</span>
-              </button>
-            ))}
-          </div>
-        </div>
+        <NodeReferencePicker
+          anchor={pickerAnchor}
+          containerRef={rootRef}
+          zoom={zoom}
+          entries={incomingImageItems.map((item, index) => ({
+            key: `${item.imageUrl}-${index}`,
+            kind: 'image',
+            label: item.label,
+            thumbUrl: item.displayUrl,
+            viewerSourceUrl: resolveImageDisplayUrl(item.imageUrl),
+            viewerImageList: incomingImageViewerList,
+          }))}
+          activeIndex={pickerActiveIndex}
+          onSelect={insertImageReference}
+          onHover={setPickerActiveIndex}
+        />
       )}
 
       {error && <div className="mb-1.5 shrink-0 text-[10px] text-red-400">{error}</div>}

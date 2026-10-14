@@ -338,7 +338,26 @@ function usesNativeImageParameters(apiModel: string): boolean {
   );
 }
 
-function mapRequestedImageSize(apiModel: string, resolution: string, aspectRatio: string): string {
+/**
+ * OpenAI 图像族的像素预算:单边 ≤3840、长短比 ≤3:1、总像素 ≤8,294,400(= 3840x2160)。
+ * 覆盖 gpt-image 全系(含 `-2k` / `-4k` / `-auto` 等变体)、dall-e 与 `-native` 协议变体。
+ *
+ * ⚠️ 刻意与 `usesNativeImageParameters` 解耦:后者管**参数协议**(是否发 aspect_ratio),
+ * 本函数管**像素预算**。两者曾合一,导致 `gpt-image-2` 既不匹配 `gpt-image-1` 也不以
+ * `-native` 结尾 → 4K + 4:3 拼出 3840x2880(11.06M 像素)被上游 400 拒绝。
+ */
+function enforcesOpenAiImagePixelBudget(apiModel: string): boolean {
+  const normalized = apiModel.trim().toLowerCase();
+  return (
+    normalized.includes("gpt-image") ||
+    normalized.includes("dall-e") ||
+    normalized.includes("dalle") ||
+    normalized.endsWith("-native") ||
+    normalized.endsWith("-n")
+  );
+}
+
+export function mapRequestedImageSize(apiModel: string, resolution: string, aspectRatio: string): string {
   const normalizedResolution = resolution.trim();
   if (/^\d+x\d+$/i.test(normalizedResolution)) {
     return normalizedResolution;
@@ -367,11 +386,11 @@ function mapRequestedImageSize(apiModel: string, resolution: string, aspectRatio
     width = roundTo16((targetLongEdge * ratioWidth) / ratioHeight);
     height = targetLongEdge;
   }
-  if (usesNativeImageParameters(apiModel)) {
-    const maxNativePixels = 8_294_400;
+  if (enforcesOpenAiImagePixelBudget(apiModel)) {
+    const maxOpenAiImagePixels = 8_294_400;
     const pixels = width * height;
-    if (pixels > maxNativePixels) {
-      const scale = Math.sqrt(maxNativePixels / pixels);
+    if (pixels > maxOpenAiImagePixels) {
+      const scale = Math.sqrt(maxOpenAiImagePixels / pixels);
       width = Math.max(16, Math.floor((width * scale) / 16) * 16);
       height = Math.max(16, Math.floor((height * scale) / 16) * 16);
     }
@@ -1097,6 +1116,18 @@ function extractBinghuoAssetUrl(payload: unknown): string | null {
 }
 
 /**
+ * base64 载荷的近似字节数 → 「6.2 MB」。用于把素材大小写进上传失败信息 ——
+ * 少了它, 超时类报错只剩一个 URL, 无法判断是「大素材传不完」还是「对端不响应」。
+ */
+function describeBase64AssetSize(base64: string): string {
+  const bytes = Math.floor((base64.length * 3) / 4);
+  const MB = 1024 * 1024;
+  if (bytes >= MB) return `${(bytes / MB).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
+/**
  * 把参考素材上传到平台换取公网 URL(multipart, 字段名固定 file)。
  * 炳火 /v1/assets/uploads 与知鸟 /v1/files 是同构流程, 只有端点与文案不同 ——
  * 合并成同一条链路, 避免两份逻辑各自漂移。
@@ -1128,7 +1159,9 @@ async function uploadPlatformReferenceAsset(
   // 上传幂等、不产生计费单, 所以网络层被拒也值得重试; 而「视频提交」拿到网络错误时
   // 是不重试的(请求可能已送达并被计费, 重提就是二次扣费)。
   const UPLOAD_ATTEMPTS = 3;
-  const UPLOAD_RETRY_BACKOFF_MS = [400, 1200];
+  // 退避从 400 / 1200ms 加大到 800 / 2400ms: 超时类失败里有一类是「网关先收完整个
+  // body 才回响应」, 失败后立刻重发只会让对端更挤 —— 与后端同值。
+  const UPLOAD_RETRY_BACKOFF_MS = [800, 2400];
   let lastPayload: unknown = null;
   // 记录「平台根本没回话」的那种失败: 网关偶发返回不带公网 URL 的 file 对象(瞬时限流
   // /风控), 以及 Windows 原生 DNS/TLS 路径偶发在建连阶段就失败(报错形如
@@ -1166,7 +1199,7 @@ async function uploadPlatformReferenceAsset(
   if (lastNetworkError !== null) {
     const detail = lastNetworkError instanceof Error ? lastNetworkError.message : String(lastNetworkError);
     throw new Error(
-      `${platformLabel} 参考素材上传失败(网络): 已重试 ${UPLOAD_ATTEMPTS - 1} 次仍未成功 (${uploadUrl}) — ${detail}`,
+      `${platformLabel} 参考素材上传失败(网络): 已重试 ${UPLOAD_ATTEMPTS - 1} 次仍未成功 — 第 ${index + 1} 个素材 / ${describeBase64AssetSize(asset.base64)} (${uploadUrl}) — ${detail}`,
     );
   }
   throw new Error(`${platformLabel} 参考素材上传响应中未找到公网 URL: ${describeVideoResponse(lastPayload)}`);

@@ -34,8 +34,13 @@ interface PromptLibraryStore {
   addLibrary: (name: string) => PromptLibrary | null;
   renameLibrary: (id: string, name: string) => void;
   deleteLibrary: (id: string) => void;
-  addTemplate: (libraryId: string, template: Omit<PromptTemplate, 'id' | 'createdAt' | 'updatedAt'>) => void;
-  updateTemplate: (libraryId: string, id: string, update: Partial<Omit<PromptTemplate, 'id' | 'createdAt'>>) => void;
+  /**
+   * 新增条目。**返回创建出的条目**;目标词库不存在时返回 `null`
+   * —— 调用方必须能区分「静默无操作」,否则会出现「点了保存什么都没发生」。
+   */
+  addTemplate: (libraryId: string, template: Omit<PromptTemplate, 'id' | 'createdAt' | 'updatedAt'>) => PromptTemplate | null;
+  /** 更新条目。词库或条目不存在时返回 `false`(同样不允许静默无操作)。 */
+  updateTemplate: (libraryId: string, id: string, update: Partial<Omit<PromptTemplate, 'id' | 'createdAt'>>) => boolean;
   deleteTemplate: (libraryId: string, id: string) => void;
   addCategory: (name: string) => void;
   renameCategory: (oldName: string, newName: string) => void;
@@ -239,7 +244,7 @@ export const usePromptLibraryStore = create<PromptLibraryStore>((set, get) => ({
   addTemplate: (libraryId, template) => {
     const library = get().libraries.find((lib) => lib.id === libraryId);
     if (!library) {
-      return;
+      return null;
     }
     const now = Date.now();
     const item: PromptTemplate = {
@@ -255,12 +260,16 @@ export const usePromptLibraryStore = create<PromptLibraryStore>((set, get) => ({
     );
     set({ libraries });
     persist(libraries);
+    return item;
   },
 
   updateTemplate: (libraryId, id, update) => {
     const library = get().libraries.find((lib) => lib.id === libraryId);
     if (!library) {
-      return;
+      return false;
+    }
+    if (!library.items.some((item) => item.id === id)) {
+      return false;
     }
     const libraries = get().libraries.map((lib) =>
       lib.id === libraryId
@@ -276,6 +285,7 @@ export const usePromptLibraryStore = create<PromptLibraryStore>((set, get) => ({
     );
     set({ libraries });
     persist(libraries);
+    return true;
   },
 
   deleteTemplate: (libraryId, id) => {

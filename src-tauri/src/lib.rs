@@ -339,6 +339,7 @@ pub fn run() {
             media_output::resolve_default_media_output_dir,
             media_output::resolve_media_output_dir,
             media_output::save_media_output_dir,
+            media_output::migrate_media_output_files,
             image::persist_image_binary,
             image::save_image_source_to_downloads,
             image::save_image_source_to_path,

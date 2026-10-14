@@ -16,6 +16,7 @@ import {
   chooseMediaOutputDir,
   cleanupUnreferencedMedia,
   loadMediaOutputDirSetting,
+  migrateMediaOutputFiles,
   resolveDefaultMediaOutputDir,
   saveMediaOutputDir,
 } from '@/commands/mediaOutput';
@@ -144,13 +145,6 @@ export function SettingsDialog({
     customApis,
     jimengCli,
     jimengCliAutoInstallStatus,
-    useUploadFilenameAsNodeTitle,
-    storyboardGenKeepStyleConsistent,
-    storyboardGenDisableTextInImage,
-    storyboardGenAutoInferEmptyFrame,
-    ignoreAtTagWhenCopyingAndGenerating,
-    enableStoryboardGenGridPreviewShortcut,
-    showStoryboardGenAdvancedRatioControls,
     showNodePrice,
     priceDisplayCurrencyMode,
     usdToCnyRate,
@@ -166,13 +160,6 @@ export function SettingsDialog({
     addCustomApi,
     updateCustomApi,
     removeCustomApi,
-    setUseUploadFilenameAsNodeTitle,
-    setStoryboardGenKeepStyleConsistent,
-    setStoryboardGenDisableTextInImage,
-    setStoryboardGenAutoInferEmptyFrame,
-    setIgnoreAtTagWhenCopyingAndGenerating,
-    setEnableStoryboardGenGridPreviewShortcut,
-    setShowStoryboardGenAdvancedRatioControls,
     setShowNodePrice,
     setPriceDisplayCurrencyMode,
     setUsdToCnyRate,
@@ -253,23 +240,6 @@ export function SettingsDialog({
   );
   const [activeCategory, setActiveCategory] = useState<SettingsCategory>(initialCategory);
   const [localApiKeys, setLocalApiKeys] = useState<Record<string, string>>(apiKeys);
-  const [localUseUploadFilenameAsNodeTitle, setLocalUseUploadFilenameAsNodeTitle] = useState(
-    useUploadFilenameAsNodeTitle
-  );
-  const [localStoryboardGenKeepStyleConsistent, setLocalStoryboardGenKeepStyleConsistent] =
-    useState(storyboardGenKeepStyleConsistent);
-  const [localStoryboardGenDisableTextInImage, setLocalStoryboardGenDisableTextInImage] = useState(
-    storyboardGenDisableTextInImage
-  );
-  const [localStoryboardGenAutoInferEmptyFrame, setLocalStoryboardGenAutoInferEmptyFrame] = useState(
-    storyboardGenAutoInferEmptyFrame
-  );
-  const [localIgnoreAtTagWhenCopyingAndGenerating, setLocalIgnoreAtTagWhenCopyingAndGenerating] =
-    useState(ignoreAtTagWhenCopyingAndGenerating);
-  const [localEnableStoryboardGenGridPreviewShortcut, setLocalEnableStoryboardGenGridPreviewShortcut] =
-    useState(enableStoryboardGenGridPreviewShortcut);
-  const [localShowStoryboardGenAdvancedRatioControls, setLocalShowStoryboardGenAdvancedRatioControls] =
-    useState(showStoryboardGenAdvancedRatioControls);
   const [localShowNodePrice, setLocalShowNodePrice] = useState(showNodePrice);
   const [localPriceDisplayCurrencyMode, setLocalPriceDisplayCurrencyMode] = useState(
     priceDisplayCurrencyMode
@@ -291,6 +261,8 @@ export function SettingsDialog({
   const [mediaOutputError, setMediaOutputError] = useState<string | null>(null);
   const [isLocalizingMedia, setIsLocalizingMedia] = useState(false);
   const [mediaLocalizeStatus, setMediaLocalizeStatus] = useState<string | null>(null);
+  const [isMigratingMedia, setIsMigratingMedia] = useState(false);
+  const [mediaMigrateStatus, setMediaMigrateStatus] = useState<string | null>(null);
   const [isCleaningMedia, setIsCleaningMedia] = useState(false);
   const [mediaCleanupStatus, setMediaCleanupStatus] = useState<string | null>(null);
   const [checkUpdateStatus, setCheckUpdateStatus] = useState<'' | 'checking' | 'has-update' | 'up-to-date' | 'failed'>('');
@@ -1238,13 +1210,6 @@ export function SettingsDialog({
     setConnectingRecommendedApiId(null);
     setRecommendedApiKeyDraft('');
     setRecommendedApiError(null);
-    setLocalUseUploadFilenameAsNodeTitle(useUploadFilenameAsNodeTitle);
-    setLocalStoryboardGenKeepStyleConsistent(storyboardGenKeepStyleConsistent);
-    setLocalStoryboardGenDisableTextInImage(storyboardGenDisableTextInImage);
-    setLocalStoryboardGenAutoInferEmptyFrame(storyboardGenAutoInferEmptyFrame);
-    setLocalIgnoreAtTagWhenCopyingAndGenerating(ignoreAtTagWhenCopyingAndGenerating);
-    setLocalEnableStoryboardGenGridPreviewShortcut(enableStoryboardGenGridPreviewShortcut);
-    setLocalShowStoryboardGenAdvancedRatioControls(showStoryboardGenAdvancedRatioControls);
     setLocalShowNodePrice(showNodePrice);
     setLocalPriceDisplayCurrencyMode(priceDisplayCurrencyMode);
     setLocalUsdToCnyRate(String(usdToCnyRate));
@@ -1373,6 +1338,49 @@ export function SettingsDialog({
   }, [isLocalizingMedia, localMediaOutputDir, t]);
 
   /**
+   * 把旧落盘位置里的素材复制到当前位置。
+   *
+   * 与本地化同样：**先把界面上（可能刚改过、还没保存）的位置落库**，否则迁移目标还是旧值，
+   * 用户会在自己刚选的文件夹里找不到东西。
+   *
+   * 是复制不是移动 —— 画布/工程里存的是绝对路径，文件离开旧目录那些引用立刻失效。
+   */
+  const handleMigrateMediaOutputFiles = useCallback(async () => {
+    if (isMigratingMedia) return;
+    setIsMigratingMedia(true);
+    setMediaMigrateStatus(null);
+    try {
+      await saveMediaOutputDir(localMediaOutputDir);
+      const report = await migrateMediaOutputFiles();
+      const size = formatBytes(report.copiedBytes);
+      setMediaMigrateStatus(
+        report.failedFiles > 0
+          ? t('settings.mediaMigrateDonePartial', {
+              sources: report.sourceRoots.length,
+              files: report.copiedFiles,
+              size,
+              skipped: report.skippedFiles,
+              failed: report.failedFiles,
+            })
+          : t('settings.mediaMigrateDone', {
+              sources: report.sourceRoots.length,
+              files: report.copiedFiles,
+              size,
+              skipped: report.skippedFiles,
+            }),
+      );
+    } catch (error) {
+      setMediaMigrateStatus(
+        t('settings.mediaMigrateFailed', {
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } finally {
+      setIsMigratingMedia(false);
+    }
+  }, [isMigratingMedia, localMediaOutputDir, t]);
+
+  /**
    * 把落盘目录里已经没人引用的文件清掉（图片/视频/音频都清）。
    *
    * 未被引用的文件先移进 `.quarantine`，放满保留期才真正删除 —— 所以这一步的即时收益
@@ -1417,13 +1425,6 @@ export function SettingsDialog({
         providers.forEach((provider) => {
           setProviderApiKey(provider.id, localApiKeys[provider.id] ?? '');
         });
-        setUseUploadFilenameAsNodeTitle(localUseUploadFilenameAsNodeTitle);
-        setStoryboardGenKeepStyleConsistent(localStoryboardGenKeepStyleConsistent);
-        setStoryboardGenDisableTextInImage(localStoryboardGenDisableTextInImage);
-        setStoryboardGenAutoInferEmptyFrame(localStoryboardGenAutoInferEmptyFrame);
-        setIgnoreAtTagWhenCopyingAndGenerating(localIgnoreAtTagWhenCopyingAndGenerating);
-        setEnableStoryboardGenGridPreviewShortcut(localEnableStoryboardGenGridPreviewShortcut);
-        setShowStoryboardGenAdvancedRatioControls(localShowStoryboardGenAdvancedRatioControls);
         setShowNodePrice(localShowNodePrice);
         setPriceDisplayCurrencyMode(localPriceDisplayCurrencyMode);
         setUsdToCnyRate(Number(localUsdToCnyRate));
@@ -1442,13 +1443,6 @@ export function SettingsDialog({
   }, [
     localApiKeys,
     localMediaOutputDir,
-    localUseUploadFilenameAsNodeTitle,
-    localStoryboardGenKeepStyleConsistent,
-    localStoryboardGenDisableTextInImage,
-    localStoryboardGenAutoInferEmptyFrame,
-    localIgnoreAtTagWhenCopyingAndGenerating,
-    localEnableStoryboardGenGridPreviewShortcut,
-    localShowStoryboardGenAdvancedRatioControls,
     localShowNodePrice,
     localPriceDisplayCurrencyMode,
     localUsdToCnyRate,
@@ -1460,13 +1454,6 @@ export function SettingsDialog({
     localEnableUpdateDialog,
     providers,
     setProviderApiKey,
-    setUseUploadFilenameAsNodeTitle,
-    setStoryboardGenKeepStyleConsistent,
-    setStoryboardGenDisableTextInImage,
-    setStoryboardGenAutoInferEmptyFrame,
-    setIgnoreAtTagWhenCopyingAndGenerating,
-    setEnableStoryboardGenGridPreviewShortcut,
-    setShowStoryboardGenAdvancedRatioControls,
     setShowNodePrice,
     setPriceDisplayCurrencyMode,
     setUsdToCnyRate,
@@ -1578,20 +1565,6 @@ export function SettingsDialog({
               `}
               >
                 <span className="text-sm">{t('settings.pricing')}</span>
-              </button>
-
-              <button
-                onClick={() => setActiveCategory('experimental')}
-                className={`
-                w-full flex items-center gap-3 px-4 py-2.5 text-left
-                transition-colors
-                ${activeCategory === 'experimental'
-                    ? 'bg-accent/10 text-text-dark border-l-2 border-accent'
-                    : 'text-text-muted hover:bg-bg-dark hover:text-text-dark'
-                  }
-              `}
-              >
-                <span className="text-sm">{t('settings.experimental')}</span>
               </button>
             </nav>
           </div>
@@ -2754,33 +2727,10 @@ export function SettingsDialog({
                 </div>
 
                 <div className="ui-scrollbar flex-1 space-y-4 overflow-y-auto p-6">
-                  <SettingsCheckboxCard
-                    checked={localStoryboardGenKeepStyleConsistent}
-                    onCheckedChange={setLocalStoryboardGenKeepStyleConsistent}
-                    title={t('settings.storyboardGenKeepStyleConsistent')}
-                    description={t('settings.storyboardGenKeepStyleConsistentDesc')}
-                  />
-
-                  <SettingsCheckboxCard
-                    checked={localIgnoreAtTagWhenCopyingAndGenerating}
-                    onCheckedChange={setLocalIgnoreAtTagWhenCopyingAndGenerating}
-                    title={t('settings.ignoreAtTagWhenCopyingAndGenerating')}
-                    description={t('settings.ignoreAtTagWhenCopyingAndGeneratingDesc')}
-                  />
-
-                  <SettingsCheckboxCard
-                    checked={localStoryboardGenDisableTextInImage}
-                    onCheckedChange={setLocalStoryboardGenDisableTextInImage}
-                    title={t('settings.storyboardGenDisableTextInImage')}
-                    description={t('settings.storyboardGenDisableTextInImageDesc')}
-                  />
-
-                  <SettingsCheckboxCard
-                    checked={localUseUploadFilenameAsNodeTitle}
-                    onCheckedChange={setLocalUseUploadFilenameAsNodeTitle}
-                    title={t('settings.useUploadFilenameAsNodeTitle')}
-                    description={t('settings.useUploadFilenameAsNodeTitleDesc')}
-                  />
+                  {/* 原本这里还有四个开关（分镜图风格与参考图保持一致 / 复制保存文本时忽略 @ 标签 /
+                      分镜图禁止生成描述文本 / 上传节点自动使用文件名作为标题），按要求已从设置页移除。
+                      字段仍留在 `settingsStore` 里（默认开启），画布节点继续直接订阅，
+                      因此既有用户的行为与之前完全一致。 */}
 
                   {/* 默认落盘位置：生成的图片/视频会落到这里 */}
                   <div className="rounded-lg border border-border-dark bg-bg-dark p-4 space-y-3">
@@ -2835,6 +2785,28 @@ export function SettingsDialog({
                     {mediaOutputError && (
                       <p className="text-xs text-red-400">{mediaOutputError}</p>
                     )}
+
+                    {/* 一键迁移：把旧落盘位置里的素材复制到当前位置 */}
+                    <div className="space-y-2 border-t border-border-dark pt-3">
+                      <p className="text-xs text-text-muted">
+                        {t('settings.mediaMigrateDesc')}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleMigrateMediaOutputFiles();
+                        }}
+                        disabled={isMigratingMedia}
+                        className="rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isMigratingMedia
+                          ? t('settings.mediaMigrateRunning')
+                          : t('settings.mediaMigrateStart')}
+                      </button>
+                      {mediaMigrateStatus && (
+                        <p className="text-xs text-text-muted">{mediaMigrateStatus}</p>
+                      )}
+                    </div>
                   </div>
 
                   {/* 存量素材本地化：把还挂在第三方临时链接上的节点/模板搬回本地 */}
@@ -2941,50 +2913,6 @@ export function SettingsDialog({
               </>
             )}
 
-            {activeCategory === 'experimental' && (
-              <>
-                <div className="px-6 py-5 border-b border-border-dark">
-                  <h2 className="text-lg font-semibold text-text-dark">
-                    {t('settings.experimental')}
-                  </h2>
-                  <p className="text-sm text-text-muted mt-1">
-                    {t('settings.experimentalDesc')}
-                  </p>
-                </div>
-
-                <div className="ui-scrollbar flex-1 space-y-4 overflow-y-auto p-6">
-                  <SettingsCheckboxCard
-                    checked={localEnableStoryboardGenGridPreviewShortcut}
-                    onCheckedChange={setLocalEnableStoryboardGenGridPreviewShortcut}
-                    title={t('settings.enableStoryboardGenGridPreviewShortcut')}
-                    description={t('settings.enableStoryboardGenGridPreviewShortcutDesc')}
-                  />
-
-                  <SettingsCheckboxCard
-                    checked={localShowStoryboardGenAdvancedRatioControls}
-                    onCheckedChange={setLocalShowStoryboardGenAdvancedRatioControls}
-                    title={t('settings.showStoryboardGenAdvancedRatioControls')}
-                    description={t('settings.showStoryboardGenAdvancedRatioControlsDesc')}
-                  />
-
-                  <SettingsCheckboxCard
-                    checked={localStoryboardGenAutoInferEmptyFrame}
-                    onCheckedChange={setLocalStoryboardGenAutoInferEmptyFrame}
-                    title={t('settings.storyboardGenAutoInferEmptyFrame')}
-                    description={t('settings.storyboardGenAutoInferEmptyFrameDesc')}
-                  />
-                </div>
-
-                <div className="flex justify-end border-t border-border-dark px-6 py-4">
-                  <button
-                    onClick={handleSave}
-                    className="rounded bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent/80"
-                  >
-                    {t('common.save')}
-                  </button>
-                </div>
-              </>
-            )}
           </div>
         </div>
       </div>

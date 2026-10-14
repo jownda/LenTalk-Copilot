@@ -58,10 +58,19 @@ async fn upload_one(
     let filename = format!("reference-{}.{}", index + 1, extension);
 
     let mut last_payload = Value::Null;
+    // 出错时把「第几个素材」写进消息: 一次提交可能有 6~10 个素材, 只说平台名 +
+    // URL 根本看不出卡在哪一个上(而每个素材的大小、是否公网 URL 都可能不同)。
+    let indexed_label = format!("{} #{}", PLATFORM_LABEL, index + 1);
     for attempt in 1..=2 {
-        let payload =
-            upload_reference_asset_multipart(&ctx.client, &upload_url, &ctx.api_key, &filename, &asset, PLATFORM_LABEL)
-                .await?;
+        let payload = upload_reference_asset_multipart(
+            &ctx.client,
+            &upload_url,
+            &ctx.api_key,
+            &filename,
+            &asset,
+            &indexed_label,
+        )
+        .await?;
         if let Some(url) = extract_asset_url(&payload) {
             return Ok(url);
         }

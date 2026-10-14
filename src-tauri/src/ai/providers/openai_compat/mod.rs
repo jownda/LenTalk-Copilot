@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use futures_util::StreamExt;
 use reqwest::multipart::{Form, Part};
 use serde_json::{json, Value};
 use tracing::info;
@@ -44,6 +45,16 @@ fn prompt_policy_hint(body: &str) -> &'static str {
     } else {
         ""
     }
+}
+
+/// 判断已收字节是否是一份**完整** JSON。
+///
+/// 中转网关在传输大体积图片响应(4K b64 PNG 可达数十 MB)时收尾断流并不罕见 ——
+/// 此时 body 里的数据往往**本身是完整的**, 只是缺 HTTP 层的正常终止
+/// (缺末尾 chunk / Content-Length 未收满)。这类响应必须直接采信: 丢弃它等于让
+/// 用户白丢一次**已在平台侧计费**的生成结果。
+fn is_complete_json_body(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && serde_json::from_slice::<Value>(bytes).is_ok()
 }
 
 impl OpenAICompatibleProvider {
@@ -542,6 +553,25 @@ impl OpenAICompatibleProvider {
             .unwrap_or_else(|_| reqwest::Client::new())
     }
 
+    /// 图片生成专用 client(同步接口)。
+    ///
+    /// 通用 `build_client()` 的总超时是 180s, 对**同步**图片接口明显偏短: gpt-image 系
+    /// 4K 出图实测经常在 3 分钟以上, 一旦超时落在 body 传输阶段, reqwest 会把它折叠成
+    /// `error decoding response body` —— 与"平台断流"在报错文案上**完全无法区分**
+    /// (实报 `req_39d98b3b-d6e8-4467-b221-4225be7639fc` 即此形态)。所以这里:
+    ///   * 总上限放宽到 15 分钟, 给 4K 留够出图时间;
+    ///   * `read_timeout(300s)` 兜底 —— 连续 5 分钟收不到**任何**字节才判死连接,
+    ///     避免对端真挂掉时用户白等一刻钟。
+    fn build_image_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .http1_only()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(900))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
     /// 短超时 client(20s): 用于「验证连接/验证协议/拉取模型」等交互操作,
     /// 避免平台不可达时 UI 长时间卡在"验证中/拉取中"。
     fn build_short_timeout_client() -> reqwest::Client {
@@ -552,49 +582,104 @@ impl OpenAICompatibleProvider {
             .unwrap_or_else(|_| reqwest::Client::new())
     }
 
+    /// 读取响应体文本。
+    ///
+    /// **刻意不用 `response.bytes()`** —— 它把 body 层的一切失败折叠成 Display 恒为
+    /// `error decoding response body` 的 `reqwest::Error`, 真实原因只藏在 `source()` 里。
+    /// 本项目 reqwest 未启用 gzip/brotli/deflate/zstd feature, 因此这条 Display 只可能
+    /// 来自**传输层截断**(连接提前关闭 / chunked 未终止 / Content-Length 未收满),
+    /// 而不是解压失败 —— 但光看 Display 完全区分不出来, 这就是之前只能写"可能返回了
+    /// 损坏的压缩或分块响应"的原因。改为逐块累积后:
+    ///   1. 流以 `Err` 结束、但已收字节是**完整 JSON** → 直接采信(`is_complete_json_body`);
+    ///   2. 否则报错, 并把 source 链 + 已收字节数 + 关键响应头一起带上, 一次定性。
     async fn read_response_text(
         response: reqwest::Response,
         context: &str,
     ) -> Result<(reqwest::StatusCode, String), AIError> {
         let status = response.status();
-        let upstream_task_id = response
-            .headers()
+        let headers = response.headers().clone();
+        let upstream_task_id = headers
             .get("x-upstream-task-id")
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let request_id = response
-            .headers()
+        // HeaderMap::get 本身大小写不敏感, 无需再试一遍 X-Request-ID。
+        let request_id = headers
             .get("x-request-id")
-            .or_else(|| response.headers().get("X-Request-ID"))
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| "unknown".to_string());
-        let bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(error) if status.is_success() => {
+        let header_of = |name: &str| -> String {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("-")
+                .to_string()
+        };
+        let declared_len = header_of("content-length");
+        // 预分配按声明长度, 但设 64MB 上限: 声明可能是假的(某些网关会给超大值),
+        // 不能让它直接决定内存申请量。
+        let mut buffer: Vec<u8> =
+            Vec::with_capacity(declared_len.parse::<usize>().unwrap_or(0).min(64 * 1024 * 1024));
+
+        let mut stream = response.bytes_stream();
+        let mut stream_error: Option<reqwest::Error> = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => buffer.extend_from_slice(&chunk),
+                Err(error) => {
+                    stream_error = Some(error);
+                    break;
+                }
+            }
+        }
+
+        if let Some(error) = stream_error {
+            if status.is_success() {
+                // 平台已受理(响应头带回任务 ID)时保留续查能力: 绝不重复提交计费请求。
                 if let Some(task_id) = upstream_task_id {
                     // Some relays return the accepted task id in a header but
                     // close a malformed chunked body. Preserve resumability
                     // without submitting the billable request again.
                     return Ok((status, format!(r#"{{"id":"{}"}}"#, task_id)));
                 }
-                return Err(AIError::TaskFailed(format!(
-                    "{} (HTTP {})响应体读取失败: {}。平台可能返回了损坏的压缩或分块响应，request_id={}",
-                    context, status, error, request_id
-                )));
+                if is_complete_json_body(&buffer) {
+                    tracing::warn!(
+                        "[OpenAI Compatible] {} 响应体收尾处断流({}), 但已收 {} 字节是完整 JSON, 直接采信",
+                        context,
+                        video_protocols::describe_reqwest_error(&error),
+                        buffer.len()
+                    );
+                    return Ok((status, String::from_utf8_lossy(&buffer).into_owned()));
+                }
             }
-            Err(error) => {
-                return Err(AIError::TaskFailed(format!(
-                    "{} (HTTP {})响应体读取失败: {}。平台可能返回了损坏的压缩或分块响应，request_id={}",
-                    context, status, error, request_id
-                )));
-            }
-        };
-        Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+            let declared = if declared_len == "-" {
+                String::new()
+            } else {
+                format!("(声明 {})", declared_len)
+            };
+            return Err(AIError::TaskFailed(format!(
+                "{} 已返回 HTTP {}, 但响应体在传输中断开: {}。已收 {} 字节{}；content-type={} content-encoding={} \
+transfer-encoding={}；request_id={}。本次请求平台已受理，这类断流多发生在上游传输大体积图片响应（4K 图可达数十 MB）时。\
+建议原样重试一次；若连续复现，请把分辨率降到 2K 或改用平台的异步查询模式，并可用上面的 request_id 向平台核对本次是否已计费。",
+                context,
+                status,
+                video_protocols::describe_reqwest_error(&error),
+                buffer.len(),
+                declared,
+                header_of("content-type"),
+                header_of("content-encoding"),
+                header_of("transfer-encoding"),
+                request_id
+            )));
+        }
+
+        Ok((status, String::from_utf8_lossy(&buffer).into_owned()))
     }
 
     /// 从 OpenAI 兼容服务的 /v1/models 拉取模型列表(供「测试链接 / 拉取模型」使用)
@@ -761,12 +846,30 @@ impl OpenAICompatibleProvider {
     }
 
     /// Native GPT Image parameter mode rejects a standalone aspect_ratio field.
+    /// ⚠️ 这只描述**参数协议**, 不代表像素预算 —— 中转平台的 `gpt-image-2` 走非 native
+    /// 协议(会发 aspect_ratio), 但上游同样施加 OpenAI 图像族的像素上限。
     fn uses_native_image_parameters(api_model: &str) -> bool {
         let normalized = api_model.trim().to_ascii_lowercase();
         normalized.ends_with("-native")
             || normalized.ends_with("-n")
             || normalized.contains("gpt-image-1")
             || normalized.contains("dall-e")
+    }
+
+    /// OpenAI 图像族的像素预算:单边 ≤3840、长短比 ≤3:1、总像素 ≤8,294,400(= 3840x2160)。
+    /// 覆盖 gpt-image 全系(gpt-image-1 / 1.5 / 2 / 2.5 / 以及 `-2k`/`-4k`/`-auto` 等变体)、
+    /// dall-e 与 `-native` 协议变体。
+    ///
+    /// ⚠️ **刻意与 `uses_native_image_parameters` 解耦**:后者管参数协议,本函数管像素预算。
+    /// 曾经两者合一, 结果 `gpt-image-2` 既不匹配 `gpt-image-1` 也不以 `-native` 结尾,
+    /// 于是 4K + 4:3 会拼出 3840x2880(11.06M 像素)被上游 400 拒绝。
+    fn enforces_openai_image_pixel_budget(api_model: &str) -> bool {
+        let normalized = api_model.trim().to_ascii_lowercase();
+        normalized.contains("gpt-image")
+            || normalized.contains("dall-e")
+            || normalized.contains("dalle")
+            || normalized.ends_with("-native")
+            || normalized.ends_with("-n")
     }
 
     fn parse_aspect_ratio(aspect_ratio: &str) -> Option<(u32, u32)> {
@@ -822,11 +925,11 @@ impl OpenAICompatibleProvider {
             )
         };
 
-        if Self::uses_native_image_parameters(api_model) {
-            const MAX_NATIVE_PIXELS: f64 = 8_294_400.0;
+        if Self::enforces_openai_image_pixel_budget(api_model) {
+            const MAX_OPENAI_IMAGE_PIXELS: f64 = 8_294_400.0;
             let pixels = width as f64 * height as f64;
-            if pixels > MAX_NATIVE_PIXELS {
-                let scale = (MAX_NATIVE_PIXELS / pixels).sqrt();
+            if pixels > MAX_OPENAI_IMAGE_PIXELS {
+                let scale = (MAX_OPENAI_IMAGE_PIXELS / pixels).sqrt();
                 width = (((width as f64 * scale) / 16.0).floor() as u32).max(1) * 16;
                 height = (((height as f64 * scale) / 16.0).floor() as u32).max(1) * 16;
             }
@@ -1711,7 +1814,7 @@ impl AIProvider for OpenAICompatibleProvider {
             .trim_end_matches("/v1")
             .trim_end_matches('/')
             .to_string();
-        let client = Self::build_client();
+        let client = Self::build_image_client();
         // WGSPAI gpt-image 强制走 Responses API(该平台只通过 image_generation tool 提供能力)
         let force_wgspai_responses = Self::uses_wgspai_responses(provider_id, api_model);
         let image_protocol = Self::resolve_image_protocol(&request.extra_params);
@@ -1961,7 +2064,7 @@ impl AIProvider for OpenAICompatibleProvider {
             .trim_end_matches("/v1")
             .trim_end_matches('/')
             .to_string();
-        let client = Self::build_client();
+        let client = Self::build_image_client();
         // WGSPAI gpt-image 强制走 Responses API(该平台只通过 image_generation tool 提供能力)
         let force_wgspai_responses = Self::uses_wgspai_responses(provider_id, api_model);
         let image_protocol = Self::resolve_image_protocol(&request.extra_params);
@@ -2317,9 +2420,97 @@ impl AIProvider for OpenAICompatibleProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{prompt_policy_hint, OpenAICompatibleProvider};
+    use super::{is_complete_json_body, prompt_policy_hint, OpenAICompatibleProvider};
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// 中转网关传大图片时收尾断流, body 往往仍是完整 JSON —— 必须采信,
+    /// 否则用户丢掉的是**已经在平台侧计费**的结果。
+    #[test]
+    fn complete_json_bodies_are_rescued_from_truncated_streams() {
+        assert!(is_complete_json_body(br#"{"data":[{"b64_json":"AAAA"}]}"#));
+        assert!(is_complete_json_body(br#"  {"id":"x"}  "#));
+        // 半截 JSON / 空 body / 网关 HTML 错误页 一律不能采信。
+        assert!(!is_complete_json_body(br#"{"data":[{"b64_json":"AAA"#));
+        assert!(!is_complete_json_body(b""));
+        assert!(!is_complete_json_body(b"<html>502 Bad Gateway</html>"));
+    }
+
+    /// 起一个「声明了 Content-Length 却提前关连接」的对端 —— 中转网关截断响应的典型形态。
+    ///
+    /// **必须先读走请求再回应**: 服务器端带着未读的接收数据关闭连接时, Windows 会发 RST,
+    /// 客户端在 `send()` 阶段就报 `10053 ConnectionAborted` —— 走不到「读 body」那一步,
+    /// 这种失败与被测行为无关, 纯属测试服务器写法问题。
+    async fn serve_truncated_response(body: &'static [u8], declared_extra: usize) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // 请求是 GET, 很短, 一次读就能读干净。
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len() + declared_extra
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+                // 发完就 FIN: 声明长度永远收不满 → 客户端读到 IncompleteMessage。
+                let _ = stream.shutdown().await;
+            }
+        });
+        address
+    }
+
+    /// 断流但**数据完整**时必须采信 —— 丢掉它等于让用户白丢一次已在平台侧计费的出图
+    /// （实报 `req_39d98b3b-d6e8-4467-b221-4225be7639fc`）。
+    #[tokio::test]
+    async fn rescues_a_complete_body_from_a_truncated_response() {
+        let address = serve_truncated_response(br#"{"data":[{"b64_json":"AAAA"}]}"#, 100).await;
+        // 必须 no_proxy(): 本机若开着系统代理, 发往 127.0.0.1 的请求会被劫持成 502
+        // (仓库里已踩过多次, 见 commands/novel.rs 顶部注释), 测试随之变成假阴性。
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client")
+            .get(format!("http://{address}/v1/images/generations"))
+            .send()
+            .await
+            .expect("响应头应当到手");
+        let (status, body) = OpenAICompatibleProvider::read_response_text(response, "测试图片请求")
+            .await
+            .expect("已收字节是完整 JSON, 必须采信");
+        assert!(status.is_success());
+        assert!(body.contains("b64_json"));
+    }
+
+    /// 断流且数据**残缺**时仍然报错, 但文案必须带上已收字节数与 request_id ——
+    /// 否则用户贴出来的报错还是那句无从下手的 "error decoding response body"。
+    #[tokio::test]
+    async fn reports_received_bytes_when_the_truncated_body_is_incomplete() {
+        // 声明长度比实际多 100 字节 → 客户端必然读到 IncompleteMessage, 拿到的 JSON 也是残缺的。
+        let address = serve_truncated_response(br#"{"data":[{"b64_json":"AAA"#, 100).await;
+        // 必须 no_proxy(): 本机若开着系统代理, 发往 127.0.0.1 的请求会被劫持成 502
+        // (仓库里已踩过多次, 见 commands/novel.rs 顶部注释), 测试随之变成假阴性。
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client")
+            .get(format!("http://{address}/v1/images/generations"))
+            .send()
+            .await
+            .expect("响应头应当到手");
+        let error = OpenAICompatibleProvider::read_response_text(response, "测试图片请求")
+            .await
+            .expect_err("残缺 JSON 必须报错");
+        let text = error.to_string();
+        assert!(text.contains("测试图片请求"), "{text}");
+        assert!(text.contains("已收"), "{text}");
+        assert!(text.contains("request_id="), "{text}");
+    }
 
     /// OpenAI 推理模型的输入内容预检拒绝: 必须补上可操作的中文指引, 其它错误保持原样。
     #[test]
@@ -2644,6 +2835,43 @@ mod tests {
         assert_eq!(
             OpenAICompatibleProvider::map_requested_image_size("gpt-image-2-auto", "4K", "9:16"),
             "2160x3840",
+        );
+    }
+
+    #[test]
+    fn clamps_relay_gpt_image_2_to_pixel_budget() {
+        // 中转平台的 `gpt-image-2` 走非 native 协议(仍发 aspect_ratio), 但上游同样限制
+        // 8,294,400 像素。4K + 4:3 直接拼出 3840x2880 = 11.06M 会被 400 拒绝:
+        // "invalid params.size ... total pixels must be <= 8294400"。
+        let size = OpenAICompatibleProvider::map_requested_image_size("gpt-image-2", "4K", "4:3");
+        let (width, height) = size.split_once('x').expect("size should be WxH");
+        let width: u64 = width.parse().expect("width should be numeric");
+        let height: u64 = height.parse().expect("height should be numeric");
+
+        assert!(
+            width * height <= 8_294_400,
+            "{size} = {} px 超出预算",
+            width * height
+        );
+        assert!(width <= 3840 && height <= 3840, "{size} 单边超过 3840");
+        assert_eq!(size, "3312x2480");
+    }
+
+    #[test]
+    fn pixel_budget_does_not_shrink_16_9_or_untouched_models() {
+        // 16:9 / 9:16 的 4K 正好等于预算上限, 不应被缩小。
+        assert_eq!(
+            OpenAICompatibleProvider::map_requested_image_size("gpt-image-2", "4K", "16:9"),
+            "3840x2160",
+        );
+        assert_eq!(
+            OpenAICompatibleProvider::map_requested_image_size("gpt-image-2", "4K", "9:16"),
+            "2160x3840",
+        );
+        // 非 OpenAI 图像族的模型不受该预算约束, 保持原样。
+        assert_eq!(
+            OpenAICompatibleProvider::map_requested_image_size("seedream-4", "4K", "4:3"),
+            "3840x2880",
         );
     }
 

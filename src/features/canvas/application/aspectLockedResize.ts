@@ -111,10 +111,18 @@ export function parseAspectRatioText(value: unknown): number | null {
   return width / height;
 }
 
-/** 这些节点在拖拽缩放时需要按媒体比例锁定。 */
+/**
+ * 这些节点在拖拽缩放时需要按媒体比例锁定。
+ *
+ * 只包含"节点盒子本身就是画面"的节点: 本地上传、结果图片、以及音频节点的视频形态。
+ *
+ * 注意 `imageEdit`(AI 图片) **不在其中**, 这是刻意的: 它的盒子是提示词输入框 +
+ * 工具栏面板, 而不是画面。它建节点时又会带上默认的 `aspectRatio: '1:1'`,
+ * 一旦按比例锁定, 面板初次的 520x320 会在指针还没移动时就被强行拉成 1:1
+ * —— 表现就是"拖右下角突然变大缩小、完全不跟手"。
+ */
 export function isAspectLockedMediaNodeType(type: CanvasNodeType): boolean {
   return type === CANVAS_NODE_TYPES.upload
-    || type === CANVAS_NODE_TYPES.imageEdit
     || type === CANVAS_NODE_TYPES.exportImage
     || type === CANVAS_NODE_TYPES.audio;
 }
@@ -222,6 +230,23 @@ export function resolveAspectLockedResize({
   const previousHeight = normalizePositive(previous.height, fallback.height);
   const nextWidth = normalizePositive(next.width, previousWidth);
   const nextHeight = normalizePositive(next.height, previousHeight);
+
+  // 指针还没真正移动的那一帧原样返回: 此时主导轴判定会退化成"宽度胜出"，
+  // 若基准比例与锁定比例不一致，节点会在手指未动时先跳一下。位移阈值取 0.5px，
+  // 覆盖 `Math.floor` 造成的同帧抖动。
+  // 只在起始尺寸可用时判定 —— 起始尺寸不可用时上面会拿候选值兜底，
+  // 那时两边的差值恒为 0，属于"没有基准"，不是"没有位移"。
+  if (
+    isUsablePositive(previous.width)
+    && isUsablePositive(previous.height)
+    && Math.abs(next.width - previous.width) < 0.5
+    && Math.abs(next.height - previous.height) < 0.5
+  ) {
+    return {
+      width: roundEdge(previous.width),
+      height: roundEdge(previous.height),
+    };
+  }
 
   const widthDelta = Math.abs(nextWidth - previousWidth) / previousWidth;
   const heightDelta = Math.abs(nextHeight - previousHeight) / previousHeight;

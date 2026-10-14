@@ -41,6 +41,15 @@ const JIMENG_CLI_MAX_REFERENCE_IMAGES: usize = 9;
 // 也不能冒重复扣费的风险。
 const JIMENG_SUBMIT_MAX_ATTEMPTS: u32 = 3;
 const JIMENG_SUBMIT_RETRY_BACKOFF_MS: [u64; 2] = [2_000, 5_000];
+
+/// 轮询阶段(`query_result`)连续网络失败的最大重试次数(每次间隔 3 秒)。
+///
+/// 与提交阶段**完全不同的安全前提**: `query_result` 是只读、免费、幂等的, 而且走到这一步
+/// 说明任务**已经在服务端创建并预缴了积分** —— 一次网络抖动就整段失败, 等于把已经扣过费的
+/// 任务丢掉(用户实报的报文正是这样: 轮询 `get_history_by_ids` 时
+/// `context deadline exceeded (Client.Timeout exceeded while awaiting headers)` 直接终止了
+/// 整个 4K 生成)。所以这里可以放心地连续重试, 只有失败到上限才放弃。
+const JIMENG_POLL_MAX_CONSECUTIVE_FAILURES: u32 = 10;
 /// 上传参考图用的字节图床服务; 仅在提交失败后用于连通性诊断。
 const JIMENG_UPLOAD_HOST: &str = "imagex.bytedanceapi.com";
 
@@ -412,6 +421,9 @@ fn submit_and_poll_jimeng_task(
     emit_cli_task_status(app, client_job_id, &submit_id, "queued", queue_count(executable), None);
 
     let task_deadline = Instant::now() + CLI_TASK_TIMEOUT;
+    // 任务此刻已在服务端创建并预缴积分: 一次查询抖动就整段失败, 等于丢掉一个已经扣过费的
+    // 任务。所以对瞬时网络失败做有限重试(只读 + 幂等, 重试不产生任何新费用)。
+    let mut consecutive_poll_failures = 0u32;
     loop {
         if Instant::now() >= task_deadline {
             emit_cli_task_status(
@@ -424,14 +436,49 @@ fn submit_and_poll_jimeng_task(
             );
             return Err("即梦 CLI 任务超时（超过 30 分钟）".to_string());
         }
-        let query = run_cli(
+        let query = match run_cli(
             executable,
             &[
                 "query_result".to_string(),
                 format!("--submit_id={submit_id}"),
                 format!("--download_dir={}", download_dir.display()),
             ],
-        )?;
+        ) {
+            Ok(output) => {
+                consecutive_poll_failures = 0;
+                output
+            }
+            Err(message) => {
+                if should_retry_poll_failure(&message, consecutive_poll_failures) {
+                    consecutive_poll_failures += 1;
+                    // 刻意不取 queue_count: 网络正不通时 `list_task` 会再卡满 30 秒超时,
+                    // 把重试间隔拖成半分钟。
+                    emit_cli_task_status(
+                        app,
+                        client_job_id,
+                        &submit_id,
+                        "retrying",
+                        None,
+                        Some(format!(
+                            "查询结果网络失败, 正在自动重试(第 {}/{} 次; 任务已在服务端创建, 重试不会重复扣费)",
+                            consecutive_poll_failures, JIMENG_POLL_MAX_CONSECUTIVE_FAILURES
+                        )),
+                    );
+                    thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+                let reason = describe_poll_failure(&submit_id, &message);
+                emit_cli_task_status(
+                    app,
+                    client_job_id,
+                    &submit_id,
+                    "failed",
+                    queue_count(executable),
+                    Some(reason.clone()),
+                );
+                return Err(reason);
+            }
+        };
 
         if is_failed(&query) {
             emit_cli_task_status(app, client_job_id, &submit_id, "failed", queue_count(executable), Some(output_summary(&query)));
@@ -526,6 +573,16 @@ fn is_transient_submit_failure(reason: &str) -> bool {
     TRANSIENT_SUBMIT_FAILURE_PATTERNS
         .iter()
         .any(|pattern| lowered.contains(*pattern))
+}
+
+/// 轮询失败是否值得重试。
+///
+/// 复用提交阶段那份瞬时网络失败特征表 —— 那些特征描述的是网络层, 与阶段无关。
+/// 与提交阶段的关键差异是**不需要**再核对计费: 提交阶段的顾虑是「重试会不会重复下单」,
+/// 而 `query_result` 只读不写, 重试永远是安全的。
+fn should_retry_poll_failure(reason: &str, consecutive_failures: u32) -> bool {
+    consecutive_failures < JIMENG_POLL_MAX_CONSECUTIVE_FAILURES
+        && is_transient_submit_failure(reason)
 }
 
 /// 纯函数: 依据「本地任务库里有没有这一次的记录、有没有产生计费」+ 报错性质,
@@ -778,6 +835,20 @@ fn humanize_jimeng_failure(reason: &str) -> Option<&'static str> {
             "说明: 即梦 CLI 的登录态已失效。\n建议: 到「设置 - 密钥 - 即梦 CLI」重新登录后再试。",
         );
     }
+    // 放在最后: 超时是最泛化的一条, 必须让上面那些更具体的原因(上传阶段 / 审核 / 未登录)
+    // 先命中 —— `ApplyImageUpload: ... context deadline exceeded` 就同时含「上传」与「超时」。
+    if lowered.contains("context deadline exceeded")
+        || lowered.contains("client.timeout exceeded")
+        || lowered.contains("deadline exceeded")
+        || lowered.contains("i/o timeout")
+    {
+        return Some(
+            "说明: 请求即梦服务器时网络超时(时限内没拿到响应), 与提示词、素材内容无关;\
+             即梦是国内服务, 若系统或应用带了代理, 走代理反而容易超时。\n\
+             建议: ① 先直接重试一次(这类多半是当时的偶发失败); \
+             ② 关掉系统代理 / VPN 再试一次做对照; ③ 换个网络(如手机热点)做对照。",
+        );
+    }
     None
 }
 
@@ -872,6 +943,68 @@ fn describe_submit_failure_context(
         None => lines.push(probe_upload_host(Duration::from_millis(2_500))),
     }
     lines
+}
+
+/// 轮询阶段失败的完整说明。
+///
+/// 必须讲清的第一件事是「这不是生成失败」: 任务已经在服务端创建并预缴了积分, 结果通常仍会
+/// 产出, 只是本地没能查回来。所以一定把 `submit_id` 交给用户, 让他能用官方 CLI 手动取回 ——
+/// 否则用户会以为白花了积分, 再去重新生成一次(那才是真的重复扣费)。
+fn describe_poll_failure(submit_id: &str, message: &str) -> String {
+    let mut out = format!(
+        "即梦 CLI 查询结果失败(注意: 这不等于生成失败 —— 任务已在服务端创建并预缴积分): {}\n\
+         说明: 卡在「查询任务结果」这一步, 与提示词、素材内容无关; 服务端通常会继续把任务跑完, \
+         结果一般不会丢。\n\
+         建议: ① 等一两分钟后用官方 CLI 直接取回这一次的结果(不必重新生成, 也就不用再扣一次费):\
+         `dreamina query_result --submit_id={submit_id} --download_dir=.`;\
+         ② 换个网络(如手机热点)做对照; ③ 若开了系统代理 / VPN, 先关掉再试。",
+        condense_upload_paths(message),
+    );
+    if let Some(hint) = humanize_jimeng_failure(message) {
+        out.push('\n');
+        out.push_str(hint);
+    }
+    out.push('\n');
+    out.push_str(&describe_cli_proxy_state());
+    out.push('\n');
+    out.push_str(&cli_log_hint());
+    out
+}
+
+/// 取证: 即梦 CLI 会不会把请求走进代理。
+///
+/// CLI 是 Go 程序, 它的 http 客户端**自动读取** `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
+/// (与 Windows 系统代理无关), 而 GUI 进程的子进程会原样继承这些变量。即梦是国内服务,
+/// 一旦被代理接管, 典型症状就是 `Client.Timeout exceeded while awaiting headers`。
+/// 这里只做取证、不改行为 —— 用真实数据帮用户判断该不该关代理。
+fn describe_cli_proxy_state() -> String {
+    let mut values: Vec<String> = Vec::new();
+    for key in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(raw) = std::env::var(key) {
+            let value = raw.trim().to_string();
+            // Windows 的环境变量名大小写不敏感, 同一个变量会被查出来两次 —— 按值去重。
+            if !value.is_empty() && !values.contains(&value) {
+                values.push(value);
+            }
+        }
+    }
+    if values.is_empty() {
+        "诊断: 未检测到代理环境变量, 即梦 CLI 按直连访问即梦服务器。".to_string()
+    } else {
+        format!(
+            "诊断: 检测到代理环境变量(HTTP_PROXY / HTTPS_PROXY / ALL_PROXY, 值: {}), \
+             即梦 CLI 会自动继承 —— 即梦是国内服务, 被代理接管时容易在查询接口上超时, \
+             建议关掉代理 / 清掉这些变量后重试一次做对照。",
+            values.join(", ")
+        )
+    }
 }
 
 /// CLI 日志里读到的一次上传失败要点。
@@ -2594,6 +2727,63 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
         assert!(!upload_hint.contains("TUN"), "实际: {upload_hint}");
         assert!(upload_hint.contains("参考图上传"));
         assert!(upload_hint.contains("不会产生任何费用"));
+    }
+
+    /// 用户实报(2026-10-14, app 1.2.29): 4K 图片生成在**查询结果**这一步被一次网络抖动
+    /// 直接终止 —— 任务已经扣过费, 结果却没能取回来。
+    const REPORTED_POLL_TIMEOUT: &str = r#"即梦 CLI 命令执行失败: do request: Post "https://jimeng.jianying.com/mweb/v1/get_history_by_ids?agent_detect=human&aid=513695&cli_version=673dd28-dirty&from=dreamina_cli": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"#;
+
+    #[test]
+    fn retries_transient_poll_failures_until_the_budget_runs_out() {
+        assert!(should_retry_poll_failure(REPORTED_POLL_TIMEOUT, 0));
+        assert!(should_retry_poll_failure(
+            REPORTED_POLL_TIMEOUT,
+            JIMENG_POLL_MAX_CONSECUTIVE_FAILURES - 1
+        ));
+        // 连续失败到上限就放弃, 不能无限等下去。
+        assert!(!should_retry_poll_failure(
+            REPORTED_POLL_TIMEOUT,
+            JIMENG_POLL_MAX_CONSECUTIVE_FAILURES
+        ));
+        // 非网络类失败(登录失效 / 参数错)重试没有意义。
+        assert!(!should_retry_poll_failure("status_code=401, unauthorized, not login", 0));
+        assert!(!should_retry_poll_failure(
+            "image_resource_id_list length is 10, should be <= 9",
+            0
+        ));
+    }
+
+    #[test]
+    fn poll_failure_keeps_submit_id_so_the_result_can_be_recovered() {
+        let message = describe_poll_failure("submit-abc-123", REPORTED_POLL_TIMEOUT);
+        // 必须说清「这不是生成失败」, 否则用户会以为积分白花而重新生成(那才是重复扣费)。
+        assert!(message.contains("不等于生成失败"), "实际: {message}");
+        assert!(message.contains("submit-abc-123"));
+        assert!(message.contains("dreamina query_result --submit_id=submit-abc-123"));
+        // 原始报文里的临时目录 / 长 URL 不该原样糊在用户面前。
+        assert!(message.contains("超时") || message.contains("网络"));
+    }
+
+    #[test]
+    fn humanize_covers_poll_timeout_without_shadowing_upload_hint() {
+        let hint = humanize_jimeng_failure(REPORTED_POLL_TIMEOUT).expect("轮询超时应有人话说明");
+        assert!(hint.contains("网络超时"), "实际: {hint}");
+        // 上传阶段的超时仍要命中更具体的上传分支(它带「不产生费用、可直接重试」的说明)。
+        let upload =
+            humanize_jimeng_failure("ApplyImageUpload: do request: context deadline exceeded").expect("上传超时");
+        assert!(upload.contains("参考图上传"), "实际: {upload}");
+        // 明确的参数错误不该被套上网络说明。
+        assert!(humanize_jimeng_failure("unknown flag: --foo").is_none());
+    }
+
+    #[test]
+    fn proxy_state_diagnostic_never_panics_and_reads_real_env() {
+        let line = describe_cli_proxy_state();
+        assert!(line.starts_with("诊断:"), "实际: {line}");
+        assert!(
+            line.contains("未检测到代理环境变量") || line.contains("检测到代理环境变量"),
+            "实际: {line}"
+        );
     }
 
     #[test]

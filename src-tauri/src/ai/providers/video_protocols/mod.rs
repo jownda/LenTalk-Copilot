@@ -415,7 +415,12 @@ pub fn extract_error_reason(raw: &str) -> Option<String> {
 ///   两种情况下走的链路完全不同, 这是最容易漏掉的一条线索。
 pub fn describe_reqwest_error(error: &reqwest::Error) -> String {
     let mut parts: Vec<String> = vec![error.to_string()];
-    let kind = if error.is_timeout() {
+    // 连接超时与「整个请求传不完」都会被 `is_timeout()` 命中 —— 但两者是完全不同的毛病:
+    // 前者要查网络/代理/对端是否可达, 后者要放宽时长或减小素材。同时命中时标注成前者,
+    // 否则看到「超时」也判不出该往哪边修。
+    let kind = if error.is_timeout() && error.is_connect() {
+        "超时(连接阶段: DNS / 建连 / TLS 未完成)"
+    } else if error.is_timeout() {
         "超时"
     } else if error.is_connect() {
         "连接失败(DNS / 建连 / TLS)"

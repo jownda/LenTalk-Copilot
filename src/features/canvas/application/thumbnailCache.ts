@@ -21,8 +21,13 @@ import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { ensureImageThumbnail } from "@/commands/thumbnail";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 
-/** 目标长边像素。工作台侧格子最宽约 92px，192 足够 2x 屏。 */
-export const THUMBNAIL_MAX_EDGE = 192;
+/**
+ * 目标长边像素。
+ *
+ * 卡片格子放大到约 108px 宽（四列网格）之后，2x 屏需要约 216 物理像素，
+ * 192 会明显发糊 —— 提到 256。缓存键里带了这个尺寸，改值只会让旧图重新生成一次。
+ */
+export const THUMBNAIL_MAX_EDGE = 256;
 
 /** 同时在跑的生成任务上限的下界：太少的话首屏要填很久。 */
 const THUMBNAIL_CONCURRENCY_MIN = 2;

@@ -27,9 +27,12 @@
   background: var(--ui-surface-field);
 }
 
-/* 工作台面板比画布节点宽：列数跟着卡片实际宽度走，而不是钉死六列。 */
+/* 工作台面板比画布节点宽：列数跟着卡片实际宽度走，而不是钉死六列。
+   `grid-auto-rows: max-content` 见 `QuickAssetPicker.tsx` 的 `CANVAS_GRID_STYLE` 注释：
+   列表是固定高度 + 滚动的 grid，不这样写行轨道会被压缩、缩略图被裁。 */
 .quick-asset-picker--studio .quick-asset-picker__grid {
   grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+  grid-auto-rows: max-content;
 }
 
 .quick-asset-picker--studio .quick-asset-picker__item {
@@ -45,7 +48,7 @@
   border-color: rgb(var(--accent-rgb));
 }
 
-/* object-contain 留白处垫底色：与画布侧的 bg-black/40 同一作用，只是跟随主题。 */
+/* 图片加载完成前的垫底色（`object-cover` 之后不再有留白，这层只是兜底占位）。 */
 .quick-asset-picker--studio .quick-asset-picker__thumb {
   background: color-mix(in srgb, rgb(var(--text-rgb)) 12%, transparent);
 }

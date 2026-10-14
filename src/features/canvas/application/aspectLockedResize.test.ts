@@ -39,14 +39,17 @@ describe('parseAspectRatioText', () => {
 
 describe('resolveMediaNodeAspectLock', () => {
   it('locks image like nodes to their aspect ratio', () => {
-    expect(resolveMediaNodeAspectLock(CANVAS_NODE_TYPES.imageEdit, { aspectRatio: '4:3' })).toEqual({
-      ratio: RATIO_4_3,
-      bounds: IMAGE_MEDIA_RESIZE_BOUNDS,
-    });
     expect(resolveMediaNodeAspectLock(CANVAS_NODE_TYPES.exportImage, { aspectRatio: '1:1' }))
       .toEqual({ ratio: 1, bounds: IMAGE_MEDIA_RESIZE_BOUNDS });
     expect(resolveMediaNodeAspectLock(CANVAS_NODE_TYPES.upload, { aspectRatio: '16:9' }))
       .toEqual({ ratio: RATIO_16_9, bounds: UPLOAD_MEDIA_RESIZE_BOUNDS });
+  });
+
+  it('leaves the AI image panel free to resize on both axes', () => {
+    // AI 图片节点建节点时自带 aspectRatio(默认 1:1), 但它的盒子是提示词面板,
+    // 不是画面 —— 一旦锁定就会在指针未移动时把 520x320 强行拉成 1:1。
+    expect(resolveMediaNodeAspectLock(CANVAS_NODE_TYPES.imageEdit, { aspectRatio: '4:3' })).toBeNull();
+    expect(resolveMediaNodeAspectLock(CANVAS_NODE_TYPES.imageEdit, { aspectRatio: '1:1' })).toBeNull();
   });
 
   it('locks video result nodes but leaves audio only nodes free', () => {
@@ -192,6 +195,49 @@ describe('resolveAspectLockedResize', () => {
         bounds: WIDE_BOUNDS,
       })
     ).toEqual({ width: 320, height: 240 });
+  });
+
+  it('leaves a zero-displacement frame untouched', () => {
+    // 基准比例(520/320)与锁定比例(4:3)不一致时, 指针还没动也不能跳一下。
+    expect(
+      resolveAspectLockedResize({
+        previous: { width: 520, height: 320 },
+        next: { width: 520, height: 320 },
+        ratio: RATIO_4_3,
+        bounds: WIDE_BOUNDS,
+      })
+    ).toEqual({ width: 520, height: 320 });
+
+    expect(
+      resolveAspectLockedResize({
+        previous: { width: 520, height: 320 },
+        next: { width: 520.4, height: 319.6 },
+        ratio: RATIO_4_3,
+        bounds: WIDE_BOUNDS,
+      })
+    ).toEqual({ width: 520, height: 320 });
+  });
+
+  it('scales proportionally when only the right edge is dragged', () => {
+    expect(
+      resolveAspectLockedResize({
+        previous: { width: 800, height: 450 },
+        next: { width: 960, height: 450 },
+        ratio: RATIO_16_9,
+        bounds: WIDE_BOUNDS,
+      })
+    ).toEqual({ width: 960, height: 540 });
+  });
+
+  it('scales proportionally when only the bottom edge is dragged', () => {
+    expect(
+      resolveAspectLockedResize({
+        previous: { width: 800, height: 450 },
+        next: { width: 800, height: 540 },
+        ratio: RATIO_16_9,
+        bounds: WIDE_BOUNDS,
+      })
+    ).toEqual({ width: 960, height: 540 });
   });
 });
 

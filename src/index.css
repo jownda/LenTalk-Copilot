@@ -198,6 +198,17 @@ html[data-platform='macos'] #root {
   transform: translate(-50%, -50%) scale(1.04);
 }
 
+/* 缩放热区(右边框 / 下边框 / 右下角)要压在节点自身内容之上，
+   但必须低于连线端口 —— 否则整条右边框 / 下边框的热区会盖住躺在边框中线上的
+   端口，端口就点不到了。两者都是绝对定位，靠 z-index 定序。 */
+.react-flow__resize-control {
+  z-index: 2;
+}
+
+.react-flow .react-flow__handle {
+  z-index: 3;
+}
+
 /* 所有类型节点使用同一套选中描边，不改变节点自身亮度。 */
 .react-flow__node.selected > * {
   border-color: rgb(var(--accent-rgb) / 0.98) !important;

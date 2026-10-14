@@ -707,6 +707,9 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
    *
    * 单独 memo 是因为卡片要按批渲染缩略图：列表数组每次都是新对象的话，滚动补批的
    * 判定就会跟着失效，几百个角色又会退回「展开那一下全量挂载」。
+   *
+   * 这里按素材库顺序（最旧在前）原样给出即可，卡片侧会统一倒成「最新创建的在最上面」——
+   * 顺序规则只有 `canvas/ui/quickAssetPickerSorting.ts` 一处，别在这里自己排。
    */
   const quickPickerItems = useMemo(() => {
     const build = (assets: LibraryAsset[], chosenIds: string[]): QuickAssetPickerItem[] =>
