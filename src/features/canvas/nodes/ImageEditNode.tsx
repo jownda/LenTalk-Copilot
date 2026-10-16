@@ -33,6 +33,7 @@ import {
   graphImageResolver,
 } from '@/features/canvas/application/canvasServices';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
+import { registerNodeGenerationHandler } from '@/features/canvas/application/nodeGenerationRegistry';
 import {
   detectAspectRatio,
   parseAspectRatio,
@@ -909,6 +910,13 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     t,
     updateNodeData,
   ]);
+
+  // 把「生成」登记给 AI Agent：它按节点名触发时走的就是这个函数 ——
+  // 与用户亲手点按钮完全是同一条路径，因此计费/取消/错误处理都不会被绕开。
+  useEffect(
+    () => registerNodeGenerationHandler(id, () => void handleGenerate()),
+    [id, handleGenerate],
+  );
 
   const syncPromptHighlightScroll = () => {
     if (!promptRef.current || !promptHighlightRef.current) {

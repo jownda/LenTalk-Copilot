@@ -13,7 +13,8 @@ import {
 import { resolveNodeDisplayName } from "@/features/canvas/domain/nodeDisplay";
 import { canvasAiGateway, graphImageResolver } from "@/features/canvas/application/canvasServices";
 import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
-import { prepareNodeImageFromFile, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { prepareNodeImageFromFile } from "@/features/canvas/application/imageData";
+import { useThumbnailFallback } from "@/features/canvas/ui/useCanvasImageSource";
 import { getVideoModel, listVideoModels } from "@/features/canvas/models";
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
 import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
@@ -70,6 +71,22 @@ function resolveModeModelLabel(modelId: string): string {
   const model = modelId ? getVideoModel(modelId) : undefined;
   return model?.displayName ?? modelId;
 }
+
+/**
+ * 素材预览小方块（36x48）。
+ *
+ * 这里原先是 `resolveImageDisplayUrl(preview)` 把原图直接喂给 `<img>` —— 一张 4000x3000 的
+ * 照片解码要几十 MB 瞬时内存，却只画一个 36px 的方块，节点一挂就是好几张。
+ * 现在走 256 缩略图（与素材选择器**共用同一份缓存**，磁盘命中几乎零成本）。
+ */
+const MotionSourceThumb = memo(({ source, alt }: { source: string; alt: string }) => {
+  const image = useThumbnailFallback(source);
+  if (image.isPlaceholder) {
+    return <div className="h-9 w-12 animate-pulse rounded bg-white/[0.06]" aria-hidden />;
+  }
+  return <img src={image.url ?? ""} alt={alt} className="h-9 w-12 rounded object-cover" />;
+});
+MotionSourceThumb.displayName = "MotionSourceThumb";
 
 export const MotionControlNode = memo(({ id, data, selected, width, height }: MotionControlNodeProps) => {
   const { t } = useTranslation();
@@ -342,7 +359,7 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
       >
         {preview ? (
           kind === "image" ? (
-            <img src={resolveImageDisplayUrl(preview)} alt={label} className="h-9 w-12 rounded object-cover" />
+            <MotionSourceThumb source={preview} alt={label} />
           ) : (
             <span className="flex h-9 w-12 items-center justify-center rounded bg-accent/10 text-accent">{icon}</span>
           )

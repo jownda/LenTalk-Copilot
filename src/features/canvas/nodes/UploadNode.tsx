@@ -41,9 +41,9 @@ import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import {
   prepareNodeImageFromFile,
   resolveImageDisplayUrl,
-  shouldUseOriginalImageByZoom,
 } from '@/features/canvas/application/imageData';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
+import { useCanvasImageSource } from '@/features/canvas/ui/useCanvasImageSource';
 import { MediaDimensionsLabel, useHoverIntent, useImageDimensions, useMediaByteSize } from '@/features/canvas/ui/MediaDimensions';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -358,16 +358,11 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
     clearTransientPreview();
   }, [clearTransientPreview]);
 
-  const imageSource = useMemo(() => {
-    if (transientPreviewUrl) {
-      return transientPreviewUrl;
-    }
-    const preferOriginal = shouldUseOriginalImageByZoom(zoom);
-    const picked = preferOriginal
-      ? data.imageUrl || data.previewImageUrl
-      : data.previewImageUrl || data.imageUrl;
-    return picked ? resolveImageDisplayUrl(picked) : null;
-  }, [data.imageUrl, data.previewImageUrl, transientPreviewUrl, zoom]);
+  // 上传中的临时预览(blob:/data:)优先 —— 它比任何落盘图都新。
+  // 其余交给统一判定：小尺寸走落盘缩略图（重开项目同步命中），放大到阈值以上才读原图。
+  const persistedImageSource = useCanvasImageSource(zoom, data.imageUrl, data.previewImageUrl);
+  const imageSource = transientPreviewUrl ?? persistedImageSource.url;
+  const imageIsPlaceholder = transientPreviewUrl ? false : persistedImageSource.isPlaceholder;
   const imageDimensions = useImageDimensions(data.imageUrl ? resolveImageDisplayUrl(data.imageUrl) : imageSource);
   // 体积按原始来源探测, asset:// / blob: 预览地址无法还原成本地文件。
   const mediaByteSize = useMediaByteSize(data.imageUrl);
@@ -407,6 +402,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
         >
           <CanvasNodeImage
             src={imageSource ?? ''}
+            placeholder={imageIsPlaceholder}
             viewerSourceUrl={data.imageUrl ? resolveImageDisplayUrl(data.imageUrl) : null}
             alt={t('node.upload.uploadedAlt')}
             className="h-full w-full object-contain"

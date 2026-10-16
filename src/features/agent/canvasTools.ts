@@ -13,6 +13,11 @@ export interface CanvasAgentToolDefinition<TSchema extends z.ZodTypeAny = z.ZodT
 
 const nodeTypes = Object.values(CANVAS_NODE_TYPES) as [string, ...string[]];
 const nodeTypeSchema = z.enum(nodeTypes as [CanvasNodeType, ...CanvasNodeType[]]);
+/**
+ * 节点引用一律用**名称**（见 `buildCanvasNodeRefNames`），不用 id：
+ * uuid 让模型逐字抄会出错，也让用户在卡片上看不懂它指的是哪个节点。
+ */
+const nodeNameSchema = z.string().min(1);
 
 export const canvasAgentTools = {
   getSnapshot: {
@@ -39,23 +44,39 @@ export const canvasAgentTools = {
   },
   updateNode: {
     name: "canvas.update_node",
-    description: "更新节点参数，不改变节点类型或连线。",
+    description: "更新节点参数（提示词、模型、比例、分辨率等），不改变节点类型或连线。",
     permission: "write",
-    schema: z.object({ nodeId: z.string().min(1), data: z.record(z.string(), z.unknown()) }),
+    schema: z.object({
+      nodeName: nodeNameSchema,
+      data: z.record(z.string(), z.unknown()),
+    }),
   },
   moveNode: {
     name: "canvas.move_node",
     description: "移动节点位置。",
     permission: "write",
-    schema: z.object({ nodeId: z.string().min(1), position: z.object({ x: z.number(), y: z.number() }) }),
+    schema: z.object({
+      nodeName: nodeNameSchema,
+      position: z.object({ x: z.number(), y: z.number() }),
+    }),
+  },
+  resizeNode: {
+    name: "canvas.resize_node",
+    description: "调整节点在画布上的显示尺寸（像素，只影响画布排版，不影响出图分辨率）。",
+    permission: "write",
+    schema: z.object({
+      nodeName: nodeNameSchema,
+      width: z.number().positive(),
+      height: z.number().positive(),
+    }),
   },
   connectNodes: {
     name: "canvas.connect_nodes",
     description: "连接两个节点；可指定 source/target handle。",
     permission: "write",
     schema: z.object({
-      sourceNodeId: z.string().min(1),
-      targetNodeId: z.string().min(1),
+      sourceName: nodeNameSchema,
+      targetName: nodeNameSchema,
       sourceHandle: z.string().optional(),
       targetHandle: z.string().optional(),
     }),
@@ -65,7 +86,15 @@ export const canvasAgentTools = {
     description: "删除节点及其相关连线。",
     permission: "destructive",
     requiresConfirmation: true,
-    schema: z.object({ nodeId: z.string().min(1) }),
+    schema: z.object({ nodeName: nodeNameSchema }),
+  },
+  runNode: {
+    name: "canvas.run_node",
+    description:
+      "触发某个节点开始生成（会真正调用模型并产生费用）。需要用户确认后才会执行。",
+    permission: "paid-operation",
+    requiresConfirmation: true,
+    schema: z.object({ nodeName: nodeNameSchema }),
   },
   undo: {
     name: "canvas.undo",

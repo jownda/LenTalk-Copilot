@@ -29,6 +29,24 @@ import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData"
  */
 export const THUMBNAIL_MAX_EDGE = 256;
 
+/**
+ * 画布节点主体图的专用尺寸。
+ *
+ * 与素材选择器的 256 分开的理由：卡片格子只有约 108px 宽，256 绰绰有余；而画布节点
+ * 动辄 200~320 CSS px，2x 屏要 500+ 物理像素，256 会明显发糊。
+ *
+ * 为什么定 512 而不是更小：生成流水线落盘的 preview 就是 512（`DEFAULT_PREVIEW_MAX_DIMENSION`），
+ * 取同一个尺寸能保证**有 preview 的图和没 preview 的图观感一致**，不会出现「新建的图清楚、
+ * 上传的照片发糊」。再小就开始肉眼可见地软了，而 512 相比原图仍是量级上的节省 ——
+ * 一张 4000x3000 的照片解码要几十 MB 瞬时内存，512 长边只有约 0.2M 像素。
+ *
+ * 为什么不干脆用原图：一屏挂 20 个节点就是几百 MB —— 这正是「每次打开项目都要重新加载媒体、
+ * 很卡」的根因。而 Rust 侧生成的缩略图**落盘持久化**，重开项目时命中只做一次文件 stat。
+ *
+ * 改了值只会让旧缩略图重新生成一次（缓存键里带了尺寸）。
+ */
+export const CANVAS_THUMBNAIL_MAX_EDGE = 512;
+
 /** 同时在跑的生成任务上限的下界：太少的话首屏要填很久。 */
 const THUMBNAIL_CONCURRENCY_MIN = 2;
 /** 上界：原图动辄 8MP，每张解码瞬时占用几十 MB，开太多了反而互相拖慢。 */
@@ -106,44 +124,55 @@ export function createTaskGate(limit: number) {
   };
 }
 
-/** 生成成功的缩略图地址（源地址 → 可直接给 `<img>` 的 asset:// 地址）。 */
+/** 缓存键：同一张图在不同尺寸下是两份独立的缩略图。 */
+function thumbnailKey(source: string, maxEdge: number): string {
+  return `${maxEdge}|${source}`;
+}
+
+/** 生成成功的缩略图地址（`尺寸|源地址` → 可直接给 `<img>` 的 asset:// 地址）。 */
 const readyThumbnails = new Map<string, string>();
-/** 生成失败的源地址。不重试：同一张图反复失败只会刷屏。 */
-const failedSources = new Set<string>();
-/** 进行中的任务，同一个源地址并发请求时复用同一个 Promise。 */
+/** 生成失败的键。不重试：同一张图反复失败只会刷屏。 */
+const failedThumbnails = new Set<string>();
+/** 进行中的任务，同一个键并发请求时复用同一个 Promise。 */
 const pendingThumbnails = new Map<string, Promise<string | null>>();
-/** 原图兜底地址缓存，避免每次渲染都重跑一遍路径转换。 */
-const fallbackSources = new Map<string, string>();
 
 const scheduleThumbnail = createTaskGate(THUMBNAIL_CONCURRENCY);
 
 /** 已生成好的缩略图地址；没有则返回 undefined。 */
-export function readThumbnail(source: string): string | undefined {
-  return readyThumbnails.get(source);
+export function readThumbnail(
+  source: string,
+  maxEdge: number = THUMBNAIL_MAX_EDGE,
+): string | undefined {
+  return readyThumbnails.get(thumbnailKey(source, maxEdge));
 }
 
-/** 不能/不必生成缩略图时的展示地址（原图，经 asset 协议转换）。 */
+/**
+ * 不能/不必生成缩略图时的展示地址（原图，经 asset 协议转换）。
+ *
+ * 缓存刻意**不在这里做** —— `resolveImageDisplayUrl` 自身已经带上有界缓存，
+ * 再维护一份只是重复。
+ */
 export function resolveFallbackSource(source: string): string {
-  const cached = fallbackSources.get(source);
-  if (cached !== undefined) return cached;
-  const resolved = resolveImageDisplayUrl(source);
-  fallbackSources.set(source, resolved);
-  return resolved;
+  return resolveImageDisplayUrl(source);
 }
 
 /** 卡片里 `<img>` 最终该用的地址：优先小图，其次原图。 */
-export function resolveDisplaySource(source: string): string {
-  return readyThumbnails.get(source) ?? resolveFallbackSource(source);
+export function resolveDisplaySource(
+  source: string,
+  maxEdge: number = THUMBNAIL_MAX_EDGE,
+): string {
+  return readThumbnail(source, maxEdge) ?? resolveFallbackSource(source);
 }
 
-async function generateThumbnail(source: string): Promise<string | null> {
+async function generateThumbnail(source: string, maxEdge: number): Promise<string | null> {
+  const key = thumbnailKey(source, maxEdge);
   try {
-    const generatedPath = await ensureImageThumbnail(source, THUMBNAIL_MAX_EDGE);
+    const generatedPath = await ensureImageThumbnail(source, maxEdge);
     const displayUrl = convertFileSrc(generatedPath);
-    readyThumbnails.set(source, displayUrl);
+    readyThumbnails.set(key, displayUrl);
     return displayUrl;
   } catch (error) {
-    failedSources.add(source);
+    failedThumbnails.add(key);
     console.warn("[thumbnail] 生成缩略图失败，回落原图", source, error);
     return null;
   }
@@ -153,19 +182,24 @@ async function generateThumbnail(source: string): Promise<string | null> {
  * 请求一张缩略图。已生成时同步 resolve；进行中时复用同一个 Promise。
  * 生成失败返回 `null`（调用方用 `resolveFallbackSource` 兜底）。
  */
-export function requestThumbnail(source: string): Promise<string | null> {
-  const cached = readyThumbnails.get(source);
+export function requestThumbnail(
+  source: string,
+  maxEdge: number = THUMBNAIL_MAX_EDGE,
+): Promise<string | null> {
+  const cached = readThumbnail(source, maxEdge);
   if (cached) return Promise.resolve(cached);
-  if (failedSources.has(source) || !canGenerateThumbnail(source)) return Promise.resolve(null);
 
-  const existing = pendingThumbnails.get(source);
+  const key = thumbnailKey(source, maxEdge);
+  if (failedThumbnails.has(key) || !canGenerateThumbnail(source)) return Promise.resolve(null);
+
+  const existing = pendingThumbnails.get(key);
   if (existing) return existing;
 
-  const task = scheduleThumbnail(() => generateThumbnail(source));
+  const task = scheduleThumbnail(() => generateThumbnail(source, maxEdge));
   const tracked = task.finally(() => {
-    pendingThumbnails.delete(source);
+    pendingThumbnails.delete(key);
   });
-  pendingThumbnails.set(source, tracked);
+  pendingThumbnails.set(key, tracked);
   return tracked;
 }
 
@@ -176,10 +210,13 @@ export function requestThumbnail(source: string): Promise<string | null> {
  * 空串不是可有可无的细节 —— 卡片要靠「有条目」来判断该停止占位动画；
  * 只回传成功项的话，源文件被删掉的那些格子会永远停在闪烁的占位上。
  */
-export async function requestThumbnails(sources: readonly string[]): Promise<Map<string, string>> {
+export async function requestThumbnails(
+  sources: readonly string[],
+  maxEdge: number = THUMBNAIL_MAX_EDGE,
+): Promise<Map<string, string>> {
   const unique = [...new Set(sources)];
   if (unique.length === 0) return new Map();
-  const results = await Promise.all(unique.map((source) => requestThumbnail(source)));
+  const results = await Promise.all(unique.map((source) => requestThumbnail(source, maxEdge)));
   const resolved = new Map<string, string>();
   unique.forEach((source, index) => {
     resolved.set(source, results[index] ?? "");
@@ -190,7 +227,6 @@ export async function requestThumbnails(sources: readonly string[]): Promise<Map
 /** 测试与排查用：把内存缓存清空。 */
 export function resetThumbnailCache(): void {
   readyThumbnails.clear();
-  failedSources.clear();
+  failedThumbnails.clear();
   pendingThumbnails.clear();
-  fallbackSources.clear();
 }

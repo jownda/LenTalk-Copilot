@@ -48,8 +48,8 @@ import {
   persistImageLocally,
   reduceAspectRatio,
   resolveImageDisplayUrl,
-  shouldUseOriginalImageByZoom,
 } from '@/features/canvas/application/imageData';
+import { useCanvasImageSource } from '@/features/canvas/ui/useCanvasImageSource';
 import { UiButton, UiCheckbox, UiChipButton, UiInput, UiPanel, UiSelect } from '@/components/ui';
 import {
   NODE_CONTROL_CHIP_CLASS,
@@ -344,13 +344,7 @@ const FrameCard = memo(
 
     useEffect(() => () => flushNoteCommit(), [flushNoteCommit]);
 
-    const imageSource = useMemo(() => {
-      const preferOriginal = shouldUseOriginalImageByZoom(zoom);
-      const picked = preferOriginal
-        ? frame.imageUrl || frame.previewImageUrl
-        : frame.previewImageUrl || frame.imageUrl;
-      return picked ? resolveImageDisplayUrl(picked) : null;
-    }, [frame.imageUrl, frame.previewImageUrl, zoom]);
+    const imageSource = useCanvasImageSource(zoom, frame.imageUrl, frame.previewImageUrl);
     const viewerSource = useMemo(() => {
       const picked = frame.imageUrl || frame.previewImageUrl;
       return picked ? resolveImageDisplayUrl(picked) : null;
@@ -391,7 +385,8 @@ const FrameCard = memo(
         >
           {frame.imageUrl ? (
             <CanvasNodeImage
-              src={imageSource ?? ''}
+              src={imageSource.url ?? ''}
+              placeholder={imageSource.isPlaceholder}
               alt={`Frame ${index + 1}`}
               viewerSourceUrl={viewerSource}
               viewerImageList={viewerImageList}

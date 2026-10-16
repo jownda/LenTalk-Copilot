@@ -54,6 +54,7 @@ import { rememberVoice, resolveVoiceForModel } from "./audio/voiceMemory";
 import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
 import { useCanvasStore } from "@/stores/canvasStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { registerNodeGenerationHandler } from "@/features/canvas/application/nodeGenerationRegistry";
 
 type AudioGenNodeProps = {
   id: string;
@@ -927,6 +928,13 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
       setSunoAction(null);
     }
   }, [flushCommit, id, resolveProviderContext, selectedModel, t, updateNodeData]);
+
+  // 把「生成」登记给 AI Agent：它按节点名触发时走的就是这个函数 ——
+  // 与用户亲手点按钮完全同一条路径，计费/取消/错误处理都不会被绕开。
+  useEffect(
+    () => registerNodeGenerationHandler(id, () => void handleGenerate()),
+    [id, handleGenerate],
+  );
 
   // ---------------------------------------------------------------------
   // ① 音色克隆 / ② 音色设计 —— 建音色资产(按次一次性计费), 产出 voice_id

@@ -1514,8 +1514,28 @@ export async function uploadZhiniaoReferenceAsset(
   return await uploadPlatformReferenceAsset(source, baseUrl, headers, index, "知鸟 AI", "/v1/files");
 }
 
-/** 知鸟 AI 扁平入口的 mode 取值: 无参考=文生视频, 单图=首帧, 双图首尾帧, 多图=参考生视频。 */
-function resolveZhiniaoVideoMode(imageMode: string | undefined, imageCount: number): string {
+/**
+ * 知鸟 AI 扁平入口的 mode 取值。
+ *
+ * 平台硬约束（网关实际返回的 400 文案，原文）：
+ *   `首帧 / 首尾帧模式不能带参考视频或参考音频 (mode=first-frame; …),
+ *     参考视频 / 参考音频请改用参考生模式 (mode=reference)`
+ * 即 **只有参考生(reference)允许携带参考音频 / 参考视频**。因此只要请求里出现这两类素材,
+ * 就必须发 reference —— 这条优先级高于下面"按图片数量推断"的默认规则。
+ *
+ * ⚠️ 曾经的写法是"只看图片数量": 单图一律 first-frame, 于是
+ *   「1 张参考图 + 1 段参考音频」(角色一致性最常见的用法: 图定外貌、音频定音色)
+ *   被静默降级成首帧, 随后被网关以 first-frame 拒收参考音频而整单失败。
+ *
+ * 其余情况沿用平台扁平入口的惯例: 无参考=文生视频, 单图=首帧, 双图首尾帧, 多图=参考生视频。
+ */
+export function resolveZhiniaoVideoMode(
+  imageMode: string | undefined,
+  imageCount: number,
+  hasReferenceMedia = false,
+): string {
+  // 参考音频 / 参考视频只有参考生模式收, 优先于图片数量推断。
+  if (hasReferenceMedia) return "reference";
   if (imageCount === 0) return "text-to-video";
   if (imageMode === "first-last" && imageCount >= 2) return "first-last";
   if (imageCount === 1) return "first-frame";
@@ -1549,7 +1569,7 @@ async function generateZhiniaoVideo(
   const body: Record<string, unknown> = {
     model: apiModel,
     prompt: request.prompt,
-    mode: resolveZhiniaoVideoMode(request.image_mode, imageSources.length),
+    mode: resolveZhiniaoVideoMode(request.image_mode, imageSources.length, audioSources.length > 0),
     duration: Math.max(1, Math.round(request.duration)),
     aspect_ratio: request.aspect_ratio,
     count: 1,

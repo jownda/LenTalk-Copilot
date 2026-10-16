@@ -10,6 +10,7 @@ import {
   selectSessionsForProject,
   serializeAgentState,
   trimMessages,
+  useAgentStore,
 } from "./agentStore";
 import type { AgentMessage, AgentSession } from "./types";
 
@@ -23,6 +24,7 @@ function session(partial: Partial<AgentSession> & { id: string }): AgentSession 
     projectId: null,
     messages: [],
     selection: null,
+    skillId: null,
     createdAt: 0,
     updatedAt: 0,
     ...partial,
@@ -69,11 +71,15 @@ describe("serializeAgentState / parseAgentState", () => {
       sessions: [session({ id: "s1", messages: [message({ id: "m1", content: "你好" })] })],
       activeSessionId: "s1",
       selection: { providerId: "p1", model: "gpt-x" },
+      skillId: "tiangonxieyi",
+      canvasAccess: "edit" as const,
     };
     const restored = parseAgentState(serializeAgentState(state));
     expect(restored?.sessions[0].messages[0].content).toBe("你好");
     expect(restored?.activeSessionId).toBe("s1");
     expect(restored?.selection?.model).toBe("gpt-x");
+    // 顶层「待用 SKILL」也要能落盘回读，否则重启后按钮就退回「加载 SKILL」
+    expect(restored?.skillId).toBe("tiangonxieyi");
   });
 
   it("drops messages that are still streaming so a half answer never lands on disk", () => {
@@ -89,6 +95,8 @@ describe("serializeAgentState / parseAgentState", () => {
       ],
       activeSessionId: "s1",
       selection: null,
+      skillId: null,
+      canvasAccess: "edit" as const,
     };
     const raw = serializeAgentState(state);
     expect(raw).not.toContain("半截");
@@ -129,6 +137,29 @@ describe("serializeAgentState / parseAgentState", () => {
     expect(restored?.sessions[0].title).toBe("新对话");
     expect(restored?.sessions[0].projectId).toBeNull();
     expect(restored?.sessions[0].messages).toEqual([]);
+    // 旧版本落盘的数据里没有 skillId，缺字段必须补 null 而不是 undefined
+    expect(restored?.sessions[0].skillId).toBeNull();
+  });
+
+  it("round-trips the loaded SKILL id and neutralises non-string values", () => {
+    const state = {
+      sessions: [session({ id: "s1", skillId: "tiangonxieyi" })],
+      activeSessionId: "s1",
+      selection: null,
+      skillId: "tiangonxieyi",
+      canvasAccess: "edit" as const,
+    };
+    expect(parseAgentState(serializeAgentState(state))?.sessions[0].skillId).toBe("tiangonxieyi");
+    expect(parseAgentState(serializeAgentState(state))?.skillId).toBe("tiangonxieyi");
+
+    const dirty = JSON.stringify({
+      sessions: [{ id: "s1", skillId: { nope: true } }, { id: "s2" }],
+      skillId: 42,
+    });
+    const restored = parseAgentState(dirty);
+    expect(restored?.sessions.map((item) => item.skillId)).toEqual([null, null]);
+    // 顶层待用值同样要兜底，否则脏数据会让按钮显示成 "42"
+    expect(restored?.skillId).toBeNull();
   });
 });
 
@@ -165,5 +196,90 @@ describe("createMemoryStorage", () => {
     expect(storage.getItem(AGENT_STORAGE_KEY)).toBe("v");
     storage.removeItem(AGENT_STORAGE_KEY);
     expect(storage.getItem(AGENT_STORAGE_KEY)).toBeNull();
+  });
+});
+
+/**
+ * 回归：曾经 `setSkill` 在没有活动会话时直接 `return {}` 空转 ——
+ * 「新项目里还没聊过任何一条消息」点加载 SKILL 毫无反应（按钮文案也不变）。
+ * 现在它与 `selection` 对称：顶层始终有一个"待用值"。
+ */
+describe("setSkill", () => {
+  it("没有活动会话时落到顶层待用值", () => {
+    useAgentStore.setState({ hydrated: true, sessions: [], activeSessionId: null, skillId: null });
+    useAgentStore.getState().setSkill("tiangonxieyi");
+    expect(useAgentStore.getState().skillId).toBe("tiangonxieyi");
+  });
+
+  it("有活动会话时同时写到会话上", () => {
+    useAgentStore.setState({
+      hydrated: true,
+      sessions: [session({ id: "s1" })],
+      activeSessionId: "s1",
+      skillId: null,
+    });
+    useAgentStore.getState().setSkill("tiangonxieyi");
+    expect(useAgentStore.getState().sessions[0].skillId).toBe("tiangonxieyi");
+    expect(useAgentStore.getState().skillId).toBe("tiangonxieyi");
+  });
+
+  it("传 null 即卸载（两层一起清）", () => {
+    useAgentStore.setState({
+      hydrated: true,
+      sessions: [session({ id: "s1", skillId: "tiangonxieyi" })],
+      activeSessionId: "s1",
+      skillId: "tiangonxieyi",
+    });
+    useAgentStore.getState().setSkill(null);
+    expect(useAgentStore.getState().sessions[0].skillId).toBeNull();
+    expect(useAgentStore.getState().skillId).toBeNull();
+  });
+
+  it("新建会话继承待用 SKILL（否则先选 SKILL 再发第一条会静默丢掉）", () => {
+    useAgentStore.setState({
+      hydrated: true,
+      sessions: [],
+      activeSessionId: null,
+      skillId: "tiangonxieyi",
+    });
+    const id = useAgentStore.getState().createSession(null);
+    const created = useAgentStore.getState().sessions.find((item) => item.id === id);
+    expect(created?.skillId).toBe("tiangonxieyi");
+  });
+});
+
+/** 画布权限档位：安全开关，必须跨会话记住，且旧数据不能把它读成脏值 */
+describe("canvasAccess", () => {
+  it("随会话状态一起往返", () => {
+    const state = {
+      sessions: [],
+      activeSessionId: null,
+      selection: null,
+      skillId: null,
+      canvasAccess: "read-only" as const,
+    };
+    expect(parseAgentState(serializeAgentState(state))?.canvasAccess).toBe("read-only");
+  });
+
+  it("旧数据（没有该字段）与脏值都兜底成默认档", () => {
+    expect(parseAgentState(JSON.stringify({ sessions: [] }))?.canvasAccess).toBe("edit");
+    expect(
+      parseAgentState(JSON.stringify({ sessions: [], canvasAccess: "root" }))?.canvasAccess,
+    ).toBe("edit");
+  });
+
+  it("setCanvasAccess 立即改状态", () => {
+    useAgentStore.getState().setCanvasAccess("read-only");
+    expect(useAgentStore.getState().canvasAccess).toBe("read-only");
+    useAgentStore.getState().setCanvasAccess("full");
+    expect(useAgentStore.getState().canvasAccess).toBe("full");
+  });
+
+  it("其它动作不会把档位冲掉（persist 已改为只传变化字段，其余从 state 补齐）", () => {
+    useAgentStore.setState({ hydrated: true, sessions: [], activeSessionId: null });
+    useAgentStore.getState().setCanvasAccess("full");
+    useAgentStore.getState().setSkill("tiangonxieyi");
+    useAgentStore.getState().createSession(null);
+    expect(useAgentStore.getState().canvasAccess).toBe("full");
   });
 });

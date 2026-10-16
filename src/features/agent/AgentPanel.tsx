@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bot,
+  Check,
   ChevronDown,
   Loader2,
+  Play,
   Plus,
   Send,
   Settings2,
+  ShieldCheck,
+  Sparkles,
   Square,
   Trash2,
   X,
@@ -23,9 +27,34 @@ import { useProjectStore } from "@/stores/projectStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 import { selectSessionsForProject, useAgentStore } from "./agentStore";
+import { extractNodeMediaUrl, getCanvasAgentSnapshot } from "./canvasContext";
+import {
+  CANVAS_ACCESS_HINTS,
+  CANVAS_ACCESS_LABELS,
+  buildCanvasToolPrompt,
+  formatCanvasSnapshotForPrompt,
+  formatCanvasToolResults,
+  parseCanvasReply,
+  stripCanvasToolBlocks,
+  type CanvasAgentAccessLevel,
+} from "./canvasToolProtocol";
+import {
+  MAX_CANVAS_TOOL_ROUNDS,
+  confirmAndRunCanvasToolCall,
+  runCanvasToolCall,
+} from "./canvasToolRunner";
 import { streamChat } from "./llmClient";
 import { MarkdownText } from "./MarkdownText";
-import type { AgentChatTurn, AgentMessage, AgentModelSelection } from "./types";
+import {
+  AGENT_SKILLS,
+  composeAgentSystemPrompt,
+  findAgentSkill,
+  type AgentSkill,
+} from "./skills";
+import type { AgentChatTurn, AgentMessage, AgentModelSelection, AgentToolCallRecord } from "./types";
+import { useThumbnailFallback } from "@/features/canvas/ui/useCanvasImageSource";
+import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { useCanvasStore } from "@/stores/canvasStore";
 
 export interface AgentPanelProps {
   open: boolean;
@@ -33,18 +62,22 @@ export interface AgentPanelProps {
 }
 
 /**
- * 当前只做纯文本创作助手，还读不到画布。
- * 明确写进系统提示，避免模型凭空编造"画布上有哪几个节点"——
- * 编造出来的节点清单比直接说"我做不到"更有害。
+ * 基础人设。画布能力由 `buildCanvasToolPrompt` 按权限档位动态追加，
+ * 实时画布快照由每次发送时注入 —— 三者拼在一起才是完整的 system prompt。
+ *
+ * 措辞上刻意强调「以系统给的现状为准」：模型对画布的唯一可靠信息来源是那份快照，
+ * 一旦放任它凭印象描述节点，编出来的清单比承认不知道更有害。
  */
 const SYSTEM_PROMPT = [
-  "你是 LenTalk Copilot 内置的创作助手，帮助用户构思故事、深化情节、撰写提示词。",
+  "你是 LenTalk Copilot 内置的创作助手，帮助用户构思故事、深化情节、撰写提示词，并直接读写用户的画布。",
   "回答使用简体中文，简洁、具体、可执行；涉及创作建议时直接给出可用的文本，而不是泛泛而谈。",
-  "当前版本你还不能读取或修改画布上的内容。若用户要求操作画布，请如实说明暂时做不到，" +
-    "并给出你建议的手动步骤，不要假设画布上存在任何节点。",
+  "关于画布：系统消息里的「画面现状」是当前画布的真实内容，节点名称（同名会带 #2、#3 后缀）与它完全一致，",
+  "你对画布的一切描述都必须以它为准；快照里没有的节点就是不存在，不要凭印象补充。",
+  "需要更完整的信息（例如某个节点的完整提示词）时，用画布工具去读，不要猜测。",
 ].join("");
 
 const SUGGESTIONS = [
+  "看看我画布上有什么，帮我理一下创作顺序",
   "帮我想三个悬疑短片的开场钩子",
   "把这段情节深化成一场戏：主角发现信是伪造的",
   "写一段赛博朋克城市夜景的文生图提示词",
@@ -61,6 +94,134 @@ function parseSelectionKey(value: string): AgentModelSelection | null {
   return { providerId: value.slice(0, index), model: value.slice(index + 2) };
 }
 
+// ---------------------------------------------------------------------------
+// 待确认操作的执行与结果回填
+// ---------------------------------------------------------------------------
+
+/** 生成最长等多久（视频偶尔要几分钟），超时就别再挂着「生成中」了 */
+const MEDIA_WATCH_TIMEOUT_MS = 15 * 60 * 1000;
+
+interface PendingMediaWatch {
+  sessionId: string;
+  messageId: string;
+  recordIndex: number;
+  /** 被触发的源节点 */
+  sourceNodeId: string;
+  /** 确认那一刻相关节点已有的媒体地址 —— 用来区分"新结果"和"本来就有的" */
+  baseline: Map<string, string | null>;
+  startedAt: number;
+}
+
+/** 与源节点相关的全部节点（它自己 + 它的直接下游） */
+function collectRelatedNodeIds(sourceNodeId: string): Set<string> {
+  const state = useCanvasStore.getState();
+  const related = new Set<string>([sourceNodeId]);
+  for (const edge of state.edges) {
+    if (edge.source === sourceNodeId) related.add(edge.target);
+  }
+  return related;
+}
+
+function buildMediaBaseline(sourceNodeId: string): Map<string, string | null> {
+  const state = useCanvasStore.getState();
+  const related = collectRelatedNodeIds(sourceNodeId);
+  const baseline = new Map<string, string | null>();
+  for (const node of state.nodes) {
+    if (!related.has(node.id)) continue;
+    baseline.set(node.id, extractNodeMediaUrl(node.data as Record<string, unknown>));
+  }
+  return baseline;
+}
+
+/** 找"新冒出来"的媒体地址：结果节点是生成过程中才 create 出来的，所以不在 baseline 里 */
+function findNewlyGeneratedMedia(watch: PendingMediaWatch): string | null {
+  const state = useCanvasStore.getState();
+  const related = collectRelatedNodeIds(watch.sourceNodeId);
+  for (const node of state.nodes) {
+    if (!related.has(node.id)) continue;
+    const url = extractNodeMediaUrl(node.data as Record<string, unknown>);
+    if (!url) continue;
+    if (url !== (watch.baseline.get(node.id) ?? null)) return url;
+  }
+  return null;
+}
+
+/** 改写某条工具记录（一律走 getState()，避免闭包里拿到过期的消息数组） */
+function patchToolRecord(
+  sessionId: string,
+  messageId: string,
+  recordIndex: number,
+  patch: Partial<AgentToolCallRecord>,
+): void {
+  const state = useAgentStore.getState();
+  const session = state.sessions.find((item) => item.id === sessionId);
+  const message = session?.messages.find((item) => item.id === messageId);
+  const records = message?.toolCalls ?? [];
+  if (recordIndex >= records.length) return;
+  const next = records.map((item, index) => (index === recordIndex ? { ...item, ...patch } : item));
+  state.patchMessage(sessionId, messageId, { toolCalls: next });
+}
+
+/**
+ * AI 回复里回显的生成结果。
+ *
+ * **只引用，不复制**：这里显示的就是画布上那份素材本身。
+ * 预览刻意走画布那套缩略图缓存 —— 同一张图在画布里早就生成过缩略图，
+ * 这里直接命中，既不额外落一份文件，也不用再解码一张大图。
+ */
+function AgentMediaPreview({ url }: { url: string }) {
+  const thumbnail = useThumbnailFallback(url);
+  return (
+    <a
+      href={resolveImageDisplayUrl(url)}
+      target="_blank"
+      rel="noreferrer"
+      title="点击查看原图"
+      className="mt-1 block overflow-hidden rounded border border-border-dark"
+    >
+      {thumbnail.url ? (
+        <img
+          src={thumbnail.url}
+          alt="生成结果"
+          className="max-h-48 w-full object-cover object-top"
+          decoding="async"
+        />
+      ) : (
+        <div className="flex h-24 w-full animate-pulse items-center justify-center bg-white/[0.06] text-[10px] text-text-muted">
+          缩略图生成中…
+        </div>
+      )}
+    </a>
+  );
+}
+
+/**
+ * SKILL 缩略图。
+ *
+ * 没有配图（或图挂了）时回退成「名字首字」色块 ——
+ * 直接渲染一个空的 `<img>` 会留下破图图标，比不显示图更难看。
+ */
+function SkillThumbnail({ skill }: { skill: AgentSkill }) {
+  const [failed, setFailed] = useState(false);
+  if (!skill.thumbnail || failed) {
+    return (
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded bg-bg-dark text-[13px] font-medium text-text-muted">
+        {skill.name.slice(0, 1)}
+      </span>
+    );
+  }
+  return (
+    <img
+      src={skill.thumbnail}
+      alt=""
+      loading="lazy"
+      decoding="async"
+      onError={() => setFailed(true)}
+      className="h-9 w-9 shrink-0 rounded bg-bg-dark object-cover"
+    />
+  );
+}
+
 export function AgentPanel({ open, onClose }: AgentPanelProps) {
   const projectId = useProjectStore((state) => state.currentProjectId);
   const customApis = useSettingsStore((state) => state.customApis);
@@ -70,12 +231,16 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
   const activeSessionId = useAgentStore((state) => state.activeSessionId);
   const streaming = useAgentStore((state) => state.streaming);
   const storeSelection = useAgentStore((state) => state.selection);
+  const storeSkillId = useAgentStore((state) => state.skillId);
+  const canvasAccess = useAgentStore((state) => state.canvasAccess);
 
   const hydrate = useAgentStore((state) => state.hydrate);
   const createSession = useAgentStore((state) => state.createSession);
   const deleteSession = useAgentStore((state) => state.deleteSession);
   const setActiveSession = useAgentStore((state) => state.setActiveSession);
   const setSelection = useAgentStore((state) => state.setSelection);
+  const setSkill = useAgentStore((state) => state.setSkill);
+  const setCanvasAccess = useAgentStore((state) => state.setCanvasAccess);
   const appendMessage = useAgentStore((state) => state.appendMessage);
   const patchMessage = useAgentStore((state) => state.patchMessage);
   const beginStreaming = useAgentStore((state) => state.beginStreaming);
@@ -84,8 +249,12 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
   const [draft, setDraft] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [showSessions, setShowSessions] = useState(false);
+  const [showSkills, setShowSkills] = useState(false);
+  const [showAccess, setShowAccess] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  /** 等着把生成结果回填到卡片上的监听 */
+  const mediaWatchesRef = useRef<PendingMediaWatch[]>([]);
 
   const projectSessions = useMemo(
     () => selectSessionsForProject(sessions, projectId ?? null),
@@ -111,6 +280,10 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
   /* eslint-enable react-hooks/exhaustive-deps */
 
   const selection = activeSession?.selection ?? storeSelection ?? defaultSelection;
+  // SKILL 优先取当前会话上存的值；**没有活动会话时回退到 store 的待用值** ——
+  // 与 `selection` 同一套思路。否则「新项目里还没聊过」时点加载 SKILL 会毫无反应。
+  const activeSkillId = activeSession ? activeSession.skillId ?? null : storeSkillId ?? null;
+  const activeSkill = useMemo(() => findAgentSkill(activeSkillId), [activeSkillId]);
   const isBusy = Boolean(streaming);
 
   useEffect(() => {
@@ -131,6 +304,43 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
     node.scrollTop = node.scrollHeight;
   }, [activeSession?.messages, streaming]);
 
+  /**
+   * 盯住画布，等生成结果冒出来就回填到对应的工具卡片上。
+   *
+   * 订阅的是整个 canvasStore（生成过程中结果节点是新建的，节点数会变），
+   * 但只有存在待回填的监听时才做实际计算，空转成本可忽略。
+   */
+  useEffect(() => {
+    const unsubscribe = useCanvasStore.subscribe(() => {
+      const watches = mediaWatchesRef.current;
+      if (watches.length === 0) return;
+      const now = Date.now();
+      const keep: PendingMediaWatch[] = [];
+      for (const watch of watches) {
+        const mediaUrl = findNewlyGeneratedMedia(watch);
+        if (mediaUrl) {
+          patchToolRecord(watch.sessionId, watch.messageId, watch.recordIndex, {
+            ok: true,
+            pending: false,
+            message: "已完成生成，结果如下（引用自画布，未额外复制文件）。",
+            mediaUrl,
+          });
+          continue;
+        }
+        if (now - watch.startedAt > MEDIA_WATCH_TIMEOUT_MS) {
+          patchToolRecord(watch.sessionId, watch.messageId, watch.recordIndex, {
+            ok: false,
+            message: "等待生成结果超时，可能是任务失败或已取消 —— 可以到画布上看一眼那个节点。",
+          });
+          continue;
+        }
+        keep.push(watch);
+      }
+      mediaWatchesRef.current = keep;
+    });
+    return unsubscribe;
+  }, []);
+
   const resolveSettings = useCallback((target: AgentModelSelection | null): AISettings => {
     return target ? resolveLenTalkChatModel(target.providerId, target.model) : loadAISettings();
   }, []);
@@ -145,6 +355,11 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
     const history = session?.messages ?? [];
     const target = session?.selection ?? useAgentStore.getState().selection ?? defaultSelection;
     const settings = resolveSettings(target);
+    // 取的是**这个会话**加载的 SKILL，而不是面板上正在显示的那份 —— 两者通常一致，
+    // 但刚新建会话、或用户在流式期间切换时可能不同，规则必须跟着消息走。
+    const targetSkill = findAgentSkill(session?.skillId ?? null);
+    // 权限档位取的是**发送这一刻**的值：中途改档只影响下一条消息
+    const level = useAgentStore.getState().canvasAccess;
 
     if (!isRemoteConfigured(settings)) {
       setNotice("尚未配置可用的 Chat 模型：请到「设置 → 自定义平台」添加模型并填入 API Key。");
@@ -172,11 +387,28 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
     appendMessage(sessionId, assistantMessage);
     setDraft("");
 
+    // 快照按发送那一刻现取：模型对画布的唯一可靠信息来源就是它
+    const systemPrompt = [
+      composeAgentSystemPrompt(SYSTEM_PROMPT, targetSkill),
+      "",
+      formatCanvasSnapshotForPrompt(getCanvasAgentSnapshot()),
+      buildCanvasToolPrompt(level),
+    ].join("\n");
+
+    // 历史里的画布操作要把执行结果一起带回去，否则模型看不到自己上一轮做过什么，
+    // 会重复建节点或反复问同一件事。
+    const historyTurns: AgentChatTurn[] = [];
+    for (const message of history) {
+      if (message.role === "system" || !message.content.trim()) continue;
+      historyTurns.push({ role: message.role, content: message.content });
+      if (message.role === "assistant" && message.toolCalls?.length) {
+        historyTurns.push({ role: "user", content: formatCanvasToolResults(message.toolCalls) });
+      }
+    }
+
     const turns: AgentChatTurn[] = [
-      { role: "system", content: SYSTEM_PROMPT },
-      ...history
-        .filter((message) => message.role !== "system" && message.content.trim().length > 0)
-        .map((message) => ({ role: message.role, content: message.content })),
+      { role: "system", content: systemPrompt },
+      ...historyTurns,
       { role: "user", content: text },
     ];
 
@@ -184,28 +416,75 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
     abortRef.current = controller;
     beginStreaming(sessionId, assistantId);
 
-    let accumulated = "";
-    try {
-      await streamChat({
-        settings,
-        messages: turns,
-        signal: controller.signal,
-        onDelta: (delta) => {
-          accumulated += delta;
-          // 流式期间不写盘：一轮回答几百个 token，逐次落盘会明显卡顿
-          patchMessage(sessionId, assistantId, { content: accumulated }, { persist: false });
-        },
-      });
+    const records: AgentToolCallRecord[] = [];
+    const settledTexts: string[] = [];
+
+    /** 已完成轮次的文本 + 当前轮正在流式的文本 */
+    const displayText = (current: string) =>
+      [...settledTexts, current].filter((part) => part.trim().length > 0).join("\n\n");
+
+    const commit = (patch: Partial<AgentMessage> = {}) => {
       patchMessage(sessionId, assistantId, {
-        content: accumulated,
+        content: displayText(""),
         pending: false,
-        error: accumulated.trim() ? undefined : "模型没有返回内容。",
+        toolCalls: records.length > 0 ? [...records] : undefined,
+        ...patch,
       });
+    };
+
+    try {
+      for (let round = 0; round < MAX_CANVAS_TOOL_ROUNDS; round += 1) {
+        let accumulated = "";
+        await streamChat({
+          settings,
+          messages: turns,
+          signal: controller.signal,
+          onDelta: (delta) => {
+            accumulated += delta;
+            // 流式期间不写盘：一轮回答几百个 token，逐次落盘会明显卡顿。
+            // 工具块在打字过程中就要剥掉，否则半截 JSON 会闪一下再消失。
+            patchMessage(
+              sessionId,
+              assistantId,
+              { content: displayText(stripCanvasToolBlocks(accumulated)) },
+              { persist: false },
+            );
+          },
+        });
+
+        const parsed = parseCanvasReply(accumulated);
+        settledTexts.push(parsed.text);
+
+        // 没有工具调用（也没有写坏的块）＝ 这一轮就是最终回答
+        if (parsed.calls.length === 0 && parsed.errors.length === 0) break;
+
+        const roundRecords = parsed.calls.map((call) => runCanvasToolCall(call, level));
+        records.push(...roundRecords);
+
+        patchMessage(
+          sessionId,
+          assistantId,
+          { content: displayText(""), toolCalls: [...records] },
+          { persist: false },
+        );
+
+        // 有待用户确认的操作就到此为止：后续步骤多半依赖生成结果，
+        // 让模型在「还没生成」的前提下继续规划只会产出一堆空话。
+        if (roundRecords.some((item) => item.pending)) break;
+
+        // 把模型这一轮的原文（含工具块）+ 真实执行结果接回上下文，它才能接着往下走
+        turns.push({ role: "assistant", content: accumulated });
+        turns.push({ role: "user", content: formatCanvasToolResults(roundRecords, parsed.errors) });
+
+        if (round === MAX_CANVAS_TOOL_ROUNDS - 1) {
+          settledTexts.push("（本轮画布操作已达次数上限，如需继续请再发一条消息。）");
+        }
+      }
+      const hasOutput = displayText("").trim().length > 0 || records.length > 0;
+      commit({ error: hasOutput ? undefined : "模型没有返回内容。" });
     } catch (error) {
       const aborted = error instanceof Error && error.name === "AbortError";
-      patchMessage(sessionId, assistantId, {
-        content: accumulated,
-        pending: false,
+      commit({
         error: aborted
           ? "已停止生成"
           : error instanceof Error
@@ -231,6 +510,51 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
 
   const handleStop = useCallback(() => {
     abortRef.current?.abort();
+  }, []);
+
+  /** 用户点了「执行」：这一刻才真正调用工具（会花钱的、或者要删东西的） */
+  const handleConfirmToolCall = useCallback((messageId: string, recordIndex: number) => {
+    const state = useAgentStore.getState();
+    const sessionId = state.activeSessionId;
+    if (!sessionId) return;
+    const message = state.sessions
+      .find((item) => item.id === sessionId)
+      ?.messages.find((item) => item.id === messageId);
+    const target = message?.toolCalls?.[recordIndex];
+    if (!target || !target.pending) return;
+
+    const executed = confirmAndRunCanvasToolCall(
+      { tool: target.tool, arguments: target.arguments },
+      state.canvasAccess,
+    );
+    patchToolRecord(sessionId, messageId, recordIndex, { ...executed, pending: false, skipped: false });
+
+    // 生成是长任务：登记监听，等画布上出现结果就把媒体引用回填到这张卡片
+    const nodeId = (executed.data as { nodeId?: string } | undefined)?.nodeId;
+    if (executed.ok && target.tool === "canvas.run_node" && nodeId) {
+      mediaWatchesRef.current.push({
+        sessionId,
+        messageId,
+        recordIndex,
+        sourceNodeId: nodeId,
+        baseline: buildMediaBaseline(nodeId),
+        startedAt: Date.now(),
+      });
+      patchToolRecord(sessionId, messageId, recordIndex, {
+        message: "已开始生成，完成后会把结果带回到这里…",
+      });
+    }
+  }, []);
+
+  const handleSkipToolCall = useCallback((messageId: string, recordIndex: number) => {
+    const sessionId = useAgentStore.getState().activeSessionId;
+    if (!sessionId) return;
+    patchToolRecord(sessionId, messageId, recordIndex, {
+      pending: false,
+      skipped: true,
+      ok: false,
+      message: "已跳过，没有执行。",
+    });
   }, []);
 
   const handleNewSession = useCallback(() => {
@@ -263,6 +587,15 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
       setSelection(parseSelectionKey(value));
     },
     [setSelection],
+  );
+
+  const handleSkillPick = useCallback(
+    (skillId: string | null) => {
+      if (useAgentStore.getState().streaming) return;
+      setSkill(skillId);
+      setShowSkills(false);
+    },
+    [setSkill],
   );
 
   if (!open) return null;
@@ -345,9 +678,15 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
         {messages.length === 0 ? (
           <div className="space-y-3 pt-2">
             <div className="rounded-lg bg-bg-dark px-3 py-2 text-xs leading-relaxed text-text-dark">
-              你好，我是 LenTalk 创作助手。可以帮你构思故事、深化情节、撰写提示词。
+              你好，我是 LenTalk 创作助手。可以帮你构思故事、深化情节、撰写提示词，也能直接读写画布。
+              {activeSkill ? (
+                <span className="mt-1 block text-accent">
+                  已加载 SKILL：{activeSkill.name} —— 接下来每一轮回答都会严格按它的规则产出。
+                </span>
+              ) : null}
               <span className="mt-1 block text-text-muted">
-                当前版本我还看不到画布内容——画布操作能力会在后续版本接入。
+                我已经能看到当前画布的节点与连线。当前画布权限：{CANVAS_ACCESS_LABELS[canvasAccess]}
+                —— 需要调整时点左下角的盾牌图标。
               </span>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -383,6 +722,56 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
                   {message.pending && message.content ? (
                     <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-text-muted align-middle" />
                   ) : null}
+                  {/* AI 对画布做过的操作。展开在正文下方，用户一眼能看到「它到底动了什么」 */}
+                  {message.toolCalls?.length ? (
+                    <div className="mt-2 space-y-1 border-t border-border-dark/60 pt-1.5">
+                      {message.toolCalls.map((record, index) => (
+                        <div
+                          key={`${record.tool}-${index}`}
+                          className="rounded border border-border-dark bg-surface-dark/60 px-2 py-1"
+                        >
+                          <div className="flex items-center gap-1">
+                            {record.pending ? (
+                              <Play className="h-3 w-3 shrink-0 text-accent" />
+                            ) : record.ok ? (
+                              <Check className="h-3 w-3 shrink-0 text-accent" />
+                            ) : (
+                              <X className="h-3 w-3 shrink-0 text-red-400" />
+                            )}
+                            <span className="text-[10px] font-medium text-text-dark">
+                              {record.label}
+                            </span>
+                            <span className="truncate text-[10px] text-text-muted">{record.tool}</span>
+                          </div>
+                          <div
+                            className="mt-0.5 line-clamp-3 whitespace-pre-wrap break-words text-[10px] leading-snug text-text-muted"
+                            title={record.message}
+                          >
+                            {record.message}
+                          </div>
+                          {record.mediaUrl ? <AgentMediaPreview url={record.mediaUrl} /> : null}
+                          {record.pending ? (
+                            <div className="mt-1.5 flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleConfirmToolCall(message.id, index)}
+                                className="rounded bg-accent px-2 py-0.5 text-[10px] font-medium text-white hover:opacity-90"
+                              >
+                                确认执行
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSkipToolCall(message.id, index)}
+                                className="rounded border border-border-dark px-2 py-0.5 text-[10px] text-text-muted hover:text-text-dark"
+                              >
+                                跳过
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                   {message.error ? (
                     <div className="mt-1 text-[11px] text-red-500">{message.error}</div>
                   ) : null}
@@ -410,33 +799,9 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
           </div>
         ) : null}
 
-        <div className="mb-2 flex items-center gap-2">
-          <select
-            value={selectionKey(selection)}
-            onChange={(event) => handleModelChange(event.target.value)}
-            disabled={isBusy}
-            className="min-w-0 flex-1 rounded-md border border-border-dark bg-bg-dark px-2 py-1 text-[11px] text-text-dark outline-none disabled:opacity-50"
-            aria-label="选择对话模型"
-          >
-            {modelOptions.length === 0 ? (
-              <option value="">未配置 Chat 模型</option>
-            ) : (
-              <>
-                {selection ? null : <option value="">请选择模型</option>}
-                {modelOptions.map((option) => {
-                  const key = `${option.providerId}::${option.model}`;
-                  return (
-                    <option key={key} value={key}>
-                      {option.providerName} · {option.model}
-                    </option>
-                  );
-                })}
-              </>
-            )}
-          </select>
-        </div>
-
-        <div className="flex items-end gap-2 rounded-lg border border-border-dark bg-bg-dark p-2">
+        {/* SKILL 与模型选择收进输入框内部。
+            单独占一行时，那条深色圆角描边和下面的输入框长得一模一样，视觉上就是「两层输入框」。 */}
+        <div className="flex flex-col gap-1 rounded-lg border border-border-dark bg-bg-dark px-2 py-1.5">
           <textarea
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
@@ -448,28 +813,170 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
             }}
             placeholder="和 AI 聊聊你的故事、情节或提示词…（Enter 发送，Shift+Enter 换行）"
             rows={2}
-            className="min-h-10 flex-1 resize-none bg-transparent text-xs text-text-dark outline-none placeholder:text-text-muted"
+            className="min-h-9 w-full resize-none bg-transparent py-1 text-xs leading-relaxed text-text-dark outline-none placeholder:text-text-muted"
           />
-          {isBusy ? (
-            <button
-              type="button"
-              onClick={handleStop}
-              className="rounded-md bg-bg-dark p-2 text-text-dark ring-1 ring-border-dark hover:ring-accent"
-              aria-label="停止生成"
-            >
-              <Square className="h-3.5 w-3.5" />
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={() => void handleSend()}
-              disabled={!draft.trim()}
-              className="rounded-md bg-accent p-2 text-white disabled:opacity-40"
-              aria-label="发送"
-            >
-              {hydrated ? <Send className="h-3.5 w-3.5" /> : <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            </button>
-          )}
+          <div className="flex items-center gap-1.5">
+            {/* 画布权限档位。做成纯图标是为了不再把工具条撑挤 —— 它也确实是低频操作 */}
+            <div className="relative shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowAccess((value) => !value)}
+                disabled={isBusy}
+                className={`flex items-center rounded px-1 py-0.5 outline-none transition-colors hover:bg-white/5 disabled:opacity-50 ${
+                  canvasAccess === "read-only"
+                    ? "text-text-muted hover:text-text-dark"
+                    : "text-accent"
+                }`}
+                aria-label="画布权限"
+                aria-expanded={showAccess}
+                title={`画布权限：${CANVAS_ACCESS_LABELS[canvasAccess]} —— ${CANVAS_ACCESS_HINTS[canvasAccess]}`}
+              >
+                <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+              </button>
+              {showAccess ? (
+                <div className="absolute bottom-full left-0 z-30 mb-1 w-64 overflow-hidden rounded-lg border border-border-dark bg-surface-dark py-1 shadow-2xl">
+                  {(Object.keys(CANVAS_ACCESS_LABELS) as CanvasAgentAccessLevel[]).map((option) => {
+                    const selected = option === canvasAccess;
+                    return (
+                      <button
+                        key={option}
+                        type="button"
+                        onClick={() => {
+                          setCanvasAccess(option);
+                          setShowAccess(false);
+                        }}
+                        className={`block w-full px-3 py-2 text-left hover:bg-bg-dark ${
+                          selected ? "bg-accent/10" : ""
+                        }`}
+                      >
+                        <span
+                          className={`flex items-center gap-1 text-[11px] font-medium ${
+                            selected ? "text-accent" : "text-text-dark"
+                          }`}
+                        >
+                          {CANVAS_ACCESS_LABELS[option]}
+                          {selected ? <Check className="h-3 w-3 shrink-0" /> : null}
+                        </span>
+                        <span className="mt-0.5 block text-[10px] leading-snug text-text-muted">
+                          {CANVAS_ACCESS_HINTS[option]}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="relative shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowSkills((value) => !value)}
+                disabled={isBusy}
+                className={`flex max-w-[170px] items-center gap-1 rounded px-1.5 py-0.5 text-[11px] outline-none transition-colors hover:bg-white/5 disabled:opacity-50 ${
+                  activeSkill ? "text-accent" : "text-text-muted hover:text-text-dark"
+                }`}
+                aria-label="加载 SKILL"
+                aria-expanded={showSkills}
+                title={activeSkill ? `已加载 SKILL：${activeSkill.name}` : "加载 SKILL"}
+              >
+                <Sparkles className="h-3 w-3 shrink-0" />
+                <span className="truncate">{activeSkill?.name ?? "加载 SKILL"}</span>
+                <ChevronDown className="h-3 w-3 shrink-0" />
+              </button>
+              {showSkills ? (
+                <div className="absolute bottom-full left-0 z-30 mb-1 max-h-80 w-80 overflow-y-auto rounded-lg border border-border-dark bg-surface-dark py-1 shadow-2xl">
+                  <button
+                    type="button"
+                    onClick={() => handleSkillPick(null)}
+                    className={`block w-full px-3 py-2 text-left text-[11px] hover:bg-bg-dark ${
+                      activeSkill ? "text-text-muted" : "text-accent"
+                    }`}
+                  >
+                    不使用 SKILL
+                  </button>
+                  {AGENT_SKILLS.map((skill) => {
+                    const selected = skill.id === activeSkillId;
+                    return (
+                      <button
+                        key={skill.id}
+                        type="button"
+                        onClick={() => handleSkillPick(skill.id)}
+                        className={`flex w-full items-start gap-2.5 px-3 py-2 text-left hover:bg-bg-dark ${
+                          selected ? "bg-accent/10 text-accent" : "text-text-dark"
+                        }`}
+                      >
+                        <SkillThumbnail skill={skill} />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex items-center gap-1">
+                            <span className="truncate text-[11px] font-medium">{skill.name}</span>
+                            {selected ? <Check className="h-3 w-3 shrink-0" /> : null}
+                          </span>
+                          <span className="line-clamp-2 mt-0.5 block text-[10px] leading-snug text-text-muted">
+                            {skill.intro}
+                          </span>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
+
+            {/* 裸 select：去掉边框与底色，否则它自己又成了一条「小输入框」。
+                宽度按内容走（不 flex-1），否则模型名与右侧箭头会被拉得很开。 */}
+            <div className="relative flex min-w-0 items-center">
+              <select
+                value={selectionKey(selection)}
+                onChange={(event) => handleModelChange(event.target.value)}
+                disabled={isBusy}
+                className={`min-w-0 max-w-[230px] cursor-pointer appearance-none truncate bg-transparent py-0.5 pr-4 text-[11px] outline-none transition-colors disabled:opacity-50 ${
+                  selection ? "text-text-dark" : "text-text-muted"
+                }`}
+                aria-label="选择对话模型"
+              >
+                {modelOptions.length === 0 ? (
+                  <option value="">未配置 Chat 模型</option>
+                ) : (
+                  <>
+                    {selection ? null : <option value="">请选择模型</option>}
+                    {modelOptions.map((option) => {
+                      const key = `${option.providerId}::${option.model}`;
+                      return (
+                        <option key={key} value={key}>
+                          {option.providerName} · {option.model}
+                        </option>
+                      );
+                    })}
+                  </>
+                )}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-text-muted" />
+            </div>
+
+            {/* 撑杆：把发送按钮顶到右端 */}
+            <span className="min-w-0 flex-1" />
+
+            {isBusy ? (
+              <button
+                type="button"
+                onClick={handleStop}
+                className="shrink-0 rounded-md p-1.5 text-text-dark ring-1 ring-border-dark hover:ring-accent"
+                aria-label="停止生成"
+              >
+                <Square className="h-3.5 w-3.5" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void handleSend()}
+                disabled={!draft.trim()}
+                className="shrink-0 rounded-md bg-accent p-1.5 text-white disabled:opacity-40"
+                aria-label="发送"
+              >
+                {hydrated ? <Send className="h-3.5 w-3.5" /> : <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </aside>

@@ -6,6 +6,11 @@ export interface CanvasNodeImageProps extends ImgHTMLAttributes<HTMLImageElement
   viewerSourceUrl?: string | null;
   viewerImageList?: Array<string | null | undefined>;
   disableViewer?: boolean;
+  /**
+   * `src` 还没就绪时（例如正在等缩略图生成）显示骨架方块，
+   * 而不是渲染一张空 `src` 的破图。调用方负责在拿到地址后把 `src` 传进来。
+   */
+  placeholder?: boolean;
 }
 
 function normalizeViewerList(
@@ -32,8 +37,10 @@ export const CanvasNodeImage = memo(({
   viewerSourceUrl,
   viewerImageList,
   disableViewer = false,
+  placeholder = false,
   onDoubleClick,
   src,
+  className,
   ...props
 }: CanvasNodeImageProps) => {
   const openImageViewer = useCanvasStore((state) => state.openImageViewer);
@@ -58,10 +65,25 @@ export const CanvasNodeImage = memo(({
     openImageViewer(resolvedSource, normalizeViewerList(viewerImageList, resolvedSource));
   }, [disableViewer, onDoubleClick, openImageViewer, src, viewerImageList, viewerSourceUrl]);
 
+  if (placeholder && !src) {
+    // 骨架占位：缩略图还没生成好时**刻意不回落原图** —— 把原图递出去等于照样
+    // 解码一遍（一张 12MP 照片几十 MB），优化就白做了。
+    return (
+      <div
+        aria-hidden
+        data-canvas-image-placeholder="true"
+        className={`animate-pulse bg-white/[0.06] ${className ?? ''}`}
+      />
+    );
+  }
+
   return (
     <img
       {...props}
       src={src}
+      className={className}
+      // 异步解码：避免大图解码阻塞主线程绘制，缩放/拖动时更跟手。
+      decoding="async"
       // 禁用浏览器原生图片拖拽(幽灵图): 否则按住图片拖动会触发原生拖拽,
       // React Flow 收不到 mousedown 拖动, 节点就拖不动。统一 false 后
       // 整个节点(含图片区)左键按住即可拖动节点, 与文本节点一致。

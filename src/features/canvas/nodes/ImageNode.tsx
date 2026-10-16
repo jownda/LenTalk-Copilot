@@ -24,13 +24,13 @@ import {
 } from '@/features/canvas/application/imageNodeSizing';
 import {
   resolveImageDisplayUrl,
-  shouldUseOriginalImageByZoom,
 } from '@/features/canvas/application/imageData';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
 import { MediaDimensionsLabel, useHoverIntent, useImageDimensions, useMediaByteSize } from '@/features/canvas/ui/MediaDimensions';
+import { useCanvasImageSource } from '@/features/canvas/ui/useCanvasImageSource';
 import { useCanvasStore } from '@/stores/canvasStore';
 
 type ImageNodeProps = NodeProps & {
@@ -134,20 +134,16 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
     return t('node.imageNode.waitingResultDelayed', { minutes: waitedMinutes });
   }, [isExportResultNode, isGenerating, t, waitedMinutes]);
 
-  const imageSource = useMemo(() => {
-    const preferOriginal = shouldUseOriginalImageByZoom(zoom);
-    const picked = preferOriginal
-      ? data.imageUrl || data.previewImageUrl
-      : data.previewImageUrl || data.imageUrl;
-    return picked ? resolveImageDisplayUrl(picked) : null;
-  }, [data.imageUrl, data.previewImageUrl, zoom]);
+  // 显示走的图：小尺寸用落盘缩略图（重开项目同步命中），放大到阈值以上才读原图。
+  // 判定与请求统一收口在 useCanvasImageSource，别在这里再拼一遍优先级。
+  const imageSource = useCanvasImageSource(zoom, data.imageUrl, data.previewImageUrl);
 
   // 获取原图 URL 用于查看器
   const originalImageUrl = useMemo(() => {
     if (!data.imageUrl) return null;
     return resolveImageDisplayUrl(data.imageUrl);
   }, [data.imageUrl]);
-  const imageDimensions = useImageDimensions(originalImageUrl || imageSource);
+  const imageDimensions = useImageDimensions(originalImageUrl || imageSource.url);
   // 体积要按原始来源探测(asset:// 无法还原成本地路径), 因此这里传入未转换的 imageUrl。
   const mediaByteSize = useMediaByteSize(data.imageUrl);
   // 尺寸/体积标注改为悬停延迟显示, 避免常驻文字干扰画面。
@@ -185,7 +181,8 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
       >
         {data.imageUrl ? (
           <CanvasNodeImage
-            src={imageSource ?? ''}
+            src={imageSource.url ?? ''}
+            placeholder={imageSource.isPlaceholder}
             alt={isExportResultNode ? t('node.imageNode.resultAlt') : t('node.imageNode.generatedAlt')}
             viewerSourceUrl={originalImageUrl}
             className="h-full w-full object-contain"

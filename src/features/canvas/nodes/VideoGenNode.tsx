@@ -88,6 +88,7 @@ import { readLiveInputText } from "@/features/canvas/application/liveInputText";
 import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
 import { useCanvasStore } from "@/stores/canvasStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { registerNodeGenerationHandler } from "@/features/canvas/application/nodeGenerationRegistry";
 import { getFloatingPanelPosition, type FloatingPanelPosition } from "@/features/canvas/ui/floatingPanelPosition";
 import { isZzdhLipSyncModel } from "@/commands/zzdhApi";
 import {
@@ -1370,6 +1371,13 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     updateNodeSize,
     videoReferenceImages,
   ]);
+
+  // 把「生成」登记给 AI Agent：它按节点名触发时走的就是这个函数 ——
+  // 与用户亲手点按钮完全同一条路径，计费/取消/错误处理都不会被绕开。
+  useEffect(
+    () => registerNodeGenerationHandler(id, () => void handleGenerate()),
+    [id, handleGenerate],
+  );
 
   // 炳火高级字段: 仅当当前模型是炳火 API 时显示折叠面板。
   // 字段名固定 reference_videos(手册 3.3 红字强调: videos / video_urls 部分模型被忽略)。

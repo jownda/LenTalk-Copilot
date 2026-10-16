@@ -107,7 +107,47 @@ export function isLikelyLocalImagePath(imageUrl: string): boolean {
   return LOCAL_PATH_PREFIX_PATTERN.test(imageUrl);
 }
 
+/**
+ * `convertFileSrc` 结果缓存。
+ *
+ * 节点每次重渲染都会走一遍这个函数（缩放、选中、拖动、生成进度都在触发），而它要做
+ * 小写化、前缀判定、`file://` 的 URL 解析与路径解码 —— 全是重复劳动。缓存后同一路径
+ * 直接命中，一屏几十个节点的一次渲染只剩查表开销。
+ *
+ * 上界保护：一个项目里的媒体路径数量级是几百到几千，超过就按插入顺序淘汰最老的。
+ */
+const displayUrlCache = new Map<string, string>();
+const DISPLAY_URL_CACHE_LIMIT = 4000;
+
 export function resolveImageDisplayUrl(imageUrl: string): string {
+  if (!imageUrl) {
+    return imageUrl;
+  }
+
+  const cached = displayUrlCache.get(imageUrl);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const resolved = computeImageDisplayUrl(imageUrl);
+
+  if (displayUrlCache.size >= DISPLAY_URL_CACHE_LIMIT) {
+    const oldest = displayUrlCache.keys().next().value;
+    if (oldest !== undefined) {
+      displayUrlCache.delete(oldest);
+    }
+  }
+  displayUrlCache.set(imageUrl, resolved);
+
+  return resolved;
+}
+
+/** 测试与排查用：丢弃地址解析缓存。 */
+export function resetImageDisplayUrlCache(): void {
+  displayUrlCache.clear();
+}
+
+function computeImageDisplayUrl(imageUrl: string): string {
   const lower = imageUrl.toLowerCase();
   if (lower.startsWith('file://')) {
     if (!isTauri()) {

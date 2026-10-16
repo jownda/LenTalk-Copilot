@@ -7,6 +7,31 @@
 
 export type AgentRole = "system" | "user" | "assistant";
 
+/** 一次画布工具调用的落档记录，挂在 assistant 消息上供 UI 展示 */
+export interface AgentToolCallRecord {
+  /** 工具全名，如 canvas.create_node */
+  tool: string;
+  /** 中文短标签，如「创建节点」 */
+  label: string;
+  /** 模型给出的原始参数（节点用名称引用，不做 id 回译） */
+  arguments: Record<string, unknown>;
+  ok: boolean;
+  /** 结果说明；待确认时是「需要你确认后才会执行」这类提示 */
+  message: string;
+  /** 等待用户确认（会花钱或具破坏性的操作）。确认后由 UI 改写该记录 */
+  pending?: boolean;
+  /** 用户主动跳过 */
+  skipped?: boolean;
+  /** 工具返回的原始数据（含 nodeId 等），供 UI 关联后续结果 */
+  data?: unknown;
+  /**
+   * 生成完成后回填的媒体地址。
+   * ⚠️ **只存引用，不复制文件** —— 复制一份会平白多占一份磁盘，
+   * 而这些素材本来就在画布上，直接指向原地址即可。
+   */
+  mediaUrl?: string;
+}
+
 export interface AgentMessage {
   id: string;
   role: AgentRole;
@@ -18,12 +43,43 @@ export interface AgentMessage {
   error?: string;
   /** 该轮实际使用的模型，便于回看是哪次调用产生的 */
   modelLabel?: string;
+  /** 本轮 AI 对画布做过的操作（按执行顺序）。旧数据没有该字段，读取时按空数组处理 */
+  toolCalls?: AgentToolCallRecord[];
 }
 
 /** 会话使用的模型选择（指向 LenTalk「设置 → 自定义平台」里已配置的 Chat 模型） */
 export interface AgentModelSelection {
   providerId: string;
   model: string;
+}
+
+/**
+ * AI 对画布的权限档位。
+ * - `read-only`：只能读，改画布的要求会被拒绝并如实告知用户
+ * - `edit`：可读可编辑（含创建 / 连线），**删除仍需更高档位**
+ * - `full`：全量，含删除
+ *
+ * 定义在这里（而非 `canvasToolProtocol.ts`）是有意的：agentStore 也要用它，
+ * 而 protocol 会 import canvasStore，让 store 反向依赖整条画布链路会绕成环。
+ */
+export type CanvasAgentAccessLevel = "read-only" | "edit" | "full";
+
+export const DEFAULT_CANVAS_ACCESS_LEVEL: CanvasAgentAccessLevel = "edit";
+
+export const CANVAS_ACCESS_LABELS: Record<CanvasAgentAccessLevel, string> = {
+  "read-only": "只看画布",
+  edit: "可编辑画布",
+  full: "可编辑与删除",
+};
+
+export const CANVAS_ACCESS_HINTS: Record<CanvasAgentAccessLevel, string> = {
+  "read-only": "AI 只能读取画布内容；任何修改请求都会被告知没有权限。",
+  edit: "AI 可以读取节点、创建节点、改参数、移动与连线；删除动作会被拒绝。",
+  full: "AI 还可以删除节点。删除走画布历史，可用撤销回退。",
+};
+
+export function isCanvasAgentAccessLevel(value: unknown): value is CanvasAgentAccessLevel {
+  return value === "read-only" || value === "edit" || value === "full";
 }
 
 export interface AgentSession {
@@ -33,6 +89,11 @@ export interface AgentSession {
   projectId: string | null;
   messages: AgentMessage[];
   selection: AgentModelSelection | null;
+  /**
+   * 本会话已加载的 SKILL id；null = 未加载。
+   * 按会话隔离而不是全局：同一个模型上并跑「仙宫场景」和「不加载 SKILL」两条线时互不污染。
+   */
+  skillId: string | null;
   createdAt: number;
   updatedAt: number;
 }

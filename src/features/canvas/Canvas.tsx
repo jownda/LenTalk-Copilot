@@ -35,6 +35,7 @@ import { matchesBinding, useKeyboardShortcutStore } from "@/stores/keyboardShort
 import { canvasAiGateway, canvasEventBus } from "@/features/canvas/application/canvasServices";
 import { nodeCatalog } from "@/features/canvas/application/nodeCatalog";
 import { buildBatchConnections, resolveBatchAnchorCandidates } from "@/features/canvas/application/batchNodeConnection";
+import { MEDIA_PREFETCH_DEBOUNCE_MS, prefetchCanvasMedia } from "@/features/canvas/application/canvasMediaPrefetch";
 import {
   CANVAS_NODE_TYPES,
   type CanvasEdge,
@@ -1153,6 +1154,26 @@ export function Canvas() {
 
   const nodes = useCanvasStore((state) => state.nodes);
   const edges = useCanvasStore((state) => state.edges);
+
+  // 节点内容变化（打开项目、生成出新图、新增节点）后补一轮媒体预热。
+  // 拖动画布不在这里处理 —— 那个时机走 handleMoveEnd，否则这个依赖会变成每帧变化。
+  // 视口用 getState() 现取，避免为每次平移/缩放增加一次重渲染。
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const {
+        currentViewport: viewport,
+        canvasViewportSize: viewportSize,
+        nodes: currentNodes,
+      } = useCanvasStore.getState();
+      prefetchCanvasMedia({
+        nodes: currentNodes,
+        viewport,
+        containerWidth: viewportSize.width,
+        containerHeight: viewportSize.height,
+      });
+    }, MEDIA_PREFETCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [nodes]);
   const history = useCanvasStore((state) => state.history);
   const dragHistorySnapshot = useCanvasStore((state) => state.dragHistorySnapshot);
   const processingRevision = useCanvasStore((state) => state.processingRevision);
@@ -2315,6 +2336,16 @@ export function Canvas() {
     (_event: unknown, viewport: Viewport) => {
       invalidateNearbyConnectionHandleCache();
       setViewportState(viewport);
+      // 视口停下才预热：拖动期间一次计算都不做，不给平移加负担。
+      // 刻意放在 early return **之前** —— 用户拖到哪就该加载到哪，与项目是否已保存无关。
+      // 这里用 getState() 而不是订阅，避免为每次 handleMove 增加一次重渲染。
+      const { canvasViewportSize: viewportSize } = useCanvasStore.getState();
+      prefetchCanvasMedia({
+        nodes: useCanvasStore.getState().nodes,
+        viewport,
+        containerWidth: viewportSize.width,
+        containerHeight: viewportSize.height,
+      });
       const project = getCurrentProject();
       if (!project || isRestoringCanvasRef.current) {
         return;

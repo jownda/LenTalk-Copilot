@@ -29,7 +29,7 @@ import { graphImageResolver } from "@/features/canvas/application/canvasServices
 import { readLiveInputText } from "@/features/canvas/application/liveInputText";
 import { CURRENT_RUNTIME_SESSION_ID } from "@/features/canvas/application/generationErrorReport";
 import { isQuickGenerationRunActive } from "@/features/canvas/application/quickGenerationRunState";
-import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { useThumbnailFallback } from "@/features/canvas/ui/useCanvasImageSource";
 import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
 import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
@@ -162,6 +162,22 @@ async function persistQuickStudioSync(projectId: string, sync: CinematicStudioQu
   const saved = await persistProjectToDatabaseById(projectId, nextProject);
   if (!saved) persistProjectById(projectId, nextProject);
 }
+
+/**
+ * 上游 / 已选素材的小方块（36x36）。
+ *
+ * 原先是 `resolveImageDisplayUrl(...)` 直出原图：一张 12MP 照片解码要几十 MB 瞬时内存，
+ * 只为了画一个 36px 的方块；素材条上挂十几个就是几百 MB —— 这是提示词工作室节点卡顿的主因。
+ * 改走 256 缩略图，而素材选择器生成的就是同一尺寸，**磁盘与内存都直接命中**。
+ */
+const CinematicMediaThumb = memo(({ source, alt }: { source: string | null | undefined; alt: string }) => {
+  const image = useThumbnailFallback(source);
+  if (image.isPlaceholder) {
+    return <div className="h-full w-full animate-pulse bg-white/[0.06]" aria-hidden />;
+  }
+  return <img className="h-full w-full object-cover" src={image.url ?? ""} alt={alt} />;
+});
+CinematicMediaThumb.displayName = "CinematicMediaThumb";
 
 export const CinematicStudioNode = memo(({ id, data, selected, width, height }: CinematicStudioNodeProps) => {
   const { i18n } = useTranslation();
@@ -1252,9 +1268,8 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                     className="relative h-9 w-9 shrink-0 overflow-hidden rounded border border-accent/60 bg-black/30"
                     title={`上游图片：${fileLabel(source, `图片 ${index + 1}`)}`}
                   >
-                    <img
-                      className="h-full w-full object-cover"
-                      src={resolveImageDisplayUrl(source)}
+                    <CinematicMediaThumb
+                      source={source}
                       alt={`上游图片 ${index + 1}`}
                     />
                     <span className="absolute inset-x-0 bottom-0 bg-black/70 px-0.5 py-px text-center text-[8px] text-white">
@@ -1288,9 +1303,8 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                     className="group/asset relative h-9 w-9 shrink-0 overflow-hidden rounded border border-white/15 bg-black/30"
                     title={cinematicDisplayName(asset, cinematicAssetNames)}
                   >
-                    <img
-                      className="h-full w-full object-cover"
-                      src={resolveImageDisplayUrl(asset.previewImageUrl || asset.sourcePath)}
+                    <CinematicMediaThumb
+                      source={asset.previewImageUrl || asset.sourcePath}
                       alt={cinematicDisplayName(asset, cinematicAssetNames)}
                     />
                     <button
