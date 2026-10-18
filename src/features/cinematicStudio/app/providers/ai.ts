@@ -1783,13 +1783,21 @@ export async function generateFinalPrompt(sourcePrompt: string, locale: Locale, 
 /**
  * 画布「提示词工作室」极简模式的独立生成链路。
  * 不读取高级工作室项目，也不会触发分镜/导演层编译；输入仅来自节点本身。
+ *
+ * `formatId` = 节点上「提示词格式」的选择（见 `quickPromptFormats`），
+ * 决定 system 规则；缺省或查不到时回落默认格式。
  */
-export async function generateQuickPrompt(input: QuickPromptInput, locale: Locale, selectedSettings?: AISettings): Promise<string> {
+export async function generateQuickPrompt(
+  input: QuickPromptInput,
+  locale: Locale,
+  selectedSettings?: AISettings,
+  formatId?: string | null,
+): Promise<string> {
   const settings = selectedSettings ?? loadAISettings();
   if (!isRemoteConfigured(settings)) {
     throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key。");
   }
-  const request = buildQuickPromptRequest(input, locale);
+  const request = buildQuickPromptRequest(input, locale, formatId);
   return chatCompletionsTextRaw(settings, request.system, request.user);
 }
 

@@ -347,16 +347,18 @@ export interface CinematicStudioNodeData extends NodeDisplayData {
    */
   quickPromptLang?: "zh" | "en";
   /**
-   * 「生成并创建视频」的进行中标记(时间戳 + 运行时会话 id)。
+   * 「生成提示词」的进行中标记(时间戳 + 运行时会话 id)。
    * 画布开了 onlyRenderVisibleElements, 节点移出视口会被卸载、局部 state 丢失,
    * 按钮就会谎报空闲; 靠这两个字段把「生成中…」恢复回来, 并保证上一次运行的
    * 残留标记不会锁住按钮(会话 id 不匹配即视为已结束)。
    */
   quickGenerationStartedAt?: number | null;
   quickGenerationSessionId?: string | null;
-  /** 图片提示词优化区：与视频提示词工作流分开保存。 */
-  imagePromptDraft?: string;
-  imagePromptResult?: string;
+  /**
+   * 「生成提示词」按钮所用的提示词格式（见 `quickPromptFormats`）。
+   * 未设置时用默认格式（Seedance 2.5）—— 老节点没有这个字段，不能当成错误。
+   */
+  quickPromptFormat?: string;
   [key: string]: unknown;
 }
 

@@ -11,10 +11,22 @@ function isValidDimensions(width: number, height: number): boolean {
 }
 
 /** 读取媒体原始像素尺寸，不使用节点的 CSS 显示尺寸。 */
-export function useImageDimensions(source: string | null | undefined): MediaDimensions | null {
+export function useImageDimensions(
+  source: string | null | undefined,
+  /**
+   * 是否真的去探测。
+   *
+   * 🔴 探测靠 `new Image()` **把原图完整加载一遍**（一张 12MP 照片几十 MB），
+   * 而尺寸标注要悬停 1.5 秒才显示。画布上几十个图节点时，无条件的探测等于
+   * 开局就把所有原图各解码一次 —— 比缩略图优化省下来的还多。
+   * 传 `false` 时不做任何加载，且**保留上一次的结果**（再次悬停可立即显示）。
+   */
+  enabled = true,
+): MediaDimensions | null {
   const [dimensions, setDimensions] = useState<MediaDimensions | null>(null);
 
   useEffect(() => {
+    if (!enabled) return;
     setDimensions(null);
     const normalizedSource = source?.trim();
     if (!normalizedSource) {
@@ -39,7 +51,7 @@ export function useImageDimensions(source: string | null | undefined): MediaDime
       image.onload = null;
       image.onerror = null;
     };
-  }, [source]);
+  }, [enabled, source]);
 
   return dimensions;
 }
@@ -73,10 +85,15 @@ export function formatMediaByteSize(bytes: number | null | undefined): string | 
  * 远程地址由 Rust 侧探测, 绕过前端 fetch 的 CORS 限制; 取不到时返回 null,
  * 由调用方决定只显示尺寸还是完全不显示。
  */
-export function useMediaByteSize(source: string | null | undefined): number | null {
+export function useMediaByteSize(
+  source: string | null | undefined,
+  /** 同 `useImageDimensions`：标注要悬停才显示，别在挂载时给每个节点都发一次 IPC。 */
+  enabled = true,
+): number | null {
   const [bytes, setBytes] = useState<number | null>(null);
 
   useEffect(() => {
+    if (!enabled) return;
     setBytes(null);
     const normalizedSource = source?.trim();
     if (!normalizedSource || !isTauri()) {
@@ -97,7 +114,7 @@ export function useMediaByteSize(source: string | null | undefined): number | nu
     return () => {
       disposed = true;
     };
-  }, [source]);
+  }, [enabled, source]);
 
   return bytes;
 }

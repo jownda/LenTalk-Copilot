@@ -11,7 +11,6 @@ import {
   Handle,
   Position,
   useUpdateNodeInternals,
-  useViewport,
   type NodeProps,
 } from '@xyflow/react';
 import { Download, FolderOpen, ImagePlus, SlidersHorizontal, SquareArrowOutUpRight } from 'lucide-react';
@@ -49,7 +48,7 @@ import {
   reduceAspectRatio,
   resolveImageDisplayUrl,
 } from '@/features/canvas/application/imageData';
-import { useCanvasImageSource } from '@/features/canvas/ui/useCanvasImageSource';
+import { useCanvasImageSourceAuto } from '@/features/canvas/ui/useCanvasImageSource';
 import { UiButton, UiCheckbox, UiChipButton, UiInput, UiPanel, UiSelect } from '@/components/ui';
 import {
   NODE_CONTROL_CHIP_CLASS,
@@ -310,7 +309,6 @@ const FrameCard = memo(
     onEditFrame,
   }: FrameCardProps) => {
     const updateStoryboardFrame = useCanvasStore((state) => state.updateStoryboardFrame);
-    const { zoom } = useViewport();
     const [noteDraft, setNoteDraft] = useState(frame.note);
     const noteDraftRef = useRef(noteDraft);
     const noteCommitTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
@@ -344,7 +342,9 @@ const FrameCard = memo(
 
     useEffect(() => () => flushNoteCommit(), [flushNoteCommit]);
 
-    const imageSource = useCanvasImageSource(zoom, frame.imageUrl, frame.previewImageUrl);
+    // ⚠️ 每个分镜格各自订阅 zoom 的话，一个分镜节点就是 6~12 份视口订阅，
+    // 平移画布时全部重渲染。`...Auto` 只订阅「是否跨过原图阈值」这一个布尔。
+    const imageSource = useCanvasImageSourceAuto(frame.imageUrl, frame.previewImageUrl);
     const viewerSource = useMemo(() => {
       const picked = frame.imageUrl || frame.previewImageUrl;
       return picked ? resolveImageDisplayUrl(picked) : null;

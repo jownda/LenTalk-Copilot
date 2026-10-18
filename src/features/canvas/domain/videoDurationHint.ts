@@ -3,7 +3,7 @@ import type { VideoModelDefinition } from '@/features/canvas/models';
 /**
  * 从文案里识别「明确写出的视频时长」，并落到目标模型允许的档位上。
  *
- * 背景：点「生成并创建视频」时，下游 AI 视频节点的时长默认沿用「上次使用」的
+ * 背景：点「生成提示词」时，下游 AI 视频节点的时长默认沿用「上次使用」的
  * 值（`settings.lastVideoDuration`，在 nodeRegistry 的 `createDefaultData` 里赋值）。
  * 但文案里已经写明秒数时（例如故事梗概写「时长10秒」，或扒剧本里每场开头的
  * 「总时长：15秒」），用户显然期望节点直接用这个秒数，而不是去翻「上次用了多少秒」。

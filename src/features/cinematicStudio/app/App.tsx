@@ -218,7 +218,6 @@ export default function App({
   const initialProjectRef = useRef(project);
   const appliedQuickSyncSignature = useRef(quickSync ? JSON.stringify(quickSync) : "");
   const resumeJobRef = useRef<ResumeJob | null>(null);
-  const [projectCodeDraft, setProjectCodeDraft] = useState(() => project.projectCode ?? "");
   const scene = project.scenes.find((item) => item.id === sceneId) ?? project.scenes[0];
   const shot = scene.shots.find((item) => item.id === shotId) ?? scene.shots[0];
   const t: CopyZh = copy[locale] as CopyZh;
@@ -416,9 +415,6 @@ export default function App({
   useEffect(() => {
     localStorage.setItem("cineprompt-locale", locale);
   }, [locale]);
-  useEffect(() => {
-    setProjectCodeDraft(project.projectCode ?? "");
-  }, [project.projectCode]);
   /** LenTalk Chat 配置变更、或资产卡内切换了填写模型时，同步刷新工作室选中的模型（地址/Key 同源） */
   useEffect(() => {
     setAiSettings(loadAISettings());
@@ -439,16 +435,6 @@ export default function App({
   };
   const selectReasoningEffort = (value: ReasoningEffort) => {
     setAiSettings(saveAISettings({ ...aiSettings, reasoningEffort: value }));
-  };
-  const commitProjectCode = () => {
-    const nextCode = projectCodeDraft.trim();
-    if (!nextCode) {
-      setProjectCodeDraft(project.projectCode ?? "");
-      return;
-    }
-    if (nextCode !== project.projectCode) {
-      dispatch({ type: "PATCH_PROJECT", patch: { projectCode: nextCode } });
-    }
   };
   /** 节点嵌入：把工程标题与提示词摘要回传给宿主节点（防抖 400ms，避免逐键同步） */
   useEffect(() => {
@@ -1332,18 +1318,9 @@ export default function App({
                 <ArrowLeft size={15} /> {locale === "zh" ? "返回画布" : "Back to canvas"}
               </button>
             )}
-            <label className="asset-project-code">
-              {t.projectCode}
-              <input
-                value={projectCodeDraft}
-                placeholder={t.projectCodePlaceholder}
-                onChange={(event) => setProjectCodeDraft(event.target.value)}
-                onBlur={commitProjectCode}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") event.currentTarget.blur();
-                }}
-              />
-            </label>
+            {/* 「项目码」输入框已移除：引用名不再带项目码（见 engine/asset-naming.ts），
+                这个字段改了不会再影响任何东西，留着只会让人以为它还有用。
+                数据字段本身保留，旧存档照常读。 */}
             <div className="locale-switch" aria-label="Language">
               <button className={locale === "zh" ? "active" : ""} onClick={() => setLocale("zh")}>
                 中

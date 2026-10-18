@@ -1,5 +1,8 @@
 import type { Locale } from "../i18n";
 import { renderVoiceReferenceSentence } from "@/features/canvas/domain/voiceReferenceFormat";
+import { assetToken } from "@/features/cinematicStudio/engine/asset-naming";
+
+import { findQuickPromptFormat } from "./quickPromptFormats";
 
 /** 轻量模式中被明确选中的素材；图片序号与最终提示词的 [imageN] 一一对应。 */
 export interface QuickPromptAsset {
@@ -61,7 +64,68 @@ export interface QuickPromptInput {
 
 type AssetBlockKind = "scene" | "character" | "prop";
 
-function renderAsset(asset: QuickPromptAsset, kind: AssetBlockKind): string {
+/**
+ * `@` 引用名对照表。
+ *
+ * 轻量链路刻意用**资产名**当引用标识（`@林小雨`），不用高级工作台那种
+ * `char_linxiaoyu` —— 名字对视频模型有语义，tag 只是个陌生 token。
+ * 但名字直接拿来用有两个必须修的问题：
+ *
+ * 1. **重名**：两个角色都叫「妈妈」时 `@妈妈` 指代不明，模型会把她们当同一人、
+ *    甚至对上同一张参考图。后来者加 `-2` 后缀区分。
+ * 2. **空格与标点**：`@林 小雨` 会被拆成两个 token（`@` 引用就断了）。
+ *    统一走 `assetToken` 规整（空格转连字符、去标点），与资产引用名同一套字符规则。
+ *
+ * 🔴 后缀用 `-2` 而不是 ` #2`：`#` 后面跟空格会把引用重新拆开。
+ * 🔴 **整篇必须共用一份对照表** —— 各段各生成一次的话，同一个角色在
+ *    ACTIVE REFERENCES 里叫 `@林小雨`、在站位里叫 `@林小雨-2`，模型就当成两个人了。
+ */
+interface QuickAssetRefNames {
+  byId: Map<string, string>;
+  byOriginalName: Map<string, string>;
+}
+
+function buildQuickAssetRefNames(assets: QuickPromptAsset[]): QuickAssetRefNames {
+  const byId = new Map<string, string>();
+  const byOriginalName = new Map<string, string>();
+  const usedCounts = new Map<string, number>();
+
+  for (const asset of assets) {
+    // 同一资产会在多个块里重复出现（场景 / 角色 / 道具），只分配一次。
+    if (byId.has(asset.id)) continue;
+
+    const original = (asset.name ?? "").trim();
+    const base = assetToken(original, "") || assetToken(asset.id, asset.id);
+    const count = (usedCounts.get(base) ?? 0) + 1;
+    usedCounts.set(base, count);
+    const refName = count === 1 ? base : `${base}-${count}`;
+
+    byId.set(asset.id, refName);
+    // 站位 / 角色表演母版只有名字没有 id，靠原名反查同一份结果。
+    if (original && !byOriginalName.has(original)) byOriginalName.set(original, refName);
+  }
+
+  return { byId, byOriginalName };
+}
+
+/** 资产（有 id）的引用名。 */
+function refNameOfAsset(refs: QuickAssetRefNames, asset: QuickPromptAsset): string {
+  return refs.byId.get(asset.id) ?? (assetToken(asset.name ?? "", "") || asset.id);
+}
+
+/** 只有名字的地方（站位地点、角色顺序、表演母版）：查不到就按同一套规则规整。 */
+function refNameOfText(refs: QuickAssetRefNames, name: string): string {
+  const trimmed = (name ?? "").trim();
+  const hit = refs.byOriginalName.get(trimmed);
+  if (hit) return hit;
+  return assetToken(trimmed, "") || trimmed;
+}
+
+function renderAsset(
+  asset: QuickPromptAsset,
+  kind: AssetBlockKind,
+  refs: QuickAssetRefNames,
+): string {
   const mediaType = asset.mediaType ?? "image";
   const reference = asset.referenceIndex
     ? mediaType === "audio"
@@ -71,7 +135,7 @@ function renderAsset(asset: QuickPromptAsset, kind: AssetBlockKind): string {
       ? " [video input]"
       : "";
   const description = asset.description?.trim() ? ` — ${asset.description.trim()}` : "";
-  return `@${asset.name}${reference} (${kind} ${mediaType})${description}`;
+  return `@${refNameOfAsset(refs, asset)}${reference} (${kind} ${mediaType})${description}`;
 }
 
 /**
@@ -82,27 +146,36 @@ function renderAsset(asset: QuickPromptAsset, kind: AssetBlockKind): string {
  *
  * 音频序号缺失（素材没有可上传的源文件）时给不出标记，退化成只有角色名的说明。
  */
-function renderCharacterVoiceReference(asset: QuickPromptAsset, locale: Locale): string {
+function renderCharacterVoiceReference(
+  asset: QuickPromptAsset,
+  locale: Locale,
+  refs: QuickAssetRefNames,
+): string {
   const description = asset.description?.trim() ? ` — ${asset.description.trim()}` : "";
+  const referenceName = refNameOfAsset(refs, asset);
   const audioIndex = asset.referenceIndex;
-  if (!audioIndex) return `@${asset.name} (character audio)${description}`;
+  if (!audioIndex) return `@${referenceName} (character audio)${description}`;
   const sentence = renderVoiceReferenceSentence(
-    { audioIndex, characterName: asset.name },
+    { audioIndex, characterName: referenceName },
     locale === "zh" ? "zh" : "en",
   );
   return `${sentence}${description}`;
 }
 
 /** 场景站位：只输出有内容的行，避免空标题干扰模型。 */
-function renderStaging(staging: QuickPromptStaging): string[] {
+function renderStaging(staging: QuickPromptStaging, refs: QuickAssetRefNames): string[] {
   const lines: string[] = [];
   if (staging.locationName) {
     const description = staging.locationDescription?.trim();
-    lines.push(`LOCATION (场景站位地点): @${staging.locationName}${description ? ` — ${description}` : ""}`);
+    lines.push(
+      `LOCATION (场景站位地点): @${refNameOfText(refs, staging.locationName)}${description ? ` — ${description}` : ""}`,
+    );
   }
   if (staging.anchorDescription?.trim()) lines.push(`SPATIAL ANCHOR (空间锚点): ${staging.anchorDescription.trim()}`);
   if (staging.characterOrderNames?.length) {
-    lines.push(`CHARACTER ORDER (左到右站位): ${staging.characterOrderNames.map((name) => `@${name}`).join(", ")}`);
+    lines.push(
+      `CHARACTER ORDER (左到右站位): ${staging.characterOrderNames.map((name) => `@${refNameOfText(refs, name)}`).join(", ")}`,
+    );
   }
   const spatial: string[] = [];
   if (staging.spacing?.trim()) spatial.push(`spacing: ${staging.spacing.trim()}`);
@@ -112,7 +185,11 @@ function renderStaging(staging: QuickPromptStaging): string[] {
   return lines;
 }
 
-function renderCharacterProfiles(profiles: QuickPromptCharacterProfile[], propByName: Map<string, string>): string[] {
+function renderCharacterProfiles(
+  profiles: QuickPromptCharacterProfile[],
+  propByName: Map<string, string>,
+  refs: QuickAssetRefNames,
+): string[] {
   const lines: string[] = [];
   for (const profile of profiles) {
     const acting = profile.actingMaster?.trim();
@@ -121,10 +198,14 @@ function renderCharacterProfiles(profiles: QuickPromptCharacterProfile[], propBy
       .map((id) => propByName.get(id))
       .filter((name): name is string => Boolean(name));
     if (!acting && !voice && props.length === 0) continue;
-    lines.push(`@${profile.name}`);
+    lines.push(`@${refNameOfText(refs, profile.name)}`);
     if (acting) lines.push(`  ACTING MASTER (表演母版): ${acting}`);
     if (voice) lines.push(`  VOICE LOCK (声音锁，仅当该角色开口时逐字使用): ${voice}`);
-    if (props.length) lines.push(`  ATTACHED PROPS (随身道具): ${props.map((name) => `@${name}`).join(", ")}`);
+    if (props.length) {
+      lines.push(
+        `  ATTACHED PROPS (随身道具): ${props.map((name) => `@${refNameOfText(refs, name)}`).join(", ")}`,
+      );
+    }
   }
   return lines;
 }
@@ -137,7 +218,14 @@ function renderCharacterProfiles(profiles: QuickPromptCharacterProfile[], propBy
  * 规则内置自 CINEDANCE V4 与 ACTING SYSTEM：轻量模式沿用其最终成片提示词、
  * 镜头控制与表演执行规范，不依赖外部 Skill 文件在运行时存在。
  */
-export function buildQuickPromptRequest(input: QuickPromptInput, locale: Locale): { system: string; user: string } {
+export function buildQuickPromptRequest(
+  input: QuickPromptInput,
+  locale: Locale,
+  formatId?: string | null,
+): { system: string; user: string } {
+  // 格式决定 system 规则与 user 首行。查不到就回落默认（Seedance）——
+  // 老节点没有该字段、或某个格式以后被删掉，都不该让生成中断。
+  const format = findQuickPromptFormat(formatId);
   const outputLanguage = locale === "zh" ? "clear, cinematic Chinese" : "clear cinematic English";
   const props = input.props ?? [];
   const allReferenceAssets = [
@@ -145,25 +233,28 @@ export function buildQuickPromptRequest(input: QuickPromptInput, locale: Locale)
     ...input.characterAssets.map((asset) => ({ asset, kind: "character" as const })),
     ...props.map((asset) => ({ asset, kind: "prop" as const })),
   ];
+  // 引用名对照表：整篇共用一份（重名加后缀、空格标点规整），否则同一个角色
+  // 在不同段落里名字不同，模型会当成两个人。
+  const refs = buildQuickAssetRefNames(allReferenceAssets.map(({ asset }) => asset));
   // ACTIVE REFERENCES is the visual-reference block. Audio references are voice locks:
   // keeping them separate prevents the video model from treating a voice clip as an image.
   const references = allReferenceAssets
     .filter(({ asset }) => asset.mediaType !== "audio")
-    .map(({ asset, kind }) => renderAsset(asset, kind));
+    .map(({ asset, kind }) => renderAsset(asset, kind, refs));
   // 角色声线走绑定句（成品里要出现的那句话）；场景 / 道具音频（环境音、音效）保持
   // 原来的标记写法 —— 它们不是任何人的声线，不该被写成「唯一人声参考」。
   const voiceReferences = allReferenceAssets
     .filter(({ asset }) => asset.mediaType === "audio")
     .map(({ asset, kind }) => (kind === "character"
-      ? renderCharacterVoiceReference(asset, locale)
-      : renderAsset(asset, kind)));
+      ? renderCharacterVoiceReference(asset, locale, refs)
+      : renderAsset(asset, kind, refs)));
   const visualProps = props.filter((asset) => asset.mediaType !== "audio");
   const propByName = new Map(props.map((prop) => [prop.id, prop.name]));
-  const stagingLines = input.staging ? renderStaging(input.staging) : [];
-  const profileLines = renderCharacterProfiles(input.characterProfiles ?? [], propByName);
+  const stagingLines = input.staging ? renderStaging(input.staging, refs) : [];
+  const profileLines = renderCharacterProfiles(input.characterProfiles ?? [], propByName, refs);
 
   const userBlocks: string[] = [
-    "Create one final Seedance/Higgsfield video prompt from this minimal brief.",
+    format.userLead,
     "",
     "STYLE:",
     input.style.trim(),
@@ -197,7 +288,7 @@ export function buildQuickPromptRequest(input: QuickPromptInput, locale: Locale)
     userBlocks.push(
       "",
       "PROP ASSETS (道具；只在该道具被故事梗概用到时才写进提示词):",
-      visualProps.map((prop) => renderAsset(prop, "prop")).join("\n"),
+      visualProps.map((prop) => renderAsset(prop, "prop", refs)).join("\n"),
     );
   }
 
@@ -207,26 +298,7 @@ export function buildQuickPromptRequest(input: QuickPromptInput, locale: Locale)
   );
 
   return {
-    system: [
-      "You are CINEDANCE V4, an elite AI film prompt director for Seedance 2.0 and Higgsfield Seedance, combined with the ACTING SYSTEM performance director.",
-      "Turn the supplied style, story synopsis, scene assets, and character assets into one production-ready video-generation prompt. Return the final prompt only: no analysis, preface, markdown fence, QA report, or explanation.",
-      `Write in ${outputLanguage}. Use direct, concrete, camera-readable and measurable language instead of abstract, poetic, or decorative prose. Keep @asset tags and [imageN]/[audioN] tokens unchanged.`,
-      "Silently follow CINEDANCE's D1-D4 method: deconstruct only this current shot or sequence; diagnose reference, first-frame, spatial, optics, physics, lighting, dialogue and continuity risks; develop locks in their required priority; then deliver only the corrected final prompt. Never expose this method or its QA.",
-      "Treat the final prompt as a sealed current-shot document. Remove scene numbers, script headers, prior-scene summaries, stale tags, unused people, unused props, and phrases such as previous, continues, same as before, or as above. Never invent unselected characters, assets, plot events, dialogue, or reference tags.",
-      "Put spatial facts before aesthetic prose. State first-frame occupancy, screen-left/right placement, body orientation, gaze direction, landmark proximity, distance and required hand/prop states whenever the brief makes them relevant. Required subjects must be visible in the first frame; use a short positive lock and a local no-failure lock only when it prevents a specific risk.",
-      "Select optics and camera only from story needs. State the camera side, framing, lens outcome, movement, trigger, stop point and response to action when relevant. Keep multi-shot continuity stable and include a cut only when the story supplies a reason. Preserve physical cause and effect, contact, weight, momentum, materials, weather and light direction; never allow floaty motion, arbitrary coverage or flat front light.",
-      "Build ACTION TIMING as physically achievable chronological time blocks when a duration or sequence is supplied. Each block describes one visible event with subject position, action, camera response, critical prop state, physics and audio where relevant. Dialogue contains only supplied quoted lines: no ad-libs, narration, subtitles, captions or unrequested offscreen voices.",
-      // FORMAT MODE 只承载「怎么组织这次生成」。画幅比例 / 时长（秒数）/ 帧率是生成时在
-      // 视频节点上选的平台参数，写进提示词正文只会与节点设置打架，因此整段禁止出现。
-      "Keep FORMAT MODE to generation organization only: whether this is a single generation or a multi-segment generation, how many segments there are, and the order and physical character of the connections between them. FORMAT MODE must never state an aspect ratio (for example 16:9, 9:16 or 1:1), a resolution, a duration, a second count or a timecode, or a frame rate (for example 24fps): those are platform parameters chosen when the video is generated, not prompt content. Never restate action, performance, dialogue, sound, lighting, optics or camera execution there either.",
-      "SCENE STAGING, CHARACTER PROFILES, and PROP ASSETS are planning context, never output text. Reference them strictly by the story synopsis: bring in a roster character only when the synopsis events actually involve them; keep a character out when the synopsis never places them on screen; use a prop only when the synopsis implies it is visible, carried, or used; apply the spatial anchor, left-to-right order, spacing, and axis to the blocking you write. Visual @asset tags and [imageN] tokens come only from ACTIVE REFERENCES. Audio @asset tags and [audioN] tokens come only from VOICE LOCK REFERENCES, and must be used only in AUDIO for a character who actually speaks.",
-      "An ACTING MASTER is an AI-only identity and behavioural baseline for one character: use it to understand who the character is, then write that character's performance for this story moment. Never paste, quote, paraphrase line by line, or expose it as a section, and never output a CHARACTER ACTING heading.",
-      "A VOICE LOCK is a per-character vocal formula. Paste it verbatim into AUDIO only for a character who actually speaks a line in the synopsis; omit it for a character who stays silent, and never invent a voice lock for a character who has none.",
-      "Character voice references follow one fixed binding sentence, copied verbatim from VOICE LOCK REFERENCES into AUDIO: `使用 @音频N 作为 @角色 的唯一人声参考。` (English output: `Use @音频N as the only voice reference for @角色.`). Keep the @音频N token and the @角色 tag exactly as supplied. Never emit [audioN], @audioN, a bare 声音参考 / voice reference label, or more than one binding for the same character, and never write an audio token outside AUDIO.",
-      "For every active character, follow ACTING SYSTEM: write behavior under immediate pressure, never emotion labels. Give a playable objective directed at a partner, a concrete obstacle or stake, changing action-verb tactics, and two to four visible beats when scene duration supports them. Show thought before words, listening/reaction before a reply, assessment pauses, purposeful physical business, motivated changes in distance and status through the body. Preserve subtext through behavior, not explanation.",
-      "Make performance observable: use gaze targets, natural micro-saccades, state-appropriate blinks and live catchlights; eyes lead the thought. Tie posture, center of gravity, breath, tempo, physical habits and speech rhythm to the scene pressure. Use stable playable states rather than vague transition chains. Ensemble reactions must travel in staggered waves, never synchronized; do not put wardrobe, camera, color or generic emotion labels inside performance instructions.",
-      "Keep every @asset tag and every [imageN] or [audioN] token exactly as received. A [video input] is an upstream video reference: use it as scene context without inventing a new asset token. Visual reference descriptions belong in ACTIVE REFERENCES; voice reference descriptions belong in VOICE LOCK REFERENCES and must not be moved into ACTIVE REFERENCES. Do not contradict or rename them. Before returning, silently verify active references, voice locks, first frame, spatial logic, gaze, camera side, optics, lighting, physics, timing, dialogue hygiene, continuity, prompt density and acting specificity; fix every failure before output.",
-    ].join(" "),
+    system: format.buildSystem({ outputLanguage, locale }),
     user: userBlocks.join("\n"),
   };
 }

@@ -33,6 +33,14 @@ export interface CanvasImagePick {
 
 export interface PickCanvasImageSourceParams {
   zoom: number;
+  /**
+   * 直接给出「是否该用原图」，跳过对 zoom 的阈值判断。
+   *
+   * 给调用方一个省重渲染的入口：节点若为了这一条判断去订阅整个视口（zoom + x + y），
+   * **平移画布**时就会连带重渲染所有带图的节点。改为订阅
+   * `transform[2] >= 阈值` 这个**布尔**后，平移完全不触发、缩放也只在跨界那一下触发。
+   */
+  useOriginal?: boolean;
   imageUrl?: string | null;
   previewImageUrl?: string | null;
   /**
@@ -46,6 +54,7 @@ const NONE: CanvasImagePick = { kind: 'none', url: null, thumbnailSource: null }
 
 export function pickCanvasImageSource({
   zoom,
+  useOriginal,
   imageUrl,
   previewImageUrl,
   allowThumbnail = true,
@@ -54,7 +63,8 @@ export function pickCanvasImageSource({
   const preview = (previewImageUrl ?? '').trim();
 
   // 关掉缩略图、或放大到阈值以上（用户主动要看细节）→ 给最清晰的可用源。
-  if (!allowThumbnail || shouldUseOriginalImageByZoom(zoom)) {
+  const shouldOriginal = useOriginal ?? shouldUseOriginalImageByZoom(zoom);
+  if (!allowThumbnail || shouldOriginal) {
     const picked = original || preview;
     return picked
       ? { kind: 'original', url: resolveImageDisplayUrl(picked), thumbnailSource: null }

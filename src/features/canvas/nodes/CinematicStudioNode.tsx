@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Handle, Position, useUpdateNodeInternals, type NodeProps } from "@xyflow/react";
 import {
   AudioLines,
+  Check,
   ChevronDown,
   Clapperboard,
   LoaderCircle,
@@ -37,7 +38,6 @@ import {
   QuickAssetPicker,
   type QuickAssetPickerItem,
 } from "@/features/canvas/ui/QuickAssetPicker";
-import { ImagePromptOptimizerPanel } from "@/features/canvas/nodes/ImagePromptOptimizerPanel";
 import {
   cinematicAssetDescription,
   cinematicAssetIdFromMirrorId,
@@ -53,6 +53,10 @@ import type { CanvasImageSource } from "@/features/cinematicStudio/app/component
 import type { Locale } from "@/features/cinematicStudio/app/i18n";
 import { generateQuickPrompt } from "@/features/cinematicStudio/app/providers/ai";
 import type { QuickPromptAsset } from "@/features/cinematicStudio/app/providers/quickPromptAgent";
+import {
+  QUICK_PROMPT_FORMATS,
+  findQuickPromptFormat,
+} from "@/features/cinematicStudio/app/providers/quickPromptFormats";
 import {
   listLenTalkChatModels,
   loadAISettings,
@@ -87,11 +91,8 @@ type CinematicStudioNodeProps = NodeProps & {
 };
 
 const CINEMATIC_STUDIO_NODE_MIN_WIDTH = 400;
-// 风格/质量与故事梗概的输入框固定为 h-24；AI 图片提示词展开时需要额外空间，
-// 折叠后则允许外框收缩，避免内容已经隐藏但节点仍保留原来的 700px 高度。
+// 风格/质量与故事梗概的输入框固定为 h-24，外框按内容高度收敛。
 const CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT = 520;
-const CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT = 700;
-const IMAGE_PROMPT_PANEL_HEIGHT_DELTA = 180;
 const QUICK_INPUT_HANDLES = {
   style: "quick-style-input",
   synopsis: "quick-synopsis-input",
@@ -183,7 +184,6 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const { i18n } = useTranslation();
   const updateNodeInternals = useUpdateNodeInternals();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
-  const updateNodeSize = useCanvasStore((state) => state.updateNodeSize);
   const { nodes, edges } = useCanvasInputGraph();
   const addEdge = useCanvasStore((state) => state.addEdge);
   const addNode = useCanvasStore((state) => state.addNode);
@@ -222,10 +222,9 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const [quickError, setQuickError] = useState("");
   const [activeAssetPicker, setActiveAssetPicker] = useState<QuickAssetPickerKind | null>(null);
   const [isChatModelPickerOpen, setIsChatModelPickerOpen] = useState(false);
+  const [isPromptFormatPickerOpen, setIsPromptFormatPickerOpen] = useState(false);
   const [activeChatProviderId, setActiveChatProviderId] = useState("");
   const [cinematicDatabaseAssetNames, setCinematicDatabaseAssetNames] = useState<Map<string, string>>(() => new Map());
-  const [isImagePromptOpen, setIsImagePromptOpen] = useState(false);
-  const expandedHeightRef = useRef(CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT);
 
   /**
    * 资产名称权威来源：素材库镜像条目（工程资产名的实时投影）→ DB 共享资产库（兜底）。
@@ -291,36 +290,13 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
 
   const resolvedWidth = typeof width === "number" && width > 1 ? Math.round(width) : CINEMATIC_STUDIO_NODE_MIN_WIDTH;
   const resolvedHeight = Math.max(
-    isImagePromptOpen ? CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT : CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT,
+    CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT,
     typeof height === "number" && height > 1 ? Math.round(height) : CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT,
   );
   const currentHeightRef = useRef(resolvedHeight);
   const currentWidthRef = useRef(resolvedWidth);
   currentHeightRef.current = resolvedHeight;
   currentWidthRef.current = resolvedWidth;
-
-  const handleImagePromptOpenChange = useCallback(
-    (nextOpen: boolean) => {
-      setIsImagePromptOpen(nextOpen);
-      const currentHeight = currentHeightRef.current;
-      if (nextOpen) {
-        const nextHeight = Math.max(CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT, expandedHeightRef.current);
-        updateNodeSize(id, currentWidthRef.current, nextHeight);
-        return;
-      }
-
-      expandedHeightRef.current = Math.max(CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT, currentHeight);
-      updateNodeSize(
-        id,
-        currentWidthRef.current,
-        Math.max(
-          CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT,
-          expandedHeightRef.current - IMAGE_PROMPT_PANEL_HEIGHT_DELTA,
-        ),
-      );
-    },
-    [id, updateNodeSize],
-  );
 
   const displayName = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.cinematicStudio, data), [data]);
 
@@ -350,17 +326,19 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
 
   /** 点击节点外/画布空白或按 Escape 时，所有轻量选择卡片自动收起。 */
   useEffect(() => {
-    if (!activeAssetPicker && !isChatModelPickerOpen) return;
+    if (!activeAssetPicker && !isChatModelPickerOpen && !isPromptFormatPickerOpen) return;
     const closePickers = (event: PointerEvent) => {
       const target = event.target instanceof Element ? event.target : null;
       if (target?.closest("[data-quick-popover]")) return;
       setActiveAssetPicker(null);
       setIsChatModelPickerOpen(false);
+      setIsPromptFormatPickerOpen(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setActiveAssetPicker(null);
       setIsChatModelPickerOpen(false);
+      setIsPromptFormatPickerOpen(false);
     };
     document.addEventListener("pointerdown", closePickers, true);
     window.addEventListener("keydown", closeOnEscape);
@@ -368,7 +346,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       document.removeEventListener("pointerdown", closePickers, true);
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [activeAssetPicker, isChatModelPickerOpen]);
+  }, [activeAssetPicker, isChatModelPickerOpen, isPromptFormatPickerOpen]);
 
   const canvasAudioSources = useMemo(() => {
     const connectedSources = graphImageResolver.collectInputAudio(id, nodes, edges);
@@ -610,6 +588,15 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const storedQuickPromptLang: Locale | undefined =
     data.quickPromptLang === "en" || data.quickPromptLang === "zh" ? data.quickPromptLang : undefined;
   const quickPromptLang: Locale = storedQuickPromptLang ?? canvasLocale;
+  // 提示词格式：老节点没有该字段，统一回落默认格式（Seedance 2.5）
+  const quickPromptFormat = useMemo(
+    () =>
+      findQuickPromptFormat(
+        typeof data.quickPromptFormat === "string" ? data.quickPromptFormat : undefined,
+      ),
+    [data.quickPromptFormat],
+  );
+  const quickPromptFormatId = quickPromptFormat.id;
   const handleQuickPromptLangChange = useCallback(
     (lang: Locale) => {
       updateNodeData(id, { quickPromptLang: lang });
@@ -1018,6 +1005,8 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           },
           quickPromptLang,
           selectedSettings,
+          // 节点上选的提示词格式决定用哪套规则生成
+          quickPromptFormatId,
         );
         // 人物音频引用统一成人可读的规范句：`使用 @音频N 作为 @角色 的唯一人声参考。`
         // @音频N 同时是画布的规范标记（视频节点「引用」按钮插入的就是它），
@@ -1071,6 +1060,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       quickChatProvider,
       quickGenerating,
       quickPromptAssets,
+      quickPromptFormatId,
       quickPromptLang,
       quickStaging,
       resolveQuickInputs,
@@ -1104,23 +1094,30 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         titleText={nodeTitle}
         editable
         onTitleChange={(value) => updateNodeData(id, { displayName: value })}
-        rightSlot={
-          <button
-            type="button"
-            className="nodrag flex items-center gap-1 rounded border border-[rgba(255,255,255,0.14)] px-1.5 py-1 text-[10px] text-text-muted transition-colors hover:border-accent hover:text-text"
-            onClick={handleOpen}
-            title="进入完整高级工作台"
-          >
-            <Settings2 className="h-3 w-3" /> 高级编辑
-          </button>
-        }
       />
 
+      {/* 「高级编辑」在**框内**右上角：浮动标题在框外上方（-top-7），
+          这块 mt-7 的空白正是给它让出来的，按钮落在这里既不压标题也不压内容。
+          以前它挂在标题栏的 rightSlot 上 —— 那是框外，和节点不再是一个视觉整体。 */}
+      <button
+        type="button"
+        className="nodrag absolute right-2 top-1 z-10 flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-text-muted transition-colors hover:bg-white/5 hover:text-text"
+        onClick={handleOpen}
+        title="进入完整高级工作台"
+      >
+        <Settings2 className="h-3 w-3" /> 高级编辑
+      </button>
+
+      {/* 内容区不再自带边框/底色：外壳那一层 border 就是**唯一**一层，
+          与「AI 视频」等节点的观感一致。此前这里是一块 rounded + border + bg 的面板，
+          套在外壳里就成了「框里还有一层框」。 */}
       <section
-        className="relative mt-7 flex min-h-0 flex-1 flex-col gap-2.5 overflow-visible rounded-lg border border-[rgba(255,255,255,0.12)] bg-bg-dark/70 p-2.5"
+        className="relative mt-7 flex min-h-0 flex-1 flex-col gap-2.5 overflow-visible"
         onPointerDown={(event) => event.stopPropagation()}
       >
-        <label className="relative flex min-h-0 flex-col gap-1 text-[10px] text-text-muted">
+        {/* 两个输入框吸收节点尺寸变化（`flex-1`），其余块保持原高（`shrink-0`）
+            —— 与「AI 视频」一致：拖外框拉高，变大的只有输入区。 */}
+        <label className="relative flex min-h-0 flex-1 flex-col gap-1 text-[10px] text-text-muted">
           <Handle
             type="target"
             id={QUICK_INPUT_HANDLES.style}
@@ -1128,16 +1125,16 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
             title="接入上游文本：风格 / 质量"
             className="!left-[-13px] !top-1/2 !h-2.5 !w-2.5 !-translate-y-1/2 !border-surface-dark !bg-accent"
           />
-          <span className="flex items-center justify-between gap-2">
+          <span className="flex shrink-0 items-center justify-between gap-2">
             风格 / 质量
             {upstreamStyleTexts.length ? (
               <span className="text-[9px] text-accent">已接入 {upstreamStyleTexts.length} 条文本</span>
             ) : null}
           </span>
-          <div className="relative">
+          <div className="relative min-h-0 flex-1">
             {/* 与 AI 图片节点(ImageEditNode)一致：上游接入的文本以灰色只读行贴在输入框底部。 */}
             <textarea
-              className={`nodrag nowheel ui-scrollbar h-24 w-full resize-y overflow-y-auto rounded border border-[rgba(255,255,255,0.12)] bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-text outline-none placeholder:text-text-muted/60 focus:border-accent ${upstreamStyleTexts.length > 0 ? "pb-[62px]" : ""}`}
+              className={`nodrag nowheel ui-scrollbar h-full min-h-[56px] w-full resize-none overflow-y-auto rounded border border-[rgba(255,255,255,0.12)] bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-text outline-none placeholder:text-text-muted/60 focus:border-accent ${upstreamStyleTexts.length > 0 ? "pb-[62px]" : ""}`}
               value={quickStyle}
               placeholder="例如：胶片感写实、冷暖对比、35mm、细腻颗粒"
               onChange={(event) => handleQuickStyleChange(event.target.value)}
@@ -1163,7 +1160,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           </div>
         </label>
 
-        <label className="relative flex min-h-0 flex-col gap-1 text-[10px] text-text-muted">
+        <label className="relative flex min-h-0 flex-1 flex-col gap-1 text-[10px] text-text-muted">
           <Handle
             type="target"
             id={QUICK_INPUT_HANDLES.synopsis}
@@ -1171,16 +1168,16 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
             title="接入上游文本：故事梗概"
             className="!left-[-13px] !top-1/2 !h-2.5 !w-2.5 !-translate-y-1/2 !border-surface-dark !bg-accent"
           />
-          <span className="flex items-center justify-between gap-2">
+          <span className="flex shrink-0 items-center justify-between gap-2">
             故事梗概
             {upstreamSynopsisTexts.length ? (
               <span className="text-[9px] text-accent">已接入 {upstreamSynopsisTexts.length} 条文本</span>
             ) : null}
           </span>
-          <div className="relative">
+          <div className="relative min-h-0 flex-1">
             {/* 与 AI 图片节点(ImageEditNode)一致：上游接入的文本以灰色只读行贴在输入框底部。 */}
             <textarea
-              className={`nodrag nowheel ui-scrollbar h-24 w-full resize-y overflow-y-auto rounded border border-[rgba(255,255,255,0.12)] bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-text outline-none placeholder:text-text-muted/60 focus:border-accent ${upstreamSynopsisTexts.length > 0 ? "pb-[62px]" : ""}`}
+              className={`nodrag nowheel ui-scrollbar h-full min-h-[56px] w-full resize-none overflow-y-auto rounded border border-[rgba(255,255,255,0.12)] bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-text outline-none placeholder:text-text-muted/60 focus:border-accent ${upstreamSynopsisTexts.length > 0 ? "pb-[62px]" : ""}`}
               value={quickSynopsis}
               placeholder="写清人物、事件、动作顺序和关键变化"
               onChange={(event) => handleQuickSynopsisChange(event.target.value)}
@@ -1206,7 +1203,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           </div>
         </label>
 
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid shrink-0 grid-cols-3 gap-2">
           {(
             [
               [
@@ -1343,7 +1340,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
 
         {quickError ? <p className="text-[10px] leading-snug text-red-400">{quickError}</p> : null}
 
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex shrink-0 items-center justify-between gap-2">
           <div data-quick-popover className="relative min-w-0 flex-1">
             <button
               type="button"
@@ -1460,11 +1457,76 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
             ) : (
               <Sparkles className="h-3.5 w-3.5" />
             )}
-            {quickGenerating ? "生成中…" : "生成并创建视频"}
+            {quickGenerating ? "生成中…" : "生成提示词"}
           </button>
         </div>
 
-        <ImagePromptOptimizerPanel nodeId={id} data={data} onOpenChange={handleImagePromptOpenChange} />
+        {/* 提示词格式：决定「生成提示词」按哪套提示词规范产出。
+            原来这个位置是「AI 图片提示词」面板，已整体移除。
+            交互与上方「Chat 模型」一致（点击展开下拉，选中即收起）。 */}
+        <div className="nodrag mt-2 flex shrink-0 items-center gap-2">
+          <span className="shrink-0 text-[10px] font-medium text-text-muted">提示词格式</span>
+          <div data-quick-popover className="relative min-w-0 flex-1">
+            <button
+              type="button"
+              className="nodrag flex h-8 w-full min-w-0 items-center gap-1.5 rounded border border-[rgba(255,255,255,0.16)] bg-black/25 px-2 text-left transition-colors hover:border-[rgba(255,255,255,0.32)] focus:border-accent"
+              aria-label="提示词格式"
+              aria-expanded={isPromptFormatPickerOpen}
+              title={quickPromptFormat.description}
+              onClick={() => setIsPromptFormatPickerOpen((current) => !current)}
+            >
+              <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-text">
+                {quickPromptFormat.name}
+              </span>
+              <ChevronDown
+                className={`h-3.5 w-3.5 shrink-0 text-text-muted transition-transform ${isPromptFormatPickerOpen ? "rotate-180" : ""}`}
+              />
+            </button>
+
+            {isPromptFormatPickerOpen ? (
+              <div
+                className="absolute bottom-[calc(100%+8px)] left-0 z-50 w-[min(420px,calc(100vw-40px))] rounded-lg border border-[rgba(255,255,255,0.16)] bg-[#171b25] p-2 shadow-2xl"
+                onPointerDown={(event) => event.stopPropagation()}
+                onWheel={(event) => event.stopPropagation()}
+              >
+                <div className="max-h-60 overflow-y-auto overscroll-contain pr-0.5">
+                  {QUICK_PROMPT_FORMATS.map((format) => {
+                    const active = format.id === quickPromptFormatId;
+                    return (
+                      <button
+                        key={format.id}
+                        type="button"
+                        className={`w-full rounded-md border px-2 py-1.5 text-left transition-colors ${
+                          active
+                            ? "border-accent/50 bg-accent/15"
+                            : "border-white/10 bg-black/20 hover:border-white/30"
+                        }`}
+                        onClick={() => {
+                          updateNodeData(id, { quickPromptFormat: format.id });
+                          setIsPromptFormatPickerOpen(false);
+                        }}
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-text">
+                            {format.name}
+                          </span>
+                          {active ? (
+                            <Check className="h-3.5 w-3.5 shrink-0 text-accent" strokeWidth={3} />
+                          ) : null}
+                        </div>
+                        {format.description ? (
+                          <p className="mt-0.5 line-clamp-2 text-[10px] leading-snug text-text-muted">
+                            {format.description}
+                          </p>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
       </section>
 
       <Handle
@@ -1475,9 +1537,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       />
       <NodeResizeHandle
         minWidth={CINEMATIC_STUDIO_NODE_MIN_WIDTH}
-        minHeight={
-          isImagePromptOpen ? CINEMATIC_STUDIO_NODE_EXPANDED_MIN_HEIGHT : CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT
-        }
+        minHeight={CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT}
       />
 
       {isOpen && typeof document !== "undefined"

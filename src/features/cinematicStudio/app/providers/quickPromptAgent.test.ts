@@ -104,8 +104,7 @@ describe('buildQuickPromptRequest', () => {
     expect(buildQuickPromptRequest(input, 'en').system).toContain('Write in clear cinematic English.');
   });
 
-  it('forbids aspect ratio, duration and frame rate inside FORMAT MODE', () => {
-    const { system, user } = buildQuickPromptRequest({
+  it('forbids aspect ratio, duration and frame rate inside FORMAT MODE', () => {    const { system, user } = buildQuickPromptRequest({
       style: '胶片颗粒',
       synopsis: '侦探穿过雨夜的站台。',
       sceneAssets: [{ id: 'loc', name: '站台', mediaType: 'image', referenceIndex: 1 }],
@@ -121,5 +120,79 @@ describe('buildQuickPromptRequest', () => {
     expect(user).toContain(
       'FORMAT MODE (generation organization only — never aspect ratio, resolution, duration in seconds, or frame rate)',
     );
+  });
+
+  /**
+   * 轻量链路用资产名当 `@` 标识（可读），但同名会让模型把两人当一人、甚至对错参考图。
+   * 后来者加 `-2` 后缀；后缀用连字符而不是 ` #2`，否则空格会把引用重新拆成两个 token。
+   */
+  it('disambiguates same-named assets with a -2 suffix', () => {
+    const { user } = buildQuickPromptRequest({
+      style: '胶片颗粒',
+      synopsis: '妈妈把信交给妈妈。',
+      sceneAssets: [],
+      characterAssets: [
+        { id: 'mom-a', name: '妈妈', mediaType: 'image', referenceIndex: 1 },
+        { id: 'mom-b', name: '妈妈', mediaType: 'image', referenceIndex: 2 },
+      ],
+    }, 'zh');
+
+    expect(user).toContain('@妈妈 [image1] (character image)');
+    expect(user).toContain('@妈妈-2 [image2] (character image)');
+  });
+
+  it('normalizes spaces and punctuation so the @ reference stays a single token', () => {
+    const { user } = buildQuickPromptRequest({
+      style: '胶片颗粒',
+      synopsis: 'Iron Man 走进面包店。',
+      sceneAssets: [{ id: 'loc', name: 'Corner Bakery!', mediaType: 'image', referenceIndex: 1 }],
+      characterAssets: [{ id: 'hero', name: 'Iron Man', mediaType: 'image', referenceIndex: 2 }],
+    }, 'zh');
+
+    expect(user).toContain('@corner-bakery [image1]');
+    expect(user).toContain('@iron-man [image2]');
+    expect(user).not.toContain('@Iron Man');
+  });
+
+  /**
+   * 🔴 整篇必须共用同一份对照表：站位里只有名字没有 id，
+   * 若各段各算一次，同一角色会变成 `@妈妈` 与 `@妈妈-2` 两个"人"。
+   */
+  it('keeps one reference name per asset across every section', () => {
+    const { user } = buildQuickPromptRequest({
+      style: '胶片颗粒',
+      synopsis: '妈妈把信交给妈妈。',
+      sceneAssets: [],
+      characterAssets: [
+        { id: 'mom-a', name: '妈妈', mediaType: 'image', referenceIndex: 1 },
+        { id: 'mom-b', name: '妈妈', mediaType: 'image', referenceIndex: 2 },
+      ],
+      staging: {
+        locationName: '客厅',
+        characterOrderNames: ['妈妈'],
+      },
+      characterProfiles: [{ id: 'mom-a', name: '妈妈', actingMaster: '克制的哭' }],
+      props: [],
+    }, 'zh');
+
+    // 站位与表演母版里只出现了「妈妈」一次编码后的引用，不应再冒出第三个名字。
+    expect(user).toContain('CHARACTER ORDER (左到右站位): @妈妈');
+    expect(user).toContain('@妈妈\n  ACTING MASTER');
+    const occurrences = (user.match(/@妈妈(-\d+)?/g) ?? []).length;
+    // ACTIVE REFERENCES 两条 + 站位一条 + 表演母版一条
+    expect(occurrences).toBe(4);
+  });
+
+  it('does not duplicate the suffix when the same asset appears in several blocks', () => {
+    const { user } = buildQuickPromptRequest({
+      style: '胶片颗粒',
+      synopsis: '站台上的侦探。',
+      // 同一个 id 既在场景里、又在角色里（上游素材与资产选择重复时会这样）
+      sceneAssets: [{ id: 'dup', name: '站台', mediaType: 'image', referenceIndex: 1 }],
+      characterAssets: [{ id: 'dup', name: '站台', mediaType: 'image', referenceIndex: 1 }],
+    }, 'zh');
+
+    expect(user).toContain('@站台 [image1]');
+    expect(user).not.toContain('@站台-2');
   });
 });

@@ -47,16 +47,16 @@ describe("renderAssetLine user notes isolation", () => {
 });
 
 describe("asset reference naming", () => {
-  it("uses the stable project / state / version tag in @ references", () => {
+  it("uses the stable state / version tag in @ references", () => {
     const tagged = {
       ...asset,
       stateName: "rain soaked",
       version: 2,
-      referenceTag: buildAssetReferenceTag({ ...asset, stateName: "rain soaked", version: 2 }, "CB"),
+      referenceTag: buildAssetReferenceTag({ ...asset, stateName: "rain soaked", version: 2 }),
     };
     const output = renderAssetLine(tagged, 1, "at-mention", "en");
-    expect(tagged.referenceTag).toBe("char_cb_hero_rain-soaked_v2");
-    expect(output).toContain("@char_cb_hero_rain-soaked_v2");
+    expect(tagged.referenceTag).toBe("char_hero_rain-soaked_v2");
+    expect(output).toContain("@char_hero_rain-soaked_v2");
   });
 
   it("merges a variant's inherited base description with its change-only description", () => {

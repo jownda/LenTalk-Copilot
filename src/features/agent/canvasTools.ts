@@ -42,6 +42,24 @@ export const canvasAgentTools = {
       data: z.record(z.string(), z.unknown()).optional(),
     }),
   },
+  createNodes: {
+    name: "canvas.create_nodes",
+    description:
+      "一次创建多个节点（整批只占一个撤销步）。批量落锚点、批量加参考图时用它，别重复调 create_node。省略 position 时自动在画布空白处排布。",
+    permission: "write",
+    schema: z.object({
+      nodes: z
+        .array(
+          z.object({
+            type: nodeTypeSchema,
+            position: z.object({ x: z.number(), y: z.number() }).optional(),
+            data: z.record(z.string(), z.unknown()).optional(),
+          }),
+        )
+        .min(1)
+        .max(40),
+    }),
+  },
   updateNode: {
     name: "canvas.update_node",
     description: "更新节点参数（提示词、模型、比例、分辨率等），不改变节点类型或连线。",
@@ -95,6 +113,16 @@ export const canvasAgentTools = {
     permission: "paid-operation",
     requiresConfirmation: true,
     schema: z.object({ nodeName: nodeNameSchema }),
+  },
+  runNodes: {
+    name: "canvas.run_nodes",
+    description:
+      "一次触发多个节点开始生成（会真正调用模型并产生费用，卡片上会先给出这批的预计花费）。需要用户确认后才会执行。",
+    permission: "paid-operation",
+    requiresConfirmation: true,
+    schema: z.object({
+      nodeNames: z.array(nodeNameSchema).min(1).max(40),
+    }),
   },
   undo: {
     name: "canvas.undo",

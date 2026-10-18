@@ -21,6 +21,7 @@ import {
   loadAISettings,
   resolveLenTalkChatModel,
   type AISettings,
+  type LenTalkChatModelOption,
 } from "@/features/cinematicStudio/app/providers/aiSettings";
 import { openSettingsDialog } from "@/features/settings/settingsEvents";
 import { useProjectStore } from "@/stores/projectStore";
@@ -251,8 +252,73 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
   const [showSessions, setShowSessions] = useState(false);
   const [showSkills, setShowSkills] = useState(false);
   const [showAccess, setShowAccess] = useState(false);
+  const [showModels, setShowModels] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  /** 输入框：随草稿内容自动长高，长文不必在 2 行的小窗里来回滚 */
+  const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  /** 消息列表的包裹层：生成结果的图片是**异步撑高**的，靠它感知内容高度变化 */
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * 是否吸附在底部。
+   *
+   * 只有用户**主动往上翻**看历史时才置 false —— 那种情况下新消息来了不该把他拽回底部；
+   * 他自己滚回底部 64px 以内就自动恢复吸附。其余所有情况（打开面板、切会话、
+   * 图片加载完撑高）都应当贴着最新一条。
+   */
+  const pinnedToBottomRef = useRef(true);
+
+  const scrollThreadToBottom = useCallback(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, []);
+
+  const handleThreadScroll = useCallback(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    const distanceToBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+    pinnedToBottomRef.current = distanceToBottom < 64;
+  }, []);
+
+  /**
+   * 打开面板 / 切换会话：**无条件**回到最新一条。
+   *
+   * 以前只在「消息变了」时滚一次 —— 但面板是靠 `return null` 卸载的，重新打开时
+   * 消息数组没变、effect 不重跑，于是每次都停在会话开头。
+   * 用双层 rAF：第一帧让 React 把消息真正挂到 DOM，第二帧布局完成才拿得到真实 scrollHeight。
+   */
+  useEffect(() => {
+    if (!open) return;
+    pinnedToBottomRef.current = true;
+    let innerFrame = 0;
+    const outerFrame = requestAnimationFrame(() => {
+      scrollThreadToBottom();
+      innerFrame = requestAnimationFrame(scrollThreadToBottom);
+    });
+    return () => {
+      cancelAnimationFrame(outerFrame);
+      if (innerFrame) cancelAnimationFrame(innerFrame);
+    };
+  }, [open, activeSessionId, scrollThreadToBottom]);
+
+  /**
+   * 内容异步撑高时继续贴底。
+   *
+   * 生成结果的媒体卡片要等图片解码完才有高度，而那一刻**不会触发 React 重渲染**，
+   * 上面那个按消息数组变化的 effect 抓不到 —— 表现就是「打开时在底部，一秒钟后
+   * 被顶到中间」。ResizeObserver 盯包裹层才能覆盖这种情况。
+   */
+  useEffect(() => {
+    if (!open) return;
+    const content = contentRef.current;
+    if (!content || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (pinnedToBottomRef.current) scrollThreadToBottom();
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [open, scrollThreadToBottom]);
   /** 等着把生成结果回填到卡片上的监听 */
   const mediaWatchesRef = useRef<PendingMediaWatch[]>([]);
 
@@ -286,6 +352,48 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
   const activeSkill = useMemo(() => findAgentSkill(activeSkillId), [activeSkillId]);
   const isBusy = Boolean(streaming);
 
+  /**
+   * 输入框随内容自动长高。
+   *
+   * 以前固定 2 行，写长提示词得在小窗里上下滚，很难看全。
+   * 现在 2 行起步，随草稿撑高，到 `max-h-44`（约 9 行）后转入内部滚动。
+   * 每次（包括发送清空后）先回到 `auto` 再量 `scrollHeight`，
+   * 否则高度只增不减。
+   */
+  useEffect(() => {
+    const el = composerTextareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [draft, open]);
+
+  // 新消息 / 流式增量：吸附时跟随；用户正在翻历史就不打断他
+  useEffect(() => {
+    if (!pinnedToBottomRef.current) return;
+    scrollThreadToBottom();
+  }, [activeSession?.messages, streaming, scrollThreadToBottom]);
+
+  /** 模型按平台分组：模型多时平铺看不出归属，分组后和「选模型」面板的观感一致 */
+  const groupedModelOptions = useMemo(() => {
+    const groups = new Map<string, LenTalkChatModelOption[]>();
+    for (const option of modelOptions) {
+      const list = groups.get(option.providerName) ?? [];
+      list.push(option);
+      groups.set(option.providerName, list);
+    }
+    return [...groups.entries()];
+  }, [modelOptions]);
+
+  /**
+   * 工具条上的三个浮层（权限 / SKILL / 模型）**互斥**：
+   * 同时只开一个，否则两块面板会叠在同一片区域里。
+   */
+  const toggleComposerPanel = useCallback((panel: "access" | "skills" | "models") => {
+    setShowAccess((current) => (panel === "access" ? !current : false));
+    setShowSkills((current) => (panel === "skills" ? !current : false));
+    setShowModels((current) => (panel === "models" ? !current : false));
+  }, []);
+
   useEffect(() => {
     hydrate();
   }, [hydrate]);
@@ -297,12 +405,34 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
     if (first) setActiveSession(first.id);
   }, [open, hydrated, activeSession, projectSessions, setActiveSession]);
 
-  // 新消息 / 流式增量都要把视口钉在底部
+  /**
+   * 工具条浮层：点面板外或按 Escape 收起。
+   *
+   * 触发按钮与面板都包在 `[data-agent-popover]` 里，`pointerdown` 命中它们时不算「点外面」
+   * —— 否则按钮自己的 onClick 还没跑到，面板就先被关了，表现成「点了没反应」。
+   */
   useEffect(() => {
-    const node = scrollRef.current;
-    if (!node) return;
-    node.scrollTop = node.scrollHeight;
-  }, [activeSession?.messages, streaming]);
+    if (!showAccess && !showSkills && !showModels) return;
+    const closeAll = () => {
+      setShowAccess(false);
+      setShowSkills(false);
+      setShowModels(false);
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest("[data-agent-popover]")) return;
+      closeAll();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeAll();
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [showAccess, showSkills, showModels]);
 
   /**
    * 盯住画布，等生成结果冒出来就回填到对应的工具卡片上。
@@ -674,7 +804,17 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
         </div>
       </header>
 
-      <div ref={scrollRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
+      <div
+        ref={scrollRef}
+        onScroll={handleThreadScroll}
+        className="min-h-0 flex-1 overflow-y-auto p-3"
+      >
+        {/* 包裹层：`space-y-3` 挪到这里，同时给 ResizeObserver 一个可观察的内容块
+            （直接观察滚动容器没用 —— 它有固定高度，内容变化不改变它自身尺寸）。 */}
+        <div ref={contentRef} className="space-y-3">
+        {/* 气泡宽度按角色分开：用户消息保留对话气泡感（右贴边、最宽 88%）；
+            **AI 回答铺满整宽** —— 正文是长段落 + 工具结果卡片，右侧留 12% 空档
+            只会让长文更窄、更早折行。 */}
         {messages.length === 0 ? (
           <div className="space-y-3 pt-2">
             <div className="rounded-lg bg-bg-dark px-3 py-2 text-xs leading-relaxed text-text-dark">
@@ -706,10 +846,10 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
           messages.map((message) => (
             <div
               key={message.id}
-              className={`max-w-[88%] rounded-lg px-3 py-2 text-xs leading-relaxed ${
+              className={`rounded-lg px-3 py-2 text-xs leading-relaxed ${
                 message.role === "user"
-                  ? "ml-auto bg-accent text-white"
-                  : "bg-bg-dark text-text-dark"
+                  ? "ml-auto max-w-[88%] bg-accent text-white"
+                  : "w-full bg-bg-dark text-text-dark"
               }`}
             >
               {message.role === "assistant" ? (
@@ -782,6 +922,7 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
             </div>
           ))
         )}
+        </div>
       </div>
 
       <div className="border-t border-border-dark p-3">
@@ -803,6 +944,7 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
             单独占一行时，那条深色圆角描边和下面的输入框长得一模一样，视觉上就是「两层输入框」。 */}
         <div className="flex flex-col gap-1 rounded-lg border border-border-dark bg-bg-dark px-2 py-1.5">
           <textarea
+            ref={composerTextareaRef}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
@@ -813,14 +955,14 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
             }}
             placeholder="和 AI 聊聊你的故事、情节或提示词…（Enter 发送，Shift+Enter 换行）"
             rows={2}
-            className="min-h-9 w-full resize-none bg-transparent py-1 text-xs leading-relaxed text-text-dark outline-none placeholder:text-text-muted"
+            className="min-h-9 max-h-44 w-full resize-none overflow-y-auto bg-transparent py-1 text-xs leading-relaxed text-text-dark outline-none placeholder:text-text-muted"
           />
-          <div className="flex items-center gap-1.5">
+          <div className="relative flex items-center gap-1.5">
             {/* 画布权限档位。做成纯图标是为了不再把工具条撑挤 —— 它也确实是低频操作 */}
-            <div className="relative shrink-0">
+            <div className="relative shrink-0" data-agent-popover>
               <button
                 type="button"
-                onClick={() => setShowAccess((value) => !value)}
+                onClick={() => toggleComposerPanel("access")}
                 disabled={isBusy}
                 className={`flex items-center rounded px-1 py-0.5 outline-none transition-colors hover:bg-white/5 disabled:opacity-50 ${
                   canvasAccess === "read-only"
@@ -867,10 +1009,10 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
               ) : null}
             </div>
 
-            <div className="relative shrink-0">
+            <div className="relative shrink-0" data-agent-popover>
               <button
                 type="button"
-                onClick={() => setShowSkills((value) => !value)}
+                onClick={() => toggleComposerPanel("skills")}
                 disabled={isBusy}
                 className={`flex max-w-[170px] items-center gap-1 rounded px-1.5 py-0.5 text-[11px] outline-none transition-colors hover:bg-white/5 disabled:opacity-50 ${
                   activeSkill ? "text-accent" : "text-text-muted hover:text-text-dark"
@@ -922,36 +1064,72 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
               ) : null}
             </div>
 
-            {/* 裸 select：去掉边框与底色，否则它自己又成了一条「小输入框」。
-                宽度按内容走（不 flex-1），否则模型名与右侧箭头会被拉得很开。 */}
-            <div className="relative flex min-w-0 items-center">
-              <select
-                value={selectionKey(selection)}
-                onChange={(event) => handleModelChange(event.target.value)}
-                disabled={isBusy}
-                className={`min-w-0 max-w-[230px] cursor-pointer appearance-none truncate bg-transparent py-0.5 pr-4 text-[11px] outline-none transition-colors disabled:opacity-50 ${
-                  selection ? "text-text-dark" : "text-text-muted"
+            {/* 模型选择：与「加载 SKILL」同一款（裸按钮 + 弹出面板）。
+                原先这里是原生 select —— 去掉边框底色是为了让它不像「第二条输入框」，
+                但原生 select 的选项列表由系统绘制，与本应用其余下拉完全脱节。 */}
+            <div className="relative shrink-0" data-agent-popover>
+              <button
+                type="button"
+                onClick={() => toggleComposerPanel("models")}
+                disabled={isBusy || modelOptions.length === 0}
+                className={`flex max-w-[200px] items-center gap-1 rounded px-1.5 py-0.5 text-[11px] outline-none transition-colors hover:bg-white/5 disabled:opacity-50 ${
+                  selection ? "text-text-dark" : "text-text-muted hover:text-text-dark"
                 }`}
                 aria-label="选择对话模型"
+                aria-expanded={showModels}
+                title={
+                  selection
+                    ? `对话模型：${selection.model}`
+                    : modelOptions.length
+                      ? "选择对话模型"
+                      : "未配置 Chat 模型"
+                }
               >
-                {modelOptions.length === 0 ? (
-                  <option value="">未配置 Chat 模型</option>
-                ) : (
-                  <>
-                    {selection ? null : <option value="">请选择模型</option>}
-                    {modelOptions.map((option) => {
+                <span className="truncate">
+                  {selection ? selection.model : modelOptions.length ? "选择模型" : "未配置 Chat 模型"}
+                </span>
+                <ChevronDown className="h-3 w-3 shrink-0" />
+              </button>
+            </div>
+
+            {/* 模型面板挂在**工具条**这一层，而不是触发器内部：
+                触发器位于工具条中偏右，若从它 `left-0` 展开 288px 会顶穿输入框右边界，
+                被面板的 overflow-hidden 裁掉（选中勾看不见）。
+                挂到工具条这层用 left-0 right-0，宽度就与输入框对齐。 */}
+            {showModels && modelOptions.length > 0 ? (
+              <div
+                data-agent-popover
+                data-agent-model-panel
+                className="absolute bottom-full left-0 right-0 z-30 mb-1 max-h-80 overflow-y-auto rounded-lg border border-border-dark bg-surface-dark py-1 shadow-2xl"
+              >
+                {groupedModelOptions.map(([providerName, options]) => (
+                  <div key={providerName}>
+                    {/* 按平台分组：模型多时平铺看不出归属 */}
+                    <p className="px-3 pb-0.5 pt-1.5 text-[10px] text-text-muted">{providerName}</p>
+                    {options.map((option) => {
                       const key = `${option.providerId}::${option.model}`;
+                      const selected = key === selectionKey(selection);
                       return (
-                        <option key={key} value={key}>
-                          {option.providerName} · {option.model}
-                        </option>
+                        <button
+                          key={key}
+                          type="button"
+                          onClick={() => {
+                            handleModelChange(key);
+                            setShowModels(false);
+                          }}
+                          className={`flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-[11px] hover:bg-bg-dark ${
+                            selected ? "bg-accent/10 text-accent" : "text-text-dark"
+                          }`}
+                        >
+                          <span className="min-w-0 flex-1 truncate">{option.model}</span>
+                          {selected ? <Check className="h-3 w-3 shrink-0" /> : null}
+                        </button>
                       );
                     })}
-                  </>
-                )}
-              </select>
-              <ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-text-muted" />
-            </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
 
             {/* 撑杆：把发送按钮顶到右端 */}
             <span className="min-w-0 flex-1" />

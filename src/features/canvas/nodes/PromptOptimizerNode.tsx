@@ -19,6 +19,7 @@ import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDeb
 import { clampTextViewScrollTop } from '@/features/canvas/application/textViewScroll';
 import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
+import { CanvasRefThumb } from '@/features/canvas/ui/CanvasRefThumb';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { NodeReferencePicker } from '@/features/canvas/ui/NodeReferencePicker';
 import {
@@ -175,12 +176,7 @@ function renderPromptWithHighlights(
           <span
             className="pointer-events-none relative -mr-5 inline-flex h-5 w-5 shrink-0 translate-x-1/2 align-middle items-center justify-center overflow-hidden rounded-md bg-accent/20 shadow-sm"
           >
-            <img
-              src={imageUrl}
-              alt={matchText}
-              draggable={false}
-              className="h-full w-full shrink-0 object-cover"
-            />
+            <CanvasRefThumb source={imageUrl} alt={matchText} className="h-full w-full shrink-0 object-cover" />
           </span>
           {matchText}
         </span>

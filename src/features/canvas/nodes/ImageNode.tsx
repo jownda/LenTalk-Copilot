@@ -3,7 +3,6 @@ import {
   Handle,
   Position,
   useUpdateNodeInternals,
-  useViewport,
   type NodeProps,
 } from '@xyflow/react';
 import { AlertTriangle, Image as ImageIcon, Sparkles } from 'lucide-react';
@@ -30,7 +29,7 @@ import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canv
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
 import { MediaDimensionsLabel, useHoverIntent, useImageDimensions, useMediaByteSize } from '@/features/canvas/ui/MediaDimensions';
-import { useCanvasImageSource } from '@/features/canvas/ui/useCanvasImageSource';
+import { useCanvasImageSourceAuto } from '@/features/canvas/ui/useCanvasImageSource';
 import { useCanvasStore } from '@/stores/canvasStore';
 
 type ImageNodeProps = NodeProps & {
@@ -51,7 +50,6 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
   const updateNodeInternals = useUpdateNodeInternals();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
-  const { zoom } = useViewport();
   const [now, setNow] = useState(() => Date.now());
   const isExportResultNode = type === CANVAS_NODE_TYPES.exportImage;
   const isGenerating = typeof data.isGenerating === 'boolean' ? data.isGenerating : false;
@@ -136,18 +134,24 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
 
   // 显示走的图：小尺寸用落盘缩略图（重开项目同步命中），放大到阈值以上才读原图。
   // 判定与请求统一收口在 useCanvasImageSource，别在这里再拼一遍优先级。
-  const imageSource = useCanvasImageSource(zoom, data.imageUrl, data.previewImageUrl);
+  // ⚠️ 用 `...Auto` 版本：它只订阅「是否跨过原图阈值」，平移画布不会让节点重渲染。
+  const imageSource = useCanvasImageSourceAuto(data.imageUrl, data.previewImageUrl);
 
   // 获取原图 URL 用于查看器
   const originalImageUrl = useMemo(() => {
     if (!data.imageUrl) return null;
     return resolveImageDisplayUrl(data.imageUrl);
   }, [data.imageUrl]);
-  const imageDimensions = useImageDimensions(originalImageUrl || imageSource.url);
-  // 体积要按原始来源探测(asset:// 无法还原成本地路径), 因此这里传入未转换的 imageUrl。
-  const mediaByteSize = useMediaByteSize(data.imageUrl);
   // 尺寸/体积标注改为悬停延迟显示, 避免常驻文字干扰画面。
   const mediaHover = useHoverIntent();
+  // 🔴 探测按需触发：标注要悬停 1.5s 才显示，而 `useImageDimensions` 会**把原图完整加载一遍**、
+  // `useMediaByteSize` 会发一次 IPC。无条件跑等于一屏几十个节点开局各解码一张原图。
+  const imageDimensions = useImageDimensions(
+    originalImageUrl || imageSource.url,
+    mediaHover.visible,
+  );
+  // 体积要按原始来源探测(asset:// 无法还原成本地路径), 因此这里传入未转换的 imageUrl。
+  const mediaByteSize = useMediaByteSize(data.imageUrl, mediaHover.visible);
 
   return (
     <div

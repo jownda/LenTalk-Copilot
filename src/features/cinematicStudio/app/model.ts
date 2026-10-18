@@ -74,7 +74,7 @@ export function migrateProject(raw: unknown): ProjectV2 {
       }
     }
     const projectCode = project.projectCode?.trim() || deriveProjectCode(project.title || project.id);
-    return migrateSceneCharacterRosters({ ...project, projectCode, assets: project.assets.map((asset) => withAssetReferenceTag(asset, projectCode)) });
+    return migrateSceneCharacterRosters({ ...project, projectCode, assets: project.assets.map((asset) => withAssetReferenceTag(asset)) });
   }
 
   const projectCode = project.projectCode?.trim() || deriveProjectCode(project.title || project.id);
@@ -142,7 +142,7 @@ export function migrateProject(raw: unknown): ProjectV2 {
     }
   }
 
-  migrated.assets = migrated.assets.map((asset) => withAssetReferenceTag(asset, projectCode));
+  migrated.assets = migrated.assets.map((asset) => withAssetReferenceTag(asset));
 
   return migrateSceneCharacterRosters(migrated);
 }

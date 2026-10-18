@@ -1527,7 +1527,16 @@ export async function uploadZhiniaoReferenceAsset(
  *   「1 张参考图 + 1 段参考音频」(角色一致性最常见的用法: 图定外貌、音频定音色)
  *   被静默降级成首帧, 随后被网关以 first-frame 拒收参考音频而整单失败。
  *
- * 其余情况沿用平台扁平入口的惯例: 无参考=文生视频, 单图=首帧, 双图首尾帧, 多图=参考生视频。
+ * ⚠️ **单图也不再走 first-frame**：平台在首帧/首尾帧模式下会**忽略 aspect_ratio、
+ *   直接沿用首帧图片的比例** —— 用户选 9:16 却拿到参考图的 3:4，且没有任何提示。
+ *   参考生(reference)才认我们传的 `aspect_ratio`。所以除非用户显式选了首尾帧
+ *   并且确实给了两张图(能表达"首帧+尾帧"的语义), 一律走 reference。
+ *
+ * 其余情况: 无参考=文生视频, 显式首尾帧+双图=first-last, 其余(含单图)=参考生视频。
+ *
+ * 🔴 **这里有第二份实现**：`src-tauri/src/ai/providers/openai_compat/mod.rs` 的
+ *   `let mode = if image_count == 0 …`（走 Rust 网关时用它）。两份必须逐条一致 ——
+ *   只改 TS 会出现「有时正常、有时又是旧行为」，取决于请求走了哪条链路。
  */
 export function resolveZhiniaoVideoMode(
   imageMode: string | undefined,
@@ -1538,7 +1547,7 @@ export function resolveZhiniaoVideoMode(
   if (hasReferenceMedia) return "reference";
   if (imageCount === 0) return "text-to-video";
   if (imageMode === "first-last" && imageCount >= 2) return "first-last";
-  if (imageCount === 1) return "first-frame";
+  // 单图、以及"选了首尾帧却只有一张图"都落到参考生: 比例由 aspect_ratio 决定。
   return "reference";
 }
 

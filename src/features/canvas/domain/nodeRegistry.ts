@@ -464,10 +464,13 @@ const cinematicStudioNodeDefinition: CanvasNodeDefinition<CinematicStudioNodeDat
     quickCharacterAssetIds: [],
     quickPrompt: null,
     quickReferenceImages: [],
-    imagePromptDraft: "",
-    imagePromptResult: "",
+    // 空串 = 未设置，读取时回落默认格式；不在这里 import 格式表，避免画布层反向依赖工作室层
+    quickPromptFormat: "",
   }),
-  defaultSize: { width: 430, height: 700 },
+  // 700 是当年「AI 图片提示词」面板展开时的高度；该面板已删，内容实测只到 ~450，
+  // 留着会是一片 242px 的空卡底。取最小高度 520（与 NodeResizeHandle 的下限一致），
+  // 只影响新建节点，已有节点保留自己的尺寸，仍可手动往下拉。
+  defaultSize: { width: 430, height: 520 },
 };
 
 const promptOptimizerNodeDefinition: CanvasNodeDefinition<PromptOptimizerNodeData> = {

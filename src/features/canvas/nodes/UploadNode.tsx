@@ -13,7 +13,6 @@ import {
   Handle,
   Position,
   useUpdateNodeInternals,
-  useViewport,
   type NodeProps,
 } from '@xyflow/react';
 import { Upload } from 'lucide-react';
@@ -43,7 +42,7 @@ import {
   resolveImageDisplayUrl,
 } from '@/features/canvas/application/imageData';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
-import { useCanvasImageSource } from '@/features/canvas/ui/useCanvasImageSource';
+import { useCanvasImageSourceAuto } from '@/features/canvas/ui/useCanvasImageSource';
 import { MediaDimensionsLabel, useHoverIntent, useImageDimensions, useMediaByteSize } from '@/features/canvas/ui/MediaDimensions';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -93,7 +92,6 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const useUploadFilenameAsNodeTitle = useSettingsStore((state) => state.useUploadFilenameAsNodeTitle);
-  const { zoom } = useViewport();
   const inputRef = useRef<HTMLInputElement>(null);
   const uploadSequenceRef = useRef(0);
   const uploadPerfRef = useRef<{
@@ -360,14 +358,19 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
 
   // 上传中的临时预览(blob:/data:)优先 —— 它比任何落盘图都新。
   // 其余交给统一判定：小尺寸走落盘缩略图（重开项目同步命中），放大到阈值以上才读原图。
-  const persistedImageSource = useCanvasImageSource(zoom, data.imageUrl, data.previewImageUrl);
+  // ⚠️ 用 `...Auto` 版本：只订阅「是否跨过原图阈值」，平移画布不会重渲染。
+  const persistedImageSource = useCanvasImageSourceAuto(data.imageUrl, data.previewImageUrl);
   const imageSource = transientPreviewUrl ?? persistedImageSource.url;
   const imageIsPlaceholder = transientPreviewUrl ? false : persistedImageSource.isPlaceholder;
-  const imageDimensions = useImageDimensions(data.imageUrl ? resolveImageDisplayUrl(data.imageUrl) : imageSource);
-  // 体积按原始来源探测, asset:// / blob: 预览地址无法还原成本地文件。
-  const mediaByteSize = useMediaByteSize(data.imageUrl);
   // 尺寸/体积标注改为悬停延迟显示, 避免常驻文字干扰画面。
   const mediaHover = useHoverIntent();
+  // 🔴 探测按需触发：标注悬停 1.5s 才显示，而这两个 hook 会加载原图 / 发 IPC。
+  const imageDimensions = useImageDimensions(
+    data.imageUrl ? resolveImageDisplayUrl(data.imageUrl) : imageSource,
+    mediaHover.visible,
+  );
+  // 体积按原始来源探测, asset:// / blob: 预览地址无法还原成本地文件。
+  const mediaByteSize = useMediaByteSize(data.imageUrl, mediaHover.visible);
 
   useEffect(() => {
     updateNodeInternals(id);

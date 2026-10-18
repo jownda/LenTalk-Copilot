@@ -63,6 +63,7 @@ import {
 } from "@/features/canvas/models";
 import { resolveModelPriceDisplay } from "@/features/canvas/pricing";
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
+import { CanvasRefThumb } from "@/features/canvas/ui/CanvasRefThumb";
 import { NodePriceBadge } from "@/features/canvas/ui/NodePriceBadge";
 import { resolveRecommendedApiPriceBadge } from "./nodePriceBadge";
 import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
@@ -252,7 +253,7 @@ function renderPromptWithHighlights(
             }}
             onMouseDown={(event) => event.stopPropagation()}
           >
-            <img src={imageUrl} alt={matchText} draggable={false} className="h-full w-full shrink-0 object-cover" />
+            <CanvasRefThumb source={imageUrl} alt={matchText} className="h-full w-full shrink-0 object-cover" />
           </span>
         </span>,
       );

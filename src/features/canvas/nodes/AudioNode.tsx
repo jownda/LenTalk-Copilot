@@ -191,6 +191,8 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   /** 画面上的透明交互层: 承接指针事件并冒泡到节点, 实现"画面任意位置左键拖动节点"。 */
   const videoSurfaceRef = useRef<HTMLDivElement>(null);
   const [isCapturing, setIsCapturing] = useState(false);
+  /** 与 `isCapturing` 并存的同步守卫：state 要等下一帧才生效，连点仍可能并发起两次抽帧。 */
+  const capturingRef = useRef(false);
   const [isUploading, setIsUploading] = useState(false);
   const [isVideoViewerOpen, setIsVideoViewerOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -735,18 +737,33 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     if (!source) {
       return;
     }
+    // 连点会并发跑两条抽帧、各自建一个结果节点。用 ref 挡，不依赖 state 的下一帧。
+    if (capturingRef.current) return;
+    capturingRef.current = true;
     setIsCapturing(true);
     try {
       // 取帧优先交给 FFmpeg，MOV/远程视频不再依赖 WebView2 canvas；浏览器环境仍回退到
       // 原来的 video + canvas 路径。始终使用原始 source，让 native 路径能识别本地文件。
       const playerTime = videoRef.current?.currentTime;
       const requestedTime =
-        Number.isFinite(playerTime) && Math.abs((playerTime ?? 0) - playbackTimeRef.current) < 0.25
+        typeof playerTime === "number" &&
+        Number.isFinite(playerTime) &&
+        Math.abs(playerTime - playbackTimeRef.current) < 0.25
           ? playerTime
           : playbackTimeRef.current;
+      /**
+       * 拖到片尾时 `playbackTime` 可能正好等于（甚至微超）视频时长。
+       * ffmpeg 在 `-ss == duration` 处取不到帧 → 输出为空 → 报错，表现出来就是
+       * 「点截图没反应 / 一直停在截图中」。往回收 0.05s，仍是最后一帧。
+       */
+      const durationHint = videoRef.current?.duration ?? videoDuration;
+      const safeTime =
+        Number.isFinite(durationHint) && durationHint > 0
+          ? Math.min(requestedTime, Math.max(0, durationHint - 0.05))
+          : requestedTime;
       const dataUrl = await captureVideoFrame({
         source,
-        timeSec: requestedTime,
+        timeSec: safeTime,
       });
       const prepared = await prepareNodeImage(dataUrl);
       const createdNodeId = addDerivedExportNode(
@@ -775,9 +792,10 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
         "截图失败",
       );
     } finally {
+      capturingRef.current = false;
       setIsCapturing(false);
     }
-  }, [addDerivedExportNode, addEdge, data.sourcePath, id]);
+  }, [addDerivedExportNode, addEdge, data.sourcePath, id, videoDuration]);
 
   /** 截图入口已移到节点工具栏(下载旁), 通过事件总线触发, 与 upload-node/reupload 一致。 */
   useEffect(() => {

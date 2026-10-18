@@ -362,12 +362,13 @@ impl OpenAICompatibleProvider {
             // 参考图的用途由 mode 决定(取值与前端 resolveZhiniaoVideoMode 严格一致),
             // 缺了 mode 平台会静默退化成纯文生视频。
             let image_count = images.as_ref().map(|items| items.len()).unwrap_or(0);
+            // ⚠️ 必须与前端 `src/commands/ai.ts: resolveZhiniaoVideoMode` **逐条一致**。
+            // 单图刻意不发 first-frame：平台在首帧 / 首尾帧模式下会忽略 aspect_ratio、
+            // 直接沿用首帧图片比例（用户选 9:16 却拿到参考图的 3:4），只有 reference 认我们传的比例。
             let mode = if image_count == 0 {
                 "text-to-video"
             } else if is_first_last && image_count >= 2 {
                 "first-last"
-            } else if image_count == 1 {
-                "first-frame"
             } else {
                 "reference"
             };

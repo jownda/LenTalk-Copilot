@@ -16,6 +16,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
+import { useStore } from '@xyflow/react';
 
 import {
   CANVAS_THUMBNAIL_MAX_EDGE,
@@ -28,7 +29,9 @@ import {
 import {
   pickCanvasImageSource,
   type CanvasImageKind,
+  type CanvasImagePick,
 } from '@/features/canvas/application/canvasImageSource';
+import { shouldUseOriginalImageByZoom } from '@/features/canvas/application/imageData';
 
 /**
  * 缩略图迟迟不返回时的兜底时长。
@@ -102,18 +105,11 @@ function useThumbnailResolution(
   return { url: resolved, giveUp };
 }
 
-/** 节点主体图片：按 zoom 在原图 / preview / 512 缩略图之间选。 */
-export function useCanvasImageSource(
-  zoom: number,
-  imageUrl?: string | null,
-  previewImageUrl?: string | null,
-  allowThumbnail = true,
-): CanvasImageSourceState {
-  const pick = useMemo(
-    () => pickCanvasImageSource({ zoom, imageUrl, previewImageUrl, allowThumbnail }),
-    [allowThumbnail, imageUrl, previewImageUrl, zoom],
-  );
-
+/**
+ * 把 `pick` 落成最终的展示状态（缩略图未就绪时给骨架 / 超时回落原图）。
+ * 抽出来是为了让「订阅 zoom 数值」与「订阅阈值布尔」两个入口共用同一套尾段逻辑。
+ */
+function useResolvedCanvasImage(pick: CanvasImagePick): CanvasImageSourceState {
   const thumbnailSource = pick.thumbnailSource;
   const { url: thumbnailUrl, giveUp } = useThumbnailResolution(
     thumbnailSource,
@@ -134,6 +130,53 @@ export function useCanvasImageSource(
   }
 
   return { url: null, isPlaceholder: true, kind: 'thumbnail' };
+}
+
+/**
+ * 节点主体图片（**推荐**）：不订阅整个视口，只订阅「是否跨过原图阈值」这一个布尔。
+ *
+ * 🔴 `useViewport()` 会订阅 `{ x, y, zoom }` —— **平移画布时 x/y 每帧都在变**，
+ * 于是每一个带图的节点都跟着每帧重渲染。一屏几十个图节点 / 分镜格时，平移就明显掉帧。
+ * 这里把订阅收窄成 `transform[2] >= 阈值`：平移完全不触发，缩放也只在跨界那一下触发。
+ */
+export function useCanvasImageSourceAuto(
+  imageUrl?: string | null,
+  previewImageUrl?: string | null,
+  allowThumbnail = true,
+): CanvasImageSourceState {
+  const useOriginal = useStore((state) =>
+    shouldUseOriginalImageByZoom(state.transform?.[2] ?? 0),
+  );
+
+  const pick = useMemo(
+    () =>
+      pickCanvasImageSource({
+        // zoom 不参与判断：上面已经把结论算成 useOriginal 了
+        zoom: 0,
+        useOriginal,
+        imageUrl,
+        previewImageUrl,
+        allowThumbnail,
+      }),
+    [allowThumbnail, imageUrl, previewImageUrl, useOriginal],
+  );
+
+  return useResolvedCanvasImage(pick);
+}
+
+/** 节点主体图片：按 zoom 在原图 / preview / 512 缩略图之间选。 */
+export function useCanvasImageSource(
+  zoom: number,
+  imageUrl?: string | null,
+  previewImageUrl?: string | null,
+  allowThumbnail = true,
+): CanvasImageSourceState {
+  const pick = useMemo(
+    () => pickCanvasImageSource({ zoom, imageUrl, previewImageUrl, allowThumbnail }),
+    [allowThumbnail, imageUrl, previewImageUrl, zoom],
+  );
+
+  return useResolvedCanvasImage(pick);
 }
 
 /**

@@ -4,7 +4,7 @@ import { isQuickGenerationRunActive, QUICK_GENERATION_STALE_MS } from "./quickGe
 
 /**
  * 这些用例锁的是用户实际报过的那条症状:
- * 「点击生成并创建视频 → 按钮显示生成中 → 把节点移出画布再移回来, 按钮立刻变回『生成并创建视频』,
+ * 「点击生成提示词 → 按钮显示生成中 → 把节点移出画布再移回来, 按钮立刻变回『生成提示词』,
  *  但下游节点还没生成」。根因是节点被卸载后局部 state 丢失, 判定必须能从落库字段重算。
  */
 describe("isQuickGenerationRunActive", () => {

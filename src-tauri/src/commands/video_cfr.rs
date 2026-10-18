@@ -153,7 +153,13 @@ pub fn remove_video_playback_file(path: String) -> Result<(), String> {
 /// 用 FFmpeg 按时间点直接抽取一帧，返回 JPEG data URL。
 ///
 /// 该路径不经过 WebView2 的视频解码器，特别适合 HEVC/ProRes MOV 和无法被 canvas
-/// 读取的远程视频。`-ss` 放在输入之后，保证用户选中的时间点准确。
+/// 读取的远程视频。
+///
+/// 🔴 **`-ss` 必须放在 `-i` 之前**（输入侧 seek）。放在 `-i` 之后是输出侧 seek：
+/// ffmpeg 会从第 0 帧一路解码到目标时间点，截「最后一帧」等于把整段视频完整解码一遍
+/// —— 几分钟的 1080p 要等几十秒到几分钟，界面就一直停在「截图中…」。
+/// 输入侧 seek 会先跳到目标附近的关键帧再解到精确帧，耗时与视频总长无关。
+/// 精确性由 ffmpeg 默认开启的 `-accurate_seek` 保证。
 #[tauri::command]
 pub fn extract_video_frame(
     app: tauri::AppHandle,
@@ -177,12 +183,13 @@ pub fn extract_video_frame(
     };
     let mut command = Command::new(ffmpeg);
     hide_child_console(&mut command);
+    // 顺序即为关键：-ss 在 -i 之前 = 输入侧快速 seek。
     command
         .args(["-hide_banner", "-loglevel", "error"])
-        .arg("-i")
-        .arg(&input)
         .arg("-ss")
         .arg(format!("{bounded_time:.6}"))
+        .arg("-i")
+        .arg(&input)
         .args(["-frames:v", "1"]);
     if let Some(width) = max_width.filter(|value| *value > 0) {
         // 保持 max_width 的语义：小视频不被无意义地放大，宽视频才按比例缩小。

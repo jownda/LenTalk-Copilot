@@ -104,9 +104,17 @@ function waitForVideoReady(video: HTMLVideoElement, timeoutMs: number): Promise<
 }
 
 function seekVideo(video: HTMLVideoElement, timeSec: number, timeoutMs: number): Promise<void> {
-  // 时长远短于请求时间点时(极短视频)收敛到中点, 否则会 seek 到片尾之外而拿不到帧。
   const duration = video.duration;
-  const bounded = Number.isFinite(duration) && duration > 0 ? Math.min(timeSec, duration / 2) : timeSec;
+  /**
+   * 钳到「最后一帧附近」。
+   *
+   * 🔴 这里以前写的是 `Math.min(timeSec, duration / 2)` —— 本意是「请求点超出片尾时收敛到中点」，
+   * 实际却把**任何超过一半时长**的请求都压到中点：用户拖到最后一帧点截图，截出来的是中间画面。
+   * 正确做法是只处理「越界」这一种情况，收敛到片尾前一点点（`-0.05s` 仍在最后一帧内）。
+   */
+  const lastUsableSec =
+    Number.isFinite(duration) && duration > 0 ? Math.max(0, duration - 0.05) : Number.POSITIVE_INFINITY;
+  const bounded = Math.min(timeSec, lastUsableSec);
   const target = Number.isFinite(bounded) && bounded > 0 ? bounded : 0;
   if (target === 0 || Math.abs(video.currentTime - target) < 0.01) {
     return Promise.resolve();
@@ -221,12 +229,41 @@ async function captureViaRustBytes(source: string, timeSec: number, maxWidth: nu
   }
 }
 
-async function captureViaFfmpeg(source: string, timeSec: number, maxWidth: number): Promise<string> {
-  return await invoke<string>("extract_video_frame", {
-    source,
-    timeSec,
-    maxWidth: maxWidth > 0 ? Math.round(maxWidth) : null,
+/**
+ * FFmpeg 抽帧的等待上限。
+ *
+ * 正常情况（输入侧 seek）是几百毫秒级；一旦卡住（老版本输出侧 seek 会从头解码整段视频、
+ * 或 ffmpeg 读了半个文件后挂起），没有上限的话界面就会永远停在「截图中…」。
+ * 超时后放弃这一路、继续走后面的回退路径，至少能给出结果或明确的错误。
+ */
+const FFMPEG_CAPTURE_TIMEOUT_MS = 25000;
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
   });
+}
+
+async function captureViaFfmpeg(source: string, timeSec: number, maxWidth: number): Promise<string> {
+  return await withTimeout(
+    invoke<string>("extract_video_frame", {
+      source,
+      timeSec,
+      maxWidth: maxWidth > 0 ? Math.round(maxWidth) : null,
+    }),
+    FFMPEG_CAPTURE_TIMEOUT_MS,
+    "ffmpeg 抽帧超时",
+  );
 }
 
 /**

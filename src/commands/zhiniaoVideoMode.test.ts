@@ -24,9 +24,11 @@ describe('resolveZhiniaoVideoMode', () => {
     expect(resolveZhiniaoVideoMode('first-last', 2, true)).toBe('reference');
   });
 
-  it('参考生 + 单图 + 无音频 → first-frame(沿用平台图生视频惯例)', () => {
-    expect(resolveZhiniaoVideoMode('reference', 1)).toBe('first-frame');
-    expect(resolveZhiniaoVideoMode(undefined, 1)).toBe('first-frame');
+  it('参考生 + 单图 + 无音频 → reference(不再自动降级成首帧)', () => {
+    // 用户实报回归：首帧 / 首尾帧模式下平台**忽略 aspect_ratio、跟随首帧图片比例**,
+    // 症状是「选了 9:16，输出却是参考图的 3:4」。单图必须走参考生。
+    expect(resolveZhiniaoVideoMode('reference', 1)).toBe('reference');
+    expect(resolveZhiniaoVideoMode(undefined, 1)).toBe('reference');
   });
 
   it('参考生 + 多图 → reference', () => {
@@ -34,12 +36,16 @@ describe('resolveZhiniaoVideoMode', () => {
     expect(resolveZhiniaoVideoMode(undefined, 2)).toBe('reference');
   });
 
-  it('首尾帧 + 双图 → first-last', () => {
+  it('首尾帧 + 双图 → first-last(用户显式选择，且两图才有首尾语义)', () => {
     expect(resolveZhiniaoVideoMode('first-last', 2)).toBe('first-last');
   });
 
-  it('首尾帧 + 单图 → first-frame(首帧生视频)', () => {
-    expect(resolveZhiniaoVideoMode('first-last', 1)).toBe('first-frame');
+  it('首尾帧 + 单图 → reference(单图凑不出首尾帧，且首帧模式控不住比例)', () => {
+    expect(resolveZhiniaoVideoMode('first-last', 1)).toBe('reference');
+  });
+
+  it('首尾帧 + 双图 + 参考图像之外还有参考音频 → reference', () => {
+    expect(resolveZhiniaoVideoMode('first-last', 2, true)).toBe('reference');
   });
 
   it('完全无参考素材 → text-to-video', () => {

@@ -239,12 +239,15 @@ const TOOL_USAGE: Record<string, string> = {
   "canvas.get_selected_nodes": "无参数",
   "canvas.create_node":
     '{"type":"节点类型","position":{"x":0,"y":0},"data":{"displayName":"给它的名字"}}',
+  "canvas.create_nodes":
+    '{"nodes":[{"type":"节点类型","data":{"displayName":"名字"}},{"type":"节点类型","data":{"displayName":"名字"}}]}（批量建节点用这个，别循环调 create_node；省略 position 会自动排布）',
   "canvas.update_node": '{"nodeName":"AI 图片","data":{"prompt":"新的提示词"}}（只写要改的字段）',
   "canvas.move_node": '{"nodeName":"AI 图片","position":{"x":0,"y":0}}',
   "canvas.resize_node": '{"nodeName":"AI 图片","width":320,"height":240}',
   "canvas.connect_nodes": '{"sourceName":"本地上传","targetName":"AI 视频"}',
   "canvas.delete_node": '{"nodeName":"AI 图片 #2"}',
   "canvas.run_node": '{"nodeName":"AI 视频"}（需用户确认后才真正执行）',
+  "canvas.run_nodes": '{"nodeNames":["AI 图片","AI 图片 #2"]}（批量触发用这个，用户确认一次即可整批执行）',
   "canvas.undo": "无参数",
   "canvas.redo": "无参数",
   "canvas.auto_layout": "无参数",
@@ -260,7 +263,7 @@ const MUTABLE_FIELDS: string[] = [
   "prompt：节点自己的提示词",
   "content：文本节点的正文",
   "model：生成用的模型 id（取值见节点的 model 字段现状，一般不要乱改）",
-  "imageMode：图生视频的模式，如 first-frame / first-last / reference",
+  "imageMode：图生视频模式，reference（参考图，默认）或 first-last（首尾帧，需两张图）",
   "aspectRatio：画面比例，如 1:1 / 16:9 / 9:16 / 4:3 / 3:4 / 21:9",
   "resolution：分辨率档位，如 720p / 1080p / 1K / 2K / 4K",
   "duration：视频时长（秒），取值必须在该模型支持范围内",
@@ -274,12 +277,14 @@ const TOOL_LABELS: Record<string, string> = {
   "canvas.get_snapshot": "读取画布",
   "canvas.get_selected_nodes": "读取选中节点",
   "canvas.create_node": "创建节点",
+  "canvas.create_nodes": "批量创建节点",
   "canvas.update_node": "更新节点参数",
   "canvas.move_node": "移动节点",
   "canvas.resize_node": "调整节点尺寸",
   "canvas.connect_nodes": "连接节点",
   "canvas.delete_node": "删除节点",
   "canvas.run_node": "触发节点生成",
+  "canvas.run_nodes": "批量触发生成",
   "canvas.undo": "撤销",
   "canvas.redo": "重做",
   "canvas.auto_layout": "自动布局",
@@ -327,16 +332,27 @@ export function buildCanvasToolPrompt(level: CanvasAgentAccessLevel = DEFAULT_CA
   lines.push("6. 不要把工具块本身展示或解释给用户，也不要在正文里复述这段 JSON。");
   lines.push("7. 画布操作失败时如实说明失败原因，不要假装已经成功。");
 
+  // ⚠️ 批量提示必须按档位分开写：低档位的提示词里出现它无权使用的工具名，
+  // 会诱使模型写出一个注定被拒的块（有用例守着「只读档不出现写工具」）。
+  if (isCanvasToolAllowed(level, "write")) {
+    lines.push(
+      "8. **批量优先**：一次要建多个节点用 canvas.create_nodes（nodes 数组），" +
+        "不要为每个节点各写一个块 —— 那样既慢又容易中途出错。",
+    );
+  }
+
   if (level === "read-only") {
     lines.push(
-      "8. 当前是**只读**模式：你只能读取画布，不能修改。用户要求改动画布时，如实说明未开启修改权限，并给出建议的手动步骤。",
+      "注意：当前是**只读**模式，你只能读取画布，不能修改。用户要求改动画布时，如实说明未开启修改权限，并给出建议的手动步骤。",
     );
   }
 
   // 只有拿得到生成权限时才提这一条 —— 否则低档位的提示词里会冒出一个它用不了的工具名
   if (isCanvasToolAllowed(level, "paid-operation")) {
     lines.push(
-      "关于 canvas.run_node：它会让节点真正开始生成并产生费用，**必须等用户确认后才执行**。" +
+      "关于 canvas.run_node / canvas.run_nodes：它们会让节点真正开始生成并产生费用，" +
+        "**必须等用户确认后才执行**（批量卡片上会显示这批的预计花费）。" +
+        "一次要跑多个节点时用 canvas.run_nodes（nodeNames 数组），用户确认一次即可整批执行；" +
         "你只负责发起，不要写成「已经生成好了」，也不要在正文里催用户——确认与否是用户的事。",
     );
   }
@@ -346,7 +362,7 @@ export function buildCanvasToolPrompt(level: CanvasAgentAccessLevel = DEFAULT_CA
     const usage = TOOL_USAGE[tool.name];
     lines.push(`- ${tool.name}：${tool.description}${usage ? ` 参数：${usage}` : ""}`);
   }
-  lines.push(`节点类型（create_node 的 type 取值）：${describeNodeTypes()}`);
+  lines.push(`节点类型（create_node / create_nodes 的 type 取值）：${describeNodeTypes()}`);
 
   // 只有拿得到改参数权限时才列字段清单，否则纯属噪音
   if (isCanvasToolAllowed(level, "write")) {

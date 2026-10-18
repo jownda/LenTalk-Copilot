@@ -33,7 +33,7 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
       const next = { ...state, ...action.patch };
       if (action.patch.projectCode === undefined) return next;
       const projectCode = action.patch.projectCode.trim() || deriveProjectCode(next.title);
-      return { ...next, projectCode, assets: (next.assets ?? []).map((asset) => withAssetReferenceTag(asset, projectCode)) };
+      return { ...next, projectCode, assets: (next.assets ?? []).map((asset) => withAssetReferenceTag(asset)) };
     }
     case "ADD_ASSET": {
       const id = action.id ?? newId();
@@ -52,7 +52,7 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
         stateName: "base",
         version: 1,
         changeLog: "",
-      }, state.projectCode?.trim() || deriveProjectCode(state.title));
+      });
       return { ...state, assets: [...(state.assets ?? []), created] };
     }
     case "SET_PROP_CHARACTER_LINK":
@@ -85,14 +85,14 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
         changeLog: "",
         stressTestStatus: "untested",
         stressTestNotes: "",
-      }, state.projectCode?.trim() || deriveProjectCode(state.title));
+      });
       return { ...state, assets: [...(state.assets ?? []), variant] };
     }
     case "UPDATE_ASSET":
       return {
         ...state,
         assets: (state.assets ?? []).map((asset) => asset.id === action.id
-          ? withAssetReferenceTag({ ...asset, ...action.patch }, state.projectCode?.trim() || deriveProjectCode(state.title))
+          ? withAssetReferenceTag({ ...asset, ...action.patch })
           : asset),
       };
     case "DELETE_ASSET":

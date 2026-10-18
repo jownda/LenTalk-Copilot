@@ -177,4 +177,77 @@ describe("executeCanvasAgentCommand", () => {
     expect(result.ok).toBe(false);
     expect(useCanvasStore.getState().edges).toHaveLength(0);
   });
+
+  describe("canvas.create_nodes（批量建节点）", () => {
+    it("一次建多个，名称按画布顺序给出（同名带 #2 后缀）", () => {
+      const created = executeCanvasAgentCommand({
+        tool: "canvas.create_nodes",
+        arguments: {
+          nodes: [
+            { type: "uploadNode", data: { displayName: "锚点" } },
+            { type: "uploadNode", data: { displayName: "锚点" } },
+            { type: "uploadNode", data: { displayName: "锚点" } },
+          ],
+        },
+      });
+
+      expect(created.ok).toBe(true);
+      const data = created.data as { nodeIds: string[]; nodeNames: string[] };
+      expect(data.nodeIds).toHaveLength(3);
+      expect(data.nodeNames).toEqual(["锚点", "锚点 #2", "锚点 #3"]);
+      expect(useCanvasStore.getState().nodes).toHaveLength(3);
+    });
+
+    /**
+     * 这是这层存在的全部理由：逐条 create_node 会让用户按住销 12 次才能退回原状。
+     */
+    it("整批只压一个历史快照 —— 撤销一次全部消失", () => {
+      executeCanvasAgentCommand({
+        tool: "canvas.create_nodes",
+        arguments: {
+          nodes: Array.from({ length: 5 }, (_, index) => ({
+            type: "uploadNode",
+            data: { displayName: `锚点${index}` },
+          })),
+        },
+      });
+      expect(useCanvasStore.getState().nodes).toHaveLength(5);
+      expect(useCanvasStore.getState().history.past).toHaveLength(1);
+
+      expect(executeCanvasAgentCommand({ tool: "canvas.undo", arguments: {} }).ok).toBe(true);
+      expect(useCanvasStore.getState().nodes).toHaveLength(0);
+    });
+
+    it("省略 position 时排在现有内容下方，互不重叠", () => {
+      createNode("uploadNode", { x: 100, y: 200 }, "已有");
+      const existingBottom = useCanvasStore.getState().nodes[0].position.y;
+
+      executeCanvasAgentCommand({
+        tool: "canvas.create_nodes",
+        arguments: {
+          nodes: [
+            { type: "uploadNode", data: { displayName: "新A" } },
+            { type: "uploadNode", data: { displayName: "新B" } },
+          ],
+        },
+      });
+
+      const nodes = useCanvasStore.getState().nodes;
+      const created = nodes.filter((node) => node.id !== nodes[0].id);
+      expect(created).toHaveLength(2);
+      for (const node of created) {
+        expect(node.position.y).toBeGreaterThan(existingBottom);
+      }
+      // 同一行两个不能重合
+      expect(created[0].position.x).not.toBe(created[1].position.x);
+    });
+
+    it("空数组被判参数无效", () => {
+      const result = executeCanvasAgentCommand({
+        tool: "canvas.create_nodes",
+        arguments: { nodes: [] },
+      });
+      expect(result.ok).toBe(false);
+    });
+  });
 });

@@ -27,6 +27,7 @@ import {
 } from '@/features/canvas/domain/canvasNodes';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
+import { CanvasRefThumb } from '@/features/canvas/ui/CanvasRefThumb';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import {
   canvasAiGateway,
@@ -222,12 +223,7 @@ function renderPromptWithHighlights(
           <span
             className="pointer-events-none relative -mr-5 inline-flex h-5 w-5 shrink-0 translate-x-1/2 align-middle items-center justify-center overflow-hidden rounded-md bg-accent/20 shadow-sm"
           >
-            <img
-              src={imageUrl}
-              alt={matchText}
-              draggable={false}
-              className="h-full w-full shrink-0 object-cover"
-            />
+            <CanvasRefThumb source={imageUrl} alt={matchText} className="h-full w-full shrink-0 object-cover" />
           </span>
           {matchText}
         </span>

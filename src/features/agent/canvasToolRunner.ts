@@ -7,8 +7,10 @@
  * 放在这里就能被 vitest 直接驱动（`canvasStore` 在 node 环境下可跑）。
  */
 
-import { getCanvasAgentSnapshot, type CanvasAgentSnapshot } from "./canvasContext";
+import { getCanvasAgentSnapshot, findCanvasNodeByRefName, type CanvasAgentSnapshot } from "./canvasContext";
 import { lenTalkCanvasPlugin } from "./canvasPlugin";
+import { estimateNodePrice, summarizeNodePrices, type NodePriceEstimate } from "./agentNodePrice";
+import { useCanvasStore } from "@/stores/canvasStore";
 import {
   CANVAS_ACCESS_LABELS,
   canvasToolLabel,
@@ -52,6 +54,45 @@ function requiresUserConfirmation(permission: CanvasAgentPermission): boolean {
   return permission === "destructive" || permission === "paid-operation";
 }
 
+/**
+ * 待确认的生成操作：列出要跑的节点 + 这批的预计花费。
+ *
+ * 只有 `run_node` / `run_nodes` 会走到这里（另一个 pending 工具是 delete_node，
+ * 它没有「花费」这个概念）。名称找不到的单独计数，不要混进合计里 ——
+ * 把未知当成 0 会给出一个偏低的报价，比不报价更糟。
+ */
+function describePendingGenerationQuote(call: ParsedCanvasToolCall): string | null {
+  const args = (call.arguments ?? {}) as Record<string, unknown>;
+  const names: string[] = Array.isArray(args.nodeNames)
+    ? args.nodeNames.filter((item): item is string => typeof item === "string")
+    : typeof args.nodeName === "string"
+      ? [args.nodeName]
+      : [];
+  if (names.length === 0) return null;
+
+  const store = useCanvasStore.getState();
+  const estimates: NodePriceEstimate[] = [];
+  const missing: string[] = [];
+  for (const name of names) {
+    const found = findCanvasNodeByRefName(name, store);
+    if (!found.node) {
+      missing.push(name);
+      continue;
+    }
+    estimates.push(estimateNodePrice(found.node));
+  }
+  if (estimates.length === 0) return null;
+
+  const preview =
+    names.slice(0, 6).join("、") + (names.length > 6 ? ` 等 ${names.length} 个` : "");
+  const lines = [`将对 ${estimates.length} 个节点执行：${preview}`];
+  lines.push(`预计 ${summarizeNodePrices(estimates)}`);
+  if (missing.length > 0) {
+    lines.push(`另有 ${missing.length} 个名称找不到，会被跳过：${missing.slice(0, 3).join("、")}`);
+  }
+  return lines.join("\n");
+}
+
 /** 走一轮工具调用：判断能不能做、要不要问；能做的直接做掉 */
 export function runCanvasToolCall(
   call: ParsedCanvasToolCall,
@@ -68,7 +109,12 @@ export function runCanvasToolCall(
   }
 
   if (requiresUserConfirmation(permission)) {
-    return buildRecord(call, { pending: true, message: "需要你确认后才会执行。" });
+    // 会花钱的操作在卡片上先报价 —— 一次跑 12 张图时，没有总价等于让用户盲签。
+    const quote = describePendingGenerationQuote(call);
+    return buildRecord(call, {
+      pending: true,
+      message: quote ?? "需要你确认后才会执行。",
+    });
   }
 
   const result = lenTalkCanvasPlugin.execute(

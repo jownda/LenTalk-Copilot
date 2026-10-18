@@ -134,6 +134,21 @@ interface CanvasState {
     /** 显式初始尺寸；省略则用节点类型注册的 defaultSize。 */
     size?: { width: number; height: number }
   ) => string;
+  /**
+   * 批量创建节点。
+   *
+   * 与连续调 N 次 `addNode` 的唯一区别就是**历史快照**：每次 `addNode` 都压一个快照，
+   * 建 12 个锚点就要按 12 次撤销才能退回去；这里整批只压一个 —— 与批量连线
+   * （`onConnectMany`）同一套约定。
+   */
+  addNodes: (
+    entries: Array<{
+      type: CanvasNodeType;
+      position: { x: number; y: number };
+      data?: Partial<CanvasNodeData>;
+      size?: { width: number; height: number };
+    }>,
+  ) => string[];
   replaceNodeType: (nodeId: string, type: CanvasNodeType, data?: Partial<CanvasNodeData>) => boolean;
   addEdge: (source: string, target: string, sourceHandle?: string, targetHandle?: string) => string | null;
   findNodePosition: (
@@ -1561,6 +1576,36 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       dragHistorySnapshot: null,
     });
     return newNode.id;
+  },
+
+  addNodes: (entries) => {
+    if (entries.length === 0) return [];
+    const state = get();
+    // 先全部构造出来再一次性 set：任何一条抛错都不会留下「建了一半」的画布。
+    const created = entries.map((entry) =>
+      canvasNodeFactory.createNode(
+        entry.type,
+        { x: entry.position.x, y: entry.position.y },
+        entry.data ?? {},
+        entry.size,
+      ),
+    );
+
+    set({
+      nodes: [...state.nodes, ...created],
+      routingRevision: state.routingRevision + 1,
+      inputGraphRevision: state.inputGraphRevision + 1,
+      ...(created.some((node) => (node.data as { isGenerating?: unknown }).isGenerating === true)
+        ? { processingRevision: state.processingRevision + 1 }
+        : {}),
+      history: {
+        past: pushSnapshot(state.history.past, createSnapshot(state.nodes, state.edges)),
+        future: [],
+      },
+      dragHistorySnapshot: null,
+    });
+
+    return created.map((node) => node.id);
   },
 
   replaceNodeType: (nodeId, type, data = {}) => {

@@ -22,17 +22,31 @@ export function deriveProjectCode(title?: string): string {
   return assetToken(title || "project", "project").slice(0, 24);
 }
 
-export function buildAssetReferenceTag(asset: Pick<Asset, "kind" | "name" | "stateName" | "version">, projectCode: string): string {
+/**
+ * 资产的 `@` 引用名。
+ *
+ * 形如 `char_rein`；**加了状态**才带状态与版本：`char_rein_wet_v2`。
+ *
+ * 两条简化（2026-10-17）：
+ * 1. **不再带项目码**。资产引用只在同一个项目内使用，项目码是纯冗余，
+ *    还让引用名长了一截（`char_cb_rein_base_v1` → `char_rein`）。
+ * 2. **没有状态就不带状态与版本**。默认状态（未填 / `base`）下 `_base_v1` 什么都没表达，
+ *    只是把每个引用名都拖长；有状态时才需要版本区分同一资产的多个变体。
+ *    ⚠️ `variant` 这类自动生成的状态**要保留** —— 它是区分同名变体的唯一标识，去掉就撞名。
+ */
+export function buildAssetReferenceTag(asset: Pick<Asset, "kind" | "name" | "stateName" | "version">): string {
   const prefix = KIND_PREFIX[asset.kind] ?? "asset";
-  const code = assetToken(projectCode, "project");
   const name = assetToken(asset.name, prefix);
-  const state = assetToken(asset.stateName || "base", "base");
+  const state = asset.stateName?.trim() ? assetToken(asset.stateName, "") : "";
+  if (!state || state === "base") {
+    return `${prefix}_${name}`;
+  }
   const version = Math.max(1, Math.round(asset.version ?? 1));
-  return `${prefix}_${code}_${name}_${state}_v${version}`;
+  return `${prefix}_${name}_${state}_v${version}`;
 }
 
 /** 旧资产也必须拥有稳定引用与状态基卡信息，避免同名资产在提示词里互相覆盖。 */
-export function withAssetReferenceTag(asset: Asset, projectCode: string): Asset {
+export function withAssetReferenceTag(asset: Asset): Asset {
   const groupId = asset.variantGroupId?.trim() || asset.baseAssetId?.trim() || asset.id;
   const baseAssetId = asset.baseAssetId?.trim() || asset.id;
   const stateName = asset.stateName?.trim() || "base";
@@ -43,7 +57,7 @@ export function withAssetReferenceTag(asset: Asset, projectCode: string): Asset 
     baseAssetId,
     stateName,
     version,
-    referenceTag: buildAssetReferenceTag({ ...asset, stateName, version }, projectCode),
+    referenceTag: buildAssetReferenceTag({ ...asset, stateName, version }),
   };
 }
 

@@ -236,6 +236,108 @@ describe("画布工具（按名称引用）", () => {
     expect(done.message).toContain("可视区域");
   });
 
+  describe("canvas.run_nodes（批量触发）", () => {
+    /** 一次建 3 个同名节点（名称就是 锚点 / 锚点 #2 / 锚点 #3） */
+    function seedThree() {
+      runCanvasToolCall(
+        {
+          tool: "canvas.create_nodes",
+          arguments: {
+            nodes: [
+              { type: "imageNode", data: { displayName: "锚点" } },
+              { type: "imageNode", data: { displayName: "锚点" } },
+              { type: "imageNode", data: { displayName: "锚点" } },
+            ],
+          },
+        },
+        "full",
+      );
+      return useCanvasStore.getState().nodes.map((node) => node.id);
+    }
+
+    it("即便有 full 权限，也先停在确认、一个都不点火", () => {
+      const ids = seedThree();
+      let fired = 0;
+      for (const id of ids) registerNodeGenerationHandler(id, () => { fired += 1; });
+
+      const asked = runCanvasToolCall(
+        {
+          tool: "canvas.run_nodes",
+          arguments: { nodeNames: ["锚点", "锚点 #2", "锚点 #3"] },
+        },
+        "full",
+      );
+      expect(asked.pending).toBe(true);
+      expect(fired).toBe(0);
+    });
+
+    it("确认后整批一起跑，每个节点只触发一次", () => {
+      const ids = seedThree();
+      const firedByNode = new Map<string, number>();
+      for (const id of ids) {
+        registerNodeGenerationHandler(id, () => {
+          firedByNode.set(id, (firedByNode.get(id) ?? 0) + 1);
+        });
+      }
+
+      const done = confirmAndRunCanvasToolCall(
+        {
+          tool: "canvas.run_nodes",
+          arguments: { nodeNames: ["锚点", "锚点 #2", "锚点 #3"] },
+        },
+        "full",
+      );
+      expect(done.ok).toBe(true);
+      expect(firedByNode.size).toBe(3);
+      expect([...firedByNode.values()]).toEqual([1, 1, 1]);
+    });
+
+    it("部分名称找不到时，能跑照跑、跳过的逐个说明原因", () => {
+      const ids = seedThree();
+      let fired = 0;
+      registerNodeGenerationHandler(ids[0], () => { fired += 1; });
+
+      const done = confirmAndRunCanvasToolCall(
+        { tool: "canvas.run_nodes", arguments: { nodeNames: ["锚点", "锚点 #2"] } },
+        "full",
+      );
+      expect(done.ok).toBe(true);
+      expect(fired).toBe(1);
+      // 第二个没注册 handler（＝不在可视区），必须如实报出来
+      expect(done.message).toContain("跳过 1 个");
+      expect(done.message).toContain("锚点 #2");
+    });
+
+    it("一个都跑不起来时判失败，不让模型以为已经开始", () => {
+      seedThree();
+      const done = confirmAndRunCanvasToolCall(
+        { tool: "canvas.run_nodes", arguments: { nodeNames: ["锚点"] } },
+        "full",
+      );
+      expect(done.ok).toBe(false);
+      expect(done.message).toContain("跳过");
+    });
+
+    /**
+     * 确认卡片上必须有总价：12 张图一起跑时，没有合计等于让用户盲签一张账单。
+     * 测试里的模型没有价格数据，所以出现的是「价格未知」——重点是**这句必须存在**。
+     */
+    it("待确认的卡片上给出节点数与预计花费", () => {
+      seedThree();
+      const asked = runCanvasToolCall(
+        {
+          tool: "canvas.run_nodes",
+          arguments: { nodeNames: ["锚点", "锚点 #2", "锚点 #3"] },
+        },
+        "full",
+      );
+      expect(asked.pending).toBe(true);
+      expect(asked.message).toContain("将对 3 个节点执行");
+      expect(asked.message).toContain("预计");
+      expect(asked.message).toContain("锚点 #2");
+    });
+  });
+
   it("读快照时把真实内容回给模型", () => {
     runCanvasToolCall(
       {

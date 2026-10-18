@@ -65,4 +65,36 @@ describe('pickCanvasImageSource', () => {
     expect(pick.kind).toBe('original');
     expect(pick.url).toBe('D:\\p.jpg');
   });
+
+  /**
+   * `useOriginal` 是给「不想为了这一个判断去订阅整个视口」的调用方用的旁路：
+   * 节点订阅 `transform[2] >= 阈值` 这个**布尔**后，平移画布就不会重渲染。
+   * 它必须与按 zoom 判断**完全等价**，否则省下来的重渲染会变成「该看原图时还在用小图」。
+   */
+  it('useOriginal 旁路与按 zoom 判断等价', () => {
+    const byZoomFar = pickCanvasImageSource({ zoom: FAR_ZOOM, imageUrl: LOCAL, previewImageUrl: 'D:\\p.jpg' });
+    const byFlagFar = pickCanvasImageSource({
+      zoom: NEAR_ZOOM, // 故意给「小图档」的 zoom，证明结论只由 useOriginal 决定
+      useOriginal: true,
+      imageUrl: LOCAL,
+      previewImageUrl: 'D:\\p.jpg',
+    });
+    expect(byFlagFar).toEqual(byZoomFar);
+
+    const byZoomNear = pickCanvasImageSource({ zoom: NEAR_ZOOM, imageUrl: LOCAL, previewImageUrl: 'D:\\p.jpg' });
+    const byFlagNear = pickCanvasImageSource({
+      zoom: FAR_ZOOM,
+      useOriginal: false,
+      imageUrl: LOCAL,
+      previewImageUrl: 'D:\\p.jpg',
+    });
+    expect(byFlagNear).toEqual(byZoomNear);
+  });
+
+  it('useOriginal 为 false 时仍然走缩略图（不会退化成直接给原图）', () => {
+    const pick = pickCanvasImageSource({ zoom: FAR_ZOOM, useOriginal: false, imageUrl: LOCAL });
+    expect(pick.kind).toBe('thumbnail');
+    expect(pick.url).toBeNull();
+    expect(pick.thumbnailSource).toBe(LOCAL);
+  });
 });

@@ -30,12 +30,13 @@ const project: ProjectV2 = {
 describe("projectReducer asset naming", () => {
   it("updates the stable tag when the state or version changes", () => {
     const next = projectReducer(project, { type: "UPDATE_ASSET", id: "kel", patch: { stateName: "wet", version: 2 } });
-    expect(next.assets?.[0].referenceTag).toBe("char_cb_kel_wet_v2");
+    expect(next.assets?.[0].referenceTag).toBe("char_kel_wet_v2");
   });
 
-  it("recalculates all asset tags after changing the project code", () => {
+  it("改项目码不再影响引用名（项目码已从引用格式里移除）", () => {
     const next = projectReducer(project, { type: "PATCH_PROJECT", patch: { projectCode: "CHB" } });
-    expect(next.assets?.[0].referenceTag).toBe("char_chb_kel_base_v1");
+    expect(next.projectCode).toBe("CHB");
+    expect(next.assets?.[0].referenceTag).toBe("char_kel");
   });
 
   it("creates an independent state card with inherited base description and a new version", () => {
@@ -43,7 +44,7 @@ describe("projectReducer asset naming", () => {
     expect(next.assets?.[1]).toMatchObject({
       id: "kel-wet", variantGroupId: "kel", baseAssetId: "kel", stateName: "wet", version: 2,
       baseDescription: "teenage boy", description: "", stressTestStatus: "untested",
-      referenceTag: "char_cb_kel_wet_v2",
+      referenceTag: "char_kel_wet_v2",
     });
   });
 

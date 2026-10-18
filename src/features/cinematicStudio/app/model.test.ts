@@ -36,7 +36,7 @@ describe("project optics migration", () => {
       baseAssetId: "kel",
       stateName: "base",
       version: 1,
-      referenceTag: "char_cully-hill-boys_kel_base_v1",
+      referenceTag: "char_kel",
     });
   });
 
