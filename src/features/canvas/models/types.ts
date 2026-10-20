@@ -53,6 +53,14 @@ export interface ImageModelDefinition {
   aspectRatios: AspectRatioOption[];
   resolutions: ResolutionOption[];
   resolveResolutions?: (context: ImageModelRuntimeContext) => ResolutionOption[];
+  /**
+   * 节点上「生成张数」的一个档位实际产出多少张。
+   *
+   * 缺省 1（一档一张，绝大多数模型）。Midjourney 是 4 —— 上游一次任务恒出 4 张，
+   * `count` 只能按「组」翻倍，见 `models/midjourney.ts` 的实测记录。
+   * 节点里存的 `imageCount` 仍然是档位（1~4），换算只发生在展示与请求两处。
+   */
+  imagesPerCountUnit?: number;
   extraParamsSchema?: ExtraParamDefinition[];
   defaultExtraParams?: Record<string, unknown>;
   pricing?: ModelPricingDefinition;

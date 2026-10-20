@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { isKnownOpenAiImagesBaseUrl, findRecommendedApiByBaseUrl, listVisibleRecommendedApis, normalizeRecommendedBaseUrl, recommendedApis, resolveNewRecommendedVideoModels, visibleRecommendedApiIds } from './recommendedApis';
+import {
+  isKnownOpenAiImagesBaseUrl,
+  findRecommendedApiByBaseUrl,
+  listVisibleRecommendedApis,
+  normalizeRecommendedBaseUrl,
+  recommendedApis,
+  resolveNewRecommendedVideoModels,
+  visibleRecommendedApiIds,
+} from './recommendedApis';
 import { isAudioModelName, isVideoGenerationModelName } from '@/stores/settingsStore';
 import { resolveVideoModelProfile } from '@/features/canvas/models/videoProfiles';
 import { isRjmVideoApiBaseUrl } from '@/commands/videoApi';
@@ -171,9 +179,7 @@ describe('炳火 API 推荐平台', () => {
   it('专属链路按 Base URL 就能命中, 不依赖自定义平台 id', () => {
     // 卡片连上后 id 由名称生成(「炳火 API」→ custom:炳火-api), 所以 Base URL 兜底
     // 必须成立, 否则节点会退化成通用 OpenAI Video 协议。
-    expect(
-      resolveVideoModelProfile('custom:炳火-api/bh2.0-720p', 'https://api.7tai.cc/v1').id,
-    ).toBe('binghuo-video');
+    expect(resolveVideoModelProfile('custom:炳火-api/bh2.0-720p', 'https://api.7tai.cc/v1').id).toBe('binghuo-video');
   });
 
   it('预填的图片模型不会被视频/音频启发式误判', () => {
@@ -181,6 +187,74 @@ describe('炳火 API 推荐平台', () => {
     expect(models.length).toBeGreaterThan(0);
     expect(models.filter((model) => isVideoGenerationModelName(model))).toEqual([]);
     expect(models.filter((model) => isAudioModelName(model))).toEqual([]);
+  });
+});
+
+describe('api666888 暗苗链路预设', () => {
+  const api = recommendedApis.find((item) => item.id === 'api666888');
+
+  it('74 个视频模型全部登记, 且每个都落到一个明确协议', () => {
+    // 2026-10-20 平台全量: chat 78 / image 21 / video 74 / audio 8。
+    // 视频 74 个一个不少 —— 这是「全量接入」的底线, 少一个就是漏配。
+    expect(api?.videoModels).toHaveLength(74);
+    expect(new Set(api?.videoModels).size).toBe(74);
+    // 抽样覆盖每个家族, 防止以后被整段误删:
+    expect(api?.videoModels).toEqual(
+      expect.arrayContaining([
+        'seedance-2.5-guanfang-anmiao',
+        'seedance-2.5-anmiao-wensheng',
+        'kling-v3-video',
+        'kling-motion-control',
+        'wan3.0-video',
+        'hailuo-h3-max',
+        'viduq4-preview',
+        'pixverse-v6-shouweizhen',
+        'happyhorse-t2v',
+        'minimax-h3',
+        'omni-flash',
+        'vo3.1',
+        'gk-video-3.5',
+        'hailuo-h3-zaishengcheng',
+      ]),
+    );
+    expect(api?.videoConfig?.transport).toBe('media-generate');
+    expect(api?.videoConfig?.transportByModel).toEqual({
+      'seedance-2.5-guanfang-anmiao': 'ark-anmiao',
+      'seedance-2.0-guanfang-anmiao': 'ark-anmiao',
+    });
+    // 满血版走方舟, 其余 72 个走 media —— 不能有第三个协议漏网。
+    const transports = (api?.videoModels ?? []).map(
+      (model) => api?.videoConfig?.transportByModel?.[model] ?? api?.videoConfig?.transport,
+    );
+    expect(new Set(transports)).toEqual(new Set(['media-generate', 'ark-anmiao']));
+  });
+
+  it('图片 19 / 音频 8 / 对话 55 分门别类登记, 不互串', () => {
+    expect(api?.models).toHaveLength(19);
+    expect(api?.audioModels).toHaveLength(8);
+    expect(api?.chatModels).toHaveLength(55);
+    // 平台图片 21 个, 其中 kling-v3 / kling-v3-omni 会被视频识别规则抢走, 刻意不收。
+    expect(api?.models).not.toContain('kling-v3');
+    expect(api?.models).not.toContain('kling-v3-omni');
+    // 23 个 anthropic / gemini 原生协议模型不登记(软件对话只走 /v1/chat/completions)。
+    expect(api?.chatModels).not.toContain('sn-5-5');
+    expect(api?.chatModels).not.toContain('gem-4-argon');
+    // 老配置靠 revision 增量补端点。
+    expect(api?.videoModelsRevision).toBe(2);
+  });
+
+  it('Base URL 指向真实网关而不是白标静态站', () => {
+    // api666888.com 只有静态站: 任何路径都回 index.html, POST /v1/media/generate 是
+    // nginx 405。真实网关在 api.lingkeai.ai(同一组出口 IP / 同一套 nginx), 填错域名
+    // 会让每个请求都拿到 HTML 而不是 JSON。
+    expect(api?.baseUrl).toBe('https://api.lingkeai.ai');
+    // 注册 / 充值走推广链接, 带 `yonghu=` 归因参数, 不能退化成裸站。
+    expect(api?.registerUrl).toBe('https://lingkeai.ai?yonghu=R7T9O1W16A64FT7W');
+    expect(api?.registerUrl).toContain('yonghu=');
+    // 显示名改成「灵柯AI」, 但 id 必须还是 api666888 —— registry.ts 的 isApi666888
+    // 按 id 认视频参数表, 改名连带改 id 会让 9 个模型的时长/画幅档位失效。
+    expect(api?.name).toBe('灵柯AI');
+    expect(api?.id).toBe('api666888');
   });
 });
 
@@ -204,6 +278,8 @@ describe('推荐平台可见白名单(密钥页展示内置推荐平台)', () =>
       'runninghub',
       'runninghub-cn',
       'modelscope',
+      // api666888: 「暗苗」链路(media 信封 + 火山方舟两种协议混挂)。
+      'api666888',
     ]);
   });
 
@@ -254,12 +330,12 @@ describe('隐藏推荐卡片不影响自定义平台命中链路', () => {
   // 手工在「自定义平台」新增同域名平台时, id 会按名称生成(如「知鸟AI」→ custom:知鸟ai),
   // 所以必须靠 baseUrl 兜底, 这里锁住这条兜底路径。
   it('字子动画 / 知鸟AI 仍按 Base URL 命中专属视频协议', () => {
-    expect(
-      resolveVideoModelProfile('custom:字子动画/zzdh-Minimax-h3-480p', 'https://www.zizidonghua.com').id,
-    ).toBe('zzdh-v8-video');
-    expect(
-      resolveVideoModelProfile('custom:知鸟ai/seedance-2-5', 'https://cuai.token6688.com').id,
-    ).toBe('zhiniao-video');
+    expect(resolveVideoModelProfile('custom:字子动画/zzdh-Minimax-h3-480p', 'https://www.zizidonghua.com').id).toBe(
+      'zzdh-v8-video',
+    );
+    expect(resolveVideoModelProfile('custom:知鸟ai/seedance-2-5', 'https://cuai.token6688.com').id).toBe(
+      'zhiniao-video',
+    );
   });
 
   it('Sub2API 视频域名仍被识别为 Rjm 异步链路', () => {
@@ -345,10 +421,7 @@ describe('RunningHub 国际版 / 国内版', () => {
       expect(preset?.videoConfig?.queryPath).toBe('/openapi/v2/query');
     }
     expect(
-      resolveVideoModelProfile(
-        'custom:runninghub/kling-v3.0-pro/image-to-video',
-        'https://www.runninghub.cn',
-      ).id,
+      resolveVideoModelProfile('custom:runninghub/kling-v3.0-pro/image-to-video', 'https://www.runninghub.cn').id,
     ).toBe('runninghub-model');
   });
 });
@@ -400,9 +473,7 @@ describe('可见推荐平台直接连接后的模型归属', () => {
 
 describe('推荐平台的余额查询声明', () => {
   it('只给确实有额度接口的平台声明 balanceKind', () => {
-    const kinds = Object.fromEntries(
-      listVisibleRecommendedApis().map((api) => [api.id, api.balanceKind ?? null]),
-    );
+    const kinds = Object.fromEntries(listVisibleRecommendedApis().map((api) => [api.id, api.balanceKind ?? null]));
     expect(kinds).toEqual({
       // TokenGo 是 One-API 系网关: /v1/dashboard/billing/subscription 存在(未授权时 401 而非 404)。
       zhiniao: 'openai-billing',
@@ -412,6 +483,8 @@ describe('推荐平台的余额查询声明', () => {
       'runninghub-cn': 'runninghub',
       // ModelScope 实测该端点返回 404 —— 声明了只会白发请求且永远查不到余额。
       modelscope: null,
+      // api666888 有 /v1/skills/balance, 但尚未接入余额查询, 先不声明。
+      api666888: null,
     });
   });
 });
@@ -420,15 +493,11 @@ describe('预设视频模型的增量同步', () => {
   // 「预设加了端点, 但已添加过该平台的用户看不到」—— 平台添加后模型列表就与预设脱钩。
   // 下面锁定补差集的语义。
   const presetEndpointIds = RUNNINGHUB_VIDEO_ENDPOINTS.map((item) => item.endpoint);
-    // 老配置: 第二批才补进来的 bytedance/* 端点当时还不存在。
-    const legacyModels = presetEndpointIds.filter((id) => !id.startsWith('bytedance/'));
+  // 老配置: 第二批才补进来的 bytedance/* 端点当时还不存在。
+  const legacyModels = presetEndpointIds.filter((id) => !id.startsWith('bytedance/'));
 
   it('从未同步过的老配置能把预设新增的端点补出来', () => {
-    const resolved = resolveNewRecommendedVideoModels(
-      'https://www.runninghub.cn',
-      legacyModels,
-      undefined,
-    );
+    const resolved = resolveNewRecommendedVideoModels('https://www.runninghub.cn', legacyModels, undefined);
     expect(resolved).not.toBeNull();
     expect(resolved?.revision).toBe(3);
     expect(resolved?.models).toEqual([
@@ -439,16 +508,12 @@ describe('预设视频模型的增量同步', () => {
   });
 
   it('已对齐的平台是 no-op —— 用户删掉的预设端点不会被反复加回来', () => {
-    expect(
-      resolveNewRecommendedVideoModels('https://www.runninghub.cn', presetEndpointIds, 3),
-    ).toBeNull();
+    expect(resolveNewRecommendedVideoModels('https://www.runninghub.cn', presetEndpointIds, 3)).toBeNull();
   });
 
   it('对齐之后用户删掉某个预设端点, 依然不会复活', () => {
     const afterUserDeletion = presetEndpointIds.filter((id) => !id.includes('hailuo'));
-    expect(
-      resolveNewRecommendedVideoModels('https://www.runninghub.cn', afterUserDeletion, 3),
-    ).toBeNull();
+    expect(resolveNewRecommendedVideoModels('https://www.runninghub.cn', afterUserDeletion, 3)).toBeNull();
   });
 
   it('用户手加的端点既不会被删, 也不影响差集', () => {

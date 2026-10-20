@@ -437,6 +437,14 @@
     "aspectRatio": "Aspect Ratio",
     "imageCount": "Images per run",
     "imageCountOption": "{{count}}",
+    "imageCountGroupHint": "This model returns {{unit}} images per job — whole groups only",
+    "midjourney": {
+      "botType": "Engine",
+      "midJourney": "MJ photoreal",
+      "nijiJourney": "Niji anime",
+      "version": "Version",
+      "stylize": "Stylize"
+    },
     "enableWebSearch": "Enable web search",
     "otherParams": "Other Params",
     "extraOptions": "Extra options",

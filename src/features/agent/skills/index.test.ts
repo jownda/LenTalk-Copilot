@@ -69,3 +69,116 @@ describe("仙宫 SKILL 的内容没被精简掉", () => {
     expect(tiangonxieyi.thumbnail).toContain(`${tiangonxieyi.id}.webp`);
   });
 });
+
+describe("不良人武侠 SKILL 的内容没被精简掉", () => {
+  const skill = findAgentSkill("seedance-buliangren-wuxia");
+
+  it("已登记，名字/简介/缩略图都齐", () => {
+    expect(skill).not.toBeNull();
+    expect(skill?.name).toBe("不良人武侠导演");
+    expect(skill?.intro).toContain("不良人");
+    expect(skill?.thumbnail).toContain(`local-assets/agent-skills/${skill?.id}.webp`);
+  });
+
+  it("模式选择与两层输出结构都在（精简掉这些等于换了 skill）", () => {
+    expect(skill?.rules).toContain("模式选择");
+    // v2 起格式从「格式A/B/C 逐镜」改成「全局设定层 + 段落层」，示例必须跟着换
+    expect(skill?.rules).toContain("提示词格式（两层结构");
+    expect(skill?.rules).toContain("【视频基础】");
+    expect(skill?.rules).toContain("【段落剧情】");
+  });
+
+  it("规则是全文，不是截断 —— 尾部触发词也必须在", () => {
+    // skill 曾经因为模板字符串被截断过一半，尾行断言就是防这个。
+    // v2 删掉了全部 cm/°/cm/s 参数表，全文从 40K 降到 20K 左右，阈值随之下调。
+    expect(skill?.rules.length ?? 0).toBeGreaterThan(15000);
+    expect(skill?.rules).toContain("用户提供包含兵器交锋、眼神对峙、武侠动作的剧本");
+  });
+
+  it("模式选择走文字提问，不再要求调用不存在的弹窗工具", () => {
+    // Agent 只有 canvas.* 工具，写「必须使用 AskUserQuestion」会让模型去调一个不存在的工具，
+    // 要么报错要么空转。四个模式必须以纯文本列表的形式问出来。
+    expect(skill?.rules).toContain("没有弹窗选择工具");
+    expect(skill?.rules).toContain("请回复序号选择拍摄模式");
+    ["武打戏", "对峙戏", "混合模式", "自动判断"].forEach((mode) => {
+      expect(skill?.rules).toContain(mode);
+    });
+    // 提问后必须停下，否则用户还没选就被写完了
+    expect(skill?.rules).toContain("提问后必须停下");
+  });
+});
+
+describe("SKILL 的提问式流程不被强制产出覆盖", () => {
+  it("system prompt 明确要求先提问再等回复", () => {
+    const skill = findAgentSkill("seedance-buliangren-wuxia");
+    const prompt = composeAgentSystemPrompt(BASE, skill);
+    expect(prompt).toContain("停下等待回复");
+  });
+});
+
+describe("不良人 SKILL 的输出硬性约束", () => {
+  const rules = findAgentSkill("seedance-buliangren-wuxia")?.rules ?? "";
+
+  it("总时长写在提示词第一行", () => {
+    expect(rules).toContain("### 输出硬性约束");
+    expect(rules).toContain("总时长：15秒｜无BGM｜无字幕｜无画外音");
+    // 示例的第一行就是总时长 —— 模型照抄示例的概率远高于照抄规则
+    expect(rules).toContain("总时长：15秒｜无BGM");
+  });
+
+  it("每个完整示例的第一行都是总时长，不是【视频基础】也不是镜头", () => {
+    const blocks = [...rules.matchAll(/```([\s\S]*?)```/g)].map((match) => match[1]);
+    const fullPrompts = blocks.filter(
+      // 模板块只有骨架，没有结尾那句；用尾句把「完整示例」和「骨架」区分开
+      (block) => block.includes("【视频基础】") && block.includes("画面稳定，角色一致，无穿帮变形。"),
+    );
+    expect(fullPrompts.length).toBeGreaterThanOrEqual(3);
+    for (const block of fullPrompts) {
+      expect(block.trimStart().startsWith("总时长：")).toBe(true);
+      // 两层结构：全局块齐全 + 每一幕七个字段齐全
+      ["【光影质感】", "【世界背景】", "【角色】", "【场景与环境】", "【段落剧情】"].forEach((field) => {
+        expect(block).toContain(field);
+      });
+      ["站位：", "镜头：", "台词：无", "情绪：", "特效：", "声音："].forEach((field) => {
+        expect(block).toContain(field);
+      });
+    }
+  });
+
+  it("成品示例里没有 cm / ° / 每秒参数（参数表已整张删除）", () => {
+    // ❌ 反例块里必须保留错误写法，所以按「代码块前面紧邻的文字」判断它是不是反例
+    const blocks = [...rules.matchAll(/```([\s\S]*?)```/g)].map((match) => ({
+      body: match[1],
+      isBadExample: rules.slice(Math.max(0, (match.index ?? 0) - 40), match.index ?? 0).includes("❌"),
+    }));
+    for (const { body, isBadExample } of blocks) {
+      if (isBadExample) continue;
+      expect(body).not.toMatch(/\d+\s*cm/);
+      expect(body).not.toMatch(/\d+\s*°/);
+      expect(body).not.toMatch(/速度\s*\d/);
+    }
+  });
+
+  it("所有示例块都不再出现热血值/色调/画幅/风格", () => {
+    // 规则文本里可以写「禁止色调」，但示例块里一个字都不能留：
+    // 示例是模型的直接模仿对象，示例带什么它就会写什么
+    const blocks = [...rules.matchAll(/```([\s\S]*?)```/g)].map((match) => match[1]);
+    expect(blocks.length).toBeGreaterThan(5);
+    for (const block of blocks) {
+      expect(block).not.toMatch(/。?热血值：\d/);
+      expect(block).not.toContain("色调");
+      expect(block).not.toContain("9:16 | ");
+      expect(block).not.toContain("3D质感");
+      expect(block).not.toContain("画质引擎");
+      // 打击感等级/技法统计原来写在示例块的尾部，会被当成提示词的一部分照抄
+      expect(block).not.toContain("打击感等级");
+      expect(block).not.toContain("技法统计");
+    }
+  });
+
+  it("强度档降级成内部推演，不再要求写进成品", () => {
+    expect(rules).toContain("仅供推演，禁止写进成品");
+    // 旧措辞「每个提示词结尾标注热血等级」正是让它出现在成品里的原因
+    expect(rules).not.toContain("每个提示词结尾标注");
+  });
+});

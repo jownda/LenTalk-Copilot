@@ -4,6 +4,7 @@ import {
   Check,
   ChevronDown,
   Loader2,
+  LocateFixed,
   Play,
   Plus,
   Send,
@@ -28,7 +29,7 @@ import { useProjectStore } from "@/stores/projectStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 import { selectSessionsForProject, useAgentStore } from "./agentStore";
-import { extractNodeMediaUrl, getCanvasAgentSnapshot } from "./canvasContext";
+import { extractNodeMediaUrl, extractToolResultNodeIds, getCanvasAgentSnapshot } from "./canvasContext";
 import {
   CANVAS_ACCESS_HINTS,
   CANVAS_ACCESS_LABELS,
@@ -687,6 +688,16 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
     });
   }, []);
 
+  /**
+   * 把画布镜头移到这张卡片碰过的节点上。
+   *
+   * 只投递请求，真正取景由 Canvas 里的 effect 调 `fitView` 完成 ——
+   * 视口是 React Flow 的非受控状态，这里拿不到它的实例。
+   */
+  const handleLocateToolCall = useCallback((nodeIds: string[]) => {
+    useCanvasStore.getState().requestFocusNodes(nodeIds);
+  }, []);
+
   const handleNewSession = useCallback(() => {
     if (useAgentStore.getState().streaming) return;
     createSession(projectId ?? null);
@@ -865,51 +876,68 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
                   {/* AI 对画布做过的操作。展开在正文下方，用户一眼能看到「它到底动了什么」 */}
                   {message.toolCalls?.length ? (
                     <div className="mt-2 space-y-1 border-t border-border-dark/60 pt-1.5">
-                      {message.toolCalls.map((record, index) => (
-                        <div
-                          key={`${record.tool}-${index}`}
-                          className="rounded border border-border-dark bg-surface-dark/60 px-2 py-1"
-                        >
-                          <div className="flex items-center gap-1">
-                            {record.pending ? (
-                              <Play className="h-3 w-3 shrink-0 text-accent" />
-                            ) : record.ok ? (
-                              <Check className="h-3 w-3 shrink-0 text-accent" />
-                            ) : (
-                              <X className="h-3 w-3 shrink-0 text-red-400" />
-                            )}
-                            <span className="text-[10px] font-medium text-text-dark">
-                              {record.label}
-                            </span>
-                            <span className="truncate text-[10px] text-text-muted">{record.tool}</span>
-                          </div>
+                      {message.toolCalls.map((record, index) => {
+                        // 这张卡片碰过的节点。有 id 才给「定位」按钮 ——
+                        // 读快照、撤销这类操作没有目标节点，给了按钮也没处可去。
+                        const locateIds = extractToolResultNodeIds(record.data);
+                        return (
                           <div
-                            className="mt-0.5 line-clamp-3 whitespace-pre-wrap break-words text-[10px] leading-snug text-text-muted"
-                            title={record.message}
+                            key={`${record.tool}-${index}`}
+                            className="rounded border border-border-dark bg-surface-dark/60 px-2 py-1"
                           >
-                            {record.message}
-                          </div>
-                          {record.mediaUrl ? <AgentMediaPreview url={record.mediaUrl} /> : null}
-                          {record.pending ? (
-                            <div className="mt-1.5 flex items-center gap-1.5">
-                              <button
-                                type="button"
-                                onClick={() => handleConfirmToolCall(message.id, index)}
-                                className="rounded bg-accent px-2 py-0.5 text-[10px] font-medium text-white hover:opacity-90"
-                              >
-                                确认执行
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleSkipToolCall(message.id, index)}
-                                className="rounded border border-border-dark px-2 py-0.5 text-[10px] text-text-muted hover:text-text-dark"
-                              >
-                                跳过
-                              </button>
+                            <div className="flex items-center gap-1">
+                              {record.pending ? (
+                                <Play className="h-3 w-3 shrink-0 text-accent" />
+                              ) : record.ok ? (
+                                <Check className="h-3 w-3 shrink-0 text-accent" />
+                              ) : (
+                                <X className="h-3 w-3 shrink-0 text-red-400" />
+                              )}
+                              <span className="text-[10px] font-medium text-text-dark">
+                                {record.label}
+                              </span>
+                              <span className="truncate text-[10px] text-text-muted">{record.tool}</span>
                             </div>
-                          ) : null}
-                        </div>
-                      ))}
+                            <div
+                              className="mt-0.5 line-clamp-3 whitespace-pre-wrap break-words text-[10px] leading-snug text-text-muted"
+                              title={record.message}
+                            >
+                              {record.message}
+                            </div>
+                            {record.mediaUrl ? <AgentMediaPreview url={record.mediaUrl} /> : null}
+                            {record.pending ? (
+                              <div className="mt-1.5 flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => handleConfirmToolCall(message.id, index)}
+                                  className="rounded bg-accent px-2 py-0.5 text-[10px] font-medium text-white hover:opacity-90"
+                                >
+                                  确认执行
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleSkipToolCall(message.id, index)}
+                                  className="rounded border border-border-dark px-2 py-0.5 text-[10px] text-text-muted hover:text-text-dark"
+                                >
+                                  跳过
+                                </button>
+                              </div>
+                            ) : null}
+                            {/* 删除类卡片不给定位按钮：那张返回里的 nodeId 已经不在画布上了 */}
+                            {!record.pending && record.ok && record.tool !== "canvas.delete_node" && locateIds.length > 0 ? (
+                              <button
+                                type="button"
+                                onClick={() => handleLocateToolCall(locateIds)}
+                                className="mt-1.5 flex items-center gap-1 rounded border border-border-dark px-2 py-0.5 text-[10px] text-text-muted hover:border-accent hover:text-accent"
+                                title="把画布镜头移到这个节点上"
+                              >
+                                <LocateFixed className="h-3 w-3 shrink-0" />
+                                定位到画布
+                              </button>
+                            ) : null}
+                          </div>
+                        );
+                      })}
                     </div>
                   ) : null}
                   {message.error ? (

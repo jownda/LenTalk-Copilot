@@ -20,6 +20,14 @@ import { isWindowsDesktopRuntime } from "@/platform/runtime";
 import { createPointsOnlyPricing } from "@/features/canvas/pricing";
 import { resolveVideoModelProfile } from "./videoProfiles";
 import { resolveImageModelResolutionOptions } from "./imageModelCapabilities";
+import { createZhiniaoImagePricing, createZhiniaoVideoPricing, isZhiniaoProvider } from "./zhiniaoPricing";
+import { createWgspaiImagePricing, createWgspaiVideoPricing, isWgspaiProvider } from "./wgspaiPricing";
+import {
+  isMidjourneyImageModel,
+  MIDJOURNEY_DEFAULT_EXTRA_PARAMS,
+  MIDJOURNEY_EXTRA_PARAMS,
+  MIDJOURNEY_IMAGES_PER_GROUP,
+} from "./midjourney";
 import { isRjmVideoApiBaseUrl } from "@/commands/videoApi";
 import { resolveMmxVoiceOperation } from "@/commands/minimaxVoice";
 import { isSunoMusicModel } from "@/commands/sunoMusic";
@@ -35,10 +43,7 @@ import {
   ZZDH_VIDEO_DURATION_OPTIONS,
 } from "@/commands/zzdhApi";
 import { WAN_CLI_PROVIDER_ID, wanCliProvider, wanCliVideoModels } from "./wanCli";
-import {
-  resolveWgspaiAspectRatioOptions,
-  resolveWgspaiDurationOptions,
-} from "@/commands/wgspaiProtocol";
+import { resolveWgspaiAspectRatioOptions, resolveWgspaiDurationOptions } from "@/commands/wgspaiProtocol";
 import {
   isRunningHubBaseUrl,
   resolveRunningHubAspectRatioOptions,
@@ -50,6 +55,7 @@ import {
   collapseRunningHubVideoModels,
   isRunningHubDedicatedVideoEndpoint,
 } from "@/commands/runningHubProtocol";
+import { resolveApi666888VideoOptions } from "./lingkeVideoOptions";
 
 const providerModules = import.meta.glob<{ provider: ModelProviderDefinition }>("./providers/*.ts", { eager: true });
 const modelModules = import.meta.glob<{ imageModel: ImageModelDefinition }>("./image/**/*.ts", { eager: true });
@@ -190,8 +196,7 @@ function isVideoUpscaleModelName(model: string): boolean {
 export function listVideoModels(): VideoModelDefinition[] {
   const customVideoModels: VideoModelDefinition[] = useSettingsStore.getState().customApis.flatMap((api) => {
     const isRunningHubApi =
-      isRunningHubBaseUrl(api.baseUrl) ||
-      ["runninghub", "runninghub-cn"].includes(api.id.trim().toLowerCase());
+      isRunningHubBaseUrl(api.baseUrl) || ["runninghub", "runninghub-cn"].includes(api.id.trim().toLowerCase());
     // RunningHub 的文生/图生/多模态是同一个模型家族的不同端点。
     // 普通视频节点只保留一个 canonical id，提交时根据实际素材选择端点。
     const configuredVideoModels = isRunningHubApi
@@ -222,11 +227,9 @@ export function listVideoModels(): VideoModelDefinition[] {
       // `seedance2.5`(固定 30 秒按次计费)会落到默认的 4~15 秒档位 —— 用户在下拉里
       // 选 12 秒, 平台照 30 秒出片。现在按站点文档单独解析。
       const isWgspai =
-        api.id.trim().toLowerCase() === "wgspai" ||
-        api.baseUrl.trim().toLowerCase().includes("api.wgspai.cn");
+        api.id.trim().toLowerCase() === "wgspai" || api.baseUrl.trim().toLowerCase().includes("api.wgspai.cn");
       const isBinghuo =
-        api.id.trim().toLowerCase() === "binghuo" ||
-        api.baseUrl.trim().toLowerCase().includes("api.7tai.cc");
+        api.id.trim().toLowerCase() === "binghuo" || api.baseUrl.trim().toLowerCase().includes("api.7tai.cc");
       const isZhiniao =
         api.id.trim().toLowerCase() === "zhiniao" ||
         api.baseUrl.trim().toLowerCase().includes("cuai.token6688.com") ||
@@ -235,8 +238,7 @@ export function listVideoModels(): VideoModelDefinition[] {
       // 每个端点的时长 / 画幅 / 分辨率枚举都不一样 —— 档位表只能按端点查官方目录。
       // `.cn` 与 `.ai` 是同一套协议, 一并识别。
       const isRunningHub =
-        isRunningHubBaseUrl(api.baseUrl) ||
-        ["runninghub", "runninghub-cn"].includes(api.id.trim().toLowerCase());
+        isRunningHubBaseUrl(api.baseUrl) || ["runninghub", "runninghub-cn"].includes(api.id.trim().toLowerCase());
       const binghuoOptions = isBinghuo ? resolveBinghuoVideoOptions(model) : undefined;
       const wgspaiOptions = isWgspai
         ? {
@@ -248,6 +250,14 @@ export function listVideoModels(): VideoModelDefinition[] {
           }
         : undefined;
       const zhiniaoOptions = isZhiniao ? resolveZhiniaoVideoOptions(model) : undefined;
+      // api666888「暗苗」链路: 9 个 seedance 模型, 2.5 系 4~30 秒 / 2.0 系 4~15 秒。
+      // 真实网关是 api.lingkeai.ai(api666888.com 只有静态站, 没有 API), 两处都认:
+      // 老配置里填的是展示域名, 新预设填的是网关域名, 不能让任何一边掉档位。
+      const isApi666888 =
+        api.id.trim().toLowerCase() === "api666888" ||
+        api.baseUrl.trim().toLowerCase().includes("api666888.com") ||
+        api.baseUrl.trim().toLowerCase().includes("lingkeai.ai");
+      const api666888Options = isApi666888 ? resolveApi666888VideoOptions(model) : undefined;
       // RunningHub 的档位表逐端点不同。这里的**空数组是有意义的返回值**: 表示该
       // 端点官方 schema 里没有这个参数(UI 应隐藏该控件), 或它的画幅字段收像素串、
       // 选项已在提交时折成像素。所以下面每处都先判 `.length` 再取用 —— 直接 `??`
@@ -284,9 +294,11 @@ export function listVideoModels(): VideoModelDefinition[] {
             : ["720p", "1080p"]
           : runningHubOptions?.resolutionValues.length
             ? runningHubOptions.resolutionValues
-            : zhiniaoOptions?.resolutionValues.length
-              ? zhiniaoOptions.resolutionValues
-              : binghuoOptions?.resolutionValues;
+            : api666888Options?.resolutionValues.length
+              ? api666888Options.resolutionValues
+              : zhiniaoOptions?.resolutionValues.length
+                ? zhiniaoOptions.resolutionValues
+                : binghuoOptions?.resolutionValues;
       // 字子动画画幅枚举只有 16:9 / 9:16 / 1:1(官方文档), 不要放 21:9 等超纲值。
       // WGSPAI 的白名单来自 `wgspaiProtocol`(seedance-v2 只认 9:16 / 16:9), 必须排在
       // 炳火前面 —— 两家现在是各自独立解析的, 顺序只影响可读性。
@@ -294,22 +306,24 @@ export function listVideoModels(): VideoModelDefinition[] {
         ? ["16:9", "9:16"]
         : isZzdh
           ? [...ZZDH_ASPECT_RATIOS]
-          : (runningHubOptions?.aspectRatios.length
-              ? runningHubOptions.aspectRatios
-              : (wgspaiOptions?.aspectRatios ??
-                zhiniaoOptions?.aspectRatios ??
-                binghuoOptions?.aspectRatios ??
-                CUSTOM_ASPECT_RATIOS));
+          : runningHubOptions?.aspectRatios.length
+            ? runningHubOptions.aspectRatios
+            : (wgspaiOptions?.aspectRatios ??
+              api666888Options?.aspectRatios ??
+              zhiniaoOptions?.aspectRatios ??
+              binghuoOptions?.aspectRatios ??
+              CUSTOM_ASPECT_RATIOS);
       const durationOptions =
         sub2ApiDuration !== undefined
           ? [sub2ApiDuration]
-          : (runningHubOptions?.durationOptions.length
-              ? runningHubOptions.durationOptions
-              : (wgspaiOptions?.durationOptions ??
-                zhiniaoOptions?.durationOptions ??
-                binghuoOptions?.durationOptions ??
-                zzdhDurationOptions ??
-                Array.from({ length: 30 }, (_, index) => index + 1)));
+          : runningHubOptions?.durationOptions.length
+            ? runningHubOptions.durationOptions
+            : (wgspaiOptions?.durationOptions ??
+              api666888Options?.durationOptions ??
+              zhiniaoOptions?.durationOptions ??
+              binghuoOptions?.durationOptions ??
+              zzdhDurationOptions ??
+              Array.from({ length: 30 }, (_, index) => index + 1));
       // RunningHub 的官方端点有中文名(`可灵图生视频3.0-pro`), 直接当展示名 ——
       // 端点 ID 里带斜杠, 原样显示在下拉里可读性太差。
       const runningHubEndpoint = isRunningHub ? resolveRunningHubVideoEndpoint(model) : undefined;
@@ -338,11 +352,8 @@ export function listVideoModels(): VideoModelDefinition[] {
         defaultDuration:
           sub2ApiDuration ??
           runningHubOptions?.durationOptions[0] ??
-          (zhiniaoOptions
-            ? zhiniaoOptions.durationOptions.includes(5)
-              ? 5
-              : zhiniaoOptions.durationOptions[0]
-            : undefined) ??
+          api666888Options?.defaultDuration ??
+          (zhiniaoOptions ? resolveZhiniaoDefaultDuration(zhiniaoOptions) : undefined) ??
           wgspaiOptions?.durationOptions[0] ??
           binghuoOptions?.durationOptions[0] ??
           5,
@@ -364,7 +375,12 @@ export function listVideoModels(): VideoModelDefinition[] {
     });
   });
 
-  return [...customVideoModels, ...buildRunningHubCliVideoModels(), ...buildJimengCliVideoModels(), ...wanCliVideoModels];
+  return [
+    ...customVideoModels,
+    ...buildRunningHubCliVideoModels(),
+    ...buildJimengCliVideoModels(),
+    ...wanCliVideoModels,
+  ];
 }
 
 export function getVideoModel(modelId: string): VideoModelDefinition | undefined {
@@ -438,9 +454,10 @@ function buildCustomAudioModels(): AudioModelDefinition[] {
       const normalizedModel = model.trim().toLowerCase();
       const isRunningHubSunoSingle = normalizedModel === "rhart-audio/suno-v5.5/single";
       const isRunningHubSunoCustom = normalizedModel === "rhart-audio/suno-v5.5/custom";
-      const operation = isRunningHubSunoSingle || isRunningHubSunoCustom
-        ? "music"
-        : resolveAudioModelOperation(normalizedModel, audioKind);
+      const operation =
+        isRunningHubSunoSingle || isRunningHubSunoCustom
+          ? "music"
+          : resolveAudioModelOperation(normalizedModel, audioKind);
       const family = resolveAudioModelFamily(normalizedModel);
       // 音色表按模型解析, 不再所有模型共用一份写死的 6 音色(那是 tts-1 的清单):
       // GM 系列真实有 30 种预置音色且只输出 wav, GT 系列 6 种、支持 6 种输出格式。
@@ -502,12 +519,12 @@ function buildCustomAudioModels(): AudioModelDefinition[] {
                   musicProtocol: "suno" as const,
                   sunoSupportedOperations: isRunningHubSunoSingle ? ["generate"] : ["custom"],
                 }
-            : {
-                // 字子动画等: 保持原来的「歌词 + 时长」最小集。
-                musicProtocol: "generic" as const,
-                musicLengthOptionsMs: [15000, 30000, 60000, 120000],
-                defaultMusicLengthMs: 30000,
-              }
+              : {
+                  // 字子动画等: 保持原来的「歌词 + 时长」最小集。
+                  musicProtocol: "generic" as const,
+                  musicLengthOptionsMs: [15000, 30000, 60000, 120000],
+                  defaultMusicLengthMs: 30000,
+                }
           : {}),
       };
     }),
@@ -596,29 +613,53 @@ function buildRunningHubCliVideoModels(): VideoModelDefinition[] {
   // web preview and use the complete local catalog when the desktop bridge has
   // exposed it through settings.
   const endpoints = [
-    "rhart-video-s/text-to-video", "rhart-video-s-official/text-to-video",
-    "rhart-video-s-official/text-to-video-pro", "kling-v3.0-pro/text-to-video",
-    "kling-v3.0-std/text-to-video", "kling-video-o3-pro/text-to-video",
-    "kling-video-o3-std/text-to-video", "kling-video-o1/text-to-video",
-    "kling-v2.6-pro/text-to-video", "kling-v2.5-turbo-pro/text-to-video",
-    "kling-v2.5-turbo-std/text-to-video", "rhart-video-v3.1-pro/text-to-video",
-    "rhart-video-v3.1-fast/text-to-video", "rhart-video-v3.1-pro-official/text-to-video",
-    "rhart-video-v3.1-fast-official/text-to-video", "rhart-video-g/text-to-video",
-    "rhart-video-g-official/text-to-video", "minimax/hailuo-02/t2v-pro",
-    "minimax/hailuo-2.3/t2v-pro", "minimax/hailuo-02/t2v-standard",
-    "minimax/hailuo-2.3/t2v-standard", "vidu/text-to-video-q3-pro",
-    "vidu/text-to-video-q3-turbo", "vidu/text-to-video", "alibaba/wan-2.6/text-to-video",
-    "seedance-v1.5-pro/text-to-video", "seedance-v1.5-pro/text-to-video-fast",
-    "rhart-video/sparkvideo-2.0/text-to-video", "rhart-video/sparkvideo-2.0-fast/text-to-video",
-    "bytedance/seedance-2.5-token/text-to-video", "minimax/hailuo-h3/text-to-video",
-    "alibaba/wan-2.7/text-to-video", "pixverse-v6/text-to-video",
-    "alibaba/wan-2.5-preview/text-to-video", "bytedance/seedance-2.0-global/text-to-video",
-    "alibaba/happyhorse-1.0/text-to-video", "kling-v3-4k/text-to-video",
-    "kling-video-o3-4k/text-to-video", "skyreels-v4/text-to-video-std",
-    "gemini-omni-flash/text-to-video", "pixverse-v5.5/text-to-video",
-    "vidu/text-to-video-q3-pro-fast", "pixverse-v5.6/text-to-video",
-    "minimax/nova-video-2.0/text-to-video", "minimax/nova-video-2.0-fast/text-to-video",
-    "minimax/eva-video-2.0/text-to-video", "minimax/eva-video-2.0-fast/text-to-video",
+    "rhart-video-s/text-to-video",
+    "rhart-video-s-official/text-to-video",
+    "rhart-video-s-official/text-to-video-pro",
+    "kling-v3.0-pro/text-to-video",
+    "kling-v3.0-std/text-to-video",
+    "kling-video-o3-pro/text-to-video",
+    "kling-video-o3-std/text-to-video",
+    "kling-video-o1/text-to-video",
+    "kling-v2.6-pro/text-to-video",
+    "kling-v2.5-turbo-pro/text-to-video",
+    "kling-v2.5-turbo-std/text-to-video",
+    "rhart-video-v3.1-pro/text-to-video",
+    "rhart-video-v3.1-fast/text-to-video",
+    "rhart-video-v3.1-pro-official/text-to-video",
+    "rhart-video-v3.1-fast-official/text-to-video",
+    "rhart-video-g/text-to-video",
+    "rhart-video-g-official/text-to-video",
+    "minimax/hailuo-02/t2v-pro",
+    "minimax/hailuo-2.3/t2v-pro",
+    "minimax/hailuo-02/t2v-standard",
+    "minimax/hailuo-2.3/t2v-standard",
+    "vidu/text-to-video-q3-pro",
+    "vidu/text-to-video-q3-turbo",
+    "vidu/text-to-video",
+    "alibaba/wan-2.6/text-to-video",
+    "seedance-v1.5-pro/text-to-video",
+    "seedance-v1.5-pro/text-to-video-fast",
+    "rhart-video/sparkvideo-2.0/text-to-video",
+    "rhart-video/sparkvideo-2.0-fast/text-to-video",
+    "bytedance/seedance-2.5-token/text-to-video",
+    "minimax/hailuo-h3/text-to-video",
+    "alibaba/wan-2.7/text-to-video",
+    "pixverse-v6/text-to-video",
+    "alibaba/wan-2.5-preview/text-to-video",
+    "bytedance/seedance-2.0-global/text-to-video",
+    "alibaba/happyhorse-1.0/text-to-video",
+    "kling-v3-4k/text-to-video",
+    "kling-video-o3-4k/text-to-video",
+    "skyreels-v4/text-to-video-std",
+    "gemini-omni-flash/text-to-video",
+    "pixverse-v5.5/text-to-video",
+    "vidu/text-to-video-q3-pro-fast",
+    "pixverse-v5.6/text-to-video",
+    "minimax/nova-video-2.0/text-to-video",
+    "minimax/nova-video-2.0-fast/text-to-video",
+    "minimax/eva-video-2.0/text-to-video",
+    "minimax/eva-video-2.0-fast/text-to-video",
   ];
   const seenFamilies = new Set<string>();
   return endpoints
@@ -643,7 +684,10 @@ function buildRunningHubCliVideoModels(): VideoModelDefinition[] {
       durationOptions: spec.durations.length ? spec.durations : Array.from({ length: 30 }, (_, index) => index + 1),
       defaultDuration: spec.durations[0] ?? 5,
       ...(spec.resolutions.length
-        ? { resolutions: spec.resolutions.map((value) => ({ value, label: value.toUpperCase() })), defaultResolution: spec.resolutions[0] }
+        ? {
+            resolutions: spec.resolutions.map((value) => ({ value, label: value.toUpperCase() })),
+            defaultResolution: spec.resolutions[0],
+          }
         : {}),
       profileId: "runninghub-model",
       profileStatus: "verified" as const,
@@ -858,10 +902,18 @@ const ZHINIAO_DEFAULT_ASPECTS = ["16:9", "9:16", "1:1"];
 /** 文档未声明 duration 的模型(数字人 / 对口型 / 视频编辑 / 超分, 时长由参考素材决定)。 */
 const ZHINIAO_FALLBACK_DURATIONS = [5, 8, 10, 15, 20, 30];
 
-const ZHINIAO_VIDEO_OPTION_TABLE: Record<
-  string,
-  { aspectRatios: string[]; durationOptions: number[]; resolutionValues: string[] }
-> = {
+interface ZhiniaoVideoOptionEntry {
+  aspectRatios: string[];
+  durationOptions: number[];
+  resolutionValues: string[];
+  /**
+   * 该模型进节点时默认选中的秒数（必须落在 `durationOptions` 里）。
+   * 不写就按通用规则：有 5 选 5，否则取首个合法档。新上线的长镜头模型在这里写 30。
+   */
+  defaultDuration?: number;
+}
+
+const ZHINIAO_VIDEO_OPTION_TABLE: Record<string, ZhiniaoVideoOptionEntry> = {
   // Seedance 2.5 · 官方直连(按秒) / 特价按秒 / 特价按次(30s 一口价)
   "seedance-2-5": {
     aspectRatios: ["16:9", "9:16", "21:9", "3:4", "1:1", "4:3"],
@@ -871,10 +923,10 @@ const ZHINIAO_VIDEO_OPTION_TABLE: Record<
   "seedance-2-5-promo": {
     aspectRatios: ["16:9", "9:16", "21:9", "3:4", "1:1", "4:3"],
     durationOptions: [4, 5, 6, 8, 10, 12, 15, 20, 25, 29, 30],
-    resolutionValues: ["480p", "720p", "1080p", "2k", "4k"],
+    resolutionValues: ["480p", "720p", "1080p"],
   },
   "seedance-2-5-special": {
-    aspectRatios: ["9:16", "16:9", "1:1", "4:3", "3:4"],
+    aspectRatios: ["9:16", "16:9", "1:1", "4:3", "3:4", "21:9"],
     durationOptions: [30],
     resolutionValues: ["720p", "1080p"],
   },
@@ -887,7 +939,7 @@ const ZHINIAO_VIDEO_OPTION_TABLE: Record<
   "seedance-2-0-promo": {
     aspectRatios: ["9:16", "16:9", "1:1", "4:3", "3:4", "21:9"],
     durationOptions: [4, 5, 6, 7, 8, 9, 10, 12, 15],
-    resolutionValues: ["480p", "720p", "1080p", "2k", "4k"],
+    resolutionValues: ["480p", "720p", "1080p", "4k"],
   },
   "seedance-2-0-special": {
     aspectRatios: ["9:16", "16:9", "21:9", "1:1", "4:3", "3:4"],
@@ -940,6 +992,17 @@ const ZHINIAO_VIDEO_OPTION_TABLE: Record<
     aspectRatios: ["16:9", "9:16", "1:1"],
     durationOptions: [5, 10, 15],
     resolutionValues: ["720p", "1080p"],
+  },
+  // 可灵 4.0: 文档(ZN 2026-10-19)的 duration 是 3~30 的**逐秒枚举**, 不是 5/10/15/30 四档。
+  // 之前只列四档, 16~29 秒这些中间值在 UI 上根本选不到。平台默认 3s, 但按「长镜头优先」
+  // 的约定仍默认 30s(合法枚举内)。
+  "kling-v4": {
+    aspectRatios: ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"],
+    durationOptions: [
+      3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+    ],
+    resolutionValues: ["720p", "1080p"],
+    defaultDuration: 30,
   },
   "kling-v3-omni-cankao": {
     aspectRatios: ["16:9", "9:16", "1:1"],
@@ -1031,8 +1094,8 @@ const ZHINIAO_VIDEO_OPTION_TABLE: Record<
     resolutionValues: ["720p"],
   },
   "grok-imagine-video": {
-    aspectRatios: ["16:9", "9:16", "1:1"],
-    durationOptions: [3, 4, 5, 6, 8, 10, 15, 20, 30],
+    aspectRatios: ["16:9", "9:16", "1:1", "4:3", "3:4"],
+    durationOptions: [3, 4, 5, 6, 8, 10, 12, 15, 20, 30],
     resolutionValues: ["480p", "720p"],
   },
   "grok-imagine-video-special": {
@@ -1044,7 +1107,7 @@ const ZHINIAO_VIDEO_OPTION_TABLE: Record<
   "omni-flash-1-1": {
     aspectRatios: ["16:9", "9:16"],
     durationOptions: [10],
-    resolutionValues: ["720p"],
+    resolutionValues: ["720p", "1080p"],
   },
   "aliyun-video-superres": {
     aspectRatios: [],
@@ -1053,11 +1116,34 @@ const ZHINIAO_VIDEO_OPTION_TABLE: Record<
   },
 };
 
-function resolveZhiniaoVideoOptions(model: string): {
+// ---------------------------------------------------------------------------
+// api666888 / 灵柯 AI「暗苗」链路
+//
+// 早期只有 9 个 seedance 模型, 档位靠「模型名里带 2.0 就 4~15 秒」硬推断; 2026-10-20
+// 平台已有 74 个视频模型, 各家族档位完全不同(kling 5/10/15、gk-video 1~15、viduq4 3~16、
+// omni-flash 4/6/8/10), 推断法必然给错档。
+//
+// 现在档位表整份抽到 `lingkeVideoOptions.ts` —— 由平台文档全量抓取生成(74/74),
+// registry 只负责按模型名查表, 不再持有任何档位常量。
+// ---------------------------------------------------------------------------
+
+interface ZhiniaoVideoOptions {
   aspectRatios: string[];
   durationOptions: number[];
   resolutionValues: string[];
-} {
+  /**
+   * 是否来自逐模型登记表（只有登记表分支会置 true，族兜底一律缺省）。
+   *
+   * false/undefined = 平台新上、我们还没核过档位的模型。这类模型按「新模型先按
+   * 30 秒默认」处理；一旦把它的真实枚举补进 `ZHINIAO_VIDEO_OPTION_TABLE`（或将来
+   * 能从平台元数据直接读到时长），`listed` 变 true，默认值就改听登记表/平台声明的。
+   */
+  listed?: boolean;
+  /** 登记表显式指定的默认秒数（见 `ZhiniaoVideoOptionEntry.defaultDuration`）。 */
+  defaultDuration?: number;
+}
+
+function resolveZhiniaoVideoOptions(model: string): ZhiniaoVideoOptions {
   const normalized = model.trim().toLowerCase();
   const exact = ZHINIAO_VIDEO_OPTION_TABLE[normalized];
   if (exact) {
@@ -1068,6 +1154,8 @@ function resolveZhiniaoVideoOptions(model: string): {
       durationOptions: exact.durationOptions.length ? exact.durationOptions : ZHINIAO_FALLBACK_DURATIONS,
       // 分辨率保持空数组: 注册表把「空」当作「该模型没有这个参数」, 直接隐藏控件。
       resolutionValues: exact.resolutionValues,
+      listed: true,
+      defaultDuration: exact.defaultDuration,
     };
   }
   // 未逐一登记的变体 SKU: 按模型族兜底。
@@ -1095,7 +1183,8 @@ function resolveZhiniaoVideoOptions(model: string): {
   if (normalized.startsWith("kling")) {
     return {
       aspectRatios: ["16:9", "9:16", "1:1"],
-      durationOptions: [3, 5, 6, 8, 10, 15],
+      // 未登记的可灵 SKU: 按「新模型先给到 30s」处理, 具体档位等平台声明后再收窄。
+      durationOptions: [5, 10, 15, 30],
       resolutionValues: ["720p", "1080p"],
     };
   }
@@ -1132,6 +1221,28 @@ function resolveZhiniaoVideoOptions(model: string): {
     durationOptions: ZHINIAO_FALLBACK_DURATIONS,
     resolutionValues: ["720p", "1080p"],
   };
+}
+
+/**
+ * 知鸟视频节点的默认秒数（用户规则，2026-10-19）。
+ *
+ * 1. **已登记的模型**：沿用老习惯「有 5 就用 5」—— 短镜头便宜、试错成本低。
+ * 2. **未登记的新模型**：默认 **30 秒**。可灵 v4 这类支持长镜头的模型越来越多，
+ *    再默认 5s 等于把能力藏起来；用户想缩短随时能改。
+ * 3. 拿不到 30 档（登记表把上限锁在 15 之类）就退到该模型的最大合法档位。
+ *
+ * 一旦能从平台元数据直接读到时长枚举（填入 `ZHINIAO_VIDEO_OPTION_TABLE` 即可），
+ * 这条规则自动改听平台的 —— 判断依据就是 `listed`。
+ */
+function resolveZhiniaoDefaultDuration(options: ZhiniaoVideoOptions): number | undefined {
+  const { durationOptions, defaultDuration } = options;
+  if (durationOptions.length === 0) return undefined;
+  // 登记表显式声明了默认档(如 kling-v4 = 30s)就以它为准, 但必须是合法枚举之一。
+  if (defaultDuration !== undefined && durationOptions.includes(defaultDuration)) return defaultDuration;
+  if (!options.listed) {
+    return durationOptions.includes(30) ? 30 : durationOptions[durationOptions.length - 1];
+  }
+  return durationOptions.includes(5) ? 5 : durationOptions[0];
 }
 
 function resolveBinghuoVideoOptions(model: string): {
@@ -1271,9 +1382,9 @@ const BINGHUO_VIDEO_PRICES: Record<string, BinghuoVideoPrice> = {
   "gz-sd2.5-480p": { type: "per-second", amount: 0.46 },
   "gz-sd2.5-720p": { type: "per-second", amount: 0.92 },
   "gz-sd2.5-1080p": { type: "per-second", amount: 2.2 },
-  "sdvip720p": { type: "per-second", amount: 0.39 },
-  "sdvip1080p": { type: "per-second", amount: 0.68 },
-  "sdvip4k": { type: "per-second", amount: 3.85 },
+  sdvip720p: { type: "per-second", amount: 0.39 },
+  sdvip1080p: { type: "per-second", amount: 0.68 },
+  sdvip4k: { type: "per-second", amount: 3.85 },
   "sd2.5-720p-ch2": { type: "per-second", amount: 0.89 },
   "sd2.5-720p-ch3": { type: "per-second", amount: 0.75 },
   "sd2.5-480p": { type: "per-second", amount: 0.59 },
@@ -1385,6 +1496,17 @@ function resolveCustomImagePricing(apiId: string, apiBaseUrl: string, model: str
     return { quote: () => ({ amount: officialAmount, currency: "CNY" as const }) };
   }
   const normalizedApiId = apiId.trim().toLowerCase();
+  // 知鸟 AI: 价格全部来自平台自己的估价接口, 且按分辨率/按秒分档(见 models/zhiniaoPricing.ts)。
+  // 先于下面的固定价表判断, 因为它的档位维度比其它平台细。
+  if (isZhiniaoProvider(apiId, apiBaseUrl)) {
+    const zhiniaoPricing = createZhiniaoImagePricing(model);
+    if (zhiniaoPricing) return zhiniaoPricing;
+  }
+  // WGSPAI(api.wgspai.cn): 图片一律 0.1 元/张(见 models/wgspaiPricing.ts)。
+  if (isWgspaiProvider(apiId, apiBaseUrl)) {
+    const wgspaiPricing = createWgspaiImagePricing(model);
+    if (wgspaiPricing) return wgspaiPricing;
+  }
   const isBinghuo = normalizedApiId === "binghuo" || apiBaseUrl.trim().toLowerCase().includes("api.7tai.cc");
   if (isBinghuo) {
     const amount = BINGHUO_IMAGE_PRICES[model.trim().toLowerCase()];
@@ -1419,6 +1541,18 @@ function resolveCustomVideoPricing(apiName: string, apiBaseUrl: string, model: s
   }
   const normalizedApiName = apiName.trim().toLowerCase();
   const normalized = model.trim().toLowerCase();
+  // 知鸟 AI: 同一模型不同分辨率可能一个按秒、一个按次(wan-3-0), 所以 unit 写在表里,
+  // 不在这里按平台统一假设(见 models/zhiniaoPricing.ts)。
+  if (isZhiniaoProvider(apiName, apiBaseUrl)) {
+    const zhiniaoPricing = createZhiniaoVideoPricing(model);
+    if (zhiniaoPricing) return zhiniaoPricing;
+  }
+  // WGSPAI: 同样把 unit 写在表里 —— 视频族多为按次一口价, 但
+  // seedance-2.0-720-new 是 0.25 元/秒(见 models/wgspaiPricing.ts)。
+  if (isWgspaiProvider(apiName, apiBaseUrl)) {
+    const wgspaiPricing = createWgspaiVideoPricing(model);
+    if (wgspaiPricing) return wgspaiPricing;
+  }
   if (isBinghuo) {
     const price = BINGHUO_VIDEO_PRICES[normalized];
     if (price) {
@@ -1487,6 +1621,9 @@ function buildCustomImageModels(): ImageModelDefinition[] {
         // 档位常被平台写进模型名(qwen-image-3.0-pro-1k / flux-2k / sd-4k), 这类模型
         // 只能按名字里那一档请求; 读不到档位时才放开 1K/2K/4K 全档位。
         const resolutions = resolveImageModelResolutionOptions(model);
+        // Midjourney 单独一套语义: 一档 = 一组 4 张, 且有引擎/版本/风格化三个专属参数。
+        // 见 models/midjourney.ts —— 没有这段, 面板上选的 count/bot_type 根本发不出去。
+        const isMidjourney = isMidjourneyImageModel(model);
         return {
           id: modelId,
           mediaType: "image",
@@ -1499,6 +1636,13 @@ function buildCustomImageModels(): ImageModelDefinition[] {
           defaultResolution: resolutions[0]?.value ?? "1K",
           aspectRatios: imageAspectRatios.map((value) => ({ value, label: value })),
           resolutions,
+          ...(isMidjourney
+            ? {
+                imagesPerCountUnit: MIDJOURNEY_IMAGES_PER_GROUP,
+                extraParamsSchema: MIDJOURNEY_EXTRA_PARAMS,
+                defaultExtraParams: MIDJOURNEY_DEFAULT_EXTRA_PARAMS,
+              }
+            : {}),
           ...(resolveCustomImagePricing(api.id, api.baseUrl, model)
             ? { pricing: resolveCustomImagePricing(api.id, api.baseUrl, model) }
             : {}),

@@ -14,8 +14,10 @@
 // 会话里, 那时的 extra_params 已经不存在了。
 // ---------------------------------------------------------------------------
 pub mod assets;
+pub mod ark;
 pub mod binghuo;
 pub mod extract;
+pub mod media;
 pub mod kling;
 pub mod runninghub;
 pub mod sub2api;
@@ -38,7 +40,7 @@ use crate::ai::{
 /// **必须与前端 `tauriAiGateway.ts` 的 `needsCompatibilityVideoWorker` 保持一致**:
 /// 不在此列却交给后端的协议会被 `submit_video_task` 直接拒掉(一个请求都不发);
 /// 在此列却仍留在前端的协议则不会走后端。两边同时改。
-pub const BACKEND_VIDEO_TRANSPORTS: [&str; 9] = [
+pub const BACKEND_VIDEO_TRANSPORTS: [&str; 11] = [
     "openai-video",
     "zhiniao-video",
     "wgspai-video",
@@ -48,6 +50,9 @@ pub const BACKEND_VIDEO_TRANSPORTS: [&str; 9] = [
     "zzdh-v8-video",
     "sub2api-video",
     "runninghub-model",
+    // api666888(灵柯同源网关) 的两条链路: 本站 media 信封 + 火山方舟格式。
+    "media-generate",
+    "ark-anmiao",
 ];
 
 /// 提交时会把 `transport` 写进元数据的协议 —— 轮询阶段据此路由到协议层。
@@ -61,7 +66,7 @@ pub const BACKEND_VIDEO_TRANSPORTS: [&str; 9] = [
 ///
 /// RunningHub 必须在此列: 它的业务错误包用 `errorCode` 而非 `error`, 且
 /// `status` 是**空串** —— 通用 `classify` 只会一直判"还在跑", 直到轮询窗口耗尽。
-const PROTOCOL_TRANSPORTS: [&str; 7] = [
+const PROTOCOL_TRANSPORTS: [&str; 9] = [
     "kling-control",
     "zhenjian-task-api",
     "zzdh-v8-video",
@@ -69,6 +74,10 @@ const PROTOCOL_TRANSPORTS: [&str; 7] = [
     "wgspai-video",
     "binghuo-video",
     "runninghub-model",
+    // 这两条的查询体不是通用形状: media 用 is_final/state/result_url,
+    // 方舟用 status + content.video_url, 都自己解析。
+    "media-generate",
+    "ark-anmiao",
 ];
 
 pub fn is_backend_transport(transport: &str) -> bool {
@@ -211,6 +220,9 @@ pub fn poll_interval(transport: &str) -> Duration {
         // 知鸟官方口径中位 4~40 分钟、p90 55~75 分钟, 3s 粒度足够。
         "zhiniao-video" => Duration::from_secs(3),
         "sub2api-video" => Duration::from_secs(4),
+        // api666888 文档建议 3~5 秒一次; 方舟建议 5~10 秒, 取 6 秒。
+        "media-generate" => Duration::from_secs(4),
+        "ark-anmiao" => Duration::from_secs(6),
         "kling-control" | "zhenjian-task-api" => Duration::from_secs(4),
         // 炳火 / WGSPAI 提交后平台侧排队较久, 5s 一次可减少无效请求。
         _ => Duration::from_secs(5),
@@ -314,6 +326,28 @@ const TERMINAL_VERDICT_MARKERS: [&str; 8] = [
 fn has_terminal_verdict(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     TERMINAL_VERDICT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// 上游「没钱了」的几种说法。
+///
+/// 各家中转的文案差异很大 —— New-API 系回 `Insufficient account balance`,
+/// 国内平台回 `预扣费额度失败, 用户剩余额度: ¥1.06` —— 但用户要做的事只有一件:
+/// 去平台后台充值。原文照抄出来(尤其那句英文)只会让人以为是我们这边的故障,
+/// 白白去翻日志。
+const INSUFFICIENT_BALANCE_MARKERS: [&str; 6] = [
+    "insufficient account balance",
+    "insufficient balance",
+    "insufficient_quota",
+    "余额不足",
+    "剩余额度",
+    "预扣费额度失败",
+];
+
+fn is_insufficient_balance(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    INSUFFICIENT_BALANCE_MARKERS
         .iter()
         .any(|marker| lower.contains(marker))
 }
@@ -487,10 +521,15 @@ fn redact_proxy(value: &str) -> String {
 /// - 其它 4xx → `TaskFailed`, 让用户立刻看到可行动的原因。
 pub fn http_error(label: &str, status: reqwest::StatusCode, raw: &str, url: &str) -> AIError {
     let reason = extract_error_reason(raw);
-    let text = match reason.as_deref() {
+    let mut text = match reason.as_deref() {
         Some(reason) => format!("{}: HTTP {} {} ({})", label, status, reason, url),
         None => format!("{}: HTTP {} ({})", label, status, url),
     };
+    // 余额不足单独补一句中文结论: 这不是网络问题、也不是我们拼错了请求,
+    // 重试一百次都是同一个 403, 唯一出路是充值。
+    if reason.as_deref().is_some_and(is_insufficient_balance) {
+        text.push_str(" ｜ 账户余额不足: 请到平台后台充值后重试");
+    }
     let verdict = reason.as_deref().is_some_and(has_terminal_verdict);
     if is_transient_status(status) && !verdict {
         AIError::Provider(text)
@@ -573,6 +612,10 @@ pub async fn poll(
         zzdh::TRANSPORT => zzdh::poll(ctx, metadata, handle).await,
         sub2api::TRANSPORT => sub2api::poll(ctx, metadata, handle).await,
         kling::TRANSPORT => kling::poll(ctx, metadata, handle).await,
+        // api666888: 两条链路的状态体都不是通用形状(is_final/state/result_url 与
+        // status + content.video_url), 通用 classify 会把已完成的判成"还在跑"。
+        media::TRANSPORT => media::poll(ctx, metadata, handle).await,
+        ark::TRANSPORT => ark::poll(ctx, metadata, handle).await,
         // WGSPAI 的族 2(Task)失败体是业务错误包 `{"code": -1, "message": "..."}`,
         // 通用归类认不出顶层 `code`, 会在 HTTP 200 的业务错误上一直判"还在跑"。
         wgspai::TRANSPORT => wgspai::poll(ctx, metadata, handle).await,
@@ -1120,5 +1163,51 @@ mod tests {
             "***@127.0.0.1:7890"
         );
         assert_eq!(redact_proxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
+    }
+
+    /// 余额不足只回一句英文, 用户会当成我们的故障去翻日志 —— 必须补中文结论。
+    #[test]
+    fn http_error_explains_insufficient_balance() {
+        let error = http_error(
+            "WGSPAI 视频请求失败",
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"Insufficient account balance","type":"insufficient_quota"}}"#,
+            "https://api.wgspai.cn/v1/videos",
+        );
+        let AIError::TaskFailed(message) = error else {
+            panic!("余额不足是终态, 不该被判成可重试");
+        };
+        assert!(message.contains("Insufficient account balance"), "{message}");
+        assert!(message.contains("账户余额不足"), "缺少中文结论: {message}");
+    }
+
+    /// 国内平台的写法(带具体剩余额度)同样要命中。
+    #[test]
+    fn http_error_explains_prepaid_quota_failure() {
+        let error = http_error(
+            "wgspai API 视频请求失败",
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"预扣费额度失败, 用户剩余额度: ¥1.069622, 需要预扣费额度: ¥2.500000"}}"#,
+            "https://api.wgspai.cn/v1/video/generations",
+        );
+        let AIError::TaskFailed(message) = error else {
+            panic!("expected TaskFailed");
+        };
+        assert!(message.contains("账户余额不足"), "{message}");
+    }
+
+    /// 鉴权失败不是余额问题: 挂错提示会把用户引到充值页, 真问题(Key 失效)反而没人查。
+    #[test]
+    fn http_error_does_not_misreport_plain_forbidden() {
+        let error = http_error(
+            "WGSPAI 视频请求失败",
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"Invalid API key"}}"#,
+            "https://api.wgspai.cn/v1/videos",
+        );
+        let AIError::TaskFailed(message) = error else {
+            panic!("expected TaskFailed");
+        };
+        assert!(!message.contains("账户余额不足"), "{message}");
     }
 }

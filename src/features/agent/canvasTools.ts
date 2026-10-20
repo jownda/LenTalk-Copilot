@@ -32,27 +32,35 @@ export const canvasAgentTools = {
     permission: "read",
     schema: z.object({}),
   },
+  focusNode: {
+    name: "canvas.focus_node",
+    description:
+      "把画布镜头移动到指定节点（只移动视野，不改任何数据）。用户说「找不到节点」「跑哪去了」时用它，别只报坐标。",
+    permission: "read",
+    schema: z.object({
+      nodeNames: z.array(nodeNameSchema).min(1).max(40),
+    }),
+  },
   createNode: {
     name: "canvas.create_node",
-    description: "在画布指定位置创建一个节点。",
+    description:
+      "创建一个节点。位置不用你算 —— 新节点会自动接在画布上最后一个节点的右侧，并与它顶边对齐。",
     permission: "write",
     schema: z.object({
       type: nodeTypeSchema,
-      position: z.object({ x: z.number(), y: z.number() }),
       data: z.record(z.string(), z.unknown()).optional(),
     }),
   },
   createNodes: {
     name: "canvas.create_nodes",
     description:
-      "一次创建多个节点（整批只占一个撤销步）。批量落锚点、批量加参考图时用它，别重复调 create_node。省略 position 时自动在画布空白处排布。",
+      "一次创建多个节点（整批只占一个撤销步）。批量落锚点、批量加参考图时用它，别重复调 create_node。位置不用你算 —— 整批从画布最后一个节点右侧接着排，与它顶边对齐，每行 4 个。",
     permission: "write",
     schema: z.object({
       nodes: z
         .array(
           z.object({
             type: nodeTypeSchema,
-            position: z.object({ x: z.number(), y: z.number() }).optional(),
             data: z.record(z.string(), z.unknown()).optional(),
           }),
         )

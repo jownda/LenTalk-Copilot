@@ -52,7 +52,18 @@ export interface CustomApiCapabilities {
   videoQueryPath: string;
   videoReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
   taskProtocol: 'generic' | 'unknown';
-  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model';
+  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model' | 'media-generate' | 'ark-anmiao';
+  /**
+   * 按模型覆盖 `videoTransport`。
+   *
+   * 同一个平台下可能混挂多条链路 —— api666888 的「暗苗」链路里, 7 个模型走本站
+   * media 信封(`/v1/media/generate`), 2 个满血版走火山方舟格式
+   * (`/api/v3/anmiao/...`)。一个平台只能存一个 `videoTransport`, 只按平台配会把
+   * 其中一半发到错的端点上; 所以这里给一个「模型 → 协议」的覆盖表。
+   *
+   * 键是**模型名**(不是 custom:id/model), 查不到时回落到 `videoTransport`。
+   */
+  videoTransports?: Record<string, NonNullable<CustomApiCapabilities['videoTransport']>>;
 }
 
 /**
@@ -72,6 +83,9 @@ const VIDEO_TRANSPORT_SET: Record<NonNullable<CustomApiCapabilities['videoTransp
   'zhiniao-video': true,
   'zhenjian-task-api': true,
   'runninghub-model': true,
+  // api666888(灵柯同源网关): 本站 media 信封 / 火山方舟格式。
+  'media-generate': true,
+  'ark-anmiao': true,
 };
 
 /** 即梦 CLI 是本地命令行工具，不使用 OpenAI 兼容平台的 API Key 配置。 */
@@ -657,6 +671,18 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
   const videoEncoding = value.videoReferenceEncoding;
   const taskProtocol = value.taskProtocol;
   const videoTransport = value.videoTransport;
+  // 逐模型覆盖表: 只保留白名单里的协议, 其余静默丢弃(与 videoTransport 同一条判据)。
+  const rawTransports = value.videoTransports;
+  const videoTransports =
+    rawTransports && typeof rawTransports === 'object' && !Array.isArray(rawTransports)
+      ? Object.fromEntries(
+          Object.entries(rawTransports as Record<string, unknown>).filter(
+            (entry): entry is [string, NonNullable<CustomApiCapabilities['videoTransport']>] =>
+              typeof entry[1] === 'string' &&
+              Object.prototype.hasOwnProperty.call(VIDEO_TRANSPORT_SET, entry[1])
+          )
+        )
+      : undefined;
   return {
     detectedAt: typeof value.detectedAt === 'number' ? value.detectedAt : Date.now(),
     detectionSource: value.detectionSource === 'manual' ? 'manual' : 'probe',
@@ -677,6 +703,9 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
     taskProtocol: taskProtocol === 'unknown' ? 'unknown' : 'generic',
     ...(typeof videoTransport === 'string' && Object.prototype.hasOwnProperty.call(VIDEO_TRANSPORT_SET, videoTransport)
       ? { videoTransport: videoTransport as NonNullable<CustomApiCapabilities['videoTransport']> }
+      : {}),
+    ...(videoTransports && Object.keys(videoTransports).length > 0
+      ? { videoTransports: videoTransports as Record<string, NonNullable<CustomApiCapabilities['videoTransport']>> }
       : {}),
   };
 }

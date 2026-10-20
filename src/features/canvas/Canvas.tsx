@@ -1468,6 +1468,55 @@ export function Canvas() {
     scheduleCanvasPersist();
   }, [nodes, edges, history, dragHistorySnapshot, scheduleCanvasPersist]);
 
+  /**
+   * 「定位到节点」的落地端（AI 卡片上的按钮、canvas.focus_node 都走这里）。
+   *
+   * 为什么不能直接在 store 里算视口：React Flow 的 viewport 是内部状态
+   * （配置里只给了 `defaultViewport`），store 那份 `currentViewport` 只是镜像，
+   * 改镜像画布不动。唯一可靠的办法是拿到 `reactFlowInstance` 调 `fitView`。
+   *
+   * 用 `fitView` 而不是 `setCenter`：单节点时它等价于「居中 + 合适缩放」，
+   * 多节点（批量创建）时自动取并集，正好是「帮我看看它刚建的那一堆」需要的取景。
+   */
+  const focusRequest = useCanvasStore((state) => state.focusRequest);
+  useEffect(() => {
+    if (!focusRequest) return;
+    let cancelled = false;
+    // 延一帧再取景：刚建出来的节点这一刻可能还没测量尺寸，
+    // 拿着 0 宽的包围盒去 fitView 会算出离谱的缩放比例。
+    const frame = requestAnimationFrame(() => {
+      const targets = useCanvasStore
+        .getState()
+        .nodes.filter((node) => focusRequest.nodeIds.includes(node.id));
+      // 节点可能已经被删掉（定位的是历史卡片），此时什么也不做
+      if (targets.length === 0) return;
+      void (async () => {
+        const fitted = await reactFlowInstance.fitView({
+          nodes: targets.map((node) => ({ id: node.id })),
+          duration: 450,
+          padding: 0.35,
+          // 只框一个不太小的节点时，别一路顶到 2 倍把上下文全挤出去
+          maxZoom: 1,
+        });
+        // Agent 面板是浮在画布右侧的一层（不是挤压画布），直接居中会让目标正好藏在它下面：
+        // 量出面板实际占的宽度，把画面往左推半个面板，落在可见区域的正中间。
+        const panel = cancelled ? null : document.querySelector<HTMLElement>("[data-canvas-agent-panel]");
+        if (!fitted || !panel) return;
+        const panelWidth = panel.getBoundingClientRect().width + 16; // 16 = 面板右侧留白
+        if (panelWidth <= 0) return;
+        const viewport = reactFlowInstance.getViewport();
+        void reactFlowInstance.setViewport(
+          { ...viewport, x: viewport.x - panelWidth / 2 },
+          { duration: 0 },
+        );
+      })();
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+    };
+  }, [focusRequest, reactFlowInstance]);
+
   useEffect(() => {
     const sleep = (delayMs: number) =>
       new Promise<void>((resolve) => {
@@ -1643,6 +1692,11 @@ export function Canvas() {
                 referenceCount: Array.isArray(generationRequest?.referenceImages)
                   ? generationRequest.referenceImages.length
                   : 0,
+                // 记账也要按组数算钱: MJ 选「4 档」= 4 组 = 4 倍价, 不传 count 会少记。
+                extraParams:
+                  typeof generationRequest?.imageCount === "number"
+                    ? { count: generationRequest.imageCount }
+                    : undefined,
                 status: "succeeded",
               });
               // Show the provider result immediately. Persisting the original

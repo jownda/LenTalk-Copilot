@@ -237,10 +237,11 @@ export function formatCanvasSnapshotForPrompt(
 const TOOL_USAGE: Record<string, string> = {
   "canvas.get_snapshot": "无参数",
   "canvas.get_selected_nodes": "无参数",
+  "canvas.focus_node": '{"nodeNames":["AI 视频"]}（把镜头移到这些节点，不改数据）',
   "canvas.create_node":
-    '{"type":"节点类型","position":{"x":0,"y":0},"data":{"displayName":"给它的名字"}}',
+    '{"type":"节点类型","data":{"displayName":"给它的名字"}}（位置自动排布，不要给坐标）',
   "canvas.create_nodes":
-    '{"nodes":[{"type":"节点类型","data":{"displayName":"名字"}},{"type":"节点类型","data":{"displayName":"名字"}}]}（批量建节点用这个，别循环调 create_node；省略 position 会自动排布）',
+    '{"nodes":[{"type":"节点类型","data":{"displayName":"名字"}},{"type":"节点类型","data":{"displayName":"名字"}}]}（批量建节点用这个，别循环调 create_node；位置自动排布，不要给坐标）',
   "canvas.update_node": '{"nodeName":"AI 图片","data":{"prompt":"新的提示词"}}（只写要改的字段）',
   "canvas.move_node": '{"nodeName":"AI 图片","position":{"x":0,"y":0}}',
   "canvas.resize_node": '{"nodeName":"AI 图片","width":320,"height":240}',
@@ -276,6 +277,7 @@ const MUTABLE_FIELDS: string[] = [
 const TOOL_LABELS: Record<string, string> = {
   "canvas.get_snapshot": "读取画布",
   "canvas.get_selected_nodes": "读取选中节点",
+  "canvas.focus_node": "定位到节点",
   "canvas.create_node": "创建节点",
   "canvas.create_nodes": "批量创建节点",
   "canvas.update_node": "更新节点参数",
@@ -331,13 +333,22 @@ export function buildCanvasToolPrompt(level: CanvasAgentAccessLevel = DEFAULT_CA
   lines.push("5. 需要先了解画布再决策时，先调用读取类工具，等我回给你结果后再继续。");
   lines.push("6. 不要把工具块本身展示或解释给用户，也不要在正文里复述这段 JSON。");
   lines.push("7. 画布操作失败时如实说明失败原因，不要假装已经成功。");
+  lines.push(
+    "8. 用户说「找不到 / 在哪 / 看不见」某个节点时，直接调 canvas.focus_node 把画布镜头移过去，" +
+      "不要只报坐标让用户自己找；建完一批节点后如果用户没提要求，也不要擅自改变视野。",
+  );
 
   // ⚠️ 批量提示必须按档位分开写：低档位的提示词里出现它无权使用的工具名，
   // 会诱使模型写出一个注定被拒的块（有用例守着「只读档不出现写工具」）。
   if (isCanvasToolAllowed(level, "write")) {
     lines.push(
-      "8. **批量优先**：一次要建多个节点用 canvas.create_nodes（nodes 数组），" +
+      "9. **批量优先**：一次要建多个节点用 canvas.create_nodes（nodes 数组），" +
         "不要为每个节点各写一个块 —— 那样既慢又容易中途出错。",
+    );
+    lines.push(
+      "10. **不要给坐标**：create_node / create_nodes 没有 position 参数。新节点会自动接在画布上最后一个节点的右侧、" +
+        "与它顶边对齐，一行排满 4 个自动换行。你算不出画布尺度，硬写坐标只会把节点丢到很远的地方；" +
+        "确实要挪动某个已存在的节点时才用 canvas.move_node（坐标可参考「画面现状」里的 @(x,y)）。",
     );
   }
 

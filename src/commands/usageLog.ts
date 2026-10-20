@@ -73,7 +73,13 @@ export interface UsageModelBreakdown {
  */
 export function estimateUsageCost(
   model: { pricing?: ModelPricingDefinition } | undefined,
-  options: { kind: 'image' | 'video' | 'audio'; size: string; duration: number }
+  options: {
+    kind: 'image' | 'video' | 'audio';
+    size: string;
+    duration: number;
+    /** 影响价格的模型参数(图片: MJ 的 count 组数; 视频: 时长由 duration 提供)。 */
+    extraParams?: Record<string, unknown>;
+  }
 ): number {
   if (!model?.pricing) {
     return 0;
@@ -81,7 +87,9 @@ export function estimateUsageCost(
   const settings = useSettingsStore.getState();
   const quote = model.pricing.quote({
     resolution: options.size,
-    extraParams: options.kind === 'video' ? { duration: options.duration } : undefined,
+    extraParams: options.kind === 'video'
+      ? { duration: options.duration, ...(options.extraParams ?? {}) }
+      : options.extraParams,
     settings: {
       displayCurrencyMode: settings.priceDisplayCurrencyMode,
       usdToCnyRate: settings.usdToCnyRate,

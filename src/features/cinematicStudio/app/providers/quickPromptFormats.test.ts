@@ -89,12 +89,15 @@ describe("格式 → 规则的联动", () => {
       name: "测试格式",
       description: "仅用于测试",
       userLead: "TEST USER LEAD",
+      userTail: "TEST USER TAIL",
       buildSystem: () => "TEST SYSTEM RULE",
     });
     try {
       const swapped = buildQuickPromptRequest(MINIMAL_INPUT, "zh", "test-format");
       expect(swapped.system).toBe("TEST SYSTEM RULE");
       expect(swapped.user.startsWith("TEST USER LEAD")).toBe(true);
+      // 段落清单也必须跟着格式走：写死在生成链路里的话，换格式后模型还是按 Seedance 出
+      expect(swapped.user.endsWith("TEST USER TAIL")).toBe(true);
 
       // 别的格式不受影响 —— 否则就是把注册表写成了共享可变状态
       const seedance = buildQuickPromptRequest(MINIMAL_INPUT, "zh", "seedance-2.5");
@@ -103,5 +106,64 @@ describe("格式 → 规则的联动", () => {
     } finally {
       QUICK_PROMPT_FORMATS.length = originalLength;
     }
+  });
+});
+
+/**
+ * H3 的规则来自 MiniMax 官方 skill（base-en.txt + ref-en.txt）。
+ * 这些字段名与标签是模型认的硬语法，翻译或改名等于格式失效，所以逐条钉住。
+ */
+describe("MiniMax H3 的规则", () => {
+  const format = findQuickPromptFormat("minimax-h3");
+
+  it("按 id 命中，没有悄悄回落成默认格式", () => {
+    expect(format.id).toBe("minimax-h3");
+    expect(format.name).toBe("MiniMax H3");
+  });
+
+  it("system 带全 H3 硬语法：三字段 / 六段 / 参考标签 / 对白记号", () => {
+    const system = format.buildSystem({ outputLanguage: "clear, cinematic Chinese", locale: "zh" });
+    expect(system).toContain("integrated_multimodal_description");
+    expect(system).toContain("overall_soundscape");
+    expect(system).toContain("non_diegetic_music");
+    expect(system).toContain("subject_definitions");
+    expect(system).toContain("retention_analysis");
+    expect(system).toContain("detailed_description");
+    expect(system).toContain("<d>[Language] ...</d>");
+    expect(system).toContain("<scenetrans>");
+    expect(system).toContain("fully_preserved");
+    // 运镜是封闭词表（H3 只认这些说法），不能被自由描述替换掉
+    expect(system).toContain("Push In / Pull Out");
+    expect(system).toContain("at slow speed");
+  });
+
+  it("system 跟随输出语言，但字段名与标签始终是英文原文", () => {
+    const zh = format.buildSystem({ outputLanguage: "clear, cinematic Chinese", locale: "zh" });
+    const en = format.buildSystem({ outputLanguage: "clear cinematic English", locale: "en" });
+    expect(zh).toContain("clear, cinematic Chinese");
+    expect(en).toContain("clear cinematic English");
+    expect(en).toContain("integrated_multimodal_description");
+  });
+
+  it("user 末行给的是 H3 字段，不是 Seedance 的大写标题", () => {
+    expect(format.userTail).toContain("integrated_multimodal_description");
+    expect(format.userTail).toContain("subject_definitions");
+    expect(format.userTail).not.toContain("ACTION TIMING");
+  });
+
+  it("生成链路对 H3 用 H3 的规则与段落清单", () => {
+    const request = buildQuickPromptRequest(MINIMAL_INPUT, "zh", "minimax-h3");
+    expect(request.system).toBe(
+      format.buildSystem({ outputLanguage: "clear, cinematic Chinese", locale: "zh" }),
+    );
+    expect(request.user.startsWith(format.userLead)).toBe(true);
+    expect(request.user.endsWith(format.userTail)).toBe(true);
+  });
+
+  it("老节点（没有格式字段）行为完全不变：仍是 Seedance 规则与段落清单", () => {
+    const request = buildQuickPromptRequest(MINIMAL_INPUT, "zh");
+    expect(request.system).toContain("CINEDANCE V4");
+    expect(request.user.endsWith(findQuickPromptFormat("seedance-2.5").userTail)).toBe(true);
+    expect(request.user).toContain("POSITIVE CONSTRAINTS");
   });
 });

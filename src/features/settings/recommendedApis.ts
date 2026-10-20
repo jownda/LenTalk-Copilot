@@ -76,20 +76,34 @@ export interface RecommendedVideoConfig {
     | 'wgspai-video'
     | 'zhiniao-video'
     | 'zhenjian-task-api'
+    /** api666888: 本站 media 信封(`/v1/media/generate` + `/v1/skills/task-status`)。 */
+    | 'media-generate'
+    /** api666888: 火山方舟格式(`/api/v3/anmiao/contents/generations/tasks`)。 */
+    | 'ark-anmiao'
     /** RunningHub: 端点本身即模型(`/openapi/v2/{endpoint}`), 参数表随请求注入。 */
     | 'runninghub-model';
+  /**
+   * 按模型覆盖 `transport`。
+   *
+   * api666888 的「暗苗」链路把两种完全不同的协议挂在同一个 Base URL 下: 7 个模型走本站
+   * media 信封, 2 个满血版走火山方舟格式。只配平台级 `transport` 会把其中一半发到错的
+   * 端点(表现为 404 / 参数非法), 所以这里按模型名逐个指定。
+   */
+  transportByModel?: Record<string, RecommendedVideoConfig['transport']>;
 }
 
 /** 已确认的 OpenAI Images 平台不通过 OPTIONS 猜测协议。 */
 export function isKnownOpenAiImagesBaseUrl(value: string): boolean {
   const normalized = value.trim().replace(/\/+$/, '').replace(/\/v1$/i, '').replace(/\/+$/, '').toLowerCase();
-  return normalized === 'https://www.fhl.mom'
-    || normalized === 'https://fhl.mom'
-    || normalized === 'https://sub-proxy-us.65535.space'
+  return (
+    normalized === 'https://www.fhl.mom' ||
+    normalized === 'https://fhl.mom' ||
+    normalized === 'https://sub-proxy-us.65535.space' ||
     // 知鸟 AI(TokenGo 网关): /v1/images/generations 为同步 OpenAI Images 协议,
     // 参考图字段是 images 数组, 直接判定为已知 Images 平台可省掉 OPTIONS 探测。
-    || normalized === 'https://cuai.token6688.com'
-    || normalized === 'https://api.tokengo.love';
+    normalized === 'https://cuai.token6688.com' ||
+    normalized === 'https://api.tokengo.love'
+  );
 }
 
 /**
@@ -506,18 +520,26 @@ export const recommendedApis: RecommendedApi[] = [
   },
   {
     id: 'wgspai',
-    name: 'WGSPAI 视频',
+    name: 'WGSPAI',
     baseUrl: 'https://api.wgspai.cn',
     registerUrl: 'https://api.wgspai.cn',
-    summary: '同一个 Base 下提供两族视频接口：Videos 族同步提交、Task 族统一异步任务',
+    pricingUrl: 'https://api.wgspai.cn/pricing',
+    summary: '同一 Base 下三种协议：对话/图片同步接口 + Videos 族 + Task 族异步任务',
     advantages: [
+      '对话走 /v1/chat/completions（GPT / Claude / Gemini / DeepSeek / Qwen / GLM）',
+      '图片走 /v1/images/generations，n 即张数；单价 0.1 元/张',
       'Videos 族 POST /v1/videos 提交、GET /v1/videos/{id} 轮询（Seedance 2.5、Seedance v2 720p、MiniMax H3）',
       'Task 族 POST /v1/task/create 提交、GET /v1/task/{id} 轮询（sd-2 / sora2-pro / veo31 / ltx2.3 等）',
       '参考素材上限按模型区分：Seedance 2.5 图 30 张、Seedance v2 系 9 图 / 3 音频 / 3 视频、MiniMax H3 仅图 9 张',
       '本地素材自动上传官方背景机图床换取公网 URL，无需手动转存',
       '提示词里的 @图N / @音频N 引用会自动翻成该模型认的写法（@图片N 或 [imageN] / [audio_1]）',
     ],
-    models: [],
+    models: [
+      // 2026-10-18 按 GET /v1/models 与 GET /api/pricing 实测：图片只有这三款，均为 0.1 元/张。
+      'gpt-image-2-2k',
+      'gpt-image-2.5',
+      'nano-banana-2',
+    ],
     videoModels: [
       // ── Videos 族（seedance2.5 / seedance-v2-720p / minimax-h3 三份专档）──
       'seedance2.5',
@@ -545,6 +567,25 @@ export const recommendedApis: RecommendedApi[] = [
       queryPath: '/v1/videos/{taskId}',
       referenceEncoding: 'url',
       transport: 'wgspai-video',
+    },
+    /**
+     * 2026-10-18 新增：GPT / DeepSeek / Qwen / GLM 几家语言模型（GET /v1/models 实测）。
+     * 与视频清单一样，这是**快照**；平台加模型后要把新名字补到这里。
+     */
+    chatModels: ['gpt-5.6-sol', 'gpt-6-luna', 'gpt-6.1-sol', 'deepseek-v4.1-flash', 'GLM-5.3', 'Qwen3.8-27B', 'wan3'],
+    // 视频清单修订号（`videoModelsRevision`）这里**刻意不设** —— 预设里的
+    // `sd-2` / `ltx2.3` / `VEO-3.1` 等是文档口径，未必每个 Key 都有权限
+    // （`GET /v1/task/models` 只回当前 Key 可见的 6 个）。强行追加差集会把一堆
+    // 403 的模型塞进老用户的下拉里，不划算。
+    /**
+     * 价格口径（`GET /api/pricing` 实付快照，2026-10-18）：
+     *   图片 0.1 元/张（三款同价）
+     *   视频 0.42 ~ 8.5 元/次，全部按次一口价；唯一例外 `seedance-2.0-720-new` 按秒 0.25 元
+     * 这里只用于卡片展示，节点上的真实报价走 `models/wgspaiPricing.ts`。
+     */
+    pricingRange: {
+      image: '¥0.1 / 张',
+      video: '¥0.42 ~ 8.5 / 次',
     },
   },
   {
@@ -751,12 +792,7 @@ export const recommendedApis: RecommendedApi[] = [
     baseUrl: 'https://www.fhl.mom/v1',
     registerUrl: 'https://www.fhl.mom/register?aff=86L574B4T2N9',
     summary: '稳定便宜接入 codex / Claude / GPT Image 2 出图',
-    advantages: [
-      'OpenAI Images 生图直连',
-      '预填 gpt-image-2 全系',
-      '1K/2K ¥0.04/张',
-      '4K ¥0.06/张',
-    ],
+    advantages: ['OpenAI Images 生图直连', '预填 gpt-image-2 全系', '1K/2K ¥0.04/张', '4K ¥0.06/张'],
     models: ['gpt-image-2', 'gpt-image-2-2k', 'gpt-image-2-4k', 'nano-banana'],
     imageConfig: {
       protocol: 'images',
@@ -927,6 +963,226 @@ export const recommendedApis: RecommendedApi[] = [
       transport: 'zhenjian-task-api',
     },
   },
+  {
+    // 灵柯 AI 的「暗苗」链路: 9 个 seedance 视频模型, 同一网关下混挂两条协议 ——
+    // 7 个走 media 信封, 2 个满血版走火山方舟格式。
+    //
+    // ⚠️ `id` 必须保持 `api666888`, 不要跟着显示名一起改 —— `registry.ts` 的
+    // `isApi666888` 是按 id 判定视频参数表(时长档位 / 画幅 / 分辨率)的, 改了 id
+    // 这些模型会退回默认档位。显示名才是给用户看的。
+    //
+    // ⚠️ Base URL 不是 api666888.com, 而是 api.lingkeai.ai。实测: api666888.com 只是
+    // 一份白标静态站(nginx try_files, 任何路径都回 index.html; POST /v1/media/generate
+    // 直接 405), 真实网关在 api.lingkeai.ai —— 两个域名解析到同一组出口 IP、同一套
+    // nginx, 文档站的公开接口也挂在 api.lingkeai.ai/gongkai/apidoc/*?domain=api666888.com。
+    // 注册 / 充值走推广链接(lingkeai.ai 与 api666888.com 是同一套站点), 调用地址仍走灵柯网关。
+    //
+    // 模型清单与参数(2026-10-19 抓自 https://api.lingkeai.ai/gongkai/apidoc/
+    // moxing-liebiao?domain=api666888.com)。
+    id: 'api666888',
+    name: '灵柯AI',
+    baseUrl: 'https://api.lingkeai.ai',
+    registerUrl: 'https://lingkeai.ai?yonghu=R7T9O1W16A64FT7W',
+    summary: '灵柯AI 全量 181 个模型: 74 视频 / 21 图片 / 78 对话 / 8 音频, 一个 Base URL 全覆盖',
+    advantages: [
+      '视频走网关的 media 信封 POST /v1/media/generate, 轮询 /v1/skills/task-status',
+      '满血版走火山方舟格式 POST /api/v3/anmiao/contents/generations/tasks',
+      '74 个视频模型逐个登记真实档位(可灵 5/10/15、万相 2~30、Vidu 3~16 …), 不再按代次猜',
+      '参考图 / 参考视频 / 参考音频统一随请求上传, 无需人像认证',
+    ],
+    // 图片 19 个(2026-10-20 全量抓取自 moxing-liebiao?domain=lingkeai.vip)。
+    //
+    // ⚠️ 平台的图片模型共 21 个, 这里刻意漏掉 `kling-v3` / `kling-v3-omni`:
+    // 它们在平台里是「可灵出图」, 但名字命中 `isVideoGenerationModelName` 的 kling 规则,
+    // 放进 models 会被当成视频模型捞进视频下拉(图片节点反而选不到), 且提交到
+    // /v1/media/generate 时会被当视频任务处理。要接这两个得先让视频识别逻辑认
+    // 平台侧的显式分类, 不属于本次范围。
+    models: [
+      'tt-image-2.5',
+      'tt-image-2.5-token',
+      'tt-image-2',
+      'banana-2.1',
+      'banana-2.1-token',
+      'tt-image-2-token',
+      'banana-pro',
+      'banana-2',
+      'doubao-seedream-5-0-pro-260628',
+      'banana-pro-token',
+      'gk-image-2.0',
+      'banana-2-token',
+      'mj_imagine',
+      'vidu-image-2',
+      'doubao-seedream-5-0-260128',
+      'wan2.7-image',
+      'doubao-seedream-4-5-251128',
+      'qwen-image',
+      'wan2.6-image',
+    ],
+    // 视频 74 个(全量)。42 个可直接跑; 其余 32 个平台把 version / mode / size 等标成
+    // 必填, 档位表里 `needsParams` 已逐个记下, 待协议层支持模型专属参数后再放开。
+    videoModels: [
+      'seedance-2.5-guanfang-anmiao',
+      'gk-video-3.5',
+      'seedance-2.5-guanfang',
+      'viduq4-preview',
+      'kwvideo-v2-ref',
+      'minimax-h3',
+      'seedance-2.0-guanfang',
+      'seedance-2.0-guanfang-anmiao',
+      'hailuo-h3-cankaosheng',
+      'omni_flash-10s',
+      'omni-flash',
+      'kling-v3-omni-cankao',
+      'wan3.0-video-quannengcankao',
+      'seedance-2.5-anmiao-quannengcankao',
+      'doubao-seedance-2-5-cankaosheng',
+      'gk-video-3',
+      'wan3.0',
+      'hailuo-h3-shouweizhen',
+      'hailuo-h3-quannengcankao',
+      'kwvideo-v2-quannengcankao',
+      'kling-avatar-image2video',
+      'hailuo-h3',
+      'seedance-2.0-anmiao-quannengcankao',
+      'seedance-2.5-anmiao',
+      'seedance-2.0-anmiao-cankaosheng',
+      'happyhorse-r2v',
+      'video-enhance',
+      'doubao-seedance-2-5-260628',
+      'omni-1.1',
+      'doubao-seedance-2-5-quannengcankao',
+      'kling-v3-video',
+      'kwvideo-v2',
+      'viduq3',
+      'viduq3-turbo-cankaosheng',
+      'wan3.0-video',
+      'seedance-2.0-anmiao',
+      'viduq3-drama',
+      'wan3.0-video-cankaosheng',
+      'kling-v3-omni-videoref',
+      'happyhorse-video-edit',
+      'hailuo-h3-max-shouweizhen',
+      'hailuo-h3-max',
+      'kling-motion-control-v3',
+      'seedance-2.5-anmiao-shouweizhen',
+      'pixverse-v6-shouweizhen',
+      'minimax-h3-max',
+      'vidu-mv',
+      'vo3.1',
+      'kling-motion-control',
+      'doubao-seedance-2-5-shouweizhen',
+      'kling-v3-omni-shouweizhen',
+      'happyhorse-1.1-r2v',
+      'happyhorse-1.1-t2v',
+      'omni_flash-10s-fl',
+      'wan2.2-animate-mix',
+      'wan3.0-video-shouweizhen',
+      'wan2.6-cankaosheng',
+      'seedance-2.5-anmiao-wensheng',
+      'viduq3-turbo',
+      'happyhorse-t2v',
+      'happyhorse-i2v',
+      'wan2.7-shouweizhen',
+      'pixverse-c1-cankaosheng',
+      'pixverse-c1-shouweizhen',
+      'viduq3-cankaosheng',
+      'wan2.6-shouzheng',
+      'wan2.7-cankaosheng',
+      'vidu-jieshuoman',
+      'happyhorse-1.1-i2v',
+      'pixverse-v5.6-shouweizhen',
+      'pixverse-v5.6-r2v',
+      'viduq2-cankaosheng',
+      'wan2.7-xuxie',
+      'hailuo-h3-zaishengcheng',
+    ],
+    // 音频 8 个(TTS / 音乐)
+    audioModels: [
+      'suno-v6',
+      'speech-2.8',
+      'suno-v4.5',
+      'music-2.5+',
+      'doubao-tts-2.0',
+      'gem-3.1-tts',
+      'music-2.5',
+      'gem-2.5-tts',
+    ],
+    // 对话 55 个(平台把厂商名换成了代号: tt=GPT / sn=Sonnet / gem=Gemini / op=Opus)。
+    // 另有 23 个(sn-* / op-* / hk-* / fb-* / gem-*)平台只给了 anthropic 的 /v1/messages
+    // 和 gemini 的 /v1beta 原生端点, 兼容协议列表里不含 openai —— 软件对话固定走
+    // /v1/chat/completions, 接进来必然 400, 所以不登记; 要用得先给对话层加两种原生协议。
+    chatModels: [
+      'tt-6-luna',
+      'tt-6-astra',
+      'tt-6.1-sol',
+      'tt-5.6-sol',
+      'kimi-k3',
+      'tt-5.5',
+      'tt-5.6-luna',
+      'tt-5.4',
+      'deepseek-v4-pro',
+      'tt-6-sol',
+      'doubao-seed-2-1-pro-260628',
+      'deepseek-v4.1-flash',
+      'qwen3.8-max',
+      'tt-5.6-terra',
+      'glm-5.3',
+      'doubao-seed-2-0-pro-260215',
+      'deepseek-v4-flash',
+      'glm-5.3-flash',
+      'gk-4.6',
+      'deepseek-v4-flash-vision-exp',
+      'qwen3.8-max-0902',
+      'deepseek-v4-pro-0813',
+      'gk-4.7',
+      'tt-5.4-mini',
+      'doubao-seed-2-1-turbo-260628',
+      'qwen3.8-flash',
+      'kimi-k2.6',
+      'glm-5.3-flashx',
+      'tt-4o',
+      'glm-5.2',
+      'tt-5.2',
+      'MiniMax-M3',
+      'gk-4.5',
+      'qwen3.7-max',
+      'kimi/kimi-k2.7-code-highspeed',
+      'deepseek-v4-flash-0731',
+      'kimi/kimi-k2.7-code',
+      'deepseek-v3.2',
+      'doubao-seed-evolving',
+      'gk-4-20',
+      'stepfun/step-3.7-flash',
+      'mimo-v2.5-pro',
+      'mimo-v2.6-pro',
+      'qwen3.5-plus',
+      'qwen3.5-flash',
+      'qwen3.6-plus',
+      'tt-5.4-nano',
+      'qwen3.8-flash-next',
+      'qwen3.7-plus',
+      'MiniMax-M2.7',
+      'doubao-seed-character-260628',
+      'gk-4.3',
+      'doubao-seed-1-8-251228',
+      'qwen3.6-flash',
+      'gk-build-0.1',
+    ],
+    // 9 → 74, 老配置靠这个号自动补端点(见 resolveNewRecommendedVideoModels)。
+    videoModelsRevision: 2,
+    audioModelsRevision: 1,
+    videoConfig: {
+      submitPath: '/v1/media/generate',
+      queryPath: '/v1/skills/task-status?task_id={taskId}',
+      // 两条链路都吃 data URL: 方舟官方支持 base64; media 的 image_url 也接受同一写法。
+      referenceEncoding: 'data_url',
+      transport: 'media-generate',
+      transportByModel: {
+        'seedance-2.5-guanfang-anmiao': 'ark-anmiao',
+        'seedance-2.0-guanfang-anmiao': 'ark-anmiao',
+      },
+    },
+  },
 ];
 
 /**
@@ -951,12 +1207,12 @@ export const visibleRecommendedApiIds: readonly string[] = [
   'runninghub',
   'runninghub-cn',
   'modelscope',
+  // api666888: 「暗苗」链路(9 个 seedance 模型, media + 方舟两种协议)。
+  'api666888',
 ];
 
 /** 按白名单过滤出需要在设置界面展示的推荐平台（隐藏 ≠ 删除配置）。 */
-export function listVisibleRecommendedApis(
-  all: readonly RecommendedApi[] = recommendedApis,
-): RecommendedApi[] {
+export function listVisibleRecommendedApis(all: readonly RecommendedApi[] = recommendedApis): RecommendedApi[] {
   const allow = new Set(visibleRecommendedApiIds);
   return all.filter((api) => allow.has(api.id));
 }
@@ -969,12 +1225,7 @@ export function listVisibleRecommendedApis(
  * 不这么做的话，同一个平台会因为一个后缀被判成"未连接"，卡片永远不够绿。
  */
 export function normalizeRecommendedBaseUrl(value: string): string {
-  return value
-    .trim()
-    .replace(/\/+$/, '')
-    .replace(/\/v1$/i, '')
-    .replace(/\/+$/, '')
-    .toLowerCase();
+  return value.trim().replace(/\/+$/, '').replace(/\/v1$/i, '').replace(/\/+$/, '').toLowerCase();
 }
 
 /**

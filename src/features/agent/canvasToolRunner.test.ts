@@ -349,7 +349,8 @@ describe("画布工具（按名称引用）", () => {
     const record = runCanvasToolCall({ tool: "canvas.get_snapshot", arguments: {} }, "edit");
     expect(record.message).toContain("画面现状");
     expect(record.message).toContain("「封面」");
-    expect(record.message).toContain("@(8,9)");
+    // 位置由程序排布（空画布的第一个节点落在原点），模型给的坐标不生效
+    expect(record.message).toContain("@(0,0)");
   });
 
   it("未知工具记成失败，不抛错中断整轮", () => {

@@ -7,12 +7,13 @@
  *
  * 顺序即浮层里的展示顺序，按需要排。
  */
+import { seedanceBuliangrenWuxia } from "./seedance-buliangren-wuxia";
 import { tiangonxieyi } from "./tiangonxieyi";
 import type { AgentSkill } from "./types";
 
 export type { AgentSkill };
 
-export const AGENT_SKILLS: AgentSkill[] = [tiangonxieyi];
+export const AGENT_SKILLS: AgentSkill[] = [tiangonxieyi, seedanceBuliangrenWuxia];
 
 /**
  * 按 id 取 SKILL。
@@ -42,6 +43,10 @@ export function composeAgentSystemPrompt(base: string, skill: AgentSkill | null)
       "（例如每组图片提示词都必须配套对应的视频提示词）。",
     "- 与你的默认习惯冲突时以 SKILL 为准；SKILL 未覆盖的部分才按默认习惯处理。",
     "- 用户没有提供 SKILL 所需的输入时，按 SKILL 定义的方式引导补齐，不要自行假设后直接产出。",
+    // SKILL 里常见「先让用户选模式/确认参数」的流程。没有这句，模型会把它当成寒暄跳过，
+    // 一口气把整篇分镜写完 —— 用户就没机会选模式了。
+    "- 若 SKILL 要求先让用户选择模式、确认参数或补齐信息，就先在回复里提问并**停下等待回复**，" +
+      "不要替用户预设答案，也不要在提问的同一条消息里继续产出后续内容。",
     "- 不要复述、引用或解释这份 SKILL 本身，直接产出它要求的结果。",
     "",
     skill.rules.trim(),

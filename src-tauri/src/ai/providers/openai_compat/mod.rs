@@ -331,6 +331,15 @@ impl OpenAICompatibleProvider {
         if video_protocols::binghuo::matches(transport, base_url, provider_id) {
             return video_protocols::binghuo::submit(&protocol_ctx, &request).await;
         }
+        // api666888(灵柯同源网关): 一条是本站 media 信封, 一条是火山方舟格式。
+        // 必须排在通用分支前面 —— 通用分支会发 `/v1/videos/generations` 并带
+        // `aspect_ratio`, 这两条链路都不认。
+        if video_protocols::media::matches(transport, base_url, provider_id) {
+            return video_protocols::media::submit(&protocol_ctx, &request).await;
+        }
+        if video_protocols::ark::matches(transport, base_url, provider_id) {
+            return video_protocols::ark::submit(&protocol_ctx, &request).await;
+        }
         // RunningHub 的端点 ID 本身即模型(`kling-v3.0-pro/image-to-video`), 且每个
         // 端点的字段名 / 枚举 / 必填默认值都不同 —— 全部由前端 `runningHubProtocol.ts`
         // 通过 `extra_params.runninghub_video` 注入, 协议层只负责按说明装填。
@@ -979,6 +988,72 @@ transfer-encoding={}；request_id={}。本次请求平台已受理，这类断�
 
     fn apply_image_count(body: &mut Value, image_count: u32) {
         body["n"] = json!(image_count);
+    }
+
+    /// 允许透传进图片请求体的「模型专属参数」白名单。
+    ///
+    /// `extra_params` 里有两种东西：一是控制字段（`image_transport` / `protocol` /
+    /// `provider_base_url` / `request_mode` / `image_generation_mode`…），只该在
+    /// 客户端与后端之间流转；二是模型自己的参数（Midjourney 的 `count` / `bot_type` /
+    /// `version` / `stylize`，各平台的 `seed` / `quality`…）。后者以前**一个都发不出去**，
+    /// 面板上选了等于没选。这里只放行确定属于请求体的键，控制字段仍然进不来。
+    ///
+    /// `negative_prompt` **刻意不在名单里**：它在 `extra_params` 里是给 grsai / fal /
+    /// RunningHub 这些自家协议读的，原样塞进 OpenAI Images 请求体会被严格的厂商
+    /// （原生 gpt-image 系）判成「未知参数」直接 400。要负向提示词请用各模型自己的字段。
+    const IMAGE_PARAM_PASSTHROUGH: &'static [&'static str] = &[
+        "count",
+        "bot_type",
+        "version",
+        "stylize",
+        "chaos",
+        "quality",
+        "style",
+        "seed",
+        "tile",
+        "hd",
+        "draft",
+        "sref",
+        "cref",
+        "iw",
+        "cw",
+        "sw",
+        "stop",
+        "weird",
+        "extra",
+        "output_format",
+    ];
+
+    /// 把白名单里的模型参数装进请求体。
+    ///
+    /// 两个细节：
+    /// - 空串按「没选」处理（Midjourney 的 `version` 默认档就是空串），别把 `""` 发上去；
+    /// - 体里一旦有 `count` 就把 `n` 删掉。Midjourney 的 `count` 是**组数**（一组 4 张），
+    ///   实测 `n` 会被上游忽略（`n: 1` 仍回 4 张），两个字段并存只会让渠道各自理解。
+    fn apply_model_extra_params(body: &mut Value, extra_params: &Option<HashMap<String, Value>>) {
+        let Some(params) = extra_params.as_ref() else {
+            return;
+        };
+        let Some(object) = body.as_object_mut() else {
+            return;
+        };
+        for key in Self::IMAGE_PARAM_PASSTHROUGH {
+            let Some(value) = params.get(*key) else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            if let Some(text) = value.as_str() {
+                if text.trim().is_empty() {
+                    continue;
+                }
+            }
+            object.insert((*key).to_string(), value.clone());
+        }
+        if object.contains_key("count") {
+            object.remove("n");
+        }
     }
 
     fn serialize_image_sources(images: Vec<String>) -> Result<String, AIError> {
@@ -1907,6 +1982,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 )?
             };
             Self::apply_image_count(&mut body, image_count);
+            Self::apply_model_extra_params(&mut body, &request.extra_params);
             Self::apply_image_mode(&mut body, &request.extra_params);
             client.post(&endpoint)
                 .bearer_auth(&api_key)
@@ -1945,6 +2021,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 "raw_base64",
             )?;
             Self::apply_image_count(&mut fallback_body, image_count);
+            Self::apply_model_extra_params(&mut fallback_body, &request.extra_params);
             Self::apply_image_mode(&mut fallback_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] WGSPAI gpt-image Responses 404, falling back to /v1/images/generations"
@@ -1976,6 +2053,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 Self::resolve_reference_image_encoding(&request.extra_params, alternate_field),
             )?;
             Self::apply_image_count(&mut alternate_body, image_count);
+            Self::apply_model_extra_params(&mut alternate_body, &request.extra_params);
             Self::apply_image_mode(&mut alternate_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] retrying with reference_image_field: {}",
@@ -2157,6 +2235,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 )?
             };
             Self::apply_image_count(&mut body, image_count);
+            Self::apply_model_extra_params(&mut body, &request.extra_params);
             Self::apply_image_mode(&mut body, &request.extra_params);
             client.post(&endpoint)
                 .bearer_auth(&api_key)
@@ -2182,6 +2261,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 "raw_base64",
             )?;
             Self::apply_image_count(&mut fallback_body, image_count);
+            Self::apply_model_extra_params(&mut fallback_body, &request.extra_params);
             Self::apply_image_mode(&mut fallback_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] async: WGSPAI gpt-image Responses 404, falling back to /v1/images/generations"
@@ -2213,6 +2293,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 Self::resolve_reference_image_encoding(&request.extra_params, alternate_field),
             )?;
             Self::apply_image_count(&mut alternate_body, image_count);
+            Self::apply_model_extra_params(&mut alternate_body, &request.extra_params);
             Self::apply_image_mode(&mut alternate_body, &request.extra_params);
             info!(
                 "[OpenAI Compatible Request] async retrying with reference_image_field: {}",

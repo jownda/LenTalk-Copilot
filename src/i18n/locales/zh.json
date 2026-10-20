@@ -437,6 +437,14 @@
     "aspectRatio": "比例",
     "imageCount": "生成张数",
     "imageCountOption": "{{count}} 张",
+    "imageCountGroupHint": "该模型一次出 {{unit}} 张，只能按组选",
+    "midjourney": {
+      "botType": "模型引擎",
+      "midJourney": "MJ 写实模式",
+      "nijiJourney": "Niji 动漫模式",
+      "version": "版本",
+      "stylize": "风格化"
+    },
     "enableWebSearch": "启用联网搜索",
     "otherParams": "其他参数",
     "extraOptions": "额外参数",

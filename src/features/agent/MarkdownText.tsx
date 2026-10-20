@@ -19,8 +19,11 @@ const MARKDOWN_CLASS = [
   "[&_h3]:mb-1 [&_h3]:mt-2 [&_h3]:text-[13px] [&_h3]:font-semibold",
   "[&_hr]:my-3 [&_hr]:border-text-muted/20",
   "[&_li]:my-0.5 [&_ol]:list-decimal [&_ol]:pl-5 [&_p]:my-1.5 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0",
+  // 代码块里的长行必须自动折行：分镜提示词一行能到 100+ 字，
+  // 面板只有 420px 宽，横向滚动等于看不全。overflow-x-auto 保留作兜底。
   "[&_pre]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-text-muted/15 [&_pre]:p-2",
-  "[&_pre_code]:bg-transparent [&_pre_code]:p-0",
+  "[&_pre]:whitespace-pre-wrap [&_pre]:break-words",
+  "[&_pre_code]:whitespace-pre-wrap [&_pre_code]:break-words [&_pre_code]:bg-transparent [&_pre_code]:p-0",
   "[&_table]:my-2 [&_table]:w-full [&_table]:border-collapse [&_table]:text-[12px]",
   "[&_td]:border [&_td]:border-text-muted/20 [&_td]:px-2 [&_td]:py-1",
   "[&_th]:border [&_th]:border-text-muted/20 [&_th]:px-2 [&_th]:py-1",

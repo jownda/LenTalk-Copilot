@@ -67,6 +67,7 @@ import {
   resolveImageModelResolutions,
 } from '@/features/canvas/models';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
+import { isWgspaiProvider } from '@/features/canvas/models/wgspaiPricing';
 import {
   NODE_CONTROL_CHIP_CLASS,
   NODE_CONTROL_ICON_CLASS,
@@ -75,6 +76,7 @@ import {
   NODE_CONTROL_PRIMARY_BUTTON_CLASS,
 } from '@/features/canvas/ui/nodeControlStyles';
 import { ModelParamsControls } from '@/features/canvas/ui/ModelParamsControls';
+import { ImageCountControl } from '@/features/canvas/ui/ImageCountControl';
 import { NodeReferencePicker } from '@/features/canvas/ui/NodeReferencePicker';
 import { PromptTemplatePicker } from '@/features/canvas/ui/PromptTemplatePicker';
 import {
@@ -441,6 +443,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   const imageModels = listImageModels();
   const selectedModel = getImageModel(data.model ?? DEFAULT_IMAGE_MODEL_ID);
   const imageCount = resolveImageGenerationCount(data.imageCount);
+  // 一档实际出几张：绝大多数模型是 1，Midjourney 是 4（一档 = 一组 4 张）。
+  // 请求侧与按钮文案都以它为准，见 models/midjourney.ts。
+  const imagesPerCountUnit = selectedModel.imagesPerCountUnit ?? 1;
   const providerApiKey = apiKeys[selectedModel.providerId] ?? '';
   // 即梦 / 万相这类本机 CLI 平台靠可执行文件与登录态工作, 没有可填的密钥 ——
   // 不能因为 apiKeys 里没有这一项就把生成拦下来。
@@ -454,6 +459,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   }, [customApis, selectedModel.providerId]);
   const effectiveExtraParams = useMemo(
     () => ({
+      // 模型自带的默认值先铺底（MJ 的 bot_type / stylize），节点上用户改过的再覆盖。
+      // 不铺这一层，用户不点开参数面板时 MJ 的必填字段就只能靠网关默认值兜着。
+      ...(selectedModel.defaultExtraParams ?? {}),
       ...(data.extraParams ?? {}),
       ...(customApiBaseUrl ? { provider_base_url: customApiBaseUrl } : {}),
     }),
@@ -495,7 +503,13 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
       showNodePrice
         ? resolveModelPriceDisplay(selectedModel, {
           resolution: selectedResolution.value,
-          extraParams: effectiveExtraParams,
+          // 一档多张的模型(Midjourney 一档 = 一组 4 张)按组计价, 报价要乘组数;
+          // WGSPAI 的图片是**按张**计价(0.1 元/张), 选 4 张就该显示 0.4;
+          // 其它模型 prices 与张数无关, 不传 count 免得被误读。
+          extraParams:
+            imagesPerCountUnit > 1 || isWgspaiProvider('', customApiBaseUrl ?? '')
+              ? { ...effectiveExtraParams, count: imageCount }
+              : effectiveExtraParams,
           language: i18n.language,
           settings: {
             displayCurrencyMode: priceDisplayCurrencyMode,
@@ -508,6 +522,9 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     [
       grsaiCreditTierId,
       i18n.language,
+      imagesPerCountUnit,
+      imageCount,
+      customApiBaseUrl,
       preferDiscountedPrice,
       priceDisplayCurrencyMode,
       effectiveExtraParams,
@@ -1302,7 +1319,6 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
           selectedResolution={selectedResolution}
           selectedAspectRatio={selectedAspectRatio}
           aspectRatioOptions={aspectRatioOptions}
-          imageCount={imageCount}
           onModelChange={(modelId) => {
             updateNodeData(id, {
               model: modelId,
@@ -1320,11 +1336,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
             setLastImageAspectRatio(aspectRatio);
           }
           }
-          onImageCountChange={(count) =>
-            updateNodeData(id, { imageCount: resolveImageGenerationCount(count) })
-          }
-          extraParams={data.extraParams}
-          onExtraParamChange={(key, value) =>
+          extraParams={data.extraParams}          onExtraParamChange={(key, value) =>
             updateNodeData(id, {
               extraParams: {
                 ...(data.extraParams ?? {}),
@@ -1349,6 +1361,18 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
           chipClassName={NODE_CONTROL_CHIP_CLASS}
           modelChipClassName={NODE_CONTROL_MODEL_CHIP_NARROW_CLASS}
           paramsChipClassName={NODE_CONTROL_PARAMS_CHIP_CLASS}
+        />
+
+        {/* 生成张数：紧挨着提示词模板按钮放在它左边 —— 这两个都是「生成前最后一拍」
+            要确认的东西，顺手一起点完再按生成。Midjourney 的一档是 4 张，
+            按钮上显示的是换算后的张数（见 models/midjourney.ts）。 */}
+        <ImageCountControl
+          imageCount={imageCount}
+          imagesPerCountUnit={imagesPerCountUnit}
+          disabled={isGenerating}
+          onChange={(count) =>
+            updateNodeData(id, { imageCount: resolveImageGenerationCount(count) })
+          }
         />
 
         {/* 提示词模板：只显示图标，点开弹出「素材库 → 提示词库」的条目卡片。

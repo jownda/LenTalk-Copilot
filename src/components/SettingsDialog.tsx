@@ -355,6 +355,7 @@ export function SettingsDialog({
         videoReferenceEncoding: api.videoConfig.referenceEncoding,
         taskProtocol: 'generic',
         videoTransport: api.videoConfig.transport,
+        ...(api.videoConfig.transportByModel ? { videoTransports: api.videoConfig.transportByModel } : {}),
       } : undefined,
     }),
     []
@@ -532,6 +533,7 @@ export function SettingsDialog({
         videoReferenceEncoding: api.videoConfig.referenceEncoding,
         taskProtocol: 'generic',
         videoTransport: api.videoConfig.transport,
+        ...(api.videoConfig.transportByModel ? { videoTransports: api.videoConfig.transportByModel } : {}),
       } : undefined),
     });
     setShowAddCustomApi(true);

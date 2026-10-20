@@ -22,6 +22,8 @@ export interface RecordGenerationOutcomeParams {
   size?: string;
   duration?: number;
   referenceCount?: number;
+  /** 影响计价的其他模型参数(如 MJ 的 count 组数)。 */
+  extraParams?: Record<string, unknown>;
   status: 'succeeded' | 'failed';
   errorMessage?: string;
   durationMs?: number;
@@ -42,6 +44,7 @@ export function recordGenerationOutcome(params: RecordGenerationOutcomeParams): 
     kind: params.kind,
     size: params.size ?? '1K',
     duration: params.duration ?? 0,
+    extraParams: params.extraParams,
   });
 
   const createdAt = Date.now();

@@ -73,6 +73,16 @@ export interface CanvasHistoryState {
 }
 
 /**
+ * 「把镜头挪到这些节点上」的一次性请求（见 `CanvasState.focusRequest`）。
+ * 只表示意图，不含目标缩放：实际取景由 `Canvas` 用 `fitView` 算。
+ */
+export interface CanvasFocusRequest {
+  nodeIds: string[];
+  /** 递增计数，保证内容相同的重复请求也能再次触发 effect */
+  nonce: number;
+}
+
+/**
  * 内存中保留的 undo 步数。每步快照持有当时的 nodes/edges 数组, 大画布(单节点带
  * base64 参考图)下 50 步会让编辑期常驻数百 MB 并拖慢每次入栈的内容去重比较。
  * 20 步足够覆盖正常编辑节奏, 同时显著降低主线程压力。
@@ -226,6 +236,19 @@ interface CanvasState {
   closeTextEditDialog: () => void;
   setViewportState: (viewport: Viewport) => void;
   setCanvasViewportSize: (size: { width: number; height: number }) => void;
+  /**
+   * 一次性「把镜头挪到这些节点上」的请求。
+   *
+   * 视口是 React Flow 的非受控状态（`defaultViewport` + 内部 transform），
+   * store 里存的那份只是镜像，改它画布不会动。所以这里只投递意图，
+   * 由 `Canvas` 里订阅这个字段的 effect 去调 `fitView` 落地。
+   *
+   * `nonce` 是必须的：反复点同一个节点的「定位」时，`nodeIds` 内容完全一样，
+   * 没有递增计数 React 会认为依赖没变、effect 不再执行 —— 按钮就成了只能点一次。
+   */
+  focusRequest: CanvasFocusRequest | null;
+  /** 请求把镜头对准这些节点（不存在的 id 会在落地时被忽略） */
+  requestFocusNodes: (nodeIds: string[]) => void;
   openImageViewer: (imageUrl: string, imageList?: string[]) => void;
   closeImageViewer: () => void;
   navigateImageViewer: (direction: 'prev' | 'next') => void;
@@ -1249,6 +1272,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   chargingGroupId: null,
   currentViewport: { x: 0, y: 0, zoom: 1 },
   canvasViewportSize: { width: 0, height: 0 },
+  focusRequest: null,
   imageViewer: {
     isOpen: false,
     currentImageUrl: null,
@@ -1487,6 +1511,15 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return;
     }
     set({ canvasViewportSize: size });
+  },
+
+  requestFocusNodes: (nodeIds) => {
+    // 去重 + 去空：AI 的批量结果里同一个 id 可能出现两次（比如 create_nodes 回填 + 连线结果）
+    const ids = Array.from(
+      new Set((Array.isArray(nodeIds) ? nodeIds : []).filter((id): id is string => typeof id === "string" && id.trim().length > 0)),
+    );
+    if (ids.length === 0) return;
+    set({ focusRequest: { nodeIds: ids, nonce: (get().focusRequest?.nonce ?? 0) + 1 } });
   },
 
   openImageViewer: (imageUrl, imageList = []) => {

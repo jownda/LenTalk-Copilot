@@ -292,10 +292,9 @@ export function buildQuickPromptRequest(
     );
   }
 
-  userBlocks.push(
-    "",
-    "Use only the applicable final-prompt sections in this order: SCENE CONTEXT, ACTIVE REFERENCES, LOCATION MAP, FIRST FRAME AND SPATIAL BLOCKING, FORMAT MODE (generation organization only — never aspect ratio, resolution, duration in seconds, or frame rate), OPTICS, CAMERA, ACTION TIMING, PHYSICS, LIGHTING, AUDIO, POSITIVE CONSTRAINTS. Do not output a standalone NEGATIVE CONSTRAINTS section unless a local failure lock is necessary.",
-  );
+  // 末尾这段只讲「成品输出哪些段落」。Seedance 是一串大写标题、H3 是下划线小写字段，
+  // 段落清单必须跟格式走，否则换格式后模型会被这句固定清单拽回 Seedance 结构。
+  userBlocks.push("", format.userTail);
 
   return {
     system: format.buildSystem({ outputLanguage, locale }),

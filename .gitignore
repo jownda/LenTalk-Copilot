@@ -47,3 +47,6 @@ __pycache__/
 
 # 本地备份文件(如改价格表前留的 registry.ts.bak-YYYYMMDD-<用途>)
 *.bak-*
+
+# 本地 agent 工作记录(不属于产品代码)
+.workbuddy/

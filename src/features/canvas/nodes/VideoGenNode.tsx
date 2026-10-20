@@ -33,6 +33,7 @@ import {
   type VideoGenNodeData,
 } from "@/features/canvas/domain/canvasNodes";
 import { resolveNodeDisplayName } from "@/features/canvas/domain/nodeDisplay";
+import { resolveVideoNodeDuration, snapVideoDurationOption } from "@/features/canvas/domain/videoNodeDefaults";
 import { canvasAiGateway, graphImageResolver } from "@/features/canvas/application/canvasServices";
 import { resolveErrorContent, showErrorDialog } from "@/features/canvas/application/errorDialog";
 import {
@@ -425,10 +426,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             return false;
           }
         }
-        return !isRunningHubDedicatedVideoEndpoint(endpoint)
-          && !normalized.includes("motion-control")
-          && !normalized.includes("lip-sync")
-          && !normalized.includes("对口型");
+        return (
+          !isRunningHubDedicatedVideoEndpoint(endpoint) &&
+          !normalized.includes("motion-control") &&
+          !normalized.includes("lip-sync") &&
+          !normalized.includes("对口型")
+        );
       }),
     [customApis, imageMode],
   );
@@ -453,7 +456,13 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const selectedVideoResolution = resolutionOptions.some((option) => option.value === data.resolution)
     ? data.resolution!
     : (selectedModel?.defaultResolution ?? resolutionOptions[0]?.value ?? "720p");
-  const selectedDuration = Math.max(durationMinimum, Math.min(durationMaximum, Math.round(Number(data.duration) || 5)));
+  // 时长必须落在模型声明的枚举里：可灵 v4 这类离散档位(5/10/15/30)的平台校验很严，
+  // 拖到 17 秒会被直接拒，所以这里统一吸附到最近的合法档，而不是简单夹取。
+  const rawDuration = Number(data.duration);
+  const selectedDuration = snapVideoDurationOption(
+    durationOptions,
+    Number.isFinite(rawDuration) && rawDuration > 0 ? rawDuration : (selectedModel?.defaultDuration ?? 5),
+  );
   const videoModelProviders = useMemo(
     () => Array.from(new Set(models.map((model) => model.providerId))).map(getModelProvider),
     [models],
@@ -1157,9 +1166,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     // 这段到 addNode 之间没有 await，所以连点不可能插进来重复提交。
     beginCooldown();
     const customId = selectedModel.providerId.slice("custom:".length);
-    const baseUrl = isJimengCli || isWanCli || isRunningHubCli ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
+    const baseUrl =
+      isJimengCli || isWanCli || isRunningHubCli ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
     const manualReferenceVideos = Array.isArray(data.binghuoReferenceVideos)
-      ? data.binghuoReferenceVideos.filter((source): source is string => typeof source === "string" && source.trim().length > 0)
+      ? data.binghuoReferenceVideos.filter(
+          (source): source is string => typeof source === "string" && source.trim().length > 0,
+        )
       : [];
     const referenceVideos = Array.from(new Set([...inputVideos, ...manualReferenceVideos]));
     const generationExtraParams = {
@@ -1233,7 +1245,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     });
     // 追加而非覆盖：连点会同时挂多个下游任务，覆盖会让先提交的那个丢掉记账，
     // 从而在下游还在跑的时候把源节点的「生成中」误清掉。
-    const trackedBefore = collectActiveGenerationNodeIds(useCanvasStore.getState().nodes.find((node) => node.id === id)?.data);
+    const trackedBefore = collectActiveGenerationNodeIds(
+      useCanvasStore.getState().nodes.find((node) => node.id === id)?.data,
+    );
     updateNodeData(id, { activeGenerationNodeIds: [...trackedBefore, outputId], activeGenerationNodeId: null });
     updateNodeSize(outputId, compactSize.width, compactSize.height);
     addEdge(id, outputId);
@@ -1375,10 +1389,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
 
   // 把「生成」登记给 AI Agent：它按节点名触发时走的就是这个函数 ——
   // 与用户亲手点按钮完全同一条路径，计费/取消/错误处理都不会被绕开。
-  useEffect(
-    () => registerNodeGenerationHandler(id, () => void handleGenerate()),
-    [id, handleGenerate],
-  );
+  useEffect(() => registerNodeGenerationHandler(id, () => void handleGenerate()), [id, handleGenerate]);
 
   // 炳火高级字段: 仅当当前模型是炳火 API 时显示折叠面板。
   // 字段名固定 reference_videos(手册 3.3 红字强调: videos / video_urls 部分模型被忽略)。
@@ -1829,6 +1840,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                                 updateNodeData(id, {
                                   model: model.id,
                                   customPrice: customModelPrices[model.id] ?? null,
+                                  // 换模型时把时长落到新模型的合法档位上；声明了
+                                  // defaultDuration 的新模型（如可灵 v4 = 30s）直接用它。
+                                  duration: resolveVideoNodeDuration(model, data.duration),
                                 });
                                 setLastVideoModelId(model.id);
                                 setShowModelPicker(false);
@@ -1916,7 +1930,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                 step="1"
                 value={selectedDuration}
                 onChange={(event) => {
-                  const duration = Number(event.target.value);
+                  const duration = snapVideoDurationOption(durationOptions, Number(event.target.value));
                   updateNodeData(id, { duration });
                   setLastVideoDuration(duration);
                 }}
@@ -1934,7 +1948,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             : jimengCliStatus.status === "running"
               ? "已进入生成阶段，无法取消"
               : jimengCliStatus.status === "retrying"
-                ? jimengCliStatus.message ?? "正在重试"
+                ? (jimengCliStatus.message ?? "正在重试")
                 : "即梦 CLI 处理中"}
           {jimengCliStatus.status === "queued" && (
             <span className="ml-1 text-text-muted/70">（CLI 未提供远端取消功能）</span>

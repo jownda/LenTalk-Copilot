@@ -89,6 +89,7 @@ import type {
   GenerateVideoPayload,
   UpscaleVideoPayload,
 } from "../application/ports";
+import { isMidjourneyImageModel } from "@/features/canvas/models/midjourney";
 import { generateWanCliVideo } from "@/commands/wanCli";
 import { useWanCliStore } from "@/stores/wanCliStore";
 
@@ -112,6 +113,37 @@ function mergeImageCount(
       : undefined;
   if (numeric == null) return extraParams;
   return { ...(extraParams ?? {}), image_count: numeric };
+}
+
+/**
+ * 把节点上的「生成张数」翻译成该模型真正认的字段。
+ *
+ * 绝大多数平台走 OpenAI Images 的 `n`（`image_count`，后端会写成 `body.n`）。
+ * **Midjourney 是例外**：实测（2026-10-18，知鸟 `mj_imagine`）`n: 1` 依旧回 4 张、
+ * 且响应里没有 `param_adjustments`——说明上游根本没看 `n`；而 `count: 2` 回了 8 张。
+ * 也就是说 `count` 是**组数**，一组恒为 4 张。
+ *
+ * 所以这里对 MJ 换字段：删掉 `image_count`（别让 n 混进请求体），改发 `count`。
+ * 节点上的 `imageCount` 仍是 1~4 的档位；档位 → 组数是一比一，张数由按钮文案换算。
+ */
+function mergeImageCountForModel(
+  extraParams: Record<string, unknown> | undefined,
+  imageCount: number | undefined,
+  model: string,
+): Record<string, unknown> | undefined {
+  if (!isMidjourneyImageModel(model)) {
+    return mergeImageCount(extraParams, imageCount);
+  }
+  const groups =
+    typeof imageCount === "number" && Number.isFinite(imageCount)
+      ? Math.max(1, Math.min(4, Math.round(imageCount)))
+      : undefined;
+  const next: Record<string, unknown> = { ...(extraParams ?? {}) };
+  delete next.image_count;
+  if (groups != null) {
+    next.count = groups;
+  }
+  return next;
 }
 
 function withAspectRatioRequirement(prompt: string, aspectRatio: string): string {
@@ -223,7 +255,13 @@ export function withZhiniaoImageMode<
   const providerId = payload.model.split("/")[0]?.replace(/^custom:/i, "") ?? "";
   const baseUrl = typeof extraParams.provider_base_url === "string" ? extraParams.provider_base_url : "";
   if (!isZhiniaoProviderId(providerId) && !isZhiniaoBaseUrl(baseUrl)) return payload;
-  extraParams.image_generation_mode = usableReferences.length > 1 ? "multi-reference" : "image-edit";
+  // Midjourney 的 mode 只有 text-to-image / multi-reference 两档（模型卡 param_schema），
+  // 传 image-edit 属于非法枚举。单张垫图在 MJ 语义里也是「多图融合」的一种，
+  // 所以 MJ 一律走 multi-reference，避免选了参考图就被上游判参数错误。
+  extraParams.image_generation_mode =
+    isMidjourneyImageModel(payload.model) || usableReferences.length > 1
+      ? "multi-reference"
+      : "image-edit";
   return { ...payload, extraParams };
 }
 
@@ -293,7 +331,11 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
     extraParams.video_query_path = customApi.capabilities.videoQueryPath;
   }
   if (customApi?.capabilities?.confidence === "high" && customApi.capabilities.videoTransport) {
-    extraParams.video_transport = customApi.capabilities.videoTransport;
+    // 同一平台下可能混挂多条链路(api666888: media 信封 + 火山方舟)。按模型覆盖优先,
+    // 查不到时回落到平台级 transport —— 模型名取 `custom:<id>/<model>` 的斜杠之后部分。
+    const modelName = payload.model.split("/").slice(1).join("/");
+    const perModel = customApi.capabilities.videoTransports?.[modelName];
+    extraParams.video_transport = perModel ?? customApi.capabilities.videoTransport;
   }
   if (
     extraParams.video_reference_encoding == null &&
@@ -590,7 +632,12 @@ export const tauriAiGateway: AiGateway = {
       normalizedReferenceImages,
       injected.model.split("/")[0] ?? "",
     );
-    const mergedExtraParams = mergeImageCount(mergeNegativePrompt(injected), payload.imageCount);
+    const mergedExtraParams = mergeImageCountForModel(
+      mergeNegativePrompt(injected),
+      payload.imageCount,
+      payload.model,
+    );
+    const isMidjourney = isMidjourneyImageModel(payload.model);
 
     return await generateImage({
       prompt: localizeReferenceTokens(withAspectRatioRequirement(payload.prompt, payload.aspectRatio), payload.model),
@@ -598,7 +645,8 @@ export const tauriAiGateway: AiGateway = {
       model: payload.model,
       size: payload.size,
       aspect_ratio: payload.aspectRatio,
-      image_count: payload.imageCount,
+      // MJ 的张数走 extra_params.count（组数），不要再带 image_count —— 后端会把它写成 n。
+      image_count: isMidjourney ? undefined : payload.imageCount,
       reference_images: referenceImages,
       extra_params: mergedExtraParams,
     });
@@ -615,7 +663,12 @@ export const tauriAiGateway: AiGateway = {
       normalizedReferenceImages,
       injected.model.split("/")[0] ?? "",
     );
-    const mergedExtraParams = mergeImageCount(mergeNegativePrompt(injected), payload.imageCount);
+    const mergedExtraParams = mergeImageCountForModel(
+      mergeNegativePrompt(injected),
+      payload.imageCount,
+      payload.model,
+    );
+    const isMidjourney = isMidjourneyImageModel(payload.model);
     // 即梦 CLI 的画幅由 `--ratio` 直接决定, 不需要(也不该)往提示词里追加画幅约束;
     // 其余平台依赖这句英文兜底上游忽略 aspect_ratio 参数的情况。
     // 这里按整个 provider 前缀判断: 普通图片(`image-*`)与超清(`upscale`)都算。
@@ -630,7 +683,7 @@ export const tauriAiGateway: AiGateway = {
       model: payload.model,
       size: payload.size,
       aspect_ratio: payload.aspectRatio,
-      image_count: payload.imageCount,
+      image_count: isMidjourney ? undefined : payload.imageCount,
       reference_images: referenceImages,
       extra_params: mergedExtraParams,
     });

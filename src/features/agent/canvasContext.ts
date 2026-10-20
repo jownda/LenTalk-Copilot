@@ -162,6 +162,32 @@ export function findCanvasNodeByRefName(
   };
 }
 
+/**
+ * 从工具返回的 `data` 里取出「这次操作碰过哪些节点」。
+ *
+ * 卡片上的「定位」按钮靠它决定显示与目标。字段不统一是有历史原因的：
+ * 单节点操作回 `nodeId`、批量回 `nodeIds`、连线回 `source`/`target`
+ * （连线两头都值得看一眼），所以一律认。
+ */
+export function extractToolResultNodeIds(data: unknown): string[] {
+  if (!data || typeof data !== "object") return [];
+  const record = data as {
+    nodeId?: unknown;
+    nodeIds?: unknown;
+    source?: unknown;
+    target?: unknown;
+  };
+  const ids: string[] = [];
+  const push = (value: unknown) => {
+    if (typeof value === "string" && value.trim()) ids.push(value.trim());
+  };
+  if (Array.isArray(record.nodeIds)) record.nodeIds.forEach(push);
+  push(record.nodeId);
+  push(record.source);
+  push(record.target);
+  return Array.from(new Set(ids));
+}
+
 /** 节点生成的媒体地址：结果可能落在不同字段上，按优先级取第一个可用的 */
 export function extractNodeMediaUrl(data: Record<string, unknown>): string | null {
   const keys = [

@@ -34,7 +34,7 @@ import {
   getVideoModel,
   resolveAudioModelFamily,
 } from "../models";
-import { resolveVideoNodeModelId, resolveVideoNodeParams } from "./videoNodeDefaults";
+import { resolveVideoNodeDuration, resolveVideoNodeModelId, resolveVideoNodeParams } from "./videoNodeDefaults";
 import { resolveImageNodeModelId, resolveImageNodeParams } from "./imageNodeDefaults";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { createCinematicProjectId } from "@/features/cinematicStudio/app/projectId";
@@ -184,7 +184,8 @@ const videoGenNodeDefinition: CanvasNodeDefinition<VideoGenNodeData> = {
       prompt: "",
       model,
       customPrice: settings.customModelPrices[model] ?? null,
-      duration: settings.lastVideoDuration,
+      duration:
+        resolveVideoNodeDuration(getVideoModel(model), settings.lastVideoDuration) ?? settings.lastVideoDuration,
       aspectRatio,
       resolution,
       imageMode: "reference",
