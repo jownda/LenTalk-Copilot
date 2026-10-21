@@ -13,6 +13,8 @@ import {
   findRecommendedApiByBaseUrl,
   resolveNewRecommendedVideoModels,
 } from '@/features/settings/recommendedApis';
+// 同上: 纯数据 + 纯函数, 无 store 依赖。
+import { isLingkeBaseUrl, LINGKE_IMAGE_NAME_OVERRIDES } from '@/features/settings/lingkeModels';
 import {
   DEFAULT_PAJUBEN_QUALITY_TIER,
   isPajubenQualityTier,
@@ -181,7 +183,16 @@ export function isVideoGenerationModelName(model: string): boolean {
     // happyhorse / omni-flash 在知鸟 AI 的清单里是视频模型，名字里既没有 video
     // 也没有 t2v（happyhorse-1-0、omni-flash-1-1），只能显式列出。
     /(?:^|[-_.])happyhorse(?:[-_.]|\d|$)/,
-    /(?:^|[-_.])omni-flash(?:[-_.]|\d|$)/,
+    // omni 家族（omni-flash-1-1 / omni_flash-10s / omni-1.1）用的是下划线或纯型号，
+    // 早先只写了 `omni-flash` 这一种拼法，`omni_flash-10s` 因此漏到图片桶里。
+    // ⚠️ 不能写成裸 `omni`：字子动画的 `Omni-Nano*` 是 nano-banana 出图，
+    // 会被一起拖进视频清单（图片节点就选不到了）。只认 flash 与纯数字型号两种。
+    /(?:^|[-_.])omni[-_]?flash(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])omni[-_]?\d/,
+    // 灵柯AI 的代号视频模型：kwvideo-v2*（可灵改写）、vo3.1（Veo 代号）。
+    // 名字里没有 video / t2v，也没有厂商名，不显式列出就会被当成图片/对话。
+    /(?:^|[-_.])kwvideo(?:[-_.]|\d|$)/,
+    /(?:^|[-_.])vo\d(?:[-_.]|\d|$)/,
     // Grok Imagine 视频系(grok-imagine-1.5 / -1-5-7tu-special / -video / -video-special);
     // 带 image 的是图片, 已在 IMAGE_MODEL_MARKER 那边拦下, 这里用否定前瞻排除。
     /grok-imagine-(?!image)/,
@@ -220,8 +231,17 @@ export function isChatCompletionModelName(model: string): boolean {
   if (imageMarker.test(value)) {
     return false;
   }
+  // 末尾这批是**转售平台的代号前缀**, 名字里根本不出现厂商名:
+  //   灵柯AI(api.lk888.ai) 把 GPT 写成 `tt-`、Gemini 写成 `gk-` / `gem-`、
+  //   Sonnet 写成 `sn-`、Opus 写成 `op-`, 另有 `hk-` / `fb-` 两条自营线;
+  //   `mimo`(小米) / `step`(阶跃) 是正常厂商名, 此前也漏了。
+  // 少了它们, 「拉取模型 → 对话」筛不出这些模型, 而图片那条兜底分支
+  // (`!视频 && !音频 && !chat`) 又会把它们当图片收进去 —— 表现就是
+  // 「对话模型跑到图片里、对话那边一个都拉不到」。
+  // 带 image / video / audio 字样的仍由上面的前置判断拦下(tt-image-2 / gk-video-3 /
+  // gem-2.5-tts 都不会被这里抢走)。
   const llmMarker =
-    /(?:^|[-_/])(gpt|o[1-4]|claude|codex|gemini|deepseek|glm|chatglm|llama|mistral|mixtral|qwen[23]?|kimi|moonshot|doubao|hunyuan|ernie|spark|baichuan|abab|phi|falcon|vicuna|wizard|openchat|hermes|nemotron|granite|olmo|jamba|command|nova|titan|minimax|groq|grok)(?=[-_.0-9]|$)|gpt-|claude-|codex-|gemini-|deepseek-|glm-|llama-|kimi|moonshot|doubao/i;
+    /(?:^|[-_/])(gpt|o[1-4]|claude|codex|gemini|deepseek|glm|chatglm|llama|mistral|mixtral|qwen[23]?|kimi|moonshot|doubao|hunyuan|ernie|spark|baichuan|abab|phi|falcon|vicuna|wizard|openchat|hermes|nemotron|granite|olmo|jamba|command|nova|titan|minimax|groq|grok|mimo|step|stepfun|tt|gk|gem|sn|op|hk|fb)(?=[-_.0-9]|$)|gpt-|claude-|codex-|gemini-|deepseek-|glm-|llama-|kimi|moonshot|doubao/i;
   return llmMarker.test(value);
 }
 
@@ -265,6 +285,8 @@ export interface CustomApiProvider {
   presetVideoModelsRevision?: number;
   /** 上一次从推荐预设同步音频模型时的版本号。 */
   presetAudioModelsRevision?: number;
+  /** 上一次从推荐预设同步对话模型时的版本号。 */
+  presetChatModelsRevision?: number;
 }
 
 /**
@@ -404,14 +426,24 @@ interface SettingsState {
   /**
    * 扒剧本上一次选用的模型（`custom:<apiId>/<model>` 或 `recommended:<id>/<model>`）。
    * 记住它是为了「关掉页面再打开不用重新选模型」。
+   *
+   * 「扒视频」拆成视觉 + 音频两段之后，这里退化为**视觉模型**的兼容位：
+   * 新写入一律走 `pajubenVisionModelKey`，读取时两者任一为空都回落到另一个，
+   * 老用户的既有选择不会因为这次拆分而凭空消失。
    */
   pajubenModelKey: string | null;
+  /** 「扒视频」第 1 步（画面识别）用的视觉模型 key；为空时回落到 `pajubenModelKey`。 */
+  pajubenVisionModelKey: string | null;
+  /** 「扒视频」第 2 步（听写台词与音效）用的音频模型 key；必须与视觉模型分开选。 */
+  pajubenAudioModelKey: string | null;
   /**
    * 「扒视频」画质档位(fast / standard / fine)。
    * 决定 fps、画面清晰度与每集帧数上限；快速模式与工作台共用，默认 standard。
    */
   pajubenQualityTier: PajubenQualityTier;
   setPajubenModelKey: (key: string | null) => void;
+  setPajubenVisionModelKey: (key: string | null) => void;
+  setPajubenAudioModelKey: (key: string | null) => void;
   setPajubenQualityTier: (tier: PajubenQualityTier) => void;
   setProviderApiKey: (providerId: string, key: string) => void;
   setJimengCliExecutable: (executable: string) => void;
@@ -428,6 +460,8 @@ interface SettingsState {
   syncRecommendedVideoModels: () => void;
   /** 把推荐预设新增的音频模型追加到已添加的平台，保留用户已有模型。 */
   syncRecommendedAudioModels: () => void;
+  /** 把推荐预设新增的对话模型追加到已添加的平台，保留用户已有模型。 */
+  syncRecommendedChatModels: () => void;
   saveVoiceProfile: (profile: Omit<SavedVoiceProfile, 'id' | 'createdAt'> & Partial<Pick<SavedVoiceProfile, 'id' | 'createdAt'>>) => SavedVoiceProfile;
   /** 记下某个官方系统音色的本地试听音频（首次用该音色合成成功后调用）。 */
   saveSystemVoicePreview: (voiceId: string, audio: string) => void;
@@ -710,7 +744,14 @@ function normalizeCustomApiCapabilities(input: unknown): CustomApiCapabilities |
   };
 }
 
-function normalizeCustomApis(input: unknown): CustomApiProvider[] {
+/**
+ * 归一化平台配置(加载 / 保存 / 同步时都走这里)。
+ *
+ * 除了补默认值, 它还负责**把放错桶的模型归位**: `models` 里混进来的视频 / 音频 /
+ * 对话模型会被移到各自的清单里。这一步对老配置尤其重要 —— 旧版分类器认不出转售
+ * 平台的代号, 错位的数据已经落盘了, 光修分类器不迁移, 用户那边仍旧是错的。
+ */
+export function normalizeCustomApis(input: unknown): CustomApiProvider[] {
   if (!Array.isArray(input)) {
     return [];
   }
@@ -724,13 +765,28 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
       const configuredModels = Array.isArray(item.models)
         ? item.models.map((model) => String(model).trim()).filter(Boolean)
         : [];
+      // 灵柯的 `kling-v3` / `kling-v3-omni` 平台登记的是**图片**模型, 名字却会被
+      // 通用的 kling 视频规则抓走 —— 结果进视频清单后在 media 提交时被当视频
+      // 任务处理, 图片下拉里根本选不到。按平台(而非全局)做例外, 避免误伤别家
+      // 真名叫 kling-v3 的视频模型。
+      const lingkeProvider = isLingkeBaseUrl(String(item.baseUrl ?? ''));
+      const isLingkeImageOnly = (model: string) =>
+        lingkeProvider && LINGKE_IMAGE_NAME_OVERRIDES.includes(model.trim().toLowerCase());
       const videoModels = Array.from(new Set([
-        ...explicitVideoModels,
-        ...configuredModels.filter(isVideoGenerationModelName),
+        ...explicitVideoModels.filter((model) => !isLingkeImageOnly(model)),
+        ...configuredModels.filter((model) => !isLingkeImageOnly(model) && isVideoGenerationModelName(model)),
       ]));
-      const chatModels = Array.isArray(item.chatModels)
-        ? item.chatModels.map((model) => String(model).trim()).filter(Boolean)
-        : [];
+      const chatModels = Array.from(new Set([
+        ...(Array.isArray(item.chatModels)
+          ? item.chatModels.map((model) => String(model).trim()).filter(Boolean)
+          : []),
+        // 存量修复: 旧版分类器认不出转售平台的代号(tt-* / gk-* / gem-* / mimo-* …),
+        // 「拉取模型」时把它们塞进了 models(图片) 里。这里在加载时把明确是对话的
+        // 挪回 chatModels —— 否则代码修好了, 用户库里的错位数据还是老样子,
+        // 对话下拉里依旧只有一两个模型。图片模型带 image / banana / seedream 字样,
+        // 已被 isChatCompletionModelName 的 imageMarker 排除, 不会被误挪。
+        ...configuredModels.filter(isChatCompletionModelName),
+      ]));
       const audioModels = Array.from(new Set([
         ...(Array.isArray(item.audioModels)
           ? item.audioModels.map((model) => String(model).trim()).filter(Boolean)
@@ -739,12 +795,17 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
       ]));
       const videoModelIds = new Set(videoModels.map((model) => model.toLowerCase()));
       const audioModelIds = new Set(audioModels.map((model) => model.toLowerCase()));
+      const chatModelIds = new Set(chatModels.map((model) => model.toLowerCase()));
       const models = configuredModels.filter(
         (model) =>
-          !videoModelIds.has(model.toLowerCase())
-          && !audioModelIds.has(model.toLowerCase())
-          && !isVideoGenerationModelName(model)
-          && !isAudioModelName(model)
+          // 平台登记成图片、名字却像视频的那两个, 直接留在图片清单里
+          isLingkeImageOnly(model)
+          || (!videoModelIds.has(model.toLowerCase())
+            && !audioModelIds.has(model.toLowerCase())
+            && !chatModelIds.has(model.toLowerCase())
+            && !isVideoGenerationModelName(model)
+            && !isAudioModelName(model)
+            && !isChatCompletionModelName(model))
       );
 
       return {
@@ -799,6 +860,10 @@ function normalizeCustomApis(input: unknown): CustomApiProvider[] {
         presetAudioModelsRevision:
           typeof item.presetAudioModelsRevision === 'number' && Number.isFinite(item.presetAudioModelsRevision)
             ? item.presetAudioModelsRevision
+            : undefined,
+        presetChatModelsRevision:
+          typeof item.presetChatModelsRevision === 'number' && Number.isFinite(item.presetChatModelsRevision)
+            ? item.presetChatModelsRevision
             : undefined,
       };
     })
@@ -951,9 +1016,19 @@ export const useSettingsStore = create<SettingsState>()(
       customModelPrices: {},
       usableModelIds: [],
       pajubenModelKey: null,
+      pajubenVisionModelKey: null,
+      pajubenAudioModelKey: null,
       pajubenQualityTier: DEFAULT_PAJUBEN_QUALITY_TIER,
       setPajubenModelKey: (key) =>
         set({ pajubenModelKey: normalizeOptionalSettingString(key) }),
+      // 视觉模型同时写老字段：工作台仍按 `pajubenModelKey` 读写，两处选择保持一致。
+      setPajubenVisionModelKey: (key) =>
+        set({
+          pajubenVisionModelKey: normalizeOptionalSettingString(key),
+          pajubenModelKey: normalizeOptionalSettingString(key),
+        }),
+      setPajubenAudioModelKey: (key) =>
+        set({ pajubenAudioModelKey: normalizeOptionalSettingString(key) }),
       // 持久化里可能残留脏字符串，非法值一律回落默认档。
       setPajubenQualityTier: (tier) =>
         set({ pajubenQualityTier: isPajubenQualityTier(tier) ? tier : DEFAULT_PAJUBEN_QUALITY_TIER }),
@@ -1048,6 +1123,28 @@ export const useSettingsStore = create<SettingsState>()(
             ...api,
             audioModels: added.length ? [...api.audioModels, ...added] : api.audioModels,
             presetAudioModelsRevision: revision,
+          };
+        });
+        if (!changed) return;
+        set({ customApis: normalizeCustomApis(customApis) });
+      },
+      syncRecommendedChatModels: () => {
+        let changed = false;
+        const customApis = get().customApis.map((api) => {
+          const preset = findRecommendedApiByBaseUrl(api.baseUrl);
+          const chatModels = preset?.chatModels;
+          const revision = preset?.chatModelsRevision;
+          if (!chatModels?.length || revision === undefined) return api;
+          if (api.presetChatModelsRevision !== undefined && api.presetChatModelsRevision >= revision) {
+            return api;
+          }
+          const known = new Set(api.chatModels.map((model) => model.trim().toLowerCase()));
+          const added = chatModels.filter((model) => !known.has(model.trim().toLowerCase()));
+          changed = true;
+          return {
+            ...api,
+            chatModels: added.length ? [...api.chatModels, ...added] : api.chatModels,
+            presetChatModelsRevision: revision,
           };
         });
         if (!changed) return;
@@ -1218,6 +1315,8 @@ export const useSettingsStore = create<SettingsState>()(
             // 追加进去。已对齐的平台是 no-op, 不会反复写盘。
             useSettingsStore.getState().syncRecommendedVideoModels();
             useSettingsStore.getState().syncRecommendedAudioModels();
+            // 对话清单同理: 灵柯AI 一次补了 55 个, 老配置里往往只有一两个。
+            useSettingsStore.getState().syncRecommendedChatModels();
           }, 0);
         };
       },

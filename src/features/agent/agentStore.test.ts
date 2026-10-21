@@ -283,3 +283,69 @@ describe("canvasAccess", () => {
     expect(useAgentStore.getState().canvasAccess).toBe("full");
   });
 });
+
+/** 早期对话压缩备忘：水位线必须能往返，否则模型会收到重复内容或漏掉历史 */
+describe("contextSummary", () => {
+  const summary = {
+    text: "## 目标与进展\n写一个悬疑短片",
+    throughMessageId: "m2",
+    throughCreatedAt: 1700000000000,
+    messageCount: 12,
+    createdAt: 1700000001000,
+    tokens: 20,
+  };
+
+  it("随会话一起落盘与读回", () => {
+    const state = {
+      sessions: [session({ id: "s1", contextSummary: summary })],
+      activeSessionId: "s1",
+      selection: null,
+      skillId: null,
+      canvasAccess: "edit" as const,
+    };
+    expect(parseAgentState(serializeAgentState(state))?.sessions[0].contextSummary).toEqual(summary);
+  });
+
+  it("缺字段或没有水位线的脏数据一律丢弃", () => {
+    expect(parseAgentState(JSON.stringify({ sessions: [session({ id: "s1" })] }))?.sessions[0].contextSummary).toBeNull();
+    expect(
+      parseAgentState(
+        JSON.stringify({
+          sessions: [session({ id: "s1", contextSummary: { text: "x" } as never })],
+        }),
+      )?.sessions[0].contextSummary,
+    ).toBeNull();
+    expect(
+      parseAgentState(
+        JSON.stringify({
+          sessions: [session({ id: "s1", contextSummary: { ...summary, text: "   " } as never })],
+        }),
+      )?.sessions[0].contextSummary,
+    ).toBeNull();
+  });
+
+  it("setContextSummary 写入后可以撤销", () => {
+    useAgentStore.setState({
+      hydrated: true,
+      sessions: [session({ id: "s1" })],
+      activeSessionId: "s1",
+    });
+    useAgentStore.getState().setContextSummary("s1", summary as never);
+    expect(useAgentStore.getState().sessions[0].contextSummary).toEqual(summary);
+    useAgentStore.getState().setContextSummary("s1", null);
+    expect(useAgentStore.getState().sessions[0].contextSummary).toBeNull();
+  });
+
+  it("撤销压缩不会动消息本身", () => {
+    useAgentStore.setState({
+      hydrated: true,
+      sessions: [
+        session({ id: "s1", messages: [message({ id: "m1" }), message({ id: "m2" })] }),
+      ],
+      activeSessionId: "s1",
+    });
+    useAgentStore.getState().setContextSummary("s1", summary as never);
+    useAgentStore.getState().setContextSummary("s1", null);
+    expect(useAgentStore.getState().sessions[0].messages).toHaveLength(2);
+  });
+});

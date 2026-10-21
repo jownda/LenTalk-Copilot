@@ -212,15 +212,15 @@ describe("listVideoModels", () => {
     }
   });
 
-  it("api666888 换成真实网关域名(api.lingkeai.ai)后档位照样生效", () => {
-    // api666888.com 只是白标静态站(任何 POST 都 405), 真实网关是 api.lingkeai.ai。
-    // 预设已改成后者, 但 id 由平台名派生(custom:api666888), 不能只靠 id 命中 ——
-    // 这条用例锁住 baseUrl 分支, 防止以后有人把 includes 判断删掉。
+  it("api666888 换成任意官方/白标域名后档位照样生效(baseUrl 兜底)", () => {
+    // 官方主域名 api.lk888.ai、备用 api.lk666.ai, 加上历史出现过的 api.lingkeai.ai /
+    // api666888.com, 全都要认。id 也不能只靠 `api666888` 命中 —— 平台名派生出来的
+    // id 可能是 `custom:api-666888`, 这条用例锁住 baseUrl 分支。
     const previousCustomApis = useSettingsStore.getState().customApis;
-    const gateway: CustomApiProvider = {
+    const makeGateway = (baseUrl: string): CustomApiProvider => ({
       id: "custom:api-666888",
-      name: "API666888",
-      baseUrl: "https://api.lingkeai.ai",
+      name: "灵柯AI",
+      baseUrl,
       apiKey: "",
       models: [],
       videoModels: ["seedance-2.5-anmiao"],
@@ -233,14 +233,31 @@ describe("listVideoModels", () => {
       referenceImageField: "image" as const,
       referenceImageEncoding: "auto" as const,
       imageTransport: "generations_json" as const,
-    };
+    });
 
-    useSettingsStore.setState({ customApis: [gateway] });
     try {
-      const model = listVideoModels().find((item) => item.id.endsWith("/seedance-2.5-anmiao"));
-      expect(model?.durationOptions[0]).toBe(4);
-      expect(model?.durationOptions).toContain(23);
-      expect(model?.durationOptions).toContain(30);
+      for (const baseUrl of [
+        "https://api.lk888.ai",
+        "https://api.lk888.ai/v1",
+        "https://api.lk666.ai",
+        "https://api.lingkeai.ai",
+        "https://api666888.com",
+      ]) {
+        useSettingsStore.setState({ customApis: [makeGateway(baseUrl)] });
+        const model = listVideoModels().find((item) => item.id.endsWith("/seedance-2.5-anmiao"));
+        expect(model?.durationOptions[0], `${baseUrl} 丢了最短档`).toBe(4);
+        expect(model?.durationOptions, `${baseUrl} 丢了 23 秒档`).toContain(23);
+        expect(model?.durationOptions, `${baseUrl} 丢了 30 秒档`).toContain(30);
+      }
+
+      // 无关域名不能被误判成灵柯, 否则任何自定义平台都会套上它的档位表。
+      // gk-video-3.5 在灵柯表里只有 5 种画幅(16:9 / 9:16 / 1:1 / 3:2 / 2:3),
+      // 通用表是 10 种 —— 用画幅数量区分, 时长表在两边都是 4~30 逐秒, 分不出来。
+      useSettingsStore.setState({
+        customApis: [{ ...makeGateway("https://api.openai.com"), videoModels: ["gk-video-3.5"] }],
+      });
+      const outsider = listVideoModels().find((item) => item.id.endsWith("/gk-video-3.5"));
+      expect(outsider?.aspectRatios).toHaveLength(10);
     } finally {
       useSettingsStore.setState({ customApis: previousCustomApis });
     }
@@ -1085,6 +1102,70 @@ describe("图片超清", () => {
       // 用户要求先不放中转站模型: 放开时这里会失败, 提醒同步改测试与文案。
       expect(models.map((model) => model.id)).toEqual([JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID]);
       expect(models.some((model) => model.id.startsWith("custom:"))).toBe(false);
+    } finally {
+      useSettingsStore.setState({ customApis: previousCustomApis });
+    }
+  });
+
+  it("灵柯图片模型按平台的 options 裁剪画幅与档位, kling 出图也进图片下拉", () => {
+    // 数据源: 2026-10-20 抓自 GET /v1/skills/models/{name} 的 params[].options。
+    // 平台逐模型校验这两个枚举, 放开通用档位会让用户选出必被拒的值。
+    const previousCustomApis = useSettingsStore.getState().customApis;
+    const lingke: CustomApiProvider = {
+      id: "custom:api-666888",
+      name: "灵柯AI",
+      baseUrl: "https://api.lk888.ai",
+      apiKey: "",
+      models: ["banana-2.1", "gk-image-2.0", "doubao-seedream-5-0-260128", "kling-v3", "tt-image-2"],
+      videoModels: [],
+      audioModels: [],
+      chatModels: [],
+      modelPrices: {},
+      createdAt: Date.now(),
+      requestMode: "sync",
+      protocol: "images",
+      referenceImageField: "images",
+      referenceImageEncoding: "auto",
+      imageTransport: "generations_json",
+    };
+
+    useSettingsStore.setState({ customApis: [lingke] });
+    try {
+      const models = listImageModels();
+      const pick = (name: string) => models.find((model) => model.id.endsWith(`/${name}`));
+
+      // banana 系全档位都在
+      expect(pick("banana-2.1")?.resolutions.map((item) => item.value)).toEqual(["1K", "2K", "4K"]);
+      expect(pick("banana-2.1")?.aspectRatios).toHaveLength(10);
+
+      // gk-image-2.0 只有 1K/2K, 画幅只有 5 种
+      expect(pick("gk-image-2.0")?.resolutions.map((item) => item.value)).toEqual(["1K", "2K"]);
+      expect(pick("gk-image-2.0")?.aspectRatios.map((item) => item.value)).toEqual([
+        "1:1",
+        "16:9",
+        "9:16",
+        "4:3",
+        "3:4",
+      ]);
+
+      // doubao-seedream-5-0-260128 没有 1K/4K, 只有 2K/3K
+      expect(pick("doubao-seedream-5-0-260128")?.resolutions.map((item) => item.value)).toEqual([
+        "2K",
+        "3K",
+      ]);
+
+      // 像素 size 族没有独立档位参数, 回退通用三档
+      expect(pick("tt-image-2")?.resolutions.map((item) => item.value)).toEqual(["1K", "2K", "4K"]);
+
+      // 名字像视频、平台登记为图片的 kling-v3 必须出现在图片下拉里
+      expect(pick("kling-v3")).toBeDefined();
+      expect(pick("kling-v3")?.resolutions.map((item) => item.value)).toEqual(["1K", "2K"]);
+
+      // 同一个模型挂在别家平台上时不套灵柯的档位表
+      useSettingsStore.setState({ customApis: [{ ...lingke, baseUrl: "https://api.openai.com" }] });
+      const outsider = listImageModels().find((model) => model.id.endsWith("/gk-image-2.0"));
+      expect(outsider?.resolutions.map((item) => item.value)).toEqual(["1K", "2K", "4K"]);
+      expect(outsider?.aspectRatios).toHaveLength(10);
     } finally {
       useSettingsStore.setState({ customApis: previousCustomApis });
     }

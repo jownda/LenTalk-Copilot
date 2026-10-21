@@ -44,7 +44,7 @@ import {
   requestVideoCancellation,
   subscribeVideoCancellation,
 } from "@/features/canvas/application/videoGenerationCancel";
-import { prepareNodeImage, reduceAspectRatio, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { prepareNodeImage, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import { resolveMediaNodeResizeBounds } from "@/features/canvas/application/aspectLockedResize";
 import { captureVideoFrame, createObjectUrlFromDataUrl } from "@/features/canvas/application/videoFrameCapture";
 import { isVideoTrackUndecoded } from "@/features/canvas/application/videoPlayback";
@@ -177,7 +177,7 @@ function formatClock(seconds: number): string {
 
 export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
-  const updateNodeDataTransient = useCanvasStore((state) => state.updateNodeDataTransient);
+  const syncMediaNodeMediaSize = useCanvasStore((state) => state.syncMediaNodeMediaSize);
   const addDerivedExportNode = useCanvasStore((state) => state.addDerivedExportNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
 
@@ -476,20 +476,17 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
     return () => cancelAnimationFrame(frameId);
   }, [isPlaying, isVideo, updateAudioWaveformProgress, updatePlaybackTime]);
 
-  // 视频解码出真实尺寸后, 把宽高比写回节点数据: 拖拽缩放据此保持画面比例。
-  // 只是补充元信息, 不参与历史记录, 因此走 transient 写入。
+  // 视频解码出真实尺寸后, 把宽高比写回节点数据, 并把边框重算成同比例的尺寸。
+  // 视频节点的盒子就是画面, 没有缩放把手, 边框只跟着画面走 —— 竖屏/横屏混排时
+  // 也不会出现「边框比例不对、画面居中留黑边」。写入不参与历史记录, 因此走 store 的
+  // 媒体尺寸同步动作(它只在数据真的变了时才动节点)。
   useEffect(() => {
     if (!isVideo || !videoDimensions) {
       return;
     }
 
-    const actualAspectRatio = reduceAspectRatio(videoDimensions.width, videoDimensions.height);
-    if (data.aspectRatio === actualAspectRatio) {
-      return;
-    }
-
-    updateNodeDataTransient(id, { aspectRatio: actualAspectRatio });
-  }, [data.aspectRatio, id, isVideo, updateNodeDataTransient, videoDimensions]);
+    syncMediaNodeMediaSize(id, videoDimensions.width, videoDimensions.height);
+  }, [id, isVideo, syncMediaNodeMediaSize, videoDimensions]);
 
   // 生成中: 定时刷新以驱动模拟进度条(与 AI 图片结果节点一致)
   useEffect(() => {
@@ -1095,7 +1092,9 @@ export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
         position={Position.Right}
         className="!h-2 !w-2 !border-surface-dark !bg-accent"
       />
-      <NodeResizeHandle {...resolveMediaNodeResizeBounds(CANVAS_NODE_TYPES.audio, data)} />
+      {/* 视频节点的盒子就是画面, 边框由画面实测宽高反推, 不给缩放把手;
+          纯音频节点的盒子是波形面板, 保留原有拖拽缩放。 */}
+      {!isVideo && <NodeResizeHandle {...resolveMediaNodeResizeBounds(CANVAS_NODE_TYPES.audio, data)} />}
       {isVideoViewerOpen &&
         mediaSrc &&
         createPortal(

@@ -51,6 +51,23 @@ export interface PajubenRunRequest {
   roleSheet?: string | null;
   dualAudioModel?: string | null;
   dualVisionModel?: string | null;
+  /**
+   * 音频/视觉模型各自所属的渠道（base_url）。
+   *
+   * 「扒视频」把画面识别和音频听写拆成两段之后，两个模型可以来自不同渠道 ——
+   * 只有一个 base_url 时，跨渠道的音频模型会打到视觉渠道上，返回「模型不存在」。
+   * 留空表示沿用上面的 `baseUrl`。
+   */
+  dualAudioBaseUrl?: string | null;
+  dualVisionBaseUrl?: string | null;
+  /**
+   * 音频/视觉模型各自的密钥。
+   *
+   * 只走环境变量传给引擎，不进命令行参数（进程列表里能看到明文）。
+   * 留空表示沿用上面的 `apiKey`。
+   */
+  dualAudioApiKey?: string | null;
+  dualVisionApiKey?: string | null;
   fromEpisode?: number | null;
   toEpisode?: number | null;
   limit?: number | null;

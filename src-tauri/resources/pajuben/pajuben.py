@@ -1029,24 +1029,44 @@ def run_dual_fallback(S, video, ep, out_dir, roles_file):
     os.makedirs(cache_dir, exist_ok=True)
     native_gemini = is_gemini_native_base(S["base_url"])
     # 原生 Gemini 单模型可以同时听声和看图；快速入口的 --dual-only 则明确
-    # 使用前端挑出的同渠道音频模型和视觉模型，不能再被当前选中模型覆盖。
+    # 使用前端挑出的音频模型和视觉模型，不能再被当前选中模型覆盖。
     use_single_native_model = native_gemini and not S.get("force_dual", False)
     audio_model = S["model"] if use_single_native_model else S["dual_audio_model"]
     vision_model = S["model"] if use_single_native_model else S["dual_vision_model"]
-    if not audio_model or not vision_model:
+    if not audio_model:
         raise RuntimeError(
-            "当前模型不支持音频输入，且当前渠道没有配置可用的音频模型（例如 Gemini）。"
-            "请在同一渠道加入 Gemini 或支持音频输入的模型后重试"
-        )
+            "没有选音频模型：画面识别和音频识别要分开做，请先指定一个能听声的音频模型"
+            "（例如 Gemini / Qwen-Omni / GPT-4o-Audio）")
+    if not vision_model:
+        raise RuntimeError(
+            "没有选视觉模型：画面识别需要一个能看图的模型，请先指定视觉模型")
     cmd = [sys.executable, "-u", script, video, "--ep", str(ep),
            "--base", S["base_url"],
            "--audio-model", audio_model,
            "--vision-model", vision_model,
-           "--output-dir", cache_dir]
+           "--output-dir", cache_dir,
+           # 画质档位同样作用于双模型流程：帧密度、清晰度、单集上限都跟工作台一致。
+           "--fps", str(S.get("fps") or 2),
+           "--longedge", str(S.get("longedge") or 768),
+           "--max-frames", str(S.get("max_frames") or 240)]
+    # 两个模型可以分属两个渠道：各自带自己的 base_url，密钥走环境变量。
+    audio_base = S.get("dual_audio_base") or ""
+    vision_base = S.get("dual_vision_base") or ""
+    if audio_base:
+        cmd += ["--audio-base", audio_base]
+    if vision_base:
+        cmd += ["--vision-base", vision_base]
     if roles_file:
         cmd += ["--roles-file", roles_file]
     env = os.environ.copy()
     env["PAJUBEN_API_KEY"] = S["key"]
+    # 只有跨渠道时才下发独立密钥；同渠道留空，子脚本自动沿用 PAJUBEN_API_KEY。
+    for name, value in (("PAJUBEN_DUAL_AUDIO_KEY", S.get("dual_audio_key")),
+                        ("PAJUBEN_DUAL_VISION_KEY", S.get("dual_vision_key"))):
+        if value:
+            env[name] = value
+        else:
+            env.pop(name, None)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1, env=env)
     # 整集双模型最多运行45分钟。到时终止该集，批处理会记录失败并继续，
@@ -1059,9 +1079,25 @@ def run_dual_fallback(S, video, ep, out_dir, roles_file):
     watchdog = threading.Timer(45 * 60, stop_stalled_worker)
     watchdog.daemon = True
     watchdog.start()
+    failure_lines = []
+    capturing = False
     try:
         for line in proc.stdout:
-            log(f"  [双模型] {line.rstrip()}")
+            text = line.rstrip()
+            # 子脚本把「哪个阶段、哪个模型、为什么失败」写成 ❌ 行，记下来拼进本层报错，
+            # 否则用户只看到一句「退出码 1」。控制台上把它降级成 ⚠ —— 最终结论由本层
+            # 的 ❌ 行给出，宿主就是按第一条 ❌ 行截取报错正文的。
+            log(f"  [双模型] {text.replace('❌', '⚠')}")
+            if "❌" in text:
+                failure_lines = [text.replace("❌", "").strip()]
+                capturing = True
+            elif capturing and text.startswith(("  ", "\t")):
+                # 紧跟其后的缩进行是「说明：……」诊断，属于同一条报错。
+                failure_lines.append(text.strip())
+            elif capturing and not text.strip():
+                continue
+            else:
+                capturing = False
         code = proc.wait()
     finally:
         watchdog.cancel()
@@ -1069,11 +1105,12 @@ def run_dual_fallback(S, video, ep, out_dir, roles_file):
         raise RuntimeError("双模型整集处理超过45分钟，已停止；下次将从缓存断点续跑")
     final_path = os.path.join(cache_dir, f"第{ep}集_双模型.txt")
     if code != 0 or not os.path.exists(final_path):
-        raise RuntimeError(f"双模型降级失败（退出码 {code}）")
+        reason = "\n    ".join(failure_lines).strip() or f"双模型引擎异常退出（退出码 {code}）"
+        raise RuntimeError(reason)
     with open(final_path, "r", encoding="utf-8") as f:
         result = f.read()
     if not result.strip():
-        raise RuntimeError("双模型降级返回空结果")
+        raise RuntimeError("双模型返回空结果：请检查视觉模型是否能正常读图")
     return result
 
 
@@ -1390,6 +1427,11 @@ def build_settings(args, cfg):
             else args.model if same_provider_fallback else args.dual_vision_model
         ),
         "force_dual": bool(args.dual_only),
+        # 两个模型可以分属两个渠道：base 走参数，密钥只走环境变量。
+        "dual_audio_base": (args.dual_audio_base or "").strip(),
+        "dual_vision_base": (args.dual_vision_base or "").strip(),
+        "dual_audio_key": (os.environ.get("PAJUBEN_DUAL_AUDIO_KEY", "") or "").strip(),
+        "dual_vision_key": (os.environ.get("PAJUBEN_DUAL_VISION_KEY", "") or "").strip(),
         "anime_mode": bool(args.anime_mode),
         "want_face": not args.no_face,
         "prompt_text": load_prompt() + (
@@ -1458,6 +1500,12 @@ def main():
     ap.add_argument("--dual-vision-model",
                     default=cfg.get("dual_vision_model", "doubao-seed-2-1-pro-260628"),
                     help="自动降级时使用的视觉及合并模型")
+    # 双模型的音频/视觉模型可以来自不同渠道：各自一套 base_url。
+    # 密钥不进命令行，只认 PAJUBEN_DUAL_AUDIO_KEY / PAJUBEN_DUAL_VISION_KEY。
+    ap.add_argument("--dual-audio-base", default="",
+                    help="音频模型所属渠道（留空沿用 --base）")
+    ap.add_argument("--dual-vision-base", default="",
+                    help="视觉模型所属渠道（留空沿用 --base）")
     args = ap.parse_args()
 
     if not shutil.which("ffmpeg"):
@@ -1514,7 +1562,9 @@ def main():
     except KeyboardInterrupt:
         sys.exit("\n已取消")
     except Exception as e:
-        if S["dual_fallback"] and should_use_dual_fallback(e):
+        # 已经走双模型的批次不能再降级一次：那只会把同一个错误重跑一遍，
+        # 还把「音频模型不支持音频」这类真原因拖成半小时后才报出来。
+        if not S["force_dual"] and S["dual_fallback"] and should_use_dual_fallback(e):
             log(f"\n⚠ 单模型失败：{e}")
             log("↳ 自动切换双模型…")
             try:

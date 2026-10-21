@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ClipboardPaste, Copy, Download, Library, Lock, LockOpen, Save, Trash2 } from "lucide-react";
+import {
+  ClipboardPaste,
+  Copy,
+  Download,
+  Library,
+  Lock,
+  LockOpen,
+  Save,
+  Scissors,
+  Trash2,
+} from "lucide-react";
 
 interface AssetCategoryOption {
   id: string;
@@ -22,6 +32,7 @@ interface CanvasContextMenuProps {
   failedNodeCount: number;
   onClearFailedNodes: () => void;
   onCopyNode: (nodeId: string) => void;
+  onCutNode: (nodeId: string) => void;
   onSaveTextToPrompt: () => void;
   onPaste: () => void;
   onAddMediaToLibrary: (url: string, mediaType: "image" | "video" | "audio", categoryId: string) => void;
@@ -44,6 +55,7 @@ export function CanvasContextMenu({
   failedNodeCount,
   onClearFailedNodes,
   onCopyNode,
+  onCutNode,
   onSaveTextToPrompt,
   onPaste,
   onAddMediaToLibrary,
@@ -93,14 +105,24 @@ export function CanvasContextMenu({
       style={{ left: position.x, top: position.y }}
     >
       {nodeId && (
-        <button
-          type="button"
-          onClick={() => onCopyNode(nodeId)}
-          className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
-        >
-          <Copy className="h-4 w-4 text-text-muted" />
-          <span>复制</span>
-        </button>
+        <>
+          <button
+            type="button"
+            onClick={() => onCutNode(nodeId)}
+            className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
+          >
+            <Scissors className="h-4 w-4 text-text-muted" />
+            <span>{t("canvas.contextMenu.cut", "剪切")}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onCopyNode(nodeId)}
+            className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
+          >
+            <Copy className="h-4 w-4 text-text-muted" />
+            <span>{t("canvas.contextMenu.copy", "复制")}</span>
+          </button>
+        </>
       )}
 
       {isGroupNode && (
@@ -122,7 +144,7 @@ export function CanvasContextMenu({
           className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:text-text-muted/50 disabled:hover:bg-transparent"
         >
           <Save className="h-4 w-4 text-accent" />
-          <span>保存到提示词库</span>
+          <span>{t("canvas.contextMenu.saveTextToPrompt", "保存到提示词库")}</span>
         </button>
       )}
 
@@ -135,7 +157,7 @@ export function CanvasContextMenu({
           className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:text-text-muted/50 disabled:hover:bg-transparent"
         >
           <ClipboardPaste className="h-4 w-4 text-text-muted" />
-          <span>粘贴</span>
+          <span>{t("canvas.contextMenu.paste", "粘贴")}</span>
         </button>
       )}
 
@@ -191,7 +213,7 @@ export function CanvasContextMenu({
           className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-red-400 transition-colors hover:bg-red-500/10 disabled:cursor-not-allowed disabled:text-text-muted/50 disabled:hover:bg-transparent"
         >
           <Trash2 className="h-4 w-4" />
-          <span>清理失败节点</span>
+          <span>{t("canvas.contextMenu.clearFailedNodes", "清理失败节点")}</span>
           {failedNodeCount > 0 && <span className="ml-auto text-xs text-text-muted">{failedNodeCount}</span>}
         </button>
       ) : null}

@@ -16,6 +16,7 @@ import type {
 } from "../../shared-types";
 import { isRemoteConfigured, loadAISettings, normalizeBaseUrl, openAICompatibleBaseUrl, type AISettings } from "./aiSettings";
 import { describeProviderFailure, isUpstreamPromptPolicyRejection } from "@/commands/providerError";
+import { createProviderStreamWatchdog } from "./providerStreamWatchdog";
 import type { Locale } from "../i18n";
 import { buildQuickPromptRequest, type QuickPromptInput } from "./quickPromptAgent";
 import { cameraMoveTemplateLibrary } from "../cameraMoveTemplates";
@@ -90,6 +91,32 @@ function decodeBase64Chunk(value: string): Uint8Array {
   return bytes;
 }
 
+/**
+ * 让不支持 signal 的原生调用也能被取消。
+ * Tauri 的 invoke 不认 AbortSignal, 这里用一个可 race 的包装: 一旦 signal 中止就
+ * 立刻抛 AbortError 交给上层, 后台请求自己仍会被后端的总超时收掉。
+ */
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const fail = () => reject(new DOMException("请求已取消", "AbortError"));
+    if (signal.aborted) {
+      fail();
+      return;
+    }
+    signal.addEventListener("abort", fail, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", fail);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", fail);
+        reject(error);
+      },
+    );
+  });
+}
+
 /** 流式响应在生成中断时携带已经收到的内容，供用户反复续写直到完成。 */
 export class ChatCompletionInterruptedError extends Error {
   readonly partialText: string;
@@ -140,7 +167,21 @@ async function remoteFetch(url: string, init: RequestInit = {}): Promise<Respons
         resolveStart = resolve;
         rejectStart = reject;
       });
+      // 看门狗: 等响应头 2 分钟, 之后 2 分钟没有新字节就判渠道挂死。
+      // 没有它的话, 事件丢失 / 上游静默时 startPromise 与 reader.read() 会永远
+      // pending, 调用方的 finally 永远不执行, 按钮就锁在「生成中…」。
+      const watchdog = createProviderStreamWatchdog({
+        onTimeout: (message) => {
+          if (settled) return;
+          settled = true;
+          const error = new Error(message);
+          if (!started) rejectStart(error);
+          else controllerRef?.error(error);
+          cleanup();
+        },
+      });
       const cleanup = () => {
+        watchdog.stop();
         unlisten?.();
         unlisten = undefined;
       };
@@ -158,10 +199,13 @@ async function remoteFetch(url: string, init: RequestInit = {}): Promise<Respons
           const payload = event.payload;
           if (payload.kind === "start") {
             started = true;
+            // 响应头到位: 换成「空闲」计时, 覆盖"连上了但不再吐数据"的渠道。
+            watchdog.touch();
             resolveStart(payload.status ?? 200);
             return;
           }
           if (payload.kind === "chunk" && payload.chunk_base64 && !settled) {
+            watchdog.touch();
             controllerRef?.enqueue(decodeBase64Chunk(payload.chunk_base64));
             return;
           }
@@ -181,6 +225,7 @@ async function remoteFetch(url: string, init: RequestInit = {}): Promise<Respons
           }
         });
 
+        watchdog.armStart();
         void invoke<void>("request_provider_stream", {
           url,
           method: init.method ?? "GET",
@@ -209,12 +254,17 @@ async function remoteFetch(url: string, init: RequestInit = {}): Promise<Respons
 
     // Do not fall through to fetch after a native request error: the provider
     // may already have accepted the billable request.
-    const result = await invoke<{ status: number; body: string }>("request_provider_json", {
+    //
+    // 非流式通道没有空闲判死的余地(合法长生成在结束前一个字节都不发), 但调用方
+    // 传进来的 AbortSignal 必须生效 —— 否则「拉模型列表」这类自己带 45 秒上限的
+    // 调用会真的等到后端 15 分钟总超时。
+    const nativeCall = invoke<{ status: number; body: string }>("request_provider_json", {
       url,
       method: init.method ?? "GET",
       headers,
       body,
     });
+    const result = init.signal ? await raceWithAbort(nativeCall, init.signal) : await nativeCall;
     return new Response(result.body, {
       status: result.status,
       statusText: result.status >= 200 && result.status < 300 ? "OK" : "Error",
@@ -1168,7 +1218,12 @@ export function classifyError(error: unknown): { kind: AIModelErrorKind; message
   // must not silently retry or fall back and risk duplicate billing.
   if (/^HTTP (?:504|524)(?:\D|$)/i.test(message)) kind = "gateway-timeout";
   else if (/^HTTP \d+/.test(message)) kind = "http";
-  else if (err.name === "AbortError" || /time\s*out|abort|被中止|操作已取消|操作已中止|请求被取消/i.test(message)) kind = "timeout";
+  else if (
+    err.name === "AbortError" ||
+    // 「超时」要单独列: 后端与看门狗抛的是中文文案(「上游 120 秒没有返回任何数据」),
+    // 只匹配 time out / abort 会让这类最需要提示"重试即可"的失败被归到 other。
+    /time\s*out|timed out|abort|超时|被中止|操作已取消|操作已中止|请求被取消|没有返回任何数据/i.test(message)
+  ) kind = "timeout";
   else if (err instanceof TypeError || /failed to fetch|networkerror|load failed|fetch failed|network request failed/i.test(message)) kind = "network";
   else if (/未返回|empty|no models/i.test(message)) kind = "empty";
   return { kind, message };

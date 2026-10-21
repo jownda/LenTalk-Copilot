@@ -57,6 +57,25 @@ fn is_complete_json_body(bytes: &[u8]) -> bool {
     !bytes.is_empty() && serde_json::from_slice::<Value>(bytes).is_ok()
 }
 
+/// media 信封里的图片参数命名族。
+///
+/// 灵柯网关把同类参数在不同模型上写成了不同名字, 而且 `size` 一词有三义 ——
+/// 像素(tt-image-2)、档位(doubao-seedream)、画幅比例(qwen-image / wan2.x-image)。
+/// 传错键名平台不报错、直接按默认值出图, 所以必须按模型挑键名。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaImageParamStyle {
+    /// banana-* / mj_imagine: `aspectRatio`(驼峰) + `imageSize`
+    CamelTier,
+    /// tt-image-2.5 / gk-image-2.0 / kling-v3* / vidu-image-2: `aspect_ratio` + `resolution`
+    SnakeTier,
+    /// doubao-seedream-*: `aspect_ratio` + `size`(档位 2K/3K/4K)
+    SnakeSizeTier,
+    /// tt-image-2*: 只有 `size`, 值是像素尺寸(比例与档位都折进像素串)
+    PixelSize,
+    /// qwen-image / wan2.x-image: `size` 就是画幅比例, 没有独立分辨率
+    RatioOnly,
+}
+
 impl OpenAICompatibleProvider {
     pub fn new() -> Self {
         Self {
@@ -592,6 +611,182 @@ impl OpenAICompatibleProvider {
             .unwrap_or_else(|_| reqwest::Client::new())
     }
 
+    /// 图片提交的重试次数。
+    ///
+    /// 参考图内联时请求体是**几 MB 到几十 MB** 的量级(实测 26MB 单单上传就要 28 秒),
+    /// 传输层抖动的概率远高于普通 JSON 调用。此前一次抖动就直接把 reqwest 的
+    /// `error sending request for url (...)` 抛给用户: 既没说原因、也没给重试机会。
+    const IMAGE_SEND_MAX_ATTEMPTS: usize = 3;
+
+    /// 把 reqwest 的传输层失败翻成能定位问题的中文。
+    ///
+    /// reqwest 的 Display 只有 `error sending request for url (…)`;到底是连接被拒、
+    /// TLS 被掐、还是超时,全在 source 链里。这层不翻出来,用户报障时我们只能瞎猜。
+    fn describe_send_failure(error: &reqwest::Error) -> String {
+        let mut causes: Vec<String> = Vec::new();
+        let mut source = std::error::Error::source(error);
+        while let Some(item) = source {
+            let text = item.to_string();
+            if !text.trim().is_empty() && !causes.iter().any(|existing| existing == &text) {
+                causes.push(text);
+            }
+            source = item.source();
+        }
+        let kind = if error.is_connect() {
+            "无法与上游建立连接"
+        } else if error.is_timeout() {
+            "等待上游超时"
+        } else if error.is_body() || error.is_request() {
+            "发送请求体时连接被中断"
+        } else {
+            "请求未能送达上游"
+        };
+        if causes.is_empty() {
+            kind.to_string()
+        } else {
+            format!("{kind}（{}）", causes.join("；"))
+        }
+    }
+
+    /// 只有在「一个字节的响应都没收到」时才允许重投。
+    ///
+    /// 拿得到状态码说明平台已经受理(哪怕回的是 4xx),重发就是重复出图、重复计费;
+    /// 而连接阶段/上传阶段就断掉的请求,对端根本没收到完整请求体,重投是安全的。
+    fn is_retryable_send_failure(error: &reqwest::Error) -> bool {
+        error.status().is_none()
+            && (error.is_connect() || error.is_timeout() || error.is_request() || error.is_body())
+    }
+
+    /// 提交图片请求: 传输层失败自动重投, 最终失败时给出可定位的中文原因。
+    ///
+    /// `build` 用闭包而不是 RequestBuilder, 因为 RequestBuilder 一旦 send 就被消费,
+    /// 想重投只能重新拼一次(请求体本身是 `Value`/`String`, 复制成本可以忽略)。
+    async fn send_image_request<F>(
+        context: &str,
+        endpoint: &str,
+        build: F,
+    ) -> Result<reqwest::Response, AIError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut attempt = 1;
+        loop {
+            match build().send().await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let detail = Self::describe_send_failure(&error);
+                    if !Self::is_retryable_send_failure(&error) || attempt >= Self::IMAGE_SEND_MAX_ATTEMPTS {
+                        return Err(AIError::NetworkMessage(format!(
+                            "{detail} [endpoint: {endpoint}，{context} 共尝试 {attempt} 次]"
+                        )));
+                    }
+                    let backoff = std::time::Duration::from_millis(600 * attempt as u64);
+                    tracing::warn!(
+                        "[OpenAI Compatible] {context} 第 {attempt} 次未送达（{detail}），{:?} 后重试",
+                        backoff
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// 判断传输层失败时的不重投说明(用于 multipart 这类无法重建请求体的分支)。
+    fn send_failure(error: reqwest::Error, context: &str, endpoint: &str) -> AIError {
+        AIError::NetworkMessage(format!(
+            "{} [endpoint: {endpoint}，{context}]",
+            Self::describe_send_failure(&error)
+        ))
+    }
+
+    /// 内联参考图的体积预算: 超过就缩放重编码。
+    ///
+    /// 手机直出的商品图动辄 4~8MB, 转 base64 再叠上 `image` + `images` 的兼容性冗余,
+    /// 单个请求体可以到 20MB 以上 —— 上传本身就要十几二十秒, 期间任何一次抖动都会
+    /// 以 `Network error: error sending request` 收场。参考图对 2K 出图的有效信息在
+    /// 长边 2048 以内已经饱和, 再大只是白等。
+    const INLINE_REFERENCE_MAX_BYTES: usize = 2 * 1024 * 1024;
+    const INLINE_REFERENCE_MAX_SIDE: u32 = 2048;
+
+    /// 把超预算的参考图缩到长边 2048 并重编码;不超预算、解不开、或压完反而更大时原样返回。
+    fn compact_inline_reference(bytes: Vec<u8>, mime: &str) -> (Vec<u8>, String) {
+        use image::GenericImageView;
+        let decoded = match image::load_from_memory(&bytes) {
+            Ok(image) => image,
+            // webp 变体 / 奇怪编码: 解不开就不要动, 原样送过去让对端自己判断
+            Err(_) => return (bytes, mime.to_string()),
+        };
+        let (width, height) = decoded.dimensions();
+        let longest = width.max(height);
+        if bytes.len() <= Self::INLINE_REFERENCE_MAX_BYTES && longest <= Self::INLINE_REFERENCE_MAX_SIDE {
+            return (bytes, mime.to_string());
+        }
+        let scale = (Self::INLINE_REFERENCE_MAX_SIDE as f64 / longest as f64).min(1.0);
+        let target = if scale < 1.0 {
+            decoded.resize_exact(
+                ((width as f64 * scale).round() as u32).max(1),
+                ((height as f64 * scale).round() as u32).max(1),
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            decoded
+        };
+        let encoded = if target.color().has_alpha() {
+            let mut buffer = Vec::new();
+            match target.write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageFormat::Png) {
+                Ok(()) => Some((buffer, "image/png")),
+                Err(_) => None,
+            }
+        } else {
+            let mut buffer = Vec::new();
+            match image::codecs::jpeg::JpegEncoder::new_with_quality(&mut std::io::Cursor::new(&mut buffer), 90)
+                .encode_image(&target)
+            {
+                Ok(()) => Some((buffer, "image/jpeg")),
+                Err(_) => None,
+            }
+        };
+        match encoded {
+            // 压完更大说明原图本来就编码得很紧, 保留原图
+            Some((buffer, out_mime)) if buffer.len() < bytes.len() => {
+                info!(
+                    "[OpenAI Compatible] 参考图压缩: {}KB -> {}KB ({}x{} 上限 {})",
+                    bytes.len() / 1024,
+                    buffer.len() / 1024,
+                    width,
+                    height,
+                    Self::INLINE_REFERENCE_MAX_SIDE
+                );
+                (buffer, out_mime.to_string())
+            }
+            _ => (bytes, mime.to_string()),
+        }
+    }
+
+    /// data URL 形态的参考图: 超预算时解码 → 缩放 → 重新编码, 其余原样返回。
+    fn compact_reference_data_url(payload: &str) -> String {
+        let Some((metadata, encoded)) = payload.split_once(',') else {
+            return format!("data:{payload}");
+        };
+        // base64 每 4 字符 3 字节, 用长度先做一次廉价预判, 避免对每张小图都解码
+        if !metadata.contains(";base64") || encoded.len() <= Self::INLINE_REFERENCE_MAX_BYTES / 3 * 4 {
+            return format!("data:{payload}");
+        }
+        let mime = metadata
+            .split(';')
+            .next()
+            .filter(|value| value.starts_with("image/"))
+            .unwrap_or("image/png");
+        match STANDARD.decode(encoded) {
+            Ok(bytes) => {
+                let (bytes, mime) = Self::compact_inline_reference(bytes, mime);
+                format!("data:{};base64,{}", mime, STANDARD.encode(bytes))
+            }
+            Err(_) => format!("data:{payload}"),
+        }
+    }
+
     /// 读取响应体文本。
     ///
     /// **刻意不用 `response.bytes()`** —— 它把 body 层的一切失败折叠成 Display 恒为
@@ -775,13 +970,15 @@ transfer-encoding={}；request_id={}。本次请求平台已受理，这类断�
             "temperature": 0.4,
         });
 
-        let response = client
-            .post(&endpoint)
-            .bearer_auth(api_key)
-            .header("Accept-Encoding", "identity")
-            .json(&body)
-            .send()
-            .await?;
+        // media 信封的请求体含全部参考图, 同样是 MB 级上传: 抖动就重投
+        let response = Self::send_image_request("media 提交", &endpoint, || {
+            client
+                .post(&endpoint)
+                .bearer_auth(api_key)
+                .header("Accept-Encoding", "identity")
+                .json(&body)
+        })
+        .await?;
         let (status, body_text) =
             Self::read_response_text(response, "/v1/chat/completions").await?;
         let payload: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
@@ -1069,6 +1266,564 @@ transfer-encoding={}；request_id={}。本次请求平台已受理，这类断�
             _ => serde_json::to_string(&unique)
                 .map_err(|error| AIError::TaskFailed(format!("图片结果序列化失败: {error}"))),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // media 信封图片(灵柯 / api666888 的音视频网关)
+    //
+    // 同一网关下**图片模型挂了两套协议**, 而且不是按平台区分、是按模型区分:
+    //   - `tt-image-2.5` 等老模型: `POST /v1/images/generations` 直接 200;
+    //   - `banana-2.1` / `gk-image-2.0` / `doubao-seedream-*` 等新模型: 一律 400
+    //     「模型 'x' 不支持 /v1/images/* 端点，请改用 POST /v1/media/generate」。
+    //
+    // 平台会把短名映射成上游真名(`banana-2.1` → `gemini-nano-banana-2.1`), 所以
+    // 无法在前端按模型名预判; 只能按**这句报错**兜底重投一次 media 信封:
+    //   POST /v1/media/generate  { model, prompt, params: { aspect_ratio,
+    //                              resolution, image_url[] } }
+    //   → {"code":200,"data":{"task_id":181687051}}
+    //   GET /v1/skills/task-status?task_id=…  → is_final + state + result_urls
+    // -----------------------------------------------------------------------
+
+    /// 单张图片任务的总等待上限。banana 实测 29 秒; 慢渠道(MJ 类)可能两三分钟。
+    const MEDIA_IMAGE_TIMEOUT_SECS: u64 = 300;
+    const MEDIA_IMAGE_POLL_INTERVAL_SECS: u64 = 3;
+
+    /// 平台在「该模型只挂了 media 信封」时返回的 400 文案。
+    ///
+    /// 必须同时认住 `media/generate` 与 `/v1/images` 两个片段: 只认前者的话,
+    /// 其它平台把 `media/generate` 写进普通参数错误的提示里也会被误判成该重投。
+    fn image_requires_media_envelope(body_text: &str) -> bool {
+        let lower = body_text.to_ascii_lowercase();
+        lower.contains("media/generate") && (lower.contains("/v1/images") || lower.contains("不支持"))
+    }
+
+    /// 「这个模型只认 media 信封」的进程内记忆。
+    ///
+    /// 不记的话每次出图都要先整包上传打一次**必败**的 `/v1/images/*`(带参考图时十几 MB),
+    /// 再整包上传一次 media —— 白白多花十秒以上, 也白白多一次断连机会(用户看到的
+    /// `Network error: error sending request` 正是这种大包上传时最容易撞上的)。
+    fn media_envelope_cache() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    fn media_envelope_key(provider_id: &str, api_model: &str) -> String {
+        format!(
+            "{}/{}",
+            provider_id.to_ascii_lowercase(),
+            api_model.to_ascii_lowercase()
+        )
+    }
+
+    fn media_envelope_known(provider_id: &str, api_model: &str) -> bool {
+        Self::media_envelope_cache()
+            .lock()
+            .map(|cache| cache.contains(&Self::media_envelope_key(provider_id, api_model)))
+            .unwrap_or(false)
+    }
+
+    fn remember_media_envelope(provider_id: &str, api_model: &str) {
+        if let Ok(mut cache) = Self::media_envelope_cache().lock() {
+            cache.insert(Self::media_envelope_key(provider_id, api_model));
+        }
+    }
+
+    /// 构造 media 信封请求体。
+    ///
+    /// 平台这套 `params` 是按**模型**定的, 不是按平台定的 —— 21 个图片模型共有
+    /// 五套不同的字段名(见 [`Self::media_image_param_style`]), 传错名不会报错,
+    /// 平台直接当没传、按默认值出图。所以这里必须按模型挑键名, 不能写死一套。
+    fn build_media_image_body(
+        api_model: &str,
+        prompt: &str,
+        resolution: &str,
+        aspect_ratio: &str,
+        reference_images: Option<&Vec<String>>,
+        extra_params: Option<&HashMap<String, Value>>,
+    ) -> Result<Value, AIError> {
+        let mut params = json!({});
+        let object = params.as_object_mut().expect("params 一定是对象");
+        let aspect_ratio = aspect_ratio.trim();
+        // 前端可能传 `auto` / `1024x1024` 这类平台不认的值, 只放行 `宽:高` 形态。
+        let ratio = Self::media_image_aspect_ratio(aspect_ratio);
+        match Self::media_image_param_style(api_model) {
+            MediaImageParamStyle::CamelTier => {
+                if let Some(ratio) = ratio {
+                    object.insert("aspectRatio".into(), json!(ratio));
+                }
+                if let Some(tier) = Self::media_image_tier(resolution) {
+                    object.insert("imageSize".into(), json!(tier));
+                }
+            }
+            MediaImageParamStyle::SnakeTier => {
+                if let Some(ratio) = ratio {
+                    object.insert("aspect_ratio".into(), json!(ratio));
+                }
+                if let Some(tier) = Self::media_image_tier(resolution) {
+                    object.insert("resolution".into(), json!(tier));
+                }
+            }
+            MediaImageParamStyle::SnakeSizeTier => {
+                if let Some(ratio) = ratio {
+                    object.insert("aspect_ratio".into(), json!(ratio));
+                }
+                if let Some(tier) = Self::media_image_tier(resolution) {
+                    object.insert("size".into(), json!(tier));
+                }
+            }
+            // 这一族的 `size` 是像素枚举, 比例与档位都要折进像素串。
+            MediaImageParamStyle::PixelSize => {
+                if let Some(size) = Self::media_image_pixel_size(resolution, aspect_ratio) {
+                    object.insert("size".into(), json!(size));
+                }
+            }
+            // 这一族没有独立分辨率参数, `size` 直接就是画幅比例。
+            MediaImageParamStyle::RatioOnly => {
+                if let Some(ratio) = ratio {
+                    object.insert("size".into(), json!(ratio));
+                }
+            }
+        }
+        let mut images: Vec<String> = Vec::new();
+        for reference in reference_images.into_iter().flatten() {
+            if let Some(image) = Self::reference_image_to_image_field(reference)? {
+                images.push(image);
+            }
+        }
+        if !images.is_empty() {
+            // 文档口径就是 `images`(type=upload 一律传数组); 平台另认 `image_url`
+            // 只是历史兼容, 新接入按文档走。
+            object.insert("images".into(), json!(images));
+        }
+        Self::apply_media_model_params(object, extra_params);
+        Ok(json!({ "model": api_model, "prompt": prompt, "params": params }))
+    }
+
+    /// 把面板上选的模型专属参数搬进 `params`。
+    ///
+    /// media 信封里连 Midjourney 的引擎都得放在 `params` 内(且是驼峰 `botType`),
+    /// 不放的话 `mj_imagine` 这类「必填引擎」的模型会直接失败; `tt-image-2.5` 的
+    /// `version`(标准版/增强版)同理。只搬白名单里的键, 控制字段进不来。
+    ///
+    /// `count` 刻意跳过: media 一次只出一张, `count` 在别的平台表示组数,
+    /// 传上去只会让渠道各按各的理解。
+    fn apply_media_model_params(
+        params: &mut serde_json::Map<String, Value>,
+        extra_params: Option<&HashMap<String, Value>>,
+    ) {
+        let Some(extra) = extra_params else {
+            return;
+        };
+        for key in Self::IMAGE_PARAM_PASSTHROUGH {
+            if *key == "count" {
+                continue;
+            }
+            let Some(value) = extra.get(*key) else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            // 空串按「没选」处理(Midjourney 的 version 默认档就是空串)
+            if value.as_str().is_some_and(|text| text.trim().is_empty()) {
+                continue;
+            }
+            // 平台的 media 参数一律驼峰: bot_type → botType
+            let field = match *key {
+                "bot_type" => "botType",
+                other => other,
+            };
+            params.insert(field.to_string(), value.clone());
+        }
+    }
+
+    /// `1K` / `2K` / `4K` 这类档位才丢给平台(图片侧参数是枚举)。
+    ///
+    /// 小数档也要认: `banana-2` 的 `imageSize` 有 `0.5K` 一档。
+    fn media_image_tier(resolution: &str) -> Option<String> {
+        let resolution = resolution.trim();
+        let bytes = resolution.as_bytes();
+        let (digits, unit) = bytes.split_at(bytes.len().checked_sub(1)?);
+        let is_tier = matches!(unit.first(), Some(b'k' | b'K'))
+            && !digits.is_empty()
+            && digits.iter().all(|byte| byte.is_ascii_digit() || *byte == b'.');
+        is_tier.then(|| resolution.to_string())
+    }
+
+    fn media_image_aspect_ratio(aspect_ratio: &str) -> Option<String> {
+        let value = aspect_ratio.trim();
+        let (width, height) = value.split_once(':')?;
+        (!width.is_empty()
+            && !height.is_empty()
+            && width.chars().all(|item| item.is_ascii_digit())
+            && height.chars().all(|item| item.is_ascii_digit()))
+        .then(|| value.to_string())
+    }
+
+    /// `tt-image-2` 族的 `size` 是像素枚举: 比例 + 档位必须查表折成具体像素。
+    /// 表来自文档里该参数的全部 options, 不在表里的组合一律不传(让平台用默认)。
+    fn media_image_pixel_size(resolution: &str, aspect_ratio: &str) -> Option<&'static str> {
+        let ratio = aspect_ratio.trim();
+        let resolution = resolution.trim().to_ascii_uppercase();
+        let table: &[(&str, &str)] = match resolution.as_str() {
+            "1K" => &[
+                ("1:1", "1024x1024"),
+                ("2:3", "1024x1536"),
+                ("3:2", "1536x1024"),
+                ("3:4", "960x1280"),
+                ("4:3", "1280x960"),
+                ("9:16", "1088x1920"),
+                ("16:9", "1920x1088"),
+                ("4:5", "1024x1280"),
+                ("5:4", "1280x1024"),
+                ("1:2", "960x1920"),
+                ("2:1", "1920x960"),
+            ],
+            "2K" => &[
+                ("1:1", "2048x2048"),
+                ("2:3", "2048x3072"),
+                ("3:2", "3072x2048"),
+                ("3:4", "1920x2560"),
+                ("4:3", "2560x1920"),
+                ("9:16", "1440x2560"),
+                ("16:9", "2560x1440"),
+                ("4:5", "2048x2560"),
+                ("5:4", "2560x2048"),
+                ("1:2", "1280x2560"),
+                ("2:1", "2560x1280"),
+            ],
+            "4K" => &[
+                ("1:1", "2880x2880"),
+                ("2:3", "2304x3456"),
+                ("3:2", "3456x2304"),
+                ("3:4", "2400x3200"),
+                ("4:3", "3200x2400"),
+                ("9:16", "2160x3840"),
+                ("16:9", "3840x2160"),
+                ("4:5", "2560x3200"),
+                ("5:4", "3200x2560"),
+                ("1:2", "1920x3840"),
+                ("2:1", "3840x1920"),
+            ],
+            _ => return None,
+        };
+        table
+            .iter()
+            .find(|(key, _)| *key == ratio)
+            .map(|(_, value)| *value)
+    }
+
+    /// 灵柯 / API666888 的图片模型参数命名族。
+    ///
+    /// 用**族**而不是逐模型分支: 同族模型的参数签名完全一致, 逐模型写会漏。
+    fn media_image_param_style(api_model: &str) -> MediaImageParamStyle {
+        let model = api_model.trim().to_ascii_lowercase();
+        if model.starts_with("banana") || model.starts_with("mj_imagine") || model == "mj-imagine" {
+            return MediaImageParamStyle::CamelTier;
+        }
+        if model.starts_with("tt-image-2.5") {
+            return MediaImageParamStyle::SnakeTier;
+        }
+        if model.starts_with("tt-image-2") {
+            return MediaImageParamStyle::PixelSize;
+        }
+        if model.starts_with("doubao-seedream") {
+            return MediaImageParamStyle::SnakeSizeTier;
+        }
+        if model.starts_with("qwen-image") || model.starts_with("wan2.6-image") || model.starts_with("wan2.7-image") {
+            return MediaImageParamStyle::RatioOnly;
+        }
+        // gk-image-2.0 / kling-v3 / kling-v3-omni / vidu-image-2 以及未知新模型:
+        // `aspect_ratio + resolution` 是平台里最常见的一套, 兜底选它。
+        MediaImageParamStyle::SnakeTier
+    }
+
+    /// 灵柯网关里「只在 media 信封出现」的 21 个图片模型(2026-10-20 抓自
+    /// `GET /houduan/gongkai/apidoc/moxing-liebiao`, 全部 `api_xieyi=media`)。
+    ///
+    /// 它们打 `/v1/images/generations` 一律 400「请改用 POST /v1/media/generate」,
+    /// 靠报错兜底等于每次白传一遍参考图(十几 MB), 所以本地直接记死。
+    const MEDIA_ONLY_IMAGE_MODELS: &[&str] = &[
+        "tt-image-2.5",
+        "tt-image-2.5-token",
+        "tt-image-2",
+        "tt-image-2-token",
+        "banana-2.1",
+        "banana-2.1-token",
+        "banana-2",
+        "banana-2-token",
+        "banana-pro",
+        "banana-pro-token",
+        "mj_imagine",
+        "doubao-seedream-4-5-251128",
+        "doubao-seedream-5-0-260128",
+        "doubao-seedream-5-0-pro-260628",
+        "gk-image-2.0",
+        "kling-v3",
+        "kling-v3-omni",
+        "vidu-image-2",
+        "qwen-image",
+        "wan2.6-image",
+        "wan2.7-image",
+    ];
+
+    /// 该模型是否「文档声明只走 media 信封」。
+    ///
+    /// 只在灵柯网关生效: 同名模型挂在别家中转上时, 对方可能是标准 OpenAI 图片协议。
+    fn declared_media_only_image_model(base_url: &str, api_model: &str) -> bool {
+        let host = base_url.to_ascii_lowercase();
+        if !(host.contains("lk888") || host.contains("lingkeai")) {
+            return false;
+        }
+        Self::MEDIA_ONLY_IMAGE_MODELS
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case(api_model.trim()))
+    }
+
+    /// 从 `{"code":200,"data":{"task_id":181687051}}` 里取任务号 —— 数字/字符串都认。
+    fn media_task_id(payload: &Value) -> Option<String> {
+        fn id_of(value: &Value) -> Option<String> {
+            match value {
+                Value::Object(map) => {
+                    for key in ["task_id", "taskId", "id"] {
+                        match map.get(key) {
+                            Some(Value::String(text)) if !text.trim().is_empty() => {
+                                return Some(text.trim().to_string())
+                            }
+                            Some(Value::Number(number)) => return Some(number.to_string()),
+                            _ => {}
+                        }
+                    }
+                    for key in ["data", "result", "task"] {
+                        if let Some(found) = map.get(key).and_then(id_of) {
+                            return Some(found);
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+        id_of(payload)
+    }
+
+    /// 业务错误包: HTTP 200 也可能是失败(`{"code":400,"msg":"…"}`)。
+    fn media_business_error(payload: &Value) -> Option<String> {
+        let map = payload.as_object()?;
+        let code = map.get("code")?;
+        let failed = match code {
+            Value::Number(number) => number.as_i64().is_some_and(|value| value != 0 && value != 200),
+            Value::String(text) => !matches!(text.trim(), "" | "0" | "200" | "success" | "ok"),
+            _ => false,
+        };
+        if !failed {
+            return None;
+        }
+        let message = ["msg", "message", "error"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(Value::as_str))
+            .unwrap_or("未知错误");
+        Some(format!("{code} {}", message.trim()))
+    }
+
+    /// 读一次任务状态: `None` = 还在跑, `Some(Ok(urls))` = 成功, `Some(Err(原因))` = 失败。
+    fn media_image_task_outcome(payload: &Value) -> Option<Result<Vec<String>, String>> {
+        let map = payload.as_object()?;
+        if !map.get("is_final").and_then(Value::as_bool).unwrap_or(false) {
+            return None;
+        }
+        let state = map
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let mut urls: Vec<String> = map
+            .get("result_urls")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(single) = map
+            .get("result_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            if !urls.iter().any(|item| item == single) {
+                urls.insert(0, single.to_string());
+            }
+        }
+        if matches!(state.as_str(), "success" | "succeeded" | "completed" | "finished") {
+            return Some(if urls.is_empty() {
+                Err("任务已完成, 但结果里没有图片地址".to_string())
+            } else {
+                Ok(urls)
+            });
+        }
+        if matches!(
+            state.as_str(),
+            "failed" | "failure" | "error" | "canceled" | "cancelled" | "timeout"
+        ) {
+            let message = map
+                .get("error")
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| value.get("message").and_then(Value::as_str).map(str::to_string))
+                })
+                .or_else(|| map.get("status").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_else(|| "平台没有给出失败原因".to_string());
+            return Some(Err(message));
+        }
+        // is_final 却没有可识别终态: 直接报错, 不要让用户陪着无限等
+        Some(Err(format!("任务已结束但状态未知(state={state})")))
+    }
+
+    /// 轮询任务直到终态。3 秒一次、最长 5 分钟 —— 图片任务实测 30 秒左右。
+    async fn poll_media_image_task(
+        client: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        task_id: &str,
+    ) -> Result<Vec<String>, AIError> {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(Self::MEDIA_IMAGE_TIMEOUT_SECS);
+        let mut last_state = String::from("未知");
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(AIError::TaskFailed(format!(
+                    "等待图片生成超时（{} 秒，最后状态：{}）—— 平台侧可能仍在生成，可稍后到平台后台按任务号 {} 查看",
+                    Self::MEDIA_IMAGE_TIMEOUT_SECS,
+                    last_state,
+                    task_id
+                )));
+            }
+            let url = format!("{}/v1/skills/task-status?task_id={}", base_url, task_id);
+            let response = client
+                .get(&url)
+                .bearer_auth(api_key)
+                .header("Accept-Encoding", "identity")
+                .send()
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    // 网络抖动(代理断连 / 连接重置)不该判死, 等下一轮再问
+                    last_state = format!("查询失败 {}", error);
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        Self::MEDIA_IMAGE_POLL_INTERVAL_SECS,
+                    ))
+                    .await;
+                    continue;
+                }
+            };
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                last_state = format!("HTTP {}", status.as_u16());
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    Self::MEDIA_IMAGE_POLL_INTERVAL_SECS,
+                ))
+                .await;
+                continue;
+            }
+            if !status.is_success() {
+                return Err(AIError::TaskFailed(format!(
+                    "查询图片任务失败 (HTTP {}): {}",
+                    status.as_u16(),
+                    text.chars().take(300).collect::<String>()
+                )));
+            }
+            let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            if let Some(state) = payload.get("state").and_then(Value::as_str) {
+                last_state = state.to_string();
+            }
+            match Self::media_image_task_outcome(&payload) {
+                Some(Ok(urls)) => return Ok(urls),
+                Some(Err(reason)) => {
+                    return Err(AIError::TaskFailed(format!("图片生成失败: {reason}")))
+                }
+                None => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        Self::MEDIA_IMAGE_POLL_INTERVAL_SECS,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// 走 media 信封生成一张图片: 提交 → 轮询 → 返回结果地址。
+    async fn generate_image_via_media(
+        client: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        api_model: &str,
+        prompt: &str,
+        resolution: &str,
+        aspect_ratio: &str,
+        reference_images: Option<&Vec<String>>,
+        extra_params: Option<&HashMap<String, Value>>,
+    ) -> Result<String, AIError> {
+        let body = Self::build_media_image_body(
+            api_model,
+            prompt,
+            resolution,
+            aspect_ratio,
+            reference_images,
+            extra_params,
+        )?;
+        let endpoint = format!("{}/v1/media/generate", base_url);
+        info!(
+            "[OpenAI Compatible] media 信封出图: model={}, has_reference={}",
+            api_model,
+            reference_images.map(|items| !items.is_empty()).unwrap_or(false)
+        );
+        let response = client
+            .post(&endpoint)
+            .bearer_auth(api_key)
+            .header("Accept-Encoding", "identity")
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if !status.is_success() {
+            return Err(AIError::TaskFailed(format!(
+                "自定义平台 media 提交失败 (HTTP {}): {} [endpoint: {}]",
+                status.as_u16(),
+                if text.trim().is_empty() {
+                    "空响应体".to_string()
+                } else {
+                    text.chars().take(300).collect::<String>()
+                },
+                endpoint
+            )));
+        }
+        if let Some(error) = Self::media_business_error(&payload) {
+            return Err(AIError::TaskFailed(format!(
+                "自定义平台 media 提交被拒绝: {error} [endpoint: {}]",
+                endpoint
+            )));
+        }
+        let task_id = Self::media_task_id(&payload).ok_or_else(|| {
+            AIError::TaskFailed(format!(
+                "media 提交响应里没有 task_id: {}",
+                text.chars().take(300).collect::<String>()
+            ))
+        })?;
+        let urls = Self::poll_media_image_task(client, base_url, api_key, &task_id).await?;
+        Self::serialize_image_sources(urls)
     }
 
     /// 构造 /v1/images/generations 请求体。
@@ -1661,13 +2416,16 @@ transfer-encoding={}；request_id={}。本次请求平台已受理，这类断�
     }
 
     /// 参考图 → 可发送给平台的 image 值:
-    /// data URL / http(s) URL 原样返回;本地路径/文件 URL 读取并转 base64 data URL。
+    /// data URL / http(s) URL 原样返回(超预算的 data URL 先缩放);本地路径/文件 URL 读取并转 base64 data URL。
     fn reference_image_to_image_field(source: &str) -> Result<Option<String>, AIError> {
         let trimmed = source.trim();
         if trimmed.is_empty() {
             return Ok(None);
         }
-        if trimmed.starts_with("data:") || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        if let Some(payload) = trimmed.strip_prefix("data:") {
+            return Ok(Some(Self::compact_reference_data_url(payload)));
+        }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
             return Ok(Some(trimmed.to_string()));
         }
         if trimmed.starts_with("asset://") || trimmed.starts_with("tauri://") || trimmed.starts_with("app://") {
@@ -1693,6 +2451,9 @@ transfer-encoding={}；request_id={}。本次请求平台已受理，这类断�
             return Ok(None);
         }
         let mime = Self::guess_image_mime(&path.to_string_lossy());
+        // 本地原图(base64 之前的那一份)同样受体积预算约束, 否则一张手机直出
+        // 的 8MB PNG 会让整个请求体膨胀到 30MB 级别。
+        let (bytes, mime) = Self::compact_inline_reference(bytes, mime);
         let encoded = STANDARD.encode(&bytes);
         Ok(Some(format!("data:{};base64,{}", mime, encoded)))
     }
@@ -1915,6 +2676,26 @@ impl AIProvider for OpenAICompatibleProvider {
         } else {
             format!("{}/v1/images/generations", base_url)
         };
+        // 已经吃过一次「该模型不支持 /v1/images/*」的 400: 直接走 media, 不再整包上传两次。
+        // 文档里声明只走 media 的那批图片模型(灵柯 21 个)同样直接走, 不用先白试一次。
+        if !is_responses
+            && !is_chat
+            && (Self::media_envelope_known(provider_id, api_model)
+                || Self::declared_media_only_image_model(&base_url, api_model))
+        {
+            return Self::generate_image_via_media(
+                &client,
+                &base_url,
+                &api_key,
+                api_model,
+                &request.prompt,
+                &request.size,
+                &request.aspect_ratio,
+                request.reference_images.as_ref(),
+                request.extra_params.as_ref(),
+            )
+            .await;
+        }
         let response = if is_responses {
             let mut body = Self::build_responses_body(
                     api_model,
@@ -1925,12 +2706,14 @@ impl AIProvider for OpenAICompatibleProvider {
                 )
                 .await?;
             Self::apply_image_count(&mut body, image_count);
-            client.post(&endpoint)
-                .bearer_auth(&api_key)
-                .header("Accept-Encoding", "identity")
-                .json(&body)
-                .send()
-                .await?
+            Self::send_image_request("图片提交", &endpoint, || {
+                client
+                    .post(&endpoint)
+                    .bearer_auth(&api_key)
+                    .header("Accept-Encoding", "identity")
+                    .json(&body)
+            })
+            .await?
         } else if is_chat {
             let mut body = Self::build_chat_body(
                     api_model,
@@ -1938,12 +2721,14 @@ impl AIProvider for OpenAICompatibleProvider {
                     request.reference_images.as_ref(),
                 )?;
             Self::apply_image_count(&mut body, image_count);
-            client.post(&endpoint)
-                .bearer_auth(&api_key)
-                .header("Accept-Encoding", "identity")
-                .json(&body)
-                .send()
-                .await?
+            Self::send_image_request("图片提交", &endpoint, || {
+                client
+                    .post(&endpoint)
+                    .bearer_auth(&api_key)
+                    .header("Accept-Encoding", "identity")
+                    .json(&body)
+            })
+            .await?
         } else if image_transport == "edits_multipart" && reference_image_count > 0 {
             let form = Self::build_edits_form(
                 provider_id,
@@ -1955,12 +2740,14 @@ impl AIProvider for OpenAICompatibleProvider {
                 image_count,
             )
             .await?;
-            client.post(&endpoint)
+            client
+                .post(&endpoint)
                 .bearer_auth(&api_key)
                 .header("Accept-Encoding", "identity")
                 .multipart(form)
                 .send()
-                .await?
+                .await
+                .map_err(|error| Self::send_failure(error, "图片上传(multipart)", &endpoint))?
         } else {
             let mut body = if image_transport == "apimart_json" {
                 Self::build_apimart_request_body(
@@ -1984,12 +2771,14 @@ impl AIProvider for OpenAICompatibleProvider {
             Self::apply_image_count(&mut body, image_count);
             Self::apply_model_extra_params(&mut body, &request.extra_params);
             Self::apply_image_mode(&mut body, &request.extra_params);
-            client.post(&endpoint)
-                .bearer_auth(&api_key)
-                .header("Accept-Encoding", "identity")
-                .json(&body)
-                .send()
-                .await?
+            Self::send_image_request("图片提交", &endpoint, || {
+                client
+                    .post(&endpoint)
+                    .bearer_auth(&api_key)
+                    .header("Accept-Encoding", "identity")
+                    .json(&body)
+            })
+            .await?
         };
         let active_protocol = if is_responses { "responses" } else if is_chat { "chat" } else { "images" };
 
@@ -2032,7 +2821,8 @@ impl AIProvider for OpenAICompatibleProvider {
                 .header("Accept-Encoding", "identity")
                 .json(&fallback_body)
                 .send()
-                .await?;
+                .await
+                .map_err(|error| Self::send_failure(error, "降级请求", &endpoint))?;
             (status, body_text) = Self::read_response_text(fallback_response, "自定义平台图片降级请求").await?;
         }
 
@@ -2065,8 +2855,32 @@ impl AIProvider for OpenAICompatibleProvider {
                 .header("Accept-Encoding", "identity")
                 .json(&alternate_body)
                 .send()
-                .await?;
+                .await
+                .map_err(|error| Self::send_failure(error, "参考图字段重试", &endpoint))?;
             (status, body_text) = Self::read_response_text(retry_response, "自定义平台图片重试请求").await?;
+        }
+        // 灵柯网关: 部分图片模型只挂 media 信封, `/v1/images/*` 会 400 并明说该怎么走。
+        // 按报错兜底而不是按模型名预判 —— 平台会把短名映射成上游真名
+        // (banana-2.1 → gemini-nano-banana-2.1), 前端那层根本看不到真名。
+        if !status.is_success() && Self::image_requires_media_envelope(&body_text) {
+            // 记住这个模型, 下次直接走 media(省掉一次十几 MB 的必败上传)
+            Self::remember_media_envelope(provider_id, api_model);
+            info!(
+                "[OpenAI Compatible] {} 不支持 /v1/images/*, 改用 /v1/media/generate",
+                api_model
+            );
+            return Self::generate_image_via_media(
+                &client,
+                &base_url,
+                &api_key,
+                api_model,
+                &request.prompt,
+                &request.size,
+                &request.aspect_ratio,
+                request.reference_images.as_ref(),
+                request.extra_params.as_ref(),
+            )
+            .await;
         }
         let payload: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         if !status.is_success() {
@@ -2178,12 +2992,14 @@ impl AIProvider for OpenAICompatibleProvider {
                 )
                 .await?;
             Self::apply_image_count(&mut body, image_count);
-            client.post(&endpoint)
-                .bearer_auth(&api_key)
-                .header("Accept-Encoding", "identity")
-                .json(&body)
-                .send()
-                .await?
+            Self::send_image_request("图片提交", &endpoint, || {
+                client
+                    .post(&endpoint)
+                    .bearer_auth(&api_key)
+                    .header("Accept-Encoding", "identity")
+                    .json(&body)
+            })
+            .await?
         } else if is_chat {
             let mut body = Self::build_chat_body(
                     api_model,
@@ -2191,12 +3007,14 @@ impl AIProvider for OpenAICompatibleProvider {
                     request.reference_images.as_ref(),
                 )?;
             Self::apply_image_count(&mut body, image_count);
-            client.post(&endpoint)
-                .bearer_auth(&api_key)
-                .header("Accept-Encoding", "identity")
-                .json(&body)
-                .send()
-                .await?
+            Self::send_image_request("图片提交", &endpoint, || {
+                client
+                    .post(&endpoint)
+                    .bearer_auth(&api_key)
+                    .header("Accept-Encoding", "identity")
+                    .json(&body)
+            })
+            .await?
         } else if image_transport == "edits_multipart" && reference_image_count > 0 {
             let form = Self::build_edits_form(
                 provider_id,
@@ -2208,12 +3026,14 @@ impl AIProvider for OpenAICompatibleProvider {
                 image_count,
             )
             .await?;
-            client.post(&endpoint)
+            client
+                .post(&endpoint)
                 .bearer_auth(&api_key)
                 .header("Accept-Encoding", "identity")
                 .multipart(form)
                 .send()
-                .await?
+                .await
+                .map_err(|error| Self::send_failure(error, "图片上传(multipart)", &endpoint))?
         } else {
             let mut body = if image_transport == "apimart_json" {
                 Self::build_apimart_request_body(
@@ -2237,12 +3057,14 @@ impl AIProvider for OpenAICompatibleProvider {
             Self::apply_image_count(&mut body, image_count);
             Self::apply_model_extra_params(&mut body, &request.extra_params);
             Self::apply_image_mode(&mut body, &request.extra_params);
-            client.post(&endpoint)
-                .bearer_auth(&api_key)
-                .header("Accept-Encoding", "identity")
-                .json(&body)
-                .send()
-                .await?
+            Self::send_image_request("图片提交", &endpoint, || {
+                client
+                    .post(&endpoint)
+                    .bearer_auth(&api_key)
+                    .header("Accept-Encoding", "identity")
+                    .json(&body)
+            })
+            .await?
         };
         let (mut status, mut body_text) = Self::read_response_text(response, "自定义平台异步提交").await?;
 
@@ -2272,7 +3094,8 @@ impl AIProvider for OpenAICompatibleProvider {
                 .header("Accept-Encoding", "identity")
                 .json(&fallback_body)
                 .send()
-                .await?;
+                .await
+                .map_err(|error| Self::send_failure(error, "降级请求", &endpoint))?;
             (status, body_text) = Self::read_response_text(fallback_response, "自定义平台异步降级请求").await?;
         }
 
@@ -2305,8 +3128,33 @@ impl AIProvider for OpenAICompatibleProvider {
                 .header("Accept-Encoding", "identity")
                 .json(&alternate_body)
                 .send()
-                .await?;
+                .await
+                .map_err(|error| Self::send_failure(error, "参考图字段重试", &endpoint))?;
             (status, body_text) = Self::read_response_text(retry_response, "自定义平台异步重试").await?;
+        }
+        // 同 `generate`: 只挂 media 信封的图片模型在异步模式下也一样要重投。
+        // 图片任务本身只有几十秒, 这里直接走「提交 + 轮询」并当作已完成返回,
+        // 不再落一条异步任务记录 —— 免得用户在任务列表里看到一条秒完的僵尸任务。
+        if !status.is_success() && Self::image_requires_media_envelope(&body_text) {
+            // 记住这个模型, 下次直接走 media(省掉一次十几 MB 的必败上传)
+            Self::remember_media_envelope(provider_id, api_model);
+            info!(
+                "[OpenAI Compatible] async: {} 不支持 /v1/images/*, 改用 /v1/media/generate",
+                api_model
+            );
+            let image = Self::generate_image_via_media(
+                &client,
+                &base_url,
+                &api_key,
+                api_model,
+                &request.prompt,
+                &request.size,
+                &request.aspect_ratio,
+                request.reference_images.as_ref(),
+                request.extra_params.as_ref(),
+            )
+            .await?;
+            return Ok(ProviderTaskSubmission::Succeeded(image));
         }
         let payload: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
 
@@ -2972,5 +3820,416 @@ mod tests {
 
         assert_eq!(body["size"], "2880x2880");
         assert!(body.get("aspect_ratio").is_none());
+    }
+
+    /// 灵柯网关的 400 文案: 该模型只挂了 media 信封。别把普通参数错误也当成它。
+    #[test]
+    fn recognises_the_media_envelope_hint() {
+        let real = r#"{"error":{"message":"模型 'gemini-nano-banana-2.1' 不支持 /v1/images/* 端点，请改用 POST /v1/media/generate（请求体 model 指定模型）","type":"invalid_request_error"}}"#;
+        assert!(OpenAICompatibleProvider::image_requires_media_envelope(real));
+
+        // 没有提到 media 信封的一律不重投, 否则会白白多打一次请求
+        assert!(!OpenAICompatibleProvider::image_requires_media_envelope(
+            r#"{"error":{"message":"invalid size"}}"#
+        ));
+        assert!(!OpenAICompatibleProvider::image_requires_media_envelope(""));
+        // 只提到 media/generate 但没说图片端点: 不认
+        assert!(!OpenAICompatibleProvider::image_requires_media_envelope(
+            r#"{"error":{"message":"media/generate is temporarily unavailable"}}"#
+        ));
+    }
+
+    #[test]
+    fn builds_media_envelope_with_references_and_tier_resolution() {
+        let references = vec![
+            "https://example.com/a.png".to_string(),
+            String::new(),
+        ];
+        // banana 系是驼峰: 传 aspect_ratio / resolution 平台不报错, 直接按默认出图,
+        // 比例与档位等于白选 —— 实测 2K/1:1 请求回了 16:9 之外的默认 2048x2048。
+        let body = OpenAICompatibleProvider::build_media_image_body(
+            "banana-2.1",
+            "product hero shot",
+            "2K",
+            "1:1",
+            Some(&references),
+            None,
+        )
+        .expect("body");
+        assert_eq!(body["model"], "banana-2.1");
+        assert_eq!(body["prompt"], "product hero shot");
+        assert_eq!(body["params"]["aspectRatio"], "1:1");
+        assert_eq!(body["params"]["imageSize"], "2K");
+        assert!(body["params"].get("aspect_ratio").is_none());
+        assert!(body["params"].get("resolution").is_none());
+        // 空参考图被丢掉, 公网 URL 原样透传; 字段名按文档是 images
+        assert_eq!(body["params"]["images"], json!(["https://example.com/a.png"]));
+        assert!(body["params"].get("image_url").is_none());
+
+        // 像素尺寸不是档位枚举, 宁可让平台用默认档
+        let body = OpenAICompatibleProvider::build_media_image_body(
+            "banana-2.1",
+            "x",
+            "1024x1024",
+            "1:1",
+            None,
+            None,
+        )
+        .expect("body");
+        assert!(body["params"].get("imageSize").is_none());
+        assert!(body["params"].get("images").is_none());
+    }
+
+    #[test]
+    fn picks_media_image_param_names_by_model_family() {
+        let build = |model: &str, resolution: &str, ratio: &str| {
+            OpenAICompatibleProvider::build_media_image_body(model, "p", resolution, ratio, None, None)
+                .expect("body")["params"]
+                .clone()
+        };
+
+        // tt-image-2.5: 下划线 + resolution
+        let params = build("tt-image-2.5", "4K", "16:9");
+        assert_eq!(params["aspect_ratio"], "16:9");
+        assert_eq!(params["resolution"], "4K");
+
+        // doubao-seedream: 下划线 + size(档位)
+        let params = build("doubao-seedream-5-0-260128", "2K", "3:4");
+        assert_eq!(params["aspect_ratio"], "3:4");
+        assert_eq!(params["size"], "2K");
+        assert!(params.get("resolution").is_none());
+
+        // tt-image-2: size 是像素枚举, 比例与档位折成像素串
+        let params = build("tt-image-2", "2K", "16:9");
+        assert_eq!(params["size"], "2560x1440");
+        assert!(params.get("aspect_ratio").is_none());
+        assert!(params.get("resolution").is_none());
+
+        // qwen-image / wan: size 就是画幅比例
+        let params = build("qwen-image", "2K", "1:1");
+        assert_eq!(params["size"], "1:1");
+        assert!(params.get("resolution").is_none());
+
+        // 未知模型兜底走 aspect_ratio + resolution
+        let params = build("gk-image-2.0", "2K", "1:1");
+        assert_eq!(params["aspect_ratio"], "1:1");
+        assert_eq!(params["resolution"], "2K");
+    }
+
+    #[test]
+    fn drops_unsupported_aspect_ratio_values() {
+        let build = |ratio: &str| {
+            OpenAICompatibleProvider::build_media_image_body(
+                "banana-2.1", "p", "2K", ratio, None, None,
+            )
+            .expect("body")["params"]
+                .clone()
+        };
+        assert!(build("auto").get("aspectRatio").is_none());
+        assert!(build("1024x1024").get("aspectRatio").is_none());
+    }
+
+    #[test]
+    fn passes_model_specific_params_into_the_media_envelope() {
+        // media 信封里连 Midjourney 的引擎都在 params 内, 且是驼峰 `botType`。
+        // 不透传的话 `mj_imagine`(botType 必填) 会直接失败。
+        let mut extra = HashMap::new();
+        extra.insert("bot_type".to_string(), json!("niji"));
+        extra.insert("stylize".to_string(), json!("250"));
+        extra.insert("count".to_string(), json!(4));
+        extra.insert("version".to_string(), json!(""));
+        extra.insert("image_transport".to_string(), json!("generations_json"));
+
+        let body = OpenAICompatibleProvider::build_media_image_body(
+            "mj_imagine",
+            "p",
+            "2K",
+            "1:1",
+            None,
+            Some(&extra),
+        )
+        .expect("body");
+
+        assert_eq!(body["params"]["botType"], "niji");
+        assert_eq!(body["params"]["stylize"], "250");
+        // media 一次只出一张, count 是组数语义, 不能透传
+        assert!(body["params"].get("count").is_none());
+        // 空串 = 没选
+        assert!(body["params"].get("version").is_none());
+        // 客户端控制字段进不了请求体
+        assert!(body["params"].get("image_transport").is_none());
+    }
+
+    #[test]
+    fn parses_media_task_ids_of_both_types() {
+        assert_eq!(
+            OpenAICompatibleProvider::media_task_id(&json!({"code":200,"data":{"task_id":181687051}})),
+            Some("181687051".to_string())
+        );
+        assert_eq!(
+            OpenAICompatibleProvider::media_task_id(&json!({"data":{"task_id":"abc-1"}})),
+            Some("abc-1".to_string())
+        );
+        assert_eq!(OpenAICompatibleProvider::media_task_id(&json!({"code":400})), None);
+    }
+
+    #[test]
+    fn reads_media_task_outcomes() {
+        // 还在跑
+        assert!(OpenAICompatibleProvider::media_image_task_outcome(&json!({
+            "is_final": false, "state": "running"
+        }))
+        .is_none());
+
+        // 成功: result_url 与 result_urls 合并去重
+        let done = OpenAICompatibleProvider::media_image_task_outcome(&json!({
+            "is_final": true,
+            "state": "success",
+            "result_url": "https://tos.example.com/a.jpg",
+            "result_urls": ["https://tos.example.com/a.jpg"],
+        }));
+        assert_eq!(
+            done,
+            Some(Ok(vec!["https://tos.example.com/a.jpg".to_string()]))
+        );
+
+        // 失败: 把平台给的原因原样带出来
+        let failed = OpenAICompatibleProvider::media_image_task_outcome(&json!({
+            "is_final": true,
+            "state": "failed",
+            "error": "content policy violation",
+        }));
+        assert_eq!(
+            failed,
+            Some(Err("content policy violation".to_string()))
+        );
+
+        // 已完成但没有图片地址: 不能当成成功返回空
+        let empty = OpenAICompatibleProvider::media_image_task_outcome(&json!({
+            "is_final": true,
+            "state": "success",
+            "result_urls": [],
+        }));
+        assert!(matches!(empty, Some(Err(_))));
+    }
+
+    /// 端到端走一遍 media 信封: 提交拿 task_id → 轮询 → 取回图片地址。
+    /// 用本机 mock 对端, 不发真实请求也不花钱。
+    #[tokio::test]
+    async fn generates_image_through_the_media_envelope() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let replies = [
+                r#"{"code":200,"data":{"task_id":181687051},"msg":"任务创建成功"}"#,
+                r#"{"is_final":true,"state":"success","result_url":"https://tos.example.com/out.jpg","result_urls":["https://tos.example.com/out.jpg"]}"#,
+            ];
+            for body in replies {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let mut buffer = [0u8; 8192];
+                let _ = stream.read(&mut buffer).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().expect("client");
+        let base_url = format!("http://{address}");
+        let image = OpenAICompatibleProvider::generate_image_via_media(
+            &client,
+            &base_url,
+            "test-key",
+            "banana-2.1",
+            "a cat on a table",
+            "2K",
+            "1:1",
+            None,
+            None,
+        )
+        .await
+        .expect("media 出图应当成功");
+        assert_eq!(image, "https://tos.example.com/out.jpg");
+    }
+
+    /// 大图参考图必须被压到体积预算内, 否则请求体随手机照片线性膨胀。
+    #[test]
+    fn compacts_oversized_reference_images() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use image::GenericImageView;
+        // 3000x2400 噪声 PNG: 接近手机直出照片的体积(解码后能被压缩才说明真的重编码了)
+        let mut source = image::RgbImage::new(3000, 2400);
+        let mut seed: u32 = 12345;
+        for pixel in source.pixels_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *pixel = image::Rgb([(seed >> 16) as u8, (seed >> 8) as u8, seed as u8]);
+        }
+        let mut png = Vec::new();
+        source
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode");
+        let original_len = png.len();
+        let data_url = format!("data:image/png;base64,{}", STANDARD.encode(&png));
+
+        let compacted = OpenAICompatibleProvider::compact_reference_data_url(&data_url[5..]);
+        let payload = compacted.strip_prefix("data:").expect("data url");
+        let (metadata, encoded) = payload.split_once(',').expect("payload");
+        assert!(metadata.contains("base64"));
+        assert!(metadata.starts_with("image/"));
+        let bytes = STANDARD.decode(encoded).expect("decode");
+        assert!(
+            bytes.len() < original_len / 4,
+            "压缩后应当显著变小: {} -> {}",
+            original_len,
+            bytes.len()
+        );
+        let decoded = image::load_from_memory(&bytes).expect("decode image");
+        let (width, height) = decoded.dimensions();
+        assert_eq!(width.max(height), OpenAICompatibleProvider::INLINE_REFERENCE_MAX_SIDE);
+    }
+
+    /// 预算内的图必须原样透传: 重编码是有损的, 不能顺手把用户的小图也压一遍。
+    #[test]
+    fn keeps_small_reference_images_untouched() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let mut source = image::RgbImage::new(64, 64);
+        source.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        let mut png = Vec::new();
+        source
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode");
+        let data_url = format!("data:image/png;base64,{}", STANDARD.encode(&png));
+        // 传进来的已经是去掉 `data:` 前缀的负载
+        assert_eq!(
+            OpenAICompatibleProvider::compact_reference_data_url(&data_url[5..]),
+            data_url
+        );
+        // 公网 URL 不下载、不改写
+        assert_eq!(
+            OpenAICompatibleProvider::reference_image_to_image_field("https://example.com/a.png")
+                .expect("ok")
+                .as_deref(),
+            Some("https://example.com/a.png")
+        );
+    }
+
+    /// 传输层失败必须翻成人话: reqwest 的 Display 只有 "error sending request for url (…)"。
+    #[tokio::test]
+    async fn describes_connect_failures_in_plain_words() {
+        let client = reqwest::Client::builder().no_proxy().build().expect("client");
+        // 127.0.0.1:1 必然拒绝连接, 用它拿到一个真实的 connect 失败
+        let error = client
+            .post("http://127.0.0.1:1/v1/images/generations")
+            .body("x")
+            .send()
+            .await
+            .expect_err("应当连接失败");
+        let described = OpenAICompatibleProvider::describe_send_failure(&error);
+        assert!(
+            described.contains("无法与上游建立连接"),
+            "实际文案: {described}"
+        );
+        assert!(OpenAICompatibleProvider::is_retryable_send_failure(&error));
+    }
+
+    /// 第一次请求被对端直接掐断, 第二次成功: 用户不该看到失败。
+    #[tokio::test]
+    async fn retries_when_the_connection_dies_before_any_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            // 第 1 次: 读完请求立刻关连接(模拟传输层抖动 / 对端掐断)
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                drop(stream);
+            }
+            // 第 2 次: 正常返回
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let body = r#"{"ok":true}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().expect("client");
+        let endpoint = format!("http://{address}/v1/images/generations");
+        let response = OpenAICompatibleProvider::send_image_request("测试", &endpoint, || {
+            client.post(&endpoint).body("payload")
+        })
+        .await
+        .expect("第二次应当成功");
+        assert!(response.status().is_success());
+    }
+
+    /// 拿到状态码就说明平台已受理: 绝不能再重投(重复出图 = 重复计费)。
+    #[tokio::test]
+    async fn never_retries_after_a_status_code_arrives() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let body = r#"{"error":{"message":"boom"}}"#;
+                let head = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().expect("client");
+        let endpoint = format!("http://{address}/v1/images/generations");
+        let response = OpenAICompatibleProvider::send_image_request("测试", &endpoint, || {
+            client.post(&endpoint).body("payload")
+        })
+        .await
+        .expect("500 是响应, 不是传输失败");
+        assert_eq!(response.status().as_u16(), 500);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// media 记忆按 provider+模型 记，且大小写不敏感（前端偶尔会把模型名大小写打得不一样）。
+    #[test]
+    fn remembers_which_models_only_speak_the_media_envelope() {
+        assert!(!OpenAICompatibleProvider::media_envelope_known(
+            "api666888-probe",
+            "banana-probe-9"
+        ));
+        OpenAICompatibleProvider::remember_media_envelope("api666888-probe", "banana-probe-9");
+        assert!(OpenAICompatibleProvider::media_envelope_known(
+            "API666888-PROBE",
+            "BANANA-PROBE-9"
+        ));
+        // 别的模型不受影响
+        assert!(!OpenAICompatibleProvider::media_envelope_known(
+            "api666888-probe",
+            "tt-image-2.5"
+        ));
     }
 }

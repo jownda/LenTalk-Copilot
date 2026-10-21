@@ -93,6 +93,10 @@ import {
   type CanvasMediaEntry,
 } from "./application/canvasMediaIndex";
 import { resolveImageDisplayUrl } from "./application/imageData";
+import {
+  buildNodeClipboardSnapshot,
+  type NodeClipboardSnapshot,
+} from "./application/nodeClipboardSnapshot";
 import { CanvasContextMenu } from "./CanvasContextMenu";
 import { SelectedNodeOverlay } from "./ui/SelectedNodeOverlay";
 import { NodeToolDialog } from "./ui/NodeToolDialog";
@@ -341,10 +345,8 @@ interface PreviewConnectionVisual {
   height: number;
 }
 
-interface ClipboardSnapshot {
-  nodes: CanvasNode[];
-  edges: CanvasEdge[];
-}
+/** 画布节点剪贴板快照（复制 / 剪切共用同一份结构）。 */
+type ClipboardSnapshot = NodeClipboardSnapshot;
 
 interface DuplicateOptions {
   explicitOffset?: { x: number; y: number };
@@ -352,6 +354,13 @@ interface DuplicateOptions {
   disableOffsetIteration?: boolean;
   suppressSelect?: boolean;
   suppressPersist?: boolean;
+  /**
+   * 指定还原的源节点（而不是去画布上按 id 找）。
+   * 「剪切」后原节点已经从画布删掉，粘贴只能靠剪贴板快照里的副本还原。
+   */
+  sourceNodes?: CanvasNode[];
+  /** 与 `sourceNodes` 配套的内部连线快照。 */
+  sourceEdges?: CanvasEdge[];
 }
 
 interface DuplicateResult {
@@ -2900,6 +2909,29 @@ export function Canvas() {
     nodeCopyIntentRef.current = null;
   }, []);
 
+  /**
+   * 「剪切」= 复制到画布剪贴板 + 从画布删除。
+   *
+   * 剪贴板里存的是节点副本，原节点删掉后就只能靠这份副本还原，所以用
+   * `buildNodeClipboardSnapshot` 生成快照：组节点会连同组内子节点、内部连线一起装进去，
+   * 否则粘贴回来只剩一个空组框（子节点已被 deleteNodes 的级联删掉）。
+   *
+   * 定义在键盘/右键处理之前：快捷键 effect 的依赖数组里要用到它。
+   */
+  const cutNodesToClipboard = useCallback(
+    (nodeIds: string[]) => {
+      const snapshot = buildNodeClipboardSnapshot(nodes, edges, nodeIds);
+      if (snapshot.nodes.length === 0) {
+        return false;
+      }
+      rememberCopiedNodes(snapshot);
+      deleteNodes(snapshot.nodes.map((node) => node.id));
+      scheduleCanvasPersist(0);
+      return true;
+    },
+    [deleteNodes, edges, nodes, rememberCopiedNodes, scheduleCanvasPersist],
+  );
+
   useEffect(() => {
     const handlePaste = (event: ClipboardEvent) => {
       pasteImageHandledRef.current = false;
@@ -2944,6 +2976,7 @@ export function Canvas() {
       const isRedo = matchesBinding(event, shortcuts.redo);
       const isGroup = matchesBinding(event, shortcuts.group);
       const isCopy = matchesBinding(event, shortcuts.copy);
+      const isCut = matchesBinding(event, shortcuts.cut);
       const isPaste = matchesBinding(event, shortcuts.paste);
       const isDelete = matchesBinding(event, shortcuts.delete);
 
@@ -2952,11 +2985,20 @@ export function Canvas() {
           return;
         }
         event.preventDefault();
-        const selectedIdSet = new Set(selectedNodeIds);
-        rememberCopiedNodes({
-          nodes: nodes.filter((node) => selectedIdSet.has(node.id)),
-          edges: edges.filter((edge) => selectedIdSet.has(edge.source) && selectedIdSet.has(edge.target)),
-        });
+        // 组节点连带组内子节点一起复制，否则粘出来是个空组框。
+        const snapshot = buildNodeClipboardSnapshot(nodes, edges, selectedNodeIds);
+        if (snapshot.nodes.length > 0) {
+          rememberCopiedNodes(snapshot);
+        }
+        return;
+      }
+
+      if (isCut) {
+        if (selectedNodeIds.length === 0) {
+          return;
+        }
+        event.preventDefault();
+        cutNodesToClipboard(selectedNodeIds);
         return;
       }
 
@@ -2970,11 +3012,16 @@ export function Canvas() {
             return;
           }
 
-          if (!copiedSnapshotRef.current || copiedSnapshotRef.current.nodes.length === 0) {
+          const snapshot = copiedSnapshotRef.current;
+          if (!snapshot || snapshot.nodes.length === 0) {
             return;
           }
 
-          void duplicateNodesRef.current?.(copiedSnapshotRef.current.nodes.map((node) => node.id));
+          // 用快照里的节点还原，而不是按 id 回画布上找：剪切后原节点已经不在了。
+          void duplicateNodesRef.current?.(snapshot.nodes.map((node) => node.id), {
+            sourceNodes: snapshot.nodes,
+            sourceEdges: snapshot.edges,
+          });
         }, 0);
         return;
       }
@@ -3024,6 +3071,7 @@ export function Canvas() {
     nodes,
     selectedNodeId,
     selectedNodeIds,
+    cutNodesToClipboard,
     deleteNode,
     deleteNodes,
     groupNodes,
@@ -3158,15 +3206,35 @@ export function Canvas() {
     scheduleCanvasPersist(0);
   }, [deleteNodes, failedGenerationNodeIds, scheduleCanvasPersist]);
 
+  /**
+   * 右键落在多选里的某个节点上时，按整片选区处理（和 Ctrl+C / Ctrl+X 一致）；
+   * 只选中了这一个（或右键的是选区外的节点）就只处理这一个。
+   */
+  const resolveContextTargetIds = useCallback(
+    (nodeId: string) =>
+      selectedNodeIds.length > 1 && selectedNodeIds.includes(nodeId) ? selectedNodeIds : [nodeId],
+    [selectedNodeIds],
+  );
+
   const handleContextCopyNode = useCallback(
     (nodeId: string) => {
-      const node = nodes.find((item) => item.id === nodeId);
-      if (!node) return;
-      rememberCopiedNodes({ nodes: [node], edges: [] });
-      setSelectedNode(nodeId);
+      const targetIds = resolveContextTargetIds(nodeId);
+      const snapshot = buildNodeClipboardSnapshot(nodes, edges, targetIds);
+      if (snapshot.nodes.length === 0) return;
+      rememberCopiedNodes(snapshot);
+      // 单选才顺带把焦点落到这个节点；多选时保留原选区，别被一次复制打散。
+      if (targetIds.length === 1) setSelectedNode(nodeId);
       setCanvasContextMenu(null);
     },
-    [nodes, rememberCopiedNodes, setSelectedNode],
+    [edges, nodes, rememberCopiedNodes, resolveContextTargetIds, setSelectedNode],
+  );
+
+  const handleContextCutNode = useCallback(
+    (nodeId: string) => {
+      setCanvasContextMenu(null);
+      cutNodesToClipboard(resolveContextTargetIds(nodeId));
+    },
+    [cutNodesToClipboard, resolveContextTargetIds],
   );
 
   /** 右键「冻结组 / 解冻组」: 冻结后组与其内部节点位置锁定 */
@@ -3226,11 +3294,14 @@ export function Canvas() {
       }
 
       if (hasNodeSnapshot) {
+        // 用快照还原：剪切过的节点已经不在画布上，按 id 回查会什么都找不到。
         duplicateNodesRef.current?.(
           nodeSnapshot!.nodes.map((node) => node.id),
           {
             targetPosition: context.flowPosition,
             disableOffsetIteration: true,
+            sourceNodes: nodeSnapshot!.nodes,
+            sourceEdges: nodeSnapshot!.edges,
           },
         );
         return;
@@ -3666,13 +3737,17 @@ export function Canvas() {
         return null as DuplicateResult | null;
       }
 
-      const sourceNodes = nodes.filter((node) => dedupedIds.includes(node.id));
+      const sourceNodes = options.sourceNodes
+        ? options.sourceNodes
+        : nodes.filter((node) => dedupedIds.includes(node.id));
       if (sourceNodes.length === 0) {
         return null as DuplicateResult | null;
       }
 
       const sourceIdSet = new Set(sourceNodes.map((node) => node.id));
-      const internalEdges = edges.filter((edge) => sourceIdSet.has(edge.source) && sourceIdSet.has(edge.target));
+      const internalEdges = options.sourceEdges
+        ? options.sourceEdges
+        : edges.filter((edge) => sourceIdSet.has(edge.source) && sourceIdSet.has(edge.target));
 
       const baseOffsets = [
         { x: 44, y: 30 },
@@ -3769,6 +3844,12 @@ export function Canvas() {
           {
             x: sourceNode.position.x + chosenOffset.x + offsetStep * 8,
             y: sourceNode.position.y + chosenOffset.y + offsetStep * 6,
+            // 组内节点跟着组一起还原：父节点也在这次还原的集合里时接上新 id。
+            // 快照已按父先子后排序，父节点这时一定在 idMap 里；父节点不在集合里
+            // （例如只剪切组内某一个节点）就当普通顶层节点粘出，不复用原组。
+            ...(sourceNode.parentId && idMap.has(sourceNode.parentId)
+              ? { parentId: idMap.get(sourceNode.parentId) as string }
+              : {}),
           },
           { ...data },
         );
@@ -5017,6 +5098,7 @@ export function Canvas() {
           failedNodeCount={failedGenerationNodeIds.length}
           onClearFailedNodes={handleClearFailedNodes}
           onCopyNode={handleContextCopyNode}
+          onCutNode={handleContextCutNode}
           onSaveTextToPrompt={handleContextSaveTextToPrompt}
           onPaste={handleContextPaste}
           onAddMediaToLibrary={handleAddMediaToLibrary}

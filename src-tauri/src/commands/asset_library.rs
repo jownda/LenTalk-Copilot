@@ -247,6 +247,89 @@ pub fn save_asset_library_state(
     Ok(normalized)
 }
 
+/// 素材库受管目录：原素材文件都放在这里。
+///
+/// 只有落在这个目录下的文件才允许被「重命名素材」改写 —— 用户从外面拖进来的文件
+/// （画布临时目录、项目 bundle 等）一律不碰。
+fn library_asset_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = app_data_dir(app)?.join("library-assets");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("Failed to create asset directory: {error}"))?;
+    Ok(directory)
+}
+
+/// 把任意素材名收敛成安全的文件名主干（不含扩展名）。
+///
+/// 素材库条目名是用户随手写的，可能带 `/ : ? *` 这类在 Windows / macOS 上非法、
+/// 或会让路径跑到别的目录的字符，所以落盘前必须净化。净化规则要**稳定**：
+/// 同名素材每次算出来的结果必须一样，否则「启动时对齐文件名」会反复改名。
+pub(crate) fn sanitize_file_stem(raw: &str) -> String {
+    let mut mapped = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        if character.is_control() {
+            continue;
+        }
+        match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => mapped.push('-'),
+            _ => mapped.push(character),
+        }
+    }
+    // 折叠连续空白：文件名里的多空格没有意义，还会让对齐逻辑误判。
+    let collapsed = mapped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim_matches(|character: char| character == '.' || character == ' ');
+    // 太长的主干在部分文件系统上会被截断，截断后名字就永远对不上，先在 80 字符处收口。
+    let limited: String = trimmed.chars().take(80).collect();
+    let limited = limited
+        .trim_end_matches(|character: char| character == '.' || character == ' ')
+        .to_string();
+    if limited.is_empty() {
+        return "素材".to_string();
+    }
+    // Windows 保留设备名：叫 `CON` / `NUL` 的文件根本创建不出来。
+    const RESERVED_NAMES: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+        "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    if RESERVED_NAMES.contains(&limited.to_ascii_lowercase().as_str()) {
+        return format!("_{limited}");
+    }
+    limited
+}
+
+/// 在目录里挑一个不冲突的目标路径：`名字.ext` → `名字 (2).ext` → ...
+fn unique_asset_destination(directory: &PathBuf, stem: &str, extension: &str) -> PathBuf {
+    let first = directory.join(format!("{stem}.{extension}"));
+    if !first.exists() {
+        return first;
+    }
+    for index in 2..=9999u32 {
+        let candidate = directory.join(format!("{stem} ({index}).{extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    directory.join(format!("{stem} ({}).{extension}", Uuid::new_v4()))
+}
+
+/// 计算新素材的落盘路径。`file_stem` 为空（备份恢复等内部场景）时退回内容哈希。
+fn resolve_asset_destination(
+    directory: &PathBuf,
+    bytes: &[u8],
+    extension: &str,
+    file_stem: Option<&str>,
+) -> PathBuf {
+    let Some(stem) = file_stem.map(str::trim).filter(|stem| !stem.is_empty()) else {
+        return directory.join(format!("{:x}.{extension}", md5::compute(bytes)));
+    };
+    let stem = sanitize_file_stem(stem);
+    let candidate = directory.join(format!("{stem}.{extension}"));
+    // 同名且内容完全一致 → 复用（重复导入同一张图不会多出一份副本）。
+    if candidate.is_file() && std::fs::read(&candidate).map(|existing| existing == bytes).unwrap_or(false) {
+        return candidate;
+    }
+    unique_asset_destination(directory, &stem, extension)
+}
+
 pub(crate) fn safe_extension(extension: &str) -> String {
     let normalized: String = extension
         .trim()
@@ -270,15 +353,14 @@ pub fn persist_library_asset_binary(
     app: AppHandle,
     bytes: Vec<u8>,
     extension: String,
+    file_stem: Option<String>,
 ) -> Result<String, String> {
     if bytes.is_empty() {
         return Err("Asset bytes are empty".to_string());
     }
-    let directory = app_data_dir(&app)?.join("library-assets");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("Failed to create asset directory: {error}"))?;
-    let filename = format!("{:x}.{}", md5::compute(&bytes), safe_extension(&extension));
-    let path = directory.join(filename);
+    let directory = library_asset_directory(&app)?;
+    let extension = safe_extension(&extension);
+    let path = resolve_asset_destination(&directory, &bytes, &extension, file_stem.as_deref());
     if !path.exists() {
         std::fs::write(&path, bytes)
             .map_err(|error| format!("Failed to persist asset file: {error}"))?;
@@ -340,6 +422,7 @@ pub fn persist_library_asset_file(
     app: AppHandle,
     source_path: String,
     extension: String,
+    file_stem: Option<String>,
 ) -> Result<String, String> {
     let source = PathBuf::from(source_path.trim());
     let metadata = std::fs::metadata(&source)
@@ -348,14 +431,67 @@ pub fn persist_library_asset_file(
         return Err("Selected media source is not a file".to_string());
     }
 
-    let directory = app_data_dir(&app)?.join("library-assets");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("Failed to create asset directory: {error}"))?;
-    let filename = format!("{}.{}", Uuid::new_v4(), safe_extension(&extension));
-    let destination = directory.join(filename);
+    let directory = library_asset_directory(&app)?;
+    let extension = safe_extension(&extension);
+    let destination = match file_stem
+        .as_deref()
+        .map(str::trim)
+        .filter(|stem| !stem.is_empty())
+    {
+        Some(stem) => unique_asset_destination(&directory, &sanitize_file_stem(stem), &extension),
+        // 没给主干名（备份恢复等内部路径）时沿用 uuid，保证不与用户文件撞名。
+        None => directory.join(format!("{}.{extension}", Uuid::new_v4())),
+    };
     std::fs::copy(&source, &destination)
         .map_err(|error| format!("Failed to copy media asset: {error}"))?;
 
+    Ok(destination.to_string_lossy().to_string())
+}
+
+/// 重命名素材库里的原素材文件，让磁盘文件名和素材库条目名保持一致。
+///
+/// 只接受 `app_data/library-assets/` 下的直接子文件：这条命令属于「素材库内部维护」，
+/// 不能变成任意路径改名的后门。扩展名保持不变（改名只改名，不改格式）。
+/// `keep_source = true` 时改为复制 —— 当多条素材共用一个文件时，搬走文件会让
+/// 另一条素材的引用失效。
+#[tauri::command]
+pub fn rename_library_asset_file(
+    app: AppHandle,
+    source_path: String,
+    file_stem: String,
+    keep_source: bool,
+) -> Result<String, String> {
+    let directory = library_asset_directory(&app)?;
+    let source = PathBuf::from(source_path.trim());
+    if source.parent() != Some(directory.as_path()) {
+        return Err("素材文件不在素材库目录内，跳过改名".to_string());
+    }
+    if !source.is_file() {
+        return Err("素材源文件已不存在".to_string());
+    }
+
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin")
+        .to_string();
+    let stem = sanitize_file_stem(&file_stem);
+    let current_stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if current_stem == stem {
+        return Ok(source.to_string_lossy().to_string());
+    }
+
+    let destination = unique_asset_destination(&directory, &stem, &extension);
+    if keep_source {
+        std::fs::copy(&source, &destination)
+            .map_err(|error| format!("Failed to copy asset file: {error}"))?;
+    } else {
+        std::fs::rename(&source, &destination)
+            .map_err(|error| format!("Failed to rename asset file: {error}"))?;
+    }
     Ok(destination.to_string_lossy().to_string())
 }
 
@@ -455,5 +591,61 @@ pub fn extract_video_thumbnail(
             return Ok(Some(output.to_string_lossy().to_string()));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_replaces_path_and_reserved_characters() {
+        assert_eq!(sanitize_file_stem("画布图片 10:08:32"), "画布图片 10-08-32");
+        assert_eq!(sanitize_file_stem("a/b\\c*d?e\"f<g>h|i"), "a-b-c-d-e-f-g-h-i");
+        assert_eq!(sanitize_file_stem("  多   空格  "), "多 空格");
+        // 首尾的点和空格在 Windows / macOS 上都不合法
+        assert_eq!(sanitize_file_stem("..封面. ."), "封面");
+        assert_eq!(sanitize_file_stem("   "), "素材");
+        assert_eq!(sanitize_file_stem("...."), "素材");
+        // Windows 保留设备名不能直接当文件名
+        assert_eq!(sanitize_file_stem("con"), "_con");
+        assert_eq!(sanitize_file_stem("NUL"), "_NUL");
+    }
+
+    #[test]
+    fn sanitize_is_stable_and_bounded() {
+        let once = sanitize_file_stem("商品头图");
+        assert_eq!(once, sanitize_file_stem(&once));
+        let long = sanitize_file_stem(&"长".repeat(200));
+        assert_eq!(long.chars().count(), 80);
+        assert_eq!(long, sanitize_file_stem(&long));
+    }
+
+    #[test]
+    fn destination_uses_stem_and_dedupes_suffixes() {
+        let dir = std::env::temp_dir().join(format!("lentalk-asset-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let extension = safe_extension("png");
+
+        let first = resolve_asset_destination(&dir, b"one", &extension, Some("商品头图"));
+        assert_eq!(first.file_name().unwrap().to_string_lossy(), "商品头图.png");
+        std::fs::write(&first, b"one").expect("write first");
+
+        // 同名但内容不同 → 追加序号, 不覆盖已有素材
+        let second = resolve_asset_destination(&dir, b"two", &extension, Some("商品头图"));
+        assert_eq!(second.file_name().unwrap().to_string_lossy(), "商品头图 (2).png");
+
+        // 同名同内容 → 复用同一个文件
+        let reused = resolve_asset_destination(&dir, b"one", &extension, Some("商品头图"));
+        assert_eq!(reused, first);
+
+        // 未给主干名(备份恢复)时退回内容哈希
+        let hashed = resolve_asset_destination(&dir, b"three", &extension, None);
+        assert_eq!(
+            hashed.file_name().unwrap().to_string_lossy(),
+            format!("{:x}.png", md5::compute(b"three"))
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -10,6 +10,7 @@ import {
   resolveImageDisplayUrl,
 } from "@/features/canvas/application/imageData";
 import { ASSET_LIBRARY_MIME_PREFIX, type AssetMediaType, type LibraryAsset } from "./types";
+import { fileNameFromPath, fileStemFromPath } from "./assetFileNaming";
 
 export function createAssetId(): string {
   return `asset-${uuid().slice(0, 12)}`;
@@ -18,6 +19,7 @@ export function createAssetId(): string {
 async function persistImageBlobForLibrary(
   blob: Blob,
   extension: string,
+  fileStem?: string,
 ): Promise<{ sourcePath: string; previewImageUrl: string; aspectRatio: string }> {
   const sourceDataUrl = await blobToDataUrl(blob);
   const aspectRatio = await detectAspectRatio(sourceDataUrl);
@@ -32,10 +34,21 @@ async function persistImageBlobForLibrary(
   }
 
   // 素材库图片必须使用独立目录，不能复用画布的 images 目录。
-  const sourcePath = await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension);
+  // 文件名直接用素材名（Rust 侧净化非法字符并去重），素材库条目和磁盘文件才对得上。
+  const sourcePath = await persistLibraryAssetBinary(
+    new Uint8Array(await blob.arrayBuffer()),
+    extension,
+    fileStem,
+  );
   const previewResponse = await fetch(previewDataUrl);
   const previewBlob = await previewResponse.blob();
-  const previewImageUrl = await persistLibraryAssetBinary(new Uint8Array(await previewBlob.arrayBuffer()), "png");
+  // 原素材重名时落盘会加序号，预览图跟着真实文件名走，别在文件名里插一段序号。
+  const finalStem = fileStemFromPath(sourcePath) || fileStem;
+  const previewImageUrl = await persistLibraryAssetBinary(
+    new Uint8Array(await previewBlob.arrayBuffer()),
+    "png",
+    finalStem ? `${finalStem}.preview` : undefined,
+  );
   return { sourcePath, previewImageUrl, aspectRatio };
 }
 
@@ -145,19 +158,21 @@ export async function importImageUrlToAssetDetailed(
     }
 
     const extension = blob.type.split("/")[1] ?? "png";
-    const fileName = `canvas-image-${Date.now()}.${extension}`;
-    const stored = await persistImageBlobForLibrary(blob, extension);
+    const preferredName = `画布图片 ${new Date().toLocaleTimeString()}`;
+    // 落盘名 == 素材名（Rust 侧只净化非法字符），条目和文件从此对得上。
+    const stored = await persistImageBlobForLibrary(blob, extension, preferredName);
     return {
       asset: {
         id: createAssetId(),
         libraryId,
         categoryId,
-        name: `画布图片 ${new Date().toLocaleTimeString()}`,
+        // 重名时落盘会加序号，素材名跟着用真实文件名，才不会「库里叫 A、盘上叫 A (2)」。
+        name: fileStemFromPath(stored.sourcePath) || preferredName,
         mediaType: "image",
         sourcePath: stored.sourcePath,
         previewImageUrl: stored.previewImageUrl,
         aspectRatio: stored.aspectRatio || "1:1",
-        sourceFileName: fileName,
+        sourceFileName: fileNameFromPath(stored.sourcePath) || `canvas-image-${Date.now()}.${extension}`,
         tags: [],
         createdAt: Date.now(),
       },
@@ -201,20 +216,20 @@ export async function importAudioUrlToAsset(
       ? sourcePathWithoutParams.split(".").pop()?.trim().toLowerCase()
       : undefined;
     const extension = blob.type.split("/")[1]?.split(";")[0] || sourceExtension || "mp3";
+    const preferredName = `画布音频 ${new Date().toLocaleTimeString()}`;
     const sourcePath = isTauri()
-      ? await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension)
+      ? await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension, preferredName)
       : displayUrl;
-    const fileName = `canvas-audio-${Date.now()}.${extension}`;
     return {
       id: createAssetId(),
       libraryId,
       categoryId,
-      name: `画布音频 ${new Date().toLocaleTimeString()}`,
+      name: fileStemFromPath(sourcePath) || preferredName,
       mediaType: "audio",
       sourcePath,
       previewImageUrl: null,
       aspectRatio: null,
-      sourceFileName: fileName,
+      sourceFileName: fileNameFromPath(sourcePath) || `canvas-audio-${Date.now()}.${extension}`,
       tags: [],
       createdAt: Date.now(),
     };
@@ -240,21 +255,21 @@ export async function importVideoUrlToAsset(
     const blob = await response.blob();
     const mime = blob.type || "video/mp4";
     const extension = mime.split("/")[1]?.split(";")[0] || "mp4";
+    const preferredName = `画布视频 ${new Date().toLocaleTimeString()}`;
     const sourcePath = isTauri()
-      ? await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension)
+      ? await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension, preferredName)
       : displayUrl;
     const previewImageUrl = isTauri() ? await extractVideoThumbnail(sourcePath) : null;
-    const fileName = `canvas-video-${Date.now()}.${extension}`;
     return {
       id: createAssetId(),
       libraryId,
       categoryId,
-      name: `画布视频 ${new Date().toLocaleTimeString()}`,
+      name: fileStemFromPath(sourcePath) || preferredName,
       mediaType: "video",
       sourcePath,
       previewImageUrl,
       aspectRatio: null,
-      sourceFileName: fileName,
+      sourceFileName: fileNameFromPath(sourcePath) || `canvas-video-${Date.now()}.${extension}`,
       tags: [],
       createdAt: Date.now(),
     };
@@ -425,18 +440,21 @@ export async function importFilesToAssets(
 
     try {
       const createdAt = Date.now();
+      // 素材名 == 磁盘文件名（去掉扩展名）。导入时就用它命名文件，后面不再需要对齐。
+      const name = assetNameFromFile(file);
       if (mediaType === "image") {
-        const stored = await persistImageBlobForLibrary(file, extensionForFile(file));
+        const stored = await persistImageBlobForLibrary(file, extensionForFile(file), name);
         imported.push({
           id: createAssetId(),
           libraryId,
           categoryId,
-          name: assetNameFromFile(file),
+          // 重名时落盘会加序号（`照片 (2).jpg`），素材名跟着用真实文件名。
+          name: fileStemFromPath(stored.sourcePath) || name,
           mediaType,
           sourcePath: stored.sourcePath,
           previewImageUrl: stored.previewImageUrl,
           aspectRatio: stored.aspectRatio || "1:1",
-          sourceFileName: file.name,
+          sourceFileName: fileNameFromPath(stored.sourcePath) || file.name,
           tags: [],
           createdAt,
         });
@@ -447,8 +465,9 @@ export async function importFilesToAssets(
       // 视频读进 WebView 再序列化给 IPC。没有路径时也会自动改为 2 MB 分块写入。
       // 浏览器模式没有持久化文件系统时保留 object URL 的轻量预览行为。
       const sourcePath = isTauri()
-        ? await persistLibraryAssetFromFile(file, extensionForFile(file))
+        ? await persistLibraryAssetFromFile(file, extensionForFile(file), name)
         : URL.createObjectURL(file);
+      const storedName = fileStemFromPath(sourcePath) || name;
 
       if (mediaType === "video") {
         // 视频: Tauri 用系统 QuickLook 抽帧; 浏览器用前端 canvas 截首帧; 失败回退 null
@@ -457,12 +476,12 @@ export async function importFilesToAssets(
           id: createAssetId(),
           libraryId,
           categoryId,
-          name: assetNameFromFile(file),
+          name: storedName,
           mediaType,
           sourcePath,
           previewImageUrl,
           aspectRatio: null,
-          sourceFileName: file.name,
+          sourceFileName: fileNameFromPath(sourcePath) || file.name,
           tags: [],
           createdAt,
         });
@@ -473,12 +492,12 @@ export async function importFilesToAssets(
         id: createAssetId(),
         libraryId,
         categoryId,
-        name: assetNameFromFile(file),
+        name: storedName,
         mediaType,
         sourcePath,
         previewImageUrl: null,
         aspectRatio: null,
-        sourceFileName: file.name,
+        sourceFileName: fileNameFromPath(sourcePath) || file.name,
         tags: [],
         createdAt,
       });

@@ -82,6 +82,27 @@ export function isCanvasAgentAccessLevel(value: unknown): value is CanvasAgentAc
   return value === "read-only" || value === "edit" || value === "full";
 }
 
+/**
+ * 一段会话早期的压缩备忘。
+ *
+ * 为什么要落盘：压缩是一次真实的模型请求，不能每轮都重做。
+ * `throughMessageId` / `throughCreatedAt` 是「已经吸收到哪一条」的水位线 ——
+ * 两者都存是因为消息有 200 条上限，水位线那条可能已被从头裁掉，届时只能按时间兜底。
+ */
+export interface AgentContextSummary {
+  /** 备忘正文（模型产出的结构化中文） */
+  text: string;
+  /** 已吸收的最后一条消息 id；被裁掉时退化为 null */
+  throughMessageId: string | null;
+  /** 已吸收的最后一条消息的时间戳，用于 id 失效时的兜底定位 */
+  throughCreatedAt: number;
+  /** 累计被吸收的消息条数，用于 UI 展示 */
+  messageCount: number;
+  createdAt: number;
+  /** 备忘自身的估算 token，用于 UI 展示压缩效果 */
+  tokens: number;
+}
+
 export interface AgentSession {
   id: string;
   title: string;
@@ -96,6 +117,11 @@ export interface AgentSession {
   skillId: string | null;
   createdAt: number;
   updatedAt: number;
+  /**
+   * 早期对话的压缩备忘；null / 缺失表示整个会话仍按原文发送。
+   * 由 `contextCompression.prepareHistory` 在历史超预算时生成。
+   */
+  contextSummary?: AgentContextSummary | null;
 }
 
 /** 送入模型的最小消息形状（剥掉 id / pending / error 等纯 UI 字段） */

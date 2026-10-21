@@ -18,10 +18,15 @@ export async function saveAssetLibraryState(state: AssetLibraryState): Promise<A
   return await invoke<AssetLibraryState>("save_asset_library_state", { state });
 }
 
-export async function persistLibraryAssetBinary(bytes: Uint8Array, extension: string): Promise<string> {
+export async function persistLibraryAssetBinary(
+  bytes: Uint8Array,
+  extension: string,
+  fileStem?: string | null,
+): Promise<string> {
   return await invoke<string>("persist_library_asset_binary", {
     bytes: Array.from(bytes),
     extension,
+    fileStem: fileStem ?? null,
   });
 }
 
@@ -46,9 +51,13 @@ export async function persistLibraryAssetBinaryChunk(
  * 将 Blob 写入素材库。优先由调用方提供的本地路径直接复制；此函数负责没有原生路径时的
  * 分块 IPC 兜底，避免上传大视频时一次性把全部字节转换为 JS 数组。
  */
-export async function persistLibraryAssetBlob(blob: Blob, extension: string): Promise<string> {
+export async function persistLibraryAssetBlob(
+  blob: Blob,
+  extension: string,
+  fileStem?: string | null,
+): Promise<string> {
   if (blob.size <= LARGE_ASSET_CHUNK_THRESHOLD_BYTES) {
-    return await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension);
+    return await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension, fileStem);
   }
 
   const fileId =
@@ -77,23 +86,58 @@ export async function persistLibraryAssetBlob(blob: Blob, extension: string): Pr
   if (!persistedPath) {
     throw new Error("素材文件分块写入未返回目标路径");
   }
+  // 分块写入只能用临时文件名（分片靠它续写），收尾后改回素材名。
+  if (fileStem?.trim()) {
+    try {
+      return await renameLibraryAssetFile(persistedPath, fileStem, false);
+    } catch (error) {
+      console.warn("[assetLibrary] rename chunked asset failed", persistedPath, error);
+    }
+  }
   return persistedPath;
 }
 
 /** 选择器/拖拽得到原生路径时直接让 Rust 拷贝；否则走受控内存的 Blob 分块写入。 */
-export async function persistLibraryAssetFromFile(file: File, extension: string): Promise<string> {
+export async function persistLibraryAssetFromFile(
+  file: File,
+  extension: string,
+  fileStem?: string | null,
+): Promise<string> {
   const nativePath = (file as File & { path?: unknown }).path;
   if (typeof nativePath === "string" && nativePath.trim()) {
-    return await persistLibraryAssetFile(nativePath, extension);
+    return await persistLibraryAssetFile(nativePath, extension, fileStem);
   }
-  return await persistLibraryAssetBlob(file, extension);
+  return await persistLibraryAssetBlob(file, extension, fileStem);
 }
 
 /** 直接复制本地媒体文件，避免视频内容经 Tauri IPC 传输。 */
-export async function persistLibraryAssetFile(sourcePath: string, extension: string): Promise<string> {
+export async function persistLibraryAssetFile(
+  sourcePath: string,
+  extension: string,
+  fileStem?: string | null,
+): Promise<string> {
   return await invoke<string>("persist_library_asset_file", {
     sourcePath,
     extension,
+    fileStem: fileStem ?? null,
+  });
+}
+
+/**
+ * 把素材库目录里的原素材文件改名，返回新路径。
+ *
+ * `keepSource = true` 表示该文件还被别的素材条目引用（旧版本按内容哈希去重，
+ * 同内容多次导入会共用一份文件），此时只能复制、不能搬走。
+ */
+export async function renameLibraryAssetFile(
+  sourcePath: string,
+  fileStem: string,
+  keepSource = false,
+): Promise<string> {
+  return await invoke<string>("rename_library_asset_file", {
+    sourcePath,
+    fileStem,
+    keepSource,
   });
 }
 

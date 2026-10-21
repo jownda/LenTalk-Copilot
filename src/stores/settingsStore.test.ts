@@ -4,9 +4,11 @@ import {
   isAudioModelName,
   isChatCompletionModelName,
   isVideoGenerationModelName,
+  normalizeCustomApis,
   useSettingsStore,
 } from './settingsStore';
 import { RUNNINGHUB_VIDEO_ENDPOINTS } from '@/commands/runningHubProtocol';
+import { recommendedApis } from '@/features/settings/recommendedApis';
 
 describe('isAudioModelName', () => {
   it('识别 TTS / 语音克隆 / 音乐生成模型', () => {
@@ -202,6 +204,129 @@ describe('启动时同步推荐预设的视频模型', () => {
     useSettingsStore.getState().syncRecommendedVideoModels();
     expect(currentApi().videoModels).toEqual(['veo3']);
     expect(currentApi().presetVideoModelsRevision).toBeUndefined();
+  });
+});
+
+describe('加载时把放错桶的模型归位', () => {
+  // 存量修复: 旧分类器认不出 tt-/gk-/gem- 这些转售代号, 「拉取模型」把它们
+  // 塞进了 models(图片)里。代码改好之后, 已经落盘的错位数据还得靠加载时的
+  // normalize 挪回来 —— 否则用户那边依旧是「对话模型在图片里、对话列表空着」。
+  function seeded(models: string[], chatModels: string[] = []) {
+    return normalizeCustomApis([
+      {
+        id: 'api666888',
+        name: '灵柯AI',
+        baseUrl: 'https://api.lk888.ai',
+        apiKey: 'sk-test',
+        models,
+        videoModels: [],
+        audioModels: [],
+        chatModels,
+      },
+    ])[0];
+  }
+
+  it('models 里的对话模型被挪到 chatModels, 图片模型原地不动', () => {
+    const api = seeded(
+      ['gem-3.1-pro', 'gpt-image-2', 'banana-2.1', 'tt-6-luna', 'kling-v3-video'],
+      ['deepseek-v4.1-flash'],
+    );
+    expect(api.chatModels).toEqual(['deepseek-v4.1-flash', 'gem-3.1-pro', 'tt-6-luna']);
+    expect(api.models).toEqual(['gpt-image-2', 'banana-2.1']);
+    expect(api.videoModels).toContain('kling-v3-video');
+  });
+
+  it('已在 chatModels 里的模型不会重复追加', () => {
+    const api = seeded(['deepseek-v4.1-flash'], ['deepseek-v4.1-flash']);
+    expect(api.chatModels).toEqual(['deepseek-v4.1-flash']);
+    expect(api.models).toEqual([]);
+  });
+
+  it('名字里没有厂商名的图片模型不会被误挪(否则图片下拉会空)', () => {
+    const api = seeded(['mj_imagine', 'vidu-image-2', 'qwen-image', 'wan2.6-image', 'Omni-Nano-pro']);
+    expect(api.models).toHaveLength(5);
+    expect(api.chatModels).toEqual([]);
+  });
+
+  it('灵柯登记为图片的 kling-v3 / kling-v3-omni 留在图片清单, 别的平台照旧当视频', () => {
+    // 平台文档里这两个的 leixing=image(可灵出图), 但名字命中通用 kling 视频规则。
+    // 只有灵柯域名下才例外, 否则会把别家真的 kling-v3 视频模型错挪成图片。
+    const lingke = seeded(['kling-v3', 'kling-v3-omni', 'kling-v3-video']);
+    expect(lingke.models).toEqual(['kling-v3', 'kling-v3-omni']);
+    expect(lingke.videoModels).toEqual(['kling-v3-video']);
+
+    const outsider = normalizeCustomApis([
+      {
+        id: 'custom:other',
+        name: '别家中转',
+        baseUrl: 'https://api.example.com',
+        apiKey: 'sk-test',
+        models: ['kling-v3'],
+        videoModels: [],
+        audioModels: [],
+        chatModels: [],
+      },
+    ])[0];
+    expect(outsider.models).toEqual([]);
+    expect(outsider.videoModels).toEqual(['kling-v3']);
+  });
+});
+
+describe('启动时同步推荐预设的对话模型', () => {
+  // 灵柯AI 的对话清单一次补到 55 个, 而老配置里往往只存了一两个 —— 用户点开对话
+  // 模型下拉只有孤零零一条, 只能自己再点「拉取模型」。这里按差集把缺的补上,
+  // 与视频 / 音频共用同一套 revision 语义(对齐之后用户删掉的不会被复活)。
+  function seed(chatModels: string[], revision?: number) {
+    useSettingsStore.setState({
+      customApis: [
+        {
+          id: 'api666888',
+          name: '灵柯AI',
+          baseUrl: 'https://api.lk888.ai',
+          apiKey: '',
+          models: [],
+          videoModels: [],
+          audioModels: [],
+          chatModels,
+          createdAt: 0,
+          requestMode: 'sync',
+          protocol: 'images',
+          referenceImageField: 'image',
+          referenceImageEncoding: 'auto',
+          imageTransport: 'auto',
+          ...(revision === undefined ? {} : { presetChatModelsRevision: revision }),
+        },
+      ],
+    });
+  }
+
+  const presetChat = recommendedApis.find((api) => api.id === 'api666888')?.chatModels ?? [];
+
+  it('老配置能补齐预设里的全部对话模型, 已有的排在最前', () => {
+    seed(['deepseek-v4.1-flash']);
+    useSettingsStore.getState().syncRecommendedChatModels();
+    const api = useSettingsStore.getState().customApis[0];
+    expect(api.chatModels[0]).toBe('deepseek-v4.1-flash');
+    expect(new Set(api.chatModels)).toEqual(new Set(presetChat));
+    expect(api.chatModels).toHaveLength(presetChat.length);
+    expect(api.presetChatModelsRevision).toBe(1);
+  });
+
+  it('对齐之后是 no-op —— 用户删掉的对话模型不会复活', () => {
+    const trimmed = presetChat.filter((model) => !model.startsWith('tt-'));
+    seed(trimmed, 1);
+    useSettingsStore.getState().syncRecommendedChatModels();
+    expect(useSettingsStore.getState().customApis[0].chatModels).toEqual(trimmed);
+  });
+
+  it('与预设无关的平台原样不动', () => {
+    seed(['my-own-chat'], 0);
+    useSettingsStore.setState({
+      customApis: [{ ...useSettingsStore.getState().customApis[0], baseUrl: 'https://api.example.com' }],
+    });
+    useSettingsStore.getState().syncRecommendedChatModels();
+    expect(useSettingsStore.getState().customApis[0].chatModels).toEqual(['my-own-chat']);
+    expect(useSettingsStore.getState().customApis[0].presetChatModelsRevision).toBe(0);
   });
 });
 

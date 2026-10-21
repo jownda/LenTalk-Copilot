@@ -20,13 +20,59 @@ export interface PajubenModelOption {
   source: "custom" | "recommended";
 }
 
-/** 模型能否直接接收扒视频流程使用的 OpenAI `input_audio` 内容。 */
+/**
+ * 模型能否直接接收扒视频流程使用的 OpenAI `input_audio` 内容。
+ *
+ * 只按名字认「明牌」的多模态/语音模型：名字猜不出来时一律当作不支持，
+ * 由引擎的实际报错兜底（见 dual_model_test.py 的模型能力诊断），
+ * 比在这里放行一个纯文本模型、让它悄悄返回一段「请提供音频」要安全。
+ */
 export function isPajubenAudioInputModel(model: string): boolean {
   const value = model.trim().toLowerCase();
   return (
     /(?:^|[-_/.])gemini(?:[-_/.]|\d|$)/.test(value) ||
     /(?:^|[-_/.])qwen\d*[-_.]?omni(?:[-_/.]|\d|$)/.test(value) ||
-    /(?:^|[-_/.])gpt[-_]?4o[-_]?(?:audio|realtime)(?:[-_.]|\d|$)/.test(value)
+    /(?:^|[-_/.])gpt[-_]?4o[-_]?(?:audio|realtime)(?:[-_.]|\d|$)/.test(value) ||
+    // 名字里自带能力的语音/全模态模型：step-audio、mimo-audio、kimi-audio、
+    // glm-4-voice、gpt-4o-mini-audio 之类，统一按 -audio/-omni/-voice/-realtime 收口。
+    /(?:^|[-_/.])(?:step|mimo|kimi|glm|doubao)[-_.]?(?:audio|omni|voice|realtime)(?:[-_/.]|\d|$)/.test(
+      value,
+    ) ||
+    /[-_.](?:audio|omni|voice)(?:[-_.]|$)/.test(value)
+  );
+}
+
+/**
+ * 扒视频的两段模型选择：视觉模型负责画面（场景/着装/动作/神态），
+ * 音频模型负责台词与音效，两者可以来自不同渠道。
+ */
+export interface PajubenModelSelection {
+  vision: PajubenModelOption | null;
+  audio: PajubenModelOption | null;
+}
+
+/** 视觉模型 key：新字段优先，回落到拆分前的老字段，老用户的选择不丢。 */
+export function resolvePajubenVisionKey(
+  visionKey: string | null | undefined,
+  legacyKey: string | null | undefined,
+): string {
+  return (visionKey ?? "").trim() || (legacyKey ?? "").trim();
+}
+
+/**
+ * 音频模型的默认值：先找同渠道的音频模型，找不到再退到全局第一个音频模型。
+ *
+ * 这里只是给下拉框一个「说得通」的初值，不代替用户选择 —— 两个下拉都明明白白
+ * 显示着当前用的是哪个模型，选错了引擎会把原因直接报出来。
+ */
+export function pickPajubenAudioDefault(
+  options: PajubenModelOption[],
+  vision: PajubenModelOption | null,
+): PajubenModelOption | null {
+  return (
+    findPajubenAudioFallbackModel(options, vision) ??
+    options.find((option) => isPajubenAudioInputModel(option.model)) ??
+    null
   );
 }
 
@@ -145,7 +191,10 @@ export interface PajubenModelGroup {
  * 组内按模型名排序，组之间按渠道名排序 —— 与 collectPajubenModelOptions 的
  * 排序规则一致，保证「上面列出的顺序」稳定，不会因为重渲染跳来跳去。
  */
-export function groupPajubenModelOptions(options: PajubenModelOption[]): PajubenModelGroup[] {
+export function groupPajubenModelOptions(
+  options: PajubenModelOption[],
+  settings: { audioFirst?: boolean } = {},
+): PajubenModelGroup[] {
   const groups = new Map<string, PajubenModelOption[]>();
   for (const option of options) {
     const bucket = groups.get(option.providerName);
@@ -155,8 +204,13 @@ export function groupPajubenModelOptions(options: PajubenModelOption[]): Pajuben
       groups.set(option.providerName, [option]);
     }
   }
+  const audioRank = (option: PajubenModelOption) => (isPajubenAudioInputModel(option.model) ? 0 : 1);
   return Array.from(groups, ([providerName, list]) => ({
     providerName,
-    options: [...list].sort((a, b) => a.model.localeCompare(b.model)),
+    options: [...list].sort((a, b) =>
+      settings.audioFirst
+        ? audioRank(a) - audioRank(b) || a.model.localeCompare(b.model)
+        : a.model.localeCompare(b.model),
+    ),
   })).sort((a, b) => a.providerName.localeCompare(b.providerName));
 }

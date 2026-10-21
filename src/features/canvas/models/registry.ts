@@ -13,6 +13,7 @@ import {
   buildCustomModelId,
   buildCustomProviderId,
   isAudioModelName,
+  isChatCompletionModelName,
   isVideoGenerationModelName,
   useSettingsStore,
 } from "@/stores/settingsStore";
@@ -20,6 +21,12 @@ import { isWindowsDesktopRuntime } from "@/platform/runtime";
 import { createPointsOnlyPricing } from "@/features/canvas/pricing";
 import { resolveVideoModelProfile } from "./videoProfiles";
 import { resolveImageModelResolutionOptions } from "./imageModelCapabilities";
+import {
+  isLingkeBaseUrl,
+  LINGKE_IMAGE_NAME_OVERRIDES,
+  resolveLingkeImageCapability,
+  type LingkeImageCapability,
+} from "@/features/settings/lingkeModels";
 import { createZhiniaoImagePricing, createZhiniaoVideoPricing, isZhiniaoProvider } from "./zhiniaoPricing";
 import { createWgspaiImagePricing, createWgspaiVideoPricing, isWgspaiProvider } from "./wgspaiPricing";
 import {
@@ -251,12 +258,14 @@ export function listVideoModels(): VideoModelDefinition[] {
         : undefined;
       const zhiniaoOptions = isZhiniao ? resolveZhiniaoVideoOptions(model) : undefined;
       // api666888「暗苗」链路: 9 个 seedance 模型, 2.5 系 4~30 秒 / 2.0 系 4~15 秒。
-      // 真实网关是 api.lingkeai.ai(api666888.com 只有静态站, 没有 API), 两处都认:
-      // 老配置里填的是展示域名, 新预设填的是网关域名, 不能让任何一边掉档位。
+      // 官方主域名是 api.lk888.ai(备用 api.lk666.ai), 但同名白标站(api666888.com /
+      // lingkeai.ai / lingkeai.vip)与别名 api.lingkeai.ai 在历史配置里都出现过 ——
+      // 四种 baseUrl 全认, 不能让任何一边掉档位。
       const isApi666888 =
         api.id.trim().toLowerCase() === "api666888" ||
-        api.baseUrl.trim().toLowerCase().includes("api666888.com") ||
-        api.baseUrl.trim().toLowerCase().includes("lingkeai.ai");
+        ["api666888.com", "lingkeai", "lk888.ai", "lk666.ai"].some((host) =>
+          api.baseUrl.trim().toLowerCase().includes(host),
+        );
       const api666888Options = isApi666888 ? resolveApi666888VideoOptions(model) : undefined;
       // RunningHub 的档位表逐端点不同。这里的**空数组是有意义的返回值**: 表示该
       // 端点官方 schema 里没有这个参数(UI 应隐藏该控件), 或它的画幅字段收像素串、
@@ -885,6 +894,40 @@ export function getModelProvider(providerId: string): ModelProviderDefinition {
 // ---------------------------------------------------------------------------
 
 const CUSTOM_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "21:9", "5:4", "4:5", "3:2", "2:3", "4:3", "3:4"] as const;
+
+/**
+ * 灵柯图片模型自己的画幅枚举, 与 App 通用档位取**交集**。
+ *
+ * 平台每个模型的 `aspect_ratio` / `aspectRatio` options 都不一样, 传枚举外的值
+ * 会被拒。取交集既裁掉 `gk-image-2.0` 没有的 21:9 / 5:4, 也不会把表里那些
+ * `1:4` / `9:21` / `7:3` 的极端比例塞进下拉。
+ *
+ * 交集为空(`tt-image-2` 族根本没有比例参数, 靠像素 `size` 表达)时返回
+ * `undefined`, 调用方回退通用档位。
+ */
+function resolveLingkeAspectRatios(
+  capability: LingkeImageCapability | undefined,
+): readonly string[] | undefined {
+  if (!capability || capability.ratios.length === 0) {
+    return undefined;
+  }
+  const allowed = CUSTOM_ASPECT_RATIOS.filter((ratio) => capability.ratios.includes(ratio));
+  return allowed.length > 0 ? allowed : undefined;
+}
+
+/**
+ * 灵柯图片模型的分辨率档位。空数组返回 `undefined` ——
+ * `qwen-image` / `wan2.x-image` 用 `size` 表达画幅、`mj_imagine` 用 `quality`,
+ * 这三类都没有档位参数, 回退默认三档即可(后端不会把它发出去)。
+ */
+function resolveLingkeImageResolutions(
+  capability: LingkeImageCapability | undefined,
+): ResolutionOption[] | undefined {
+  if (!capability || capability.resolutions.length === 0) {
+    return undefined;
+  }
+  return capability.resolutions.map((value) => ({ value, label: value }));
+}
 
 /**
  * 知鸟 AI(TokenGo)视频模型的档位清单。
@@ -1606,21 +1649,37 @@ function buildCustomImageModels(): ImageModelDefinition[] {
     api.models
       .filter((model) => {
         const normalizedModel = model.trim().toLowerCase();
+        // 灵柯登记成图片的两个 kling 模型名字会被视频规则抓走, 这里放行
+        const isLingkeImageOverride =
+          isLingkeBaseUrl(api.baseUrl) && LINGKE_IMAGE_NAME_OVERRIDES.includes(normalizedModel);
         return (
-          !isVideoGenerationModelName(model) &&
-          !isAudioModelName(model) &&
-          !api.videoModels.some((videoModel) => videoModel.trim().toLowerCase() === normalizedModel) &&
-          !(api.audioModels ?? []).some((audioModel) => audioModel.trim().toLowerCase() === normalizedModel)
+          isLingkeImageOverride
+          || (!isVideoGenerationModelName(model)
+            && !isAudioModelName(model)
+            // 对话模型不进图片下拉: 转售平台把 GPT/Gemini 写成 tt-/gk- 代号, 旧分类器
+            // 认不出来就把它们留在 models 里, 图片节点会多出一串根本出不了图的模型。
+            && !isChatCompletionModelName(model)
+            && !api.videoModels.some((videoModel) => videoModel.trim().toLowerCase() === normalizedModel)
+            && !(api.audioModels ?? []).some((audioModel) => audioModel.trim().toLowerCase() === normalizedModel))
         );
       })
       .map((model) => {
         const modelId = buildCustomModelId(api.id, model);
         // 字子动画图片: 官方画幅枚举同为 16:9 / 9:16 / 1:1, 参考图字段 reference_images。
         const isZzdhImageApi = isZzdhProvider(api.id, api.baseUrl);
-        const imageAspectRatios = isZzdhImageApi ? [...ZZDH_ASPECT_RATIOS] : CUSTOM_ASPECT_RATIOS;
+        // 灵柯的每个图片模型都有自己的比例/档位枚举(gk-image-2.0 没有 4K、
+        // doubao-seedream-5-0-260128 只有 2K/3K …), 放开通用档位等于让用户
+        // 选出平台必拒的值。表见 features/settings/lingkeModels.ts。
+        const lingkeCapability = isLingkeBaseUrl(api.baseUrl)
+          ? resolveLingkeImageCapability(model)
+          : undefined;
+        const imageAspectRatios = isZzdhImageApi
+          ? [...ZZDH_ASPECT_RATIOS]
+          : (resolveLingkeAspectRatios(lingkeCapability) ?? CUSTOM_ASPECT_RATIOS);
         // 档位常被平台写进模型名(qwen-image-3.0-pro-1k / flux-2k / sd-4k), 这类模型
         // 只能按名字里那一档请求; 读不到档位时才放开 1K/2K/4K 全档位。
-        const resolutions = resolveImageModelResolutionOptions(model);
+        const resolutions = resolveLingkeImageResolutions(lingkeCapability)
+          ?? resolveImageModelResolutionOptions(model);
         // Midjourney 单独一套语义: 一档 = 一组 4 张, 且有引擎/版本/风格化三个专属参数。
         // 见 models/midjourney.ts —— 没有这段, 面板上选的 count/bot_type 根本发不出去。
         const isMidjourney = isMidjourneyImageModel(model);

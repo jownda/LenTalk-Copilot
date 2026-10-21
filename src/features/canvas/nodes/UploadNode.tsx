@@ -28,7 +28,6 @@ import {
 } from '@/features/canvas/domain/canvasNodes';
 import {
   resolveMinEdgeFittedSize,
-  resolveResizeMinConstraintsByAspect,
 } from '@/features/canvas/application/imageNodeSizing';
 import {
   isNodeUsingDefaultDisplayName,
@@ -36,7 +35,6 @@ import {
 } from '@/features/canvas/domain/nodeDisplay';
 import { canvasEventBus } from '@/features/canvas/application/canvasServices';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
-import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import {
   prepareNodeImageFromFile,
   resolveImageDisplayUrl,
@@ -92,6 +90,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const useUploadFilenameAsNodeTitle = useSettingsStore((state) => state.useUploadFilenameAsNodeTitle);
+  const syncMediaNodeMediaSize = useCanvasStore((state) => state.syncMediaNodeMediaSize);
   const inputRef = useRef<HTMLInputElement>(null);
   const uploadSequenceRef = useRef(0);
   const uploadPerfRef = useRef<{
@@ -110,12 +109,6 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
   });
   const resolvedWidth = resolveNodeDimension(width, compactSize.width);
   const resolvedHeight = resolveNodeDimension(height, compactSize.height);
-  const resizeConstraints = resolveResizeMinConstraintsByAspect(resolvedAspectRatio, {
-    minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
-    minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
-  });
-  const resizeMinWidth = resizeConstraints.minWidth;
-  const resizeMinHeight = resizeConstraints.minHeight;
   const resolvedTitle = useMemo(() => {
     const sourceFileName = typeof data.sourceFileName === 'string' ? data.sourceFileName.trim() : '';
     if (
@@ -249,6 +242,13 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
   );
 
   const handleImageLoad = useCallback((event: SyntheticEvent<HTMLImageElement>) => {
+    // 画面一加载出来就按真实宽高把边框重算成同比例: 上传节点的盒子就是画面,
+    // 没有缩放把手(见下方 render), 边框只跟着画面走。
+    const image = event.currentTarget;
+    if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+      syncMediaNodeMediaSize(id, image.naturalWidth, image.naturalHeight);
+    }
+
     const perf = uploadPerfRef.current;
     if (!perf) {
       return;
@@ -293,7 +293,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
         );
       });
     }
-  }, [clearTransientPreview, id]);
+  }, [clearTransientPreview, id, syncMediaNodeMediaSize]);
 
   const handleDrop = useCallback(
     async (event: DragEvent<HTMLElement>) => {
@@ -441,12 +441,6 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
         id="source"
         position={Position.Right}
         className="!h-2 !w-2 !border-surface-dark !bg-accent"
-      />
-      <NodeResizeHandle
-        minWidth={resizeMinWidth}
-        minHeight={resizeMinHeight}
-        maxWidth={1400}
-        maxHeight={1400}
       />
     </div>
   );

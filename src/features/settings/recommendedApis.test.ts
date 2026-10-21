@@ -9,7 +9,8 @@ import {
   resolveNewRecommendedVideoModels,
   visibleRecommendedApiIds,
 } from './recommendedApis';
-import { isAudioModelName, isVideoGenerationModelName } from '@/stores/settingsStore';
+import { isAudioModelName, isChatCompletionModelName, isVideoGenerationModelName } from '@/stores/settingsStore';
+import { LINGKE_IMAGE_NAME_OVERRIDES } from './lingkeModels';
 import { resolveVideoModelProfile } from '@/features/canvas/models/videoProfiles';
 import { isRjmVideoApiBaseUrl } from '@/commands/videoApi';
 import { RUNNINGHUB_VIDEO_ENDPOINTS, RUNNINGHUB_VIDEO_TRANSPORT } from '@/commands/runningHubProtocol';
@@ -229,13 +230,16 @@ describe('api666888 暗苗链路预设', () => {
     expect(new Set(transports)).toEqual(new Set(['media-generate', 'ark-anmiao']));
   });
 
-  it('图片 19 / 音频 8 / 对话 55 分门别类登记, 不互串', () => {
-    expect(api?.models).toHaveLength(19);
+  it('图片 21 / 音频 8 / 对话 55 分门别类登记, 不互串', () => {
+    expect(api?.models).toHaveLength(21);
     expect(api?.audioModels).toHaveLength(8);
     expect(api?.chatModels).toHaveLength(55);
-    // 平台图片 21 个, 其中 kling-v3 / kling-v3-omni 会被视频识别规则抢走, 刻意不收。
-    expect(api?.models).not.toContain('kling-v3');
-    expect(api?.models).not.toContain('kling-v3-omni');
+    // 平台把 kling-v3 / kling-v3-omni 登记为「可灵出图」, 名字却命中 kling 视频规则:
+    // settingsStore 按平台做了显式例外, 它们才留在图片清单里(视频清单里不能重复出现)。
+    expect(api?.models).toContain('kling-v3');
+    expect(api?.models).toContain('kling-v3-omni');
+    expect(api?.videoModels).not.toContain('kling-v3');
+    expect(api?.videoModels).not.toContain('kling-v3-omni');
     // 23 个 anthropic / gemini 原生协议模型不登记(软件对话只走 /v1/chat/completions)。
     expect(api?.chatModels).not.toContain('sn-5-5');
     expect(api?.chatModels).not.toContain('gem-4-argon');
@@ -243,16 +247,58 @@ describe('api666888 暗苗链路预设', () => {
     expect(api?.videoModelsRevision).toBe(2);
   });
 
-  it('Base URL 指向真实网关而不是白标静态站', () => {
-    // api666888.com 只有静态站: 任何路径都回 index.html, POST /v1/media/generate 是
-    // nginx 405。真实网关在 api.lingkeai.ai(同一组出口 IP / 同一套 nginx), 填错域名
-    // 会让每个请求都拿到 HTML 而不是 JSON。
-    expect(api?.baseUrl).toBe('https://api.lingkeai.ai');
+  it('181 个模型都能被「拉取模型」的分类器分进对的桶', () => {
+    // 反例: 旧分类器只认厂商真名, 而灵柯把 GPT / Gemini 写成 tt- / gk- / gem- 代号,
+    // 于是 22 个对话模型既不像视频也不像音频、更不像对话 —— 图片那条兜底分支
+    // (`!video && !audio && !chat`) 就把它们收进 models 了。表现正是用户看到的
+    // 「对话模型跑到图片里, 对话那边拉取不到」。
+    const classify = (model: string) =>
+      // 灵柯把 kling-v3 / kling-v3-omni 登记成图片模型, 裸分类器只认名字会把它们
+      // 判成视频; settingsStore 按平台做了例外, 这里同步优待。
+      LINGKE_IMAGE_NAME_OVERRIDES.includes(model.trim().toLowerCase())
+        ? 'image'
+        : isVideoGenerationModelName(model)
+          ? 'video'
+          : isAudioModelName(model)
+            ? 'audio'
+            : isChatCompletionModelName(model)
+              ? 'chat'
+              : 'image';
+    const mismatch = (list: string[] | undefined, expected: string) =>
+      (list ?? []).filter((model) => classify(model) !== expected);
+
+    expect(mismatch(api?.models, 'image')).toEqual([]);
+    expect(mismatch(api?.videoModels, 'video')).toEqual([]);
+    expect(mismatch(api?.audioModels, 'audio')).toEqual([]);
+    expect(mismatch(api?.chatModels, 'chat')).toEqual([]);
+
+    // 代号家族逐个点名, 防止以后又有人把它们从正则里删掉。
+    for (const model of ['tt-6-luna', 'tt-5.4-nano', 'gk-4.6', 'gk-build-0.1', 'mimo-v2.6-pro', 'stepfun/step-3.7-flash']) {
+      expect(isChatCompletionModelName(model), model).toBe(true);
+    }
+    for (const model of ['kwvideo-v2', 'kwvideo-v2-ref', 'omni_flash-10s', 'omni-1.1', 'vo3.1']) {
+      expect(isVideoGenerationModelName(model), model).toBe(true);
+    }
+    // 带 image / video / tts 字样的依旧归原位, 不能被代号前缀抢走。
+    expect(classify('tt-image-2')).toBe('image');
+    expect(classify('gk-image-2.0')).toBe('image');
+    expect(classify('gk-video-3')).toBe('video');
+    expect(classify('gem-2.5-tts')).toBe('audio');
+  });
+
+  it('Base URL 指向官方主域名而不是白标静态站', () => {
+    // 官方报错文案写明主域名 api.lk888.ai / 备用 api.lk666.ai。api666888.com、
+    // lingkeai.ai、lingkeai.vip、huifengai.com 都是同一套白标站(任何路径回
+    // index.html, POST 是 405), api.lingkeai.ai 只是别名 —— 填错会让每个请求
+    // 拿到 HTML 而不是 JSON。
+    expect(api?.baseUrl).toBe('https://api.lk888.ai');
+    // 代码会自己拼 `/v1/...`, baseUrl 再带 /v1 就会变成 /v1/v1/...
+    expect(api?.baseUrl).not.toMatch(/\/v1\/?$/);
     // 注册 / 充值走推广链接, 带 `yonghu=` 归因参数, 不能退化成裸站。
     expect(api?.registerUrl).toBe('https://lingkeai.ai?yonghu=R7T9O1W16A64FT7W');
     expect(api?.registerUrl).toContain('yonghu=');
     // 显示名改成「灵柯AI」, 但 id 必须还是 api666888 —— registry.ts 的 isApi666888
-    // 按 id 认视频参数表, 改名连带改 id 会让 9 个模型的时长/画幅档位失效。
+    // 按 id 认视频参数表, 改名连带改 id 会让 74 个模型的时长/画幅档位失效。
     expect(api?.name).toBe('灵柯AI');
     expect(api?.id).toBe('api666888');
   });
@@ -457,10 +503,14 @@ describe('推荐平台 Base URL 匹配(卡片「已连接」徽章的判定依�
 
 describe('可见推荐平台直接连接后的模型归属', () => {
   it('预填的图片模型不会被视频/音频启发式抢走(否则连上后列表里看不到)', () => {
+    // 灵柯平台把 `kling-v3` / `kling-v3-omni` **登记为图片模型**(可灵出图), 名字却
+    // 命中通用 kling 视频规则 —— settingsStore 按平台做了显式例外, 这里同步放过。
+    const isDeclaredImageName = (model: string) =>
+      LINGKE_IMAGE_NAME_OVERRIDES.includes(model.trim().toLowerCase());
     for (const api of listVisibleRecommendedApis()) {
       const models = api.models ?? [];
       expect(
-        models.filter((model) => isVideoGenerationModelName(model)),
+        models.filter((model) => !isDeclaredImageName(model) && isVideoGenerationModelName(model)),
         `${api.id} 的图片模型被当成视频模型`,
       ).toEqual([]);
       expect(

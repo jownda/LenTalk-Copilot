@@ -8,6 +8,8 @@ import {
   findPajubenAudioFallbackModel,
   groupPajubenModelOptions,
   isPajubenAudioInputModel,
+  pickPajubenAudioDefault,
+  resolvePajubenVisionKey,
 } from "./pajubenModels";
 
 function customApi(overrides: Partial<CustomApiProvider> & { id: string; name: string }): CustomApiProvider {
@@ -160,6 +162,72 @@ describe("groupPajubenModelOptions", () => {
 
   it("空清单返回空数组", () => {
     expect(groupPajubenModelOptions([])).toEqual([]);
+  });
+});
+
+describe("pajuben dual-model selection", () => {
+  it("视觉模型 key 优先用新字段，老字段兜底，两者都空则为空串", () => {
+    expect(resolvePajubenVisionKey("custom:a/gpt-6-astra", "custom:b/gemini-3-pro")).toBe(
+      "custom:a/gpt-6-astra",
+    );
+    // 拆分前只有 pajubenModelKey：老用户的选择必须还能用。
+    expect(resolvePajubenVisionKey(null, "custom:b/gemini-3-pro")).toBe("custom:b/gemini-3-pro");
+    expect(resolvePajubenVisionKey("", "")).toBe("");
+    expect(resolvePajubenVisionKey(undefined, null)).toBe("");
+  });
+
+  it("音频模型默认值先同渠道、再全局；一个音频模型都没有时返回 null", () => {
+    const options = collectPajubenModelOptions(
+      [
+        customApi({
+          id: "vision",
+          name: "视觉渠道",
+          apiKey: "sk-v",
+          baseUrl: "https://vision.example/v1",
+          chatModels: ["gpt-6-astra"],
+        }),
+        customApi({
+          id: "audio",
+          name: "音频渠道",
+          apiKey: "sk-a",
+          baseUrl: "https://audio.example/v1",
+          chatModels: ["gemini-3-pro"],
+        }),
+      ],
+      {},
+    );
+    const vision = options.find((option) => option.model === "gpt-6-astra") ?? null;
+    // 视觉渠道里没有音频模型 → 退到全局第一个音频模型（另一个渠道）。
+    expect(pickPajubenAudioDefault(options, vision)?.model).toBe("gemini-3-pro");
+
+    const noAudio = collectPajubenModelOptions(
+      [customApi({ id: "t", name: "纯文本", apiKey: "sk-t", chatModels: ["gpt-6-astra"] })],
+      {},
+    );
+    expect(pickPajubenAudioDefault(noAudio, noAudio[0] ?? null)).toBeNull();
+  });
+
+  it("音频下拉把能听声的模型排在同渠道最前面", () => {
+    const options = collectPajubenModelOptions(
+      [customApi({ id: "a", name: "渠道A", apiKey: "sk-a", chatModels: ["aaa-text", "gemini-3-pro"] })],
+      {},
+    );
+    expect(groupPajubenModelOptions(options)[0].options.map((option) => option.model)).toEqual([
+      "aaa-text",
+      "gemini-3-pro",
+    ]);
+    expect(
+      groupPajubenModelOptions(options, { audioFirst: true })[0].options.map((option) => option.model),
+    ).toEqual(["gemini-3-pro", "aaa-text"]);
+  });
+
+  it("认得出更多语音/全模态模型名", () => {
+    for (const model of ["step-audio-2", "mimo-audio-7b", "kimi-audio", "glm-4-voice", "gpt-4o-mini-audio"]) {
+      expect(isPajubenAudioInputModel(model), model).toBe(true);
+    }
+    for (const model of ["gpt-6-astra", "claude-5-sonnet", "deepseek-v4"]) {
+      expect(isPajubenAudioInputModel(model), model).toBe(false);
+    }
   });
 });
 

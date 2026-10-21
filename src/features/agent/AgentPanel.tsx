@@ -31,6 +31,12 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { selectSessionsForProject, useAgentStore } from "./agentStore";
 import { extractNodeMediaUrl, extractToolResultNodeIds, getCanvasAgentSnapshot } from "./canvasContext";
 import {
+  formatSummaryForSystemPrompt,
+  summarizeHistory,
+  mechanicalTrim,
+  prepareHistory,
+} from "./contextCompression";
+import {
   CANVAS_ACCESS_HINTS,
   CANVAS_ACCESS_LABELS,
   buildCanvasToolPrompt,
@@ -247,9 +253,14 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
   const patchMessage = useAgentStore((state) => state.patchMessage);
   const beginStreaming = useAgentStore((state) => state.beginStreaming);
   const endStreaming = useAgentStore((state) => state.endStreaming);
+  const setContextSummary = useAgentStore((state) => state.setContextSummary);
 
   const [draft, setDraft] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
+  /** 正在压缩早期上下文：此时还没开始请求，但同样要挡住重复发送 */
+  const [compressing, setCompressing] = useState(false);
+  const [compressionStatus, setCompressionStatus] = useState<string | null>(null);
+  const [showSummary, setShowSummary] = useState(false);
   const [showSessions, setShowSessions] = useState(false);
   const [showSkills, setShowSkills] = useState(false);
   const [showAccess, setShowAccess] = useState(false);
@@ -351,7 +362,7 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
   // 与 `selection` 同一套思路。否则「新项目里还没聊过」时点加载 SKILL 会毫无反应。
   const activeSkillId = activeSession ? activeSession.skillId ?? null : storeSkillId ?? null;
   const activeSkill = useMemo(() => findAgentSkill(activeSkillId), [activeSkillId]);
-  const isBusy = Boolean(streaming);
+  const isBusy = Boolean(streaming) || compressing;
 
   /**
    * 输入框随内容自动长高。
@@ -478,7 +489,9 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
 
   const handleSend = useCallback(async () => {
     const text = draft.trim();
-    if (!text || useAgentStore.getState().streaming) return;
+    // `abortRef` 覆盖「压缩中」与「流式中」两个阶段：前者 `streaming` 还是 null，
+    // 只看 store 的话连按两次 Enter 会并发起两轮请求。
+    if (!text || abortRef.current || useAgentStore.getState().streaming) return;
 
     const sessionId = activeSession?.id ?? createSession(projectId ?? null);
     // createSession 之后 store 已同步更新，这里必须重新取一次，不能用闭包里的旧数组
@@ -518,18 +531,80 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
     appendMessage(sessionId, assistantMessage);
     setDraft("");
 
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    /** 压缩阶段被中止：还没进入流式，但要保证占位消息不会一直转圈 */
+    const cancelDuringCompression = () => {
+      abortRef.current = null;
+      endStreaming();
+      patchMessage(sessionId, assistantId, {
+        content: "",
+        pending: false,
+        error: "已停止生成",
+      });
+    };
+
+    /**
+     * 超长历史的压缩在**组装请求之前**做：摘要要落盘、要拼进 system prompt，
+     * 不能事后再补。只在真正超预算时才发请求，平时这一步是纯计算（零延迟）。
+     */
+    let keepMessages = history;
+    let summary = session?.contextSummary ?? null;
+    if (history.length > 0) {
+      try {
+        setCompressing(true);
+        const prepared = await prepareHistory({
+          messages: history,
+          summary,
+          summarize: (turns, previousSummary) =>
+            summarizeHistory({
+              settings,
+              turns,
+              previousSummary,
+              signal: controller.signal,
+              onProgress: setCompressionStatus,
+            }),
+        });
+        if (prepared.compressed && prepared.summary) {
+          summary = prepared.summary;
+          setContextSummary(sessionId, prepared.summary);
+        }
+        keepMessages = prepared.keep;
+      } catch (error) {
+        if (controller.signal.aborted) {
+          // 用户在压缩阶段点了停止：不留半截状态，直接按「已停止」收尾
+          cancelDuringCompression();
+          return;
+        }
+        // 压缩失败不该连对话一起断掉 —— 退化成机械裁剪，并如实说明原因
+        keepMessages = mechanicalTrim(history, summary);
+        const reason = error instanceof Error ? error.message : String(error);
+        setNotice(`早期对话压缩失败（${reason}），本轮只携带了最近的部分对话；下次发送会自动重试。`);
+      } finally {
+        setCompressing(false);
+        setCompressionStatus(null);
+      }
+    }
+    if (controller.signal.aborted) {
+      cancelDuringCompression();
+      return;
+    }
+
     // 快照按发送那一刻现取：模型对画布的唯一可靠信息来源就是它
+    const summaryBlock = formatSummaryForSystemPrompt(summary);
     const systemPrompt = [
       composeAgentSystemPrompt(SYSTEM_PROMPT, targetSkill),
       "",
       formatCanvasSnapshotForPrompt(getCanvasAgentSnapshot()),
       buildCanvasToolPrompt(level),
+      summaryBlock ? `\n${summaryBlock}` : "",
     ].join("\n");
 
     // 历史里的画布操作要把执行结果一起带回去，否则模型看不到自己上一轮做过什么，
     // 会重复建节点或反复问同一件事。
     const historyTurns: AgentChatTurn[] = [];
-    for (const message of history) {
+    for (const message of keepMessages) {
       if (message.role === "system" || !message.content.trim()) continue;
       historyTurns.push({ role: message.role, content: message.content });
       if (message.role === "assistant" && message.toolCalls?.length) {
@@ -543,8 +618,6 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
       { role: "user", content: text },
     ];
 
-    const controller = new AbortController();
-    abortRef.current = controller;
     beginStreaming(sessionId, assistantId);
 
     const records: AgentToolCallRecord[] = [];
@@ -637,6 +710,7 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
     patchMessage,
     projectId,
     resolveSettings,
+    setContextSummary,
   ]);
 
   const handleStop = useCallback(() => {
@@ -742,6 +816,7 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
   if (!open) return null;
 
   const messages = activeSession?.messages ?? [];
+  const contextSummary = activeSession?.contextSummary ?? null;
 
   return (
     <aside
@@ -823,6 +898,50 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
         {/* 包裹层：`space-y-3` 挪到这里，同时给 ResizeObserver 一个可观察的内容块
             （直接观察滚动容器没用 —— 它有固定高度，内容变化不改变它自身尺寸）。 */}
         <div ref={contentRef} className="space-y-3">
+        {/* 压缩备忘：默认收起，只占一行。用户得能看见「AI 还记得什么」——
+            否则模型按备忘回答时，看起来就像凭空知道了一些他以为自己已经翻过去的事。 */}
+        {contextSummary && messages.length > 0 ? (
+          <div className="rounded-lg border border-border-dark bg-bg-dark px-2.5 py-1.5 text-[11px]">
+            <button
+              type="button"
+              onClick={() => setShowSummary((value) => !value)}
+              className="flex w-full items-center gap-1.5 text-left text-text-muted transition-colors hover:text-text-dark"
+              aria-expanded={showSummary}
+            >
+              <Sparkles className="h-3 w-3 shrink-0 text-accent" />
+              <span className="min-w-0 flex-1 truncate">
+                已压缩前 {contextSummary.messageCount} 条早期对话（约 {contextSummary.tokens} tokens）
+              </span>
+              <ChevronDown
+                className={`h-3 w-3 shrink-0 transition-transform ${showSummary ? "rotate-180" : ""}`}
+              />
+            </button>
+            {showSummary ? (
+              <div className="mt-1.5 space-y-1.5 border-t border-border-dark pt-1.5">
+                <p className="whitespace-pre-wrap break-words leading-relaxed text-text-dark">
+                  {contextSummary.text}
+                </p>
+                <div className="flex items-start justify-between gap-2 text-[10px] text-text-muted">
+                  <span className="min-w-0 flex-1">
+                    这些原文不再随请求发送，只有上面这份备忘参与对话。
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!activeSession) return;
+                      setContextSummary(activeSession.id, null);
+                      setShowSummary(false);
+                      setNotice("已撤销压缩：下一轮会重新带上完整原文，超预算时会再压一次。");
+                    }}
+                    className="shrink-0 rounded border border-border-dark px-1.5 py-0.5 text-text-dark hover:border-accent hover:text-accent"
+                  >
+                    撤销压缩
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         {/* 气泡宽度按角色分开：用户消息保留对话气泡感（右贴边、最宽 88%）；
             **AI 回答铺满整宽** —— 正文是长段落 + 工具结果卡片，右侧留 12% 空档
             只会让长文更窄、更早折行。 */}
@@ -954,6 +1073,15 @@ export function AgentPanel({ open, onClose }: AgentPanelProps) {
       </div>
 
       <div className="border-t border-border-dark p-3">
+        {/* 压缩进度：与下方 notice 分开，因为 notice 永远带「去设置」按钮，
+            而压缩既不是错误也跟设置无关。 */}
+        {compressionStatus ? (
+          <div className="mb-2 flex items-center gap-2 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-2 text-[11px] text-text-dark">
+            <Loader2 className="h-3 w-3 shrink-0 animate-spin text-accent" />
+            <span className="flex-1">{compressionStatus}</span>
+            <span className="shrink-0 text-[10px] text-text-muted">会保留最近对话原文</span>
+          </div>
+        ) : null}
         {notice ? (
           <div className="mb-2 flex items-start gap-2 rounded-lg border border-border-dark bg-bg-dark px-2.5 py-2 text-[11px] leading-relaxed text-text-muted">
             <span className="flex-1">{notice}</span>

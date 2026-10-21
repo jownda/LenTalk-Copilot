@@ -33,6 +33,15 @@ export interface RecommendedApi {
   audioModelsRevision?: number;
   chatModels?: string[];
   /**
+   * `chatModels` 的增量同步版本 —— **每次增删 `chatModels` 都必须 +1**。
+   *
+   * 与 `videoModelsRevision` / `audioModelsRevision` 同一套语义: 平台添加后
+   * `chatModels` 就与预设脱钩了, 之后预设补进来的对话模型老用户看不到, 只能删平台
+   * 重加。灵柯AI 的对话清单一次补了 55 个, 老配置里往往只有 1 个, 靠这个号在启动时
+   * 按差集追加上去(见 `settingsStore.syncRecommendedChatModels`)。
+   */
+  chatModelsRevision?: number;
+  /**
    * 价格区间展示（公开平台表范围，参考即可，非实付价）。
    * - 各分项可选；未填的类别不显示对应 pill。
    * - 字符串已含单位（如 "⚡0.01 ~ 0.17 / 张"），UI 直接渲染。
@@ -971,17 +980,24 @@ export const recommendedApis: RecommendedApi[] = [
     // `isApi666888` 是按 id 判定视频参数表(时长档位 / 画幅 / 分辨率)的, 改了 id
     // 这些模型会退回默认档位。显示名才是给用户看的。
     //
-    // ⚠️ Base URL 不是 api666888.com, 而是 api.lingkeai.ai。实测: api666888.com 只是
-    // 一份白标静态站(nginx try_files, 任何路径都回 index.html; POST /v1/media/generate
-    // 直接 405), 真实网关在 api.lingkeai.ai —— 两个域名解析到同一组出口 IP、同一套
-    // nginx, 文档站的公开接口也挂在 api.lingkeai.ai/gongkai/apidoc/*?domain=api666888.com。
-    // 注册 / 充值走推广链接(lingkeai.ai 与 api666888.com 是同一套站点), 调用地址仍走灵柯网关。
+    // ⚠️ Base URL 用官方主域名 api.lk888.ai(代码会拼 `/v1/...`, 所以这里不带 /v1)。
     //
-    // 模型清单与参数(2026-10-19 抓自 https://api.lingkeai.ai/gongkai/apidoc/
-    // moxing-liebiao?domain=api666888.com)。
+    // 域名关系(2026-10-20 实测): api666888.com / lingkeai.ai / lingkeai.vip /
+    // huifengai.com 都是同一套前端的白标站(首页 16278 字节、md5 全等, 任何路径都回
+    // index.html, POST 直接 405), 真实网关只有 api.lk888.ai(主) 与 api.lk666.ai(备),
+    // 平台自己的报错文案就写着这两个。api.lingkeai.ai 是它的别名, 能用但不是官方
+    // 推荐地址; 老配置里留下的 api666888.com / lingkeai.ai 由 registry.ts 与
+    // media.rs 的 baseUrl 兜底继续认, 不会掉档位。
+    //
+    // 主域名实测: POST /v1/media/generate、POST /api/v3/anmiao/contents/generations/tasks、
+    // POST /v1/chat/completions、GET /v1/skills/task-status 全部 401(路径存在, 仅缺 key)。
+    // 注册 / 充值走推广链接 lingkeai.ai?yonghu=…(展示站), 调用仍走 api.lk888.ai。
+    //
+    // 模型清单与参数(2026-10-19 抓自文档数据接口 /gongkai/apidoc/moxing-liebiao,
+    // 该接口挂在 api.lingkeai.ai 上, 与调用网关无关)。
     id: 'api666888',
     name: '灵柯AI',
-    baseUrl: 'https://api.lingkeai.ai',
+    baseUrl: 'https://api.lk888.ai',
     registerUrl: 'https://lingkeai.ai?yonghu=R7T9O1W16A64FT7W',
     summary: '灵柯AI 全量 181 个模型: 74 视频 / 21 图片 / 78 对话 / 8 音频, 一个 Base URL 全覆盖',
     advantages: [
@@ -990,13 +1006,16 @@ export const recommendedApis: RecommendedApi[] = [
       '74 个视频模型逐个登记真实档位(可灵 5/10/15、万相 2~30、Vidu 3~16 …), 不再按代次猜',
       '参考图 / 参考视频 / 参考音频统一随请求上传, 无需人像认证',
     ],
-    // 图片 19 个(2026-10-20 全量抓取自 moxing-liebiao?domain=lingkeai.vip)。
+    // 图片 21 个(2026-10-20 全量抓取自 moxing-liebiao?domain=lingkeai.vip)。
     //
-    // ⚠️ 平台的图片模型共 21 个, 这里刻意漏掉 `kling-v3` / `kling-v3-omni`:
-    // 它们在平台里是「可灵出图」, 但名字命中 `isVideoGenerationModelName` 的 kling 规则,
-    // 放进 models 会被当成视频模型捞进视频下拉(图片节点反而选不到), 且提交到
-    // /v1/media/generate 时会被当视频任务处理。要接这两个得先让视频识别逻辑认
-    // 平台侧的显式分类, 不属于本次范围。
+    // 这 21 个在平台里的 `api_xieyi` 全部是 `media` —— 打 /v1/images/generations
+    // 一律 400「请改用 POST /v1/media/generate」, 后端已按模型名直连 media 信封
+    // (见 openai_compat 的 MEDIA_ONLY_IMAGE_MODELS)。
+    //
+    // `kling-v3` / `kling-v3-omni` 平台登记为**可灵出图**, 名字却命中
+    // `isVideoGenerationModelName` 的 kling 规则: 归一化时会被挪进视频清单,
+    // 图片下拉里反而选不到。现在 settingsStore 按平台做例外
+    // (LINGKE_IMAGE_NAME_OVERRIDES), 这两个才真正能出图。
     models: [
       'tt-image-2.5',
       'tt-image-2.5-token',
@@ -1017,6 +1036,8 @@ export const recommendedApis: RecommendedApi[] = [
       'doubao-seedream-4-5-251128',
       'qwen-image',
       'wan2.6-image',
+      'kling-v3',
+      'kling-v3-omni',
     ],
     // 视频 74 个(全量)。42 个可直接跑; 其余 32 个平台把 version / mode / size 等标成
     // 必填, 档位表里 `needsParams` 已逐个记下, 待协议层支持模型专属参数后再放开。
@@ -1108,9 +1129,11 @@ export const recommendedApis: RecommendedApi[] = [
       'gem-2.5-tts',
     ],
     // 对话 55 个(平台把厂商名换成了代号: tt=GPT / sn=Sonnet / gem=Gemini / op=Opus)。
-    // 另有 23 个(sn-* / op-* / hk-* / fb-* / gem-*)平台只给了 anthropic 的 /v1/messages
-    // 和 gemini 的 /v1beta 原生端点, 兼容协议列表里不含 openai —— 软件对话固定走
-    // /v1/chat/completions, 接进来必然 400, 所以不登记; 要用得先给对话层加两种原生协议。
+    // 另有 23 个(sn-* / op-* / hk-* / fb-* / gem-* 的一部分)平台文档只列了 anthropic 的
+    // /v1/messages 与 gemini 的 /v1beta 原生端点, 预设**不主动登记**(它由用户按需
+    // 「拉取模型」自行勾选)。2026-10-20 实测: 这批模型（sn-5 / op-5 / fb-5 / hk-5-5 /
+    // gem-3.1-pro）打 /v1/chat/completions **同样回 200**, 网关已经把 anthropic 的
+    // `msg_` 响应包成了 chat.completion(只是个别渠道偶发超时), 所以拉取到就能直接用。
     chatModels: [
       'tt-6-luna',
       'tt-6-astra',
@@ -1171,6 +1194,7 @@ export const recommendedApis: RecommendedApi[] = [
     // 9 → 74, 老配置靠这个号自动补端点(见 resolveNewRecommendedVideoModels)。
     videoModelsRevision: 2,
     audioModelsRevision: 1,
+    chatModelsRevision: 1,
     videoConfig: {
       submitPath: '/v1/media/generate',
       queryPath: '/v1/skills/task-status?task_id={taskId}',

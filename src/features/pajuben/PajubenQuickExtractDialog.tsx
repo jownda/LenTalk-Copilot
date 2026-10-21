@@ -26,9 +26,10 @@ import {
 } from "@/commands/pajuben";
 
 import {
-  findPajubenAudioFallbackModel,
   groupPajubenModelOptions,
   isPajubenAudioInputModel,
+  pickPajubenAudioDefault,
+  resolvePajubenVisionKey,
   usePajubenModelOptions,
 } from "./pajubenModels";
 import { guessEpisodeFromVideoName } from "./pajubenEpisode";
@@ -70,8 +71,18 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
   const { t } = useTranslation();
   const modelOptions = usePajubenModelOptions();
   const modelGroups = useMemo(() => groupPajubenModelOptions(modelOptions), [modelOptions]);
-  const modelKey = useSettingsStore((state) => state.pajubenModelKey) ?? "";
-  const setModelKey = useSettingsStore((state) => state.setPajubenModelKey);
+  // 音频下拉把「能听声的模型」排到每个渠道的最前面，省得用户在几十个模型里翻。
+  const audioModelGroups = useMemo(
+    () => groupPajubenModelOptions(modelOptions, { audioFirst: true }),
+    [modelOptions],
+  );
+  // 视觉模型：新字段优先，回落到拆分前的老字段（工作台仍写 pajubenModelKey）。
+  const storedVisionKey = useSettingsStore((state) => state.pajubenVisionModelKey);
+  const legacyVisionKey = useSettingsStore((state) => state.pajubenModelKey);
+  const visionKey = resolvePajubenVisionKey(storedVisionKey, legacyVisionKey);
+  const setVisionKey = useSettingsStore((state) => state.setPajubenVisionModelKey);
+  const audioKey = useSettingsStore((state) => state.pajubenAudioModelKey) ?? "";
+  const setAudioKey = useSettingsStore((state) => state.setPajubenAudioModelKey);
   const qualityTier = useSettingsStore((state) => state.pajubenQualityTier);
   const setQualityTier = useSettingsStore((state) => state.setPajubenQualityTier);
   // 脏值/缺省由 resolve 兜底；档位同时决定 fps / 清晰度 / 每集帧数上限。
@@ -111,20 +122,32 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
     return pending;
   }, []);
 
-  const selectedOption = useMemo(
-    () => modelOptions.find((option) => option.key === modelKey) ?? null,
-    [modelKey, modelOptions],
+  const visionOption = useMemo(
+    () => modelOptions.find((option) => option.key === visionKey) ?? null,
+    [modelOptions, visionKey],
   );
-  const audioFallbackOption = useMemo(
-    () => findPajubenAudioFallbackModel(modelOptions, selectedOption),
-    [modelOptions, selectedOption],
+  /**
+   * 音频模型：优先用用户选过的；没选过就给一个默认值（同渠道音频模型 →
+   * 全局第一个音频模型）。默认值同样显示在下拉里，不偷偷替换用户的意图。
+   */
+  const audioOption = useMemo(() => {
+    const stored = modelOptions.find((option) => option.key === audioKey) ?? null;
+    return stored ?? pickPajubenAudioDefault(modelOptions, visionOption);
+  }, [audioKey, modelOptions, visionOption]);
+  const audioModelLooksUnsupported = Boolean(
+    audioOption && !isPajubenAudioInputModel(audioOption.model),
   );
 
   /** 上次选的渠道被删掉后存储里的 key 会悬空 —— 清掉，别让「生成」一直灰着不说原因。 */
   useEffect(() => {
-    if (!modelKey) return;
-    if (!modelOptions.some((option) => option.key === modelKey)) setModelKey(null);
-  }, [modelKey, modelOptions, setModelKey]);
+    if (!visionKey) return;
+    if (!modelOptions.some((option) => option.key === visionKey)) setVisionKey(null);
+  }, [modelOptions, setVisionKey, visionKey]);
+
+  useEffect(() => {
+    if (!audioKey) return;
+    if (!modelOptions.some((option) => option.key === audioKey)) setAudioKey(null);
+  }, [audioKey, modelOptions, setAudioKey]);
 
   /**
    * 扒完：把 `第N集.txt` 读回来，直接在视频节点右侧开一个文本节点。
@@ -223,12 +246,34 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
       setNotice(t("pajuben.quickNeedLocal", "这个视频不是本机文件（是网络地址），请先下载到本地再扒"));
       return;
     }
-    if (!selectedOption) {
-      setNotice(t("pajuben.needModel", "请先选择模型"));
+    // 两个模型各自校验、各自报错：只说「请选择模型」时，用户不知道该补哪一个。
+    if (!visionOption) {
+      setNotice(t("pajuben.quickNeedVisionModel", "请先选择视觉模型（负责识别场景、人物着装与动作）"));
       return;
     }
-    if (!selectedOption.apiKey.trim()) {
-      setNotice(t("pajuben.needApiKey", "所选渠道没有可用密钥，请先在「设置 → 密钥」里填写"));
+    if (!audioOption) {
+      setNotice(
+        t(
+          "pajuben.quickNeedAudioModel",
+          "请先选择音频模型（负责识别台词与音效）。当前渠道里没有能听声的模型，请到「设置 → 密钥」添加 Gemini、Qwen-Omni 等支持音频的模型",
+        ),
+      );
+      return;
+    }
+    if (!visionOption.apiKey.trim()) {
+      setNotice(
+        t("pajuben.quickVisionNoKey", "视觉模型所在的渠道（{{provider}}）没有可用密钥，请先在「设置 → 密钥」里填写", {
+          provider: visionOption.providerName,
+        }),
+      );
+      return;
+    }
+    if (!audioOption.apiKey.trim()) {
+      setNotice(
+        t("pajuben.quickAudioNoKey", "音频模型所在的渠道（{{provider}}）没有可用密钥，请先在「设置 → 密钥」里填写", {
+          provider: audioOption.providerName,
+        }),
+      );
       return;
     }
     setNotice(null);
@@ -256,9 +301,10 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
       const spawnRequest: PajubenRunRequest = {
         target: videoPath,
         batch: false,
-        baseUrl: selectedOption.baseUrl,
-        apiKey: selectedOption.apiKey,
-        model: selectedOption.model,
+        // 顶层渠道 = 视觉模型渠道；音频模型自带自己的 base/key，可以分属另一家。
+        baseUrl: visionOption.baseUrl,
+        apiKey: visionOption.apiKey,
+        model: visionOption.model,
         provider: "",
         proxy: "",
         episode,
@@ -267,20 +313,26 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
         resolution: qualityPreset.resolution,
         maxFrames: qualityPreset.maxFrames,
         workers: 3,
-        audio: isPajubenAudioInputModel(selectedOption.model) || Boolean(audioFallbackOption),
+        // 双模型流程里台词由音频模型单独听写，这一位只表示「这一集需要台词」。
+        audio: true,
         animeMode: false,
         faceEnabled: environment.faceReady,
         outputDir: null,
         roleSheet: null,
-        dualAudioModel: audioFallbackOption?.model ?? null,
-        dualVisionModel: selectedOption.model,
+        dualVisionModel: visionOption.model,
+        dualAudioModel: audioOption.model,
+        dualVisionBaseUrl: visionOption.baseUrl,
+        dualAudioBaseUrl: audioOption.baseUrl,
+        dualVisionApiKey: visionOption.apiKey,
+        dualAudioApiKey: audioOption.apiKey,
         fromEpisode: null,
         toEpisode: null,
         limit: null,
         overwrite: false,
         skipAliasVerify: false,
-        forceDualFallback: Boolean(audioFallbackOption) && !isPajubenAudioInputModel(selectedOption.model),
-        disableDualFallback: !isPajubenAudioInputModel(selectedOption.model) && !audioFallbackOption,
+        // 固定两步走：画面识别与音频识别各用各的模型，再合并成剧情。
+        forceDualFallback: true,
+        disableDualFallback: false,
       };
       // 超时兜底：Rust 侧一旦不回包（例如命令 panic），await 永不 settle，
       // 界面就会永久停在「扒取中…」且按钮一直禁用。
@@ -304,7 +356,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
       setRunning(false);
       setNotice(error instanceof Error ? error.message : String(error));
     }
-  }, [audioFallbackOption, canExtract, episode, qualityPreset, running, selectedOption, t, videoPath]);
+  }, [audioOption, canExtract, episode, qualityPreset, running, t, videoPath, visionOption]);
 
   const handleCancel = useCallback(async () => {
     try {
@@ -325,7 +377,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
       isOpen
       title={t("pajuben.quickTitle", "扒视频")}
       onClose={handleRequestClose}
-      widthClassName="w-[440px]"
+      widthClassName="w-[520px]"
       footer={
         <>
           <UiButton type="button" variant="ghost" size="sm" disabled={running} onClick={handleRequestClose}>
@@ -341,7 +393,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
             type="button"
             variant="primary"
             size="sm"
-            disabled={running || !canExtract || !selectedOption}
+            disabled={running || !canExtract}
             onClick={() => void handleGenerate()}
           >
             {running ? (
@@ -367,36 +419,91 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
         </div>
 
         <div>
-          <span className="mb-1.5 block text-xs font-medium text-text-muted">{t("pajuben.model", "模型")}</span>
-          <select
-            className={`nodrag nowheel ${FIELD_CLASS}`}
-            value={modelKey}
-            onChange={(event) => setModelKey(event.target.value)}
-            onPointerDown={(event) => event.stopPropagation()}
-            onMouseDown={(event) => event.stopPropagation()}
-            disabled={running}
-          >
-            <option value="">
-              {modelOptions.length > 0
-                ? t("pajuben.modelPlaceholder", "请选择模型（来自「设置 → 密钥」）")
-                : t("pajuben.modelEmpty", "尚未配置任何渠道，请先到「设置 → 密钥」添加")}
-            </option>
-            {modelGroups.map((group) => (
-              <optgroup key={group.providerName} label={group.providerName}>
-                {group.options.map((option) => (
-                  <option key={option.key} value={option.key}>
-                    {option.model}
-                  </option>
+          {/* 两个模型同一行：左边看画面，右边听声音，选完再交给引擎合并成剧情。 */}
+          <div className="grid grid-cols-2 gap-2">
+            <div className="min-w-0">
+              <span className="mb-1.5 block text-xs font-medium text-text-muted">
+                {t("pajuben.quickVisionModel", "视觉模型")}
+              </span>
+              <select
+                className={`nodrag nowheel ${FIELD_CLASS}`}
+                value={visionOption?.key ?? ""}
+                onChange={(event) => setVisionKey(event.target.value || null)}
+                onPointerDown={(event) => event.stopPropagation()}
+                onMouseDown={(event) => event.stopPropagation()}
+                disabled={running}
+                title={t("pajuben.quickVisionModel", "视觉模型")}
+              >
+                <option value="">
+                  {modelOptions.length > 0
+                    ? t("pajuben.quickVisionPlaceholder", "请选择视觉模型")
+                    : t("pajuben.modelEmpty", "尚未配置任何渠道，请先到「设置 → 密钥」添加")}
+                </option>
+                {modelGroups.map((group) => (
+                  <optgroup key={group.providerName} label={group.providerName}>
+                    {group.options.map((option) => (
+                      <option key={option.key} value={option.key}>
+                        {option.model}
+                      </option>
+                    ))}
+                  </optgroup>
                 ))}
-              </optgroup>
-            ))}
-          </select>
-          <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">
+              </select>
+              <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">
+                {t("pajuben.quickVisionHint", "看画面：场景、人物着装、动作与神态")}
+              </p>
+            </div>
+
+            <div className="min-w-0">
+              <span className="mb-1.5 block text-xs font-medium text-text-muted">
+                {t("pajuben.quickAudioModel", "音频模型")}
+              </span>
+              <select
+                className={`nodrag nowheel ${FIELD_CLASS}`}
+                value={audioOption?.key ?? ""}
+                onChange={(event) => setAudioKey(event.target.value || null)}
+                onPointerDown={(event) => event.stopPropagation()}
+                onMouseDown={(event) => event.stopPropagation()}
+                disabled={running}
+                title={t("pajuben.quickAudioModel", "音频模型")}
+              >
+                <option value="">
+                  {modelOptions.length > 0
+                    ? t("pajuben.quickAudioPlaceholder", "请选择音频模型")
+                    : t("pajuben.modelEmpty", "尚未配置任何渠道，请先到「设置 → 密钥」添加")}
+                </option>
+                {audioModelGroups.map((group) => (
+                  <optgroup key={group.providerName} label={group.providerName}>
+                    {group.options.map((option) => (
+                      <option key={option.key} value={option.key}>
+                        {isPajubenAudioInputModel(option.model)
+                          ? option.model
+                          : `${option.model} · ${t("pajuben.quickAudioUncertain", "可能不支持音频")}`}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">
+                {t("pajuben.quickAudioHint", "听声音：台词、旁白与音效")}
+              </p>
+            </div>
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-text-muted">
             {t(
-              "pajuben.quickAudioModelHint",
-              "支持音频的模型直接听声；普通视觉模型优先使用同渠道音频模型，没有音频模型时改用视频字幕提取台词。",
+              "pajuben.quickDualHint",
+              "画面和声音分开识别，再合并成剧情：视觉模型看场景与动作，音频模型听台词与音效，两个模型可以来自不同渠道。",
             )}
           </p>
+          {audioModelLooksUnsupported && (
+            <p className="mt-1.5 flex items-start gap-1.5 text-[11px] leading-relaxed text-amber-400">
+              <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              {t(
+                "pajuben.quickAudioSuspect",
+                "这个模型看起来不能接收音频，运行后可能直接报错。建议改选 Gemini、Qwen-Omni、GPT-4o-Audio 等能听声的模型。",
+              )}
+            </p>
+          )}
         </div>
 
         <div>

@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState, type SyntheticEvent } from 'react';
 import {
   Handle,
   Position,
@@ -17,16 +17,12 @@ import {
   type ExportImageNodeData,
   type ImageEditNodeData,
 } from '@/features/canvas/domain/canvasNodes';
-import {
-  resolveMinEdgeFittedSize,
-  resolveResizeMinConstraintsByAspect,
-} from '@/features/canvas/application/imageNodeSizing';
+import { resolveMinEdgeFittedSize } from '@/features/canvas/application/imageNodeSizing';
 import {
   resolveImageDisplayUrl,
 } from '@/features/canvas/application/imageData';
 import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
-import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
 import { MediaDimensionsLabel, useHoverIntent, useImageDimensions, useMediaByteSize } from '@/features/canvas/ui/MediaDimensions';
 import { useCanvasImageSourceAuto } from '@/features/canvas/ui/useCanvasImageSource';
@@ -50,6 +46,7 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
   const updateNodeInternals = useUpdateNodeInternals();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const syncMediaNodeMediaSize = useCanvasStore((state) => state.syncMediaNodeMediaSize);
   const [now, setNow] = useState(() => Date.now());
   const isExportResultNode = type === CANVAS_NODE_TYPES.exportImage;
   const isGenerating = typeof data.isGenerating === 'boolean' ? data.isGenerating : false;
@@ -68,12 +65,6 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
     minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
     minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
   });
-  const resizeConstraints = resolveResizeMinConstraintsByAspect(resolvedAspectRatio, {
-    minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
-    minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
-  });
-  const resizeMinWidth = resizeConstraints.minWidth;
-  const resizeMinHeight = resizeConstraints.minHeight;
   const resolvedWidth = resolveNodeDimension(width, compactSize.width);
   const resolvedHeight = resolveNodeDimension(height, compactSize.height);
   const resolvedTitle = useMemo(
@@ -153,6 +144,22 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
   // 体积要按原始来源探测(asset:// 无法还原成本地路径), 因此这里传入未转换的 imageUrl。
   const mediaByteSize = useMediaByteSize(data.imageUrl, mediaHover.visible);
 
+  /**
+   * 画面一加载出来就把真实宽高交回 store: 边框据此重算成同比例的尺寸。
+   *
+   * 结果图片节点的盒子就是画面本身, 所以这里**没有**缩放把手 —— 边框始终贴合画面,
+   * 换一张不同比例的图画时边框跟着收敛, 不会出现「边框被拉大了、画面居中留黑边」。
+   */
+  const handleImageLoad = useCallback(
+    (event: SyntheticEvent<HTMLImageElement>) => {
+      const image = event.currentTarget;
+      if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+        syncMediaNodeMediaSize(id, image.naturalWidth, image.naturalHeight);
+      }
+    },
+    [id, syncMediaNodeMediaSize]
+  );
+
   return (
     <div
       className={`
@@ -190,6 +197,7 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
             alt={isExportResultNode ? t('node.imageNode.resultAlt') : t('node.imageNode.generatedAlt')}
             viewerSourceUrl={originalImageUrl}
             className="h-full w-full object-contain"
+            onLoad={handleImageLoad}
           />
         ) : hasGenerationError ? (
           <div className="flex h-full w-full flex-col items-center justify-center gap-2 px-4 text-red-300">
@@ -241,12 +249,6 @@ export const ImageNode = memo(({ id, data, selected, type, width, height }: Imag
         id="source"
         position={Position.Right}
         className="!h-2 !w-2 !border-surface-dark !bg-accent"
-      />
-      <NodeResizeHandle
-        minWidth={resizeMinWidth}
-        minHeight={resizeMinHeight}
-        maxWidth={1600}
-        maxHeight={1600}
       />
     </div>
   );

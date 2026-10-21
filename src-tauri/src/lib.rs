@@ -351,6 +351,7 @@ pub fn run() {
             asset_library::persist_library_asset_binary,
             asset_library::persist_library_asset_binary_chunk,
             asset_library::persist_library_asset_file,
+            asset_library::rename_library_asset_file,
             asset_library::write_library_backup,
             asset_library::extract_video_thumbnail,
             thumbnail::ensure_image_thumbnail,

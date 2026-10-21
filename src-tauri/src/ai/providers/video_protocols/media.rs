@@ -252,10 +252,15 @@ fn classify_media(payload: &Value) -> ProviderTaskPollResult {
 
 /// 前端 `injectCustomApiRequestMode` 会按平台 id / Base URL 注入好 transport;
 /// Base URL 兜底只在 transport 为空时生效, 免得用户显式配的通用协议被抢走。
+///
+/// 官方主域名是 api.lk888.ai(备用 api.lk666.ai); api666888.com / lingkeai 系列是
+/// 同一家的白标站与别名, 历史配置里都出现过, 一并认。
 pub fn matches(transport: &str, provider_base_url: &str, _provider_id: &str) -> bool {
     transport == TRANSPORT
         || (transport.is_empty()
-            && (provider_base_url.contains("api666888.com") || provider_base_url.contains("lingkeai")))
+            && ["api666888.com", "lingkeai", "lk888.ai", "lk666.ai"]
+                .iter()
+                .any(|host| provider_base_url.contains(host)))
 }
 
 #[cfg(test)]
@@ -324,5 +329,23 @@ mod tests {
     fn data_包裹的状态体也能读() {
         let wrapped = json!({"code": 200, "data": {"is_final": true, "state": "success", "result_url": "https://cdn/y.mp4"}});
         assert!(matches!(classify_media(&wrapped), ProviderTaskPollResult::Succeeded(_)));
+    }
+
+    /// 灵柯的官方主域名是 api.lk888.ai, 备用 api.lk666.ai; 白标站与别名域名在
+    /// 历史配置里都出现过。transport 为空时才允许按 baseUrl 兜底, 显式配置不能被抢。
+    #[test]
+    fn base_url_兜底认得官网主域名与历史域名() {
+        for host in [
+            "https://api.lk888.ai",
+            "https://api.lk888.ai/v1",
+            "https://api.lk666.ai",
+            "https://api.lingkeai.ai",
+            "https://api666888.com",
+        ] {
+            assert!(matches("", host, "api666888"), "{} 应命中 media 协议", host);
+        }
+        assert!(!matches("", "https://api.openai.com", "openai"));
+        // 显式配了别的协议时, baseUrl 兜底不生效。
+        assert!(!matches("openai-video", "https://api.lk888.ai", "api666888"));
     }
 }

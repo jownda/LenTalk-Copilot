@@ -13,6 +13,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -129,6 +130,12 @@ fn failure_detail(lines: &[String]) -> String {
 #[derive(Default)]
 pub struct PajubenState {
     child: Arc<Mutex<Option<Child>>>,
+    /// 本次运行是否被用户点了「停止」。
+    ///
+    /// 不能只靠退出码判断：Python 引擎报错退出和被取消在 Windows 上都是退出码 1，
+    /// 只按退出码判会把「音频模型不支持音频」这种真错误显示成「已取消」，
+    /// 用户拿不到任何原因。
+    cancelled: Arc<AtomicBool>,
 }
 
 impl PajubenState {
@@ -187,6 +194,18 @@ pub struct PajubenRunRequest {
     pub role_sheet: Option<String>,
     pub dual_audio_model: Option<String>,
     pub dual_vision_model: Option<String>,
+    /// 音频模型所属渠道；None/空 = 沿用 `base_url`。
+    #[serde(default)]
+    pub dual_audio_base_url: Option<String>,
+    /// 视觉模型所属渠道；None/空 = 沿用 `base_url`。
+    #[serde(default)]
+    pub dual_vision_base_url: Option<String>,
+    /// 音频模型密钥；只走环境变量（`PAJUBEN_DUAL_AUDIO_KEY`），不进命令行。
+    #[serde(default)]
+    pub dual_audio_api_key: Option<String>,
+    /// 视觉模型密钥；只走环境变量（`PAJUBEN_DUAL_VISION_KEY`），不进命令行。
+    #[serde(default)]
+    pub dual_vision_api_key: Option<String>,
     pub from_episode: Option<u32>,
     pub to_episode: Option<u32>,
     pub limit: Option<u32>,
@@ -639,6 +658,23 @@ fn build_arguments(engine: &Path, request: &PajubenRunRequest) -> Vec<String> {
         args.push("--dual-vision-model".to_string());
         args.push(model.trim().to_string());
     }
+    // 两个模型可以来自不同渠道：各自带上自己的 base_url，密钥走环境变量。
+    if let Some(base) = request
+        .dual_audio_base_url
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+    {
+        args.push("--dual-audio-base".to_string());
+        args.push(base.trim().to_string());
+    }
+    if let Some(base) = request
+        .dual_vision_base_url
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+    {
+        args.push("--dual-vision-base".to_string());
+        args.push(base.trim().to_string());
+    }
     if let Some(from) = request.from_episode {
         args.push("--from".to_string());
         args.push(from.to_string());
@@ -803,6 +839,21 @@ pub fn pajuben_run(
         .stderr(Stdio::piped());
     // 密钥走环境变量：命令行参数会出现在进程列表里，同机其他进程可读。
     command.env("PAJUBEN_API_KEY", request.api_key.trim());
+    // 双模型两段各自的密钥：视觉模型和音频模型常常分属两个渠道，各用各的 key。
+    for (name, value) in [
+        ("PAJUBEN_DUAL_AUDIO_KEY", request.dual_audio_api_key.as_deref()),
+        ("PAJUBEN_DUAL_VISION_KEY", request.dual_vision_api_key.as_deref()),
+    ] {
+        match value.map(str::trim) {
+            Some(key) if !key.is_empty() => {
+                command.env(name, key);
+            }
+            _ => {
+                // 上一轮运行残留的环境变量必须清掉，否则换回同渠道时会用错 key。
+                command.env_remove(name);
+            }
+        }
+    }
     // 宿主注入的代理会一路污染到引擎发起的模型请求上：引擎用 `curl` 子进程发
     // 请求（见 pajuben.py 的 `curl_post_json`），而 curl 会自动读 `http_proxy` /
     // `https_proxy` 这类环境变量，把本该直连的请求转到一个本机转发代理上。
@@ -837,6 +888,9 @@ pub fn pajuben_run(
         command.process_group(0);
     }
 
+    // 新一次运行先把上一次的「已取消」标记清掉，否则一次取消会让后续每次
+    // 失败都显示成「已取消」。
+    state.cancelled.store(false, Ordering::SeqCst);
     let mut child = command.spawn().map_err(|error| {
         format!(
             "启动扒剧本引擎失败：{error}（解释器 {}）",
@@ -916,6 +970,7 @@ pub fn pajuben_run(
     let app_handle = app.clone();
     let run = run_id.clone();
     let child_slot = state.child.clone();
+    let cancelled_flag = state.cancelled.clone();
     let log_tail = log_tail.clone();
     std::thread::spawn(move || {
         for handle in handles {
@@ -948,7 +1003,10 @@ pub fn pajuben_run(
         }
         let code = status.as_ref().and_then(|value| value.code());
         let success = status.as_ref().map(|value| value.success()).unwrap_or(false);
-        let cancelled = matches!(code, Some(1) | Some(137) | None) && !success;
+        // 只有「用户点了停止」或「被信号杀掉（code 为 None）」才算取消；
+        // 其它非零退出码一律当失败，让引擎的报错原文能带到界面上。
+        let was_cancelled = cancelled_flag.load(Ordering::SeqCst);
+        let cancelled = !success && (was_cancelled || code.is_none());
         let _ = app_handle.emit(
             FINISH_EVENT,
             FinishPayload {
@@ -991,6 +1049,8 @@ pub fn pajuben_cancel(state: State<'_, PajubenState>) -> Result<(), String> {
         let mut guard = state.lock()?;
         match guard.as_mut() {
             Some(child) => {
+                // 先立旗再 kill：finish 线程靠它区分「用户停止」与「引擎报错」。
+                state.cancelled.store(true, Ordering::SeqCst);
                 let pid = child.id();
                 let _ = child.kill();
                 pid
@@ -1122,6 +1182,10 @@ mod tests {
             role_sheet: None,
             dual_audio_model: None,
             dual_vision_model: None,
+            dual_audio_base_url: None,
+            dual_vision_base_url: None,
+            dual_audio_api_key: None,
+            dual_vision_api_key: None,
             from_episode: None,
             to_episode: None,
             limit: None,
@@ -1174,6 +1238,34 @@ mod tests {
         }
         assert!(args.contains(&"--limit".to_string()));
         assert!(args.contains(&"3".to_string()));
+    }
+
+    #[test]
+    fn dual_models_forward_their_own_channel() {
+        // 音频模型与视觉模型可以分别来自两个渠道：只传一个 --base 会把音频
+        // 模型打到视觉渠道上，报出来是「模型不存在」，用户根本看不出原因。
+        let mut request = base_request();
+        request.force_dual_fallback = true;
+        request.dual_audio_model = Some("gemini-3-pro".to_string());
+        request.dual_vision_model = Some("gpt-6-astra".to_string());
+        request.dual_audio_base_url = Some("https://audio.example/v1".to_string());
+        request.dual_vision_base_url = Some("https://vision.example/v1".to_string());
+        let args = build_arguments(Path::new("X:/engine"), &request);
+
+        for (flag, value) in [
+            ("--dual-audio-model", "gemini-3-pro"),
+            ("--dual-vision-model", "gpt-6-astra"),
+            ("--dual-audio-base", "https://audio.example/v1"),
+            ("--dual-vision-base", "https://vision.example/v1"),
+        ] {
+            let index = args
+                .iter()
+                .position(|item| item == flag)
+                .unwrap_or_else(|| panic!("缺少 {flag}"));
+            assert_eq!(args[index + 1], value, "{flag} 的取值不对");
+        }
+        // 密钥绝不能出现在命令行参数里（进程列表可见）。
+        assert!(!args.iter().any(|item| item.contains("sk-")));
     }
 
     #[test]

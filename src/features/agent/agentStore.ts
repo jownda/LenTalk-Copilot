@@ -14,6 +14,7 @@ import { create } from "zustand";
 import {
   DEFAULT_CANVAS_ACCESS_LEVEL,
   isCanvasAgentAccessLevel,
+  type AgentContextSummary,
   type AgentMessage,
   type AgentModelSelection,
   type AgentSession,
@@ -89,6 +90,11 @@ export interface AgentState {
     options?: { persist?: boolean },
   ) => void;
   removeMessage: (sessionId: string, messageId: string) => void;
+  /**
+   * 写入 / 清除会话的早期对话备忘。
+   * 传 null 表示撤销压缩 —— 下一轮发送会按原文重新判断要不要压。
+   */
+  setContextSummary: (sessionId: string, summary: AgentContextSummary | null) => void;
 
   beginStreaming: (sessionId: string, messageId: string) => void;
   endStreaming: () => void;
@@ -135,6 +141,34 @@ export function serializeAgentState(state: PersistedAgentState): string {
   } satisfies PersistedAgentState & { version: number });
 }
 
+/**
+ * 校验磁盘上的压缩备忘。字段缺一个就不能用 —— 水位线错位会让模型重复收到
+ * 已经压缩过的旧消息，比没有备忘更糟。
+ */
+export function parseContextSummary(value: unknown): AgentContextSummary | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Partial<AgentContextSummary>;
+  if (typeof raw.text !== "string" || !raw.text.trim()) return null;
+  const throughCreatedAt =
+    typeof raw.throughCreatedAt === "number" && Number.isFinite(raw.throughCreatedAt)
+      ? raw.throughCreatedAt
+      : 0;
+  const throughMessageId = typeof raw.throughMessageId === "string" ? raw.throughMessageId : null;
+  // 两个水位线都没有 ⇒ 无法判断覆盖范围，只能丢弃
+  if (!throughMessageId && throughCreatedAt <= 0) return null;
+  return {
+    text: raw.text,
+    throughMessageId,
+    throughCreatedAt,
+    messageCount:
+      typeof raw.messageCount === "number" && Number.isFinite(raw.messageCount)
+        ? raw.messageCount
+        : 0,
+    createdAt: typeof raw.createdAt === "number" ? raw.createdAt : Date.now(),
+    tokens: typeof raw.tokens === "number" && Number.isFinite(raw.tokens) ? raw.tokens : 0,
+  };
+}
+
 /** 反序列化：对磁盘上的历史数据做防御性校验，任何一条坏记录都不该拖垮整个 store */
 export function parseAgentState(raw: string | null): PersistedAgentState | null {
   if (!raw) return null;
@@ -152,6 +186,7 @@ export function parseAgentState(raw: string | null): PersistedAgentState | null 
         selection: session.selection ?? null,
         // 旧版本落盘的数据没有这个字段，必须兜底成 null，否则会话打开就崩
         skillId: typeof session.skillId === "string" ? session.skillId : null,
+        contextSummary: parseContextSummary(session.contextSummary),
         messages: Array.isArray(session.messages)
           ? session.messages
               .filter(
@@ -428,6 +463,16 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
   beginStreaming: (sessionId, messageId) => set({ streaming: { sessionId, messageId } }),
   endStreaming: () => set({ streaming: null }),
+
+  setContextSummary: (sessionId, summary) => {
+    set((state) => {
+      const sessions = state.sessions.map((session) =>
+        session.id === sessionId ? { ...session, contextSummary: summary } : session,
+      );
+      persist({ sessions });
+      return { sessions };
+    });
+  },
 
   clearProjectSessions: (projectId) => {
     set((state) => {

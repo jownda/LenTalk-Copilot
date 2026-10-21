@@ -45,6 +45,7 @@ export function ShortcutSettingsDialog({ open, onClose }: ShortcutSettingsDialog
     redo: t('canvas.shortcuts.redo', '重做'),
     group: t('canvas.shortcuts.group', '分组'),
     copy: t('canvas.shortcuts.copy', '复制'),
+    cut: t('canvas.shortcuts.cut', '剪切'),
     paste: t('canvas.shortcuts.paste', '粘贴'),
     delete: t('canvas.shortcuts.delete', '删除'),
   }), [t]);

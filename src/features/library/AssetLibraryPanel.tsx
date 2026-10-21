@@ -510,7 +510,8 @@ export const AssetLibraryPanel = memo(
           return;
         }
         if (renameDialog.mode === "asset" && renameDialog.targetId) {
-          renameAsset(renameDialog.targetId, name);
+          // 重命名会连带改磁盘文件名并修复工程引用，失败在 store 内已降级为只改名。
+          void renameAsset(renameDialog.targetId, name);
         } else if (renameDialog.mode === "library" && renameDialog.targetId) {
           renameLibrary(renameDialog.targetId, name);
         } else if (renameDialog.mode === "newLibrary") {

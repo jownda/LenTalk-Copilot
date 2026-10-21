@@ -403,6 +403,18 @@ describe("collectSceneAssetIds", () => {
     expect(result.message).toContain(String(status));
   });
 
+  it("把看门狗与后端的静默超时归到 timeout，界面才会提示「可重试」", () => {
+    // 这两条文案分别来自前端看门狗(providerStreamWatchdog)和后端 read_timeout。
+    // 以前只匹配 `time out` / `abort`，中文超时文案会掉进 other，界面直接把原始
+    // 报错甩给用户，看不出「渠道挂了，点一次就好」。
+    expect(classifyError(new Error("上游 120 秒没有返回任何数据，已中断，可重试")).kind).toBe("timeout");
+    expect(classifyError(new Error("等待上游响应超时（120 秒未收到响应头），已中断，可重试")).kind).toBe("timeout");
+    expect(classifyError(new Error("等待上游响应超时（900 秒内没有收到响应头），已中断，可重试")).kind).toBe("timeout");
+    expect(classifyError(new Error("error sending request: operation timed out")).kind).toBe("timeout");
+    // 真正的参数错误不能被误判成超时。
+    expect(classifyError(new Error("HTTP 400：invalid duration")).kind).toBe("http");
+  });
+
   it("只返回地点、站位角色、镜头参与者和动作引用的资产", () => {
     expect(collectSceneAssetIds(project, scene)).toEqual(["location", "hero", "prop", "support"]);
     expect(collectSceneAssetIds(project, scene)).not.toContain("unused-character");

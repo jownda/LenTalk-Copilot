@@ -50,6 +50,8 @@ import {
   resolveMediaNodeAspectLock,
   type AspectLockedSize,
 } from '@/features/canvas/application/aspectLockedResize';
+import { resolveMediaNodeFitSize } from '@/features/canvas/application/mediaNodeSizing';
+import { reduceAspectRatio } from '@/features/canvas/application/imageData';
 
 export type {
   ActiveToolDialog,
@@ -197,6 +199,14 @@ interface CanvasState {
   updateNodeDataTransient: (nodeId: string, data: Partial<CanvasNodeData>) => void;
   updateNodePosition: (nodeId: string, position: { x: number; y: number }) => void;
   updateNodeSize: (nodeId: string, width: number, height: number) => void;
+  /**
+   * 媒体(图片/视频)真实尺寸就绪后, 把节点边框重算成与画面同比例的尺寸。
+   *
+   * 结果图片 / 上传图片 / 视频节点的边框就是画面, 尺寸不再由用户拖动决定,
+   * 而是**跟着画面走**: 换了一张不同比例的画面, 边框自动收敛到新比例,
+   * 不会留下黑边。冒泡到 store 是因为节点自身只拿到实测宽高, 改不了自己的盒子。
+   */
+  syncMediaNodeMediaSize: (nodeId: string, mediaWidth: number, mediaHeight: number) => void;
   updateStoryboardFrame: (
     nodeId: string,
     frameId: string,
@@ -765,6 +775,18 @@ function isImageAutoResizableType(type: CanvasNodeType): boolean {
 }
 
 /**
+ * 盒子本身=画面的节点: 结果图片、上传图片、媒体节点(视频形态)。
+ *
+ * 这些节点的边框不再允许用户拖动改尺寸, 而是由画面实测宽高反推 ——
+ * 边框始终贴合画面, 换画面时也跟着变。
+ */
+function isMediaBoxNodeType(type: CanvasNodeType): boolean {
+  return type === CANVAS_NODE_TYPES.exportImage
+    || type === CANVAS_NODE_TYPES.upload
+    || type === CANVAS_NODE_TYPES.audio;
+}
+
+/**
  * 本次拖拽缩放手势的起始尺寸, 按节点 id 缓存。
  *
  * React Flow 的 resize 手柄在 pointerdown 时缓存一次起始尺寸(`startValues`), 之后每帧
@@ -948,7 +970,10 @@ function maybeApplyImageAutoResize(node: CanvasNode, patch: Partial<CanvasNodeDa
   }
 
   const isSizeManuallyAdjusted = patchData.isSizeManuallyAdjusted ?? nodeData.isSizeManuallyAdjusted ?? false;
-  if (isSizeManuallyAdjusted) {
+  // 「手动调过尺寸」只对**面板型**节点有意义(AI 图片节点的盒子是提示词+参数面板)。
+  // 结果图片/上传图片的盒子就是画面, 边框由画面反推, 旧项目里遗留的手动标记不能再
+  // 把自动尺寸挡住 —— 否则那些节点会永远停在历史拖动留下的错误比例上。
+  if (isSizeManuallyAdjusted && node.type === CANVAS_NODE_TYPES.imageEdit) {
     return node;
   }
 
@@ -1301,7 +1326,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       let nextNodes = applyNodeChanges<CanvasNode>(lockedChanges, state.nodes);
       if (resizedNodeIds.size > 0) {
         nextNodes = nextNodes.map((node) => {
-          if (!resizedNodeIds.has(node.id) || !isImageAutoResizableType(node.type)) {
+          // 只有面板型节点需要记住「用户手动调过尺寸」: 媒体节点的边框由画面反推,
+          // 记下手动标记反而会让它不再跟随画面。
+          if (!resizedNodeIds.has(node.id) || node.type !== CANVAS_NODE_TYPES.imageEdit) {
             return node;
           }
           return withManualSizeLock(node);
@@ -2213,6 +2240,67 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       if (!changed) {
         return {};
       }
+
+      return { nodes: nextNodes, routingRevision: state.routingRevision + 1 };
+    });
+  },
+
+  syncMediaNodeMediaSize: (nodeId, mediaWidth, mediaHeight) => {
+    if (!(mediaWidth > 0) || !(mediaHeight > 0)) {
+      return;
+    }
+
+    set((state) => {
+      const node = state.nodes.find((candidate) => candidate.id === nodeId);
+      if (!node || !isMediaBoxNodeType(node.type)) {
+        return {};
+      }
+
+      const nodeData = node.data as CanvasNodeData & { aspectRatio?: string };
+      const nextAspectRatio = reduceAspectRatio(mediaWidth, mediaHeight);
+      // 盒子尺寸以显式 width/height 为准(那是渲染真正用的值); 只有它们缺失时才退回
+      // 测量值 —— 测量的 measured 会比 store 的更新晚一帧, 拿它当基准会让同一张图
+      // 在两次同步之间算出不同尺寸。
+      const fallbackSize = getNodeSize(node);
+      const currentSize = {
+        width: typeof node.width === 'number' ? node.width : fallbackSize.width,
+        height: typeof node.height === 'number' ? node.height : fallbackSize.height,
+      };
+      const nextSize = resolveMediaNodeFitSize(mediaWidth, mediaHeight, currentSize);
+      if (!nextSize) {
+        return {};
+      }
+
+      const aspectChanged = nodeData.aspectRatio !== nextAspectRatio;
+      const sizeChanged =
+        currentSize.width !== nextSize.width || currentSize.height !== nextSize.height;
+      if (!aspectChanged && !sizeChanged) {
+        return {};
+      }
+
+      const nextNodes = state.nodes.map((candidate) => {
+        if (candidate.id !== nodeId) {
+          return candidate;
+        }
+
+        return {
+          ...candidate,
+          ...(sizeChanged
+            ? {
+                width: nextSize.width,
+                height: nextSize.height,
+                style: {
+                  ...(candidate.style ?? {}),
+                  width: nextSize.width,
+                  height: nextSize.height,
+                },
+              }
+            : {}),
+          data: aspectChanged
+            ? ({ ...candidate.data, aspectRatio: nextAspectRatio } as CanvasNodeData)
+            : candidate.data,
+        };
+      });
 
       return { nodes: nextNodes, routingRevision: state.routingRevision + 1 };
     });

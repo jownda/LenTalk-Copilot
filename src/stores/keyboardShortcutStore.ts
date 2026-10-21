@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
 /** 快捷键功能 id */
-export type ShortcutId = 'undo' | 'redo' | 'group' | 'copy' | 'paste' | 'delete';
+export type ShortcutId = 'undo' | 'redo' | 'group' | 'copy' | 'cut' | 'paste' | 'delete';
 
 /** 快捷键绑定:主键(小写)+ 修饰键 */
 export interface ShortcutBinding {
@@ -14,13 +14,14 @@ export interface ShortcutBinding {
   alt: boolean;
 }
 
-export const SHORTCUT_IDS: ShortcutId[] = ['undo', 'redo', 'group', 'copy', 'paste', 'delete'];
+export const SHORTCUT_IDS: ShortcutId[] = ['undo', 'redo', 'group', 'copy', 'cut', 'paste', 'delete'];
 
 export const DEFAULT_SHORTCUTS: Record<ShortcutId, ShortcutBinding> = {
   undo: { key: 'z', ctrl: true, shift: false, alt: false },
   redo: { key: 'y', ctrl: true, shift: false, alt: false },
   group: { key: 'g', ctrl: true, shift: false, alt: false },
   copy: { key: 'c', ctrl: true, shift: false, alt: false },
+  cut: { key: 'x', ctrl: true, shift: false, alt: false },
   paste: { key: 'v', ctrl: true, shift: false, alt: false },
   delete: { key: 'delete', ctrl: false, shift: false, alt: false },
 };
@@ -123,6 +124,17 @@ export const useKeyboardShortcutStore = create<KeyboardShortcutState>()(
     {
       name: 'storyboard-keyboard-shortcuts-v1',
       partialize: (state) => ({ bindings: state.bindings }),
+      // 老用户的 localStorage 里没有后加的功能（例如「剪切」）：缺的键用默认绑定补齐，
+      // 否则设置面板读到的 bindings[id] 是 undefined，渲染快捷键标签时会直接抛错。
+      merge: (persisted, current) => {
+        const persistedBindings =
+          (persisted as { bindings?: Partial<Record<ShortcutId, ShortcutBinding>> } | undefined)
+            ?.bindings ?? {};
+        return {
+          ...current,
+          bindings: { ...DEFAULT_SHORTCUTS, ...persistedBindings },
+        };
+      },
     }
   )
 );

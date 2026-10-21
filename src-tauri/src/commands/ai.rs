@@ -641,9 +641,14 @@ pub async fn request_provider_json(
     // Prompt compilation/final delivery can legitimately take several minutes.
     // Keep this aligned with the frontend response window while retaining a
     // finite bound for a provider that never completes the request.
+    //
+    // ⚠️ 这里**不加** `read_timeout`: 非流式响应在生成结束前一个字节都不发,
+    // 加了短读超时会把正常的长生成直接掐断。空闲判死只对 `request_provider_stream`
+    // 有意义(流式响应本该持续吐字节)。连接阶段的超时对两者都安全。
     let client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(15 * 60))
+        .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+        .timeout(PROVIDER_TOTAL_TIMEOUT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let mut request = client.request(http_method, parsed_url);
@@ -760,6 +765,17 @@ pub async fn request_provider_multipart(
     })
 }
 
+/// 建立连接的上限。中转平台挂死时通常卡在 TCP/TLS 阶段, 20 秒足够区分。
+const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// 流式响应"连续多久没有任何字节"判死。
+///
+/// 为什么需要它: 部分中转渠道的 TCP 连接一直活着却再也不吐数据, 只有 15 分钟总超时
+/// 兜底的话, 前端「提示词工作室 → 生成提示词」会一直停在「生成中…」, 用户只能干等,
+/// 也分不清是模型在长考还是渠道死了。健康渠道的首字节通常在几秒内到达。
+const PROVIDER_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// 单次请求的硬上限, 给合法的长提示词生成留足时间。
+const PROVIDER_TOTAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 /// Stream an OpenAI-compatible response to the webview one chunk at a time.
 /// This is intentionally a small transport primitive: parsing SSE, tracking
 /// received text, and deciding whether to resume remain frontend concerns.
@@ -794,7 +810,11 @@ pub async fn request_provider_stream(
         .map_err(|error| format!("Invalid provider HTTP method: {}", error))?;
     let client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(15 * 60))
+        .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+        // 流式响应必须能及时发现"管道还在、上游已经不给数据"的渠道。
+        // 只靠 15 分钟总超时的话, 前端会一直停在「生成中…」, 用户只能干等。
+        .read_timeout(PROVIDER_STREAM_READ_TIMEOUT)
+        .timeout(PROVIDER_TOTAL_TIMEOUT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let mut request = client.request(http_method, parsed_url);
@@ -808,7 +828,22 @@ pub async fn request_provider_stream(
     let mut response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
-            let message = format!("Provider request failed: {}", error);
+            // 区分"连不上 / 等不到响应头"与普通失败。前者是渠道挂死最常见的样子,
+            // 报错要让用户知道是网络侧超时而不是提示词有问题。
+            let message = if error.is_connect() {
+                format!(
+                    "无法连接上游（{} 秒内未建立连接），请检查网络或更换渠道：{}",
+                    PROVIDER_CONNECT_TIMEOUT.as_secs(),
+                    error
+                )
+            } else if error.is_timeout() {
+                format!(
+                    "等待上游响应超时（{} 秒内没有收到响应头），已中断，可重试",
+                    PROVIDER_TOTAL_TIMEOUT.as_secs()
+                )
+            } else {
+                format!("Provider request failed: {}", error)
+            };
             let _ = emit("error", None, None, Some(message.clone()));
             return Err(message);
         }
@@ -838,7 +873,16 @@ pub async fn request_provider_stream(
             }
             Ok(None) => break,
             Err(error) => {
-                let message = format!("Failed to read provider response: {}", error);
+                // read_timeout 命中的就是「渠道挂死」: TCP 还在, 上游一个字都不给。
+                // 这种情况必须尽快失败, 否则按钮会一直停在「生成中…」。
+                let message = if error.is_timeout() {
+                    format!(
+                        "上游 {} 秒没有返回任何数据，已中断，可重试",
+                        PROVIDER_STREAM_READ_TIMEOUT.as_secs()
+                    )
+                } else {
+                    format!("Failed to read provider response: {}", error)
+                };
                 emit("error", Some(status), None, Some(message.clone()))?;
                 return Err(message);
             }
