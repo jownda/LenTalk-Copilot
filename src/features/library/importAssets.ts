@@ -1,0 +1,509 @@
+import { v4 as uuid } from "uuid";
+import { isTauri } from "@tauri-apps/api/core";
+
+import { persistLibraryAssetBinary, persistLibraryAssetFromFile, extractVideoThumbnail } from "@/commands/assetLibrary";
+import {
+  blobToDataUrl,
+  createPreviewDataUrl,
+  detectAspectRatio,
+  imageUrlToDataUrl,
+  resolveImageDisplayUrl,
+} from "@/features/canvas/application/imageData";
+import { ASSET_LIBRARY_MIME_PREFIX, type AssetMediaType, type LibraryAsset } from "./types";
+import { fileNameFromPath, fileStemFromPath } from "./assetFileNaming";
+
+export function createAssetId(): string {
+  return `asset-${uuid().slice(0, 12)}`;
+}
+
+async function persistImageBlobForLibrary(
+  blob: Blob,
+  extension: string,
+  fileStem?: string,
+): Promise<{ sourcePath: string; previewImageUrl: string; aspectRatio: string }> {
+  const sourceDataUrl = await blobToDataUrl(blob);
+  const aspectRatio = await detectAspectRatio(sourceDataUrl);
+  const previewDataUrl = await createPreviewDataUrl(sourceDataUrl);
+
+  if (!isTauri()) {
+    return {
+      sourcePath: sourceDataUrl,
+      previewImageUrl: previewDataUrl,
+      aspectRatio,
+    };
+  }
+
+  // 素材库图片必须使用独立目录，不能复用画布的 images 目录。
+  // 文件名直接用素材名（Rust 侧净化非法字符并去重），素材库条目和磁盘文件才对得上。
+  const sourcePath = await persistLibraryAssetBinary(
+    new Uint8Array(await blob.arrayBuffer()),
+    extension,
+    fileStem,
+  );
+  const previewResponse = await fetch(previewDataUrl);
+  const previewBlob = await previewResponse.blob();
+  // 原素材重名时落盘会加序号，预览图跟着真实文件名走，别在文件名里插一段序号。
+  const finalStem = fileStemFromPath(sourcePath) || fileStem;
+  const previewImageUrl = await persistLibraryAssetBinary(
+    new Uint8Array(await previewBlob.arrayBuffer()),
+    "png",
+    finalStem ? `${finalStem}.preview` : undefined,
+  );
+  return { sourcePath, previewImageUrl, aspectRatio };
+}
+
+export interface ImportImageFailure {
+  /** 面向用户的简短原因（会拼进错误弹窗正文） */
+  reason: string;
+  /** 排查细节: 源地址、HTTP 状态、底层错误信息 */
+  details?: string;
+}
+
+export interface ImportImageOutcome {
+  asset: LibraryAsset | null;
+  failure: ImportImageFailure | null;
+}
+
+function describeImportError(error: unknown): string {
+  if (error instanceof Error) {
+    const detailed = error as Error & { details?: string };
+    return detailed.details ? `${error.message}\n${detailed.details}` : error.message;
+  }
+  return String(error);
+}
+
+/**
+ * 从图片 URL 下载为本地素材(画布图片「添加到素材库」用)。
+ * 返回 null 表示下载或处理失败。
+ *
+ * 需要知道失败原因时请改用 importImageUrlToAssetDetailed —— 本函数为兼容旧调用点
+ * 仍会静默返回 null。
+ */
+export async function importImageUrlToAsset(
+  imageUrl: string,
+  libraryId: string,
+  categoryId: string | null,
+): Promise<LibraryAsset | null> {
+  const { asset } = await importImageUrlToAssetDetailed(imageUrl, libraryId, categoryId);
+  return asset;
+}
+
+/**
+ * 同 importImageUrlToAsset，但会把失败原因一并返回。
+ *
+ * 原实现把真实错误整个吞进 console.warn，用户只看到「无法将该图片添加到素材库」，
+ * 无法区分下面几种完全不同的情况 —— 排查时等于全盲:
+ *   1) 本地源文件已被移动/删除（loadImage 读文件失败）
+ *   2) 远端地址被跨域策略拦截或已过期（fetch 失败）
+ *   3) 数据不是可解码的图片（detectAspectRatio 解码失败）
+ *   4) 字节为空或写盘失败（Rust 侧 persist_library_asset_binary 报错）
+ */
+export async function importImageUrlToAssetDetailed(
+  imageUrl: string,
+  libraryId: string,
+  categoryId: string | null,
+): Promise<ImportImageOutcome> {
+  const source = (imageUrl ?? "").trim();
+  if (!source) {
+    return { asset: null, failure: { reason: "图片地址为空" } };
+  }
+
+  const isRemote = /^https?:\/\//i.test(source);
+
+  // 画布结果在桌面端通常是本地路径，先转换为 data URL 才能稳定读取。
+  let normalizedImageUrl: string;
+  try {
+    normalizedImageUrl = await imageUrlToDataUrl(source);
+  } catch (error) {
+    return {
+      asset: null,
+      failure: {
+        reason: isRemote ? "无法下载该图片" : "无法读取该图片的本地文件",
+        details: `${
+          isRemote
+            ? "远端地址不可访问，或被跨域策略拦截（常见于平台返回的临时图片链接）"
+            : "本地源文件可能已被移动、删除，或不在应用可读目录内"
+        }\nsource=${source}\n${describeImportError(error)}`,
+      },
+    };
+  }
+
+  try {
+    const response = await fetch(normalizedImageUrl);
+    if (!response.ok) {
+      return {
+        asset: null,
+        failure: {
+          reason: `读取图片数据失败（HTTP ${response.status}）`,
+          details: `source=${source}`,
+        },
+      };
+    }
+
+    const blob = await response.blob();
+    if (blob.size === 0) {
+      return {
+        asset: null,
+        failure: { reason: "读到的图片数据为空", details: `source=${source}` },
+      };
+    }
+    if (blob.type && !blob.type.startsWith("image/")) {
+      return {
+        asset: null,
+        failure: {
+          reason: `该节点的内容是 ${blob.type}，不是图片`,
+          details: `source=${source}\n若节点是视频，请用节点工具栏的「添加到素材库」`,
+        },
+      };
+    }
+
+    const extension = blob.type.split("/")[1] ?? "png";
+    const preferredName = `画布图片 ${new Date().toLocaleTimeString()}`;
+    // 落盘名 == 素材名（Rust 侧只净化非法字符），条目和文件从此对得上。
+    const stored = await persistImageBlobForLibrary(blob, extension, preferredName);
+    return {
+      asset: {
+        id: createAssetId(),
+        libraryId,
+        categoryId,
+        // 重名时落盘会加序号，素材名跟着用真实文件名，才不会「库里叫 A、盘上叫 A (2)」。
+        name: fileStemFromPath(stored.sourcePath) || preferredName,
+        mediaType: "image",
+        sourcePath: stored.sourcePath,
+        previewImageUrl: stored.previewImageUrl,
+        aspectRatio: stored.aspectRatio || "1:1",
+        sourceFileName: fileNameFromPath(stored.sourcePath) || `canvas-image-${Date.now()}.${extension}`,
+        tags: [],
+        createdAt: Date.now(),
+      },
+      failure: null,
+    };
+  } catch (error) {
+    console.warn("[assetLibrary] import image url failed", source, error);
+    return {
+      asset: null,
+      failure: {
+        reason: "图片数据处理失败",
+        details: `source=${source}\n${describeImportError(error)}`,
+      },
+    };
+  }
+}
+
+/** 将画布音频 URL/本地路径复制为素材库音频，并保留可播放的本地源文件。 */
+export async function importAudioUrlToAsset(
+  audioUrl: string,
+  libraryId: string,
+  categoryId: string | null,
+): Promise<LibraryAsset | null> {
+  try {
+    const source = audioUrl.trim();
+    if (!source) {
+      return null;
+    }
+    const displayUrl =
+      source.startsWith("data:") || /^https?:\/\//i.test(source) ? source : resolveImageDisplayUrl(source);
+    const response = await fetch(displayUrl);
+    if (!response.ok) {
+      return null;
+    }
+    const blob = await response.blob();
+    if (blob.size === 0) {
+      return null;
+    }
+    const sourcePathWithoutParams = source.split(/[?#]/, 1)[0] ?? "";
+    const sourceExtension = sourcePathWithoutParams.includes(".")
+      ? sourcePathWithoutParams.split(".").pop()?.trim().toLowerCase()
+      : undefined;
+    const extension = blob.type.split("/")[1]?.split(";")[0] || sourceExtension || "mp3";
+    const preferredName = `画布音频 ${new Date().toLocaleTimeString()}`;
+    const sourcePath = isTauri()
+      ? await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension, preferredName)
+      : displayUrl;
+    return {
+      id: createAssetId(),
+      libraryId,
+      categoryId,
+      name: fileStemFromPath(sourcePath) || preferredName,
+      mediaType: "audio",
+      sourcePath,
+      previewImageUrl: null,
+      aspectRatio: null,
+      sourceFileName: fileNameFromPath(sourcePath) || `canvas-audio-${Date.now()}.${extension}`,
+      tags: [],
+      createdAt: Date.now(),
+    };
+  } catch (error) {
+    console.warn("[assetLibrary] import audio url failed", audioUrl, error);
+    return null;
+  }
+}
+
+/** 将画布视频 URL/本地路径复制为素材库视频，并保留可播放的本地源文件。 */
+export async function importVideoUrlToAsset(
+  videoUrl: string,
+  libraryId: string,
+  categoryId: string | null,
+): Promise<LibraryAsset | null> {
+  try {
+    const displayUrl =
+      videoUrl.startsWith("data:") || /^https?:\/\//i.test(videoUrl) ? videoUrl : resolveImageDisplayUrl(videoUrl);
+    const response = await fetch(displayUrl);
+    if (!response.ok) {
+      return null;
+    }
+    const blob = await response.blob();
+    const mime = blob.type || "video/mp4";
+    const extension = mime.split("/")[1]?.split(";")[0] || "mp4";
+    const preferredName = `画布视频 ${new Date().toLocaleTimeString()}`;
+    const sourcePath = isTauri()
+      ? await persistLibraryAssetBinary(new Uint8Array(await blob.arrayBuffer()), extension, preferredName)
+      : displayUrl;
+    const previewImageUrl = isTauri() ? await extractVideoThumbnail(sourcePath) : null;
+    return {
+      id: createAssetId(),
+      libraryId,
+      categoryId,
+      name: fileStemFromPath(sourcePath) || preferredName,
+      mediaType: "video",
+      sourcePath,
+      previewImageUrl,
+      aspectRatio: null,
+      sourceFileName: fileNameFromPath(sourcePath) || `canvas-video-${Date.now()}.${extension}`,
+      tags: [],
+      createdAt: Date.now(),
+    };
+  } catch (error) {
+    console.warn("[assetLibrary] import video url failed", videoUrl, error);
+    return null;
+  }
+}
+
+export function assetDragPayload(assetId: string): string {
+  return JSON.stringify({ id: assetId });
+}
+
+export function parseAssetDragPayload(payload: string | null): string | null {
+  if (!payload) return null;
+  try {
+    const parsed = JSON.parse(payload) as { id?: unknown };
+    return typeof parsed.id === "string" ? parsed.id : null;
+  } catch {
+    return null;
+  }
+}
+
+export const ASSET_DRAG_DATA_TYPE = ASSET_LIBRARY_MIME_PREFIX;
+
+/** 提示词拖拽到画布的数据类型(用于创建 AI 图片节点) */
+export const PROMPT_DRAG_DATA_TYPE = "application/x-storyboard-prompt";
+
+export function promptDragPayload(promptId: string): string {
+  return JSON.stringify({ id: promptId });
+}
+
+export function parsePromptDragPayload(payload: string | null): string | null {
+  if (!payload) return null;
+  try {
+    const parsed = JSON.parse(payload) as { id?: unknown };
+    return typeof parsed.id === "string" ? parsed.id : null;
+  } catch {
+    return null;
+  }
+}
+
+function mediaTypeForFile(file: File): AssetMediaType | null {
+  if (file.type.startsWith("image/")) return "image";
+  if (file.type.startsWith("video/")) return "video";
+  if (file.type.startsWith("audio/")) return "audio";
+  return null;
+}
+
+function extensionForFile(file: File): string {
+  const extension = file.name.split(".").pop()?.trim();
+  if (extension && extension !== file.name) return extension;
+  if (file.type === "video/mp4") return "mp4";
+  if (file.type === "audio/mpeg") return "mp3";
+  if (file.type === "audio/wav") return "wav";
+  return "bin";
+}
+
+function assetNameFromFile(file: File): string {
+  return file.name.replace(/\.[^.]+$/, "").trim() || file.name || "未命名素材";
+}
+
+/**
+ * 提取视频首帧作为缩略图: <video> 解码 + canvas 压缩, 返回小尺寸 JPEG data URL。
+ * 关键: 视频元素必须挂载到 DOM 并静音自动播放(WKWebView 中离屏 video 不真正解码,
+ * videoWidth 恒为 0 导致截图失败)。失败返回 null, 由调用方回退。
+ */
+function captureVideoThumbnail(file: File): Promise<string | null> {
+  return new Promise((resolve) => {
+    const objectUrl = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.setAttribute("webkit-playsinline", "true");
+    video.style.cssText = "position:fixed;left:-9999px;top:0;width:4px;height:4px;opacity:0;pointer-events:none;";
+    document.body.appendChild(video);
+
+    let settled = false;
+    const timeoutId = window.setTimeout(() => settle(null, "timeout"), 10000);
+    const cleanup = () => {
+      window.clearTimeout(timeoutId);
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      video.remove();
+      URL.revokeObjectURL(objectUrl);
+    };
+    const settle = (dataUrl: string | null, reason?: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (dataUrl === null && reason) {
+        console.warn("[videoThumb] capture failed:", reason);
+      }
+      resolve(dataUrl);
+    };
+
+    /** 尝试绘制首帧; 视频尺寸未就绪时静默等待后续事件 */
+    const tryDraw = () => {
+      try {
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        if (!vw || !vh) {
+          return;
+        }
+        const targetWidth = 320;
+        const scale = targetWidth / vw;
+        const width = targetWidth;
+        const height = Math.max(1, Math.round(vh * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          settle(null, "no 2d context");
+          return;
+        }
+        ctx.drawImage(video, 0, 0, width, height);
+        settle(canvas.toDataURL("image/jpeg", 0.72));
+      } catch (error) {
+        settle(null, error instanceof Error ? error.message : String(error));
+      }
+    };
+
+    const tryAutoplay = () => {
+      if (video.paused) {
+        void video
+          .play()
+          .then(() => {
+            video.pause();
+            tryDraw();
+          })
+          .catch(() => tryDraw());
+      }
+    };
+
+    video.onerror = () => settle(null, "video element error");
+    video.onloadeddata = () => tryDraw();
+    video.onloadedmetadata = () => {
+      try {
+        video.currentTime = Math.min(0.1, (video.duration || 0) / 2);
+      } catch {
+        // 忽略, 等 oncanplay/autoplay 兜底
+      }
+    };
+    video.onseeked = () => tryDraw();
+    video.oncanplay = tryAutoplay;
+
+    video.src = objectUrl;
+    video.load();
+    // 立即尝试静音自动播放(部分环境 oncanplay 不触发)
+    tryAutoplay();
+  });
+}
+
+export async function importFilesToAssets(
+  files: File[],
+  libraryId: string,
+  categoryId: string | null,
+): Promise<LibraryAsset[]> {
+  const imported: LibraryAsset[] = [];
+  for (const file of files) {
+    const mediaType = mediaTypeForFile(file);
+    if (!mediaType) continue;
+
+    try {
+      const createdAt = Date.now();
+      // 素材名 == 磁盘文件名（去掉扩展名）。导入时就用它命名文件，后面不再需要对齐。
+      const name = assetNameFromFile(file);
+      if (mediaType === "image") {
+        const stored = await persistImageBlobForLibrary(file, extensionForFile(file), name);
+        imported.push({
+          id: createAssetId(),
+          libraryId,
+          categoryId,
+          // 重名时落盘会加序号（`照片 (2).jpg`），素材名跟着用真实文件名。
+          name: fileStemFromPath(stored.sourcePath) || name,
+          mediaType,
+          sourcePath: stored.sourcePath,
+          previewImageUrl: stored.previewImageUrl,
+          aspectRatio: stored.aspectRatio || "1:1",
+          sourceFileName: fileNameFromPath(stored.sourcePath) || file.name,
+          tags: [],
+          createdAt,
+        });
+        continue;
+      }
+
+      // Tauri 文件选择器/拖拽文件通常会携带原生路径，直接在 Rust 侧复制，避免将整段
+      // 视频读进 WebView 再序列化给 IPC。没有路径时也会自动改为 2 MB 分块写入。
+      // 浏览器模式没有持久化文件系统时保留 object URL 的轻量预览行为。
+      const sourcePath = isTauri()
+        ? await persistLibraryAssetFromFile(file, extensionForFile(file), name)
+        : URL.createObjectURL(file);
+      const storedName = fileStemFromPath(sourcePath) || name;
+
+      if (mediaType === "video") {
+        // 视频: Tauri 用系统 QuickLook 抽帧; 浏览器用前端 canvas 截首帧; 失败回退 null
+        const previewImageUrl = isTauri() ? await extractVideoThumbnail(sourcePath) : await captureVideoThumbnail(file);
+        imported.push({
+          id: createAssetId(),
+          libraryId,
+          categoryId,
+          name: storedName,
+          mediaType,
+          sourcePath,
+          previewImageUrl,
+          aspectRatio: null,
+          sourceFileName: fileNameFromPath(sourcePath) || file.name,
+          tags: [],
+          createdAt,
+        });
+        continue;
+      }
+
+      imported.push({
+        id: createAssetId(),
+        libraryId,
+        categoryId,
+        name: storedName,
+        mediaType,
+        sourcePath,
+        previewImageUrl: null,
+        aspectRatio: null,
+        sourceFileName: fileNameFromPath(sourcePath) || file.name,
+        tags: [],
+        createdAt,
+      });
+    } catch (error) {
+      console.warn("[assetLibrary] import failed", file.name, error);
+    }
+  }
+  return imported;
+}

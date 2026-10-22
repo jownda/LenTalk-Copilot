@@ -1,0 +1,81 @@
+/*
+ * 候选浮层卡片 —— 工作台侧（`variant="studio"）。
+ *
+ * 卡片 portal 到 `document.body`，落在 `.cinematic-studio-app` 之外，拿不到那里定义的
+ * 局部设计令牌（`--surface` / `--border` / `--accent` …）。所以这里直接读 `:root` 上的
+ * 全局主题令牌 —— 它们本来就是那套局部令牌的来源，明暗与自定义强调色一样会跟着变。
+ */
+
+.quick-asset-picker--studio {
+  color: rgb(var(--text-rgb));
+  background: rgb(var(--surface-rgb));
+  border: 1px solid var(--ui-border-strong);
+  box-shadow: var(--ui-shadow-panel);
+}
+
+.quick-asset-picker--studio .quick-asset-picker__title {
+  color: rgb(var(--text-rgb));
+}
+
+.quick-asset-picker--studio .quick-asset-picker__close {
+  color: rgb(var(--text-muted-rgb));
+  transition: color 0.15s, background-color 0.15s;
+}
+
+.quick-asset-picker--studio .quick-asset-picker__close:hover {
+  color: rgb(var(--text-rgb));
+  background: var(--ui-surface-field);
+}
+
+/* 工作台面板比画布节点宽：列数跟着卡片实际宽度走，而不是钉死六列。
+   `grid-auto-rows: max-content` 见 `QuickAssetPicker.tsx` 的 `CANVAS_GRID_STYLE` 注释：
+   列表是固定高度 + 滚动的 grid，不这样写行轨道会被压缩、缩略图被裁。 */
+.quick-asset-picker--studio .quick-asset-picker__grid {
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+  grid-auto-rows: max-content;
+}
+
+.quick-asset-picker--studio .quick-asset-picker__item {
+  border-color: var(--ui-border-soft);
+  background: var(--ui-surface-field);
+}
+
+.quick-asset-picker--studio .quick-asset-picker__item:hover {
+  border-color: var(--ui-border-strong);
+}
+
+.quick-asset-picker--studio .quick-asset-picker__item.is-active {
+  border-color: rgb(var(--accent-rgb));
+}
+
+/* 图片加载完成前的垫底色（`object-cover` 之后不再有留白，这层只是兜底占位）。 */
+.quick-asset-picker--studio .quick-asset-picker__thumb {
+  background: color-mix(in srgb, rgb(var(--text-rgb)) 12%, transparent);
+}
+
+.quick-asset-picker--studio .quick-asset-picker__fallback {
+  color: rgb(var(--text-muted-rgb));
+  background: color-mix(in srgb, rgb(var(--text-rgb)) 8%, transparent);
+}
+
+/* 缩略图生成中的占位块：首字母用更淡的颜色，避免和「真的没有图」的兜底混淆。 */
+.quick-asset-picker--studio .quick-asset-picker__skeleton {
+  color: color-mix(in srgb, rgb(var(--text-rgb)) 22%, transparent);
+  background: color-mix(in srgb, rgb(var(--text-rgb)) 6%, transparent);
+  animation: quick-asset-picker-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes quick-asset-picker-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* 空状态文案 / 列表滚动条沿用主题色。 */
+.quick-asset-picker--studio .ui-scrollbar {
+  scrollbar-color: var(--ui-border-strong) transparent;
+}

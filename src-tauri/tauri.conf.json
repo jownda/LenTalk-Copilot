@@ -1,0 +1,91 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LenTalk",
+  "version": "1.2.38",
+  "identifier": "com.storyboard.copilot",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "LenTalk",
+        "dragDropEnabled": false,
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 600,
+        "visible": false,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": false,
+        "transparent": false,
+        "shadow": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/**",
+          "$APPLOCALDATA/**",
+          "$TEMP/**"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "resources": {
+      "resources/pajuben/": "pajuben/",
+      "resources/novel-downloader/": "novel-downloader/"
+    },
+    "externalBin": [
+      "binaries/tomato-novel-downloader"
+    ],
+    "targets": "all",
+    "windows": {
+      "wix": {
+        "language": "zh-CN"
+      },
+      "nsis": {
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "displayLanguageSelector": false,
+        "installerHooks": "./windows/hooks.nsh"
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcxQkJFOTI5MTUxRTMxNDIKUldSQ01SNFZLZW03Y1hFN3VLVlhJMlBjRHE5M1dITnlRZDhWYUIwT09MR3FtUzM0aHc4MWpKWDgK",
+      "dangerousInsecureTransportProtocol": true,
+      "endpoints": [
+        "http://118.25.194.71/ota/latest-{{target}}.json",
+        "https://ghfast.top/https://github.com/jownda/LenTalk-Copilot/releases/latest/download/latest-{{target}}.json",
+        "https://gh-proxy.com/https://github.com/jownda/LenTalk-Copilot/releases/latest/download/latest-{{target}}.json",
+        "https://ghproxy.net/https://github.com/jownda/LenTalk-Copilot/releases/latest/download/latest-{{target}}.json",
+        "https://github.com/jownda/LenTalk-Copilot/releases/latest/download/latest-{{target}}.json"
+      ]
+    }
+  }
+}

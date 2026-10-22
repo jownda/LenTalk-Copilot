@@ -1,0 +1,892 @@
+use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tauri::{AppHandle, Manager};
+
+use crate::database;
+
+/// 单个素材搬运失败的原因（不中断整体同步，只在结果里回报）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateAssetFailure {
+    pub source: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateSyncResult {
+    pub template_count: usize,
+    pub copied_file_count: usize,
+    /// 本次因源失效/网络不可达而没能搬运的素材数。
+    pub failed_file_count: usize,
+    pub failures: Vec<TemplateAssetFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateImportResult {
+    pub imported_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateUploadResult {
+    /// 共享盘上原本没有该模板 -> true（新建包目录）；已有 -> false（原地更新）。
+    pub created: bool,
+    pub copied_file_count: usize,
+    pub failed_file_count: usize,
+    pub failures: Vec<TemplateAssetFailure>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TemplateStorageRecord {
+    id: String,
+    name: String,
+    payload_json: String,
+}
+
+fn normalize_share_path(value: &str) -> Result<String, String> {
+    let normalized = value.trim().replace('/', "\\");
+    if !normalized.starts_with(r"\\") {
+        return Err("共享盘路径必须是 UNC 路径".to_string());
+    }
+    let trimmed = normalized.trim_end_matches('\\').to_string();
+    if trimmed.len() < 5 || trimmed.split('\\').filter(|part| !part.is_empty()).count() < 2 {
+        return Err("共享盘路径无效".to_string());
+    }
+    if trimmed.split('\\').any(|part| part == "." || part == "..") {
+        return Err("共享盘路径不允许包含相对路径段".to_string());
+    }
+    Ok(trimmed)
+}
+
+fn normalized_for_compare(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase()
+}
+
+/// Every shared-drive write must pass this lexical containment check immediately before it.
+///
+/// `Path::components()` 只在 Windows 上把 `\` 当分隔符；非 Windows 平台上整个 UNC 串
+/// 是**一个**组件，`..` 检查会静默失效（`shared_write_path_rejects_escape` 在 macOS 上
+/// 就是这么红的）。所以再按 `\` / `/` 显式切一遍段，让这条防线不依赖构建平台。
+fn validate_shared_write_path(root: &Path, target: &Path) -> Result<(), String> {
+    if target.components().any(|component| component == Component::ParentDir)
+        || target.to_string_lossy().split(['\\', '/']).any(|segment| segment == "..")
+    {
+        return Err(format!("拒绝包含上级路径的共享盘写入: {target:?}"));
+    }
+    let root_text = normalized_for_compare(root);
+    let target_text = normalized_for_compare(target);
+    let prefix = format!("{root_text}\\");
+    if target_text != root_text && !target_text.starts_with(&prefix) {
+        return Err(format!("拒绝越界共享盘写入: {target:?}"));
+    }
+    Ok(())
+}
+
+fn validate_share_root(value: &str) -> Result<PathBuf, String> {
+    let normalized = normalize_share_path(value)?;
+    let root = PathBuf::from(&normalized);
+    if !root.is_dir() {
+        return Err(format!("共享盘目录不存在或不可访问: {normalized}"));
+    }
+    Ok(root)
+}
+
+/// 把任意字符串净化成安全的文件/目录名, 并按 UTF-8 字节预算截断。
+///
+/// **绝不能用 `String::truncate`**: 它按字节切, 切点多字节字符(中文/emoji)中间时会
+/// `assert!(self.is_char_boundary(new_len))` 直接 panic。模板名常直接取用提示词
+/// (动辄数千字节的中文), 第 80 字节很容易落在汉字中间 —— 命令 panic 后 Tauri
+/// 不会回包, 前端 `invoke` 永不 settle, 界面就永久停在「同步中」, 共享盘上连目录
+/// 都建不出来。改成按字符累加、以字节预算为上限, 保证落点始终在字符边界上。
+const SAFE_NAME_MAX_BYTES: usize = 80;
+
+fn safe_name(value: &str) -> String {
+    let sanitized = value.trim().chars().map(|character| {
+        if matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || character.is_control() {
+            '_'
+        } else {
+            character
+        }
+    });
+    let mut truncated = String::new();
+    for character in sanitized {
+        if truncated.len() + character.len_utf8() > SAFE_NAME_MAX_BYTES {
+            break;
+        }
+        truncated.push(character);
+    }
+    let result = truncated.trim_matches([' ', '.']).to_string();
+    if result.is_empty() { "template".to_string() } else { result }
+}
+
+fn open_templates(app: &AppHandle) -> Result<(Connection, Vec<TemplateStorageRecord>), String> {
+    let conn = database::open(app)?;
+    let mut statement = conn
+        .prepare("SELECT id, name, payload_json, created_at, updated_at FROM templates ORDER BY updated_at DESC")
+        .map_err(|error| format!("读取模板失败: {error}"))?;
+    let rows = statement.query_map([], |row| {
+        Ok(TemplateStorageRecord {
+            id: row.get(0)?, name: row.get(1)?, payload_json: row.get(2)?,
+        })
+    }).map_err(|error| format!("读取模板失败: {error}"))?;
+    let records = rows.collect::<Result<Vec<_>, _>>().map_err(|error| format!("解析模板失败: {error}"))?;
+    drop(statement);
+    Ok((conn, records))
+}
+
+/// 读取共享盘中已经存在的模板 ID。
+///
+/// 同步是“只增不改”策略: 只要共享盘已有同一个模板 ID, 本次本地模板就不再
+/// 写入, 即使本地模板名称或内容后来发生了变化也不覆盖共享盘版本。
+fn shared_template_ids(templates_root: &Path) -> Result<HashSet<String>, String> {
+    let mut ids = HashSet::new();
+    if !templates_root.is_dir() {
+        return Ok(ids);
+    }
+    for entry in fs::read_dir(templates_root).map_err(|error| format!("读取共享盘模板目录失败: {error}"))? {
+        let package_dir = entry.map_err(|error| format!("读取共享盘模板目录失败: {error}"))?.path();
+        if !package_dir.is_dir() {
+            continue;
+        }
+        let template_json = package_dir.join("template.json");
+        let Ok(payload_json) = fs::read_to_string(&template_json) else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&payload_json) else {
+            continue;
+        };
+        if let Some(id) = payload.get("id").and_then(Value::as_str) {
+            ids.insert(id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+/// 按模板 ID 在共享盘上认领已有包目录。
+///
+/// 包目录名是「模板名-ID」拼出来的，本地改过名之后就再也按名字碰不上旧目录，
+/// 只能读每个目录里的 `template.json` 回认 ID。不认领而直接新建的后果是：同一个
+/// 模板在共享盘上出现两份包，导入端会看到同 ID 两个目录（先扫到的那个生效）。
+fn find_shared_package_dir(templates_root: &Path, template_id: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir(templates_root).ok()?.flatten() {
+        let package_dir = entry.path();
+        if !package_dir.is_dir() {
+            continue;
+        }
+        let Ok(payload_json) = fs::read_to_string(package_dir.join("template.json")) else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&payload_json) else {
+            continue;
+        };
+        if payload.get("id").and_then(Value::as_str) == Some(template_id) {
+            return Some(package_dir);
+        }
+    }
+    None
+}
+
+fn should_import_template(local_ids: &HashSet<String>, template_id: &str) -> bool {
+    !local_ids.contains(template_id)
+}
+
+/// 递归收集 payload 里所有「可搬运的媒体来源」。
+///
+/// 不能只看 `assets` 数组: 节点数据里的 `previewImageUrl`(缩略图)、
+/// `studioReferenceImages` / `studioReferenceAudio` 等字段并不保证出现在
+/// `assets` 里(见 `createTemplate.ts`), 而 `rewrite_media_paths` 会重写整份
+/// payload。漏掉的字段会以「导出机本地绝对路径」原样写进共享盘 template.json,
+/// 换电脑后这些路径不存在 → 图片/缩略图全坏。
+///
+/// 只收「远端 URL」和「本机真实存在的文件」: `data:` 是自包含的内联数据,
+/// `asset:` 需要运行时解析, 两者都搬不动也无需搬运。
+fn asset_sources(payload: &Value) -> Vec<String> {
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+    collect_media_sources(payload, &mut sources, &mut seen);
+    sources
+}
+
+fn collect_media_sources(value: &Value, sources: &mut Vec<String>, seen: &mut HashSet<String>) {
+    match value {
+        Value::String(source) => {
+            let transportable = is_remote_source(source) || source_to_local_path(source).is_some();
+            if transportable && seen.insert(source.clone()) {
+                sources.push(source.clone());
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| collect_media_sources(item, sources, seen)),
+        Value::Object(entries) => entries.values().for_each(|item| collect_media_sources(item, sources, seen)),
+        _ => {}
+    }
+}
+
+fn is_remote_source(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
+}
+
+fn source_to_local_path(source: &str) -> Option<PathBuf> {
+    if is_remote_source(source) || source.starts_with("data:") || source.starts_with("asset:") {
+        return None;
+    }
+    let candidate = if let Some(file_url) = source.strip_prefix("file://") {
+        let decoded = urlencoding::decode(file_url).ok()?.into_owned();
+        decoded.strip_prefix('/').unwrap_or(&decoded).to_string()
+    } else {
+        source.to_string()
+    };
+    let path = PathBuf::from(candidate);
+    path.is_file().then_some(path)
+}
+
+fn asset_file_name(source: &str) -> String {
+    let candidate = source
+        .split('?')
+        .next()
+        .and_then(|value| value.rsplit(['/', '\\']).next())
+        .unwrap_or("");
+    let name = safe_name(candidate);
+    if name == "template" || !name.contains('.') {
+        format!("video-{:x}.mp4", md5::compute(source.as_bytes()))
+    } else {
+        name
+    }
+}
+
+fn allocate_media_file_name(source: &str, used_names: &mut HashSet<String>) -> String {
+    let preferred = asset_file_name(source);
+    if used_names.insert(preferred.to_ascii_lowercase()) {
+        return preferred;
+    }
+    let candidate = format!("{:x}-{}", md5::compute(source.as_bytes()), preferred);
+    used_names.insert(candidate.to_ascii_lowercase());
+    candidate
+}
+
+fn rewrite_media_paths(value: &mut Value, source_map: &HashMap<String, String>) {
+    match value {
+        Value::String(source) => {
+            if let Some(shared_source) = source_map.get(source) {
+                *source = shared_source.clone();
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| rewrite_media_paths(item, source_map)),
+        Value::Object(entries) => entries.values_mut().for_each(|item| rewrite_media_paths(item, source_map)),
+        _ => {}
+    }
+}
+
+fn basename(value: &str) -> Option<String> {
+    let candidate = value.split('?').next()?.rsplit(['/', '\\']).next()?.trim();
+    (!candidate.is_empty()).then(|| candidate.to_ascii_lowercase())
+}
+
+fn rewrite_import_media_paths(
+    value: &mut Value,
+    source_map: &HashMap<String, String>,
+    media_by_name: &HashMap<String, String>,
+) {
+    match value {
+        Value::String(source) => {
+            if let Some(shared_source) = source_map.get(source) {
+                *source = shared_source.clone();
+            } else if let Some(file_name) = basename(source) {
+                if let Some(shared_source) = media_by_name.get(&file_name) {
+                    *source = shared_source.clone();
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| rewrite_import_media_paths(item, source_map, media_by_name)),
+        Value::Object(entries) => entries.values_mut().for_each(|item| rewrite_import_media_paths(item, source_map, media_by_name)),
+        _ => {}
+    }
+}
+
+fn cache_imported_template_media(
+    app: &AppHandle,
+    template_id: &str,
+    videos_dir: &Path,
+) -> Result<HashMap<String, String>, String> {
+    if !videos_dir.is_dir() {
+        return Ok(HashMap::new());
+    }
+    let cache_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位本机模板媒体目录: {error}"))?
+        .join("template-shared-media")
+        .join(safe_name(template_id));
+    fs::create_dir_all(&cache_dir)
+        .map_err(|error| format!("无法创建本机模板媒体目录 {}: {error}", cache_dir.display()))?;
+
+    let mut media_by_name = HashMap::<String, String>::new();
+    for media in fs::read_dir(videos_dir).map_err(|error| format!("读取共享盘模板媒体失败: {error}"))? {
+        let source = media.map_err(|error| format!("读取共享盘模板媒体失败: {error}"))?.path();
+        if !source.is_file() {
+            continue;
+        }
+        let Some(file_name) = source.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let target = cache_dir.join(safe_name(file_name));
+        let copied = copy_if_local_newer(&source, &target)?;
+        if copied || target.is_file() {
+            media_by_name.insert(file_name.to_ascii_lowercase(), target.to_string_lossy().to_string());
+        }
+    }
+    Ok(media_by_name)
+}
+
+fn copy_if_local_newer(source: &Path, target: &Path) -> Result<bool, String> {
+    let source_modified = fs::metadata(source).and_then(|metadata| metadata.modified()).ok();
+    let target_modified = fs::metadata(target).and_then(|metadata| metadata.modified()).ok();
+    if target_modified.is_some() && source_modified.is_some() && source_modified <= target_modified {
+        return Ok(false);
+    }
+    fs::copy(source, target)
+        .map(|_| true)
+        .map_err(|error| format!("复制模板视频失败: {error}"))
+}
+
+fn write_template_payload(
+    root: &Path,
+    target: &Path,
+    payload: &str,
+) -> Result<bool, String> {
+    validate_shared_write_path(root, target)?;
+    if fs::read_to_string(target).ok().as_deref() == Some(payload) {
+        return Ok(false);
+    }
+    fs::write(target, payload)
+        .map(|_| true)
+        .map_err(|error| format!("写入模板 JSON 失败: {error}"))
+}
+
+/// 单个素材的网络搬运预算。
+///
+/// 远端素材下载的重试 / 超时参数。
+///
+/// 旧实现直接用 `reqwest::get`：没有超时、没有 UA、没有重试，并且默认会带上系统/环境
+/// 变量代理。三者叠加的后果是——代理不可用时请求根本发不出去，错误只剩下
+/// `error sending request for url (...)` 一句，看不出是代理问题还是源站问题。
+///
+/// 前端 `TEMPLATE_SYNC_TIMEOUT_MS`（5 分钟）是整批同步的兜底。如果按
+/// 「尝试次数 × 通道数 × 单次超时」自由累加，一条卡死的连接就能把前端拖到超时，
+/// 用户只看到「同步超时」，看不出到底是哪个素材坏了。所以每个素材给一个**总预算**，
+/// 到点就记账跳过，继续跑下一个。
+const ASSET_TOTAL_BUDGET: Duration = Duration::from_secs(150);
+const ASSET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const ASSET_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const ASSET_MAX_ATTEMPTS: usize = 2;
+
+/// 「直连优先 → 系统代理兜底」两条通道。
+///
+/// 素材 CDN（阿里云 OSS 等）国内直连即可，且用户系统代理挂掉时直连是唯一活路；
+/// 反过来在必须走代理的网络里，直连失败后还能靠第二条通道救回来。
+fn asset_clients() -> Vec<(reqwest::Client, &'static str)> {
+    let mut clients = Vec::new();
+    if let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(ASSET_CONNECT_TIMEOUT)
+        .timeout(ASSET_REQUEST_TIMEOUT)
+        .build()
+    {
+        clients.push((client, "直连"));
+    }
+    if let Ok(client) = reqwest::Client::builder()
+        .connect_timeout(ASSET_CONNECT_TIMEOUT)
+        .timeout(ASSET_REQUEST_TIMEOUT)
+        .build()
+    {
+        clients.push((client, "系统代理"));
+    }
+    clients
+}
+
+fn describe_remote_status(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        404 | 410 => format!("{status}（素材已在源站被删除或过期清理）"),
+        403 => format!("{status}（源站拒绝访问，可能已过期或需要授权）"),
+        _ => status.to_string(),
+    }
+}
+
+/// 下载远端素材到共享盘；返回 `true` 表示本次真的写入了文件。
+///
+/// 素材源失效属于常态：模板里存的多是第三方 CDN 的临时链接，会被定期清理。所以这里
+/// 只回报失败原因，由调用方跳过该素材继续跑完其余文件，保证一个过期链接不会
+/// 让整批模板同步失败。
+async fn download_remote_to_path(root: &Path, target: &Path, source: &str) -> Result<bool, String> {
+    validate_shared_write_path(root, target)?;
+    if target.exists() {
+        return Ok(false);
+    }
+    let clients = asset_clients();
+    if clients.is_empty() {
+        return Err("无法创建 HTTP 客户端".to_string());
+    }
+    match tokio::time::timeout(
+        ASSET_TOTAL_BUDGET,
+        download_remote_attempts(&clients, root, target, source),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!("下载超时（超过 {} 秒）", ASSET_TOTAL_BUDGET.as_secs())),
+    }
+}
+
+/// 「直连 → 系统代理」两条通道依次试，整轮失败后最多重试 `ASSET_MAX_ATTEMPTS` 轮。
+async fn download_remote_attempts(
+    clients: &[(reqwest::Client, &'static str)],
+    root: &Path,
+    target: &Path,
+    source: &str,
+) -> Result<bool, String> {
+    let mut last_error = String::from("请求未发出");
+    for attempt in 1..=ASSET_MAX_ATTEMPTS {
+        for (client, channel) in clients {
+            let request = client
+                .get(source)
+                .header(reqwest::header::USER_AGENT, "LenTalk/1.0 (template-sync)");
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_client_error() {
+                        // 4xx 是素材自身的问题（已删除/无权限），换通道或重试都没有意义。
+                        return Err(describe_remote_status(status));
+                    }
+                    if !status.is_success() {
+                        last_error = format!("{channel} {status}");
+                        continue;
+                    }
+                    match response.bytes().await {
+                        Ok(bytes) => {
+                            validate_shared_write_path(root, target)?;
+                            fs::write(target, &bytes)
+                                .map_err(|error| format!("写入共享盘失败: {error}"))?;
+                            return Ok(true);
+                        }
+                        Err(error) => last_error = format!("{channel} 读取响应失败: {error}"),
+                    }
+                }
+                Err(error) => last_error = format!("{channel} {error}"),
+            }
+        }
+        if attempt < ASSET_MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(400 * attempt as u64)).await;
+        }
+    }
+    Err(last_error)
+}
+
+/// 把一个模板打包写进共享盘：`template.json` + `videos/` + `media-map.json`。
+///
+/// 返回本次真正写入的文件数。调用方决定"要不要写"——批量同步跳过共享盘已有的 ID，
+/// 单模板上传由用户显式触发、允许原地更新，所以这里只负责写，不做去重判断。
+struct PackagePushOutcome {
+    copied_file_count: usize,
+    failures: Vec<TemplateAssetFailure>,
+}
+
+async fn push_template_package(
+    root: &Path,
+    package_dir: &Path,
+    record: &TemplateStorageRecord,
+) -> Result<PackagePushOutcome, String> {
+    let payload: Value = serde_json::from_str(&record.payload_json).map_err(|error| format!("模板 {} 数据无效: {error}", record.id))?;
+    let videos_dir = package_dir.join("videos");
+    validate_shared_write_path(root, package_dir)?;
+    validate_shared_write_path(root, &videos_dir)?;
+    fs::create_dir_all(&videos_dir).map_err(|error| format!("创建模板视频目录失败: {error}"))?;
+
+    let mut payload_for_share = payload.clone();
+    let mut source_map = HashMap::<String, String>::new();
+    let mut manifest = HashMap::<String, String>::new();
+    let mut used_names = HashSet::<String>::new();
+    let mut copied_file_count = 0;
+    let mut failures = Vec::<TemplateAssetFailure>::new();
+    for source in asset_sources(&payload) {
+        let file_name = allocate_media_file_name(&source, &mut used_names);
+        let target = videos_dir.join(&file_name);
+        validate_shared_write_path(root, &target)?;
+        // 单个素材搬不动只记账、不打断整批：模板里的远端链接会被源站定期清理，
+        // 一个过期视频不该让其余模板全部同步失败。
+        let copied = if is_remote_source(&source) {
+            match download_remote_to_path(root, &target, &source).await {
+                Ok(copied) => copied,
+                Err(reason) => {
+                    failures.push(TemplateAssetFailure { source: source.clone(), reason });
+                    continue;
+                }
+            }
+        } else {
+            let Some(source_path) = source_to_local_path(&source) else {
+                failures.push(TemplateAssetFailure {
+                    source: source.clone(),
+                    reason: "本机文件已不存在".to_string(),
+                });
+                continue;
+            };
+            match copy_if_local_newer(&source_path, &target) {
+                Ok(copied) => copied,
+                Err(reason) => {
+                    failures.push(TemplateAssetFailure { source: source.clone(), reason });
+                    continue;
+                }
+            }
+        };
+        if copied {
+            copied_file_count += 1;
+        }
+        let shared_source = target.to_string_lossy().to_string();
+        source_map.insert(source.clone(), shared_source);
+        manifest.insert(source, file_name);
+    }
+
+    rewrite_media_paths(&mut payload_for_share, &source_map);
+    let shared_payload = serde_json::to_string(&payload_for_share).map_err(|error| format!("序列化共享模板失败: {error}"))?;
+    let template_json = package_dir.join("template.json");
+    if write_template_payload(root, &template_json, &shared_payload)? {
+        copied_file_count += 1;
+    }
+
+    // 更新已有包时把旧映射并进来：媒体文件从不删除，旧条目仍然有效，丢掉只会让
+    // 导入端少一层 source → 文件名的对应关系（导入端还有按文件名回认的兜底）。
+    let manifest_json = package_dir.join("media-map.json");
+    let mut merged_manifest: HashMap<String, String> = fs::read_to_string(&manifest_json)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default();
+    merged_manifest.extend(manifest);
+    let manifest_payload = serde_json::to_string(&merged_manifest).map_err(|error| format!("序列化模板媒体映射失败: {error}"))?;
+    if write_template_payload(root, &manifest_json, &manifest_payload)? {
+        copied_file_count += 1;
+    }
+
+    Ok(PackagePushOutcome { copied_file_count, failures })
+}
+
+/// 批量同步：共享盘没有的模板才上传，已有同 ID 的完全不碰（不覆盖共享盘现有内容）。
+#[tauri::command]
+pub async fn template_sync_to_share(app: AppHandle, shared_root: String) -> Result<TemplateSyncResult, String> {
+    let root = validate_share_root(&shared_root)?;
+    let (_conn, records) = open_templates(&app)?;
+    let templates_root = root.join("templates");
+    validate_shared_write_path(&root, &templates_root)?;
+    fs::create_dir_all(&templates_root).map_err(|error| format!("创建模板备份目录失败: {error}"))?;
+    let existing_shared_ids = shared_template_ids(&templates_root)?;
+    let mut template_count = 0;
+    let mut copied_file_count = 0;
+    let mut failures = Vec::<TemplateAssetFailure>::new();
+
+    for record in &records {
+        // 共享盘已有同 ID 模板时完全跳过, 不覆盖共享盘现有内容。
+        if existing_shared_ids.contains(&record.id) {
+            continue;
+        }
+        let package_dir = templates_root.join(format!("{}-{}", safe_name(&record.name), safe_name(&record.id)));
+        // 兼容旧的/手工创建的目录: 即使 template.json 缺失或损坏, 也不能覆盖已有目录。
+        if package_dir.exists() {
+            continue;
+        }
+        let outcome = push_template_package(&root, &package_dir, record).await?;
+        copied_file_count += outcome.copied_file_count;
+        failures.extend(outcome.failures);
+        template_count += 1;
+    }
+
+    Ok(TemplateSyncResult {
+        template_count,
+        copied_file_count,
+        failed_file_count: failures.len(),
+        failures,
+    })
+}
+
+/// 单模板上传到共享盘（画布内右键菜单触发）。
+///
+/// 与批量同步的策略差异是**故意的**：这里是用户对一个具体模板的显式动作，
+/// 「共享盘已存在就静默跳过」会让按钮看起来点了没反应。因此已有同 ID 包时
+/// 原地更新（媒体按较新覆盖），并把结果里的 `created` 回传给界面区分"新上传/已更新"。
+#[tauri::command]
+pub async fn template_upload_to_share(app: AppHandle, template_id: String, shared_root: String) -> Result<TemplateUploadResult, String> {
+    let root = validate_share_root(&shared_root)?;
+    let templates_root = root.join("templates");
+    validate_shared_write_path(&root, &templates_root)?;
+    let (_conn, records) = open_templates(&app)?;
+    let record = records
+        .into_iter()
+        .find(|record| record.id == template_id)
+        .ok_or_else(|| format!("本机未找到模板: {template_id}"))?;
+    fs::create_dir_all(&templates_root).map_err(|error| format!("创建模板备份目录失败: {error}"))?;
+
+    let existing_dir = find_shared_package_dir(&templates_root, &record.id);
+    let created = existing_dir.is_none();
+    let package_dir = existing_dir
+        .unwrap_or_else(|| templates_root.join(format!("{}-{}", safe_name(&record.name), safe_name(&record.id))));
+    let outcome = push_template_package(&root, &package_dir, &record).await?;
+
+    Ok(TemplateUploadResult {
+        created,
+        copied_file_count: outcome.copied_file_count,
+        failed_file_count: outcome.failures.len(),
+        failures: outcome.failures,
+    })
+}
+
+#[tauri::command]
+pub fn template_sync_from_share(app: AppHandle, shared_root: String) -> Result<TemplateImportResult, String> {
+    let root = validate_share_root(&shared_root)?;
+    let templates_root = root.join("templates");
+    validate_shared_write_path(&root, &templates_root)?;
+    if !templates_root.is_dir() { return Ok(TemplateImportResult { imported_count: 0 }); }
+    let conn = database::open(&app)?;
+    let mut local_template_ids = HashSet::<String>::new();
+    {
+        let mut statement = conn
+            .prepare("SELECT id FROM templates")
+            .map_err(|error| format!("读取本地模板失败: {error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("读取本地模板失败: {error}"))?;
+        for row in rows {
+            local_template_ids.insert(row.map_err(|error| format!("读取本地模板失败: {error}"))?);
+        }
+    }
+    let mut imported_count = 0;
+    for entry in fs::read_dir(&templates_root).map_err(|error| format!("读取共享盘模板目录失败: {error}"))? {
+        let package_dir = entry.map_err(|error| format!("读取共享盘模板目录失败: {error}"))?.path();
+        let template_json = package_dir.join("template.json");
+        validate_shared_write_path(&root, &template_json)?;
+        if !template_json.is_file() { continue; }
+        let payload_json = fs::read_to_string(&template_json).map_err(|error| format!("读取共享盘模板失败: {error}"))?;
+        let mut payload: Value = serde_json::from_str(&payload_json).map_err(|error| format!("共享盘模板 JSON 无效: {error}"))?;
+        let videos_dir = package_dir.join("videos");
+        validate_shared_write_path(&root, &videos_dir)?;
+        let manifest_json = package_dir.join("media-map.json");
+        validate_shared_write_path(&root, &manifest_json)?;
+        let manifest: HashMap<String, String> = fs::read_to_string(&manifest_json)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .unwrap_or_default();
+        let source_map = manifest.into_iter().map(|(source, file_name)| {
+            (source, videos_dir.join(file_name).to_string_lossy().to_string())
+        }).collect::<HashMap<_, _>>();
+        let mut media_by_name = HashMap::<String, String>::new();
+        if videos_dir.is_dir() {
+            for media in fs::read_dir(&videos_dir).map_err(|error| format!("读取共享盘模板媒体失败: {error}"))? {
+                let media_path = media.map_err(|error| format!("读取共享盘模板媒体失败: {error}"))?.path();
+                if media_path.is_file() {
+                    if let Some(file_name) = media_path.file_name().and_then(|name| name.to_str()) {
+                        media_by_name.insert(file_name.to_ascii_lowercase(), media_path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        let id = payload.get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "共享盘模板缺少 id".to_string())?
+            .to_string();
+        // 读取共享盘只做去重导入。本地已有同 ID 模板时保留本地版本, 绝不更新或删除。
+        if !should_import_template(&local_template_ids, &id) {
+            continue;
+        }
+        let media_by_name = cache_imported_template_media(&app, &id, &videos_dir)?;
+        let local_source_map = source_map
+            .into_iter()
+            .filter_map(|(source, shared_source)| {
+                let file_name = basename(&shared_source)?;
+                media_by_name.get(&file_name).cloned().map(|local_source| (source, local_source))
+            })
+            .collect::<HashMap<_, _>>();
+        rewrite_import_media_paths(&mut payload, &local_source_map, &media_by_name);
+        let name = payload.get("name").and_then(Value::as_str).unwrap_or("导入模板").to_string();
+        let created_at = payload.get("createdAt").and_then(Value::as_str).and_then(|value| chrono_like_timestamp(value)).unwrap_or(0);
+        let updated_at = payload.get("updatedAt").and_then(Value::as_str).and_then(|value| chrono_like_timestamp(value)).unwrap_or(created_at);
+        let imported_payload = serde_json::to_string(&payload).map_err(|error| format!("序列化导入模板失败: {error}"))?;
+        let inserted = conn.execute("INSERT OR IGNORE INTO templates (id, name, payload_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![&id, name, imported_payload, created_at, updated_at]).map_err(|error| format!("导入模板失败: {error}"))?;
+        if inserted > 0 {
+            local_template_ids.insert(id);
+            imported_count += 1;
+        }
+    }
+    Ok(TemplateImportResult { imported_count })
+}
+
+fn chrono_like_timestamp(value: &str) -> Option<i64> {
+    let parsed = value.parse::<i64>().ok();
+    parsed.or_else(|| Some(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_shared_package_dir, normalize_share_path, rewrite_import_media_paths, rewrite_media_paths, safe_name, should_import_template, shared_template_ids, validate_shared_write_path};
+    use std::collections::HashMap;
+    use std::path::Path;
+    use serde_json::json;
+
+    #[test]
+    fn shared_path_requires_unc_root() {
+        assert!(normalize_share_path(r"C:\temp\templates").is_err());
+        assert!(normalize_share_path(r"\\server\share\templates").is_ok());
+    }
+
+    #[test]
+    fn shared_write_path_rejects_escape() {
+        let root = Path::new(r"\\server\share\templates");
+        assert!(validate_shared_write_path(root, Path::new(r"\\server\share\templates\a\template.json")).is_ok());
+        assert!(validate_shared_write_path(root, Path::new(r"\\server\share\other\template.json")).is_err());
+        assert!(validate_shared_write_path(root, Path::new(r"\\server\share\templates\..\other\template.json")).is_err());
+    }
+
+    #[test]
+    fn shared_template_ids_are_used_for_upload_deduplication() {
+        let dir = std::env::temp_dir().join(format!("lentalk-template-shared-ids-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("existing-package")).unwrap();
+        std::fs::write(
+            dir.join("existing-package").join("template.json"),
+            r#"{"id":"existing-template","name":"已有模板"}"#,
+        )
+        .unwrap();
+
+        let ids = shared_template_ids(&dir).unwrap();
+        assert!(ids.contains("existing-template"));
+        assert!(!should_import_template(&ids, "existing-template"));
+        assert!(should_import_template(&ids, "local-only-template"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upload_reclaims_shared_package_by_template_id() {
+        // 本地改过名之后包目录名不再匹配，必须靠 template.json 里的 id 认领旧包，
+        // 否则同一个模板会在共享盘上堆出多份目录（导入端会看到同 ID 两个目录）。
+        let dir = std::env::temp_dir().join(format!("lentalk-template-claim-{}", std::process::id()));
+        let renamed = dir.join("新名字-keep-id");
+        std::fs::create_dir_all(&renamed).unwrap();
+        std::fs::write(
+            renamed.join("template.json"),
+            r#"{"id":"keep-id","name":"改过名字的模板"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(find_shared_package_dir(&dir, "keep-id").as_deref(), Some(renamed.as_path()));
+        assert!(find_shared_package_dir(&dir, "other-id").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn collects_media_sources_outside_the_assets_array() {
+        // 复现线上问题: 节点数据里的 previewImageUrl 不在 assets 里,
+        // 旧实现只扫 assets → 缩略图不会被拷到共享盘, 换电脑后全坏。
+        let dir = std::env::temp_dir().join("lentalk-template-sync-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let preview = dir.join("preview.png");
+        std::fs::write(&preview, b"stub").unwrap();
+        let preview_text = preview.to_string_lossy().to_string();
+        let payload = json!({
+            "assets": [{ "sourcePath": "https://example.com/cover.mp4" }],
+            "graph": { "nodes": [{ "data": { "previewImageUrl": preview_text } }] },
+        });
+
+        let sources = super::asset_sources(&payload);
+
+        assert!(sources.contains(&"https://example.com/cover.mp4".to_string()));
+        assert!(sources.contains(&preview_text), "节点数据里的本机文件也必须被收集: {sources:?}");
+    }
+
+    #[test]
+    fn media_sources_are_deduplicated_and_skip_untransportable_schemes() {
+        let payload = json!({
+            "assets": [
+                { "sourcePath": "https://example.com/a.png" },
+                { "sourcePath": "https://example.com/a.png" },
+            ],
+            "graph": { "nodes": [{ "data": {
+                "previewImageUrl": "data:image/png;base64,iVBORw0KGgo=",
+                "imageUrl": "asset:library/abc.png",
+            } }] },
+        });
+
+        let sources = super::asset_sources(&payload);
+
+        assert_eq!(sources, vec!["https://example.com/a.png".to_string()]);
+    }
+
+    #[test]
+    fn safe_name_never_cuts_a_multibyte_character() {
+        // 复现线上「一直卡在同步中」: 模板名直接取用提示词(长中文), 旧实现用
+        // String::truncate(80) 按字节切, 第 80 字节落在汉字中间 → panic →
+        // 命令不回包 → 前端 invoke 永不 settle。
+        let name = "SCENE CONTEXT \n13.5秒竖屏9:16真人实景药品广告短片。约50岁男士与藏医视频通话，全流程展示藏九公腰椎贴的使用与承诺。";
+        let result = safe_name(name);
+        assert!(result.len() <= super::SAFE_NAME_MAX_BYTES, "截断后字节数超预算: {}", result.len());
+        assert!(result.is_char_boundary(result.len()), "截断点必须落在字符边界上");
+
+        // 第 80 字节恰好落在字符边界时也必须正常(不能因为贪心提前少截太多)
+        let aligned = "SCENE CONTEXT\n传统藏式药房工坊内部，草药香气与热气弥漫。中景横贯一条长木案，两侧立着满墙药材斗柜。";
+        assert!(!safe_name(aligned).is_empty());
+    }
+
+    #[test]
+    fn safe_name_falls_back_for_blank_and_strips_illegal_characters() {
+        assert_eq!(safe_name("   "), "template");
+        assert_eq!(safe_name(r#"a<b>c:d"e/f\g|h?i*j"#), "a_b_c_d_e_f_g_h_i_j");
+    }
+
+    #[test]
+    fn shared_template_payload_uses_packaged_media_paths() {
+        let source = r"D:\source-machine\references\hero.png";
+        let shared = r"\\server\share\templates\demo\videos\hero.png";
+        let mut payload = json!({
+            "assets": [{ "sourcePath": source }],
+            "pipeline": { "referenceImages": [{ "sourcePath": source }] },
+            "graph": { "nodes": [{ "data": { "imageUrl": source } }] },
+        });
+        let map = HashMap::from([(source.to_string(), shared.to_string())]);
+        rewrite_media_paths(&mut payload, &map);
+        assert_eq!(payload["assets"][0]["sourcePath"], shared);
+        assert_eq!(payload["pipeline"]["referenceImages"][0]["sourcePath"], shared);
+        assert_eq!(payload["graph"]["nodes"][0]["data"]["imageUrl"], shared);
+    }
+
+    #[test]
+    fn legacy_template_import_recovers_media_by_file_name() {
+        let mut payload = json!({
+            "assets": [{ "sourcePath": r"D:\old-machine\media\clip.mp4" }],
+            "artifacts": { "coverVideo": { "sourcePath": r"D:\old-machine\media\clip.mp4" } },
+        });
+        let media_by_name = HashMap::from([(
+            "clip.mp4".to_string(),
+            r"\\server\share\templates\demo\videos\clip.mp4".to_string(),
+        )]);
+        rewrite_import_media_paths(&mut payload, &HashMap::new(), &media_by_name);
+        assert_eq!(payload["assets"][0]["sourcePath"], r"\\server\share\templates\demo\videos\clip.mp4");
+        assert_eq!(payload["artifacts"]["coverVideo"]["sourcePath"], r"\\server\share\templates\demo\videos\clip.mp4");
+    }
+
+    #[test]
+    fn imported_template_rewrites_shared_media_to_local_cache() {
+        let shared_source = r"\\server\share\templates\demo\videos\clip.mp4";
+        let local_source = r"C:\Users\tester\AppData\Roaming\LenTalk\template-shared-media\demo\clip.mp4";
+        let mut payload = json!({
+            "assets": [{ "sourcePath": shared_source }],
+            "artifacts": { "coverVideo": { "sourcePath": shared_source } },
+        });
+        let source_map = HashMap::from([(shared_source.to_string(), local_source.to_string())]);
+        rewrite_import_media_paths(&mut payload, &source_map, &HashMap::new());
+        assert_eq!(payload["assets"][0]["sourcePath"], local_source);
+        assert_eq!(payload["artifacts"]["coverVideo"]["sourcePath"], local_source);
+    }
+}

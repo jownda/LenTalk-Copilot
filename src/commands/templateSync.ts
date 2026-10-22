@@ -1,0 +1,101 @@
+import { invoke, isTauri } from '@tauri-apps/api/core';
+
+export const DEFAULT_TEMPLATE_SHARE_ROOT = '\\\\192.168.3.254\\藏倍宁-专用盘\\AI-片头\\AI形象候选\\模板备份不要删';
+export const TEMPLATE_SHARE_SETTING_KEY = 'templates.share-root';
+
+/**
+ * 同步/导入的超时兜底。
+ *
+ * Rust 命令一旦 panic（例如旧版 `safe_name` 的 `String::truncate` 切在多字节字符中间），
+ * Tauri 不会回包 → `invoke` 的 Promise 永不 settle → 界面永久停在「同步中」且按钮一直禁用。
+ * 加一层超时，保证失败最终能被看见、按钮能恢复。正常同步只需数秒（实测共享盘 ~53 MB/s），
+ * 5 分钟足够覆盖上百 MB 的首次全量同步。
+ */
+export const TEMPLATE_SYNC_TIMEOUT_MS = 5 * 60 * 1000;
+
+export class TemplateSyncTimeoutError extends Error {
+  readonly code = 'TEMPLATE_SYNC_TIMEOUT';
+
+  constructor() {
+    super(`模板同步超时：${TEMPLATE_SYNC_TIMEOUT_MS / 60000} 分钟内没有收到响应，已中止等待`);
+    this.name = 'TemplateSyncTimeoutError';
+  }
+}
+
+function withSyncTimeout<T>(task: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new TemplateSyncTimeoutError()), TEMPLATE_SYNC_TIMEOUT_MS);
+    task.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
+export async function loadTemplateShareRoot(): Promise<string | null> {
+  if (!isTauri()) return null;
+  return invoke<string | null>('load_app_setting', { key: TEMPLATE_SHARE_SETTING_KEY });
+}
+
+export async function saveTemplateShareRoot(root: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('save_app_setting', { key: TEMPLATE_SHARE_SETTING_KEY, value: root });
+}
+
+export interface TemplateAssetFailure {
+  /** 原始素材地址（远端 URL 或本机路径）。 */
+  source: string;
+  /** 失败原因，可直接展示给用户。 */
+  reason: string;
+}
+
+export interface TemplateSyncResult {
+  templateCount: number;
+  copiedFileCount: number;
+  /** 因源站已删除/过期/网络不可达而没能搬运的素材数。 */
+  failedFileCount: number;
+  failures: TemplateAssetFailure[];
+}
+
+export async function syncTemplatesToShare(sharedRoot: string): Promise<TemplateSyncResult> {
+  if (!isTauri()) throw new Error('共享盘同步仅支持桌面端');
+  return withSyncTimeout(invoke<TemplateSyncResult>('template_sync_to_share', { sharedRoot }));
+}
+
+export async function syncTemplatesFromShare(sharedRoot: string): Promise<{ importedCount: number }> {
+  if (!isTauri()) throw new Error('共享盘读取仅支持桌面端');
+  return withSyncTimeout(invoke<{ importedCount: number }>('template_sync_from_share', { sharedRoot }));
+}
+
+export interface TemplateUploadResult {
+  /** 共享盘原本没有该模板（新建包目录）；false 表示原地更新了已有包。 */
+  created: boolean;
+  copiedFileCount: number;
+  /** 源已失效、没能搬上共享盘的素材数。 */
+  failedFileCount: number;
+  failures: TemplateAssetFailure[];
+}
+
+/** 单独上传一个模板到共享盘（画布内模板卡片右键）。 */
+export async function uploadTemplateToShare(templateId: string, sharedRoot: string): Promise<TemplateUploadResult> {
+  if (!isTauri()) throw new Error('共享盘上传仅支持桌面端');
+  return withSyncTimeout(invoke<TemplateUploadResult>('template_upload_to_share', { templateId, sharedRoot }));
+}
+
+/**
+ * 取当前生效的共享盘位置：优先用户保存过的设置，没有就用内置默认路径。
+ *
+ * 画布里的右键上传/同步按钮不弹设置窗（改路径仍在模板页的「同步共享盘」里），
+ * 所以这里必须有一个兜底值，否则第一次用会直接报「请输入共享盘文件夹路径」。
+ */
+export async function resolveTemplateShareRoot(): Promise<string> {
+  if (!isTauri()) return DEFAULT_TEMPLATE_SHARE_ROOT;
+  const saved = await loadTemplateShareRoot().catch(() => null);
+  return saved?.trim() || DEFAULT_TEMPLATE_SHARE_ROOT;
+}

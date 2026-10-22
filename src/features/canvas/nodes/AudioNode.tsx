@@ -1,0 +1,1139 @@
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type SyntheticEvent,
+} from "react";
+import { createPortal } from "react-dom";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { Handle, Position } from "@xyflow/react";
+import {
+  AlertTriangle,
+  AudioLines,
+  CircleSlash,
+  LoaderCircle,
+  Maximize2,
+  Music2,
+  Pause,
+  Play,
+  Upload,
+  Video,
+  X,
+} from "lucide-react";
+
+import { CANVAS_NODE_TYPES, type AudioNodeData } from "@/features/canvas/domain/canvasNodes";
+import { resolveNodeDisplayName } from "@/features/canvas/domain/nodeDisplay";
+import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
+import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
+import {
+  MediaDimensionsLabel,
+  useHoverIntent,
+  useMediaByteSize,
+  type MediaDimensions,
+} from "@/features/canvas/ui/MediaDimensions";
+import { canvasAiGateway, canvasEventBus } from "@/features/canvas/application/canvasServices";
+import {
+  closeVideoCancellationWindow,
+  isVideoCancellationRequested,
+  isVideoCancellationWindowOpen,
+  requestVideoCancellation,
+  subscribeVideoCancellation,
+} from "@/features/canvas/application/videoGenerationCancel";
+import { prepareNodeImage, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { resolveMediaNodeResizeBounds } from "@/features/canvas/application/aspectLockedResize";
+import { captureVideoFrame, createObjectUrlFromDataUrl } from "@/features/canvas/application/videoFrameCapture";
+import { isVideoTrackUndecoded } from "@/features/canvas/application/videoPlayback";
+import { showErrorDialog } from "@/features/canvas/application/errorDialog";
+import { extractVideoThumbnail, persistLibraryAssetFile, persistLibraryAssetFromFile } from "@/commands/assetLibrary";
+import { useCanvasStore } from "@/stores/canvasStore";
+
+type AudioNodeProps = {
+  id: string;
+  data: AudioNodeData;
+  selected?: boolean;
+};
+
+/**
+ * 远端视频兜底抽帧的宽度上限。
+ * 节点封面用不到全分辨率, 先限宽再交给 prepareNodeImage, 能显著降低 canvas
+ * 与 dataURL 的内存占用(4K 帧按原尺寸绘制可达数十 MB)。
+ */
+const REMOTE_VIDEO_THUMBNAIL_MAX_WIDTH = 640;
+
+/**
+ * 轻量级的稳定波形占位。音频文件的解码在不同 WebView/CORS 环境下并不总是可用，
+ * 因此节点先用来源生成稳定的柱高，播放进度仍由真实 audio 元素驱动；不会因为取不到
+ * 波形而让音频节点空白或卡住。
+ */
+function createWaveformBars(source: string, count = 56): number[] {
+  let seed = 2166136261;
+  for (const character of source) {
+    seed ^= character.charCodeAt(0);
+    seed = Math.imul(seed, 16777619);
+  }
+  return Array.from({ length: count }, (_, index) => {
+    seed = Math.imul(seed ^ (index + 1), 16777619);
+    const noise = ((seed >>> 0) % 1000) / 1000;
+    const envelope = 0.55 + 0.45 * Math.sin((index / count) * Math.PI);
+    return Math.max(0.14, Math.min(1, (0.28 + noise * 0.72) * envelope));
+  });
+}
+
+function createWaveformBarsFromBuffer(buffer: AudioBuffer, count = 56): number[] {
+  const frameSize = Math.max(1, Math.floor(buffer.length / count));
+  const bars = Array.from({ length: count }, (_, index) => {
+    const start = index * frameSize;
+    const end = Math.min(buffer.length, start + frameSize);
+    const step = Math.max(1, Math.floor((end - start) / 512));
+    let peak = 0;
+    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+      const samples = buffer.getChannelData(channel);
+      for (let frame = start; frame < end; frame += step) peak = Math.max(peak, Math.abs(samples[frame] ?? 0));
+    }
+    return peak;
+  });
+  const maximum = Math.max(...bars, 0.0001);
+  return bars.map((bar) => Math.max(0.12, Math.min(1, Math.sqrt(bar / maximum))));
+}
+
+/** 已判定为空白(全透明)的缩略图地址缓存, 避免同一会话里反复解码同一张图。 */
+const blankThumbnailCache = new Set<string>();
+
+/**
+ * 封面自动抽取的配额(键 = `节点id|视频来源`)。
+ *
+ * 抽不出封面时 `previewImageUrl` 会一直是空的, effect 每次依赖变化或节点重新挂载都会再跑
+ * 一遍, 而每一遍至少要启动一次 ffmpeg —— Windows 上就是黑框反复弹出。这里给每个(节点, 来源)
+ * 一份配额, 用完后不再自动重试; 换了来源会得到新键, 配额随之重置。
+ */
+const thumbnailAttemptCounts = new Map<string, number>();
+
+/** 自动抽取的最大尝试次数: 给"首帧尚未提交 → 抽出空白 → 清空重抽"这轮预期内的往返留余量。 */
+const MAX_THUMBNAIL_ATTEMPTS = 3;
+
+/**
+ * 判断缩略图是否为空白图。
+ *
+ * 早期版本在视频帧尚未提交到合成器时就抽帧, 全透明画布被当成缩略图存了下来, 又因为内容
+ * 完全一致被引用池复用 —— 表现就是一批视频节点"没有封面"。这里把图读回来采样 alpha 做一次
+ * 判定, 命中即清空重抽。
+ *
+ * 读像素受同源限制: 本地路径经 resolveImageDisplayUrl 转成 asset 协议后同源可读; 若某张图
+ * 跨域而抛 SecurityError, 按"正常"处理, 不影响原有显示。
+ */
+async function isBlankThumbnail(source: string): Promise<boolean> {
+  if (blankThumbnailCache.has(source)) {
+    return true;
+  }
+  return new Promise<boolean>((resolve) => {
+    const image = new Image();
+    image.onload = () => {
+      try {
+        const side = 32;
+        const canvas = document.createElement("canvas");
+        canvas.width = side;
+        canvas.height = side;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          resolve(false);
+          return;
+        }
+        context.drawImage(image, 0, 0, side, side);
+        const pixels = context.getImageData(0, 0, side, side).data;
+        let opaque = 0;
+        for (let index = 3; index < pixels.length; index += 4) {
+          if (pixels[index] > 8) {
+            opaque += 1;
+          }
+        }
+        const blank = opaque === 0;
+        if (blank) {
+          blankThumbnailCache.add(source);
+        }
+        resolve(blank);
+      } catch {
+        // 跨域或解码失败时无法判定, 保持原样。
+        resolve(false);
+      }
+    };
+    image.onerror = () => resolve(false);
+    image.src = resolveImageDisplayUrl(source);
+  });
+}
+
+/** 秒 -> `m:ss`; 未加载完/非法值(NaN, Infinity)统一显示 0:00。 */
+function formatClock(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "0:00";
+  }
+  const total = Math.floor(seconds);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+export const AudioNode = memo(({ id, data, selected }: AudioNodeProps) => {
+  const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const syncMediaNodeMediaSize = useCanvasStore((state) => state.syncMediaNodeMediaSize);
+  const addDerivedExportNode = useCanvasStore((state) => state.addDerivedExportNode);
+  const addEdge = useCanvasStore((state) => state.addEdge);
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  // 音频 timeupdate 事件频率较低；波形进度直接用 rAF 驱动 DOM，避免逐格跳动。
+  const audioProgressFillRef = useRef<HTMLDivElement>(null);
+  const audioPlayheadRef = useRef<HTMLDivElement>(null);
+  const viewerVideoRef = useRef<HTMLVideoElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  /** 画面上的透明交互层: 承接指针事件并冒泡到节点, 实现"画面任意位置左键拖动节点"。 */
+  const videoSurfaceRef = useRef<HTMLDivElement>(null);
+  const [isCapturing, setIsCapturing] = useState(false);
+  /** 与 `isCapturing` 并存的同步守卫：state 要等下一帧才生效，连点仍可能并发起两次抽帧。 */
+  const capturingRef = useRef(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isVideoViewerOpen, setIsVideoViewerOpen] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  const [videoDimensions, setVideoDimensions] = useState<MediaDimensions | null>(null);
+  // 播放状态一律由 video 的 play/pause/ended 事件回写, 不做本地乐观更新,
+  // 否则"自动播放被拒"或"源不可用"时按钮会显示成正在播放。
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackTime, setPlaybackTime] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
+  /** 指针是否在画面上: 控制条仅在悬停(或播放中)出现, 其余时间完全让位给拖动。 */
+  const [isVideoHovered, setIsVideoHovered] = useState(false);
+  /** 本地 asset 协议在部分 WebView / 编码组合下不能直接解码，失败后切换到同源 Blob。 */
+  const [localVideoFallbackSrc, setLocalVideoFallbackSrc] = useState<string | null>(null);
+  const localVideoFallbackSrcRef = useRef<string | null>(null);
+  const playbackTempPathRef = useRef<string | null>(null);
+  const videoFallbackRequestRef = useRef(0);
+  const localVideoFallbackLoadingRef = useRef(false);
+
+  const resolvedTitle = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, data), [data]);
+  const isVideo = data.mediaType === "video";
+  const mediaSrc = data.sourcePath ? resolveImageDisplayUrl(data.sourcePath) : null;
+  const playbackSrc = localVideoFallbackSrc ?? mediaSrc;
+  const fallbackWaveformBars = useMemo(() => (mediaSrc ? createWaveformBars(mediaSrc) : []), [mediaSrc]);
+  const [waveformBars, setWaveformBars] = useState<number[]>(fallbackWaveformBars);
+  // 尺寸/体积标注改为悬停延迟显示, 避免常驻文字干扰画面。
+  const mediaHover = useHoverIntent();
+  // 文件大小仅在用户选中或悬停时查询；大量视频节点不再同时发起原生文件 stat 调用。
+  const mediaByteSize = useMediaByteSize(isVideo && (selected || mediaHover.visible) ? data.sourcePath : null);
+  const isGenerating = typeof data.isGenerating === "boolean" ? data.isGenerating : false;
+  const generationError = typeof data.generationError === "string" ? data.generationError.trim() : "";
+  const hasGenerationError = isGenerating === false && !mediaSrc && generationError.length > 0;
+  const generationCanceled = data.generationCanceled === true;
+  const hasGenerationCanceled = isGenerating === false && !mediaSrc && generationCanceled;
+  /**
+   * 「取消生成」入口只在**请求还没送到平台**这一段显示。
+   *
+   * 窗口由提交流水线(前端准备/上传)与后端在飞表共同决定, 见 videoGenerationCancel.ts:
+   * 平台一受理, 后端就把窗口关掉, 按钮随之消失 —— 那时取消只会丢掉已经计费的结果。
+   */
+  const cancelWindowOpen = useSyncExternalStore(
+    subscribeVideoCancellation,
+    () => isVideoCancellationWindowOpen(id),
+    () => false,
+  );
+  const cancelRequested = useSyncExternalStore(
+    subscribeVideoCancellation,
+    () => isVideoCancellationRequested(id),
+    () => false,
+  );
+
+  /**
+   * 取消这次生成。
+   *
+   * 分两段处理, 与窗口的两段一一对应:
+   *  - 请求还没 invoke 出去(前端准备/上传阶段): 只置位, 提交流水线会在下一个检查点
+   *    中止并把节点落成「已取消」;
+   *  - 已经交到后端、请求还在飞: 让后端把在飞请求丢掉(`cancelGenerateVideoJob`)。
+   *    后端回 `too_late` 说明平台已经受理 —— 收掉入口, 让任务照常跑完, 不留一个
+   *    点了没反应的按钮。
+   */
+  const handleCancelGeneration = useCallback(() => {
+    if (!requestVideoCancellation(id)) return;
+    const jobId = typeof data.generationJobId === "string" ? data.generationJobId : "";
+    if (!jobId) return;
+    void canvasAiGateway
+      .cancelGenerateVideoJob(jobId)
+      .then((outcome) => {
+        if (outcome !== "canceled") closeVideoCancellationWindow(id);
+      })
+      .catch(() => {
+        closeVideoCancellationWindow(id);
+      });
+  }, [data.generationJobId, id]);
+  const generationStartedAt = typeof data.generationStartedAt === "number" ? data.generationStartedAt : null;
+  const generationDurationMs = typeof data.generationDurationMs === "number" ? data.generationDurationMs : 180000;
+  // 有封面的视频平时只显示图片，不占用解码器。悬停、播放、打开查看器时才按需挂载。
+  // 选中节点时保持 video 元素挂载，否则点击节点工具栏截图时 ref 为空，时间点会退回 0 秒。
+  const shouldMountVideo =
+    isVideo && (!data.previewImageUrl || selected || isVideoHovered || isPlaying || isVideoViewerOpen);
+
+  useEffect(() => {
+    setWaveformBars(fallbackWaveformBars);
+    // 默认波形已经足够用于未选中节点；只有用户当前操作的音频才解码完整文件，避免
+    // 多节点画布同时把多条长音频解压到内存。
+    if (isVideo || !selected || !mediaSrc || typeof AudioContext === "undefined") return;
+    const controller = new AbortController();
+    const audioContext = new AudioContext();
+    void fetch(mediaSrc, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Audio fetch failed: ${response.status}`);
+        return response.arrayBuffer();
+      })
+      .then((bytes) => audioContext.decodeAudioData(bytes))
+      .then((buffer) => {
+        if (!controller.signal.aborted) setWaveformBars(createWaveformBarsFromBuffer(buffer));
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) console.debug("[mediaNode] waveform decode fallback", error);
+      })
+      .finally(() => void audioContext.close());
+    return () => controller.abort();
+  }, [fallbackWaveformBars, isVideo, mediaSrc, selected]);
+
+  useEffect(() => {
+    videoFallbackRequestRef.current += 1;
+    setVideoDimensions(null);
+    setVideoDuration(0);
+    setPlaybackTime(0);
+    playbackTimeRef.current = 0;
+    audioProgressFillRef.current?.style.setProperty("clip-path", "inset(0 100% 0 0)");
+    audioPlayheadRef.current?.style.setProperty("left", "0%");
+    setIsPlaying(false);
+    localVideoFallbackLoadingRef.current = false;
+    setLocalVideoFallbackSrc((current) => {
+      if (current) {
+        if (current.startsWith("blob:")) URL.revokeObjectURL(current);
+      }
+      localVideoFallbackSrcRef.current = null;
+      return null;
+    });
+    const previousPlaybackPath = playbackTempPathRef.current;
+    playbackTempPathRef.current = null;
+    if (previousPlaybackPath) {
+      void invoke("remove_video_playback_file", { path: previousPlaybackPath }).catch(() => undefined);
+    }
+  }, [data.sourcePath, isVideo]);
+
+  useEffect(
+    () => () => {
+      const fallbackSrc = localVideoFallbackSrcRef.current;
+      if (fallbackSrc?.startsWith("blob:")) {
+        URL.revokeObjectURL(fallbackSrc);
+        localVideoFallbackSrcRef.current = null;
+      }
+      const playbackPath = playbackTempPathRef.current;
+      playbackTempPathRef.current = null;
+      if (playbackPath) {
+        void invoke("remove_video_playback_file", { path: playbackPath }).catch(() => undefined);
+      }
+    },
+    [],
+  );
+
+  const handleLocalVideoLoadError = useCallback(() => {
+    const source = data.sourcePath?.trim();
+    if (!isVideo || !source || !isTauri() || localVideoFallbackLoadingRef.current) {
+      return;
+    }
+    // 原生播放器失败时统一转成 H.264/AAC MP4。MOV 里的 HEVC、ProRes 等编码在
+    // WebView2 中常常只能显示元信息，不能真正解码或 seek；远程视频也走同一条链路。
+    const lower = source.toLowerCase();
+    if (lower.startsWith("blob:") || lower.startsWith("data:")) {
+      return;
+    }
+    const requestId = ++videoFallbackRequestRef.current;
+    localVideoFallbackLoadingRef.current = true;
+    void invoke<string>("prepare_video_playback", { source })
+      .then((preparedPath) => {
+        if (videoFallbackRequestRef.current !== requestId) {
+          void invoke("remove_video_playback_file", { path: preparedPath }).catch(() => undefined);
+          return;
+        }
+        playbackTempPathRef.current = preparedPath;
+        const preparedUrl = resolveImageDisplayUrl(preparedPath);
+        setLocalVideoFallbackSrc((current) => {
+          if (current?.startsWith("blob:")) {
+            URL.revokeObjectURL(current);
+          }
+          localVideoFallbackSrcRef.current = preparedUrl;
+          return preparedUrl;
+        });
+      })
+      .catch(async (error) => {
+        // 转码不可用时仍尝试读取原始字节，兼容少量 WebView 能解码但 asset 协议加载失败的文件。
+        try {
+          if (videoFallbackRequestRef.current !== requestId) return;
+          const dataUrl = await invoke<string>("load_media_data_url", { source });
+          if (videoFallbackRequestRef.current !== requestId) return;
+          const blobUrl = createObjectUrlFromDataUrl(dataUrl);
+          setLocalVideoFallbackSrc((current) => {
+            if (current?.startsWith("blob:")) URL.revokeObjectURL(current);
+            localVideoFallbackSrcRef.current = blobUrl;
+            return blobUrl;
+          });
+        } catch (fallbackError) {
+          localVideoFallbackLoadingRef.current = false;
+          console.warn("[mediaNode] video playback fallback failed", error, fallbackError);
+        }
+      });
+  }, [data.sourcePath, isVideo]);
+
+  const handleVideoMetadata = useCallback(
+    (event: SyntheticEvent<HTMLVideoElement>) => {
+      const video = event.currentTarget;
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        setVideoDimensions({ width: video.videoWidth, height: video.videoHeight });
+      }
+      // 时长用于控制条进度: 流式/未探测到时长时 duration 为 NaN 或 Infinity, 需挡掉。
+      if (Number.isFinite(video.duration) && video.duration > 0) {
+        setVideoDuration(video.duration);
+      }
+      // HEVC/ProRes 的素材在 WebView2 里不会触发 error, 只会被静默丢掉视频轨 ——
+      // 表现为「只有声音、没有画面」。这种情况只能靠「时长已就绪但尺寸仍为 0」识别,
+      // 识别到就立刻走 H.264 播放代理, 否则整条 onError 兜底永远不会被调用。
+      if (isVideoTrackUndecoded(video)) {
+        handleLocalVideoLoadError();
+      }
+    },
+    [handleLocalVideoLoadError],
+  );
+
+  /** 控制条播放/暂停按钮。播放失败(自动播放策略/源不可用)时保持暂停, 不打断用户。 */
+  const toggleVideoPlayback = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    if (video.paused) {
+      void video.play().catch((error: unknown) => {
+        console.warn("[mediaNode] video play failed", error);
+      });
+      return;
+    }
+    video.pause();
+  }, []);
+
+  const toggleAudioPlayback = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audio.paused) {
+      void audio.play().catch((error: unknown) => console.warn("[mediaNode] audio play failed", error));
+    } else {
+      audio.pause();
+    }
+  }, []);
+
+  // timeupdate 通常每秒触发 4～10 次。每次都 setState 会让播放中的每个节点反复
+  // 参与 React Flow 重渲染；把画布显示精度限制到 0.2 秒，人眼看不出差异但明显减轻卡顿。
+  const playbackTimeRef = useRef(0);
+  const updatePlaybackTime = useCallback((nextTime: number, force = false) => {
+    if (!Number.isFinite(nextTime)) return;
+    if (!force && Math.abs(nextTime - playbackTimeRef.current) < 0.2) return;
+    playbackTimeRef.current = nextTime;
+    setPlaybackTime(nextTime);
+  }, []);
+
+  const updateAudioWaveformProgress = useCallback((time: number, duration: number) => {
+    if (!Number.isFinite(time) || !Number.isFinite(duration) || duration <= 0) return;
+    const percent = Math.max(0, Math.min(100, (time / duration) * 100));
+    // 只写两个轻量 DOM 属性，不让 56 根波形柱在每一帧随 React 重渲染。
+    audioProgressFillRef.current?.style.setProperty("clip-path", `inset(0 ${100 - percent}% 0 0)`);
+    audioPlayheadRef.current?.style.setProperty("left", `${percent}%`);
+  }, []);
+
+  const seekAudio = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      const audio = audioRef.current;
+      if (!audio || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
+      const rect = event.currentTarget.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+      audio.currentTime = ratio * audio.duration;
+      updateAudioWaveformProgress(audio.currentTime, audio.duration);
+      updatePlaybackTime(audio.currentTime, true);
+    },
+    [updateAudioWaveformProgress, updatePlaybackTime],
+  );
+
+  // 浏览器的 timeupdate 通常只有 4～10fps。播放中额外用 requestAnimationFrame 读取
+  // currentTime，让波形遮罩与播放头连续移动；React 状态仍按 0.2 秒节流更新时钟文本。
+  useEffect(() => {
+    if (isVideo || !isPlaying) return;
+    let frameId = 0;
+    const updateFrame = () => {
+      const audio = audioRef.current;
+      if (!audio || audio.paused) return;
+      updateAudioWaveformProgress(audio.currentTime, audio.duration);
+      updatePlaybackTime(audio.currentTime);
+      frameId = requestAnimationFrame(updateFrame);
+    };
+    frameId = requestAnimationFrame(updateFrame);
+    return () => cancelAnimationFrame(frameId);
+  }, [isPlaying, isVideo, updateAudioWaveformProgress, updatePlaybackTime]);
+
+  // 视频解码出真实尺寸后, 把宽高比写回节点数据, 并把边框重算成同比例的尺寸。
+  // 视频节点的盒子就是画面, 没有缩放把手, 边框只跟着画面走 —— 竖屏/横屏混排时
+  // 也不会出现「边框比例不对、画面居中留黑边」。写入不参与历史记录, 因此走 store 的
+  // 媒体尺寸同步动作(它只在数据真的变了时才动节点)。
+  useEffect(() => {
+    if (!isVideo || !videoDimensions) {
+      return;
+    }
+
+    syncMediaNodeMediaSize(id, videoDimensions.width, videoDimensions.height);
+  }, [id, isVideo, syncMediaNodeMediaSize, videoDimensions]);
+
+  // 生成中: 定时刷新以驱动模拟进度条(与 AI 图片结果节点一致)
+  useEffect(() => {
+    if (!isGenerating) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+    }, 120);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isGenerating]);
+
+  useEffect(() => {
+    if (!isVideoViewerOpen) {
+      return;
+    }
+    // 放大播放器接管播放: 先停掉节点内的播放, 避免两路声音叠在一起。
+    videoRef.current?.pause();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsVideoViewerOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isVideoViewerOpen]);
+
+  // 双击画面 = 打开放大播放器。
+  //
+  // 现在画面上的指针事件全部落在覆盖层(videoSurfaceRef)上, <video> 自身是
+  // pointer-events:none, 所以这里监听覆盖层而非 video 元素。
+  // 仍必须挂在**捕获阶段**: React Flow 的"双击缩放"监听挂在 pane(祖先)上且在
+  // 冒泡阶段执行, 早于 React root 的合成事件派发 —— JSX onDoubleClick 拦不住它,
+  // 结果会是"双击既打开播放器又把画布缩放了"。目标元素上的捕获监听先执行, 就地
+  // stopImmediatePropagation 可一并取消 UA 默认行为(原生全屏)与画布缩放。
+  useEffect(() => {
+    const surface = videoSurfaceRef.current;
+    if (!isVideo || !surface) {
+      return;
+    }
+    const handleDoubleClick = (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setIsVideoViewerOpen(true);
+    };
+    surface.addEventListener("dblclick", handleDoubleClick, true);
+    return () => {
+      surface.removeEventListener("dblclick", handleDoubleClick, true);
+    };
+  }, [isVideo, mediaSrc]);
+
+  // 查看器内的视频本身就是一个"全屏视图", 双击不该再叠一层原生全屏。
+  useEffect(() => {
+    const video = viewerVideoRef.current;
+    if (!isVideoViewerOpen || !video) {
+      return;
+    }
+    const blockNativeDoubleClickFullscreen = (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    video.addEventListener("dblclick", blockNativeDoubleClickFullscreen, true);
+    return () => {
+      video.removeEventListener("dblclick", blockNativeDoubleClickFullscreen, true);
+    };
+  }, [isVideoViewerOpen]);
+
+  const simulatedProgress = useMemo(() => {
+    if (!isGenerating) {
+      return 0;
+    }
+    const startedAt = generationStartedAt ?? Date.now();
+    const duration = Math.max(1000, generationDurationMs);
+    const elapsed = Math.max(0, now - startedAt);
+    return Math.min(elapsed / duration, 0.96);
+  }, [generationDurationMs, generationStartedAt, isGenerating, now]);
+
+  const waitedMinutes = useMemo(() => {
+    if (!isGenerating || generationStartedAt === null) {
+      return 0;
+    }
+    return Math.floor(Math.max(0, now - generationStartedAt) / 60000);
+  }, [generationStartedAt, isGenerating, now]);
+
+  const waitingResultText = useMemo(() => {
+    if (!isGenerating || waitedMinutes < 2) {
+      return "生成中…";
+    }
+    return `生成中…（已等待 ${waitedMinutes} 分钟）`;
+  }, [isGenerating, waitedMinutes]);
+
+  const applyMediaSource = useCallback(
+    (sourcePath: string, mediaType: "audio" | "video", fileName: string) => {
+      updateNodeData(id, {
+        sourcePath,
+        mediaType,
+        previewImageUrl: null,
+        aspectRatio: undefined,
+        displayName: fileName.replace(/\.[^.]+$/, "").trim() || fileName,
+      });
+    },
+    [id, updateNodeData],
+  );
+
+  /** 上传媒体文件(点击选择或拖拽), 持久化后写入节点 */
+  const handleMediaFiles = useCallback(
+    async (files: FileList | File[]) => {
+      const file = Array.from(files)[0];
+      if (!file) {
+        return;
+      }
+      const mediaType = file.type.startsWith("video/") ? "video" : file.type.startsWith("audio/") ? "audio" : null;
+      if (!mediaType) {
+        return;
+      }
+      setIsUploading(true);
+      try {
+        const extension = file.name.split(".").pop()?.trim() || (mediaType === "video" ? "mp4" : "mp3");
+        const sourcePath = isTauri() ? await persistLibraryAssetFromFile(file, extension) : URL.createObjectURL(file);
+        applyMediaSource(sourcePath, mediaType, file.name);
+      } catch (error) {
+        console.warn("[mediaNode] upload failed", error);
+      } finally {
+        setIsUploading(false);
+      }
+    },
+    [applyMediaSource],
+  );
+
+  const handleUploadClick = useCallback(async () => {
+    if (!isTauri()) {
+      fileInputRef.current?.click();
+      return;
+    }
+
+    const selectedPath = await open({
+      multiple: false,
+      filters: [
+        {
+          name: "媒体文件",
+          extensions: ["mp4", "mov", "m4v", "webm", "avi", "mkv", "mp3", "m4a", "wav", "aac", "flac", "ogg"],
+        },
+      ],
+    });
+    if (!selectedPath || Array.isArray(selectedPath)) {
+      return;
+    }
+
+    const fileName = selectedPath.split(/[\\/]/).pop() || "media";
+    const extension = fileName.split(".").pop()?.trim() || "bin";
+    const videoExtensions = new Set(["mp4", "mov", "m4v", "webm", "avi", "mkv"]);
+    const mediaType = videoExtensions.has(extension.toLowerCase()) ? "video" : "audio";
+    setIsUploading(true);
+    try {
+      const sourcePath = await persistLibraryAssetFile(selectedPath, extension);
+      applyMediaSource(sourcePath, mediaType, fileName);
+    } catch (error) {
+      console.warn("[mediaNode] native upload failed", error);
+    } finally {
+      setIsUploading(false);
+    }
+  }, [applyMediaSource]);
+
+  useEffect(() => {
+    return canvasEventBus.subscribe("upload-node/reupload", ({ nodeId }) => {
+      if (nodeId === id) {
+        void handleUploadClick();
+      }
+    });
+  }, [handleUploadClick, id]);
+
+  // 历史版本抽帧时视频帧尚未呈现, 在引用池里留下一批全透明"空白封面"(还被多个节点按内容复用)。
+  // 拿到缩略图先做一次空白判定, 命中就清空, 由下面的抽帧流程重新生成(失败也不会再写空白图)。
+  useEffect(() => {
+    const thumbnail = data.previewImageUrl;
+    if (!isVideo || !thumbnail) {
+      return;
+    }
+    let disposed = false;
+    void (async () => {
+      const blank = await isBlankThumbnail(thumbnail);
+      if (!disposed && blank) {
+        updateNodeData(id, { previewImageUrl: null });
+      }
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, [data.previewImageUrl, id, isVideo, updateNodeData]);
+
+  // 桌面端优先由 FFmpeg 抽取视频封面，避免 WebView2 对 MOV 编码和视频 canvas 的限制；
+  // 没有 FFmpeg 时再回退到前端解码路径。
+  useEffect(() => {
+    // 存成局部常量: data.sourcePath 是属性访问, 跨 async 边界后 TS 无法保持窄化。
+    const sourcePath = data.sourcePath;
+    if (!isVideo || !isTauri() || data.previewImageUrl || !sourcePath) {
+      return;
+    }
+    // 配额用尽就不再自动重试, 避免"抽帧失败/抽出空白 → 清空 → 再抽"无限循环。
+    const thumbnailKey = `${id}|${sourcePath}`;
+    if ((thumbnailAttemptCounts.get(thumbnailKey) ?? 0) >= MAX_THUMBNAIL_ATTEMPTS) {
+      return;
+    }
+    let disposed = false;
+    const commitThumbnail = (thumbnail: string | null | undefined): boolean => {
+      if (disposed || !thumbnail) {
+        return false;
+      }
+      updateNodeData(id, { previewImageUrl: thumbnail });
+      return true;
+    };
+    void (async () => {
+      try {
+        const localThumbnail = await extractVideoThumbnail(sourcePath).catch(() => null);
+        if (commitThumbnail(localThumbnail) || disposed) {
+          return;
+        }
+        try {
+          const dataUrl = await captureVideoFrame({
+            source: sourcePath,
+            maxWidth: REMOTE_VIDEO_THUMBNAIL_MAX_WIDTH,
+          });
+          const prepared = await prepareNodeImage(dataUrl);
+          commitThumbnail(prepared.previewImageUrl ?? prepared.imageUrl ?? dataUrl);
+        } catch (error) {
+          // 三级取帧都失败时保持 video 播放器显示, 不打断用户。
+          console.warn("[mediaNode] remote video thumbnail fallback failed", error);
+        }
+      } finally {
+        // 因卸载被取消的那次不计数: 组件马上会重新挂载并再试, 不该白白吃掉配额。
+        if (!disposed) {
+          thumbnailAttemptCounts.set(thumbnailKey, (thumbnailAttemptCounts.get(thumbnailKey) ?? 0) + 1);
+        }
+      }
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, [data.previewImageUrl, data.sourcePath, id, isVideo, updateNodeData]);
+
+  const handleCaptureFrame = useCallback(async () => {
+    const source = data.sourcePath;
+    if (!source) {
+      return;
+    }
+    // 连点会并发跑两条抽帧、各自建一个结果节点。用 ref 挡，不依赖 state 的下一帧。
+    if (capturingRef.current) return;
+    capturingRef.current = true;
+    setIsCapturing(true);
+    try {
+      // 取帧优先交给 FFmpeg，MOV/远程视频不再依赖 WebView2 canvas；浏览器环境仍回退到
+      // 原来的 video + canvas 路径。始终使用原始 source，让 native 路径能识别本地文件。
+      const playerTime = videoRef.current?.currentTime;
+      const requestedTime =
+        typeof playerTime === "number" &&
+        Number.isFinite(playerTime) &&
+        Math.abs(playerTime - playbackTimeRef.current) < 0.25
+          ? playerTime
+          : playbackTimeRef.current;
+      /**
+       * 拖到片尾时 `playbackTime` 可能正好等于（甚至微超）视频时长。
+       * ffmpeg 在 `-ss == duration` 处取不到帧 → 输出为空 → 报错，表现出来就是
+       * 「点截图没反应 / 一直停在截图中」。往回收 0.05s，仍是最后一帧。
+       */
+      const durationHint = videoRef.current?.duration ?? videoDuration;
+      const safeTime =
+        Number.isFinite(durationHint) && durationHint > 0
+          ? Math.min(requestedTime, Math.max(0, durationHint - 0.05))
+          : requestedTime;
+      const dataUrl = await captureVideoFrame({
+        source,
+        timeSec: safeTime,
+      });
+      const prepared = await prepareNodeImage(dataUrl);
+      const createdNodeId = addDerivedExportNode(
+        id,
+        prepared.imageUrl,
+        prepared.aspectRatio,
+        prepared.previewImageUrl,
+        {
+          defaultTitle: "视频截图",
+          resultKind: "generic",
+          aspectRatioStrategy: "provided",
+        },
+      );
+      if (createdNodeId) {
+        addEdge(id, createdNodeId);
+      }
+    } catch (error) {
+      console.warn("[mediaNode] capture frame failed", error);
+      // 截图结果节点无法创建时, 用全局错误弹窗反馈(按钮已移到节点工具栏, 节点内不再有错误行)。
+      void showErrorDialog(
+        error instanceof DOMException && error.name === "SecurityError"
+          ? "视频源未授权跨域截图"
+          : error instanceof Error
+            ? error.message
+            : "截图失败",
+        "截图失败",
+      );
+    } finally {
+      capturingRef.current = false;
+      setIsCapturing(false);
+    }
+  }, [addDerivedExportNode, addEdge, data.sourcePath, id, videoDuration]);
+
+  /** 截图入口已移到节点工具栏(下载旁), 通过事件总线触发, 与 upload-node/reupload 一致。 */
+  useEffect(() => {
+    return canvasEventBus.subscribe("media-node/capture-frame", ({ nodeId }) => {
+      if (nodeId === id) {
+        void handleCaptureFrame();
+      }
+    });
+  }, [handleCaptureFrame, id]);
+
+  const dropHandlers = {
+    onDragOver: (event: React.DragEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    onDrop: (event: React.DragEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void handleMediaFiles(event.dataTransfer.files);
+    },
+  };
+
+  return (
+    <div
+      className={`relative flex h-full w-full flex-col rounded-[var(--node-radius)] border bg-surface-dark/90 transition-colors duration-150 canvas-media-node p-0 ${
+        hasGenerationError
+          ? selected
+            ? "border-red-400 shadow-[0_0_0_1px_rgba(248,113,113,0.42)]"
+            : "border-red-500/70 bg-[rgba(127,29,29,0.12)] hover:border-red-400/80 dark:border-red-500/70 dark:hover:border-red-400/80"
+          : selected
+            ? "border-accent shadow-[0_0_0_1px_rgba(59,130,246,0.32)]"
+            : "border-[rgba(15,23,42,0.22)] dark:border-[rgba(255,255,255,0.22)]"
+      }`}
+      {...dropHandlers}
+      {...mediaHover.hoverProps}
+    >
+      <NodeHeader
+        className={NODE_HEADER_FLOATING_POSITION_CLASS}
+        icon={isVideo ? <Video className="h-4 w-4" /> : <Music2 className="h-4 w-4" />}
+        titleText={resolvedTitle}
+        editable
+        onTitleChange={(nextTitle) => updateNodeData(id, { displayName: nextTitle })}
+      />
+
+      {mediaSrc ? (
+        isVideo ? (
+          <>
+            {/* 视频画面顶到上部, 铺满可用空间; 缩略图作为 poster。
+                交互约定: 画面任意位置左键拖拽 = 移动节点; 播放/暂停/进度在底部控制条;
+                双击画面(或点放大按钮) 进放大播放器。 */}
+            <div
+              className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-[inherit] bg-black/45"
+              onPointerEnter={() => setIsVideoHovered(true)}
+              onPointerLeave={() => setIsVideoHovered(false)}
+            >
+              {/* 媒体元素默认 draggable: 不关掉时按住画面拖动会触发浏览器原生拖拽,
+                  生成一个跟随鼠标的拖影, 与 React Flow 的节点拖动争夺同一个指针,
+                  表现为节点粘在鼠标上甩不掉。项目内所有 <img> 都已 draggable={false},
+                  此处补齐 video/audio。 */}
+              {shouldMountVideo ? (
+                <video
+                  ref={videoRef}
+                  draggable={false}
+                  onDragStart={(event) => event.preventDefault()}
+                  src={playbackSrc ?? ""}
+                  preload="metadata"
+                  poster={data.previewImageUrl ? resolveImageDisplayUrl(data.previewImageUrl) : undefined}
+                  className="pointer-events-none h-full w-full object-contain"
+                  onLoadedMetadata={handleVideoMetadata}
+                  onError={handleLocalVideoLoadError}
+                  onPlay={() => setIsPlaying(true)}
+                  onPause={() => setIsPlaying(false)}
+                  onEnded={() => setIsPlaying(false)}
+                  onTimeUpdate={(event) => updatePlaybackTime(event.currentTarget.currentTime)}
+                />
+              ) : (
+                <img
+                  src={resolveImageDisplayUrl(data.previewImageUrl ?? "")}
+                  alt={resolvedTitle}
+                  draggable={false}
+                  className="pointer-events-none h-full w-full object-contain"
+                />
+              )}
+              {/* 透明交互层: 画面上的指针事件落在这里并冒泡到节点, 于是画面任意位置
+                  左键拖拽都能移动节点。刻意不加 nodrag —— 加了就拖不动了。 */}
+              <div ref={videoSurfaceRef} className="absolute inset-0" />
+              {/* 截图进行中的轻量反馈: 按钮在节点工具栏, 这里只显示进度 */}
+              {isCapturing && (
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35">
+                  <span className="flex items-center gap-1.5 rounded-full bg-bg-dark/85 px-2.5 py-1 text-[11px] text-text-dark">
+                    <LoaderCircle className="h-3.5 w-3.5 animate-spin text-accent/80" />
+                    截图中…
+                  </span>
+                </div>
+              )}
+              {/* 播放控制条: 带 nodrag, 在其上的指针不会拖动节点, 因此进度条可正常拖拽。
+                  节点内不再使用原生 controls —— 原生控件会吃掉画面上的指针, 与"任意位置拖动节点"冲突。
+                  仅悬停/播放中出现: 其余时间 opacity-0 + pointer-events-none, 画面整块都能拖。 */}
+              <div
+                className={`nodrag absolute inset-x-0 bottom-0 z-10 flex items-center gap-1.5 bg-gradient-to-t from-black/80 via-black/40 to-transparent px-2 pb-1.5 pt-6 text-white transition-opacity duration-150 ${
+                  isVideoHovered || isPlaying ? "opacity-100" : "pointer-events-none opacity-0"
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={toggleVideoPlayback}
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white/20 transition-colors hover:bg-white/40"
+                  title={isPlaying ? "暂停" : "播放"}
+                  aria-label={isPlaying ? "暂停" : "播放"}
+                >
+                  {isPlaying ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={videoDuration > 0 ? videoDuration : 1}
+                  step={0.01}
+                  value={videoDuration > 0 ? Math.min(playbackTime, videoDuration) : 0}
+                  onChange={(event) => {
+                    const video = videoRef.current;
+                    const next = Number(event.target.value);
+                    if (video && Number.isFinite(next)) {
+                      video.currentTime = next;
+                    }
+                    updatePlaybackTime(next, true);
+                  }}
+                  className="h-3 min-w-0 flex-1 cursor-pointer accent-white"
+                  title="播放进度"
+                  aria-label="播放进度"
+                />
+                <span className="shrink-0 text-[10px] tabular-nums text-white/80">
+                  {formatClock(playbackTime)} / {formatClock(videoDuration)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsVideoViewerOpen(true)}
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-white/20 transition-colors hover:bg-white/40"
+                  title="放大播放（双击画面同样可打开）"
+                  aria-label="放大播放"
+                >
+                  <Maximize2 className="h-3 w-3" />
+                </button>
+              </div>
+            </div>
+            <MediaDimensionsLabel dimensions={videoDimensions} fileSize={mediaByteSize} visible={mediaHover.visible} />
+          </>
+        ) : (
+          <div className="relative min-h-0 flex-1 overflow-hidden rounded-[inherit]">
+            <audio
+              ref={audioRef}
+              draggable={false}
+              onDragStart={(event) => event.preventDefault()}
+              src={mediaSrc}
+              preload="metadata"
+              className="sr-only"
+              onLoadedMetadata={(event) => {
+                const duration = event.currentTarget.duration;
+                if (Number.isFinite(duration) && duration > 0) setVideoDuration(duration);
+              }}
+              onPlay={() => setIsPlaying(true)}
+              onPause={() => setIsPlaying(false)}
+              onEnded={() => setIsPlaying(false)}
+              onTimeUpdate={(event) => {
+                updateAudioWaveformProgress(event.currentTarget.currentTime, event.currentTarget.duration);
+                updatePlaybackTime(event.currentTarget.currentTime);
+              }}
+            />
+            <div
+              className="group absolute inset-0 flex cursor-pointer items-center gap-[3px] overflow-hidden"
+              onClick={seekAudio}
+              role="slider"
+              aria-label="音频播放进度"
+              aria-valuemin={0}
+              aria-valuemax={videoDuration || 0}
+              aria-valuenow={playbackTime}
+            >
+              <div className="absolute inset-0 bg-accent/[0.06]" />
+              <div className="absolute inset-0 flex items-center gap-[3px]">
+                {waveformBars.map((height, index) => (
+                  <span
+                    key={`${mediaSrc}-base-${index}`}
+                    className="min-w-[2px] flex-1 rounded-full bg-text-muted/45 transition-colors group-hover:bg-text-muted/65"
+                    style={{ height: `${Math.round(height * 100)}%` }}
+                  />
+                ))}
+              </div>
+              <div
+                ref={audioProgressFillRef}
+                className="pointer-events-none absolute inset-0 z-[2] flex items-center gap-[3px] overflow-hidden"
+                style={{ clipPath: `inset(0 ${100 - (videoDuration > 0 ? Math.min(100, (playbackTime / videoDuration) * 100) : 0)}% 0 0)` }}
+              >
+                {waveformBars.map((height, index) => (
+                  <span
+                    key={`${mediaSrc}-played-${index}`}
+                    className="min-w-[2px] flex-1 rounded-full bg-accent"
+                    style={{ height: `${Math.round(height * 100)}%` }}
+                  />
+                ))}
+              </div>
+              <div
+                ref={audioPlayheadRef}
+                className="pointer-events-none absolute inset-y-0 z-[3] w-px bg-accent/90 shadow-[0_0_5px_rgba(59,130,246,0.75)]"
+                style={{ left: `${videoDuration > 0 ? Math.min(100, (playbackTime / videoDuration) * 100) : 0}%` }}
+              />
+            </div>
+            <button
+              type="button"
+              className="nodrag nopan absolute bottom-2 left-2 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-accent text-white shadow-md transition-transform hover:scale-105"
+              onClick={toggleAudioPlayback}
+              onMouseDown={(event) => event.stopPropagation()}
+              aria-label={isPlaying ? "暂停音频" : "播放音频"}
+            >
+              {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="ml-0.5 h-3.5 w-3.5" />}
+            </button>
+            <span className="pointer-events-none absolute bottom-2 right-2 z-10 rounded bg-bg-dark/65 px-1.5 py-0.5 text-[10px] tabular-nums text-text-dark/85">
+              {formatClock(playbackTime)} / {formatClock(videoDuration)}
+            </span>
+          </div>
+        )
+      ) : hasGenerationError ? (
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-[inherit] bg-[rgba(127,29,29,0.2)] px-4 text-red-300">
+          <AlertTriangle className="h-7 w-7 opacity-90" />
+          <span className="text-center text-[12px] font-medium leading-5 text-red-200">生成失败</span>
+          <span className="max-h-[88px] overflow-y-auto break-words text-center text-[11px] leading-5 text-red-200/90">
+            {generationError}
+          </span>
+        </div>
+      ) : hasGenerationCanceled ? (
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-1.5 rounded-[inherit] bg-bg-dark/35 px-4 text-text-muted">
+          <CircleSlash className="h-7 w-7 opacity-70" />
+          <span className="text-center text-[12px] font-medium leading-5">已取消生成</span>
+          <span className="text-center text-[11px] leading-5 text-text-muted/80">请求未送达模型平台</span>
+        </div>
+      ) : isGenerating ? (
+        <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-1.5 overflow-hidden rounded-[inherit] bg-bg-dark/45 p-2 text-text-muted/85">
+          <LoaderCircle className="h-7 w-7 animate-spin text-accent/70" />
+          <span className="px-4 text-center text-[12px] leading-6">
+            {cancelWindowOpen ? "正在准备提交…" : waitingResultText}
+          </span>
+          {cancelWindowOpen && (
+            <button
+              type="button"
+              className="nodrag nopan relative z-10 flex items-center gap-1 rounded-full border border-white/20 bg-bg-dark/70 px-2.5 py-1 text-[11px] leading-none text-text-dark/90 transition-colors hover:bg-bg-dark hover:text-text-dark disabled:cursor-default disabled:opacity-60"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={handleCancelGeneration}
+              disabled={cancelRequested}
+            >
+              <X className="h-3 w-3" />
+              {cancelRequested ? "正在取消…" : "取消生成"}
+            </button>
+          )}
+          <div className="pointer-events-none absolute inset-0 overflow-hidden">
+            <div className="absolute inset-0 bg-bg-dark/30" />
+            <div
+              className="absolute left-0 top-0 h-full bg-gradient-to-r from-[rgba(255,255,255,0.28)] to-[rgba(255,255,255,0.05)] transition-[width] duration-100 ease-linear"
+              style={{ width: `${simulatedProgress * 100}%` }}
+            />
+          </div>
+        </div>
+      ) : (
+        /* 空状态: 点击或拖拽上传媒体 */
+        <button
+          type="button"
+          className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-[inherit] text-text-muted transition-colors hover:bg-accent/5 hover:text-text-dark"
+          onClick={() => void handleUploadClick()}
+        >
+          {isVideo ? <Video className="h-9 w-9 opacity-60" /> : <AudioLines className="h-9 w-9 opacity-60" />}
+          <span className="flex items-center gap-1.5 text-xs">
+            <Upload className="h-3.5 w-3.5" />
+            {isUploading ? "上传中…" : isVideo ? "点击或拖拽上传视频" : "点击或拖拽上传音频"}
+          </span>
+        </button>
+      )}
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="video/*,audio/*"
+        className="hidden"
+        onChange={(event) => {
+          if (event.target.files) {
+            void handleMediaFiles(event.target.files);
+          }
+          event.target.value = "";
+        }}
+      />
+
+      <Handle
+        type="target"
+        id="target"
+        position={Position.Left}
+        className="!h-2 !w-2 !border-surface-dark !bg-accent"
+      />
+      <Handle
+        type="source"
+        id="source"
+        position={Position.Right}
+        className="!h-2 !w-2 !border-surface-dark !bg-accent"
+      />
+      {/* 视频形态也放开缩放：store 侧对 `audio` + `mediaType==='video'` 走
+          VIDEO_MEDIA_RESIZE_BOUNDS 的等比修正，盒子只是"框住画面"，用户需要能调大小；
+          以前这里直接不给把手，视频节点就完全拖不动。 */}
+      <NodeResizeHandle {...resolveMediaNodeResizeBounds(CANVAS_NODE_TYPES.audio, data)} />
+      {isVideoViewerOpen &&
+        mediaSrc &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[180] flex items-center justify-center bg-black/90 p-6 backdrop-blur-sm"
+            onClick={() => setIsVideoViewerOpen(false)}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="absolute right-5 top-5 z-10 flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-black/60 text-white transition-colors hover:bg-white/15"
+              onClick={() => setIsVideoViewerOpen(false)}
+              title="关闭视频预览"
+              aria-label="关闭视频预览"
+            >
+              <X className="h-5 w-5" />
+            </button>
+            <video
+              ref={viewerVideoRef}
+              controls
+              autoPlay
+              draggable={false}
+              onDragStart={(event) => event.preventDefault()}
+              onDoubleClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              src={playbackSrc ?? ""}
+              preload="auto"
+              className="max-h-full max-w-full rounded-lg object-contain shadow-2xl"
+              onClick={(event) => event.stopPropagation()}
+              onError={handleLocalVideoLoadError}
+            />
+          </div>,
+          document.body,
+        )}
+    </div>
+  );
+});
+
+AudioNode.displayName = "AudioNode";

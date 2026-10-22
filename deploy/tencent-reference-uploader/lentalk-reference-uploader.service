@@ -1,0 +1,20 @@
+[Unit]
+Description=LenTalk public reference asset uploader
+After=network.target
+
+[Service]
+Type=simple
+User=lentalk-uploader
+Group=lentalk-uploader
+EnvironmentFile=/etc/lentalk-reference-uploader.env
+ExecStart=/usr/bin/python3 /opt/lentalk-reference-uploader/app.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/lentalk-reference-uploader
+
+[Install]
+WantedBy=multi-user.target

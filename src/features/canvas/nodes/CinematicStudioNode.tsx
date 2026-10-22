@@ -1,0 +1,1565 @@
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
+import { Handle, Position, useUpdateNodeInternals, type NodeProps } from "@xyflow/react";
+import {
+  AudioLines,
+  Check,
+  ChevronDown,
+  Clapperboard,
+  LoaderCircle,
+  Settings2,
+  Sparkles,
+  Video,
+  X,
+} from "lucide-react";
+
+import {
+  CANVAS_NODE_TYPES,
+  isAudioNode,
+  type CanvasEdge,
+  type CanvasNode,
+  type CinematicStudioNodeData,
+} from "@/features/canvas/domain/canvasNodes";
+import { resolveNodeDisplayName, isNodeUsingDefaultDisplayName } from "@/features/canvas/domain/nodeDisplay";
+import { resolveVideoNodeModelId } from "@/features/canvas/domain/videoNodeDefaults";
+import { resolveVideoDurationHintFromTexts } from "@/features/canvas/domain/videoDurationHint";
+import { applyVoiceReferenceFormat } from "@/features/canvas/domain/voiceReferenceFormat";
+import { getDefaultVideoModelId, getVideoModel } from "@/features/canvas/models";
+import { graphImageResolver } from "@/features/canvas/application/canvasServices";
+import { readLiveInputText } from "@/features/canvas/application/liveInputText";
+import { CURRENT_RUNTIME_SESSION_ID } from "@/features/canvas/application/generationErrorReport";
+import { isQuickGenerationRunActive } from "@/features/canvas/application/quickGenerationRunState";
+import { useThumbnailFallback } from "@/features/canvas/ui/useCanvasImageSource";
+import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
+import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
+import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
+import {
+  QuickAssetPicker,
+  type QuickAssetPickerItem,
+} from "@/features/canvas/ui/QuickAssetPicker";
+import {
+  cinematicAssetDescription,
+  cinematicAssetIdFromMirrorId,
+  cinematicAssetKey,
+  cinematicAssetKind,
+  cinematicImageAssets,
+  isCinematicMirrorAsset,
+} from "@/features/library/cinematicMirror";
+import { useCanvasStore } from "@/stores/canvasStore";
+import { useSettingsStore } from "@/stores/settingsStore";
+import { CinematicStudioWorkbench } from "@/features/cinematicStudio/CinematicStudioWorkbench";
+import type { CanvasImageSource } from "@/features/cinematicStudio/app/components/DirectorLayersCard";
+import type { Locale } from "@/features/cinematicStudio/app/i18n";
+import { generateQuickPrompt } from "@/features/cinematicStudio/app/providers/ai";
+import type { QuickPromptAsset } from "@/features/cinematicStudio/app/providers/quickPromptAgent";
+import {
+  QUICK_PROMPT_FORMATS,
+  findQuickPromptFormat,
+} from "@/features/cinematicStudio/app/providers/quickPromptFormats";
+import {
+  listLenTalkChatModels,
+  loadAISettings,
+  resolveLenTalkChatModel,
+} from "@/features/cinematicStudio/app/providers/aiSettings";
+import {
+  duplicateCinematicProject,
+  loadProjectById,
+  loadProjectFromDatabaseById,
+  loadSharedAssets,
+  mergeAssetPool,
+  persistProjectById,
+  persistProjectToDatabaseById,
+} from "@/features/cinematicStudio/app/model";
+import { DEFAULT_CINEMATIC_PROJECT_ID, createCinematicProjectId } from "@/features/cinematicStudio/app/projectId";
+import {
+  applyQuickStudioSync,
+  mergeUpstreamText,
+  stripUpstreamText,
+  type CinematicStudioQuickSync,
+  type CinematicStudioUpstreamText,
+} from "@/features/cinematicStudio/app/quickStudioSync";
+import { buildQuickStagingContext } from "@/features/cinematicStudio/app/quickStagingContext";
+import type { SceneStaging } from "@/features/cinematicStudio/shared-types";
+import { useAssetLibraryStore } from "@/features/library/assetStore";
+import type { LibraryAsset } from "@/features/library/types";
+
+type CinematicStudioNodeProps = NodeProps & {
+  id: string;
+  data: CinematicStudioNodeData;
+  selected?: boolean;
+};
+
+const CINEMATIC_STUDIO_NODE_MIN_WIDTH = 400;
+// 风格/质量与故事梗概的输入框固定为 h-24，外框按内容高度收敛。
+const CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT = 520;
+const QUICK_INPUT_HANDLES = {
+  style: "quick-style-input",
+  synopsis: "quick-synopsis-input",
+  sceneAssets: "quick-scene-assets-input",
+  characterAssets: "quick-character-assets-input",
+  propAssets: "quick-prop-assets-input",
+} as const;
+
+/** 节点上三个平行的资产候选框：场景站位 / 场景角色候选 / 道具。 */
+type QuickAssetPickerKind = "scene" | "character" | "prop";
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+}
+
+function selectedCinematicAssets(ids: string[], assets: LibraryAsset[]): LibraryAsset[] {
+  const assetsByCinematicId = new Map<string, LibraryAsset>();
+  for (const asset of assets) {
+    if (asset.mediaType !== "image" || !asset.sourcePath.trim()) continue;
+    const key = cinematicAssetKey(asset);
+    if (!assetsByCinematicId.has(key)) assetsByCinematicId.set(key, asset);
+  }
+  return ids
+    .map((assetId) => assetsByCinematicId.get(assetId) ?? assets.find((asset) => asset.id === assetId))
+    .filter((asset): asset is LibraryAsset => Boolean(asset));
+}
+
+function cinematicDisplayName(asset: LibraryAsset, canonicalNames: Map<string, string>): string {
+  return canonicalNames.get(cinematicAssetKey(asset))?.trim() || asset.name.trim() || "未命名素材";
+}
+
+function inputEdgesForHandle(edges: CanvasEdge[], nodeId: string, handleId: string): CanvasEdge[] {
+  return edges.filter((edge) => edge.target === nodeId && edge.targetHandle === handleId);
+}
+
+function collectInputVideos(edges: CanvasEdge[], nodes: CanvasNode[]): string[] {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const videos = edges
+    .map((edge) => nodeById.get(edge.source))
+    .filter((node): node is CanvasNode => Boolean(node))
+    .flatMap((node) => {
+      const data = node.data as { mediaType?: unknown; sourcePath?: unknown };
+      return node.type === CANVAS_NODE_TYPES.audio &&
+        data.mediaType === "video" &&
+        typeof data.sourcePath === "string" &&
+        data.sourcePath.trim()
+        ? [data.sourcePath.trim()]
+        : [];
+    });
+  return [...new Set(videos)];
+}
+
+function fileLabel(source: string, fallback: string): string {
+  return source.split(/[\\/]/).pop()?.trim() || fallback;
+}
+
+/** Write compact-node edits into its matching advanced-workbench project. */
+async function persistQuickStudioSync(projectId: string, sync: CinematicStudioQuickSync) {
+  if (!projectId) return;
+  // Browser/local fallback is written immediately; the SQLite copy is then
+  // refreshed from the latest stored project to avoid discarding other edits.
+  const localProject = applyQuickStudioSync(loadProjectById(projectId), sync);
+  persistProjectById(projectId, localProject);
+  const storedProject = await loadProjectFromDatabaseById(projectId);
+  const nextProject = applyQuickStudioSync(storedProject ?? localProject, sync);
+  const saved = await persistProjectToDatabaseById(projectId, nextProject);
+  if (!saved) persistProjectById(projectId, nextProject);
+}
+
+/**
+ * 上游 / 已选素材的小方块（36x36）。
+ *
+ * 原先是 `resolveImageDisplayUrl(...)` 直出原图：一张 12MP 照片解码要几十 MB 瞬时内存，
+ * 只为了画一个 36px 的方块；素材条上挂十几个就是几百 MB —— 这是提示词工作室节点卡顿的主因。
+ * 改走 256 缩略图，而素材选择器生成的就是同一尺寸，**磁盘与内存都直接命中**。
+ */
+const CinematicMediaThumb = memo(({ source, alt }: { source: string | null | undefined; alt: string }) => {
+  const image = useThumbnailFallback(source);
+  if (image.isPlaceholder) {
+    return <div className="h-full w-full animate-pulse bg-white/[0.06]" aria-hidden />;
+  }
+  return <img className="h-full w-full object-cover" src={image.url ?? ""} alt={alt} />;
+});
+CinematicMediaThumb.displayName = "CinematicMediaThumb";
+
+export const CinematicStudioNode = memo(({ id, data, selected, width, height }: CinematicStudioNodeProps) => {
+  const { i18n } = useTranslation();
+  const updateNodeInternals = useUpdateNodeInternals();
+  const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
+  const { nodes, edges } = useCanvasInputGraph();
+  const addEdge = useCanvasStore((state) => state.addEdge);
+  const addNode = useCanvasStore((state) => state.addNode);
+  const findNodePosition = useCanvasStore((state) => state.findNodePosition);
+  const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const libraryAssets = useAssetLibraryStore((state) => state.assets);
+  const assetLibraryHydrated = useAssetLibraryStore((state) => state.isHydrated);
+  const hydrateAssetLibrary = useAssetLibraryStore((state) => state.hydrate);
+  const customApis = useSettingsStore((state) => state.customApis);
+  const cinematicAiSelection = useSettingsStore((state) => state.cinematicAiSelection);
+  const [isOpen, setIsOpen] = useState(false);
+  // 提示词 Agent 要跑几十秒到几分钟, 而画布开了 onlyRenderVisibleElements:
+  // 节点一旦移出视口就被卸载, 局部 state 会丢, 按钮随即谎报空闲。
+  // 所以「生成中…」按「本次运行时会话里的进行中标记」恢复 —— 上一次运行留下的标记
+  // 说明那次调用早已随进程结束, 不该再锁住按钮。
+  const persistedQuickStartedAt =
+    typeof data.quickGenerationStartedAt === "number" ? data.quickGenerationStartedAt : 0;
+  const persistedQuickSessionId =
+    typeof data.quickGenerationSessionId === "string" ? data.quickGenerationSessionId : "";
+  const isPersistedQuickRunActive = isQuickGenerationRunActive(
+    persistedQuickStartedAt,
+    persistedQuickSessionId,
+  );
+  const [quickGenerating, setQuickGenerating] = useState(() => isPersistedQuickRunActive);
+  // 防止 React state 提交前的快速双击重复启动提示词生成并创建两个视频节点。
+  const quickGenerationLockRef = useRef(false);
+  useEffect(() => {
+    if (isPersistedQuickRunActive) return;
+    // 标记被清空(本轮 finally, 或上一个已卸载实例的 finally)即释放按钮;
+    // 上一次运行残留 / 已超窗的标记顺带清掉, 否则按钮会一直停在「生成中…」。
+    if (!quickGenerationLockRef.current) setQuickGenerating(false);
+    if (persistedQuickSessionId) {
+      updateNodeData(id, { quickGenerationStartedAt: null, quickGenerationSessionId: null });
+    }
+  }, [id, isPersistedQuickRunActive, persistedQuickSessionId, updateNodeData]);
+  const [quickError, setQuickError] = useState("");
+  const [activeAssetPicker, setActiveAssetPicker] = useState<QuickAssetPickerKind | null>(null);
+  const [isChatModelPickerOpen, setIsChatModelPickerOpen] = useState(false);
+  const [isPromptFormatPickerOpen, setIsPromptFormatPickerOpen] = useState(false);
+  const [activeChatProviderId, setActiveChatProviderId] = useState("");
+  const [cinematicDatabaseAssetNames, setCinematicDatabaseAssetNames] = useState<Map<string, string>>(() => new Map());
+
+  /**
+   * 资产名称权威来源：素材库镜像条目（工程资产名的实时投影）→ DB 共享资产库（兜底）。
+   *
+   * 以前只从 DB 读一次，于是「在资产库改了资产名 → 节点候选 / 已选框仍是旧名」，
+   * 要等节点重新挂载（或素材库重新 hydrate）才刷新，看起来像「要等一会儿才同步」。
+   * 镜像条目随工程资产改动实时重写，拿它当主来源就与资产库改动同帧生效；
+   * DB 名仍保留为镜像尚未生成时的兜底。
+   */
+  const cinematicAssetNames = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const asset of libraryAssets) {
+      if (!asset.sourcePath.trim() || !isCinematicMirrorAsset(asset)) continue;
+      const name = asset.name.trim();
+      if (!name) continue;
+      const key = cinematicAssetKey(asset);
+      if (!map.has(key)) map.set(key, name);
+    }
+    for (const [key, name] of cinematicDatabaseAssetNames) {
+      if (!map.has(key)) map.set(key, name);
+    }
+    return map;
+  }, [cinematicDatabaseAssetNames, libraryAssets]);
+
+  useEffect(() => {
+    if (!assetLibraryHydrated) return;
+    let cancelled = false;
+    void loadSharedAssets()
+      .then((assets) => {
+        if (cancelled) return;
+        setCinematicDatabaseAssetNames(
+          new Map(
+            assets
+              .filter((asset) => asset.id.trim() && asset.name.trim())
+              .map((asset) => [asset.id, asset.name.trim()]),
+          ),
+        );
+      })
+      .catch(() => {
+        // 素材库读取失败时继续使用镜像名称，不能阻塞节点操作。
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [assetLibraryHydrated]);
+
+  const chatModels = useMemo(() => listLenTalkChatModels(), [customApis]);
+  // 与 AI 图片模型面板一致：先按平台区分，再在平台内选择模型。
+  const chatModelGroups = useMemo(() => {
+    const groups = new Map<string, { providerId: string; providerName: string; models: string[] }>();
+    for (const option of chatModels) {
+      const group = groups.get(option.providerId) ?? {
+        providerId: option.providerId,
+        providerName: option.providerName,
+        models: [],
+      };
+      if (!group.models.includes(option.model)) group.models.push(option.model);
+      groups.set(option.providerId, group);
+    }
+    return [...groups.values()];
+  }, [chatModels]);
+  const defaultChatSettings = useMemo(() => loadAISettings(), [cinematicAiSelection, customApis]);
+
+  const resolvedWidth = typeof width === "number" && width > 1 ? Math.round(width) : CINEMATIC_STUDIO_NODE_MIN_WIDTH;
+  const resolvedHeight = Math.max(
+    CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT,
+    typeof height === "number" && height > 1 ? Math.round(height) : CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT,
+  );
+  const currentHeightRef = useRef(resolvedHeight);
+  const currentWidthRef = useRef(resolvedWidth);
+  currentHeightRef.current = resolvedHeight;
+  currentWidthRef.current = resolvedWidth;
+
+  const displayName = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.cinematicStudio, data), [data]);
+
+  // 每个节点一份独立工程：老节点没有 id 时补发一个，
+  // 之后双击打开就是它自己的空白模板 / 既有内容，不再和别的节点共用工程。
+  const studioProjectId =
+    typeof data.studioProjectId === "string" && data.studioProjectId.trim() ? data.studioProjectId.trim() : "";
+
+  // 老节点此前与别的节点共用全局工程：若它确实用过（有缓存快照），
+  // 把那份工程复制到自己的 id 下，避免升级后看起来「内容丢了」。
+  const hadStudioActivity = Boolean(
+    (typeof data.lastProjectTitle === "string" && data.lastProjectTitle.trim()) ||
+    (typeof data.lastProjectDescription === "string" && data.lastProjectDescription.trim()) ||
+    (typeof data.lastPromptPreview === "string" && data.lastPromptPreview.trim()),
+  );
+
+  useEffect(() => {
+    if (studioProjectId) return;
+    const nextProjectId = createCinematicProjectId();
+    if (hadStudioActivity) void duplicateCinematicProject(DEFAULT_CINEMATIC_PROJECT_ID, nextProjectId);
+    updateNodeData(id, { studioProjectId: nextProjectId });
+  }, [hadStudioActivity, id, studioProjectId, updateNodeData]);
+
+  useEffect(() => {
+    if (!assetLibraryHydrated) void hydrateAssetLibrary();
+  }, [assetLibraryHydrated, hydrateAssetLibrary]);
+
+  /** 点击节点外/画布空白或按 Escape 时，所有轻量选择卡片自动收起。 */
+  useEffect(() => {
+    if (!activeAssetPicker && !isChatModelPickerOpen && !isPromptFormatPickerOpen) return;
+    const closePickers = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest("[data-quick-popover]")) return;
+      setActiveAssetPicker(null);
+      setIsChatModelPickerOpen(false);
+      setIsPromptFormatPickerOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setActiveAssetPicker(null);
+      setIsChatModelPickerOpen(false);
+      setIsPromptFormatPickerOpen(false);
+    };
+    document.addEventListener("pointerdown", closePickers, true);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closePickers, true);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [activeAssetPicker, isChatModelPickerOpen, isPromptFormatPickerOpen]);
+
+  const canvasAudioSources = useMemo(() => {
+    const connectedSources = graphImageResolver.collectInputAudio(id, nodes, edges);
+    const labelBySource = new Map<string, string>();
+
+    for (const node of nodes) {
+      if (!isAudioNode(node) || node.data.mediaType === "video" || !node.data.sourcePath) {
+        continue;
+      }
+      const source = node.data.sourcePath;
+      const nodeLabel = resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, node.data);
+      const fileName = source.split(/[\\/]/).pop()?.trim() ?? "";
+      labelBySource.set(source, nodeLabel !== "媒体" ? nodeLabel : fileName || "画布音频");
+    }
+
+    return connectedSources
+      .filter((source) => labelBySource.has(source))
+      .map((source) => ({ source, label: labelBySource.get(source) ?? "画布音频" }));
+  }, [edges, id, nodes]);
+
+  const canvasImageSources = useMemo<CanvasImageSource[]>(() => {
+    const connectedSources = graphImageResolver.collectInputImages(id, nodes, edges);
+    const labelBySource = new Map<string, string>();
+    for (const node of nodes) {
+      const nodeData = node.data as Record<string, unknown>;
+      const nodeLabel = resolveNodeDisplayName(
+        node.type as (typeof CANVAS_NODE_TYPES)[keyof typeof CANVAS_NODE_TYPES],
+        node.data,
+      );
+      const sources = [
+        nodeData.imageUrl,
+        nodeData.outputImageUrl,
+        nodeData.inputImageUrl,
+        ...(Array.isArray(nodeData.frames)
+          ? nodeData.frames.map(
+              (frame) =>
+                (frame as Record<string, unknown>).imageUrl ?? (frame as Record<string, unknown>).previewImageUrl,
+            )
+          : []),
+      ].filter((source): source is string => typeof source === "string" && source.trim().length > 0);
+      for (const source of sources) labelBySource.set(source, nodeLabel || "画布图片");
+    }
+    return connectedSources.map((source) => ({ source, label: labelBySource.get(source) ?? "画布图片" }));
+  }, [edges, id, nodes]);
+
+  const styleInputEdges = useMemo(() => inputEdgesForHandle(edges, id, QUICK_INPUT_HANDLES.style), [edges, id]);
+  const synopsisInputEdges = useMemo(() => inputEdgesForHandle(edges, id, QUICK_INPUT_HANDLES.synopsis), [edges, id]);
+  const sceneAssetInputEdges = useMemo(
+    () => inputEdgesForHandle(edges, id, QUICK_INPUT_HANDLES.sceneAssets),
+    [edges, id],
+  );
+  const characterAssetInputEdges = useMemo(
+    () => inputEdgesForHandle(edges, id, QUICK_INPUT_HANDLES.characterAssets),
+    [edges, id],
+  );
+  const propAssetInputEdges = useMemo(
+    () => inputEdgesForHandle(edges, id, QUICK_INPUT_HANDLES.propAssets),
+    [edges, id],
+  );
+  const upstreamStyleTexts = useMemo(
+    () => graphImageResolver.collectInputText(id, nodes, styleInputEdges),
+    [id, nodes, styleInputEdges],
+  );
+  const upstreamSynopsisTexts = useMemo(
+    () => graphImageResolver.collectInputText(id, nodes, synopsisInputEdges),
+    [id, nodes, synopsisInputEdges],
+  );
+  const sceneInputMedia = useMemo(
+    () => ({
+      images: graphImageResolver.collectInputImages(id, nodes, sceneAssetInputEdges),
+      audio: graphImageResolver.collectInputAudio(id, nodes, sceneAssetInputEdges),
+      videos: collectInputVideos(sceneAssetInputEdges, nodes),
+    }),
+    [id, nodes, sceneAssetInputEdges],
+  );
+  const characterInputMedia = useMemo(
+    () => ({
+      images: graphImageResolver.collectInputImages(id, nodes, characterAssetInputEdges),
+      audio: graphImageResolver.collectInputAudio(id, nodes, characterAssetInputEdges),
+      videos: collectInputVideos(characterAssetInputEdges, nodes),
+    }),
+    [id, nodes, characterAssetInputEdges],
+  );
+  const propInputMedia = useMemo(
+    () => ({
+      images: graphImageResolver.collectInputImages(id, nodes, propAssetInputEdges),
+      audio: graphImageResolver.collectInputAudio(id, nodes, propAssetInputEdges),
+      videos: collectInputVideos(propAssetInputEdges, nodes),
+    }),
+    [id, nodes, propAssetInputEdges],
+  );
+
+  useEffect(() => {
+    updateNodeInternals(id);
+  }, [id, resolvedHeight, resolvedWidth, updateNodeInternals]);
+
+  const handleOpen = useCallback(
+    (event: React.MouseEvent) => {
+      event.stopPropagation();
+      setSelectedNode(id);
+      setIsOpen(true);
+    },
+    [id, setSelectedNode],
+  );
+
+  const handleClose = useCallback(() => {
+    setIsOpen(false);
+  }, []);
+
+  const handleStateChange = useCallback(
+    (snapshot: {
+      projectTitle?: string;
+      projectDescription?: string;
+      promptPreview?: string;
+      referenceImages?: string[];
+      referenceAudio?: string[];
+      quickSync?: CinematicStudioQuickSync;
+    }) => {
+      updateNodeData(id, {
+        lastProjectTitle: typeof snapshot.projectTitle === "string" ? snapshot.projectTitle : null,
+        lastProjectDescription: typeof snapshot.projectDescription === "string" ? snapshot.projectDescription : null,
+        lastPromptPreview: typeof snapshot.promptPreview === "string" ? snapshot.promptPreview : null,
+        studioReferenceImages: Array.isArray(snapshot.referenceImages) ? snapshot.referenceImages : [],
+        studioReferenceAudio: Array.isArray(snapshot.referenceAudio) ? snapshot.referenceAudio : [],
+        ...(snapshot.quickSync
+          ? {
+              // 回写的应当是节点手输的原文；早期版本会把「上游 + 本地」合并后再写进工程，
+              // 这里顺手剥掉可能残留的上游块，避免它被当成用户输入长期留在输入框里。
+              // 必须用**实时**上游文本：用 render 期快照会在「文本刚改完、防抖还没落库」
+              // 时剥不掉，块就被永久烧进 quickStyle/quickSynopsis，之后换文本也会一直带着旧内容。
+              quickStyle: stripUpstreamText(
+                snapshot.quickSync.styleBrief,
+                readLiveInputText(id, QUICK_INPUT_HANDLES.style),
+              ),
+              quickSynopsis: stripUpstreamText(
+                snapshot.quickSync.storySynopsis,
+                readLiveInputText(id, QUICK_INPUT_HANDLES.synopsis),
+              ),
+              quickStaging: snapshot.quickSync.staging,
+              quickSyncInitialized: true,
+              quickStudioSceneId: snapshot.quickSync.sceneId ?? "",
+            }
+          : {}),
+      });
+    },
+    [id, updateNodeData],
+  );
+
+  const handleSendToVideo = useCallback(
+    (payload: {
+      prompt: string;
+      referenceImages: string[];
+      referenceAudio: string[];
+      /** 除提示词外还要一起找秒数的原文：用户自己写的故事梗概 / 风格。 */
+      durationHintSources?: readonly string[];
+    }) => {
+      const nextPrompt = payload.prompt.trim();
+      if (!nextPrompt) return;
+      const pendingVideoNode = nodes.find((node) => {
+        if (node.type !== CANVAS_NODE_TYPES.videoGen) return false;
+        const nodeData = node.data as { prompt?: unknown; isGenerating?: unknown; generationJobId?: unknown };
+        if (typeof nodeData.prompt !== "string" || nodeData.prompt.trim() !== nextPrompt) return false;
+        if (nodeData.isGenerating !== true && typeof nodeData.generationJobId !== "string") return false;
+        return edges.some((edge) => edge.source === id && edge.target === node.id);
+      });
+      if (pendingVideoNode) {
+        // 同一提示词已有未完成的视频任务时，只选中原节点，不再创建/提交第二个任务。
+        setSelectedNode(pendingVideoNode.id);
+        return;
+      }
+      const placement = findNodePosition(id, 420, 360);
+      // 文案里写明了几秒（例如梗概写「5秒的视频」）就直接落到节点时长上；没写、
+      // 或者目标模型只支持固定时长时返回 null，此时保持 createDefaultData 给出的
+      // 「上次使用」时长不动。模型解析与 nodeRegistry 的 createDefaultData 保持一致，
+      // 保证算的确实是这个新节点将要用的模型。
+      const settings = useSettingsStore.getState();
+      const targetModelId = resolveVideoNodeModelId(
+        settings.lastVideoModelId,
+        (modelId) => Boolean(getVideoModel(modelId)),
+        getDefaultVideoModelId(),
+      );
+      const durationHint = resolveVideoDurationHintFromTexts(getVideoModel(targetModelId), [
+        nextPrompt,
+        ...(payload.durationHintSources ?? []),
+      ]);
+      const videoNodeId = addNode(CANVAS_NODE_TYPES.videoGen, placement, {
+        prompt: nextPrompt,
+        // 模型 / 宽高比 / 分辨率不再写死: 交给 createDefaultData 沿用「上次使用」的配置
+        // (与 duration 的既有行为一致), 避免工作室发过去的节点还要重新选一遍。
+        // duration 只在文案写明秒数时才覆盖，否则同样沿用「上次使用」的值。
+        ...(durationHint !== null ? { duration: durationHint } : {}),
+        studioReferenceImages: payload.referenceImages,
+        studioReferenceAudio: payload.referenceAudio,
+      });
+      addEdge(id, videoNodeId);
+      setSelectedNode(videoNodeId);
+    },
+    [addEdge, addNode, edges, findNodePosition, id, nodes, setSelectedNode],
+  );
+
+  const quickStyle = typeof data.quickStyle === "string" ? data.quickStyle : "";
+  const quickSynopsis = typeof data.quickSynopsis === "string" ? data.quickSynopsis : "";
+  /**
+   * 「风格 / 质量」「故事梗概」两条口子**当前**的内容（上游接入的文本 + 节点里手输的）。
+   * 上游那一半走 `readLiveInputText`（补交防抖中的编辑 + 现取 store），不用 render 期快照 ——
+   * 否则「文本改完立刻点生成」会拿到上一版文本。节点里手输的字段是即时落库的，可直接用。
+   */
+  const resolveQuickInputs = useCallback(() => ({
+    style: mergeUpstreamText(readLiveInputText(id, QUICK_INPUT_HANDLES.style), quickStyle),
+    synopsis: mergeUpstreamText(readLiveInputText(id, QUICK_INPUT_HANDLES.synopsis), quickSynopsis),
+  }), [id, quickStyle, quickSynopsis]);
+  // 上游文本单独走一条通道进高级编辑，在输入框下方作灰色只读回显（不进工程文件）。
+  const quickSyncUpstream = useMemo<CinematicStudioUpstreamText>(
+    () => ({
+      styleBrief: upstreamStyleTexts,
+      storySynopsis: upstreamSynopsisTexts,
+    }),
+    [upstreamStyleTexts, upstreamSynopsisTexts],
+  );
+  const hasUpstreamText = upstreamStyleTexts.length > 0 || upstreamSynopsisTexts.length > 0;
+  const quickChatProvider = typeof data.quickChatProvider === "string" ? data.quickChatProvider : "";
+  const quickChatModel = typeof data.quickChatModel === "string" ? data.quickChatModel : "";
+  const selectedQuickChatProvider = quickChatProvider || defaultChatSettings.provider;
+  const selectedQuickChatModel = quickChatModel || defaultChatSettings.model;
+  const hasSelectedQuickChatModel = chatModels.some(
+    (option) => option.providerId === selectedQuickChatProvider && option.model === selectedQuickChatModel,
+  );
+  const selectedQuickChatOption = chatModels.find(
+    (option) => option.providerId === selectedQuickChatProvider && option.model === selectedQuickChatModel,
+  );
+  const resolvedActiveChatProviderId = chatModelGroups.some((group) => group.providerId === activeChatProviderId)
+    ? activeChatProviderId
+    : hasSelectedQuickChatModel
+      ? selectedQuickChatProvider
+      : (chatModelGroups[0]?.providerId ?? "");
+  const activeChatModelGroup = chatModelGroups.find((group) => group.providerId === resolvedActiveChatProviderId);
+  // 提示词输出语言：画布语言是默认值，节点上一旦点过中/英切换就固定为用户的选择。
+  const canvasLocale: Locale = i18n.language.startsWith("en") ? "en" : "zh";
+  const storedQuickPromptLang: Locale | undefined =
+    data.quickPromptLang === "en" || data.quickPromptLang === "zh" ? data.quickPromptLang : undefined;
+  const quickPromptLang: Locale = storedQuickPromptLang ?? canvasLocale;
+  // 提示词格式：老节点没有该字段，统一回落默认格式（Seedance 2.5）
+  const quickPromptFormat = useMemo(
+    () =>
+      findQuickPromptFormat(
+        typeof data.quickPromptFormat === "string" ? data.quickPromptFormat : undefined,
+      ),
+    [data.quickPromptFormat],
+  );
+  const quickPromptFormatId = quickPromptFormat.id;
+  const handleQuickPromptLangChange = useCallback(
+    (lang: Locale) => {
+      updateNodeData(id, { quickPromptLang: lang });
+    },
+    [id, updateNodeData],
+  );
+  // `quickStaging` intentionally follows SceneStaging from the advanced editor.
+  // The two legacy arrays are read only as a migration path for existing canvases.
+  const hasQuickStaging = Boolean(
+    data.quickStaging && typeof data.quickStaging === "object" && !Array.isArray(data.quickStaging),
+  );
+  const quickStaging = (hasQuickStaging ? data.quickStaging : {}) as SceneStaging;
+  // 空对象代表「这个节点还没点过场景站位」——那种情况不能把站位推给高级编辑，
+  // 否则一打开高级编辑就会把里面已经设好的地点 / 角色候选清空。
+  const hasQuickStagingData = hasQuickStaging && Object.keys(quickStaging).length > 0;
+  const quickStudioSync = useMemo<CinematicStudioQuickSync>(
+    () => ({
+      sceneId:
+        typeof data.quickStudioSceneId === "string" && data.quickStudioSceneId.trim()
+          ? data.quickStudioSceneId.trim()
+          : undefined,
+      // 只传节点里手输的原文：高级编辑里的白字就是这份内容，
+      // 上游文本另走 quickSyncUpstream，在输入框下方作灰色回显。
+      styleBrief: quickStyle,
+      storySynopsis: quickSynopsis,
+      // 站位整对象双向同步：节点改 → 高级编辑跟着改，高级编辑改 → 节点跟着改。
+      ...(hasQuickStagingData ? { staging: { ...quickStaging } } : {}),
+    }),
+    [data.quickStudioSceneId, hasQuickStagingData, quickStyle, quickSynopsis, quickStaging],
+  );
+  const quickSyncInitialized = data.quickSyncInitialized === true;
+  const quickStudioSyncRef = useRef(quickStudioSync);
+  const quickStudioSyncTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  useEffect(() => {
+    quickStudioSyncRef.current = quickStudioSync;
+  }, [quickStudioSync]);
+  useEffect(
+    () => () => {
+      if (quickStudioSyncTimer.current !== null) window.clearTimeout(quickStudioSyncTimer.current);
+    },
+    [],
+  );
+  const scheduleQuickStudioSync = useCallback(
+    (patch: Partial<CinematicStudioQuickSync>) => {
+      const next = { ...quickStudioSyncRef.current, ...patch };
+      quickStudioSyncRef.current = next;
+      if (!studioProjectId) return;
+      if (quickStudioSyncTimer.current !== null) window.clearTimeout(quickStudioSyncTimer.current);
+      quickStudioSyncTimer.current = window.setTimeout(() => {
+        quickStudioSyncTimer.current = null;
+        void persistQuickStudioSync(studioProjectId, quickStudioSyncRef.current);
+      }, 300);
+    },
+    [studioProjectId],
+  );
+  const handleQuickStyleChange = useCallback(
+    (value: string) => {
+      updateNodeData(id, { quickStyle: value, quickSyncInitialized: true });
+      scheduleQuickStudioSync({ styleBrief: value });
+    },
+    [id, scheduleQuickStudioSync, updateNodeData],
+  );
+  const handleQuickSynopsisChange = useCallback(
+    (value: string) => {
+      updateNodeData(id, { quickSynopsis: value, quickSyncInitialized: true });
+      scheduleQuickStudioSync({ storySynopsis: value });
+    },
+    [id, scheduleQuickStudioSync, updateNodeData],
+  );
+  const legacySceneAssetIds = stringArray(data.quickSceneAssetIds);
+  const legacyCharacterAssetIds = stringArray(data.quickCharacterAssetIds);
+  const sceneAssetIds = hasQuickStaging
+    ? quickStaging.locationAssetId
+      ? [quickStaging.locationAssetId]
+      : []
+    : legacySceneAssetIds;
+  const characterAssetIds = hasQuickStaging
+    ? [...new Set(quickStaging.characterRoster ?? [])]
+    : legacyCharacterAssetIds;
+  // 道具是后加的能力：没有历史遗留数组，未点过任何候选框时按空列表处理。
+  const propAssetIds = hasQuickStaging ? [...new Set(quickStaging.propRoster ?? [])] : [];
+  const selectedSceneAssets = useMemo(
+    () => selectedCinematicAssets(sceneAssetIds, libraryAssets),
+    [libraryAssets, sceneAssetIds.join("|")],
+  );
+  const selectedCharacterAssets = useMemo(
+    () => selectedCinematicAssets(characterAssetIds, libraryAssets),
+    [characterAssetIds.join("|"), libraryAssets],
+  );
+  const selectedPropAssets = useMemo(
+    () => selectedCinematicAssets(propAssetIds, libraryAssets),
+    [libraryAssets, propAssetIds.join("|")],
+  );
+  // 与高级编辑器一致：地点是单一的场景站位资产；场景角色候选由
+  // characterRoster 维护。镜像库中的多张参考图仍属于同一电影资产。
+  const locationAssets = useMemo(() => cinematicImageAssets(libraryAssets, "location"), [libraryAssets]);
+  const characterAssets = useMemo(() => cinematicImageAssets(libraryAssets, "character"), [libraryAssets]);
+  const characterCandidates = useMemo(
+    () => characterAssets.filter((asset) => !characterAssetIds.includes(cinematicAssetKey(asset))),
+    [characterAssetIds.join("|"), characterAssets],
+  );
+  // 道具候选与场景 / 角色同源：都从素材库的 cinematic-* 镜像里取图，
+  // 因此「资产库里有图」是进候选的必要条件，与另外两个框完全一致。
+  const propAssets = useMemo(() => cinematicImageAssets(libraryAssets, "prop"), [libraryAssets]);
+  const propCandidates = useMemo(
+    () => propAssets.filter((asset) => !propAssetIds.includes(cinematicAssetKey(asset))),
+    [propAssetIds.join("|"), propAssets],
+  );
+  /**
+   * 候选卡片的列表数据。
+   *
+   * 单独 memo 是因为卡片要按批渲染缩略图：列表数组每次都是新对象的话，滚动补批的
+   * 判定就会跟着失效，几百个角色又会退回「展开那一下全量挂载」。
+   *
+   * 这里按素材库顺序（最旧在前）原样给出即可，卡片侧会统一倒成「最新创建的在最上面」——
+   * 顺序规则只有 `canvas/ui/quickAssetPickerSorting.ts` 一处，别在这里自己排。
+   */
+  const quickPickerItems = useMemo(() => {
+    const build = (assets: LibraryAsset[], chosenIds: string[]): QuickAssetPickerItem[] =>
+      assets.map((asset) => ({
+        id: asset.id,
+        name: cinematicDisplayName(asset, cinematicAssetNames),
+        // 传原始地址：卡片内部会换成 Rust 生成的小缩略图。这里若先转成展示地址，
+        // 「本地原图」和「http 直链」就分不出来了，卡片只能退回解码上百 MB 的原图。
+        source: asset.previewImageUrl || asset.sourcePath,
+        active: chosenIds.includes(cinematicAssetKey(asset)),
+      }));
+    return {
+      scene: build(locationAssets, sceneAssetIds),
+      character: build(characterCandidates, characterAssetIds),
+      prop: build(propCandidates, propAssetIds),
+    };
+  }, [
+    cinematicAssetNames,
+    characterAssetIds.join("|"),
+    characterCandidates,
+    locationAssets,
+    propAssetIds.join("|"),
+    propCandidates,
+    sceneAssetIds.join("|"),
+  ]);
+  const selectedCharacterVoiceAssets = useMemo(() => {
+    const selectedCharacterIds = new Set(characterAssetIds);
+    const seenSources = new Set<string>();
+    return libraryAssets.filter((asset) => {
+      const source = asset.sourcePath.trim();
+      if (asset.mediaType !== "audio" || cinematicAssetKind(asset) !== "character" || !source) return false;
+      if (!selectedCharacterIds.has(cinematicAssetKey(asset)) || seenSources.has(source)) return false;
+      seenSources.add(source);
+      return true;
+    });
+  }, [characterAssetIds.join("|"), libraryAssets]);
+
+  // 道具的参考图只存在于画布素材库的镜像条目里，工程资产记录只保存语义。
+  // 同一个道具取首张参考图，与场景 / 角色资产的取图规则一致。
+  const propImageSources = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const asset of libraryAssets) {
+      const source = asset.sourcePath.trim();
+      if (asset.mediaType !== "image" || !source) continue;
+      if (cinematicAssetKind(asset) !== "prop") continue;
+      const key = cinematicAssetKey(asset);
+      if (!map.has(key)) map.set(key, source);
+    }
+    return map;
+  }, [libraryAssets]);
+
+  // 所有引用统一使用电影工程资产名称；镜像名称仅作为旧数据的 fallback。
+  const cinematicMirrorNames = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const asset of libraryAssets) {
+      if (!asset.sourcePath.trim()) continue;
+      const key = cinematicAssetKey(asset);
+      if (!map.has(key)) map.set(key, cinematicDisplayName(asset, cinematicAssetNames));
+    }
+    return map;
+  }, [cinematicAssetNames, libraryAssets]);
+
+  const toggleQuickAsset = useCallback(
+    (kind: QuickAssetPickerKind, assetId: string) => {
+      const asset = libraryAssets.find((item) => item.id === assetId);
+      const cinematicId = asset ? cinematicAssetKey(asset) : assetId;
+      if (kind === "scene") {
+        const staging = {
+          ...quickStaging,
+          locationAssetId: sceneAssetIds.includes(cinematicId) ? undefined : cinematicId,
+        };
+        updateNodeData(id, {
+          quickStaging: staging,
+          quickSyncInitialized: true,
+        });
+        scheduleQuickStudioSync({ staging });
+        return;
+      }
+      if (kind === "prop") {
+        // 道具只维护 propRoster：它不参与空间左右排序，也不牵动角色候选。
+        const propRoster = propAssetIds.includes(cinematicId)
+          ? propAssetIds.filter((item) => item !== cinematicId)
+          : [...propAssetIds, cinematicId];
+        const staging = { ...quickStaging, propRoster };
+        updateNodeData(id, { quickStaging: staging, quickSyncInitialized: true });
+        scheduleQuickStudioSync({ staging });
+        return;
+      }
+      const characterRoster = characterAssetIds.includes(cinematicId)
+        ? characterAssetIds.filter((item) => item !== cinematicId)
+        : [...characterAssetIds, cinematicId];
+      const staging = {
+        ...quickStaging,
+        characterRoster,
+        // 与高级编辑器的候选角色删除逻辑一致：移出候选时同时移出站位排序，
+        // 但新增候选不会自动占用一个左右站位。
+        characterOrder: characterRoster.includes(cinematicId)
+          ? quickStaging.characterOrder
+          : (quickStaging.characterOrder ?? []).filter((item) => item !== cinematicId),
+      };
+      updateNodeData(id, { quickStaging: staging, quickSyncInitialized: true });
+      scheduleQuickStudioSync({ staging });
+    },
+    [
+      characterAssetIds,
+      id,
+      libraryAssets,
+      propAssetIds,
+      quickStaging,
+      sceneAssetIds,
+      scheduleQuickStudioSync,
+      updateNodeData,
+    ],
+  );
+
+  const quickPromptAssets = useMemo(() => {
+    const imageSources: string[] = [];
+    const audioSources: string[] = [];
+    const imageIndex = new Map<string, number>();
+    const audioIndex = new Map<string, number>();
+    const toPromptAsset = ({
+      id: assetId,
+      name,
+      description,
+      source,
+      mediaType = "image",
+    }: {
+      id: string;
+      name: string;
+      description?: string;
+      source: string;
+      mediaType?: QuickPromptAsset["mediaType"];
+    }): QuickPromptAsset => {
+      const path = source.trim();
+      let referenceIndex: number | undefined;
+      if (path && mediaType !== "video") {
+        const sources = mediaType === "audio" ? audioSources : imageSources;
+        const index = mediaType === "audio" ? audioIndex : imageIndex;
+        referenceIndex = index.get(path);
+        if (!referenceIndex) {
+          referenceIndex = sources.length + 1;
+          index.set(path, referenceIndex);
+          sources.push(path);
+        }
+      }
+      return { id: assetId, name: name.trim() || "未命名素材", description, mediaType, referenceIndex };
+    };
+    const libraryAssetToPromptAsset = (asset: LibraryAsset) =>
+      toPromptAsset({
+        id: asset.id,
+        name: cinematicDisplayName(asset, cinematicAssetNames),
+        description: cinematicAssetDescription(asset),
+        source: asset.sourcePath,
+        mediaType: asset.mediaType,
+      });
+    const upstreamAsset = (
+      kind: QuickAssetPickerKind,
+      mediaType: QuickPromptAsset["mediaType"],
+      source: string,
+      index: number,
+    ) =>
+      toPromptAsset({
+        id: `upstream-${kind}-${mediaType}-${index}-${source}`,
+        name: `${kind === "scene" ? "场景" : kind === "character" ? "角色" : "道具"}${mediaType === "image" ? "图片" : mediaType === "audio" ? "音频" : "视频"} ${index + 1}`,
+        description: `上游接入：${fileLabel(source, "素材")}`,
+        source,
+        mediaType,
+      });
+    // 角色声线的镜像条目：mirror 的 cinematic id 就是所属角色资产 id，且同一条目的
+    // 图片与音频共用电影资产名称 —— 所以这里解出的序号 + 角色 id 就是提示词里
+    // 「哪个 @角色 对应哪条音频参考」。上游接入的音频（`角色音频 N`）没有这层绑定，
+    // 无法判定它是谁的声线，因此不参与规范句。
+    const characterVoicePromptAssets = selectedCharacterVoiceAssets.map(libraryAssetToPromptAsset);
+    const voiceBindings = selectedCharacterVoiceAssets.flatMap((asset, index) => {
+      const audioIndex = characterVoicePromptAssets[index]?.referenceIndex;
+      const characterId = cinematicAssetKey(asset);
+      return typeof audioIndex === "number" && characterId ? [{ audioIndex, characterId }] : [];
+    });
+    return {
+      voiceBindings,
+      sceneAssets: [
+        ...selectedSceneAssets.map(libraryAssetToPromptAsset),
+        ...sceneInputMedia.images.map((source, index) => upstreamAsset("scene", "image", source, index)),
+        ...sceneInputMedia.audio.map((source, index) => upstreamAsset("scene", "audio", source, index)),
+        ...sceneInputMedia.videos.map((source, index) => upstreamAsset("scene", "video", source, index)),
+      ],
+      characterAssets: [
+        ...selectedCharacterAssets.map(libraryAssetToPromptAsset),
+        ...characterVoicePromptAssets,
+        ...characterInputMedia.images.map((source, index) => upstreamAsset("character", "image", source, index)),
+        ...characterInputMedia.audio.map((source, index) => upstreamAsset("character", "audio", source, index)),
+        ...characterInputMedia.videos.map((source, index) => upstreamAsset("character", "video", source, index)),
+      ],
+      // 道具接在最后：参考图顺序 = 场景 → 角色 → 道具，与提示词里的引用区块同序。
+      propAssets: [
+        ...propInputMedia.images.map((source, index) => upstreamAsset("prop", "image", source, index)),
+        ...propInputMedia.audio.map((source, index) => upstreamAsset("prop", "audio", source, index)),
+        ...propInputMedia.videos.map((source, index) => upstreamAsset("prop", "video", source, index)),
+      ],
+      referenceImages: imageSources,
+      referenceAudio: audioSources,
+    };
+  }, [
+    characterInputMedia,
+    cinematicAssetNames,
+    propInputMedia,
+    sceneInputMedia,
+    selectedCharacterAssets,
+    selectedCharacterVoiceAssets,
+    selectedSceneAssets,
+  ]);
+
+  const handleQuickGenerate = useCallback(
+    async (event: React.MouseEvent) => {
+      event.stopPropagation();
+      if (quickGenerationLockRef.current || quickGenerating) return;
+      // 先取一份「当前」的风格 / 梗概：补交防抖中的文本节点编辑，再从 store 现算。
+      // 必须在取锁之前完成 —— 下面这条分支会直接 return，以前会把互斥锁永久留在手上。
+      const quickInputs = resolveQuickInputs();
+      if (!quickInputs.style || !quickInputs.synopsis) {
+        setQuickError("请先填写风格/质量和故事梗概。");
+        return;
+      }
+      quickGenerationLockRef.current = true;
+      setQuickError("");
+      setQuickGenerating(true);
+      // 落库(带运行时会话): 节点被卸载后重新挂载时靠它把按钮恢复成「生成中…」。
+      updateNodeData(id, {
+        quickGenerationStartedAt: Date.now(),
+        quickGenerationSessionId: CURRENT_RUNTIME_SESSION_ID,
+      });
+      try {
+        const selectedSettings =
+          quickChatProvider && quickChatModel
+            ? resolveLenTalkChatModel(quickChatProvider, quickChatModel)
+            : defaultChatSettings;
+        // 场景站位 / 场景角色候选里除了资产 id 还有描述、表演母版、声音锁、随身道具和
+        // 站位的空间文字，这些只存在于电影工程的资产记录里。生成前读一次资产库，把它们
+        // 一起带给 Agent，模型才能「按故事梗概」决定引用谁。
+        // 注意：资产是全局共享的（节点工程只保存场景结构），所以必须读共享资产库，
+        // 再并上节点工程自己的遗留资产，否则拿到的 assets 是空的。
+        const [storedProject, sharedAssets] = await Promise.all([
+          studioProjectId ? loadProjectFromDatabaseById(studioProjectId) : Promise.resolve(null),
+          loadSharedAssets(),
+        ]);
+        const assets = mergeAssetPool(sharedAssets, storedProject?.assets ?? []);
+        const projectAssetNames = new Map(
+          assets.filter((asset) => asset.name.trim()).map((asset) => [asset.id, asset.name.trim()]),
+        );
+        const stagingContext = buildQuickStagingContext({
+          assets,
+          staging: hasQuickStagingData ? quickStaging : undefined,
+          imageSources: quickPromptAssets.referenceImages,
+          resolveImageSource: (assetId) => propImageSources.get(assetId),
+          resolveAssetName: (assetId) => projectAssetNames.get(assetId) ?? cinematicMirrorNames.get(assetId),
+        });
+        // 素材库镜像里的描述是从工程资产复制过来的，旧数据曾被落库丢过该字段，
+        // 退化成一串标签（「场景、电影资产」）。生成前用工程资产的描述兜底，
+        // 保证「场景站位 / 角色候选里的描述」一定进提示词。
+        const descriptionByAssetId = new Map<string, string>();
+        for (const asset of assets) {
+          const description = asset.descriptionZh?.trim() || asset.description?.trim();
+          if (description) descriptionByAssetId.set(asset.id, description);
+        }
+        const withProjectMetadata = (list: QuickPromptAsset[]): QuickPromptAsset[] =>
+          list.map((item) => {
+            const assetId = cinematicAssetIdFromMirrorId(item.id);
+            const description = descriptionByAssetId.get(assetId);
+            const name = projectAssetNames.get(assetId);
+            if (!description && !name) return item;
+            return {
+              ...item,
+              ...(name && name !== item.name ? { name } : {}),
+              ...(description && description !== item.description ? { description } : {}),
+            };
+          });
+        const rawPrompt = await generateQuickPrompt(
+          {
+            style: quickInputs.style,
+            synopsis: quickInputs.synopsis,
+            sceneAssets: withProjectMetadata(quickPromptAssets.sceneAssets),
+            characterAssets: withProjectMetadata(quickPromptAssets.characterAssets),
+            ...(stagingContext.staging ? { staging: stagingContext.staging } : {}),
+            ...(stagingContext.characterProfiles.length ? { characterProfiles: stagingContext.characterProfiles } : {}),
+            // 道具 = 上游接入的道具媒体（已带 [imageN]）+ 站位里收集到的道具
+            // （角色随身道具 + 道具候选框选中的场景道具）。
+            ...(quickPromptAssets.propAssets.length || stagingContext.props.length
+              ? { props: [...withProjectMetadata(quickPromptAssets.propAssets), ...stagingContext.props] }
+              : {}),
+          },
+          quickPromptLang,
+          selectedSettings,
+          // 节点上选的提示词格式决定用哪套规则生成
+          quickPromptFormatId,
+        );
+        // 人物音频引用统一成人可读的规范句：`使用 @音频N 作为 @角色 的唯一人声参考。`
+        // @音频N 同时是画布的规范标记（视频节点「引用」按钮插入的就是它），
+        // AI 输出里可能写成 [audioN] / @audioN 或旧式「声音参考：」，在落节点前一次收敛。
+        // 角色名走与 ACTIVE REFERENCES 同一套解析（电影工程资产名），保证与 @角色 标签一致。
+        const prompt = applyVoiceReferenceFormat(
+          rawPrompt,
+          quickPromptAssets.voiceBindings.map(({ audioIndex, characterId }) => ({
+            audioIndex,
+            characterName: projectAssetNames.get(characterId) ?? cinematicMirrorNames.get(characterId) ?? "",
+          })),
+          quickPromptLang,
+        );
+        // 道具参考图续在场景 / 角色之后，既有 [imageN] 顺序完全不变。
+        const referenceImages = [...quickPromptAssets.referenceImages, ...stagingContext.referenceImages];
+        // 极简生成链路：保存当前结果后立即创建右侧 AI 视频节点并自动连线。
+        // 图片与声音均来自场景/角色输入口及其本地资产选择；视频输入作为提示词 Agent 的上下文素材。
+        const referenceAudio = quickPromptAssets.referenceAudio;
+        updateNodeData(id, {
+          quickPrompt: prompt,
+          quickReferenceImages: referenceImages,
+          lastPromptPreview: prompt,
+          studioReferenceImages: referenceImages,
+          studioReferenceAudio: referenceAudio,
+        });
+        handleSendToVideo({
+          prompt,
+          referenceImages,
+          referenceAudio,
+          // Agent 的输出语言未必保留用户原话里的「5秒」，所以把自己写的故事梗概 /
+          // 风格也一起找一遍；两者都已并上上游接进来的文本。
+          durationHintSources: [quickInputs.synopsis, quickInputs.style],
+        });
+      } catch (error) {
+        setQuickError(error instanceof Error ? error.message : "生成提示词失败，请稍后重试。");
+      } finally {
+        quickGenerationLockRef.current = false;
+        setQuickGenerating(false);
+        // 生成结束(成功或失败)即释放: 成功时下游视频节点已经建好。
+        updateNodeData(id, { quickGenerationStartedAt: null, quickGenerationSessionId: null });
+      }
+    },
+    [
+      cinematicMirrorNames,
+      defaultChatSettings,
+      handleSendToVideo,
+      hasQuickStagingData,
+      id,
+      propImageSources,
+      quickChatModel,
+      quickChatProvider,
+      quickGenerating,
+      quickPromptAssets,
+      quickPromptFormatId,
+      quickPromptLang,
+      quickStaging,
+      resolveQuickInputs,
+      studioProjectId,
+      updateNodeData,
+    ],
+  );
+
+  const cachedTitle = typeof data.lastProjectTitle === "string" ? data.lastProjectTitle.trim() : "";
+  const isLegacyPreview = cachedTitle === "雨夜" || cachedTitle === "Rain Night";
+  const projectTitle = cachedTitle && !isLegacyPreview ? cachedTitle : null;
+  // 标题优先级：用户给节点起的名字 > 工作室工程标题 > 默认名。
+  const hasCustomTitle = !isNodeUsingDefaultDisplayName(CANVAS_NODE_TYPES.cinematicStudio, data);
+  const nodeTitle = hasCustomTitle ? displayName : (projectTitle ?? displayName);
+
+  return (
+    <div
+      className={`
+        group relative flex h-full flex-col overflow-visible rounded-[var(--node-radius)] border bg-surface-dark/90 p-2 transition-colors duration-150
+        ${
+          selected
+            ? "border-accent shadow-[0_0_0_1px_rgba(59,130,246,0.32)]"
+            : "border-[rgba(15,23,42,0.22)] hover:border-[rgba(15,23,42,0.34)] dark:border-[rgba(255,255,255,0.22)] dark:hover:border-[rgba(255,255,255,0.34)]"
+        }
+      `}
+      style={{ width: resolvedWidth, height: resolvedHeight }}
+    >
+      <NodeHeader
+        className={NODE_HEADER_FLOATING_POSITION_CLASS}
+        icon={<Clapperboard className="h-4 w-4" />}
+        titleText={nodeTitle}
+        editable
+        onTitleChange={(value) => updateNodeData(id, { displayName: value })}
+      />
+
+      {/* 「高级编辑」在**框内**右上角：浮动标题在框外上方（-top-7），
+          这块 mt-7 的空白正是给它让出来的，按钮落在这里既不压标题也不压内容。
+          以前它挂在标题栏的 rightSlot 上 —— 那是框外，和节点不再是一个视觉整体。 */}
+      <button
+        type="button"
+        className="nodrag absolute right-2 top-1 z-10 flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-text-muted transition-colors hover:bg-white/5 hover:text-text"
+        onClick={handleOpen}
+        title="进入完整高级工作台"
+      >
+        <Settings2 className="h-3 w-3" /> 高级编辑
+      </button>
+
+      {/* 内容区不再自带边框/底色：外壳那一层 border 就是**唯一**一层，
+          与「AI 视频」等节点的观感一致。此前这里是一块 rounded + border + bg 的面板，
+          套在外壳里就成了「框里还有一层框」。 */}
+      <section
+        className="relative mt-7 flex min-h-0 flex-1 flex-col gap-2.5 overflow-visible"
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        {/* 两个输入框吸收节点尺寸变化（`flex-1`），其余块保持原高（`shrink-0`）
+            —— 与「AI 视频」一致：拖外框拉高，变大的只有输入区。 */}
+        <label className="relative flex min-h-0 flex-1 flex-col gap-1 text-[10px] text-text-muted">
+          <Handle
+            type="target"
+            id={QUICK_INPUT_HANDLES.style}
+            position={Position.Left}
+            title="接入上游文本：风格 / 质量"
+            className="!left-[-13px] !top-1/2 !h-2.5 !w-2.5 !-translate-y-1/2 !border-surface-dark !bg-accent"
+          />
+          <span className="flex shrink-0 items-center justify-between gap-2">
+            风格 / 质量
+            {upstreamStyleTexts.length ? (
+              <span className="text-[9px] text-accent">已接入 {upstreamStyleTexts.length} 条文本</span>
+            ) : null}
+          </span>
+          <div className="relative min-h-0 flex-1">
+            {/* 与 AI 图片节点(ImageEditNode)一致：上游接入的文本以灰色只读行贴在输入框底部。 */}
+            <textarea
+              className={`nodrag nowheel ui-scrollbar-hover h-full min-h-[56px] w-full resize-none overflow-y-auto rounded border border-[rgba(255,255,255,0.12)] bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-text outline-none placeholder:text-text-muted/60 focus:border-accent ${upstreamStyleTexts.length > 0 ? "pb-[62px]" : ""}`}
+              value={quickStyle}
+              placeholder="例如：胶片感写实、冷暖对比、35mm、细腻颗粒"
+              onChange={(event) => handleQuickStyleChange(event.target.value)}
+              onPointerDown={(event) => event.stopPropagation()}
+              onWheel={(event) => event.stopPropagation()}
+            />
+            {upstreamStyleTexts.length > 0 && (
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute bottom-0 left-0 right-0 z-10 flex flex-col rounded-b bg-bg-dark/90 px-2 py-1 text-[11px] leading-relaxed text-text-muted"
+              >
+                {upstreamStyleTexts.slice(0, 3).map((text, index) => (
+                  <div
+                    key={`upstream-style-${index}`}
+                    className="overflow-hidden text-ellipsis whitespace-nowrap"
+                    title={text}
+                  >
+                    {text}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </label>
+
+        <label className="relative flex min-h-0 flex-1 flex-col gap-1 text-[10px] text-text-muted">
+          <Handle
+            type="target"
+            id={QUICK_INPUT_HANDLES.synopsis}
+            position={Position.Left}
+            title="接入上游文本：故事梗概"
+            className="!left-[-13px] !top-1/2 !h-2.5 !w-2.5 !-translate-y-1/2 !border-surface-dark !bg-accent"
+          />
+          <span className="flex shrink-0 items-center justify-between gap-2">
+            故事梗概
+            {upstreamSynopsisTexts.length ? (
+              <span className="text-[9px] text-accent">已接入 {upstreamSynopsisTexts.length} 条文本</span>
+            ) : null}
+          </span>
+          <div className="relative min-h-0 flex-1">
+            {/* 与 AI 图片节点(ImageEditNode)一致：上游接入的文本以灰色只读行贴在输入框底部。 */}
+            <textarea
+              className={`nodrag nowheel ui-scrollbar-hover h-full min-h-[56px] w-full resize-none overflow-y-auto rounded border border-[rgba(255,255,255,0.12)] bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-text outline-none placeholder:text-text-muted/60 focus:border-accent ${upstreamSynopsisTexts.length > 0 ? "pb-[62px]" : ""}`}
+              value={quickSynopsis}
+              placeholder="写清人物、事件、动作顺序和关键变化"
+              onChange={(event) => handleQuickSynopsisChange(event.target.value)}
+              onPointerDown={(event) => event.stopPropagation()}
+              onWheel={(event) => event.stopPropagation()}
+            />
+            {upstreamSynopsisTexts.length > 0 && (
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute bottom-0 left-0 right-0 z-10 flex flex-col rounded-b bg-bg-dark/90 px-2 py-1 text-[11px] leading-relaxed text-text-muted"
+              >
+                {upstreamSynopsisTexts.slice(0, 3).map((text, index) => (
+                  <div
+                    key={`upstream-synopsis-${index}`}
+                    className="overflow-hidden text-ellipsis whitespace-nowrap"
+                    title={text}
+                  >
+                    {text}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </label>
+
+        <div className="grid shrink-0 grid-cols-3 gap-2">
+          {(
+            [
+              [
+                "scene",
+                "场景站位",
+                "地点",
+                "选择地点资产",
+                QUICK_INPUT_HANDLES.sceneAssets,
+                selectedSceneAssets,
+                quickPickerItems.scene,
+                sceneInputMedia,
+              ],
+              [
+                "character",
+                "场景角色候选",
+                "角色",
+                "选择角色加入场景角色候选",
+                QUICK_INPUT_HANDLES.characterAssets,
+                selectedCharacterAssets,
+                quickPickerItems.character,
+                characterInputMedia,
+              ],
+              [
+                "prop",
+                "道具",
+                "道具",
+                "选择道具加入本场",
+                QUICK_INPUT_HANDLES.propAssets,
+                selectedPropAssets,
+                quickPickerItems.prop,
+                propInputMedia,
+              ],
+            ] as const
+          ).map(([kind, label, sourceLabel, pickerLabel, inputHandleId, chosen, pickerItems, connectedMedia]) => (
+            <div
+              key={kind}
+              data-quick-popover
+              className="relative rounded border border-[rgba(255,255,255,0.12)] bg-black/15 p-1.5"
+            >
+              <Handle
+                type="target"
+                id={inputHandleId}
+                position={Position.Left}
+                title={`接入上游${label}：图片、音频或视频`}
+                className="!left-[-13px] !top-1/2 !h-2.5 !w-2.5 !-translate-y-1/2 !border-surface-dark !bg-accent"
+              />
+              <p className="mb-1 flex items-center justify-between gap-2 text-[10px] text-text-muted">
+                <span>{label}</span>
+                {connectedMedia.images.length + connectedMedia.audio.length + connectedMedia.videos.length > 0 ? (
+                  <span className="text-[9px] text-accent">
+                    已接入 {connectedMedia.images.length + connectedMedia.audio.length + connectedMedia.videos.length}
+                  </span>
+                ) : null}
+              </p>
+              <div className="ui-scrollbar-hover flex min-h-10 items-center gap-1 overflow-x-auto pb-0.5">
+                {connectedMedia.images.map((source, index) => (
+                  <div
+                    key={`input-image-${source}`}
+                    className="relative h-9 w-9 shrink-0 overflow-hidden rounded border border-accent/60 bg-black/30"
+                    title={`上游图片：${fileLabel(source, `图片 ${index + 1}`)}`}
+                  >
+                    <CinematicMediaThumb
+                      source={source}
+                      alt={`上游图片 ${index + 1}`}
+                    />
+                    <span className="absolute inset-x-0 bottom-0 bg-black/70 px-0.5 py-px text-center text-[8px] text-white">
+                      接入
+                    </span>
+                  </div>
+                ))}
+                {connectedMedia.audio.map((source, index) => (
+                  <div
+                    key={`input-audio-${source}`}
+                    className="relative flex h-9 w-9 shrink-0 flex-col items-center justify-center rounded border border-accent/60 bg-accent/10 text-accent"
+                    title={`上游音频：${fileLabel(source, `音频 ${index + 1}`)}`}
+                  >
+                    <AudioLines className="h-3.5 w-3.5" />
+                    <span className="mt-0.5 text-[8px]">音频</span>
+                  </div>
+                ))}
+                {connectedMedia.videos.map((source, index) => (
+                  <div
+                    key={`input-video-${source}`}
+                    className="relative flex h-9 w-9 shrink-0 flex-col items-center justify-center rounded border border-accent/60 bg-accent/10 text-accent"
+                    title={`上游视频：${fileLabel(source, `视频 ${index + 1}`)}`}
+                  >
+                    <Video className="h-3.5 w-3.5" />
+                    <span className="mt-0.5 text-[8px]">视频</span>
+                  </div>
+                ))}
+                {chosen.map((asset) => (
+                  <div
+                    key={asset.id}
+                    className="group/asset relative h-9 w-9 shrink-0 overflow-hidden rounded border border-white/15 bg-black/30"
+                    title={cinematicDisplayName(asset, cinematicAssetNames)}
+                  >
+                    <CinematicMediaThumb
+                      source={asset.previewImageUrl || asset.sourcePath}
+                      alt={cinematicDisplayName(asset, cinematicAssetNames)}
+                    />
+                    <button
+                      type="button"
+                      aria-label={`移除${cinematicDisplayName(asset, cinematicAssetNames)}`}
+                      className="absolute inset-0 flex items-center justify-center bg-black/65 opacity-0 transition-opacity group-hover/asset:opacity-100"
+                      onClick={() => toggleQuickAsset(kind, asset.id)}
+                    >
+                      <X className="h-3.5 w-3.5 text-white" />
+                    </button>
+                  </div>
+                ))}
+                <QuickAssetPicker
+                  addLabel={`添加${label}`}
+                  active={activeAssetPicker === kind}
+                  onToggleOpen={(next) => setActiveAssetPicker(next ? kind : null)}
+                  title={pickerLabel}
+                  emptyHint={
+                    kind === "character" && characterAssets.length
+                      ? "所有角色都已加入场景角色候选"
+                      : kind === "prop" && propAssets.length
+                        ? "所有道具都已加入本场"
+                        : `资产库「${sourceLabel}」中暂无资产`
+                  }
+                  items={pickerItems}
+                  onToggleItem={(assetId) => toggleQuickAsset(kind, assetId)}
+                />
+                {chosen.length === 0 &&
+                connectedMedia.images.length + connectedMedia.audio.length + connectedMedia.videos.length === 0 ? (
+                  // 空态提示别再 `whitespace-nowrap`：三列并排时它比格子还宽，
+                  // 会把这一行撑出横向滚动条 —— 内容明明是空的，却常驻一条滑竿。
+                  // `truncate` 自带 nowrap + 省略号，配合 `min-w-0` 才能收缩。
+                  <span className="min-w-0 truncate text-[9px] text-text-muted/70">接入媒体或点击 + 选择</span>
+                ) : null}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {quickError ? <p className="text-[10px] leading-snug text-red-400">{quickError}</p> : null}
+
+        <div className="flex shrink-0 items-center justify-between gap-2">
+          <div data-quick-popover className="relative min-w-0 flex-1">
+            <button
+              type="button"
+              className="nodrag flex h-8 w-full min-w-0 items-center gap-1.5 rounded border border-[rgba(255,255,255,0.16)] bg-black/25 px-2 text-left transition-colors hover:border-[rgba(255,255,255,0.32)] focus:border-accent disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={quickGenerating || chatModels.length === 0}
+              aria-label="Chat 模型"
+              onClick={() => {
+                setActiveChatProviderId(
+                  hasSelectedQuickChatModel ? selectedQuickChatProvider : (chatModelGroups[0]?.providerId ?? ""),
+                );
+                setIsChatModelPickerOpen((current) => !current);
+              }}
+            >
+              <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-text">
+                {selectedQuickChatOption?.model ?? (chatModels.length ? "选择 Chat 模型" : "请先配置 Chat 模型")}
+              </span>
+              {selectedQuickChatOption ? (
+                <span className="max-w-[72px] truncate text-[10px] text-text-muted">
+                  {selectedQuickChatOption.providerName}
+                </span>
+              ) : null}
+              <ChevronDown
+                className={`h-3.5 w-3.5 shrink-0 text-text-muted transition-transform ${isChatModelPickerOpen ? "rotate-180" : ""}`}
+              />
+            </button>
+
+            {isChatModelPickerOpen && chatModelGroups.length ? (
+              <div
+                className="absolute bottom-[calc(100%+8px)] left-0 z-50 w-[min(420px,calc(100vw-40px))] rounded-lg border border-[rgba(255,255,255,0.16)] bg-[#171b25] p-2 shadow-2xl"
+                onPointerDown={(event) => event.stopPropagation()}
+                onWheel={(event) => event.stopPropagation()}
+              >
+                <div className="ui-scrollbar max-h-60 overflow-y-auto overscroll-contain pr-0.5">
+                  <section>
+                    <p className="mb-2 text-[10px] font-medium text-text-muted">平台</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {chatModelGroups.map((group) => {
+                        const active = group.providerId === resolvedActiveChatProviderId;
+                        return (
+                          <button
+                            key={group.providerId}
+                            type="button"
+                            className={`h-7 rounded-md border px-2 text-[10px] transition-colors ${active ? "border-accent/50 bg-accent/15 text-text" : "border-white/15 bg-black/20 text-text-muted hover:border-white/30 hover:text-text"}`}
+                            onClick={() => setActiveChatProviderId(group.providerId)}
+                          >
+                            {group.providerName}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                  <section className="mt-3 border-t border-white/10 pt-3">
+                    <p className="mb-2 text-[10px] font-medium text-text-muted">Chat 模型</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {activeChatModelGroup?.models.map((model) => {
+                        const active =
+                          activeChatModelGroup.providerId === selectedQuickChatProvider &&
+                          model === selectedQuickChatModel;
+                        return (
+                          <button
+                            key={`${activeChatModelGroup.providerId}:${model}`}
+                            type="button"
+                            className={`min-w-0 max-w-full rounded-md border px-2 py-1.5 text-left text-[10px] transition-colors ${active ? "border-accent/50 bg-accent/15 text-text" : "border-white/15 bg-black/20 text-text-muted hover:border-white/30 hover:text-text"}`}
+                            onClick={() => {
+                              updateNodeData(id, {
+                                quickChatProvider: activeChatModelGroup.providerId,
+                                quickChatModel: model,
+                              });
+                              setIsChatModelPickerOpen(false);
+                            }}
+                          >
+                            {model}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                </div>
+              </div>
+            ) : null}
+          </div>
+          {/* 提示词输出语言：默认跟随画布语言，点过之后固定为用户的选择。 */}
+          <div
+            className="nodrag flex h-8 shrink-0 items-stretch overflow-hidden rounded border border-[rgba(255,255,255,0.16)]"
+            title={
+              storedQuickPromptLang
+                ? "提示词输出语言（已固定，不再跟随画布）"
+                : `提示词输出语言：跟随画布（当前${canvasLocale === "zh" ? "中文" : "English"}）`
+            }
+          >
+            <button
+              type="button"
+              className={`px-2 text-[11px] font-medium transition-colors ${quickPromptLang === "zh" ? "bg-accent text-white" : "text-text-muted hover:bg-white/5 hover:text-text"}`}
+              onClick={() => handleQuickPromptLangChange("zh")}
+            >
+              中
+            </button>
+            <button
+              type="button"
+              className={`px-2 text-[11px] font-medium transition-colors ${quickPromptLang === "en" ? "bg-accent text-white" : "text-text-muted hover:bg-white/5 hover:text-text"}`}
+              onClick={() => handleQuickPromptLangChange("en")}
+            >
+              EN
+            </button>
+          </div>
+          <button
+            type="button"
+            className="shrink-0 flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={quickGenerating || chatModels.length === 0}
+            onClick={handleQuickGenerate}
+          >
+            {quickGenerating ? (
+              <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Sparkles className="h-3.5 w-3.5" />
+            )}
+            {quickGenerating ? "生成中…" : "生成提示词"}
+          </button>
+        </div>
+
+        {/* 提示词格式：决定「生成提示词」按哪套提示词规范产出。
+            原来这个位置是「AI 图片提示词」面板，已整体移除。
+            交互与上方「Chat 模型」一致（点击展开下拉，选中即收起）。 */}
+        <div className="nodrag mt-2 flex shrink-0 items-center gap-2">
+          <span className="shrink-0 text-[10px] font-medium text-text-muted">提示词格式</span>
+          <div data-quick-popover className="relative min-w-0 flex-1">
+            <button
+              type="button"
+              className="nodrag flex h-8 w-full min-w-0 items-center gap-1.5 rounded border border-[rgba(255,255,255,0.16)] bg-black/25 px-2 text-left transition-colors hover:border-[rgba(255,255,255,0.32)] focus:border-accent"
+              aria-label="提示词格式"
+              aria-expanded={isPromptFormatPickerOpen}
+              title={quickPromptFormat.description}
+              onClick={() => setIsPromptFormatPickerOpen((current) => !current)}
+            >
+              <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-text">
+                {quickPromptFormat.name}
+              </span>
+              <ChevronDown
+                className={`h-3.5 w-3.5 shrink-0 text-text-muted transition-transform ${isPromptFormatPickerOpen ? "rotate-180" : ""}`}
+              />
+            </button>
+
+            {isPromptFormatPickerOpen ? (
+              <div
+                className="absolute bottom-[calc(100%+8px)] left-0 z-50 w-[min(420px,calc(100vw-40px))] rounded-lg border border-[rgba(255,255,255,0.16)] bg-[#171b25] p-2 shadow-2xl"
+                onPointerDown={(event) => event.stopPropagation()}
+                onWheel={(event) => event.stopPropagation()}
+              >
+                <div className="ui-scrollbar max-h-60 overflow-y-auto overscroll-contain pr-0.5">
+                  {QUICK_PROMPT_FORMATS.map((format) => {
+                    const active = format.id === quickPromptFormatId;
+                    return (
+                      <button
+                        key={format.id}
+                        type="button"
+                        className={`w-full rounded-md border px-2 py-1.5 text-left transition-colors ${
+                          active
+                            ? "border-accent/50 bg-accent/15"
+                            : "border-white/10 bg-black/20 hover:border-white/30"
+                        }`}
+                        onClick={() => {
+                          updateNodeData(id, { quickPromptFormat: format.id });
+                          setIsPromptFormatPickerOpen(false);
+                        }}
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-text">
+                            {format.name}
+                          </span>
+                          {active ? (
+                            <Check className="h-3.5 w-3.5 shrink-0 text-accent" strokeWidth={3} />
+                          ) : null}
+                        </div>
+                        {format.description ? (
+                          <p className="mt-0.5 line-clamp-2 text-[10px] leading-snug text-text-muted">
+                            {format.description}
+                          </p>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </section>
+
+      <Handle
+        type="source"
+        id="source"
+        position={Position.Right}
+        className="!h-2 !w-2 !border-surface-dark !bg-accent"
+      />
+      <NodeResizeHandle
+        minWidth={CINEMATIC_STUDIO_NODE_MIN_WIDTH}
+        minHeight={CINEMATIC_STUDIO_NODE_COLLAPSED_MIN_HEIGHT}
+      />
+
+      {isOpen && typeof document !== "undefined"
+        ? createPortal(
+            <CinematicStudioWorkbench
+              onClose={handleClose}
+              onStateChange={handleStateChange}
+              onSendToVideo={handleSendToVideo}
+              canvasAudioSources={canvasAudioSources}
+              canvasImageSources={canvasImageSources}
+              projectId={studioProjectId || undefined}
+              quickSync={quickSyncInitialized || hasUpstreamText || hasQuickStagingData ? quickStudioSync : undefined}
+              quickSyncUpstream={quickSyncUpstream}
+            />,
+            document.body,
+          )
+        : null}
+    </div>
+  );
+});
+
+CinematicStudioNode.displayName = "CinematicStudioNode";

@@ -1,0 +1,282 @@
+name: Build Installers
+
+# 触发方式:
+#   1. 手动: Actions 页面 → Build Installers → Run workflow(可填版本号)
+#   2. 自动: 推送 v* 标签(如 git tag v1.0.0 && git push --tags)
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release 版本号(如 v1.0.0)"
+        required: true
+        default: "v1.0.0"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows (NSIS exe + MSI)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      # ── OTA 分发基址(仓库 Settings → Variables 配置) ──────────────────
+      # 留空   → 回落 github 镜像转发(ghfast.top), 即当前默认行为
+      # 轻量云 → 填服务器地址, 如 https://update.example.com 或 http://1.2.3.4:8080
+      # 对象存储 → 到期后只把这个变量改成 COS 域名, 无需再动工作流
+      #
+      # 注意: 这个变量只决定"清单里的 url 指向哪里", CI 本身不再向服务器推任何文件。
+      # 自建源的产物由服务器自己的 lentalk-ota-sync.timer 主动从 GitHub Release 拉取。
+      # 原因: runner 在美国 Azure 机房, 跨境 scp 实测只有 6~9 KB/s, 40MB 要传 77 分钟,
+      # 且会直接失败(v1.2.19 的 macOS 就是栽在这一步, 导致 Release 里连 darwin 资产都没有)。
+      # 详见《LenTalk-OTA-发布慢-根因与修复方案.md》。因此本工作流不再需要任何 SSH 凭据。
+      UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Setup Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # 随包 ffmpeg(视频 VFR→CFR 归一化用):压缩包放在 bundled-tools Release 资产上,
+      # 构建前还原到 src-tauri/resources/bin/。主配置不含 resources, 只有
+      # tauri.windows.conf.json 引用它, 因此 macOS job 不需要这一步。
+      - name: Restore bundled ffmpeg
+        run: npm run setup:ffmpeg
+
+      # 扒剧本引擎的随包运行时(嵌入式 Python + numpy/opencv/Pillow + ONNX 模型,
+      # 约 250MB):同样不入库, 构建前从公开源(PyPI / npmmirror / OpenCV Zoo)
+      # 还原。仅 Windows 随包, macOS job 不需要这一步。
+      - name: Restore bundled pajuben runtime
+        run: npm run setup:pajuben
+
+      - name: Clean stale bundle artifacts
+        shell: bash
+        run: rm -rf src-tauri/target/release/bundle
+
+      - name: Build Windows installers
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles nsis,msi
+
+      - name: Generate updater metadata (windows)
+        id: meta
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
+          VERSION_NUM="${VERSION#v}"
+          EXE=$(ls src-tauri/target/release/bundle/nsis/LenTalk_${VERSION_NUM}_*-setup.exe | head -1)
+          EXE_NAME=$(basename "$EXE")
+          SIG=$(cat "${EXE}.sig")
+          # 资源下载基址: 自建源(轻量云/COS) → <基址>/releases/<tag>; 未配置 → github 镜像前缀转发
+          if [ -n "$UPDATE_BASE_URL" ]; then
+            ASSET_BASE="${UPDATE_BASE_URL%/}/releases/$VERSION"
+          else
+            ASSET_BASE="https://ghfast.top/https://github.com/jownda/LenTalk-Copilot/releases/download/$VERSION"
+          fi
+          cat > latest-windows.json <<EOF
+          {
+            "version": "$VERSION_NUM",
+            "notes": "LenTalk $VERSION",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "windows-x86_64-nsis": {
+                "signature": "$SIG",
+                "url": "${ASSET_BASE}/${EXE_NAME}"
+              },
+              "windows-x86_64": {
+                "signature": "$SIG",
+                "url": "${ASSET_BASE}/${EXE_NAME}"
+              }
+            }
+          }
+          EOF
+          echo "资源基址: ${ASSET_BASE}/${EXE_NAME}"
+          echo "exe_path=$EXE" >> "$GITHUB_OUTPUT"
+          echo "asset_base=$ASSET_BASE" >> "$GITHUB_OUTPUT"
+
+      # ── 自建源同步已移到服务器侧 ────────────────────────────────────────
+      # 原先这里用 scp 把 exe/sig/清单跨境推给腾讯云, 实测只有 6~9 KB/s,
+      # 37MB 要传 12 分钟以上, 且会直接失败(v1.2.19 的 macOS job 卡了 2858s 后挂掉,
+      # 连带后面的 Release 步骤被 skip → Release 里连 darwin 资产都没有)。
+      # 现在由服务器上的 lentalk-ota-sync.timer 主动从本 Release 拉取(实测 20MB 约 30 秒,
+      # 全平台 37MB 约 52 秒)。服务器侧细节见 OTA-RUNBOOK.md。
+      # 保险丝: 老客户端仍有 ghfast.top 等镜像端点兜底, 自建源不可用时不会断供。
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2.5.1
+        with:
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+          name: LenTalk ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.sig
+            latest-windows.json
+
+  build-macos:
+    name: macOS (dmg)
+    runs-on: macos-latest
+    env:
+      # 与 build-windows 同一组变量, 两个平台的清单基址始终一致
+      # (同样只影响清单里的 url; 自建源产物由服务器主动拉取, 见 build-windows 的说明)
+      UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Clean stale bundle artifacts
+        run: rm -rf src-tauri/target/release/bundle
+
+      # 只打 .app(tauri 自带 dmg 脚本有 bug),dmg 用 hdiutil 手动打
+      - name: Build macOS app bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles app
+
+      - name: Package dmg
+        run: |
+          set -e
+          mkdir -p dmg-staging
+          cp -R src-tauri/target/release/bundle/macos/LenTalk.app dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
+          VERSION_NUM="${VERSION#v}"
+          hdiutil create -volname LenTalk -srcfolder dmg-staging -ov -format UDZO \
+            -imagekey zlib-level=9 "LenTalk_${VERSION_NUM}_aarch64.dmg"
+
+      - name: Generate updater metadata (macos)
+        id: meta
+        run: |
+          set -e
+          VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
+          VERSION_NUM="${VERSION#v}"
+          SIG=$(cat src-tauri/target/release/bundle/macos/LenTalk.app.tar.gz.sig)
+          # 与 Windows 同一套基址规则
+          if [ -n "$UPDATE_BASE_URL" ]; then
+            ASSET_BASE="${UPDATE_BASE_URL%/}/releases/$VERSION"
+          else
+            ASSET_BASE="https://ghfast.top/https://github.com/jownda/LenTalk-Copilot/releases/download/$VERSION"
+          fi
+          cat > latest-darwin.json <<EOF
+          {
+            "version": "$VERSION_NUM",
+            "notes": "LenTalk $VERSION",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "$SIG",
+                "url": "${ASSET_BASE}/LenTalk.app.tar.gz"
+              }
+            }
+          }
+          EOF
+          cp latest-darwin.json latest-macos.json
+          echo "资源基址: ${ASSET_BASE}/LenTalk.app.tar.gz"
+          echo "asset_base=$ASSET_BASE" >> "$GITHUB_OUTPUT"
+
+      # ── 自建源同步已移到服务器侧(同 build-windows) ──────────────────────
+      # 这一步原本是整个工作流最慢也最脆的地方: 把 .app.tar.gz(20MB) + dmg(20MB)
+      # 跨境 scp 给腾讯云, 实测 6~9 KB/s。v1.2.19 就是在这里跑了 2858 秒后失败,
+      # 导致紧随其后的 Release 步骤被 skip —— darwin 资产至今没进 GitHub Release。
+      # 现在改由服务器的 lentalk-ota-sync.timer 主动拉取。
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2.5.1
+        with:
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+          name: LenTalk ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            LenTalk_*_aarch64.dmg
+            src-tauri/target/release/bundle/macos/*.tar.gz
+            src-tauri/target/release/bundle/macos/*.sig
+            latest-darwin.json
+            latest-macos.json
+
+  repair-legacy-updater-manifests:
+    name: Merge updater manifests for older clients
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Merge platform metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}"
+          mkdir -p metadata
+          gh release download "$VERSION" \
+            --repo "${{ github.repository }}" \
+            --pattern latest-windows.json \
+            --pattern latest-macos.json \
+            --dir metadata \
+            --clobber
+          jq -s '.[0] as $windows | .[1] as $macos | ($windows * $macos) | .platforms = ($windows.platforms * $macos.platforms)' \
+            metadata/latest-windows.json metadata/latest-macos.json > metadata/latest-combined.json
+          # 逐个「先删后传」，不要用 `gh release upload --clobber`。
+          # 实测 2026-09-23 v1.2.25：多资产场景下 clobber 会报
+          #   HTTP 422: Validation Failed — ReleaseAsset.name already exists
+          # 它的 delete-then-create 有竞态，会让整个 job 变红（产物本身不受影响，
+          # 但 Actions 页面是 ✗，且最新一个清单不会被合并）。
+          # delete-asset 对不存在的资产返回非 0，故用 `|| true` 兜住。
+          for f in latest-windows.json latest-macos.json; do
+            cp metadata/latest-combined.json "metadata/$f"
+            gh release delete-asset "$VERSION" "$f" --repo "${{ github.repository }}" --yes || true
+            gh release upload "$VERSION" "metadata/$f" --repo "${{ github.repository }}"
+          done

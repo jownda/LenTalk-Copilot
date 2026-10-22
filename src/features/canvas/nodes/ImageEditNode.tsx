@@ -1,0 +1,1460 @@
+import {
+  type KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+  memo,
+  useMemo,
+  useState,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+} from 'react';
+import { Handle, Position, useStore, useUpdateNodeInternals, type NodeProps } from '@xyflow/react';
+import { createPortal } from 'react-dom';
+import { Sparkles } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import {
+  AUTO_REQUEST_ASPECT_RATIO,
+  CANVAS_NODE_TYPES,
+  EXPORT_RESULT_NODE_DEFAULT_WIDTH,
+  EXPORT_RESULT_NODE_LAYOUT_HEIGHT,
+  IMAGE_GENERATION_COUNT_MAX,
+  IMAGE_GENERATION_COUNT_MIN,
+  type ImageEditNodeData,
+  type ImageSize,
+} from '@/features/canvas/domain/canvasNodes';
+import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
+import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
+import { CanvasRefThumb } from '@/features/canvas/ui/CanvasRefThumb';
+import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
+import {
+  canvasAiGateway,
+  graphImageResolver,
+} from '@/features/canvas/application/canvasServices';
+import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
+import { registerNodeGenerationHandler } from '@/features/canvas/application/nodeGenerationRegistry';
+import {
+  detectAspectRatio,
+  parseAspectRatio,
+  resolveImageDisplayUrl,
+} from '@/features/canvas/application/imageData';
+import {
+  buildGenerationErrorReport,
+  CURRENT_RUNTIME_SESSION_ID,
+  createReferenceImagePlaceholders,
+  getRuntimeDiagnostics,
+  type GenerationDebugContext,
+} from '@/features/canvas/application/generationErrorReport';
+import {
+  findReferenceTokens,
+  insertReferenceToken,
+  remapImageReferenceTokens,
+  removeOutOfRangeReferenceTokens,
+  removeTextRange,
+  resolveReferenceAwareDeleteRange,
+} from '@/features/canvas/application/referenceTokenEditing';
+import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
+import { readLiveInputText } from '@/features/canvas/application/liveInputText';
+import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
+import {
+  DEFAULT_IMAGE_MODEL_ID,
+  getImageModel,
+  isApiKeylessProvider,
+  listImageModels,
+  resolveImageModelResolution,
+  resolveImageModelResolutions,
+} from '@/features/canvas/models';
+import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
+import { isWgspaiProvider } from '@/features/canvas/models/wgspaiPricing';
+import {
+  NODE_CONTROL_CHIP_CLASS,
+  NODE_CONTROL_ICON_CLASS,
+  NODE_CONTROL_MODEL_CHIP_NARROW_CLASS,
+  NODE_CONTROL_PARAMS_CHIP_CLASS,
+  NODE_CONTROL_PRIMARY_BUTTON_CLASS,
+} from '@/features/canvas/ui/nodeControlStyles';
+import { ModelParamsControls } from '@/features/canvas/ui/ModelParamsControls';
+import { ImageCountControl } from '@/features/canvas/ui/ImageCountControl';
+import { NodeReferencePicker } from '@/features/canvas/ui/NodeReferencePicker';
+import { PromptTemplatePicker } from '@/features/canvas/ui/PromptTemplatePicker';
+import {
+  PICKER_FALLBACK_ANCHOR,
+  resolvePickerAnchor,
+  type PickerAnchor,
+} from '@/features/canvas/ui/nodeReferencePickerLayout';
+import { appendPromptText, composePromptText, type PromptApplyMode } from '@/features/prompts/promptApply';
+import type { PromptTemplate } from '@/features/prompts/promptLibraryStore';
+import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
+import { resolveRecommendedApiPriceBadge } from './nodePriceBadge';
+import { UiButton } from '@/components/ui';
+import { useCanvasStore } from '@/stores/canvasStore';
+import { useSettingsStore } from '@/stores/settingsStore';
+
+type ImageEditNodeProps = NodeProps & {
+  id: string;
+  data: ImageEditNodeData;
+  selected?: boolean;
+};
+
+interface AspectRatioChoice {
+  value: string;
+  label: string;
+}
+
+const IMAGE_EDIT_NODE_MIN_WIDTH = 390;
+const IMAGE_EDIT_NODE_MIN_HEIGHT = 180;
+const IMAGE_EDIT_NODE_MAX_WIDTH = 1400;
+const IMAGE_EDIT_NODE_MAX_HEIGHT = 1000;
+const IMAGE_EDIT_NODE_DEFAULT_WIDTH = 520;
+const IMAGE_EDIT_NODE_DEFAULT_HEIGHT = 320;
+
+/** 缩略图轻量预览浮层状态: 图片地址 + 鼠标点击位置(用于定位) */
+interface ReferencePreviewState {
+  url: string;
+  x: number;
+  y: number;
+}
+
+const REFERENCE_PREVIEW_WIDTH = 180;
+const REFERENCE_PREVIEW_ESTIMATED_HEIGHT = 160;
+const REFERENCE_PREVIEW_MARGIN = 8;
+const REFERENCE_PREVIEW_OFFSET = 12;
+const REFERENCE_PREVIEW_MAX_SIZE = 200;
+const REFERENCE_PREVIEW_MIN_SIZE = 80;
+
+/** 按图片原始比例计算预览显示尺寸(等比缩放, 限制在最大尺寸内, 不小于最小尺寸) */
+function resolvePreviewDisplaySize(
+  naturalWidth: number,
+  naturalHeight: number
+): { width: number; height: number } {
+  const safeWidth = Math.max(1, naturalWidth);
+  const safeHeight = Math.max(1, naturalHeight);
+  const scale = Math.min(
+    REFERENCE_PREVIEW_MAX_SIZE / safeWidth,
+    REFERENCE_PREVIEW_MAX_SIZE / safeHeight,
+    1
+  );
+  let width = Math.max(REFERENCE_PREVIEW_MIN_SIZE, Math.round(safeWidth * scale));
+  let height = Math.max(REFERENCE_PREVIEW_MIN_SIZE, Math.round(safeHeight * scale));
+  if (width > REFERENCE_PREVIEW_MAX_SIZE) {
+    height = Math.round((height * REFERENCE_PREVIEW_MAX_SIZE) / width);
+    width = REFERENCE_PREVIEW_MAX_SIZE;
+  }
+  if (height > REFERENCE_PREVIEW_MAX_SIZE) {
+    width = Math.round((width * REFERENCE_PREVIEW_MAX_SIZE) / height);
+    height = REFERENCE_PREVIEW_MAX_SIZE;
+  }
+  return { width, height };
+}
+
+function resolvePreviewLeft(clientX: number, width: number): number {
+  if (typeof window === 'undefined') {
+    return clientX + REFERENCE_PREVIEW_OFFSET;
+  }
+  let left = clientX + REFERENCE_PREVIEW_OFFSET;
+  if (left + width > window.innerWidth - REFERENCE_PREVIEW_MARGIN) {
+    left = clientX - width - REFERENCE_PREVIEW_OFFSET;
+  }
+  return Math.max(
+    REFERENCE_PREVIEW_MARGIN,
+    Math.min(left, window.innerWidth - width - REFERENCE_PREVIEW_MARGIN)
+  );
+}
+
+function resolvePreviewTop(clientY: number, height: number): number {
+  if (typeof window === 'undefined') {
+    return clientY + REFERENCE_PREVIEW_OFFSET;
+  }
+  let top = clientY + REFERENCE_PREVIEW_OFFSET;
+  if (top + height > window.innerHeight - REFERENCE_PREVIEW_MARGIN) {
+    top = clientY - height - REFERENCE_PREVIEW_OFFSET;
+  }
+  return Math.max(
+    REFERENCE_PREVIEW_MARGIN,
+    Math.min(top, window.innerHeight - height - REFERENCE_PREVIEW_MARGIN)
+  );
+}
+
+function renderPromptWithHighlights(
+  prompt: string,
+  maxImageCount: number,
+  imageUrls: string[],
+  onThumbnailClick: (imageIndex: number, event: ReactMouseEvent<HTMLSpanElement>) => void
+): ReactNode {
+  if (!prompt) {
+    return ' ';
+  }
+
+  const segments: ReactNode[] = [];
+  let lastIndex = 0;
+  const referenceTokens = findReferenceTokens(prompt, maxImageCount);
+  for (const token of referenceTokens) {
+    const matchStart = token.start;
+    const matchText = token.token;
+    const imageIndex = token.value - 1;
+    const imageUrl = imageUrls[imageIndex] ?? null;
+
+    if (matchStart > lastIndex) {
+      segments.push(
+        <span key={`plain-${lastIndex}`}>{prompt.slice(lastIndex, matchStart)}</span>
+      );
+    }
+
+    if (imageUrl) {
+      // 保留 token 占位以保持光标位置一致(token 文字透明, 只显示缩略图)。
+      // 高亮层(z-20)覆盖在 textarea 上方: textarea 文字透明, 用户只看到
+      // 高亮层渲染的普通文字 + 缩略图, 不会看到 @图N 字样。
+      // 缩略图以行内元素参与排版,再用同宽负外边距抵消其占位。
+      // 这样它永远跟随当前文字行,而高亮层总宽度仍与 textarea 的 @图N 完全一致。
+      segments.push(
+        <span
+          key={`ref-${matchStart}`}
+          data-reference-image-index={imageIndex}
+          className="pointer-events-auto relative z-0 cursor-zoom-in select-none text-transparent"
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick={(event) => {
+            event.stopPropagation();
+            onThumbnailClick(imageIndex, event);
+          }}
+        >
+          <span
+            className="pointer-events-none relative -mr-5 inline-flex h-5 w-5 shrink-0 translate-x-1/2 align-middle items-center justify-center overflow-hidden rounded-md bg-accent/20 shadow-sm"
+          >
+            <CanvasRefThumb source={imageUrl} alt={matchText} className="h-full w-full shrink-0 object-cover" />
+          </span>
+          {matchText}
+        </span>
+      );
+    } else {
+      segments.push(
+        <span
+          key={`ref-${matchStart}`}
+          className="relative z-0 text-transparent"
+        >
+          {matchText}
+        </span>
+      );
+    }
+
+    lastIndex = matchStart + matchText.length;
+  }
+
+  if (lastIndex < prompt.length) {
+    segments.push(<span key={`plain-${lastIndex}`}>{prompt.slice(lastIndex)}</span>);
+  }
+
+  return segments;
+}
+
+function restoreBrokenImageReference(
+  previousPrompt: string,
+  nextPrompt: string,
+  maxImageCount: number
+): string {
+  const previousTokens = findReferenceTokens(previousPrompt, maxImageCount);
+  let restoredPrompt = nextPrompt;
+
+  for (const token of previousTokens) {
+    if (restoredPrompt.includes(token.token)) {
+      continue;
+    }
+
+    let prefixLength = 0;
+    const maxPrefixLength = Math.min(previousPrompt.length, restoredPrompt.length);
+    while (
+      prefixLength < maxPrefixLength
+      && previousPrompt[prefixLength] === restoredPrompt[prefixLength]
+    ) {
+      prefixLength += 1;
+    }
+
+    let suffixLength = 0;
+    const maxSuffixLength = Math.min(
+      previousPrompt.length - prefixLength,
+      restoredPrompt.length - prefixLength
+    );
+    while (
+      suffixLength < maxSuffixLength
+      && previousPrompt[previousPrompt.length - 1 - suffixLength]
+        === restoredPrompt[restoredPrompt.length - 1 - suffixLength]
+    ) {
+      suffixLength += 1;
+    }
+
+    const changedStart = prefixLength;
+    const changedEnd = previousPrompt.length - suffixLength;
+    if (token.start >= changedEnd || token.end <= changedStart) {
+      continue;
+    }
+
+    restoredPrompt = `${restoredPrompt.slice(0, prefixLength)}${token.token}${
+      suffixLength > 0 ? restoredPrompt.slice(restoredPrompt.length - suffixLength) : ''
+    }`;
+  }
+
+  return restoredPrompt;
+}
+
+function resolveAtomicReferenceSelection(
+  text: string,
+  selectionStart: number,
+  selectionEnd: number,
+  maxImageCount: number
+): { start: number; end: number } | null {
+  const safeStart = Math.max(0, Math.min(selectionStart, text.length));
+  const safeEnd = Math.max(0, Math.min(selectionEnd, text.length));
+
+  for (const token of findReferenceTokens(text, maxImageCount)) {
+    if (safeStart === safeEnd && safeStart > token.start && safeStart < token.end) {
+      const midpoint = token.start + (token.end - token.start) / 2;
+      const boundary = safeStart < midpoint ? token.start : token.end;
+      return { start: boundary, end: boundary };
+    }
+
+    if (safeStart !== safeEnd && safeStart < token.end && safeEnd > token.start) {
+      return {
+        start: Math.min(safeStart, token.start),
+        end: Math.max(safeEnd, token.end),
+      };
+    }
+  }
+
+  return null;
+}
+
+function pickClosestAspectRatio(
+  targetRatio: number,
+  supportedAspectRatios: string[]
+): string {
+  const supported = supportedAspectRatios.length > 0 ? supportedAspectRatios : ['1:1'];
+  let bestValue = supported[0];
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (const aspectRatio of supported) {
+    const ratio = parseAspectRatio(aspectRatio);
+    const distance = Math.abs(Math.log(ratio / targetRatio));
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestValue = aspectRatio;
+    }
+  }
+
+  return bestValue;
+}
+
+function resolveImageGenerationCount(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return IMAGE_GENERATION_COUNT_MIN;
+  return Math.max(
+    IMAGE_GENERATION_COUNT_MIN,
+    Math.min(IMAGE_GENERATION_COUNT_MAX, Math.round(numeric)),
+  );
+}
+
+function buildAiResultNodeTitle(prompt: string, fallbackTitle: string): string {
+  const normalizedPrompt = prompt.trim();
+  if (!normalizedPrompt) {
+    return fallbackTitle;
+  }
+
+  return normalizedPrompt;
+}
+
+export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageEditNodeProps) => {
+  const { t, i18n } = useTranslation();
+  const updateNodeInternals = useUpdateNodeInternals();
+  const [error, setError] = useState<string | null>(null);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const generationLockRef = useRef(false);
+
+  const rootRef = useRef<HTMLDivElement>(null);
+  // 画布缩放：@ 候选面板的锚点换算与视觉间距都要靠它折算。
+  // 用 useStore 选择器而不是 useViewport —— 后者在平移画布时也会触发重渲染，拖画布会变卡。
+  const zoom = useStore((state) => state.transform[2]);
+  const promptRef = useRef<HTMLTextAreaElement>(null);
+  const promptHighlightRef = useRef<HTMLDivElement>(null);
+  const [promptDraft, setPromptDraft] = useState(() => data.prompt ?? '');
+  const promptDraftRef = useRef(promptDraft);
+  /** 缩略图轻量预览: 从鼠标点击位置左侧滑出, 点击空白处关闭 */
+  const [previewState, setPreviewState] = useState<ReferencePreviewState | null>(null);
+  /** 预览图按图片比例自适应后的显示尺寸(加载完成前为 null) */
+  const [previewSize, setPreviewSize] = useState<{ width: number; height: number } | null>(null);
+  const [showImagePicker, setShowImagePicker] = useState(false);
+  const [pickerCursor, setPickerCursor] = useState<number | null>(null);
+  const [pickerActiveIndex, setPickerActiveIndex] = useState(0);
+  const [pickerAnchor, setPickerAnchor] = useState<PickerAnchor>(PICKER_FALLBACK_ANCHOR);
+
+  const { nodes, edges } = useCanvasInputGraph();
+  const incomingImages = useMemo(
+    () => graphImageResolver.collectInputImages(id, nodes, edges),
+    [edges, id, nodes]
+  );
+  const previousIncomingImagesRef = useRef(incomingImages);
+  const incomingText = useMemo(
+    () => graphImageResolver.collectInputText(id, nodes, edges),
+    [edges, id, nodes]
+  );
+  const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
+  const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const addNode = useCanvasStore((state) => state.addNode);
+  const findNodePosition = useCanvasStore((state) => state.findNodePosition);
+  const addEdge = useCanvasStore((state) => state.addEdge);
+  const apiKeys = useSettingsStore((state) => state.apiKeys);
+  const customApis = useSettingsStore((state) => state.customApis);
+  const customModelPrices = useSettingsStore((state) => state.customModelPrices);
+  const setCustomModelPrice = useSettingsStore((state) => state.setCustomModelPrice);
+  const setLastImageSize = useSettingsStore((state) => state.setLastImageSize);
+  const setLastImageAspectRatio = useSettingsStore((state) => state.setLastImageAspectRatio);
+  const grsaiNanoBananaProModel = useSettingsStore((state) => state.grsaiNanoBananaProModel);
+  const showNodePrice = useSettingsStore((state) => state.showNodePrice);
+  const priceDisplayCurrencyMode = useSettingsStore((state) => state.priceDisplayCurrencyMode);
+  const usdToCnyRate = useSettingsStore((state) => state.usdToCnyRate);
+  const preferDiscountedPrice = useSettingsStore((state) => state.preferDiscountedPrice);
+  const grsaiCreditTierId = useSettingsStore((state) => state.grsaiCreditTierId);
+  const { cancelCommit: cancelPromptCommit, flushCommit: flushPromptCommit, scheduleCommit: schedulePromptCommit } =
+    useDebouncedNodeTextCommit({
+      nodeId: id,
+      field: 'prompt',
+      valueRef: promptDraftRef,
+      updateNodeData,
+    });
+
+  // 文本引用预览现在按行渲染(每行一个上游文本), 不再需要合并字符串
+
+  const incomingImageItems = useMemo(
+    () =>
+      incomingImages.map((imageUrl, index) => ({
+        imageUrl,
+        displayUrl: resolveImageDisplayUrl(imageUrl),
+        label: `图${index + 1}`,
+      })),
+    [incomingImages]
+  );
+  const incomingImageViewerList = useMemo(
+    () => incomingImageItems.map((item) => resolveImageDisplayUrl(item.imageUrl)),
+    [incomingImageItems]
+  );
+
+  const imageModels = listImageModels();
+  const selectedModel = getImageModel(data.model ?? DEFAULT_IMAGE_MODEL_ID);
+  const imageCount = resolveImageGenerationCount(data.imageCount);
+  // 一档实际出几张：绝大多数模型是 1，Midjourney 是 4（一档 = 一组 4 张）。
+  // 请求侧与按钮文案都以它为准，见 models/midjourney.ts。
+  const imagesPerCountUnit = selectedModel.imagesPerCountUnit ?? 1;
+  const providerApiKey = apiKeys[selectedModel.providerId] ?? '';
+  // 即梦 / 万相这类本机 CLI 平台靠可执行文件与登录态工作, 没有可填的密钥 ——
+  // 不能因为 apiKeys 里没有这一项就把生成拦下来。
+  const isKeylessProvider = isApiKeylessProvider(selectedModel.providerId);
+  const customApiBaseUrl = useMemo(() => {
+    if (!selectedModel.providerId.startsWith('custom:')) {
+      return undefined;
+    }
+    const customId = selectedModel.providerId.slice('custom:'.length);
+    return customApis.find((api) => api.id === customId)?.baseUrl;
+  }, [customApis, selectedModel.providerId]);
+  const effectiveExtraParams = useMemo(
+    () => ({
+      // 模型自带的默认值先铺底（MJ 的 bot_type / stylize），节点上用户改过的再覆盖。
+      // 不铺这一层，用户不点开参数面板时 MJ 的必填字段就只能靠网关默认值兜着。
+      ...(selectedModel.defaultExtraParams ?? {}),
+      ...(data.extraParams ?? {}),
+      ...(customApiBaseUrl ? { provider_base_url: customApiBaseUrl } : {}),
+    }),
+    [customApiBaseUrl, data.extraParams, grsaiNanoBananaProModel, selectedModel.id]
+  );
+  const resolutionOptions = useMemo(
+    () => resolveImageModelResolutions(selectedModel, { extraParams: effectiveExtraParams }),
+    [effectiveExtraParams, selectedModel]
+  );
+
+  const selectedResolution = useMemo(
+    () => resolveImageModelResolution(selectedModel, data.size, { extraParams: effectiveExtraParams }),
+    [data.size, effectiveExtraParams, selectedModel]
+  );
+
+  const aspectRatioOptions = useMemo<AspectRatioChoice[]>(
+    () => [{
+      value: AUTO_REQUEST_ASPECT_RATIO,
+      label: t('modelParams.autoAspectRatio'),
+    }, ...selectedModel.aspectRatios],
+    [selectedModel.aspectRatios, t]
+  );
+
+  const selectedAspectRatio = useMemo(
+    () =>
+      aspectRatioOptions.find((item) => item.value === data.requestAspectRatio) ??
+      aspectRatioOptions[0],
+    [aspectRatioOptions, data.requestAspectRatio]
+  );
+
+  const requestResolution = selectedModel.resolveRequest({
+    referenceImageCount: incomingImages.length,
+  });
+  // fal/kie 平台已移除, web search 开关不再出现
+  const showWebSearchToggle = false;
+  const webSearchEnabled = Boolean(data.extraParams?.enable_web_search);
+  const resolvedPriceDisplay = useMemo(
+    () =>
+      showNodePrice
+        ? resolveModelPriceDisplay(selectedModel, {
+          resolution: selectedResolution.value,
+          // 一档多张的模型(Midjourney 一档 = 一组 4 张)按组计价, 报价要乘组数;
+          // WGSPAI 的图片是**按张**计价(0.1 元/张), 选 4 张就该显示 0.4;
+          // 其它模型 prices 与张数无关, 不传 count 免得被误读。
+          extraParams:
+            imagesPerCountUnit > 1 || isWgspaiProvider('', customApiBaseUrl ?? '')
+              ? { ...effectiveExtraParams, count: imageCount }
+              : effectiveExtraParams,
+          language: i18n.language,
+          settings: {
+            displayCurrencyMode: priceDisplayCurrencyMode,
+            usdToCnyRate,
+            preferDiscountedPrice,
+            grsaiCreditTierId,
+          },
+        })
+        : null,
+    [
+      grsaiCreditTierId,
+      i18n.language,
+      imagesPerCountUnit,
+      imageCount,
+      customApiBaseUrl,
+      preferDiscountedPrice,
+      priceDisplayCurrencyMode,
+      effectiveExtraParams,
+      selectedModel,
+      selectedResolution.value,
+      showNodePrice,
+      usdToCnyRate,
+    ]
+  );
+  const resolvedPriceTooltip = useMemo(() => {
+    if (!resolvedPriceDisplay) {
+      return undefined;
+    }
+
+    const lines = [resolvedPriceDisplay.label];
+    if (resolvedPriceDisplay.nativeLabel) {
+      lines.push(t('pricing.nativePrice', { value: resolvedPriceDisplay.nativeLabel }));
+    }
+    if (resolvedPriceDisplay.originalLabel) {
+      lines.push(t('pricing.originalPrice', { value: resolvedPriceDisplay.originalLabel }));
+    }
+    if (resolvedPriceDisplay.pointsCost) {
+      lines.push(t('pricing.pointsCost', { count: resolvedPriceDisplay.pointsCost }));
+    }
+    if (resolvedPriceDisplay.grsaiCreditTier) {
+      lines.push(
+        t('pricing.grsaiTier', {
+          price: resolvedPriceDisplay.grsaiCreditTier.priceCny.toFixed(2),
+          credits: resolvedPriceDisplay.grsaiCreditTier.credits.toLocaleString(
+            i18n.language.startsWith('zh') ? 'zh-CN' : 'en-US'
+          ),
+        })
+      );
+    }
+    return lines.join('\n');
+  }, [i18n.language, resolvedPriceDisplay, t]);
+
+  // 推荐平台（如知鸟 AI / 炳火）的模型未注册精确 pricing,
+  // 用 recommendedApis.pricingRange.image 区间作为右上角徽章的兜底。
+  // 注意: 这里不能改 resolvedPriceDisplay 本身, 否则会污染 tooltip,
+  // 而是单独合成一个轻量 badgeInfo, 仅在显示前判定 null 时顶替。
+  const recommendedPriceBadge = useMemo(
+    () => resolvedPriceDisplay
+      ? null
+      : resolveRecommendedApiPriceBadge(selectedModel?.providerId, customApis, 'image'),
+    [customApis, resolvedPriceDisplay, selectedModel?.providerId],
+  );
+  const displayedPriceBadge = resolvedPriceDisplay ?? recommendedPriceBadge;
+  const customPrice = data.customPrice !== undefined
+    ? (typeof data.customPrice === 'string' ? data.customPrice.trim() : '')
+    : (customModelPrices[selectedModel.id] ?? '');
+  const priceBadgeLabel = customPrice || displayedPriceBadge?.label || '[无价格]';
+
+  const handlePriceChange = useCallback((value: string | null) => {
+    updateNodeData(id, { customPrice: value });
+    setCustomModelPrice(selectedModel.id, value);
+  }, [id, selectedModel.id, setCustomModelPrice, updateNodeData]);
+
+  useEffect(() => {
+    const legacyPrice = typeof data.customPrice === 'string' ? data.customPrice.trim() : '';
+    if (legacyPrice && !customModelPrices[selectedModel.id]) {
+      setCustomModelPrice(selectedModel.id, legacyPrice);
+    }
+  }, [customModelPrices, data.customPrice, selectedModel.id, setCustomModelPrice]);
+
+  const supportedAspectRatioValues = useMemo(
+    () => selectedModel.aspectRatios.map((item) => item.value),
+    [selectedModel.aspectRatios]
+  );
+
+  const resolvedTitle = useMemo(
+    () => resolveNodeDisplayName(CANVAS_NODE_TYPES.imageEdit, data),
+    [data]
+  );
+
+  const resolvedWidth = Math.max(IMAGE_EDIT_NODE_MIN_WIDTH, Math.round(width ?? IMAGE_EDIT_NODE_DEFAULT_WIDTH));
+  const resolvedHeight = Math.max(IMAGE_EDIT_NODE_MIN_HEIGHT, Math.round(height ?? IMAGE_EDIT_NODE_DEFAULT_HEIGHT));
+
+  useEffect(() => {
+    updateNodeInternals(id);
+  }, [id, resolvedHeight, resolvedWidth, updateNodeInternals]);
+
+  useEffect(() => {
+    const externalPrompt = data.prompt ?? '';
+    if (externalPrompt !== promptDraftRef.current) {
+      promptDraftRef.current = externalPrompt;
+      setPromptDraft(externalPrompt);
+    }
+  }, [data.prompt]);
+
+  const commitPromptDraft = useCallback((nextPrompt: string) => {
+    promptDraftRef.current = nextPrompt;
+    cancelPromptCommit();
+    updateNodeData(id, { prompt: nextPrompt });
+  }, [cancelPromptCommit, id, updateNodeData]);
+
+  // 上游图片断连或重排时，按原始图片来源重映射 @图N；断开的图片
+  // 只删除自己的引用，后续图片不会继承错误编号。
+  useEffect(() => {
+    const remapped = remapImageReferenceTokens(
+      promptDraftRef.current,
+      previousIncomingImagesRef.current,
+      incomingImages,
+    );
+    const cleaned = removeOutOfRangeReferenceTokens(remapped, incomingImages.length);
+    previousIncomingImagesRef.current = incomingImages;
+    if (cleaned !== promptDraftRef.current) {
+      promptDraftRef.current = cleaned;
+      setPromptDraft(cleaned);
+      cancelPromptCommit();
+      updateNodeData(id, { prompt: cleaned });
+    }
+  }, [cancelPromptCommit, id, incomingImages, updateNodeData]);
+
+  // 轻量预览浮层: Esc 关闭
+  useEffect(() => {
+    if (!previewState) {
+      return;
+    }
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setPreviewState(null);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [previewState]);
+
+  useEffect(() => {
+    if (data.model !== selectedModel.id) {
+      updateNodeData(id, { model: selectedModel.id });
+    }
+
+    if (data.size !== selectedResolution.value) {
+      updateNodeData(id, { size: selectedResolution.value as ImageSize });
+    }
+
+    if (data.requestAspectRatio !== selectedAspectRatio.value) {
+      updateNodeData(id, { requestAspectRatio: selectedAspectRatio.value });
+    }
+  }, [
+    data.model,
+    data.requestAspectRatio,
+    data.size,
+    id,
+    selectedAspectRatio.value,
+    selectedModel.id,
+    selectedResolution.value,
+    updateNodeData,
+  ]);
+
+  useEffect(() => {
+    if (incomingImages.length === 0) {
+      setShowImagePicker(false);
+      setPickerCursor(null);
+      setPickerActiveIndex(0);
+      return;
+    }
+
+    setPickerActiveIndex((previous) => Math.min(previous, incomingImages.length - 1));
+  }, [incomingImages.length]);
+
+  useEffect(() => {
+    const handleOutside = (event: MouseEvent) => {
+      if (rootRef.current?.contains(event.target as globalThis.Node)) {
+        return;
+      }
+
+      setShowImagePicker(false);
+      setPickerCursor(null);
+    };
+
+    document.addEventListener('mousedown', handleOutside, true);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside, true);
+    };
+  }, []);
+
+  const handleGenerate = useCallback(async () => {
+    if (generationLockRef.current) {
+      return;
+    }
+    generationLockRef.current = true;
+    setIsGenerating(true);
+    flushPromptCommit();
+
+    const prompt = [
+      promptDraftRef.current.replace(/@(?=图\d+)/g, '').trim(),
+      // 上游文本节点的编辑是防抖提交的: 现取一次(补交欠账 + 直读 store), 避免用到上一版文本。
+      ...readLiveInputText(id),
+    ].filter(Boolean).join('\n\n').trim();
+    if (!prompt) {
+      const errorMessage = t('node.imageEdit.promptRequired');
+      setError(errorMessage);
+      void showErrorDialog(errorMessage, t('common.error'));
+      generationLockRef.current = false;
+      setIsGenerating(false);
+      return;
+    }
+
+    if (!providerApiKey && !isKeylessProvider) {
+      const errorMessage = t('node.imageEdit.apiKeyRequired');
+      setError(errorMessage);
+      void showErrorDialog(errorMessage, t('common.error'));
+      generationLockRef.current = false;
+      setIsGenerating(false);
+      return;
+    }
+
+    const generationDurationMs = selectedModel.expectedDurationMs ?? 60000;
+    const generationStartedAt = Date.now();
+    const resultNodeTitle = buildAiResultNodeTitle(prompt, t('node.imageEdit.resultTitle'));
+    // 诊断信息只用于错误报告，不能阻塞首次生成。Windows 首次调用会触发
+    // Tauri 版本/系统信息初始化，改为与生成请求并行采集。
+    const runtimeDiagnosticsPromise = Promise.resolve().then(() => getRuntimeDiagnostics()).catch(() => ({
+      appVersion: 'unknown',
+      osName: 'Unknown',
+      osVersion: 'unknown',
+      osBuild: 'unknown',
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent || '' : '',
+    }));
+    setError(null);
+
+    const newNodePosition = findNodePosition(
+      id,
+      EXPORT_RESULT_NODE_DEFAULT_WIDTH,
+      EXPORT_RESULT_NODE_LAYOUT_HEIGHT
+    );
+    const newNodeId = addNode(
+      CANVAS_NODE_TYPES.exportImage,
+      newNodePosition,
+      {
+        isGenerating: true,
+        generationStartedAt,
+        generationDurationMs,
+        // 创建即标记当前运行会话: 提交拿到 jobId 前的窗口期内, Canvas 的
+        // "无 jobId 自动恢复"逻辑不会把本节点当作残留任务重复提交(重复扣费)
+        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+        generationRequest: {
+          kind: 'image',
+          prompt,
+          model: requestResolution.requestModel,
+          size: selectedResolution.value,
+          aspectRatio: selectedAspectRatio.value,
+          imageCount,
+          referenceImages: incomingImages,
+          extraParams: { ...effectiveExtraParams, image_count: imageCount },
+        },
+        resultKind: 'generic',
+        displayName: resultNodeTitle,
+      }
+    );
+    addEdge(id, newNodeId);
+
+    try {
+      if (!isKeylessProvider) {
+        await canvasAiGateway.setApiKey(selectedModel.providerId, providerApiKey);
+      }
+
+      let resolvedRequestAspectRatio = selectedAspectRatio.value;
+      if (resolvedRequestAspectRatio === AUTO_REQUEST_ASPECT_RATIO) {
+        if (incomingImages.length > 0) {
+          try {
+            const sourceAspectRatio = await detectAspectRatio(incomingImages[0]);
+            const sourceAspectRatioValue = parseAspectRatio(sourceAspectRatio);
+            resolvedRequestAspectRatio = pickClosestAspectRatio(
+              sourceAspectRatioValue,
+              supportedAspectRatioValues
+            );
+          } catch {
+            resolvedRequestAspectRatio = pickClosestAspectRatio(1, supportedAspectRatioValues);
+          }
+        } else {
+          resolvedRequestAspectRatio = pickClosestAspectRatio(1, supportedAspectRatioValues);
+        }
+      }
+
+      const negativePrompt = String((data as Record<string, unknown>).negativePrompt ?? '').trim();
+      updateNodeData(newNodeId, {
+        // 先标记当前运行会话: 提交拿到 jobId 前的窗口期内, Canvas 的
+        // "无 jobId 自动恢复"逻辑不会把本节点当作残留任务重复提交
+        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+        generationRequest: {
+          kind: 'image',
+          prompt,
+          negativePrompt: negativePrompt || undefined,
+          model: requestResolution.requestModel,
+          size: selectedResolution.value,
+          aspectRatio: resolvedRequestAspectRatio,
+          imageCount,
+          referenceImages: incomingImages,
+          extraParams: effectiveExtraParams,
+        },
+      });
+      const generationPayload = {
+        prompt,
+        negativePrompt: negativePrompt || undefined,
+        model: requestResolution.requestModel,
+        size: selectedResolution.value,
+        aspectRatio: resolvedRequestAspectRatio,
+        imageCount,
+        referenceImages: incomingImages,
+        extraParams: effectiveExtraParams,
+      };
+      const runtimeDiagnostics = await runtimeDiagnosticsPromise;
+      const generationDebugContext: GenerationDebugContext = {
+        sourceType: 'imageEdit',
+        providerId: selectedModel.providerId,
+        requestModel: requestResolution.requestModel,
+        requestSize: selectedResolution.value,
+        requestAspectRatio: resolvedRequestAspectRatio,
+        prompt,
+        negativePrompt: negativePrompt || undefined,
+        extraParams: effectiveExtraParams,
+        referenceImageCount: incomingImages.length,
+        referenceImagePlaceholders: createReferenceImagePlaceholders(incomingImages.length),
+        appVersion: runtimeDiagnostics.appVersion,
+        osName: runtimeDiagnostics.osName,
+        osVersion: runtimeDiagnostics.osVersion,
+        osBuild: runtimeDiagnostics.osBuild,
+        userAgent: runtimeDiagnostics.userAgent,
+      };
+      // Every image request is a local background job. Canvas is the single
+      // completion path and can resume polling after the view is remounted.
+      const jobId = await canvasAiGateway.submitGenerateImageJob(generationPayload);
+      updateNodeData(newNodeId, {
+        generationJobId: jobId,
+        generationSourceType: 'imageEdit',
+        generationProviderId: selectedModel.providerId,
+        generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+        generationDebugContext,
+      });
+    } catch (generationError) {
+      const resolvedError = resolveErrorContent(generationError, t('ai.error'));
+      const runtimeDiagnostics = await runtimeDiagnosticsPromise;
+      const generationDebugContext: GenerationDebugContext = {
+        sourceType: 'imageEdit',
+        providerId: selectedModel.providerId,
+        requestModel: requestResolution.requestModel,
+        requestSize: selectedResolution.value,
+        requestAspectRatio: selectedAspectRatio.value,
+        prompt,
+        extraParams: effectiveExtraParams,
+        referenceImageCount: incomingImages.length,
+        referenceImagePlaceholders: createReferenceImagePlaceholders(incomingImages.length),
+        appVersion: runtimeDiagnostics.appVersion,
+        osName: runtimeDiagnostics.osName,
+        osVersion: runtimeDiagnostics.osVersion,
+        osBuild: runtimeDiagnostics.osBuild,
+        userAgent: runtimeDiagnostics.userAgent,
+      };
+      const reportText = buildGenerationErrorReport({
+        errorMessage: resolvedError.message,
+        errorDetails: resolvedError.details,
+        context: generationDebugContext,
+      });
+      setError(resolvedError.message);
+      void showErrorDialog(
+        resolvedError.message,
+        t('common.error'),
+        resolvedError.details,
+        reportText
+      );
+      updateNodeData(newNodeId, {
+        isGenerating: false,
+        generationStartedAt: null,
+        generationJobId: null,
+        generationProviderId: null,
+        generationClientSessionId: null,
+        generationError: resolvedError.message,
+        generationErrorDetails: resolvedError.details ?? null,
+        generationDebugContext,
+      });
+    } finally {
+      generationLockRef.current = false;
+      setIsGenerating(false);
+    }
+  }, [
+    addNode,
+    addEdge,
+    providerApiKey,
+    findNodePosition,
+    effectiveExtraParams,
+    flushPromptCommit,
+    id,
+    incomingImages,
+    imageCount,
+    isKeylessProvider,
+    requestResolution.requestModel,
+    selectedAspectRatio.value,
+    selectedModel.id,
+    selectedModel.expectedDurationMs,
+    selectedModel.providerId,
+    selectedResolution.value,
+    supportedAspectRatioValues,
+    t,
+    updateNodeData,
+  ]);
+
+  // 把「生成」登记给 AI Agent：它按节点名触发时走的就是这个函数 ——
+  // 与用户亲手点按钮完全是同一条路径，因此计费/取消/错误处理都不会被绕开。
+  useEffect(
+    () => registerNodeGenerationHandler(id, () => void handleGenerate()),
+    [id, handleGenerate],
+  );
+
+  const syncPromptHighlightScroll = () => {
+    if (!promptRef.current || !promptHighlightRef.current) {
+      return;
+    }
+
+    promptHighlightRef.current.scrollTop = promptRef.current.scrollTop;
+    promptHighlightRef.current.scrollLeft = promptRef.current.scrollLeft;
+  };
+
+  /**
+   * 插入 / 删除引用 token 后，光标与视图必须停在原处。
+   *
+   * 受控 textarea 的 value 一变，浏览器会把选区丢到文末、把视图滚到最后一行；
+   * 原先用 requestAnimationFrame 补救，但那会先让用户看到一帧「字跳到最后一行」，
+   * 且同一批里若再有第二次 value 更新（节点数据回写）会把光标重新冲掉。
+   * 改为：记下操作前的光标与 scrollTop，在 layout 阶段（浏览器绘制前）写回，
+   * 并在用户下一次真实交互之前持续钉住 —— 插入点之外的内容原地不动。
+   */
+  const pendingPromptCaretRef = useRef<{ cursor: number; scrollTop: number | null } | null>(null);
+
+  const clearPendingPromptCaret = useCallback(() => {
+    pendingPromptCaretRef.current = null;
+  }, []);
+
+  useLayoutEffect(() => {
+    const pending = pendingPromptCaretRef.current;
+    const textarea = promptRef.current;
+    if (!pending || !textarea) {
+      return;
+    }
+    textarea.focus();
+    textarea.setSelectionRange(pending.cursor, pending.cursor);
+    // scrollTop 只写回一次：之后用户自己滚动时不再被程序抢回去。
+    if (pending.scrollTop !== null) {
+      textarea.scrollTop = pending.scrollTop;
+      syncPromptHighlightScroll();
+      pending.scrollTop = null;
+    }
+  });
+
+  const handlePromptAreaClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    const referenceElements = event.currentTarget.querySelectorAll<HTMLElement>(
+      '[data-reference-image-index]'
+    );
+
+    for (const element of referenceElements) {
+      const rect = element.getBoundingClientRect();
+      if (
+        event.clientX < rect.left
+        || event.clientX > rect.right
+        || event.clientY < rect.top
+        || event.clientY > rect.bottom
+      ) {
+        continue;
+      }
+
+      const imageIndex = Number(element.dataset.referenceImageIndex);
+      const image = incomingImageItems[imageIndex];
+      if (!image) {
+        return;
+      }
+
+      setPreviewState({ url: image.displayUrl, x: event.clientX, y: event.clientY });
+      setPreviewSize(null);
+      return;
+    }
+  }, [incomingImageItems]);
+
+  const handleReferenceThumbnailClick = useCallback((
+    imageIndex: number,
+    event: ReactMouseEvent<HTMLSpanElement>
+  ) => {
+    const image = incomingImageItems[imageIndex];
+    if (!image) {
+      return;
+    }
+
+    setPreviewState({ url: image.displayUrl, x: event.clientX, y: event.clientY });
+    setPreviewSize(null);
+  }, [incomingImageItems]);
+
+  const normalizePromptSelection = useCallback((textarea: HTMLTextAreaElement) => {
+    const currentPrompt = promptDraftRef.current;
+    const selectionStart = textarea.selectionStart ?? currentPrompt.length;
+    const selectionEnd = textarea.selectionEnd ?? selectionStart;
+    const normalized = resolveAtomicReferenceSelection(
+      currentPrompt,
+      selectionStart,
+      selectionEnd,
+      incomingImages.length
+    );
+    if (normalized) {
+      textarea.setSelectionRange(normalized.start, normalized.end);
+    }
+  }, [incomingImages.length]);
+
+  const insertImageReference = useCallback((imageIndex: number) => {
+    const marker = `@图${imageIndex + 1}`;
+    let basePrompt = promptDraftRef.current;
+    // 优先用按 @ 时记录的光标；异常路径（没记录到）退回 textarea 当前光标，
+    // 绝不退回「文末」—— 否则引用会凭空插到最后一行，光标也跟着跳到末尾。
+    let baseCursor = pickerCursor ?? promptRef.current?.selectionStart ?? basePrompt.length;
+    // 兜底: 光标前(忽略尾部空格)已是 '@' 时先移除, 避免插入后出现 '@@图N'
+    const trimmedBefore = basePrompt.slice(0, baseCursor).replace(/\s+$/, '');
+    if (trimmedBefore.endsWith('@')) {
+      const atIndex = trimmedBefore.length - 1;
+      basePrompt = basePrompt.slice(0, atIndex) + basePrompt.slice(atIndex + 1);
+      baseCursor = atIndex;
+    }
+    const { nextText: nextPrompt, nextCursor } = insertReferenceToken(basePrompt, baseCursor, marker);
+
+    pendingPromptCaretRef.current = {
+      cursor: nextCursor,
+      scrollTop: promptRef.current?.scrollTop ?? 0,
+    };
+    setPromptDraft(nextPrompt);
+    commitPromptDraft(nextPrompt);
+    setShowImagePicker(false);
+    setPickerCursor(null);
+    setPickerActiveIndex(0);
+  }, [commitPromptDraft, pickerCursor]);
+
+  /**
+   * 从「提示词模板」卡片填入一段文本。
+   *
+   * 合并规则与追加规则都走 `prompts/promptApply`：素材库提示词 tab 的「正向 / 完整」、
+   * 拖拽提示词到画布、画布右键「应用到选中节点」用的是同一份纯函数 ——
+   * 同一个模板不管从哪条路进去，落进输入框的文字都完全一样。
+   *
+   * 填入位置是文末：光标跟到新内容末尾，并把视图带到底部
+   * （`scrollTop` 写一个极大值，浏览器会夹到最大滚动位置，正好是末尾）。
+   */
+  const handleApplyPromptTemplate = useCallback((
+    template: PromptTemplate,
+    mode: PromptApplyMode
+  ) => {
+    const nextPrompt = appendPromptText(promptDraftRef.current, composePromptText(template, mode));
+
+    pendingPromptCaretRef.current = {
+      cursor: nextPrompt.length,
+      scrollTop: Number.MAX_SAFE_INTEGER,
+    };
+    setPromptDraft(nextPrompt);
+    commitPromptDraft(nextPrompt);
+  }, [commitPromptDraft]);
+
+  const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    // 只要用户开始敲键盘，就由浏览器接管光标，不再回钉插入位置。
+    clearPendingPromptCaret();
+    const currentPrompt = promptDraftRef.current;
+    const selectionStart = event.currentTarget.selectionStart ?? currentPrompt.length;
+    const selectionEnd = event.currentTarget.selectionEnd ?? selectionStart;
+
+    // 引用 token 是原子内容: 光标通过键盘移动到 token 内部时,直接跳到边界;
+    // 普通输入不会插入 token 中间,避免 @图N 被拆坏。Backspace/Delete 继续走下方
+    // 的整体删除逻辑。
+    const activeImageToken = findReferenceTokens(currentPrompt, incomingImages.length).find(
+      (token) =>
+        (selectionStart !== selectionEnd
+          && selectionStart < token.end
+          && selectionEnd > token.start)
+        || (selectionStart === selectionEnd
+          && selectionStart > token.start
+          && selectionStart < token.end)
+        || (event.key === 'ArrowLeft' && selectionStart === token.end && selectionEnd === token.end)
+        || (event.key === 'ArrowRight' && selectionStart === token.start && selectionEnd === token.start)
+    );
+    if (
+      activeImageToken
+      && event.key !== 'Backspace'
+      && event.key !== 'Delete'
+      && event.key !== 'ArrowLeft'
+      && event.key !== 'ArrowRight'
+    ) {
+      event.preventDefault();
+      const nextCursor = selectionStart <= activeImageToken.start
+        ? activeImageToken.start
+        : activeImageToken.end;
+      event.currentTarget.setSelectionRange(nextCursor, nextCursor);
+      return;
+    }
+
+    if (activeImageToken && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+      event.preventDefault();
+      const nextCursor = event.key === 'ArrowLeft'
+        ? activeImageToken.start
+        : activeImageToken.end;
+      event.currentTarget.setSelectionRange(nextCursor, nextCursor);
+      return;
+    }
+
+    if (event.key === 'Backspace' || event.key === 'Delete') {
+      const deletionDirection = event.key === 'Backspace' ? 'backward' : 'forward';
+      const deleteRange = resolveReferenceAwareDeleteRange(
+        currentPrompt,
+        selectionStart,
+        selectionEnd,
+        deletionDirection,
+        incomingImages.length
+      );
+      if (deleteRange) {
+        event.preventDefault();
+        const { nextText, nextCursor } = removeTextRange(currentPrompt, deleteRange);
+        pendingPromptCaretRef.current = {
+          cursor: nextCursor,
+          scrollTop: promptRef.current?.scrollTop ?? 0,
+        };
+        setPromptDraft(nextText);
+        commitPromptDraft(nextText);
+        return;
+      }
+    }
+
+    if (showImagePicker && incomingImages.length > 0) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        setPickerActiveIndex((previous) => (previous + 1) % incomingImages.length);
+        return;
+      }
+
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        setPickerActiveIndex((previous) =>
+          previous === 0 ? incomingImages.length - 1 : previous - 1
+        );
+        return;
+      }
+
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        insertImageReference(pickerActiveIndex);
+        return;
+      }
+    }
+
+    const isAtKey = event.key === '@' || (event.shiftKey && event.code === 'Digit2');
+    if (isAtKey && !event.ctrlKey && !event.metaKey && !event.altKey && incomingImages.length > 0) {
+      event.preventDefault();
+      const cursor = event.currentTarget.selectionStart ?? promptDraftRef.current.length;
+      setPickerAnchor(resolvePickerAnchor(rootRef.current, event.currentTarget, cursor, zoom));
+      setPickerCursor(cursor);
+      setShowImagePicker(true);
+      setPickerActiveIndex(0);
+      return;
+    }
+
+    if (event.key === 'Escape' && showImagePicker) {
+      event.preventDefault();
+      setShowImagePicker(false);
+      setPickerCursor(null);
+      setPickerActiveIndex(0);
+      return;
+    }
+
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+      event.preventDefault();
+      void handleGenerate();
+    }
+  };
+
+  return (
+    <div
+      ref={rootRef}
+      className={`
+        group relative flex h-full flex-col overflow-visible rounded-[var(--node-radius)] border bg-surface-dark/90 p-2 transition-colors duration-150
+        ${selected
+          ? 'border-accent shadow-[0_0_0_1px_rgba(59,130,246,0.32)]'
+          : 'border-[rgba(15,23,42,0.22)] hover:border-[rgba(15,23,42,0.34)] dark:border-[rgba(255,255,255,0.22)] dark:hover:border-[rgba(255,255,255,0.34)]'}
+      `}
+      style={{ width: `${resolvedWidth}px`, height: `${resolvedHeight}px` }}
+      onClick={() => setSelectedNode(id)}
+    >
+      <NodeHeader
+        className={NODE_HEADER_FLOATING_POSITION_CLASS}
+        icon={<Sparkles className="h-4 w-4" />}
+        titleText={resolvedTitle}
+        rightSlot={
+          showNodePrice ? (
+            <NodePriceBadge
+              label={priceBadgeLabel}
+              customPrice={customPrice || null}
+              editable
+              onPriceChange={handlePriceChange}
+              title={resolvedPriceTooltip ?? displayedPriceBadge?.nativeLabel}
+            />
+          ) : undefined
+        }
+        editable
+        onTitleChange={(nextTitle) => updateNodeData(id, { displayName: nextTitle })}
+      />
+
+      <div className="relative min-h-0 flex-1 rounded-lg border border-[rgba(255,255,255,0.1)] bg-bg-dark/45 p-2">
+        <div
+          className="relative h-full min-h-0"
+          onClick={handlePromptAreaClick}
+        >
+          <div
+            ref={promptHighlightRef}
+            aria-hidden="true"
+            className="ui-scrollbar pointer-events-none absolute inset-0 z-20 overflow-y-auto overflow-x-hidden text-sm leading-6 text-text-dark"
+            style={{ scrollbarGutter: 'stable' }}
+          >
+            <div className="min-h-full whitespace-pre-wrap break-words px-1 py-0.5">
+              {renderPromptWithHighlights(
+                promptDraft,
+                incomingImages.length,
+                incomingImageItems.map((item) => item.displayUrl),
+                handleReferenceThumbnailClick
+              )}
+            </div>
+          </div>
+
+          <textarea
+            ref={promptRef}
+            value={promptDraft}
+            onChange={(event) => {
+              clearPendingPromptCaret();
+              const nextValue = restoreBrokenImageReference(
+                promptDraftRef.current,
+                event.target.value,
+                incomingImages.length
+              );
+              promptDraftRef.current = nextValue;
+              setPromptDraft(nextValue);
+              schedulePromptCommit();
+            }}
+            onBlur={() => {
+              clearPendingPromptCaret();
+              flushPromptCommit();
+            }}
+            onSelect={(event) => normalizePromptSelection(event.currentTarget)}
+            onKeyDown={handlePromptKeyDown}
+            onScroll={syncPromptHighlightScroll}
+            onMouseDown={(event) => {
+              // 用户自己点选光标位置时不再回钉。
+              clearPendingPromptCaret();
+              event.stopPropagation();
+            }}
+            placeholder={t('node.imageEdit.promptPlaceholder')}
+            className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent px-1 py-0.5 text-sm leading-6 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${incomingText.length > 0 ? 'pb-20' : ''}`}
+            style={{ scrollbarGutter: 'stable' }}
+          />
+          {incomingText.length > 0 && (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 flex flex-col gap-0 bg-bg-dark/90 px-1 py-0.5 text-sm leading-6 text-text-muted"
+            >
+              {incomingText.slice(0, 3).map((text, index) => (
+                <div
+                  key={`incoming-text-${index}`}
+                  className="overflow-hidden text-ellipsis whitespace-nowrap"
+                  title={text}
+                >
+                  {text}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {showImagePicker && incomingImageItems.length > 0 && (
+          <NodeReferencePicker
+            anchor={pickerAnchor}
+            containerRef={rootRef}
+            zoom={zoom}
+            entries={incomingImageItems.map((item, index) => ({
+              key: `${item.imageUrl}-${index}`,
+              kind: 'image',
+              label: item.label,
+              thumbUrl: item.displayUrl,
+              viewerSourceUrl: resolveImageDisplayUrl(item.imageUrl),
+              viewerImageList: incomingImageViewerList,
+            }))}
+            activeIndex={pickerActiveIndex}
+            onSelect={insertImageReference}
+            onHover={setPickerActiveIndex}
+          />
+        )}
+      </div>
+
+      <div className="mt-2 flex shrink-0 items-center gap-1.5">
+        <ModelParamsControls
+          imageModels={imageModels}
+          selectedModel={selectedModel}
+          resolutionOptions={resolutionOptions}
+          selectedResolution={selectedResolution}
+          selectedAspectRatio={selectedAspectRatio}
+          aspectRatioOptions={aspectRatioOptions}
+          onModelChange={(modelId) => {
+            updateNodeData(id, {
+              model: modelId,
+              customPrice: customModelPrices[modelId] ?? null,
+            });
+          }}
+          onResolutionChange={(resolution) => {
+            updateNodeData(id, { size: resolution as ImageSize });
+            // 记住本次选择, 新建图片节点默认沿用
+            setLastImageSize(resolution);
+          }
+          }
+          onAspectRatioChange={(aspectRatio) => {
+            updateNodeData(id, { requestAspectRatio: aspectRatio });
+            setLastImageAspectRatio(aspectRatio);
+          }
+          }
+          extraParams={data.extraParams}          onExtraParamChange={(key, value) =>
+            updateNodeData(id, {
+              extraParams: {
+                ...(data.extraParams ?? {}),
+                [key]: value,
+              },
+            })
+          }
+          showWebSearchToggle={showWebSearchToggle}
+          webSearchEnabled={webSearchEnabled}
+          onWebSearchToggle={(enabled) =>
+            updateNodeData(id, {
+              extraParams: {
+                ...(data.extraParams ?? {}),
+                enable_web_search: enabled,
+              },
+            })
+          }
+          triggerSize="sm"
+          // 模型 chip 只留模型名：平台名（KIE / PPIO / 即梦…）在这一格里是冗余信息
+          // —— 模型选择面板本来就按平台分组，展开就能看到。去掉后这一排宽松不少。
+          showProviderName={false}
+          chipClassName={NODE_CONTROL_CHIP_CLASS}
+          modelChipClassName={NODE_CONTROL_MODEL_CHIP_NARROW_CLASS}
+          paramsChipClassName={NODE_CONTROL_PARAMS_CHIP_CLASS}
+        />
+
+        {/* 生成张数：紧挨着提示词模板按钮放在它左边 —— 这两个都是「生成前最后一拍」
+            要确认的东西，顺手一起点完再按生成。Midjourney 的一档是 4 张，
+            按钮上显示的是换算后的张数（见 models/midjourney.ts）。 */}
+        <ImageCountControl
+          imageCount={imageCount}
+          imagesPerCountUnit={imagesPerCountUnit}
+          disabled={isGenerating}
+          onChange={(count) =>
+            updateNodeData(id, { imageCount: resolveImageGenerationCount(count) })
+          }
+        />
+
+        {/* 提示词模板：只显示图标，点开弹出「素材库 → 提示词库」的条目卡片。
+            紧跟在模型 / 参数后面，和左边那一组同一条基线对齐（右侧只剩生成按钮）。 */}
+        <PromptTemplatePicker onApply={handleApplyPromptTemplate} />
+
+        {/* 撑开中间的空档，把生成按钮顶到最右。 */}
+        <div className="ml-auto" />
+
+        <UiButton
+          disabled={isGenerating}
+          onClick={(event) => {
+            event.stopPropagation();
+            void handleGenerate();
+          }}
+          variant="primary"
+          className={`shrink-0 ${NODE_CONTROL_PRIMARY_BUTTON_CLASS}`}
+        >
+          <Sparkles className={NODE_CONTROL_ICON_CLASS} strokeWidth={2.8} />
+          {t('canvas.generate')}
+        </UiButton>
+      </div>
+
+      {error && <div className="mt-1 shrink-0 text-xs text-red-400">{error}</div>}
+
+      <Handle
+        type="target"
+        id="target"
+        position={Position.Left}
+        className="!h-2 !w-2 !border-surface-dark !bg-accent"
+      />
+      <Handle
+        type="source"
+        id="source"
+        position={Position.Right}
+        className="!h-2 !w-2 !border-surface-dark !bg-accent"
+      />
+      <NodeResizeHandle
+        minWidth={IMAGE_EDIT_NODE_MIN_WIDTH}
+        minHeight={IMAGE_EDIT_NODE_MIN_HEIGHT}
+        maxWidth={IMAGE_EDIT_NODE_MAX_WIDTH}
+        maxHeight={IMAGE_EDIT_NODE_MAX_HEIGHT}
+      />
+
+      {previewState && createPortal(
+        <>
+          <div className="fixed inset-0 z-[190]" onClick={() => setPreviewState(null)} />
+          <div
+            className="fixed z-[200] overflow-hidden rounded-lg border border-[rgba(255,255,255,0.16)] bg-black/60 shadow-2xl"
+            style={{
+              width: previewSize?.width ?? REFERENCE_PREVIEW_WIDTH,
+              height: previewSize?.height ?? REFERENCE_PREVIEW_ESTIMATED_HEIGHT,
+              left: resolvePreviewLeft(
+                previewState.x,
+                previewSize?.width ?? REFERENCE_PREVIEW_WIDTH
+              ),
+              top: resolvePreviewTop(
+                previewState.y,
+                previewSize?.height ?? REFERENCE_PREVIEW_ESTIMATED_HEIGHT
+              ),
+              transformOrigin: 'left center',
+              animation: 'reference-preview-pop 0.16s ease-out',
+            }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <img
+              src={previewState.url}
+              alt="参考图预览"
+              draggable={false}
+              className="h-full w-full object-contain"
+              onLoad={(event) => {
+                const img = event.currentTarget;
+                setPreviewSize(resolvePreviewDisplaySize(img.naturalWidth, img.naturalHeight));
+              }}
+            />
+          </div>
+          <style>{`@keyframes reference-preview-pop { from { transform: translateX(-12px) scaleX(0.75); opacity: 0; } to { transform: translateX(0) scaleX(1); opacity: 1; } }`}</style>
+        </>,
+        document.body
+      )}
+    </div>
+  );
+});
+
+ImageEditNode.displayName = 'ImageEditNode';

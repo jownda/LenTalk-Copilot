@@ -1,0 +1,2090 @@
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
+import { listen } from "@tauri-apps/api/event";
+import { Handle, Position, useStore, useUpdateNodeInternals } from "@xyflow/react";
+import {
+  AudioLines,
+  ChevronDown,
+  Clapperboard,
+  ImagePlus,
+  LoaderCircle,
+  Plus,
+  Sparkles,
+  Trash2,
+  X,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
+
+import {
+  CANVAS_NODE_TYPES,
+  EXPORT_RESULT_NODE_MIN_HEIGHT,
+  EXPORT_RESULT_NODE_MIN_WIDTH,
+  type VideoGenNodeData,
+} from "@/features/canvas/domain/canvasNodes";
+import { resolveNodeDisplayName } from "@/features/canvas/domain/nodeDisplay";
+import { resolveVideoNodeDuration, snapVideoDurationOption } from "@/features/canvas/domain/videoNodeDefaults";
+import { canvasAiGateway, graphImageResolver } from "@/features/canvas/application/canvasServices";
+import { resolveErrorContent, showErrorDialog } from "@/features/canvas/application/errorDialog";
+import {
+  buildGenerationErrorReport,
+  createReferenceImagePlaceholders,
+  CURRENT_RUNTIME_SESSION_ID,
+  getRuntimeDiagnostics,
+  type GenerationDebugContext,
+} from "@/features/canvas/application/generationErrorReport";
+import { mergeMediaReferenceSources } from "@/features/canvas/application/mediaReferenceSources";
+import { filterExcludedReferences } from "@/features/canvas/application/referenceExclusions";
+import { collectActiveGenerationNodeIds } from "@/features/canvas/application/videoGenActiveTasks";
+import {
+  closeVideoCancellationWindow,
+  isVideoCancellationRequested,
+  isVideoGenerationCanceledError,
+  openVideoCancellationWindow,
+} from "@/features/canvas/application/videoGenerationCancel";
+import { recordGenerationOutcome } from "@/features/canvas/application/usageRecording";
+import { resolveMinEdgeFittedSize } from "@/features/canvas/application/imageNodeSizing";
+import {
+  getDefaultVideoModelId,
+  getModelProvider,
+  getVideoModelProfile,
+  JIMENG_CLI_PROVIDER_ID,
+  RUNNINGHUB_CLI_PROVIDER_ID,
+  listVideoModels,
+} from "@/features/canvas/models";
+import { resolveModelPriceDisplay } from "@/features/canvas/pricing";
+import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
+import { CanvasRefThumb } from "@/features/canvas/ui/CanvasRefThumb";
+import { NodePriceBadge } from "@/features/canvas/ui/NodePriceBadge";
+import { resolveRecommendedApiPriceBadge } from "./nodePriceBadge";
+import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
+import { CanvasNodeImage } from "@/features/canvas/ui/CanvasNodeImage";
+import { NodeReferencePicker } from "@/features/canvas/ui/NodeReferencePicker";
+import {
+  PICKER_FALLBACK_ANCHOR,
+  resolvePickerAnchor,
+  type PickerAnchor,
+} from "@/features/canvas/ui/nodeReferencePickerLayout";
+import { prepareNodeImageFromFile, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import {
+  findReferenceTokens,
+  insertReferenceToken,
+  remapAudioReferenceTokens,
+  remapImageReferenceTokens,
+  removeOutOfRangeReferenceTokens,
+  removeTextRange,
+  resolveReferenceAwareDeleteRange,
+} from "@/features/canvas/application/referenceTokenEditing";
+import { useDebouncedNodeTextCommit } from "@/features/canvas/application/useDebouncedNodeTextCommit";
+import { readLiveInputText } from "@/features/canvas/application/liveInputText";
+import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
+import { useCanvasStore } from "@/stores/canvasStore";
+import { useSettingsStore } from "@/stores/settingsStore";
+import { registerNodeGenerationHandler } from "@/features/canvas/application/nodeGenerationRegistry";
+import { getFloatingPanelPosition, type FloatingPanelPosition } from "@/features/canvas/ui/floatingPanelPosition";
+import { isZzdhLipSyncModel } from "@/commands/zzdhApi";
+import {
+  isRunningHubDedicatedVideoEndpoint,
+  isRunningHubBaseUrl,
+  resolveRunningHubVideoEndpoint,
+  resolveRunningHubVideoEndpointForInput,
+  runningHubEndpointSupportsInput,
+} from "@/commands/runningHubProtocol";
+
+type VideoGenNodeProps = { id: string; data: VideoGenNodeData; selected?: boolean; width?: number; height?: number };
+
+const VIDEO_GEN_NODE_MIN_WIDTH = 320;
+const VIDEO_GEN_NODE_MIN_HEIGHT = 320;
+const VIDEO_GEN_NODE_MAX_WIDTH = 720;
+const VIDEO_GEN_NODE_MAX_HEIGHT = 560;
+const VIDEO_GEN_NODE_DEFAULT_WIDTH = 420;
+const VIDEO_GEN_NODE_DEFAULT_HEIGHT = 360;
+const JIMENG_CLI_MAX_REFERENCE_IMAGES = 9;
+/**
+ * 连点冷却：一次提交成功后 2s 内不再接受新的提交。
+ * 这是「防手滑连点」而不是「防重复扣费」——刻意不再等视频生成完才解禁，
+ * 让用户能连续发起多次生成，各次任务互不影响。
+ */
+const GENERATE_COOLDOWN_MS = 2000;
+
+interface ReferencePickerItem {
+  kind: "image" | "audio";
+  index: number;
+  label: string;
+  source: string;
+}
+
+/** 输入框下方展示的一条「已引用素材」缩略图。 */
+interface ReferenceTile {
+  key: string;
+  kind: "image" | "audio";
+  source: string;
+  /** 与该素材在提示词里的引用序号一致(图N / 音频N) */
+  label: string;
+  displayUrl: string | null;
+  /** false = 当前模型不会使用它(即梦忽略工作室音频), 仅展示以便删除 */
+  used: boolean;
+}
+
+type FrameSlot = "first" | "last";
+
+type JimengCliStatus = {
+  /** `retrying` = 提交阶段的网络失败正在自动重试(参考图上传超时等), 任务尚未创建。 */
+  status: "queued" | "running" | "retrying" | "succeeded" | "failed";
+  queueCount?: number | null;
+  message?: string | null;
+};
+
+/** 缩略图轻量预览浮层状态: 图片地址 + 鼠标点击位置(用于定位) */
+interface ReferencePreviewState {
+  url: string;
+  x: number;
+  y: number;
+}
+
+const REFERENCE_PREVIEW_WIDTH = 180;
+const REFERENCE_PREVIEW_ESTIMATED_HEIGHT = 160;
+const REFERENCE_PREVIEW_MARGIN = 8;
+const REFERENCE_PREVIEW_OFFSET = 12;
+const REFERENCE_PREVIEW_MAX_SIZE = 200;
+const REFERENCE_PREVIEW_MIN_SIZE = 80;
+
+/** 按图片原始比例计算预览显示尺寸(等比缩放, 限制在最大尺寸内, 不小于最小尺寸) */
+function resolvePreviewDisplaySize(naturalWidth: number, naturalHeight: number): { width: number; height: number } {
+  const safeWidth = Math.max(1, naturalWidth);
+  const safeHeight = Math.max(1, naturalHeight);
+  const scale = Math.min(REFERENCE_PREVIEW_MAX_SIZE / safeWidth, REFERENCE_PREVIEW_MAX_SIZE / safeHeight, 1);
+  let width = Math.max(REFERENCE_PREVIEW_MIN_SIZE, Math.round(safeWidth * scale));
+  let height = Math.max(REFERENCE_PREVIEW_MIN_SIZE, Math.round(safeHeight * scale));
+  if (width > REFERENCE_PREVIEW_MAX_SIZE) {
+    height = Math.round((height * REFERENCE_PREVIEW_MAX_SIZE) / width);
+    width = REFERENCE_PREVIEW_MAX_SIZE;
+  }
+  if (height > REFERENCE_PREVIEW_MAX_SIZE) {
+    width = Math.round((width * REFERENCE_PREVIEW_MAX_SIZE) / height);
+    height = REFERENCE_PREVIEW_MAX_SIZE;
+  }
+  return { width, height };
+}
+
+function resolvePreviewLeft(clientX: number, width: number): number {
+  if (typeof window === "undefined") {
+    return clientX + REFERENCE_PREVIEW_OFFSET;
+  }
+  let left = clientX + REFERENCE_PREVIEW_OFFSET;
+  if (left + width > window.innerWidth - REFERENCE_PREVIEW_MARGIN) {
+    left = clientX - width - REFERENCE_PREVIEW_OFFSET;
+  }
+  return Math.max(REFERENCE_PREVIEW_MARGIN, Math.min(left, window.innerWidth - width - REFERENCE_PREVIEW_MARGIN));
+}
+
+function resolvePreviewTop(clientY: number, height: number): number {
+  if (typeof window === "undefined") {
+    return clientY + REFERENCE_PREVIEW_OFFSET;
+  }
+  let top = clientY + REFERENCE_PREVIEW_OFFSET;
+  if (top + height > window.innerHeight - REFERENCE_PREVIEW_MARGIN) {
+    top = clientY - height - REFERENCE_PREVIEW_OFFSET;
+  }
+  return Math.max(REFERENCE_PREVIEW_MARGIN, Math.min(top, window.innerHeight - height - REFERENCE_PREVIEW_MARGIN));
+}
+
+function renderPromptWithHighlights(
+  prompt: string,
+  maxImageCount: number,
+  maxAudioCount: number,
+  imageUrls: string[],
+  audioSources: string[],
+  resolveAudioLabel: (source: string, index: number) => string,
+  onThumbnailClick?: (displayUrl: string, event: { clientX: number; clientY: number }) => void,
+): ReactNode {
+  if (!prompt) {
+    return " ";
+  }
+
+  const segments: ReactNode[] = [];
+  let lastIndex = 0;
+  const referenceTokens = findReferenceTokens(prompt, maxImageCount, maxAudioCount);
+  for (const token of referenceTokens) {
+    const matchStart = token.start;
+    const matchText = token.token;
+    const imageUrl = token.kind === "image" ? (imageUrls[token.value - 1] ?? null) : null;
+
+    if (matchStart > lastIndex) {
+      segments.push(<span key={`plain-${lastIndex}`}>{prompt.slice(lastIndex, matchStart)}</span>);
+    }
+
+    if (token.kind === "audio") {
+      // 音频胶囊必须限制在原始 token 的行内占位宽度中，否则会盖住后续文字。
+      const source = audioSources[token.value - 1];
+      const label = source ? resolveAudioLabel(source, token.value - 1) : matchText;
+      segments.push(
+        <span key={`ref-${matchStart}`} className="relative z-0 text-transparent">
+          {matchText}
+          <span
+            title={label}
+            className="pointer-events-none absolute left-0 top-1/2 inline-flex h-[18px] max-w-full -translate-y-1/2 items-center gap-0.5 overflow-hidden rounded-[5px] bg-accent px-1 text-[10px] font-medium leading-none text-white"
+          >
+            <AudioLines className="h-3 w-3 shrink-0" />
+            <span className="truncate">{label}</span>
+          </span>
+        </span>,
+      );
+    } else if (imageUrl) {
+      // 保留 token 占位以保持光标位置一致(token 文字透明, 只显示缩略图)。
+      // 缩略图固定 20×20 正方形居中, 尺寸稳定不影响行高排版。
+      segments.push(
+        <span key={`ref-${matchStart}`} className="relative z-0 text-transparent">
+          {matchText}
+          <span
+            className="pointer-events-auto absolute left-1/2 top-1/2 inline-flex h-[20px] w-[20px] -translate-x-1/2 -translate-y-1/2 cursor-zoom-in items-center justify-center overflow-hidden rounded-[5px] bg-accent/70"
+            onClick={(event) => {
+              event.stopPropagation();
+              onThumbnailClick?.(imageUrl, event);
+            }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <CanvasRefThumb source={imageUrl} alt={matchText} className="h-full w-full shrink-0 object-cover" />
+          </span>
+        </span>,
+      );
+    } else {
+      segments.push(
+        <span key={`ref-${matchStart}`} className="relative z-0 text-transparent">
+          {matchText}
+        </span>,
+      );
+    }
+
+    lastIndex = matchStart + matchText.length;
+  }
+
+  if (lastIndex < prompt.length) {
+    segments.push(<span key={`plain-${lastIndex}`}>{prompt.slice(lastIndex)}</span>);
+  }
+
+  return segments;
+}
+
+export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGenNodeProps) => {
+  const { t, i18n } = useTranslation();
+  const updateNodeInternals = useUpdateNodeInternals();
+  const { nodes, edges } = useCanvasInputGraph();
+  const inputImages = useMemo(() => graphImageResolver.collectInputImages(id, nodes, edges), [edges, id, nodes]);
+  const inputAudio = useMemo(() => graphImageResolver.collectInputAudio(id, nodes, edges), [edges, id, nodes]);
+  const inputVideos = useMemo(() => graphImageResolver.collectInputVideos(id, nodes, edges), [edges, id, nodes]);
+  const inputText = useMemo(() => graphImageResolver.collectInputText(id, nodes, edges), [edges, id, nodes]);
+  const audioNodes = useMemo(() => nodes.filter((node) => node.type === CANVAS_NODE_TYPES.audio), [nodes]);
+  const addNode = useCanvasStore((state) => state.addNode);
+  const addEdge = useCanvasStore((state) => state.addEdge);
+  const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const processingRevision = useCanvasStore((state) => state.processingRevision);
+  const updateNodeSize = useCanvasStore((state) => state.updateNodeSize);
+  const findNodePosition = useCanvasStore((state) => state.findNodePosition);
+  const apiKeys = useSettingsStore((state) => state.apiKeys);
+  const customApis = useSettingsStore((state) => state.customApis);
+  const customModelPrices = useSettingsStore((state) => state.customModelPrices);
+  const setCustomModelPrice = useSettingsStore((state) => state.setCustomModelPrice);
+  const showNodePrice = useSettingsStore((state) => state.showNodePrice);
+  const priceDisplayCurrencyMode = useSettingsStore((state) => state.priceDisplayCurrencyMode);
+  const usdToCnyRate = useSettingsStore((state) => state.usdToCnyRate);
+  const preferDiscountedPrice = useSettingsStore((state) => state.preferDiscountedPrice);
+  const grsaiCreditTierId = useSettingsStore((state) => state.grsaiCreditTierId);
+  const setLastVideoDuration = useSettingsStore((state) => state.setLastVideoDuration);
+  const setLastVideoModelId = useSettingsStore((state) => state.setLastVideoModelId);
+  const setLastVideoAspectRatio = useSettingsStore((state) => state.setLastVideoAspectRatio);
+  const setLastVideoResolution = useSettingsStore((state) => state.setLastVideoResolution);
+  const [isGenerating, setIsGenerating] = useState(() => collectActiveGenerationNodeIds(data).length > 0);
+  /** 在跑的下游任务 id 列表（旧工程里可能是单个 activeGenerationNodeId）。 */
+  const activeGenerationNodeIds = collectActiveGenerationNodeIds(data);
+  const activeGenerationKey = activeGenerationNodeIds.join("\u0000");
+  /** 已提交、还没跑完的任务数——允许连点后会 > 1。 */
+  const activeTaskCount = activeGenerationNodeIds.length;
+  /**
+   * 连点冷却：提交成功后 2s 内不再接受新的提交。
+   * 之所以记「上次提交的时刻」而不是布尔量，是因为一次提交里有 await，
+   * 布尔量要等异步返回才能复位，会让实际冷却变成「2s + 接口耗时」，不可控。
+   */
+  const lastSubmitAtRef = useRef(0);
+  /**
+   * 本节点开出去的「可取消窗口」(下游结果节点 id)。
+   *
+   * 窗口是模块级内存态, 不该被节点卸载悄悄漏掉 —— 卸载时统一收干净, 否则一个早就
+   * 没有入口的窗口会一直挂在表里。
+   */
+  const cancelWindowNodeIdsRef = useRef<Set<string>>(new Set());
+  useEffect(
+    () => () => {
+      for (const outputId of cancelWindowNodeIdsRef.current) closeVideoCancellationWindow(outputId);
+      cancelWindowNodeIdsRef.current.clear();
+    },
+    [],
+  );
+  const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
+  const isCoolingDown = cooldownRemainingMs > 0;
+  const cooldownSeconds = Math.max(1, Math.ceil(cooldownRemainingMs / 1000));
+
+  useEffect(() => {
+    if (!isCoolingDown) return;
+    const timer = window.setInterval(() => {
+      const left = GENERATE_COOLDOWN_MS - (Date.now() - lastSubmitAtRef.current);
+      setCooldownRemainingMs(left > 0 ? left : 0);
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [isCoolingDown]);
+
+  const beginCooldown = useCallback(() => {
+    lastSubmitAtRef.current = Date.now();
+    setCooldownRemainingMs(GENERATE_COOLDOWN_MS);
+  }, []);
+
+  // 下游媒体节点才持有真正的平台任务状态。连点之后可能同时有多个任务在跑，
+  // 所以逐个核对：已经进入终态（或被删掉）的从列表里摘掉，只要还剩一个就让源节点
+  // 维持「生成中」。这里不再充当提交互斥锁——提交频率由 2s 冷却控制。
+  useEffect(() => {
+    void activeGenerationKey;
+    // 下游任务状态更新走 processingRevision，不一定刷新 inputGraphRevision；
+    // 直接读 store 确保慢平台完成/失败后能及时把源节点摘出「生成中」。
+    void processingRevision;
+    const state = useCanvasStore.getState();
+    const tracked = collectActiveGenerationNodeIds(state.nodes.find((node) => node.id === id)?.data);
+    const stillRunning = tracked.filter((outputId) => {
+      const outputNode = state.nodes.find((node) => node.id === outputId);
+      return outputNode ? (outputNode.data as { isGenerating?: unknown }).isGenerating === true : false;
+    });
+    if (stillRunning.length !== tracked.length) {
+      updateNodeData(id, { activeGenerationNodeIds: stillRunning, activeGenerationNodeId: null });
+    }
+    // 下游节点被删掉时顺手收掉它的取消窗口, 免得在模块表里长期占着一个没人能点的入口。
+    for (const outputId of tracked) {
+      if (state.nodes.some((node) => node.id === outputId)) continue;
+      cancelWindowNodeIdsRef.current.delete(outputId);
+      closeVideoCancellationWindow(outputId);
+    }
+    setIsGenerating(stillRunning.length > 0);
+  }, [activeGenerationKey, id, nodes, processingRevision, updateNodeData]);
+  const [jimengCliStatus, setJimengCliStatus] = useState<JimengCliStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [showImagePicker, setShowImagePicker] = useState(false);
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [showDurationSlider, setShowDurationSlider] = useState(false);
+  const [pickerCursor, setPickerCursor] = useState<number | null>(null);
+  const [pickerActiveIndex, setPickerActiveIndex] = useState(0);
+  const [pickerAnchor, setPickerAnchor] = useState<PickerAnchor>(PICKER_FALLBACK_ANCHOR);
+  const promptRef = useRef<HTMLTextAreaElement>(null);
+  const promptHighlightRef = useRef<HTMLDivElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  // 画布缩放：@ 候选面板的锚点换算与视觉间距都要靠它折算。
+  // 用 useStore 选择器而不是 useViewport —— 后者在平移画布时也会触发重渲染，拖画布会变卡。
+  const zoom = useStore((state) => state.transform[2]);
+  const modelTriggerRef = useRef<HTMLDivElement>(null);
+  const modelPickerRef = useRef<HTMLDivElement>(null);
+  const [modelPickerPosition, setModelPickerPosition] = useState<FloatingPanelPosition | null>(null);
+  const firstFrameInputRef = useRef<HTMLInputElement>(null);
+  const lastFrameInputRef = useRef<HTMLInputElement>(null);
+  const [promptDraft, setPromptDraft] = useState(() => data.prompt ?? "");
+  const promptDraftRef = useRef(promptDraft);
+  /** 缩略图轻量预览: 从鼠标点击位置左侧滑出, 点击空白处关闭 */
+  const [previewState, setPreviewState] = useState<ReferencePreviewState | null>(null);
+  /** 预览图按图片比例自适应后的显示尺寸(加载完成前为 null) */
+  const [previewSize, setPreviewSize] = useState<{ width: number; height: number } | null>(null);
+  const {
+    cancelCommit: cancelPromptCommit,
+    flushCommit: flushPromptCommit,
+    scheduleCommit: schedulePromptCommit,
+  } = useDebouncedNodeTextCommit({
+    nodeId: id,
+    field: "prompt",
+    valueRef: promptDraftRef,
+    updateNodeData,
+  });
+
+  const imageMode = data.imageMode === "first-last" ? "first-last" : "reference";
+  const models = useMemo(
+    () =>
+      listVideoModels().filter((model) => {
+        if (isZzdhLipSyncModel(model.id)) return false;
+        const endpoint = model.id.split("/").slice(1).join("/");
+        const normalized = model.id.toLowerCase();
+        const providerId = model.providerId.replace(/^custom:/, "");
+        const api = customApis.find((item) => item.id === providerId);
+        if (isRunningHubBaseUrl(api?.baseUrl) && endpoint) {
+          const spec = resolveRunningHubVideoEndpoint(endpoint);
+          // 普通节点只显示有文生能力的 canonical 家族。图生/多模态由实际输入路由。
+          if (spec && !runningHubEndpointSupportsInput(spec, "text")) return false;
+          if (imageMode === "first-last" && spec && !resolveRunningHubVideoEndpointForInput(endpoint, "first-last")) {
+            return false;
+          }
+        }
+        return (
+          !isRunningHubDedicatedVideoEndpoint(endpoint) &&
+          !normalized.includes("motion-control") &&
+          !normalized.includes("lip-sync") &&
+          !normalized.includes("对口型")
+        );
+      }),
+    [customApis, imageMode],
+  );
+  const selectedModel =
+    models.find((model) => model.id === data.model) ??
+    models.find((model) => model.id === getDefaultVideoModelId()) ??
+    models[0];
+  const isJimengCli = selectedModel?.providerId === JIMENG_CLI_PROVIDER_ID;
+  const isWanCli = selectedModel?.providerId === "wan-cli";
+  const isRunningHubCli = selectedModel?.providerId === RUNNINGHUB_CLI_PROVIDER_ID;
+  const selectedProfile = selectedModel ? getVideoModelProfile(selectedModel.profileId) : null;
+  useEffect(() => {
+    if (isZzdhLipSyncModel(data.model) && selectedModel && data.model !== selectedModel.id) {
+      updateNodeData(id, { model: selectedModel.id });
+    }
+  }, [data.model, id, selectedModel, updateNodeData]);
+  const [modelPickerProviderId, setModelPickerProviderId] = useState(selectedModel?.providerId ?? "");
+  const durationOptions = selectedModel?.durationOptions ?? Array.from({ length: 30 }, (_, index) => index + 1);
+  const durationMinimum = durationOptions[0] ?? 1;
+  const durationMaximum = durationOptions[durationOptions.length - 1] ?? 30;
+  const resolutionOptions = selectedModel?.resolutions ?? [];
+  const selectedVideoResolution = resolutionOptions.some((option) => option.value === data.resolution)
+    ? data.resolution!
+    : (selectedModel?.defaultResolution ?? resolutionOptions[0]?.value ?? "720p");
+  // 时长必须落在模型声明的枚举里：可灵 v4 这类离散档位(5/10/15/30)的平台校验很严，
+  // 拖到 17 秒会被直接拒，所以这里统一吸附到最近的合法档，而不是简单夹取。
+  const rawDuration = Number(data.duration);
+  const selectedDuration = snapVideoDurationOption(
+    durationOptions,
+    Number.isFinite(rawDuration) && rawDuration > 0 ? rawDuration : (selectedModel?.defaultDuration ?? 5),
+  );
+  const videoModelProviders = useMemo(
+    () => Array.from(new Set(models.map((model) => model.providerId))).map(getModelProvider),
+    [models],
+  );
+  const pickerProviderModels = useMemo(
+    () => models.filter((model) => model.providerId === modelPickerProviderId),
+    [modelPickerProviderId, models],
+  );
+  const selectedModelName = useMemo(() => {
+    if (!selectedModel) return "";
+    const providerName = getModelProvider(selectedModel.providerId).label;
+    const prefix = `${providerName} · `;
+    return selectedModel.displayName.startsWith(prefix)
+      ? selectedModel.displayName.slice(prefix.length)
+      : selectedModel.displayName;
+  }, [selectedModel]);
+  // “发送到视频节点”会把附件直接写入新节点；同时保留连线输入，覆盖状态回传尚在防抖的瞬间。
+  const directReferenceImages = useMemo(
+    () =>
+      Array.isArray(data.studioReferenceImages)
+        ? data.studioReferenceImages.map((value) => value.trim()).filter(Boolean)
+        : [],
+    [data.studioReferenceImages],
+  );
+  const directReferenceAudio = useMemo(
+    () =>
+      Array.isArray(data.studioReferenceAudio)
+        ? data.studioReferenceAudio.map((value) => value.trim()).filter(Boolean)
+        : [],
+    [data.studioReferenceAudio],
+  );
+  // 用户在本节点手动移除过的来源要一直剔除: 其中一部分来自上游连线, 只清空
+  // studioReference* 是删不掉的(上游会把同一份素材再喂回来)。
+  const excludedReferenceSources = useMemo(
+    () =>
+      Array.isArray(data.excludedReferenceSources)
+        ? data.excludedReferenceSources.filter(
+            (value): value is string => typeof value === "string" && value.length > 0,
+          )
+        : [],
+    [data.excludedReferenceSources],
+  );
+  const excludedReferenceSourceSet = useMemo(() => new Set(excludedReferenceSources), [excludedReferenceSources]);
+  const inputImagesFiltered = useMemo(
+    () => filterExcludedReferences(inputImages, excludedReferenceSources),
+    [excludedReferenceSources, inputImages],
+  );
+  const inputAudioFiltered = useMemo(
+    () => filterExcludedReferences(inputAudio, excludedReferenceSources),
+    [excludedReferenceSources, inputAudio],
+  );
+  const resolvedInputImages = useMemo(
+    () => mergeMediaReferenceSources(directReferenceImages, inputImagesFiltered),
+    [directReferenceImages, inputImagesFiltered],
+  );
+  const resolvedInputAudio = useMemo(
+    () => mergeMediaReferenceSources(directReferenceAudio, inputAudioFiltered),
+    [directReferenceAudio, inputAudioFiltered],
+  );
+  // 即梦 CLI 只接受通过画布连接进来的本地音频节点；工作室快照仅供
+  // 其他支持直接音频附件的模型使用。
+  const usableInputAudio = isJimengCli ? inputAudioFiltered : resolvedInputAudio;
+  // 文本引用预览现在按行渲染(每行一个上游文本), 不再需要合并字符串
+  // 首尾帧与上游参考图是两种互斥输入方式。首尾帧只使用节点内上传的两张图。
+  const referenceInputImages = useMemo(
+    () => (imageMode === "reference" ? resolvedInputImages : []),
+    [imageMode, resolvedInputImages],
+  );
+  const previousReferenceImagesRef = useRef(referenceInputImages);
+  const firstLastFrameImages = useMemo(
+    () =>
+      [data.firstFrameImageUrl, data.lastFrameImageUrl].filter(
+        (imageUrl): imageUrl is string => typeof imageUrl === "string" && imageUrl.trim().length > 0,
+      ),
+    [data.firstFrameImageUrl, data.lastFrameImageUrl],
+  );
+  const videoReferenceImages = useMemo(
+    () => (imageMode === "first-last" ? firstLastFrameImages : referenceInputImages),
+    [firstLastFrameImages, imageMode, referenceInputImages],
+  );
+
+  useEffect(() => {
+    if (selectedModel?.providerId) {
+      setModelPickerProviderId(selectedModel.providerId);
+    }
+  }, [selectedModel?.providerId]);
+
+  useLayoutEffect(() => {
+    if (!showModelPicker || !modelTriggerRef.current || !modelPickerRef.current) return;
+    const updatePosition = () => {
+      const next = getFloatingPanelPosition(modelTriggerRef.current, modelPickerRef.current, {
+        align: "start",
+        preferredSide: "below",
+        fallbackSize: { width: 320, height: 340 },
+      });
+      if (next) setModelPickerPosition(next);
+    };
+    updatePosition();
+    const observer = new ResizeObserver(updatePosition);
+    observer.observe(modelTriggerRef.current);
+    observer.observe(modelPickerRef.current);
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
+  }, [modelPickerProviderId, showModelPicker]);
+  // 音频引用标签: 优先用音频节点自己的标题(素材名/文件名), 避免"音频1/音频2"分不清。
+  // 默认标题"媒体"没有区分度, 视为未命名, 回退到文件名。
+  const audioLabelBySource = useMemo(() => {
+    const labelBySource = new Map<string, string>();
+    for (const node of audioNodes) {
+      if (node.type !== CANVAS_NODE_TYPES.audio || typeof node.data.sourcePath !== "string") {
+        continue;
+      }
+      const sourcePath = node.data.sourcePath;
+      if (labelBySource.has(sourcePath)) {
+        continue;
+      }
+      const rawName = typeof node.data.displayName === "string" ? node.data.displayName.trim() : "";
+      const customName = rawName && rawName !== "媒体" ? rawName : "";
+      labelBySource.set(sourcePath, customName);
+    }
+    return labelBySource;
+  }, [audioNodes]);
+  const resolveAudioLabel = useCallback(
+    (source: string, index: number): string => {
+      const customName = audioLabelBySource.get(source);
+      if (customName) {
+        return customName;
+      }
+      // 回退: 从路径取文件名(去掉扩展名), 仍无则用"音频N"
+      const fileName = source.split(/[\\/]/).pop() ?? "";
+      const baseName = fileName.replace(/\.[^.]+$/, "").trim();
+      return baseName || `音频${index + 1}`;
+    },
+    [audioLabelBySource],
+  );
+  const inputImageItems = useMemo(
+    () =>
+      referenceInputImages.map((imageUrl, index) => ({
+        imageUrl,
+        label: `图${index + 1}`,
+      })),
+    [referenceInputImages],
+  );
+  const inputImageViewerList = useMemo(
+    () => inputImageItems.map((item) => resolveImageDisplayUrl(item.imageUrl)),
+    [inputImageItems],
+  );
+  const inputImageDisplayUrls = useMemo(
+    () => inputImageItems.map((item) => resolveImageDisplayUrl(item.imageUrl)),
+    [inputImageItems],
+  );
+  const referencePickerItems = useMemo<ReferencePickerItem[]>(
+    () => [
+      ...inputImageItems.map((item, index) => ({
+        kind: "image" as const,
+        index,
+        label: item.label,
+        source: item.imageUrl,
+      })),
+      ...usableInputAudio.map((source, index) => ({
+        kind: "audio" as const,
+        index,
+        label: resolveAudioLabel(source, index),
+        source,
+      })),
+    ],
+    [inputImageItems, resolveAudioLabel, usableInputAudio],
+  );
+  /**
+   * 移除一条引用素材。两个来源都要处理:
+   * - 节点自身附件(studioReference*)→ 从数组里摘掉;
+   * - 上游连线喂进来的(如提示词工作室的 studioReference*)→ 记进
+   *   excludedReferenceSources, 否则上游会把同一份素材再喂回来。
+   * 图片 token 由监听 referenceInputImages 的 effect 自动重映射;
+   * 音频没有对应 effect, 这里同步处理 @音频N。
+   */
+  const removeReferenceTile = useCallback(
+    (tile: ReferenceTile) => {
+      const nextExcluded = excludedReferenceSourceSet.has(tile.source)
+        ? excludedReferenceSources
+        : [...excludedReferenceSources, tile.source];
+      const nextExcludedSet = new Set(nextExcluded);
+      const nextDirectImages = directReferenceImages.filter((item) => item !== tile.source);
+      const nextDirectAudio = directReferenceAudio.filter((item) => item !== tile.source);
+
+      const patch: Partial<VideoGenNodeData> = { excludedReferenceSources: nextExcluded };
+      if (nextDirectImages.length !== directReferenceImages.length) {
+        patch.studioReferenceImages = nextDirectImages;
+      }
+      if (tile.kind === "audio") {
+        const nextUsableAudio = isJimengCli
+          ? inputAudio.filter((item) => !nextExcludedSet.has(item))
+          : mergeMediaReferenceSources(
+              nextDirectAudio,
+              inputAudio.filter((item) => !nextExcludedSet.has(item)),
+            );
+        const nextPrompt = remapAudioReferenceTokens(promptDraftRef.current, usableInputAudio, nextUsableAudio);
+        promptDraftRef.current = nextPrompt;
+        setPromptDraft(nextPrompt);
+        cancelPromptCommit();
+        patch.prompt = nextPrompt;
+        if (nextDirectAudio.length !== directReferenceAudio.length) {
+          patch.studioReferenceAudio = nextDirectAudio;
+        }
+      }
+      updateNodeData(id, patch);
+    },
+    [
+      cancelPromptCommit,
+      directReferenceAudio,
+      directReferenceImages,
+      excludedReferenceSourceSet,
+      excludedReferenceSources,
+      id,
+      inputAudio,
+      isJimengCli,
+      usableInputAudio,
+      updateNodeData,
+    ],
+  );
+  /** 输入框下方要显示的「实际会随请求上传的引用素材」清单。 */
+  const referenceTiles = useMemo<ReferenceTile[]>(() => {
+    const tiles: ReferenceTile[] = referenceInputImages.map((source, index) => ({
+      key: `image-${source}`,
+      kind: "image" as const,
+      source,
+      label: `图${index + 1}`,
+      displayUrl: inputImageDisplayUrls[index] ?? null,
+      used: true,
+    }));
+    usableInputAudio.forEach((source, index) => {
+      tiles.push({
+        key: `audio-${source}`,
+        kind: "audio" as const,
+        source,
+        label: `音频${index + 1}`,
+        displayUrl: null,
+        used: true,
+      });
+    });
+    // 即梦不读工作室音频, 但这些素材仍留在节点上, 要让用户看得见并能删掉。
+    if (isJimengCli) {
+      const usedSources = new Set(usableInputAudio);
+      directReferenceAudio.forEach((source, index) => {
+        if (usedSources.has(source)) {
+          return;
+        }
+        tiles.push({
+          key: `audio-${source}`,
+          kind: "audio" as const,
+          source,
+          label: resolveAudioLabel(source, index),
+          displayUrl: null,
+          used: false,
+        });
+      });
+    }
+    return tiles;
+  }, [
+    directReferenceAudio,
+    inputImageDisplayUrls,
+    isJimengCli,
+    referenceInputImages,
+    resolveAudioLabel,
+    usableInputAudio,
+  ]);
+  const title = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.videoGen, data), [data]);
+  const resolvedWidth = Math.max(VIDEO_GEN_NODE_MIN_WIDTH, Math.round(width ?? VIDEO_GEN_NODE_DEFAULT_WIDTH));
+  const resolvedHeight = Math.max(VIDEO_GEN_NODE_MIN_HEIGHT, Math.round(height ?? VIDEO_GEN_NODE_DEFAULT_HEIGHT));
+  const price = useMemo(
+    () =>
+      selectedModel && showNodePrice
+        ? resolveModelPriceDisplay(selectedModel, {
+            resolution: selectedVideoResolution,
+            extraParams: { duration: selectedDuration },
+            language: i18n.language,
+            settings: {
+              displayCurrencyMode: priceDisplayCurrencyMode,
+              usdToCnyRate,
+              preferDiscountedPrice,
+              grsaiCreditTierId,
+            },
+          })
+        : null,
+    [
+      grsaiCreditTierId,
+      i18n.language,
+      preferDiscountedPrice,
+      priceDisplayCurrencyMode,
+      selectedDuration,
+      selectedModel,
+      selectedVideoResolution,
+      showNodePrice,
+      usdToCnyRate,
+    ],
+  );
+
+  // 推荐平台（如知鸟 AI / 炳火）在 registry 里没注册精确 pricing,
+  // 但 recommendedApis.pricingRange 仍登记了图片/视频/音频三类区间,
+  // 这里消费同一份数据到节点右上角,作为「精确价缺失时」的区间兜底。
+  const recommendedPriceBadge = useMemo(
+    () => (price ? null : resolveRecommendedApiPriceBadge(selectedModel?.providerId, customApis, "video")),
+    [customApis, price, selectedModel?.providerId],
+  );
+  const nodePrice = price ?? recommendedPriceBadge;
+  const customPrice =
+    data.customPrice !== undefined
+      ? typeof data.customPrice === "string"
+        ? data.customPrice.trim()
+        : ""
+      : selectedModel
+        ? (customModelPrices[selectedModel.id] ?? "")
+        : "";
+  const priceBadgeLabel = customPrice || nodePrice?.label || "[无价格]";
+
+  const handlePriceChange = useCallback(
+    (value: string | null) => {
+      if (!selectedModel) return;
+      updateNodeData(id, { customPrice: value });
+      setCustomModelPrice(selectedModel.id, value);
+    },
+    [id, selectedModel, setCustomModelPrice, updateNodeData],
+  );
+
+  useEffect(() => {
+    if (!selectedModel) return;
+    const legacyPrice = typeof data.customPrice === "string" ? data.customPrice.trim() : "";
+    if (legacyPrice && !customModelPrices[selectedModel.id]) {
+      setCustomModelPrice(selectedModel.id, legacyPrice);
+    }
+  }, [customModelPrices, data.customPrice, selectedModel, setCustomModelPrice]);
+
+  useEffect(() => {
+    updateNodeInternals(id);
+  }, [id, resolvedHeight, resolvedWidth, updateNodeInternals]);
+
+  useEffect(() => {
+    const externalPrompt = data.prompt ?? "";
+    if (externalPrompt !== promptDraftRef.current) {
+      promptDraftRef.current = externalPrompt;
+      setPromptDraft(externalPrompt);
+    }
+  }, [data.prompt]);
+
+  useEffect(() => {
+    if (imageMode !== "reference") {
+      return;
+    }
+    const remappedPrompt = remapImageReferenceTokens(
+      promptDraftRef.current,
+      previousReferenceImagesRef.current,
+      referenceInputImages,
+    );
+    const cleanedPrompt = removeOutOfRangeReferenceTokens(
+      remappedPrompt,
+      referenceInputImages.length,
+      usableInputAudio.length,
+    );
+    previousReferenceImagesRef.current = referenceInputImages;
+    if (cleanedPrompt !== promptDraftRef.current) {
+      promptDraftRef.current = cleanedPrompt;
+      setPromptDraft(cleanedPrompt);
+      cancelPromptCommit();
+      updateNodeData(id, { prompt: cleanedPrompt });
+    }
+  }, [cancelPromptCommit, id, imageMode, referenceInputImages, usableInputAudio.length, updateNodeData]);
+
+  useEffect(() => {
+    if (referencePickerItems.length === 0) {
+      setShowImagePicker(false);
+      setPickerCursor(null);
+      setPickerActiveIndex(0);
+      return;
+    }
+    setPickerActiveIndex((current) => Math.min(current, referencePickerItems.length - 1));
+  }, [referencePickerItems.length]);
+
+  // 轻量预览浮层: Esc 关闭
+  useEffect(() => {
+    if (!previewState) {
+      return;
+    }
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPreviewState(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [previewState]);
+
+  useEffect(() => {
+    if (!isGenerating || !isJimengCli) {
+      return;
+    }
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{
+      client_job_id?: string;
+      status?: JimengCliStatus["status"];
+      queue_count?: number | null;
+      message?: string | null;
+    }>("jimeng-cli-status", (event) => {
+      const payload = event.payload;
+      if (payload.client_job_id !== id || !payload.status) {
+        return;
+      }
+      setJimengCliStatus({
+        status: payload.status,
+        queueCount: payload.queue_count,
+        message: payload.message,
+      });
+    }).then((remove) => {
+      if (disposed) {
+        remove();
+      } else {
+        unlisten = remove;
+      }
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [id, isGenerating, isJimengCli]);
+
+  // 浮层: 点击节点外部关闭
+  useEffect(() => {
+    const handleOutside = (event: MouseEvent) => {
+      const target = event.target as globalThis.Node;
+      if (rootRef.current?.contains(target) || modelPickerRef.current?.contains(target)) {
+        return;
+      }
+      setShowImagePicker(false);
+      setPickerCursor(null);
+      setShowModelPicker(false);
+      setShowDurationSlider(false);
+    };
+    document.addEventListener("mousedown", handleOutside, true);
+    return () => {
+      document.removeEventListener("mousedown", handleOutside, true);
+    };
+  }, []);
+
+  const syncPromptHighlightScroll = () => {
+    if (!promptRef.current || !promptHighlightRef.current) {
+      return;
+    }
+    promptHighlightRef.current.scrollTop = promptRef.current.scrollTop;
+    promptHighlightRef.current.scrollLeft = promptRef.current.scrollLeft;
+  };
+
+  /**
+   * 插入 / 删除引用 token 后，光标与视图必须停在原处。
+   *
+   * 受控 textarea 的 value 一变，浏览器会把选区丢到文末、把视图滚到最后一行；
+   * 原先用 requestAnimationFrame 补救，但那会先让用户看到一帧「字跳到最后一行」，
+   * 且同一批里若再有第二次 value 更新（节点数据回写）会把光标重新冲掉。
+   * 改为：记下操作前的光标与 scrollTop，在 layout 阶段（浏览器绘制前）写回，
+   * 并在用户下一次真实交互之前持续钉住 —— 插入点之外的内容原地不动。
+   */
+  const pendingPromptCaretRef = useRef<{ cursor: number; scrollTop: number | null } | null>(null);
+
+  const clearPendingPromptCaret = useCallback(() => {
+    pendingPromptCaretRef.current = null;
+  }, []);
+
+  useLayoutEffect(() => {
+    const pending = pendingPromptCaretRef.current;
+    const textarea = promptRef.current;
+    if (!pending || !textarea) {
+      return;
+    }
+    textarea.focus();
+    textarea.setSelectionRange(pending.cursor, pending.cursor);
+    // scrollTop 只写回一次：之后用户自己滚动时不再被程序抢回去。
+    if (pending.scrollTop !== null) {
+      textarea.scrollTop = pending.scrollTop;
+      syncPromptHighlightScroll();
+      pending.scrollTop = null;
+    }
+  });
+
+  const insertReference = useCallback(
+    (item: ReferencePickerItem) => {
+      const marker = item.kind === "image" ? `@图${item.index + 1}` : `@音频${item.index + 1}`;
+      let basePrompt = promptDraftRef.current;
+      // 优先用按 @ 时记录的光标；异常路径（没记录到）退回 textarea 当前光标，
+      // 绝不退回「文末」—— 否则引用会凭空插到最后一行，光标也跟着跳到末尾。
+      let baseCursor = pickerCursor ?? promptRef.current?.selectionStart ?? basePrompt.length;
+      // 兜底: 光标前(忽略尾部空格)已是 '@' 时先移除, 避免插入后出现 '@@图N'
+      const trimmedBefore = basePrompt.slice(0, baseCursor).replace(/\s+$/, "");
+      if (trimmedBefore.endsWith("@")) {
+        const atIndex = trimmedBefore.length - 1;
+        basePrompt = basePrompt.slice(0, atIndex) + basePrompt.slice(atIndex + 1);
+        baseCursor = atIndex;
+      }
+      const { nextText, nextCursor } = insertReferenceToken(basePrompt, baseCursor, marker);
+      pendingPromptCaretRef.current = {
+        cursor: nextCursor,
+        scrollTop: promptRef.current?.scrollTop ?? 0,
+      };
+      promptDraftRef.current = nextText;
+      setPromptDraft(nextText);
+      cancelPromptCommit();
+      updateNodeData(id, { prompt: nextText });
+      setShowImagePicker(false);
+      setPickerCursor(null);
+      setPickerActiveIndex(0);
+    },
+    [cancelPromptCommit, id, pickerCursor, updateNodeData],
+  );
+
+  const handlePromptKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+      // 只要用户开始敲键盘，就由浏览器接管光标，不再回钉插入位置。
+      clearPendingPromptCaret();
+      if (event.key === "Backspace" || event.key === "Delete") {
+        const currentPrompt = promptDraftRef.current;
+        const selectionStart = event.currentTarget.selectionStart ?? currentPrompt.length;
+        const selectionEnd = event.currentTarget.selectionEnd ?? selectionStart;
+        const deletionDirection = event.key === "Backspace" ? "backward" : "forward";
+        const deleteRange = resolveReferenceAwareDeleteRange(
+          currentPrompt,
+          selectionStart,
+          selectionEnd,
+          deletionDirection,
+          referenceInputImages.length,
+          usableInputAudio.length,
+        );
+        if (deleteRange) {
+          event.preventDefault();
+          const { nextText, nextCursor } = removeTextRange(currentPrompt, deleteRange);
+          pendingPromptCaretRef.current = {
+            cursor: nextCursor,
+            scrollTop: promptRef.current?.scrollTop ?? 0,
+          };
+          promptDraftRef.current = nextText;
+          setPromptDraft(nextText);
+          cancelPromptCommit();
+          updateNodeData(id, { prompt: nextText });
+          return;
+        }
+      }
+
+      if (showImagePicker && referencePickerItems.length > 0) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          setPickerActiveIndex((current) => (current + 1) % referencePickerItems.length);
+          return;
+        }
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          setPickerActiveIndex((current) => (current + referencePickerItems.length - 1) % referencePickerItems.length);
+          return;
+        }
+        if (event.key === "Enter") {
+          event.preventDefault();
+          const activeItem = referencePickerItems[pickerActiveIndex];
+          if (activeItem) {
+            insertReference(activeItem);
+          }
+          return;
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          setShowImagePicker(false);
+          setPickerCursor(null);
+          return;
+        }
+      }
+
+      const isAtKey = event.key === "@" || (event.shiftKey && event.code === "Digit2");
+      if (isAtKey && !event.ctrlKey && !event.metaKey && !event.altKey && referencePickerItems.length > 0) {
+        event.preventDefault();
+        const cursor = event.currentTarget.selectionStart ?? promptDraftRef.current.length;
+        setPickerAnchor(resolvePickerAnchor(rootRef.current, event.currentTarget, cursor, zoom));
+        setPickerCursor(cursor);
+        setPickerActiveIndex(0);
+        setShowImagePicker(true);
+      }
+    },
+    [
+      cancelPromptCommit,
+      clearPendingPromptCaret,
+      id,
+      insertReference,
+      pickerActiveIndex,
+      referenceInputImages.length,
+      referencePickerItems,
+      showImagePicker,
+      usableInputAudio.length,
+      updateNodeData,
+      zoom,
+    ],
+  );
+
+  const handleFrameFileChange = useCallback(
+    async (slot: FrameSlot, event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      event.target.value = "";
+      if (!file || !file.type.startsWith("image/")) {
+        return;
+      }
+      try {
+        const prepared = await prepareNodeImageFromFile(file);
+        updateNodeData(
+          id,
+          slot === "first"
+            ? {
+                firstFrameImageUrl: prepared.imageUrl,
+                firstFramePreviewImageUrl: prepared.previewImageUrl,
+              }
+            : {
+                lastFrameImageUrl: prepared.imageUrl,
+                lastFramePreviewImageUrl: prepared.previewImageUrl,
+              },
+        );
+        setError(null);
+      } catch (uploadError) {
+        const resolved = resolveErrorContent(uploadError, "图片上传失败");
+        setError(resolved.message);
+        void showErrorDialog(resolved.message, t("common.error"), resolved.details);
+      }
+    },
+    [id, t, updateNodeData],
+  );
+
+  const openFrameFilePicker = useCallback((slot: FrameSlot) => {
+    if (slot === "first") {
+      firstFrameInputRef.current?.click();
+      return;
+    }
+    lastFrameInputRef.current?.click();
+  }, []);
+
+  const clearFrame = useCallback(
+    (slot: FrameSlot) => {
+      updateNodeData(
+        id,
+        slot === "first"
+          ? {
+              firstFrameImageUrl: null,
+              firstFramePreviewImageUrl: null,
+            }
+          : {
+              lastFrameImageUrl: null,
+              lastFramePreviewImageUrl: null,
+            },
+      );
+      setError(null);
+    },
+    [id, updateNodeData],
+  );
+
+  const handleGenerate = useCallback(async () => {
+    // 冷却期内的连点直接丢弃（按钮此时也是灰的）。校验失败不消耗冷却，
+    // 用户改完提示词/密钥可以立刻重试。
+    if (Date.now() - lastSubmitAtRef.current < GENERATE_COOLDOWN_MS) {
+      return;
+    }
+    if (!selectedModel) {
+      const message = "请先在设置中添加视频模型";
+      setError(message);
+      void showErrorDialog(message, t("common.error"));
+      return;
+    }
+    setLastVideoDuration(selectedDuration);
+    flushPromptCommit();
+    // 上游文本节点的编辑同样是防抖提交的: 先补交欠账, 再从 store 现取一次。
+    // 直接用 render 期的 inputText 会在「上游文本刚改完」时把上一版内容拼进提示词。
+    const liveInputText = readLiveInputText(id);
+    const prompt = [promptDraftRef.current.trim(), ...liveInputText].filter(Boolean).join("\n\n").trim();
+    if (!prompt) {
+      return;
+    }
+    if (imageMode === "first-last" && firstLastFrameImages.length < 2) {
+      const message = t("node.videoGen.firstLastNeedImages");
+      setError(message);
+      void showErrorDialog(message, t("common.error"));
+      return;
+    }
+    if (isWanCli && (usableInputAudio.length > 0 || videoReferenceImages.length > 5)) {
+      const message = t(usableInputAudio.length > 0 ? "wanCli.audioUnsupported" : "wanCli.referenceLimit");
+      setError(message);
+      void showErrorDialog(message, t("common.error"));
+      return;
+    }
+    const apiKey = apiKeys[selectedModel.providerId] ?? "";
+    if (!isJimengCli && !isWanCli && !isRunningHubCli && !apiKey) {
+      const message = "请在设置中填写 API Key";
+      setError(message);
+      void showErrorDialog(message, t("common.error"));
+      return;
+    }
+    // 校验全部通过、即将真正提交——从这里开始同步地占用冷却窗口。
+    // 这段到 addNode 之间没有 await，所以连点不可能插进来重复提交。
+    beginCooldown();
+    const customId = selectedModel.providerId.slice("custom:".length);
+    const baseUrl =
+      isJimengCli || isWanCli || isRunningHubCli ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
+    const manualReferenceVideos = Array.isArray(data.binghuoReferenceVideos)
+      ? data.binghuoReferenceVideos.filter(
+          (source): source is string => typeof source === "string" && source.trim().length > 0,
+        )
+      : [];
+    const referenceVideos = Array.from(new Set([...inputVideos, ...manualReferenceVideos]));
+    const generationExtraParams = {
+      ...(referenceVideos.length > 0 ? { reference_videos: referenceVideos.slice(0, 10) } : {}),
+      ...(data.binghuoSkipReview === true ? { skip_review: true } : {}),
+    };
+    const baseGenerationDebugContext: GenerationDebugContext = {
+      sourceType: "videoGen",
+      providerId: selectedModel.providerId,
+      requestModel: selectedModel.id,
+      requestAspectRatio: data.aspectRatio,
+      prompt,
+      extraParams: {
+        ...(baseUrl ? { provider_base_url: baseUrl } : {}),
+        video_resolution: selectedVideoResolution,
+        image_mode: imageMode,
+        ...generationExtraParams,
+      },
+      referenceImageCount: videoReferenceImages.length,
+      referenceImagePlaceholders: createReferenceImagePlaceholders(videoReferenceImages.length),
+      referenceAudioCount: usableInputAudio.length,
+    };
+    const runtimeDiagnosticsPromise = getRuntimeDiagnostics().catch(() => null);
+    // 立即创建下游视频节点(生成中状态), 成功后再填充视频地址, 失败时把错误写入节点。
+    // 与 AI 图片节点一致: 点击生成即出现结果节点 + 连线, 报错信息显示在节点上。
+    // 尺寸采用与图片结果节点相同的紧凑算法, 避免下游节点过大。
+    const generationStartedAt = Date.now();
+    const clientJobId = isWanCli ? crypto.randomUUID() : id;
+    const compactSize = resolveMinEdgeFittedSize(data.aspectRatio, {
+      minWidth: EXPORT_RESULT_NODE_MIN_WIDTH,
+      minHeight: EXPORT_RESULT_NODE_MIN_HEIGHT,
+    });
+    const outputId = addNode(CANVAS_NODE_TYPES.audio, findNodePosition(id, 360, 240), {
+      displayName: prompt,
+      mediaType: "video",
+      aspectRatio: data.aspectRatio,
+      isGenerating: true,
+      generationStartedAt,
+      // 标记本次运行会话, 避免 Canvas 的"生成中节点自动恢复"逻辑把本次正常提交
+      // 误判为重启残留任务而重复提交(重复扣费)
+      generationClientSessionId: CURRENT_RUNTIME_SESSION_ID,
+      generationDurationMs: selectedModel.expectedDurationMs ?? 180000,
+      generationProviderId: selectedModel.providerId,
+      generationModel: selectedModel.id,
+      providerBaseUrl: baseUrl,
+      generationDebugContext: baseGenerationDebugContext,
+      generationRequest: {
+        kind: "video",
+        // 作为支持幂等提交的平台的稳定请求键。重试同一个节点时复用，避免
+        // 网络超时后重复创建任务或重复扣费。
+        clientJobId,
+        prompt,
+        model: selectedModel.id,
+        duration: selectedDuration,
+        aspectRatio: data.aspectRatio,
+        videoResolution: selectedVideoResolution,
+        imageMode,
+        referenceImages: videoReferenceImages,
+        referenceAudio: usableInputAudio,
+        extraParams: generationExtraParams,
+      },
+    });
+    void runtimeDiagnosticsPromise.then((runtimeDiagnostics) => {
+      if (!runtimeDiagnostics) return;
+      const outputNode = useCanvasStore.getState().nodes.find((node) => node.id === outputId);
+      if (outputNode) {
+        updateNodeData(outputId, {
+          generationDebugContext: { ...baseGenerationDebugContext, ...runtimeDiagnostics },
+        });
+      }
+    });
+    // 追加而非覆盖：连点会同时挂多个下游任务，覆盖会让先提交的那个丢掉记账，
+    // 从而在下游还在跑的时候把源节点的「生成中」误清掉。
+    const trackedBefore = collectActiveGenerationNodeIds(
+      useCanvasStore.getState().nodes.find((node) => node.id === id)?.data,
+    );
+    updateNodeData(id, { activeGenerationNodeIds: [...trackedBefore, outputId], activeGenerationNodeId: null });
+    updateNodeSize(outputId, compactSize.width, compactSize.height);
+    addEdge(id, outputId);
+    // 打开「可取消窗口」: 从这一刻到平台受理为止, 下游节点上显示「取消生成」。
+    // 必须在第一个 await 之前开 —— 后面的素材规整/上传才是这个窗口的主要内容。
+    openVideoCancellationWindow(outputId);
+    cancelWindowNodeIdsRef.current.add(outputId);
+    setIsGenerating(true);
+    setJimengCliStatus(isJimengCli ? { status: "queued" } : null);
+    setError(null);
+    try {
+      if (!isJimengCli && !isWanCli && !isRunningHubCli) {
+        await canvasAiGateway.setApiKey(selectedModel.providerId, apiKey);
+      }
+      const { jobId: generationJobId, cancelable } = await canvasAiGateway.submitGenerateVideoJob(
+        {
+          clientJobId,
+          prompt,
+          model: selectedModel.id,
+          duration: selectedDuration,
+          aspectRatio: data.aspectRatio,
+          videoResolution: selectedVideoResolution,
+          imageMode,
+          referenceImages: videoReferenceImages,
+          referenceAudio: usableInputAudio,
+          extraParams: generationExtraParams,
+        },
+        { cancellationNodeId: outputId },
+      );
+      updateNodeData(outputId, {
+        generationJobId,
+        generationError: null,
+        generationErrorDetails: null,
+      });
+      // 本地 CLI 类平台(jimeng / wan / runninghub)拦不住已经交出去的进程, 窗口到此为止。
+      if (!cancelable) {
+        closeVideoCancellationWindow(outputId);
+        cancelWindowNodeIdsRef.current.delete(outputId);
+        return;
+      }
+      // 竞态: 用户点取消时请求已经交出去了, 检查点来不及拦。立刻让后端中止 ——
+      // 若后端回 too_late(平台已受理), 就收掉按钮让任务正常跑完。
+      if (isVideoCancellationRequested(outputId)) {
+        const outcome = await canvasAiGateway.cancelGenerateVideoJob(generationJobId).catch(() => "too_late" as const);
+        if (outcome !== "canceled") {
+          closeVideoCancellationWindow(outputId);
+          cancelWindowNodeIdsRef.current.delete(outputId);
+        }
+      }
+    } catch (generationError) {
+      // 用户主动取消不是失败: 下游节点要显示「已取消」而不是红色报错, 更不能弹错误框。
+      if (isVideoGenerationCanceledError(generationError)) {
+        closeVideoCancellationWindow(outputId);
+        cancelWindowNodeIdsRef.current.delete(outputId);
+        // CLI 链路的状态靠引擎回推事件更新; 这次提交根本没跑出去, 没有事件会回来,
+        // 不清掉就会在源节点上留一个永不消失的「排队中」。
+        setJimengCliStatus(null);
+        updateNodeData(outputId, {
+          isGenerating: false,
+          generationStartedAt: null,
+          generationJobId: null,
+          generationClientSessionId: null,
+          generationCanceled: true,
+          generationError: null,
+          generationErrorDetails: null,
+        });
+        return;
+      }
+      closeVideoCancellationWindow(outputId);
+      cancelWindowNodeIdsRef.current.delete(outputId);
+      const resolved = resolveErrorContent(generationError, "视频生成失败");
+      setError(resolved.message);
+      recordGenerationOutcome({
+        nodeId: outputId,
+        kind: "video",
+        providerId: selectedModel.providerId,
+        modelId: selectedModel.id,
+        size: selectedVideoResolution,
+        duration: selectedDuration,
+        referenceCount: videoReferenceImages.length,
+        status: "failed",
+        errorMessage: resolved.message,
+        durationMs: Date.now() - generationStartedAt,
+      });
+      const runtimeDiagnostics = await runtimeDiagnosticsPromise;
+      const generationDebugContext: GenerationDebugContext = {
+        ...baseGenerationDebugContext,
+        ...(runtimeDiagnostics ?? {}),
+      };
+      updateNodeData(outputId, {
+        isGenerating: false,
+        generationStartedAt: null,
+        generationError: resolved.message,
+        generationErrorDetails: resolved.details ?? null,
+        generationClientSessionId: null,
+        generationDebugContext,
+      });
+      // 不用手动从 activeGenerationNodeIds 里摘自己：上面已把下游节点标成终态，
+      // 源节点的核对 effect 会把它清掉（连点场景下也只会摘掉这一个）。
+      void showErrorDialog(
+        resolved.message,
+        t("common.error"),
+        resolved.details,
+        buildGenerationErrorReport({
+          errorMessage: resolved.message,
+          errorDetails: resolved.details,
+          context: generationDebugContext,
+        }),
+      );
+    }
+  }, [
+    addEdge,
+    addNode,
+    apiKeys,
+    beginCooldown,
+    customApis,
+    data.aspectRatio,
+    data.binghuoReferenceVideos,
+    data.binghuoSkipReview,
+    findNodePosition,
+    firstLastFrameImages.length,
+    flushPromptCommit,
+    id,
+    imageMode,
+    inputVideos,
+    inputText,
+    isWanCli,
+    selectedDuration,
+    selectedModel,
+    selectedProfile,
+    selectedVideoResolution,
+    setLastVideoDuration,
+    t,
+    usableInputAudio,
+    updateNodeData,
+    updateNodeSize,
+    videoReferenceImages,
+  ]);
+
+  // 把「生成」登记给 AI Agent：它按节点名触发时走的就是这个函数 ——
+  // 与用户亲手点按钮完全同一条路径，计费/取消/错误处理都不会被绕开。
+  useEffect(() => registerNodeGenerationHandler(id, () => void handleGenerate()), [id, handleGenerate]);
+
+  // 炳火高级字段: 仅当当前模型是炳火 API 时显示折叠面板。
+  // 字段名固定 reference_videos(手册 3.3 红字强调: videos / video_urls 部分模型被忽略)。
+  const binghuoReferenceVideos = data.binghuoReferenceVideos ?? [];
+  const binghuoSkipReview = data.binghuoSkipReview === true;
+  const isBinghuoModel =
+    typeof selectedModel?.providerId === "string" &&
+    selectedModel.providerId.startsWith("custom:") &&
+    (customApis.find((api) => api.id === selectedModel.providerId.slice("custom:".length))?.baseUrl ?? "").includes(
+      "7tai.cc",
+    );
+
+  return (
+    <div
+      ref={rootRef}
+      className={`relative flex h-full flex-col gap-2 overflow-visible rounded-[var(--node-radius)] border bg-surface-dark/90 p-3 ${selected ? "border-accent shadow-[0_0_0_1px_rgba(59,130,246,0.32)]" : "border-[rgba(255,255,255,0.18)]"}`}
+      style={{ width: `${resolvedWidth}px`, height: `${resolvedHeight}px` }}
+    >
+      <NodeHeader
+        className={NODE_HEADER_FLOATING_POSITION_CLASS}
+        icon={<Clapperboard className="h-4 w-4" />}
+        titleText={title}
+        editable
+        onTitleChange={(displayName) => updateNodeData(id, { displayName })}
+        rightSlot={
+          showNodePrice ? (
+            <NodePriceBadge
+              label={priceBadgeLabel}
+              customPrice={customPrice || null}
+              editable
+              onPriceChange={handlePriceChange}
+              title={nodePrice?.nativeLabel}
+            />
+          ) : null
+        }
+      />
+      <div className="relative min-h-0 flex-1 rounded-md border border-border-dark bg-bg-dark/60">
+        <div className="relative h-full min-h-0">
+          <div
+            ref={promptHighlightRef}
+            aria-hidden="true"
+            className="ui-scrollbar pointer-events-none absolute inset-0 z-20 overflow-y-auto overflow-x-hidden text-xs leading-5 text-text-dark"
+            style={{ scrollbarGutter: "stable" }}
+          >
+            <div className="min-h-full whitespace-pre-wrap break-words p-2">
+              {renderPromptWithHighlights(
+                promptDraft,
+                referenceInputImages.length,
+                usableInputAudio.length,
+                inputImageDisplayUrls,
+                usableInputAudio,
+                resolveAudioLabel,
+                (displayUrl, event) => {
+                  setPreviewState({ url: displayUrl, x: event.clientX, y: event.clientY });
+                  setPreviewSize(null);
+                },
+              )}
+            </div>
+          </div>
+          <textarea
+            ref={promptRef}
+            value={promptDraft}
+            onChange={(event) => {
+              clearPendingPromptCaret();
+              const nextValue = event.target.value;
+              promptDraftRef.current = nextValue;
+              setPromptDraft(nextValue);
+              schedulePromptCommit();
+            }}
+            onBlur={() => {
+              clearPendingPromptCaret();
+              flushPromptCommit();
+            }}
+            onKeyDown={handlePromptKeyDown}
+            onScroll={syncPromptHighlightScroll}
+            onMouseDown={(event) => {
+              // 用户自己点选光标位置时不再回钉。
+              clearPendingPromptCaret();
+              event.stopPropagation();
+            }}
+            placeholder="描述要生成的视频"
+            className={`ui-scrollbar nodrag nowheel relative z-10 h-full w-full resize-none overflow-y-auto overflow-x-hidden border-none bg-transparent p-2 text-xs leading-5 text-transparent caret-text-dark outline-none placeholder:text-text-muted/80 focus:border-transparent whitespace-pre-wrap break-words [font-family:inherit] ${inputText.length > 0 ? "pb-20" : ""}`}
+            style={{ scrollbarGutter: "stable" }}
+          />
+          {inputText.length > 0 && (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 flex flex-col gap-0 bg-bg-dark/90 p-2 text-xs leading-5 text-text-muted"
+            >
+              {inputText.slice(0, 3).map((text, index) => (
+                <div
+                  key={`input-text-${index}`}
+                  className="overflow-hidden text-ellipsis whitespace-nowrap"
+                  title={text}
+                >
+                  {text}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        {showImagePicker && referencePickerItems.length > 0 && (
+          <NodeReferencePicker
+            anchor={pickerAnchor}
+            containerRef={rootRef}
+            zoom={zoom}
+            entries={referencePickerItems.map((item, index) => ({
+              key: `${item.kind}-${item.source}-${index}`,
+              kind: item.kind,
+              label: item.label,
+              thumbUrl: item.kind === "image" ? inputImageDisplayUrls[item.index] : null,
+              viewerSourceUrl: item.kind === "image" ? resolveImageDisplayUrl(item.source) : null,
+              viewerImageList: inputImageViewerList,
+            }))}
+            activeIndex={pickerActiveIndex}
+            onSelect={(index) => {
+              const item = referencePickerItems[index];
+              if (item) {
+                insertReference(item);
+              }
+            }}
+            onHover={setPickerActiveIndex}
+          />
+        )}
+      </div>
+      {referenceTiles.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5" data-video-reference-strip>
+          <span className="text-[11px] text-text-muted">{t("node.videoGen.referenceAssets", "引用素材")}</span>
+          {referenceTiles.map((tile) => (
+            <div
+              key={tile.key}
+              className={`nodrag group/ref relative h-9 w-9 shrink-0 overflow-hidden rounded border ${
+                tile.used ? "border-border-dark bg-black/40" : "border-dashed border-border-dark/70 opacity-60"
+              }`}
+              title={tile.used ? tile.label : `${tile.label} · ${t("node.videoGen.ignoredByJimeng", "即梦不使用")}`}
+            >
+              {tile.kind === "image" && tile.displayUrl ? (
+                <CanvasNodeImage
+                  src={tile.displayUrl}
+                  alt={tile.label}
+                  disableViewer
+                  draggable={false}
+                  className="pointer-events-none h-full w-full object-cover"
+                />
+              ) : (
+                <span className="flex h-full w-full items-center justify-center text-accent">
+                  <AudioLines className="h-4 w-4" aria-hidden="true" />
+                </span>
+              )}
+              <span className="pointer-events-none absolute bottom-0 left-0 right-0 bg-black/65 text-center text-[9px] leading-[11px] text-white">
+                {tile.label}
+              </span>
+              <button
+                type="button"
+                className="nodrag absolute right-0 top-0 flex h-4 w-4 items-center justify-center rounded-bl bg-black/70 text-white opacity-70 transition-opacity hover:bg-red-700/90 hover:opacity-100 group-hover/ref:opacity-100"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  removeReferenceTile(tile);
+                }}
+                onMouseDown={(event) => event.stopPropagation()}
+                title={t("node.videoGen.removeReferenceAsset", "移除该引用素材(不再上传给模型)")}
+                aria-label={t("node.videoGen.removeReferenceAsset", "移除该引用素材(不再上传给模型)")}
+              >
+                <X className="h-3 w-3" aria-hidden="true" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="flex items-center gap-1" role="group" aria-label={t("node.videoGen.imageMode")}>
+        <button
+          type="button"
+          className={`nodrag h-7 rounded-md border px-2 text-[11px] transition-colors ${
+            imageMode === "reference"
+              ? "border-accent/50 bg-accent/15 text-text-dark"
+              : "border-border-dark bg-bg-dark text-text-muted hover:text-text-dark"
+          }`}
+          onClick={(event) => {
+            event.stopPropagation();
+            updateNodeData(id, { imageMode: "reference" });
+          }}
+        >
+          {t("node.videoGen.referenceMode")}
+        </button>
+        <button
+          type="button"
+          className={`nodrag h-7 rounded-md border px-2 text-[11px] transition-colors ${
+            imageMode === "first-last"
+              ? "border-accent/50 bg-accent/15 text-text-dark"
+              : "border-border-dark bg-bg-dark text-text-muted hover:text-text-dark"
+          }`}
+          onClick={(event) => {
+            event.stopPropagation();
+            updateNodeData(id, { imageMode: "first-last" });
+          }}
+        >
+          {t("node.videoGen.firstLastMode")}
+        </button>
+        {imageMode === "first-last" && (
+          <span className="min-w-0 truncate text-[11px] text-text-muted">{t("node.videoGen.firstLastHint")}</span>
+        )}
+        <span
+          className={`ml-auto shrink-0 text-[11px] ${
+            isJimengCli && videoReferenceImages.length > JIMENG_CLI_MAX_REFERENCE_IMAGES
+              ? "text-red-400"
+              : "text-text-muted"
+          }`}
+          title={isJimengCli ? t("node.videoGen.referenceImageLimit") : undefined}
+        >
+          {t("node.videoGen.referenceImageCount", { count: videoReferenceImages.length })}
+          {isJimengCli ? ` / ${JIMENG_CLI_MAX_REFERENCE_IMAGES}` : ""}
+        </span>
+      </div>
+      {imageMode === "first-last" && (
+        <div className="grid grid-cols-2 gap-2">
+          <div className="min-w-0">
+            <span className="mb-1 block text-[11px] text-text-muted">{t("node.videoGen.firstFrame")}</span>
+            <div className="relative h-[68px]">
+              <button
+                type="button"
+                className="nodrag flex h-full w-full items-center justify-center overflow-hidden rounded-md border border-dashed border-border-dark bg-bg-dark text-text-muted transition-colors hover:border-accent/60 hover:bg-accent/5 hover:text-text-dark"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  openFrameFilePicker("first");
+                }}
+                onMouseDown={(event) => event.stopPropagation()}
+                title={
+                  data.firstFrameImageUrl ? t("node.videoGen.replaceFirstFrame") : t("node.videoGen.uploadFirstFrame")
+                }
+                aria-label={
+                  data.firstFrameImageUrl ? t("node.videoGen.replaceFirstFrame") : t("node.videoGen.uploadFirstFrame")
+                }
+              >
+                {data.firstFrameImageUrl ? (
+                  <CanvasNodeImage
+                    src={resolveImageDisplayUrl(data.firstFramePreviewImageUrl || data.firstFrameImageUrl)}
+                    alt={t("node.videoGen.firstFrame")}
+                    disableViewer
+                    draggable={false}
+                    className="pointer-events-none h-full w-full object-contain"
+                  />
+                ) : (
+                  <Plus className="h-5 w-5" aria-hidden="true" />
+                )}
+              </button>
+              {data.firstFrameImageUrl && (
+                <div className="absolute right-1 top-1 flex gap-1">
+                  <button
+                    type="button"
+                    className="nodrag flex h-6 w-6 items-center justify-center rounded border border-white/20 bg-black/65 text-white transition-colors hover:bg-black/85"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openFrameFilePicker("first");
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    title={t("node.videoGen.replaceFirstFrame")}
+                    aria-label={t("node.videoGen.replaceFirstFrame")}
+                  >
+                    <ImagePlus className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="nodrag flex h-6 w-6 items-center justify-center rounded border border-white/20 bg-black/65 text-white transition-colors hover:bg-red-700/85"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      clearFrame("first");
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    title={t("node.videoGen.removeFirstFrame")}
+                    aria-label={t("node.videoGen.removeFirstFrame")}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="min-w-0">
+            <span className="mb-1 block text-[11px] text-text-muted">{t("node.videoGen.lastFrame")}</span>
+            <div className="relative h-[68px]">
+              <button
+                type="button"
+                className="nodrag flex h-full w-full items-center justify-center overflow-hidden rounded-md border border-dashed border-border-dark bg-bg-dark text-text-muted transition-colors hover:border-accent/60 hover:bg-accent/5 hover:text-text-dark"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  openFrameFilePicker("last");
+                }}
+                onMouseDown={(event) => event.stopPropagation()}
+                title={
+                  data.lastFrameImageUrl ? t("node.videoGen.replaceLastFrame") : t("node.videoGen.uploadLastFrame")
+                }
+                aria-label={
+                  data.lastFrameImageUrl ? t("node.videoGen.replaceLastFrame") : t("node.videoGen.uploadLastFrame")
+                }
+              >
+                {data.lastFrameImageUrl ? (
+                  <CanvasNodeImage
+                    src={resolveImageDisplayUrl(data.lastFramePreviewImageUrl || data.lastFrameImageUrl)}
+                    alt={t("node.videoGen.lastFrame")}
+                    disableViewer
+                    draggable={false}
+                    className="pointer-events-none h-full w-full object-contain"
+                  />
+                ) : (
+                  <Plus className="h-5 w-5" aria-hidden="true" />
+                )}
+              </button>
+              {data.lastFrameImageUrl && (
+                <div className="absolute right-1 top-1 flex gap-1">
+                  <button
+                    type="button"
+                    className="nodrag flex h-6 w-6 items-center justify-center rounded border border-white/20 bg-black/65 text-white transition-colors hover:bg-black/85"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openFrameFilePicker("last");
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    title={t("node.videoGen.replaceLastFrame")}
+                    aria-label={t("node.videoGen.replaceLastFrame")}
+                  >
+                    <ImagePlus className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="nodrag flex h-6 w-6 items-center justify-center rounded border border-white/20 bg-black/65 text-white transition-colors hover:bg-red-700/85"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      clearFrame("last");
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    title={t("node.videoGen.removeLastFrame")}
+                    aria-label={t("node.videoGen.removeLastFrame")}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+          <input
+            ref={firstFrameInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(event) => void handleFrameFileChange("first", event)}
+          />
+          <input
+            ref={lastFrameInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(event) => void handleFrameFileChange("last", event)}
+          />
+        </div>
+      )}
+      <div
+        className={`grid gap-1.5 ${
+          imageMode === "first-last"
+            ? resolutionOptions.length > 0
+              ? "grid-cols-[minmax(0,1fr)_58px_72px]"
+              : "grid-cols-[minmax(0,1fr)_78px]"
+            : resolutionOptions.length > 0
+              ? "grid-cols-[minmax(0,1fr)_58px_58px_72px]"
+              : "grid-cols-[minmax(0,1fr)_72px_78px]"
+        }`}
+      >
+        <div ref={modelTriggerRef} className="relative min-w-0">
+          <button
+            type="button"
+            className="nodrag flex h-8 w-full min-w-0 items-center justify-between gap-1 rounded border border-border-dark bg-bg-dark px-2 text-left text-xs text-text-dark"
+            onClick={(event) => {
+              event.stopPropagation();
+              setShowImagePicker(false);
+              setShowDurationSlider(false);
+              setShowModelPicker((current) => !current);
+            }}
+            onMouseDown={(event) => event.stopPropagation()}
+            aria-expanded={showModelPicker}
+            aria-label={t("modelParams.model")}
+          >
+            <span className="min-w-0 truncate">
+              {selectedModelName || (models.length === 0 ? "请先配置视频模型" : "")}
+            </span>
+            <ChevronDown
+              className={`h-3.5 w-3.5 shrink-0 transition-transform ${showModelPicker ? "rotate-180" : ""}`}
+            />
+          </button>
+          {showModelPicker &&
+            typeof document !== "undefined" &&
+            createPortal(
+              <div
+                ref={modelPickerRef}
+                className="nodrag nowheel fixed z-[160] w-[320px] max-w-[calc(100vw-32px)] rounded-lg border border-[rgba(255,255,255,0.16)] bg-surface-dark p-3 shadow-xl"
+                style={modelPickerPosition ?? undefined}
+                onPointerDown={(event) => event.stopPropagation()}
+                onMouseDown={(event) => event.stopPropagation()}
+                onWheelCapture={(event) => event.stopPropagation()}
+              >
+                {models.length === 0 ? (
+                  <div className="text-xs text-text-muted">请先在设置中配置视频模型</div>
+                ) : (
+                  <div className="ui-scrollbar max-h-[300px] space-y-3 overflow-y-auto">
+                    <section>
+                      <div className="mb-2 text-xs font-medium text-text-muted">{t("modelParams.provider")}</div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {videoModelProviders.map((provider) => {
+                          const active = provider.id === modelPickerProviderId;
+                          return (
+                            <button
+                              key={provider.id}
+                              type="button"
+                              className={`h-8 rounded-lg border px-3 text-xs transition-colors ${
+                                active
+                                  ? "border-accent/50 bg-accent/15 text-text-dark"
+                                  : "border-[rgba(255,255,255,0.12)] bg-bg-dark/65 text-text-muted hover:border-[rgba(255,255,255,0.2)]"
+                              }`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setModelPickerProviderId(provider.id);
+                              }}
+                            >
+                              {provider.label || provider.name}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </section>
+                    <section>
+                      <div className="mb-2 text-xs font-medium text-text-muted">{t("modelParams.model")}</div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {pickerProviderModels.map((model) => {
+                          const providerName = getModelProvider(model.providerId).label;
+                          const label = model.displayName.startsWith(`${providerName} · `)
+                            ? model.displayName.slice(providerName.length + 3)
+                            : model.displayName;
+                          const active = model.id === selectedModel?.id;
+                          return (
+                            <button
+                              key={model.id}
+                              type="button"
+                              className={`min-h-8 max-w-full rounded-lg border px-3 py-1.5 text-xs leading-4 transition-colors ${
+                                active
+                                  ? "border-accent/50 bg-accent/15 text-text-dark"
+                                  : "border-[rgba(255,255,255,0.12)] bg-bg-dark/65 text-text-muted hover:border-[rgba(255,255,255,0.2)] hover:bg-[rgba(255,255,255,0.05)]"
+                              }`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                updateNodeData(id, {
+                                  model: model.id,
+                                  customPrice: customModelPrices[model.id] ?? null,
+                                  // 换模型时把时长落到新模型的合法档位上；声明了
+                                  // defaultDuration 的新模型（如可灵 v4 = 30s）直接用它。
+                                  duration: resolveVideoNodeDuration(model, data.duration),
+                                });
+                                setLastVideoModelId(model.id);
+                                setShowModelPicker(false);
+                              }}
+                            >
+                              <span className="break-words">{label}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  </div>
+                )}
+              </div>,
+              document.body,
+            )}
+        </div>
+        {imageMode !== "first-last" && (
+          <select
+            className="nodrag h-8 rounded border border-border-dark bg-bg-dark px-1 text-xs text-text-dark"
+            value={data.aspectRatio}
+            onChange={(event) => {
+              setShowModelPicker(false);
+              updateNodeData(id, { aspectRatio: event.target.value });
+              setLastVideoAspectRatio(event.target.value);
+            }}
+          >
+            {(selectedModel?.aspectRatios ?? []).map((ratio) => (
+              <option key={ratio.value} value={ratio.value}>
+                {ratio.label}
+              </option>
+            ))}
+          </select>
+        )}
+        {resolutionOptions.length > 0 && (
+          <select
+            className="nodrag h-8 rounded border border-border-dark bg-bg-dark px-1 text-xs text-text-dark"
+            value={selectedVideoResolution}
+            onChange={(event) => {
+              setShowModelPicker(false);
+              updateNodeData(id, { resolution: event.target.value });
+              setLastVideoResolution(event.target.value);
+            }}
+            aria-label="视频分辨率"
+          >
+            {resolutionOptions.map((resolution) => (
+              <option key={resolution.value} value={resolution.value}>
+                {resolution.label}
+              </option>
+            ))}
+          </select>
+        )}
+        <div className="relative">
+          <button
+            type="button"
+            className="nodrag flex h-8 w-full items-center justify-between rounded border border-border-dark bg-bg-dark px-2 text-xs text-text-dark"
+            onClick={(event) => {
+              event.stopPropagation();
+              setShowImagePicker(false);
+              setShowModelPicker(false);
+              setShowDurationSlider((current) => !current);
+            }}
+            onMouseDown={(event) => event.stopPropagation()}
+            aria-expanded={showDurationSlider}
+            aria-label="视频时长"
+          >
+            <span>{selectedDuration}s</span>
+            <ChevronDown className={`h-3.5 w-3.5 transition-transform ${showDurationSlider ? "rotate-180" : ""}`} />
+          </button>
+          {showDurationSlider && (
+            <div
+              className="nodrag nowheel absolute right-0 top-[calc(100%+6px)] z-30 w-52 rounded-lg border border-[rgba(255,255,255,0.16)] bg-surface-dark p-3 shadow-xl"
+              onMouseDown={(event) => event.stopPropagation()}
+              onWheelCapture={(event) => event.stopPropagation()}
+            >
+              <div className="mb-2 flex items-center justify-between text-[11px] text-text-muted">
+                <span>{durationMinimum}秒</span>
+                <span className="font-medium text-text-dark">{selectedDuration} 秒</span>
+                <span>{durationMaximum}秒</span>
+              </div>
+              <input
+                type="range"
+                min={durationMinimum}
+                max={durationMaximum}
+                step="1"
+                value={selectedDuration}
+                onChange={(event) => {
+                  const duration = snapVideoDurationOption(durationOptions, Number(event.target.value));
+                  updateNodeData(id, { duration });
+                  setLastVideoDuration(duration);
+                }}
+                className="nodrag nowheel h-1.5 w-full cursor-pointer appearance-none rounded-full bg-border-dark [accent-color:var(--color-accent)]"
+                aria-label="视频时长（秒）"
+              />
+            </div>
+          )}
+        </div>
+      </div>
+      {isJimengCli && isGenerating && jimengCliStatus && (
+        <div className="text-[11px] text-text-muted">
+          {jimengCliStatus.status === "queued"
+            ? `排队中${typeof jimengCliStatus.queueCount === "number" ? ` · 当前排队 ${jimengCliStatus.queueCount}` : ""}`
+            : jimengCliStatus.status === "running"
+              ? "已进入生成阶段，无法取消"
+              : jimengCliStatus.status === "retrying"
+                ? (jimengCliStatus.message ?? "正在重试")
+                : "即梦 CLI 处理中"}
+          {jimengCliStatus.status === "queued" && (
+            <span className="ml-1 text-text-muted/70">（CLI 未提供远端取消功能）</span>
+          )}
+        </div>
+      )}
+      {isWanCli && imageMode === "first-last" && (
+        <span className="text-[11px] text-text-muted">{t("wanCli.frameRatio")}</span>
+      )}
+      {selectedProfile && !isJimengCli && (
+        <span className={`text-[11px] ${selectedProfile.status === "verified" ? "text-text-muted" : "text-amber-400"}`}>
+          {selectedProfile.protocolLabel}
+        </span>
+      )}
+      {error && <span className="line-clamp-2 text-[11px] text-red-400">{error}</span>}
+      {isBinghuoModel && (
+        <details
+          className="nodrag rounded-md border border-border-dark/70 bg-bg-dark/40 px-2 py-1 text-[11px] text-text-muted open:pb-2"
+          onClick={(event) => event.stopPropagation()}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <summary className="nodrag cursor-pointer select-none text-text-dark">
+            {t("node.videoGen.binghuoAdvanced")}
+          </summary>
+          <div className="nodrag mt-2 flex flex-col gap-2">
+            <label className="flex flex-col gap-1">
+              <span className="flex items-center justify-between">
+                <span>{t("node.videoGen.binghuoReferenceVideosLabel")}</span>
+                <span className="text-text-muted">
+                  {t("node.videoGen.binghuoReferenceVideosCount", { count: binghuoReferenceVideos.length })}
+                </span>
+              </span>
+              <textarea
+                className="nodrag min-h-[64px] resize-y rounded-md border border-border-dark/70 bg-bg-dark px-2 py-1 font-mono text-[11px] text-text-dark focus:border-accent/60 focus:outline-none"
+                placeholder="https://…/clip1.mp4&#10;https://…/clip2.mp4"
+                value={binghuoReferenceVideos.join("\n")}
+                spellCheck={false}
+                onChange={(event) => {
+                  const urls = event.target.value
+                    .split(/\r?\n/)
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                    .slice(0, 3);
+                  updateNodeData(id, { binghuoReferenceVideos: urls });
+                }}
+                onClick={(event) => event.stopPropagation()}
+                onMouseDown={(event) => event.stopPropagation()}
+                onKeyDown={(event) => event.stopPropagation()}
+              />
+              <span className="leading-snug text-text-muted/90">{t("node.videoGen.binghuoReferenceVideosHint")}</span>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  className="nodrag h-3.5 w-3.5 accent-accent"
+                  checked={binghuoSkipReview}
+                  onChange={(event) => updateNodeData(id, { binghuoSkipReview: event.target.checked })}
+                  onClick={(event) => event.stopPropagation()}
+                  onMouseDown={(event) => event.stopPropagation()}
+                />
+                <span>{t("node.videoGen.binghuoSkipReviewLabel")}</span>
+              </span>
+              <span className="leading-snug text-text-muted/90">{t("node.videoGen.binghuoSkipReviewHint")}</span>
+            </label>
+          </div>
+        </details>
+      )}
+      <button
+        type="button"
+        disabled={isCoolingDown || !selectedModel || (!promptDraft.trim() && inputText.length === 0)}
+        onClick={() => void handleGenerate()}
+        className="nodrag mt-auto flex h-8 items-center justify-center gap-1.5 rounded-md bg-accent text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-45"
+      >
+        {isCoolingDown ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+        {isCoolingDown ? `冷却 ${cooldownSeconds}s` : "生成视频"}
+        {activeTaskCount > 0 && (
+          <span
+            className="rounded-full bg-white/25 px-1.5 text-[10px] leading-4"
+            title={`已提交 ${activeTaskCount} 个任务，生成中`}
+          >
+            {activeTaskCount}
+          </span>
+        )}
+      </button>
+      <Handle
+        id="target"
+        type="target"
+        position={Position.Left}
+        className="!h-2 !w-2 !border-surface-dark !bg-accent"
+      />
+      <Handle
+        id="source"
+        type="source"
+        position={Position.Right}
+        className="!h-2 !w-2 !border-surface-dark !bg-accent"
+      />
+      <NodeResizeHandle
+        minWidth={VIDEO_GEN_NODE_MIN_WIDTH}
+        minHeight={VIDEO_GEN_NODE_MIN_HEIGHT}
+        maxWidth={VIDEO_GEN_NODE_MAX_WIDTH}
+        maxHeight={VIDEO_GEN_NODE_MAX_HEIGHT}
+      />
+      {previewState &&
+        createPortal(
+          <>
+            <div className="fixed inset-0 z-[190]" onClick={() => setPreviewState(null)} />
+            <div
+              className="fixed z-[200] overflow-hidden rounded-lg border border-[rgba(255,255,255,0.16)] bg-black/60 shadow-2xl"
+              style={{
+                width: previewSize?.width ?? REFERENCE_PREVIEW_WIDTH,
+                height: previewSize?.height ?? REFERENCE_PREVIEW_ESTIMATED_HEIGHT,
+                left: resolvePreviewLeft(previewState.x, previewSize?.width ?? REFERENCE_PREVIEW_WIDTH),
+                top: resolvePreviewTop(previewState.y, previewSize?.height ?? REFERENCE_PREVIEW_ESTIMATED_HEIGHT),
+                transformOrigin: "left center",
+                animation: "reference-preview-pop 0.16s ease-out",
+              }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <img
+                src={previewState.url}
+                alt="参考图预览"
+                draggable={false}
+                className="h-full w-full object-contain"
+                onLoad={(event) => {
+                  const img = event.currentTarget;
+                  setPreviewSize(resolvePreviewDisplaySize(img.naturalWidth, img.naturalHeight));
+                }}
+              />
+            </div>
+            <style>{`@keyframes reference-preview-pop { from { transform: translateX(-12px) scaleX(0.75); opacity: 0; } to { transform: translateX(0) scaleX(1); opacity: 1; } }`}</style>
+          </>,
+          document.body,
+        )}
+    </div>
+  );
+});
+
+VideoGenNode.displayName = "VideoGenNode";

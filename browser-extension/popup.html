@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>LenTalk 素材捕手</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <span class="dot" id="status-dot"></span>
+      <span class="status" id="status-text">正在检测 LenTalk…</span>
+      <button class="ghost" id="rescan" title="重新扫描并重连">重新扫描</button>
+    </header>
+
+    <div class="toolbar">
+      <select id="category" title="存进哪个分类"></select>
+      <button class="ghost" id="select-all">全选</button>
+      <button class="ghost" id="select-none">清空</button>
+    </div>
+
+    <div class="filters" id="filters"></div>
+
+    <main class="grid" id="grid"></main>
+    <p class="empty" id="empty" hidden>这个页面上没有找到图片或直链视频。</p>
+
+    <div class="failures" id="failures" hidden></div>
+
+    <footer class="bar footer">
+      <span class="summary" id="summary">已选 0 项</span>
+      <button class="primary" id="import" disabled>入库</button>
+    </footer>
+
+    <p class="hint">点视频缩略图可直接预览播放（HLS 流同样支持）；在图片或视频上点右键，也能一键存进素材库。</p>
+
+    <div class="peek" id="peek" hidden>
+      <div class="peek-head">
+        <span class="peek-title" id="peek-title"></span>
+        <button class="ghost" id="peek-raw">原链</button>
+        <button class="ghost" id="peek-close">关闭</button>
+      </div>
+      <div class="peek-stage" id="peek-stage"></div>
+      <p class="peek-note" id="peek-note" hidden></p>
+    </div>
+
+    <!-- hls.js 只用于把 m3u8 清单逐段取回并喂给 MSE —— Chrome 的 <video> 原生不吃 HLS。
+         本地文件、无 eval/new Function，符合 MV3 的 CSP（不能用远程脚本）。 -->
+    <script src="vendor/hls.min.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

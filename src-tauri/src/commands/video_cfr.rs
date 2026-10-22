@@ -1,0 +1,602 @@
+//! 视频 CFR（恒定帧率）归一化。
+//!
+//! 背景：知鸟 AI(aliyun-video-superres) 等超分服务端对 VFR（可变帧率）源视频的
+//! 时间轴处理不当，会把整段视频按错误帧率重采样并插帧，导致输出被整体拉伸成
+//! 慢动作、时长变长、音画不同步（实测 14.02s/337 帧被拉到 25.02s/600 帧）。
+//!
+//! 本模块在超分上传前做一道保险：内置轻量 MP4 解析读取视频轨 stts 时间戳表，
+//! 判断是否 VFR；仅在 VFR 时调用随应用分发的 ffmpeg 转成 30fps CFR 临时文件，
+//! 供前端替换上传源。CFR 源 / 非 MP4 / 缺 ffmpeg 一律原路径返回，不阻塞主流程。
+
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+
+/// 归一化结果：`converted=true` 表示已转出 CFR 新文件（output_path 为新文件路径）；
+/// `converted=false` 表示无需转换（CFR / 非 MP4 / 缺 ffmpeg），output_path 保持源路径。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoCfrResult {
+    pub output_path: String,
+    pub converted: bool,
+    pub reason: Option<String>,
+}
+
+const PLAYBACK_FILE_PREFIX: &str = "lentalk-playback-";
+
+fn playback_temp_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{}{}.mp4",
+        PLAYBACK_FILE_PREFIX,
+        uuid::Uuid::new_v4()
+    ))
+}
+
+/// 把媒体来源统一成 ffmpeg 能直接吃的形式：`http(s)` 原样、`file://` 解码成本地路径、
+/// 其余非协议字符串按本地路径处理。
+///
+/// 同时供视频编辑（`video_edit::render_video_edit`）复用，避免两处各写一份解码逻辑。
+pub(crate) fn local_or_remote_video_source(source: &str) -> Option<String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(trimmed.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("file://") {
+        let decoded = urlencoding::decode(rest).ok()?;
+        #[cfg(target_os = "windows")]
+        let decoded = decoded.strip_prefix('/').unwrap_or(&decoded);
+        return Some(decoded.to_string());
+    }
+    if trimmed.contains("://") || trimmed.starts_with("data:") {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn run_ffmpeg_to_mp4(ffmpeg: &Path, input: &str, output: &Path) -> Result<(), String> {
+    let mut command = Command::new(ffmpeg);
+    hide_child_console(&mut command);
+    let status = command
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .arg("-i")
+        .arg(input)
+        // 影像轨可选：调用方也会在「时长已就绪但 videoWidth=0」时进来（HEVC 被 WebView2
+        // 静默丢轨）。若源本身就没有视频轨，不应在这里硬失败，产出一条纯音频代理即可。
+        .args(["-map", "0:v:0?", "-map", "0:a?"])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        ])
+        .args(["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"])
+        .arg(output)
+        .status()
+        .map_err(|error| format!("无法启动 ffmpeg: {error}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg 播放兼容转换失败 (exit: {status:?})"));
+    }
+    let empty_or_missing = output
+        .metadata()
+        .map(|meta| meta.len() == 0)
+        .unwrap_or(true);
+    if empty_or_missing {
+        return Err("ffmpeg 播放兼容转换未生成有效文件".to_string());
+    }
+    Ok(())
+}
+
+/// 为 WebView2 生成一个 H.264/AAC 播放代理。
+///
+/// MOV 容器本身不是问题，实际不稳定的通常是 HEVC、ProRes 或相机生成的时间轴。
+///
+/// 前端有两条触发路径，都只对**已经确认播不了**的素材生效，正常 MP4/MOV 不会额外转码：
+/// 1. 原生播放器触发 `error`；
+/// 2. 时长已解析、但 `videoWidth/videoHeight` 仍为 0 —— WebView2 遇到无解码器的视频轨
+///    （HEVC/H.265、ProRes）不报错，只把视频轨静默丢掉、声音照播，只能靠尺寸识别。
+#[tauri::command]
+pub async fn prepare_video_playback(
+    app: tauri::AppHandle,
+    source: String,
+) -> Result<String, String> {
+    // 整段转码是分钟级 CPU 活。非 async 的 Tauri 命令跑在**主线程**上，会把窗口
+    // 重绘和队列里所有 invoke 一起冻住；转到阻塞线程池（写法同 commands::thumbnail）。
+    tauri::async_runtime::spawn_blocking(move || prepare_video_playback_blocking(app, source))
+        .await
+        .map_err(|error| format!("准备播放文件失败: {error}"))?
+}
+
+fn prepare_video_playback_blocking(
+    app: tauri::AppHandle,
+    source: String,
+) -> Result<String, String> {
+    let input = local_or_remote_video_source(&source)
+        .ok_or_else(|| "不支持的视频来源，无法准备兼容播放文件".to_string())?;
+    if !input.starts_with("http://") && !input.starts_with("https://") && !Path::new(&input).is_file() {
+        return Err(format!("视频文件不存在: {input}"));
+    }
+    let ffmpeg = resolve_ffmpeg_path(&app)
+        .ok_or_else(|| "未找到 ffmpeg，无法转换视频播放格式".to_string())?;
+    let output = playback_temp_path();
+    if let Err(error) = run_ffmpeg_to_mp4(&ffmpeg, &input, &output) {
+        let _ = std::fs::remove_file(&output);
+        return Err(error);
+    }
+    Ok(output.to_string_lossy().to_string())
+}
+
+/// 删除由 `prepare_video_playback` 产生的临时文件，拒绝删除其它路径。
+#[tauri::command]
+pub fn remove_video_playback_file(path: String) -> Result<(), String> {
+    let target = PathBuf::from(path.trim());
+    let file_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "播放临时文件路径无效".to_string())?;
+    let expected_parent = std::env::temp_dir();
+    if target.parent() != Some(expected_parent.as_path())
+        || !file_name.starts_with(PLAYBACK_FILE_PREFIX)
+        || target.extension().and_then(|value| value.to_str()) != Some("mp4")
+    {
+        return Err("拒绝删除非 LenTalk 播放临时文件".to_string());
+    }
+    match std::fs::remove_file(&target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("删除播放临时文件失败: {error}")),
+    }
+}
+
+/// 用 FFmpeg 按时间点直接抽取一帧，返回 JPEG data URL。
+///
+/// 该路径不经过 WebView2 的视频解码器，特别适合 HEVC/ProRes MOV 和无法被 canvas
+/// 读取的远程视频。
+///
+/// 🔴 **`-ss` 必须放在 `-i` 之前**（输入侧 seek）。放在 `-i` 之后是输出侧 seek：
+/// ffmpeg 会从第 0 帧一路解码到目标时间点，截「最后一帧」等于把整段视频完整解码一遍
+/// —— 几分钟的 1080p 要等几十秒到几分钟，界面就一直停在「截图中…」。
+/// 输入侧 seek 会先跳到目标附近的关键帧再解到精确帧，耗时与视频总长无关。
+/// 精确性由 ffmpeg 默认开启的 `-accurate_seek` 保证。
+#[tauri::command]
+pub async fn extract_video_frame(
+    app: tauri::AppHandle,
+    source: String,
+    time_sec: f64,
+    max_width: Option<u32>,
+) -> Result<String, String> {
+    // 拖动进度条会连发这个命令，而 ffmpeg 抽帧是几百毫秒级的阻塞活。
+    // 放在主线程上等于把拖动过程变成「每帧都卡一下」。
+    tauri::async_runtime::spawn_blocking(move || {
+        extract_video_frame_blocking(app, source, time_sec, max_width)
+    })
+    .await
+    .map_err(|error| format!("抽取视频帧失败: {error}"))?
+}
+
+fn extract_video_frame_blocking(
+    app: tauri::AppHandle,
+    source: String,
+    time_sec: f64,
+    max_width: Option<u32>,
+) -> Result<String, String> {
+    use base64::Engine;
+
+    let input = local_or_remote_video_source(&source)
+        .ok_or_else(|| "不支持的视频来源，无法用 ffmpeg 抽帧".to_string())?;
+    if !input.starts_with("http://") && !input.starts_with("https://") && !Path::new(&input).is_file() {
+        return Err(format!("视频文件不存在: {input}"));
+    }
+    let ffmpeg = resolve_ffmpeg_path(&app)
+        .ok_or_else(|| "未找到 ffmpeg，无法抽取视频帧".to_string())?;
+    let bounded_time = if time_sec.is_finite() && time_sec > 0.0 {
+        time_sec
+    } else {
+        0.05
+    };
+    let mut command = Command::new(ffmpeg);
+    hide_child_console(&mut command);
+    // 顺序即为关键：-ss 在 -i 之前 = 输入侧快速 seek。
+    command
+        .args(["-hide_banner", "-loglevel", "error"])
+        .arg("-ss")
+        .arg(format!("{bounded_time:.6}"))
+        .arg("-i")
+        .arg(&input)
+        .args(["-frames:v", "1"]);
+    if let Some(width) = max_width.filter(|value| *value > 0) {
+        // 保持 max_width 的语义：小视频不被无意义地放大，宽视频才按比例缩小。
+        command.args([
+            "-vf",
+            &format!("scale={width}:-2:force_original_aspect_ratio=decrease"),
+        ]);
+    }
+    let output = command
+        .args(["-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1"])
+        .output()
+        .map_err(|error| format!("无法启动 ffmpeg: {error}"))?;
+    if !output.status.success() || output.stdout.is_empty() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "ffmpeg 抽帧失败".to_string()
+        } else {
+            format!("ffmpeg 抽帧失败: {detail}")
+        });
+    }
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(output.stdout)
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct Mp4Box {
+    box_type: [u8; 4],
+    body_start: u64,
+    body_size: u64,
+}
+
+fn read_u32(file: &mut File, offset: u64) -> std::io::Result<u32> {
+    let mut buf = [0u8; 4];
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut buf)?;
+    Ok(u32::from_be_bytes(buf))
+}
+
+fn read_u64(file: &mut File, offset: u64) -> std::io::Result<u64> {
+    let mut buf = [0u8; 8];
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut buf)?;
+    Ok(u64::from_be_bytes(buf))
+}
+
+/// 遍历一段范围内的顶层 box（ISO BMFF：ftyp / moov / mdat / free …）。
+fn list_boxes(file: &mut File, start: u64, end: u64) -> std::io::Result<Vec<Mp4Box>> {
+    let mut boxes = Vec::new();
+    let mut offset = start;
+    while offset + 8 <= end {
+        let size32 = read_u32(file, offset)?;
+        let mut box_type = [0u8; 4];
+        file.seek(SeekFrom::Start(offset + 4))?;
+        file.read_exact(&mut box_type)?;
+        let (header_size, body_size) = if size32 == 1 {
+            let large = read_u64(file, offset + 8)?;
+            (16u64, large.saturating_sub(16))
+        } else if size32 == 0 {
+            (8u64, end.saturating_sub(offset + 8))
+        } else {
+            (8u64, (size32 as u64).saturating_sub(8))
+        };
+        if body_size == 0 {
+            break;
+        }
+        boxes.push(Mp4Box {
+            box_type,
+            body_start: offset + header_size,
+            body_size,
+        });
+        offset += header_size + body_size;
+    }
+    Ok(boxes)
+}
+
+fn find_box<'a>(boxes: &'a [Mp4Box], box_type: &[u8; 4]) -> Option<&'a Mp4Box> {
+    boxes.iter().find(|item| &item.box_type == box_type)
+}
+
+/// 沿 moov → trak → mdia → minf → stbl 定位视频轨的 stts（解码时间戳表）。
+fn find_video_stts(file: &mut File, start: u64, end: u64) -> std::io::Result<Option<Mp4Box>> {
+    let tops = list_boxes(file, start, end)?;
+    let Some(moov) = find_box(&tops, b"moov") else {
+        return Ok(None);
+    };
+    let moov_end = moov.body_start + moov.body_size;
+    let traks = list_boxes(file, moov.body_start, moov_end)?;
+    for trak in traks.iter().filter(|item| &item.box_type == b"trak") {
+        let trak_end = trak.body_start + trak.body_size;
+        let trak_children = list_boxes(file, trak.body_start, trak_end)?;
+        let Some(mdia) = find_box(&trak_children, b"mdia") else {
+            continue;
+        };
+        let mdia_end = mdia.body_start + mdia.body_size;
+        let mdia_children = list_boxes(file, mdia.body_start, mdia_end)?;
+        // hdlr body: fullbox(4) + pre_defined(4) + handler_type(4)
+        let is_video = mdia_children
+            .iter()
+            .find(|item| &item.box_type == b"hdlr")
+            .map(|hdlr| {
+                read_u32(file, hdlr.body_start + 8)
+                    .map(|handler| handler == u32::from_be_bytes(*b"vide"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !is_video {
+            continue;
+        }
+        let Some(minf) = find_box(&mdia_children, b"minf") else {
+            continue;
+        };
+        let minf_end = minf.body_start + minf.body_size;
+        let minf_children = list_boxes(file, minf.body_start, minf_end)?;
+        let Some(stbl) = find_box(&minf_children, b"stbl") else {
+            continue;
+        };
+        let stbl_end = stbl.body_start + stbl.body_size;
+        let stbl_children = list_boxes(file, stbl.body_start, stbl_end)?;
+        if let Some(stts) = find_box(&stbl_children, b"stts") {
+            return Ok(Some(stts.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// 读取 stts 的 sample_delta 集合（run-length 编码，取每段 delta 值即可判断是否 VFR）。
+fn read_stts_deltas(file: &mut File, stts: &Mp4Box) -> std::io::Result<Vec<u32>> {
+    let mut deltas = Vec::new();
+    // stts body: fullbox(4) + entry_count(4) + entries(sample_count u32 + sample_delta u32)
+    let entry_count = read_u32(file, stts.body_start + 4)? as usize;
+    const MAX_ENTRIES: usize = 200_000;
+    for index in 0..entry_count.min(MAX_ENTRIES) {
+        let entry_offset = stts.body_start + 8 + (index as u64) * 8;
+        if entry_offset + 8 > stts.body_start + stts.body_size {
+            break;
+        }
+        let sample_delta = read_u32(file, entry_offset + 4)?;
+        deltas.push(sample_delta);
+    }
+    Ok(deltas)
+}
+
+/// VFR 判定：非零 delta 种类 > 1 即为可变帧率。
+fn deltas_are_vfr(deltas: &[u32]) -> bool {
+    let mut seen = HashSet::new();
+    for &delta in deltas {
+        if delta > 0 {
+            seen.insert(delta);
+        }
+    }
+    seen.len() > 1
+}
+
+/// Windows 上给子进程加 CREATE_NO_WINDOW。
+///
+/// Tauri 主进程以 `windows_subsystem = "windows"` 启动，本身没有控制台；不设置这个标志时
+/// 每启动一次 ffmpeg 都会**新建并弹出一个黑色命令行窗口**。转码/抽帧耗时越长，窗口挂得越久。
+pub(crate) fn hide_child_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
+fn ffmpeg_exe_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    }
+}
+
+/// 探查可执行文件时要试的后缀：Windows 需要显式带后缀，其他平台就是裸名。
+fn executable_suffixes() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &[".exe", ".cmd", ".bat"]
+    }
+    #[cfg(not(windows))]
+    {
+        &[""]
+    }
+}
+
+/// 在 `PATH` 里按顺序找第一个存在的可执行文件。用于复用用户自己装好的工具链。
+pub(crate) fn find_on_path(names: &[&str]) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let suffixes = executable_suffixes();
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for name in names {
+            for suffix in suffixes {
+                let candidate = dir.join(format!("{name}{suffix}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 用户系统里已安装的 ffmpeg。
+///
+/// macOS 上从 Finder / Dock 启动的 App 拿不到登录 shell 的 `PATH`（不含 Homebrew
+/// 的 `/opt/homebrew/bin`），所以 PATH 落空时再补查 Homebrew 的两个默认目录。
+/// 这一步是随包二进制缺失时的兜底：视频缩略图、CFR 归一化、视频编辑都依赖它。
+pub(crate) fn system_ffmpeg_path() -> Option<PathBuf> {
+    if let Some(path) = find_on_path(&["ffmpeg"]) {
+        return Some(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    for candidate in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+/// 定位 ffmpeg：随包资源目录 → 编译期清单目录（dev）→ 应用数据目录（Windows 按需下载）
+/// → 可执行文件同目录 → 系统已安装版本（PATH / Homebrew）。
+///
+/// 最后一档系统回退是必需的：开发预览与部分 macOS 安装包不带 ffmpeg 二进制，
+/// 之前只找随包路径，导致「未找到 ffmpeg」而整条视频链路不可用。
+/// 同时供视频缩略图抽帧（asset_library::extract_video_thumbnail）复用。
+pub(crate) fn resolve_ffmpeg_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let candidate = resource_dir.join("bin").join(ffmpeg_exe_name());
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("bin")
+        .join(ffmpeg_exe_name());
+    if manifest.is_file() {
+        return Some(manifest);
+    }
+    // Windows 安装包不再内置约 79MB 的 ffmpeg；扒剧本首次使用后会按需下载到
+    // 应用数据目录，视频超分与缩略图也应复用同一份二进制。
+    #[cfg(windows)]
+    if let Ok(app_data) = app.path().app_data_dir() {
+        let candidate = app_data.join("tools").join("ffmpeg").join(ffmpeg_exe_name());
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    // 已安装版 LenTalk 的按需下载目录：%LOCALAPPDATA%\LenTalk\bin\ffmpeg.exe。
+    // 开发预览和已安装版可能使用不同的 app_data_dir，显式兼容这个路径。
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let candidate = PathBuf::from(local_app_data)
+            .join("LenTalk")
+            .join("bin")
+            .join(ffmpeg_exe_name());
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("bin").join(ffmpeg_exe_name());
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    system_ffmpeg_path()
+}
+
+fn run_ffmpeg_normalize(ffmpeg: &Path, input: &Path, output: &Path) -> Result<(), String> {
+    let mut command = Command::new(ffmpeg);
+    hide_child_console(&mut command);
+    let status = command
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .arg("-i")
+        .arg(input)
+        .args(["-r", "30"])
+        .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"])
+        .args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"])
+        .arg(output)
+        .status()
+        .map_err(|error| format!("无法启动 ffmpeg: {error}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg 转码失败 (exit: {status:?})"));
+    }
+    let empty_or_missing = output
+        .metadata()
+        .map(|meta| meta.len() == 0)
+        .unwrap_or(true);
+    if empty_or_missing {
+        return Err("ffmpeg 输出文件缺失或为空".to_string());
+    }
+    Ok(())
+}
+
+/// 超分上传前的 CFR 归一化入口：VFR 源转 30fps CFR 临时文件，其余原样返回。
+#[tauri::command]
+pub async fn normalize_video_cfr(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<VideoCfrResult, String> {
+    // VFR → CFR 要整片重编码，绝不能占着主线程。
+    tauri::async_runtime::spawn_blocking(move || normalize_video_cfr_blocking(app, source_path))
+        .await
+        .map_err(|error| format!("视频帧率归一化失败: {error}"))?
+}
+
+fn normalize_video_cfr_blocking(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<VideoCfrResult, String> {
+    let unchanged = |reason: &str| VideoCfrResult {
+        output_path: source_path.clone(),
+        converted: false,
+        reason: Some(reason.to_string()),
+    };
+
+    let source = Path::new(&source_path);
+    if !source.is_file() {
+        return Ok(unchanged("源文件不存在"));
+    }
+    let extension = source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "mp4" && extension != "mov" && extension != "m4v" {
+        return Ok(unchanged("非 MP4/MOV 容器，跳过 CFR 归一化"));
+    }
+
+    let mut file = File::open(source).map_err(|error| format!("打开源视频失败: {error}"))?;
+    let file_len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|error| format!("读取文件长度失败: {error}"))?;
+    if file_len < 64 {
+        return Ok(unchanged("文件过小，无法解析"));
+    }
+    let stts = find_video_stts(&mut file, 0, file_len)
+        .map_err(|error| format!("解析视频结构失败: {error}"))?;
+    let Some(stts) = stts else {
+        return Ok(unchanged("未找到视频轨时间戳表(stts)"));
+    };
+    let deltas = read_stts_deltas(&mut file, &stts)
+        .map_err(|error| format!("读取时间戳表失败: {error}"))?;
+    if deltas.is_empty() {
+        return Ok(unchanged("时间戳表为空"));
+    }
+    if !deltas_are_vfr(&deltas) {
+        return Ok(unchanged("恒定帧率(CFR)，无需转换"));
+    }
+    let Some(ffmpeg) = resolve_ffmpeg_path(&app) else {
+        return Ok(unchanged("未找到 ffmpeg 可执行文件"));
+    };
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let output = std::env::temp_dir().join(format!("lentalk-cfr-{nanos}.mp4"));
+    run_ffmpeg_normalize(&ffmpeg, source, &output)?;
+
+    Ok(VideoCfrResult {
+        output_path: output.to_string_lossy().to_string(),
+        converted: true,
+        reason: None,
+    })
+}
+

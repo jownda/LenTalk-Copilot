@@ -1,0 +1,39 @@
+import {
+  DIAGNOSTIC_EN_RES, DIAGNOSTIC_ZH_RES, META_EN_RES, META_ZH_RES,
+} from "./lexicon";
+
+const EMPTY_SECTION_RE = /^(?:ACTIVE REFERENCES|SCENE MAP AND STAGING|LOCATION MAP|FIRST FRAME(?: AND SPATIAL BLOCKING)?|FORMAT MODE|OPTICS|CAMERA|PERFORMANCE|SHOT EXECUTION|PHYSICS|LIGHTING|AUDIO|POSITIVE CONSTRAINTS|NEGATIVE LOCKS(?: \(GLOBAL ONLY\))?|活动引用|场景地图和站位|位置图|首帧(?:与空间走位|与站位)?|格式模式|光学|相机|表演|镜头执行|物理|光线|音频|正向约束|负面局部锁)\s*[:：]?\s*$/i;
+
+function isProjectMetadata(line: string): boolean {
+  return META_ZH_RES.some((pattern) => pattern.test(line)) || META_EN_RES.some((pattern) => pattern.test(line));
+}
+
+function isDiagnosticMetadata(line: string): boolean {
+  return DIAGNOSTIC_ZH_RES.some((pattern) => pattern.test(line)) || DIAGNOSTIC_EN_RES.some((pattern) => pattern.test(line));
+}
+
+/**
+ * V2.5：最终提示词正文的统一净化出口。
+ * 只删除项目管理/诊断元数据与空分段，不改写用户的画面指令和资产引用。
+ */
+export function sanitizeDirectorText(text: string): string {
+  if (!text?.trim()) return "";
+
+  const kept = text
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .filter((line) => !isProjectMetadata(line) && !isDiagnosticMetadata(line));
+
+  const withoutEmptySections: string[] = [];
+  for (let index = 0; index < kept.length; index += 1) {
+    const line = kept[index].trim();
+    if (EMPTY_SECTION_RE.test(line)) {
+      let next = index + 1;
+      while (next < kept.length && !kept[next].trim()) next += 1;
+      if (next >= kept.length || EMPTY_SECTION_RE.test(kept[next].trim())) continue;
+    }
+    withoutEmptySections.push(kept[index]);
+  }
+
+  return withoutEmptySections.join("\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
