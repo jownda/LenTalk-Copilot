@@ -81,6 +81,8 @@ export interface RecommendedVideoConfig {
   referenceEncoding: 'data_url' | 'raw_base64' | 'url';
   transport:
     | 'sub2api-video'
+    /** Dramaya(video.dramaya.us): 提交 /v1/videos, 成片签名地址不带 Bearer 下载。 */
+    | 'dramaya-video'
     | 'binghuo-video'
     | 'wgspai-video'
     | 'zhiniao-video'
@@ -828,6 +830,52 @@ export const recommendedApis: RecommendedApi[] = [
       referenceImageField: 'image',
       referenceImageEncoding: 'data_url',
       imageTransport: 'auto',
+    },
+  },
+  {
+    id: 'dramaya',
+    name: 'Dramaya',
+    baseUrl: 'https://video.dramaya.us',
+    registerUrl: 'https://sub2api.dramaya.us/keys',
+    summary: '异步视频任务网关：Seedance 2.0 / 2.5 分渠道(A~F)、MiniMax H3、SD1.1 四个独立型号',
+    advantages: [
+      '提交 POST /v1/videos 后轮询 GET /v1/videos/{taskId}',
+      '时长按型号 4~15 秒 / 4~30 秒，分辨率与画幅逐型号不同',
+      '本地参考图自动上传 /v1/files 换 image_id(公网 URL 直接透传)',
+      '1 credit = 1 元，按秒(渠道 A / F / minimax-h3)或按条(B / C / E)计费',
+    ],
+    models: [],
+    // 文档 5.3 / 5.4 已发布的精确型号 ID。大小写与连字符都不能改
+    // (`seedance2.5-A` ≠ `Seedance2.5-A`), 平台按精确串路由。
+    videoModels: [
+      'seedance2.0-A',
+      'seedance2.5-A',
+      'seedance2.0-B',
+      'seedance2.0-fast-B',
+      'seedance2.5-720p-B',
+      'seedance2.0-720p-C',
+      'seedance2.5-720p-C',
+      'seedance2.0-720p-E',
+      'seedance2.0-F',
+      'seedance2.5-F',
+      'seedance2.0-F-720p',
+      'seedance2.0-fast-F-720p',
+      'minimax-h3',
+      'sd11-seedance-2.0',
+      'sd11-seedance-2.0-fast',
+      'sd11-seedance-2.0-mini',
+      'sd11-seedance-2.5',
+    ],
+    videoModelsRevision: 1,
+    videoConfig: {
+      submitPath: '/v1/videos',
+      queryPath: '/v1/videos/{taskId}',
+      // 公网 URL 直接进 image_urls; 本地素材由后端上传 /v1/files 换 image_id。
+      referenceEncoding: 'url',
+      transport: 'dramaya-video',
+    },
+    pricingRange: {
+      video: '¥0.16 ~ 45 / 次',
     },
   },
   {

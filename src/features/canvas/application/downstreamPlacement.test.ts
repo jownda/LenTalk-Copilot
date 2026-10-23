@@ -48,6 +48,23 @@ describe('findDownstreamPlacement', () => {
     expect(overlaps({ ...position, ...SIZE }, hugeGroup)).toBe(false);
   });
 
+  it('右边只是被挡住一小段时，落点仍在母节点附近（不绕远）', () => {
+    // 挡板只占住同列顶部 120px —— 下面完全空着，用户看到的就是「其实还有空间」。
+    // 具体是「同排跨过」还是「同列往下」不重要，重要的是**不许飞远**。
+    const blocker: PlacementRect = {
+      x: SOURCE.x + SOURCE.width + GAP,
+      y: SOURCE.y,
+      width: 200,
+      height: 120,
+    };
+    const position = findDownstreamPlacement({ source: SOURCE, size: SIZE, obstacles: [blocker] });
+    const candidate: PlacementRect = { ...position, ...SIZE };
+
+    expect(overlaps(candidate, blocker)).toBe(false);
+    expect(position.x - (SOURCE.x + SOURCE.width)).toBeLessThanOrEqual(SIZE.width + GAP);
+    expect(Math.abs(position.y - SOURCE.y)).toBeLessThanOrEqual(SIZE.height + GAP);
+  });
+
   it('同排右侧整列被占时，最多跨一列就找位置（不会一直往右漂）', () => {
     const blockers: PlacementRect[] = [0, 1, 2, 3, 4, 5, 6, 7, 8].map((index) => ({
       x: SOURCE.x + SOURCE.width + GAP,

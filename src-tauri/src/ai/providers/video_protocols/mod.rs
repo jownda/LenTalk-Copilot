@@ -16,6 +16,7 @@
 pub mod assets;
 pub mod ark;
 pub mod binghuo;
+pub mod dramaya;
 pub mod extract;
 pub mod media;
 pub mod kling;
@@ -40,7 +41,7 @@ use crate::ai::{
 /// **必须与前端 `tauriAiGateway.ts` 的 `needsCompatibilityVideoWorker` 保持一致**:
 /// 不在此列却交给后端的协议会被 `submit_video_task` 直接拒掉(一个请求都不发);
 /// 在此列却仍留在前端的协议则不会走后端。两边同时改。
-pub const BACKEND_VIDEO_TRANSPORTS: [&str; 11] = [
+pub const BACKEND_VIDEO_TRANSPORTS: [&str; 12] = [
     "openai-video",
     "zhiniao-video",
     "wgspai-video",
@@ -53,6 +54,9 @@ pub const BACKEND_VIDEO_TRANSPORTS: [&str; 11] = [
     // api666888(灵柯同源网关) 的两条链路: 本站 media 信封 + 火山方舟格式。
     "media-generate",
     "ark-anmiao",
+    // Dramaya(video.dramaya.us): 与 Sub2API 同族但字段口径不同(seconds /
+    // aspect_ratio / image_urls), 签名成片下载还不带 Bearer —— 单独一份实现。
+    "dramaya-video",
 ];
 
 /// 提交时会把 `transport` 写进元数据的协议 —— 轮询阶段据此路由到协议层。
@@ -66,7 +70,7 @@ pub const BACKEND_VIDEO_TRANSPORTS: [&str; 11] = [
 ///
 /// RunningHub 必须在此列: 它的业务错误包用 `errorCode` 而非 `error`, 且
 /// `status` 是**空串** —— 通用 `classify` 只会一直判"还在跑", 直到轮询窗口耗尽。
-const PROTOCOL_TRANSPORTS: [&str; 9] = [
+const PROTOCOL_TRANSPORTS: [&str; 10] = [
     "kling-control",
     "zhenjian-task-api",
     "zzdh-v8-video",
@@ -78,6 +82,7 @@ const PROTOCOL_TRANSPORTS: [&str; 9] = [
     // 方舟用 status + content.video_url, 都自己解析。
     "media-generate",
     "ark-anmiao",
+    "dramaya-video",
 ];
 
 pub fn is_backend_transport(transport: &str) -> bool {
@@ -219,7 +224,7 @@ pub fn poll_interval(transport: &str) -> Duration {
     match transport {
         // 知鸟官方口径中位 4~40 分钟、p90 55~75 分钟, 3s 粒度足够。
         "zhiniao-video" => Duration::from_secs(3),
-        "sub2api-video" => Duration::from_secs(4),
+        "sub2api-video" | "dramaya-video" => Duration::from_secs(4),
         // api666888 文档建议 3~5 秒一次; 方舟建议 5~10 秒, 取 6 秒。
         "media-generate" => Duration::from_secs(4),
         "ark-anmiao" => Duration::from_secs(6),
@@ -611,6 +616,7 @@ pub async fn poll(
         zhenjian::TRANSPORT => zhenjian::poll(ctx, metadata, handle).await,
         zzdh::TRANSPORT => zzdh::poll(ctx, metadata, handle).await,
         sub2api::TRANSPORT => sub2api::poll(ctx, metadata, handle).await,
+        dramaya::TRANSPORT => dramaya::poll(ctx, metadata, handle).await,
         kling::TRANSPORT => kling::poll(ctx, metadata, handle).await,
         // api666888: 两条链路的状态体都不是通用形状(is_final/state/result_url 与
         // status + content.video_url), 通用 classify 会把已完成的判成"还在跑"。

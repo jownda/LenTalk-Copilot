@@ -6,24 +6,15 @@
 // 区别仅是界面上只留模型选择，并把成功结果自动落到视频节点右侧的文本节点。
 // ---------------------------------------------------------------------------
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CircleAlert, LoaderCircle, Play, Square } from "lucide-react";
 
 import { UiButton, UiModal } from "@/components/ui/primitives";
-import { useCanvasStore } from "@/stores/canvasStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { CANVAS_NODE_TYPES, type CanvasNode } from "@/features/canvas/domain/canvasNodes";
-import {
-  cancelPajuben,
-  onPajubenFinish,
-  onPajubenLog,
-  onPajubenProgress,
-  probePajubenEnvironment,
-  readPajubenScript,
-  runPajuben,
-  type PajubenRunRequest,
-} from "@/commands/pajuben";
+import type { CanvasNode } from "@/features/canvas/domain/canvasNodes";
+import { cancelPajuben, probePajubenEnvironment, runPajuben, type PajubenRunRequest } from "@/commands/pajuben";
+import { isQuickRunActive, usePajubenQuickRuns } from "./pajubenQuickRuns";
 
 import {
   groupPajubenModelOptions,
@@ -39,25 +30,10 @@ import {
   resolvePajubenQualityPreset,
 } from "./pajubenQuality";
 
-/** 剧本正文节点的初始版面：文本节点默认 300×180，读整集剧本太挤。 */
-const SCRIPT_NODE_WIDTH = 460;
-const SCRIPT_NODE_HEIGHT = 420;
-
 /** `pajuben_run` 只负责拉起子进程，正常几百毫秒内回包；超时说明 Rust 侧没响应。 */
 const SPAWN_TIMEOUT_MS = 30_000;
 /** 首次补装 FFmpeg 要下载/安装，不能沿用普通拉起的 30 秒兜底。 */
 const FFMPEG_INSTALL_TIMEOUT_MS = 10 * 60_000;
-
-/**
- * 某些 OpenAI 兼容中转会静默丢弃 `input_audio`。模型会返回一段“请上传音频”
- * 的说明文字，进程却正常退出；这不是可用剧本，不能当成功结果落到画布。
- */
-function isAudioInputRejected(script: string): boolean {
-  const normalized = script.replace(/\s+/g, "");
-  return [/未收到.*音频/, /没有.*音频/, /未提供.*音频/, /请补充.*音频/, /无法.*(?:台词|听写|转写)/].some((pattern) =>
-    pattern.test(normalized),
-  );
-}
 
 const FIELD_CLASS =
   "h-9 w-full rounded-lg border border-border-dark bg-bg-dark px-3 text-sm text-text-dark outline-none transition-colors placeholder:text-text-muted focus:border-accent";
@@ -87,9 +63,6 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
   const setQualityTier = useSettingsStore((state) => state.setPajubenQualityTier);
   // 脏值/缺省由 resolve 兜底；档位同时决定 fps / 清晰度 / 每集帧数上限。
   const qualityPreset = useMemo(() => resolvePajubenQualityPreset(qualityTier), [qualityTier]);
-  const addNode = useCanvasStore((state) => state.addNode);
-  const addEdge = useCanvasStore((state) => state.addEdge);
-  const findNodePosition = useCanvasStore((state) => state.findNodePosition);
 
   const videoPath =
     typeof (node.data as { sourcePath?: unknown }).sourcePath === "string"
@@ -99,29 +72,20 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
   const episode = useMemo(() => guessEpisodeFromVideoName(videoPath), [videoPath]);
   const videoName = videoPath.split(/[\\/]/).pop() ?? videoPath;
 
-  const [running, setRunning] = useState(false);
-  const [percent, setPercent] = useState(0);
-  const [statusText, setStatusText] = useState("");
+  // 运行状态存在模块级登记表里，不随卡片卸载消失：关掉窗口后台继续跑，
+  // 重新点「扒视频」时从这里恢复进度。
+  const run = usePajubenQuickRuns((state) => state.runs[node.id]);
+  const startRun = usePajubenQuickRuns((state) => state.start);
+  const setRunStage = usePajubenQuickRuns((state) => state.setStage);
+  const bindRunId = usePajubenQuickRuns((state) => state.bindRunId);
+  const failRun = usePajubenQuickRuns((state) => state.fail);
+  const clearRun = usePajubenQuickRuns((state) => state.clear);
+  const running = isQuickRunActive(run);
+  const percent = run?.percent ?? 0;
+  const statusText = run?.statusText ?? "";
+  const startedAt = run?.startedAt ?? 0;
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
-  const runIdRef = useRef<string | null>(null);
-  /** 已经发出 runPajuben、但还没收到 finish —— 用来把「秒失败」的 finish 认领回来。 */
-  const armedRef = useRef(false);
-  /** finish 早于 runPajuben 回包时先存这里，拿到 runId 立刻补处理。 */
-  const pendingFinishRef = useRef<{ success: boolean; message: string } | null>(null);
-  /**
-   * 取出「先到一步」的 finish 并立即清空。
-   *
-   * 单独包一层是为了躲开 TS 的别名收窄：直接写
-   * `const queued = pendingFinishRef.current; if (queued) { ... }` 时，
-   * 上面那句 `pendingFinishRef.current = null` 会把整个后续流程里的
-   * `pendingFinishRef.current` 收窄成 `null`，`queued` 被判成 `never`。
-   */
-  const takePendingFinish = useCallback((): { success: boolean; message: string } | null => {
-    const pending = pendingFinishRef.current;
-    pendingFinishRef.current = null;
-    return pending;
-  }, []);
 
   const visionOption = useMemo(
     () => modelOptions.find((option) => option.key === visionKey) ?? null,
@@ -151,98 +115,42 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
   }, [audioKey, modelOptions, setAudioKey]);
 
   /**
-   * 扒完：把 `第N集.txt` 读回来，直接在视频节点右侧开一个文本节点。
+   * 状态翻转即收尾：
+   * - 成功 → 直接关卡片（剧本节点已由后台登记表落好，不需要卡片在场）；
+   * - 失败 → 把原因显示在卡片里，留在原地让用户改参数重试。
    *
-   * 刻意不走 finish 事件的 message —— 那里面只有落盘路径，整篇剧本几万字，
-   * 塞进事件负载会把 IPC 撑得很大；正文走 `pajuben_read_script` 单独取。
+   * 卡片关着的时候由 `pajubenQuickRuns` 自己落节点，这段只负责「开着的时候」的界面表现。
    */
-  const handleFinished = useCallback(
-    async (success: boolean, message: string) => {
-      runIdRef.current = null;
-      armedRef.current = false;
-      pendingFinishRef.current = null;
-      setRunning(false);
-      if (!success) {
-        setNotice(message);
-        return;
-      }
-      try {
-        const script = await readPajubenScript({ target: videoPath, episode });
-        if (isAudioInputRejected(script)) {
-          setNotice(
-            t(
-              "pajuben.quickAudioUnsupported",
-              "所选模型或渠道没有接收到视频音频，无法生成完整台词剧本。请改用支持音频输入/视频理解的模型后重试。",
-            ),
-          );
-          return;
-        }
-        const scriptNodeId = addNode(
-          CANVAS_NODE_TYPES.textAnnotation,
-          findNodePosition(node.id, SCRIPT_NODE_WIDTH, SCRIPT_NODE_HEIGHT),
-          {
-            displayName: t("pajuben.quickNodeName", "第 {{n}} 集 剧本", { n: episode }),
-            content: script,
-          },
-          { width: SCRIPT_NODE_WIDTH, height: SCRIPT_NODE_HEIGHT },
-        );
-        // 剧本节点用连线挂回来源视频：画布上多扒几条片子时，一眼能看出这份稿子
-        // 是从哪一条扒下来的（节点是按集号命名的，画布视频又几乎都是第 1 集）。
-        addEdge(node.id, scriptNodeId);
+  // 打开卡片那一刻的状态先记下来：若这单在后台已经跑完（succeeded），
+  // 说明用户是来「看结果」的，不能一开就自动关掉。
+  const [statusOnOpen] = useState(run?.status ?? null);
+  useEffect(() => {
+    if (!run) {
+      setNotice(null);
+      return;
+    }
+    if (run.status === "succeeded") {
+      if (statusOnOpen !== "succeeded") {
+        // 本卡片在场时跑完了：剧本节点已落好，收起卡片即可，登记一并清掉。
+        clearRun(node.id);
         onClose();
-      } catch (error) {
-        setNotice(error instanceof Error ? error.message : String(error));
       }
-    },
-    [addEdge, addNode, episode, findNodePosition, node.id, onClose, t, videoPath],
-  );
+      return;
+    }
+    setNotice(run.status === "failed" ? (run.notice ?? "") : null);
+  }, [clearRun, node.id, onClose, run, statusOnOpen]);
 
   useEffect(() => {
-    const pending = Promise.all([
-      onPajubenLog((payload) => {
-        if (!runIdRef.current || payload.runId !== runIdRef.current) return;
-        setStatusText(payload.line);
-      }),
-      onPajubenProgress((payload) => {
-        if (!runIdRef.current || payload.runId !== runIdRef.current) return;
-        if (payload.kind === "overall") {
-          const total = payload.total ?? 0;
-          if (total > 0) setPercent(Math.min(100, Math.round(((payload.done ?? 0) / total) * 100)));
-          return;
-        }
-        if (payload.kind === "episode" && typeof payload.percent === "number") {
-          setPercent(payload.percent);
-        }
-        if (payload.text) setStatusText(payload.text);
-      }),
-      onPajubenFinish((payload) => {
-        if (!armedRef.current) return;
-        if (!runIdRef.current) {
-          // runId 还没回包：引擎起手就失败（解释器/密钥/路径问题）时 finish 会先到，
-          // 丢掉它就等于让弹窗永久卡在「扒取中…」。
-          pendingFinishRef.current = { success: payload.success, message: payload.message };
-          return;
-        }
-        if (payload.runId !== runIdRef.current) return;
-        void handleFinished(payload.success, payload.message);
-      }),
-    ]);
-    return () => {
-      void pending.then((unlisteners) => unlisteners.forEach((unlisten) => unlisten()));
-    };
-  }, [handleFinished]);
-
-  useEffect(() => {
-    if (!running) {
+    if (!running || startedAt <= 0) {
       setElapsedSeconds(0);
       return;
     }
-    const startedAt = Date.now();
-    const timer = window.setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
-    }, 1_000);
+    // 从**登记表里的开始时间**算：关掉卡片再打开，等待秒数接着数，不归零。
+    const tick = () => setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+    tick();
+    const timer = window.setInterval(tick, 1_000);
     return () => window.clearInterval(timer);
-  }, [running]);
+  }, [running, startedAt]);
 
   const handleGenerate = useCallback(async () => {
     if (running) return;
@@ -281,26 +189,29 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
       return;
     }
     setNotice(null);
-    setPercent(0);
-    setStatusText(t("pajuben.quickPreparing", "正在准备视频和模型请求…"));
     setElapsedSeconds(0);
-    setRunning(true);
-    // 先武装再发命令：引擎起手就失败时 finish 事件可能早于 runPajuben 回包
-    armedRef.current = true;
-    pendingFinishRef.current = null;
+    // 登记「这一单」：卡片此后随时可以关，进度与收尾都在登记表里推进。
+    startRun({
+      nodeId: node.id,
+      videoPath,
+      episode,
+      statusText: t("pajuben.quickPreparing", "正在准备视频和模型请求…"),
+    });
     try {
-      setStatusText(t("pajuben.quickCheckingFfmpeg", "正在检查 FFmpeg…"));
+      setRunStage(node.id, t("pajuben.quickCheckingFfmpeg", "正在检查 FFmpeg…"));
       const environment = await probePajubenEnvironment();
       const needsFfmpegInstall = !environment.ffmpegDir;
       if (needsFfmpegInstall) {
-        setStatusText(
+        setRunStage(
+          node.id,
+          
           t(
             "pajuben.quickInstallingFfmpeg",
             "未检测到 FFmpeg，正在下载并自动安装；请保持网络连接，首次安装可能需要几分钟…",
           ),
         );
       } else {
-        setStatusText(t("pajuben.quickPreparing", "正在准备视频和模型请求…"));
+        setRunStage(node.id, t("pajuben.quickPreparing", "正在准备视频和模型请求…"));
       }
       const spawnRequest: PajubenRunRequest = {
         target: videoPath,
@@ -349,32 +260,44 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
           ),
         ),
       ]);
-      runIdRef.current = id;
-      // finish 早于回包时先补处理一次
-      const queued = takePendingFinish();
-      if (queued) {
-        void handleFinished(queued.success, queued.message);
-      }
+      // 绑定任务号。若 finish 已经先到（引擎起手就失败），登记表会自己认领这条记录，
+      // 这里绑定后状态会被收尾逻辑覆盖，不会卡在「扒取中…」。
+      bindRunId(node.id, id);
     } catch (error) {
-      armedRef.current = false;
-      setRunning(false);
-      setNotice(error instanceof Error ? error.message : String(error));
+      failRun(node.id, error instanceof Error ? error.message : String(error));
     }
-  }, [audioOption, canExtract, episode, qualityPreset, running, t, videoPath, visionOption]);
+  }, [
+    audioOption,
+    bindRunId,
+    canExtract,
+    episode,
+    failRun,
+    node.id,
+    qualityPreset,
+    running,
+    setRunStage,
+    startRun,
+    t,
+    videoPath,
+    visionOption,
+  ]);
 
   const handleCancel = useCallback(async () => {
     try {
       await cancelPajuben();
+      clearRun(node.id);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     }
-  }, []);
+  }, [clearRun, node.id]);
 
-  // 扒取过程中不允许关窗：监听器一卸，扒完的剧本就没人接、节点也落不下来
+  /**
+   * 关窗不再拦住运行：这一单跑在模块级登记表里，关掉卡片只是收起界面，
+   * 扒完照样落节点；再次点「扒视频」会从登记表恢复进度。
+   */
   const handleRequestClose = useCallback(() => {
-    if (running) return;
     onClose();
-  }, [onClose, running]);
+  }, [onClose]);
 
   return (
     <UiModal
@@ -384,7 +307,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
       widthClassName="w-[520px]"
       footer={
         <>
-          <UiButton type="button" variant="ghost" size="sm" disabled={running} onClick={handleRequestClose}>
+          <UiButton type="button" variant="ghost" size="sm" onClick={handleRequestClose}>
             {t("common.close", "关闭")}
           </UiButton>
           {running && (

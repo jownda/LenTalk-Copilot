@@ -22,7 +22,7 @@ import {
   type CinematicStudioNodeData,
 } from "@/features/canvas/domain/canvasNodes";
 import { resolveNodeDisplayName, isNodeUsingDefaultDisplayName } from "@/features/canvas/domain/nodeDisplay";
-import { resolveVideoNodeModelId } from "@/features/canvas/domain/videoNodeDefaults";
+import { resolveVideoNodeModelId, resolveVideoNodeParams } from "@/features/canvas/domain/videoNodeDefaults";
 import { resolveVideoDurationHintFromTexts } from "@/features/canvas/domain/videoDurationHint";
 import { applyVoiceReferenceFormat } from "@/features/canvas/domain/voiceReferenceFormat";
 import { getDefaultVideoModelId, getVideoModel } from "@/features/canvas/models";
@@ -532,11 +532,23 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         nextPrompt,
         ...(payload.durationHintSources ?? []),
       ]);
+      // 模型 / 画幅 / 分辨率**显式带过去**。
+      //
+      // 以前完全交给 `createDefaultData` 兜底，于是「上次用的模型解析不出来」时会退到
+      // 全局默认模型，那一档的默认分辨率往往是 720p —— 用户刚在视频节点上选的 480p
+      // 就被悄悄改回去了（线上反馈：知鸟 seedance-2-5-promo 选 480p，工作室发出的
+      // 节点还是 720p）。这里按**用户上次的模型**取一次参数，经
+      // `resolveVideoNodeParams` 校验后显式写入，链路不再依赖兜底模型的默认值。
+      const videoParams = resolveVideoNodeParams(getVideoModel(targetModelId), {
+        aspectRatio: settings.lastVideoAspectRatio,
+        resolution: settings.lastVideoResolution,
+      });
       const videoNodeId = addNode(CANVAS_NODE_TYPES.videoGen, placement, {
         prompt: nextPrompt,
-        // 模型 / 宽高比 / 分辨率不再写死: 交给 createDefaultData 沿用「上次使用」的配置
-        // (与 duration 的既有行为一致), 避免工作室发过去的节点还要重新选一遍。
-        // duration 只在文案写明秒数时才覆盖，否则同样沿用「上次使用」的值。
+        model: targetModelId,
+        aspectRatio: videoParams.aspectRatio,
+        resolution: videoParams.resolution,
+        // duration 只在文案写明秒数时才覆盖，否则沿用「上次使用」的值。
         ...(durationHint !== null ? { duration: durationHint } : {}),
         studioReferenceImages: payload.referenceImages,
         studioReferenceAudio: payload.referenceAudio,

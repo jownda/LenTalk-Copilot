@@ -1134,7 +1134,17 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       void showErrorDialog(message, t("common.error"));
       return;
     }
+    // 生成前把「这一单实际用的参数」全部记进 settings。
+    //
+    // 只记时长是不够的: `lastVideoModelId` 以前只有用户**手动拉动模型下拉**时才写,
+    // 节点是「提示词工作室」建出来的时候从来不写 —— 于是工作室下次建节点时
+    // `resolveVideoNodeModelId` 发现记忆为空, 退到全局默认模型, 连带分辨率/画幅都换成
+    // 那个模型的默认值(用户刚选的 480p 被改回 720p)。生成这一刻同步, 语义也正是
+    // 「上次使用」。
     setLastVideoDuration(selectedDuration);
+    setLastVideoModelId(selectedModel.id);
+    if (data.aspectRatio) setLastVideoAspectRatio(data.aspectRatio);
+    if (selectedVideoResolution) setLastVideoResolution(selectedVideoResolution);
     flushPromptCommit();
     // 上游文本节点的编辑同样是防抖提交的: 先补交欠账, 再从 store 现取一次。
     // 直接用 render 期的 inputText 会在「上游文本刚改完」时把上一版内容拼进提示词。
@@ -1379,7 +1389,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     selectedModel,
     selectedProfile,
     selectedVideoResolution,
+    setLastVideoAspectRatio,
     setLastVideoDuration,
+    setLastVideoModelId,
+    setLastVideoResolution,
     t,
     usableInputAudio,
     updateNodeData,

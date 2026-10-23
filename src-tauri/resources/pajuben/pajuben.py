@@ -1135,7 +1135,7 @@ def should_use_dual_fallback(error):
 
 # 双模型缓存的格式版本：拉片/合并提示词或产出结构一变就 +1，让旧缓存整体失效。
 # 否则改完提示词重跑，拿回来的还是上一版提示词写出来的稿子。
-DUAL_CACHE_VERSION = "v3"
+DUAL_CACHE_VERSION = "v6"
 
 
 def video_fingerprint(path):

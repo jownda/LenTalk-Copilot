@@ -54,7 +54,7 @@ export interface CustomApiCapabilities {
   videoQueryPath: string;
   videoReferenceEncoding: 'data_url' | 'raw_base64' | 'url' | 'multipart' | 'unknown';
   taskProtocol: 'generic' | 'unknown';
-  videoTransport?: 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model' | 'media-generate' | 'ark-anmiao';
+  videoTransport?: 'sub2api-video' | 'dramaya-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model' | 'media-generate' | 'ark-anmiao';
   /**
    * 按模型覆盖 `videoTransport`。
    *
@@ -79,6 +79,8 @@ export interface CustomApiCapabilities {
  */
 const VIDEO_TRANSPORT_SET: Record<NonNullable<CustomApiCapabilities['videoTransport']>, true> = {
   'sub2api-video': true,
+  // Dramaya(video.dramaya.us): 与 Sub2API 同族但字段口径不同。
+  'dramaya-video': true,
   'zzdh-v8-video': true,
   'binghuo-video': true,
   'wgspai-video': true,

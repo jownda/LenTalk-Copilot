@@ -7,7 +7,7 @@ import {
   RUNNINGHUB_QUERY_PATH,
 } from '@/commands/runningHubProtocol';
 
-export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model' | 'jimeng-cli' | 'wan-cli';
+export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'dramaya-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model' | 'jimeng-cli' | 'wan-cli';
 export type VideoProfileStatus = 'verified' | 'pending-adaptation';
 export type VideoReferenceTarget = 'data-url' | 'public-url' | 'platform-file';
 
@@ -157,6 +157,27 @@ const ZHINIAO_VIDEO_PROFILE: VideoModelProfile = {
   supportsReferenceAudio: true,
 };
 
+/**
+ * Dramaya(video.dramaya.us)视频链路。
+ *
+ * 与 Sub2API 同族但字段口径不同(见后端 `video_protocols/dramaya.rs`):
+ * 提交 `/v1/videos`、轮询 `/v1/videos/{taskId}`、成片 `/content`;
+ * 时长字段 `seconds`、画幅 `aspect_ratio`、参考图 `image_urls`(本地素材先传
+ * `/v1/files` 换 id)。参考音频文档也支持(reference_audio_urls), 但每型号上限不同,
+ * UI 只保证「可以选」, 实际是否被型号接受由平台判定。
+ */
+const DRAMAYA_VIDEO_PROFILE: VideoModelProfile = {
+  id: 'dramaya-video',
+  status: 'verified',
+  protocolLabel: 'Dramaya 异步视频 / 已验证',
+  submitPath: '/v1/videos',
+  queryPath: '/v1/videos/{taskId}',
+  referenceImageTarget: 'platform-file',
+  supportsReferenceImages: true,
+  supportsFirstLast: true,
+  supportsReferenceAudio: true,
+};
+
 const ZHENJIAN_TASK_PROFILE: VideoModelProfile = {
   id: 'zhenjian-task-api',
   status: 'verified',
@@ -231,6 +252,18 @@ function isRunningHubVideoProvider(provider: string, providerBaseUrl?: string): 
   return id === 'runninghub' || id === 'runninghub-cn' || isRunningHubBaseUrl(providerBaseUrl);
 }
 
+/**
+ * Dramaya 的识别。**必须按 Base URL 判, 并且排在 seedance 正则之前** ——
+ * 它的模型名全叫 `seedance2.0-A` / `seedance2.5-A`, 一旦落到通用 Seedance 档案,
+ * 节点页签会显示错协议、参考图/参考音频开关也跟着错。
+ */
+function isDramayaVideoProvider(provider: string, providerBaseUrl?: string): boolean {
+  if (provider === 'custom:dramaya') return true;
+  const baseUrl = providerBaseUrl?.trim().toLowerCase() ?? '';
+  if (!baseUrl) return false;
+  return /^(?:https?:\/\/)?video\.dramaya\.us(?:[/:]|$)/i.test(baseUrl);
+}
+
 export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: string): VideoModelProfile {
   if (modelId.startsWith('wan-cli/')) return wanCliVideoProfile;
   const provider = modelId.split('/')[0]?.trim().toLowerCase();
@@ -248,6 +281,7 @@ export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: stri
   }
   // 字子动画的识别必须同时看 id 与 Base URL: 用户自建平台时 id 常是中文「字子动画」,
   // 只认 'custom:zizidonghua' 会掉到通用 OpenAI Video 档案(节点页签显示错误的协议)。
+  if (isDramayaVideoProvider(provider, providerBaseUrl)) return DRAMAYA_VIDEO_PROFILE;
   if (isZzdhProvider(provider, providerBaseUrl)) return ZZDH_V8_VIDEO_PROFILE;
   if (isBinghuoVideoProvider(provider, providerBaseUrl)) return BINGHUO_VIDEO_PROFILE;
   if (provider === 'custom:wgspai') return WGSPAI_VIDEO_PROFILE;
@@ -262,6 +296,7 @@ export function getVideoModelProfile(profileId?: string): VideoModelProfile {
     'openai-video': OPENAI_VIDEO_PROFILE,
     'seedance-v2': SEEDANCE_V2_PROFILE,
     'sub2api-video': SUB2API_VIDEO_PROFILE,
+    'dramaya-video': DRAMAYA_VIDEO_PROFILE,
     'zzdh-v8-video': ZZDH_V8_VIDEO_PROFILE,
     'binghuo-video': BINGHUO_VIDEO_PROFILE,
     'wgspai-video': WGSPAI_VIDEO_PROFILE,

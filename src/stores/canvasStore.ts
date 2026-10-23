@@ -13,6 +13,7 @@ import {
   CANVAS_NODE_TYPES,
   DEFAULT_ASPECT_RATIO,
   DEFAULT_NODE_WIDTH,
+  DEFAULT_NODE_HEIGHT,
   EXPORT_RESULT_NODE_DEFAULT_WIDTH,
   EXPORT_RESULT_NODE_LAYOUT_HEIGHT,
   EXPORT_RESULT_NODE_MIN_HEIGHT,
@@ -38,6 +39,7 @@ import {
 import { EXPORT_RESULT_DISPLAY_NAME } from '@/features/canvas/domain/nodeDisplay';
 import { nodeCatalog } from '@/features/canvas/application/nodeCatalog';
 import { canvasNodeFactory } from '@/features/canvas/application/canvasServices';
+import { findDownstreamPlacement } from '@/features/canvas/application/downstreamPlacement';
 import { computeAutoLayout, computeAlignment, computeSmartSnapLayout } from '@/features/canvas/application/canvasLayout';
 import type { NodeAlignMode } from '@/features/canvas/application/canvasLayout';
 import {
@@ -1779,94 +1781,38 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       }
     }
 
-    const sourceWidth = sourceNode.measured?.width ?? DEFAULT_NODE_WIDTH;
-    // 下游节点采用稳定的“首个右侧、后续向下”布局:
-    // 1. 第一个下游节点与母节点顶边对齐, 右侧只留最小间距;
-    // 2. 第二个及后续节点与第一个下游节点左边对齐, 叠在末个下游节点下方, 只留最小间距;
-    // 3. 下方被占时, 改为与第一个下游节点顶边对齐、左侧回到默认最小位置, 只沿右侧避让。
-    // 这段优先于旧的环形搜索, 因而生成结果不会因为附近有节点而跳到较远位置。
-    const downstreamNodes = state.edges
+    const sourceSize = {
+      width: sourceNode.measured?.width ?? sourceNode.width ?? DEFAULT_NODE_WIDTH,
+      height: sourceNode.measured?.height ?? sourceNode.height ?? DEFAULT_NODE_HEIGHT,
+    };
+    // 顶层节点的落位交给纯函数 `findDownstreamPlacement`（有单测）：
+    // 先同排右侧 → 允许跨度内跨过矮挡板 → 同列往下 → 来源正下方。
+    //
+    // 这里替换掉的旧实现是「碰到挡板就推到挡板右缘 + 间距」，只要挡板是个宽东西
+    // （分组 / 分镜 / 工作室面板），新节点就被甩到很右边 —— 线上反馈正是
+    // 「右边只是被挡住了一点，其实还有空间，节点却生成到很远的地方」。
+    const rectOf = (node: CanvasNode) => ({
+      x: node.position.x,
+      y: node.position.y,
+      width: node.measured?.width ?? node.width ?? DEFAULT_NODE_WIDTH,
+      height: node.measured?.height ?? node.height ?? DEFAULT_NODE_HEIGHT,
+    });
+    // 组内子节点的坐标是**相对父组**的，不能当画布绝对坐标去碰撞。
+    const obstacles = state.nodes
+      .filter((node) => node.id !== sourceNodeId && !node.parentId)
+      .map(rectOf);
+    const downstreamRects = state.edges
       .filter((edge) => edge.source === sourceNodeId)
       .map((edge) => state.nodes.find((node) => node.id === edge.target))
-      .filter((node): node is CanvasNode => Boolean(node));
-    const getNodeSize = (node: CanvasNode) => ({
-      width: node.measured?.width ?? node.width ?? DEFAULT_NODE_WIDTH,
-      height: node.measured?.height ?? node.height ?? 200,
+      .filter((node): node is CanvasNode => Boolean(node) && !node?.parentId)
+      .map(rectOf);
+
+    return findDownstreamPlacement({
+      source: { ...sourceNode.position, ...sourceSize },
+      size: { width: newNodeWidth, height: newNodeHeight },
+      obstacles,
+      downstreamRects,
     });
-    const collidingNode = (x: number, y: number): CanvasNode | null => {
-      return (
-        state.nodes.find((node) => {
-          // 顶层下游节点的坐标是画布绝对坐标, 组内子节点则是相对父组坐标,
-          // 不能把后者误当成画布上的挡板。
-          if (node.id === sourceNodeId || node.parentId) {
-            return false;
-          }
-          const size = getNodeSize(node);
-          return (
-            x < node.position.x + size.width &&
-            x + newNodeWidth > node.position.x &&
-            y < node.position.y + size.height &&
-            y + newNodeHeight > node.position.y
-          );
-        }) ?? null
-      );
-    };
-    const resolveDownstreamPosition = (
-      initial: { x: number; y: number },
-      axis: "horizontal" | "vertical",
-      lockCrossAxis = false,
-    ) => {
-      let position = initial;
-      const visited = new Set<string>();
-      // 最多沿所有现有节点走一遍, 防止极端重叠数据造成死循环。
-      for (let index = 0; index <= state.nodes.length; index += 1) {
-        const blocker = collidingNode(position.x, position.y);
-        if (!blocker || visited.has(blocker.id)) {
-          return position;
-        }
-        visited.add(blocker.id);
-        const blockerSize = getNodeSize(blocker);
-        position =
-          axis === "horizontal"
-            ? {
-                x: blocker.position.x + blockerSize.width + DOWNSTREAM_ALIGNMENT_GAP,
-                y: lockCrossAxis ? position.y : blocker.position.y,
-              }
-            : {
-                x: lockCrossAxis ? position.x : blocker.position.x,
-                y: blocker.position.y + blockerSize.height + DOWNSTREAM_ALIGNMENT_GAP,
-              };
-      }
-      return position;
-    };
-
-    /** 默认最小左侧: 来源节点右缘 + 最小间距。 */
-    const defaultLeftX = sourceNode.position.x + sourceWidth + DOWNSTREAM_ALIGNMENT_GAP;
-
-    if (downstreamNodes.length === 0) {
-      return resolveDownstreamPosition({ x: defaultLeftX, y: sourceNode.position.y }, "horizontal");
-    }
-
-    const firstDownstream = downstreamNodes[0];
-    const lastDownstream = downstreamNodes[downstreamNodes.length - 1];
-    const lastSize = getNodeSize(lastDownstream);
-    // 默认: 接在最后一个下游节点下方, 左边缘与第一个下游节点对齐。
-    const belowLastDownstream = {
-      x: firstDownstream.position.x,
-      y: lastDownstream.position.y + lastSize.height + DOWNSTREAM_ALIGNMENT_GAP,
-    };
-    if (!collidingNode(belowLastDownstream.x, belowLastDownstream.y)) {
-      return belowLastDownstream;
-    }
-
-    // 下方被占: 改为与第一个下游节点顶边对齐、左侧回到默认最小位置,
-    // 只沿右侧避让(不再把对齐基准换成挡板, 免得结果被甩到远处)。
-    return resolveDownstreamPosition(
-      { x: defaultLeftX, y: firstDownstream.position.y },
-      "horizontal",
-      true,
-    );
-
   },
 
   addDerivedUploadNode: (sourceNodeId, imageUrl, aspectRatio, previewImageUrl) => {

@@ -37,6 +37,7 @@ describe("needsCompatibilityVideoWorker", () => {
       "zhenjian-task-api",
       "zzdh-v8-video",
       "sub2api-video",
+      "dramaya-video",
     ];
     for (const transport of remoteTransports) {
       expect(needsCompatibilityVideoWorker(withTransport("custom:relay/m", transport))).toBe(false);

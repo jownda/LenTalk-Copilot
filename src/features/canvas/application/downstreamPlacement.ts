@@ -64,7 +64,8 @@ function isFree(
  * 计算下游节点落点（画布绝对坐标）。候选顺序：
  * 1. 接在已有下游节点的最下方，左边与第一个下游对齐；
  * 2. 同排右侧（来源右缘 + 间距）；
- * 3. 同排向右跨过「挡板右缘未超出允许跨度」的障碍，逐格尝试；
+ * 3b. 同排向右跨过「挡板右缘未超出允许跨度」的障碍，逐格尝试（首选，保持横向流）；
+ * 3c. 挡板太宽不允许跨过，但同列下方还有空 → 在同一列往下让开；
  * 4. 同一列往下（每格 = 一个自身高度 + 间距）；
  * 5. 来源节点正下方，逐行往下；
  * 6. 兜底：右侧继续往外，保证不与已有内容重叠。
@@ -97,7 +98,7 @@ export function findDownstreamPlacement({
     return { x: leftX, y: source.y };
   }
 
-  // 3) 同排向右跨过挡板，但只在允许跨度内（跨度上限就是「不许乱飞」的闸门）
+  // 3b) 同排向右跨过挡板，但只在允许跨度内（跨度上限就是「不许乱飞」的闸门）
   const blockers = obstacles
     .filter(
       (rect) =>
@@ -115,6 +116,27 @@ export function findDownstreamPlacement({
       if (free(blocker.edge, y)) {
         return { x: blocker.edge, y };
       }
+    }
+  }
+
+  // 3c) 同列只是被挡了一小段，且挡板宽到不允许横向跨过 → 就地在同列往下让开。
+  //
+  // 线上反馈的正是这种图景：「右边不远处被挡住了一点，其实还有空间，节点却生成到
+  // 很远的地方」。旧实现一律横向推到挡板右侧，挡板一宽就飞了；这里先看「让开它底部
+  // 还有没有位置」，有就留在同一列，视觉上仍然是紧贴母节点右侧。
+  const columnBlockers = obstacles
+    .filter(
+      (rect) =>
+        rect.x < leftX + size.width &&
+        rect.x + rect.width > leftX &&
+        rect.y < source.y + size.height &&
+        rect.y + rect.height > source.y,
+    )
+    .sort((a, b) => a.y + a.height - (b.y + b.height));
+  for (const blocker of columnBlockers) {
+    const y = blocker.y + blocker.height + gap;
+    if (free(leftX, y)) {
+      return { x: leftX, y };
     }
   }
 

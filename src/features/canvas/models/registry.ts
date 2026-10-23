@@ -29,6 +29,7 @@ import {
 } from "@/features/settings/lingkeModels";
 import { createZhiniaoImagePricing, createZhiniaoVideoPricing, isZhiniaoProvider } from "./zhiniaoPricing";
 import { createWgspaiImagePricing, createWgspaiVideoPricing, isWgspaiProvider } from "./wgspaiPricing";
+import { createDramayaVideoPricing, isDramayaVideoBaseUrl, resolveDramayaVideoOptions } from "./dramayaModels";
 import {
   isMidjourneyImageModel,
   MIDJOURNEY_DEFAULT_EXTRA_PARAMS,
@@ -241,6 +242,11 @@ export function listVideoModels(): VideoModelDefinition[] {
         api.id.trim().toLowerCase() === "zhiniao" ||
         api.baseUrl.trim().toLowerCase().includes("cuai.token6688.com") ||
         api.baseUrl.trim().toLowerCase().includes("api.tokengo.love");
+      // Dramaya(video.dramaya.us): 时长/分辨率/画幅逐型号不同, 且价格与分辨率相关,
+      // 统一放在 models/dramayaModels.ts —— 这里只挂在同一个判定上。
+      const isDramaya =
+        api.id.trim().toLowerCase() === "dramaya" || isDramayaVideoBaseUrl(api.baseUrl);
+      const dramayaOptions = isDramaya ? resolveDramayaVideoOptions(model) : undefined;
       // RunningHub: 「模型」就是官方端点 ID(`kling-v3.0-pro/image-to-video`),
       // 每个端点的时长 / 画幅 / 分辨率枚举都不一样 —— 档位表只能按端点查官方目录。
       // `.cn` 与 `.ai` 是同一套协议, 一并识别。
@@ -293,7 +299,9 @@ export function listVideoModels(): VideoModelDefinition[] {
             )
           : ZZDH_VIDEO_DURATION_OPTIONS
         : undefined;
-      const resolutionValues = isSub2ApiSeedance
+      const resolutionValues = dramayaOptions?.resolutionValues.length
+        ? dramayaOptions.resolutionValues
+        : isSub2ApiSeedance
         ? normalizedModel === "seedance2.5"
           ? ["480p", "720p"]
           : ["480p", "720p", "1080p", "4k"]
@@ -311,7 +319,9 @@ export function listVideoModels(): VideoModelDefinition[] {
       // 字子动画画幅枚举只有 16:9 / 9:16 / 1:1(官方文档), 不要放 21:9 等超纲值。
       // WGSPAI 的白名单来自 `wgspaiProtocol`(seedance-v2 只认 9:16 / 16:9), 必须排在
       // 炳火前面 —— 两家现在是各自独立解析的, 顺序只影响可读性。
-      const aspectRatios = isSub2ApiSeedance
+      const aspectRatios = dramayaOptions
+        ? dramayaOptions.aspectRatios
+        : isSub2ApiSeedance
         ? ["16:9", "9:16"]
         : isZzdh
           ? [...ZZDH_ASPECT_RATIOS]
@@ -323,7 +333,9 @@ export function listVideoModels(): VideoModelDefinition[] {
               binghuoOptions?.aspectRatios ??
               CUSTOM_ASPECT_RATIOS);
       const durationOptions =
-        sub2ApiDuration !== undefined
+        dramayaOptions?.durationOptions.length
+          ? dramayaOptions.durationOptions
+          : sub2ApiDuration !== undefined
           ? [sub2ApiDuration]
           : runningHubOptions?.durationOptions.length
             ? runningHubOptions.durationOptions
@@ -359,6 +371,7 @@ export function listVideoModels(): VideoModelDefinition[] {
         // WGSPAI 的 seedance2.5 档位只有 [30], 落到通用的 5 会让下拉显示一个
         // 并不存在的选项。
         defaultDuration:
+          dramayaOptions?.defaultDuration ??
           sub2ApiDuration ??
           runningHubOptions?.durationOptions[0] ??
           api666888Options?.defaultDuration ??
@@ -1595,6 +1608,12 @@ function resolveCustomVideoPricing(apiName: string, apiBaseUrl: string, model: s
   if (isWgspaiProvider(apiName, apiBaseUrl)) {
     const wgspaiPricing = createWgspaiVideoPricing(model);
     if (wgspaiPricing) return wgspaiPricing;
+  }
+  // Dramaya: 按秒 / 按条两种计价, 且单价随分辨率变 —— 所以报价必须读 context.resolution。
+  // 查不到该分辨率的价就返回 null, 让 UI 显示「未知」, 不拿最低档冒充。
+  if (isDramayaVideoBaseUrl(apiBaseUrl) || apiName.trim().toLowerCase() === "dramaya") {
+    const dramayaPricing = createDramayaVideoPricing(model);
+    if (dramayaPricing) return dramayaPricing;
   }
   if (isBinghuo) {
     const price = BINGHUO_VIDEO_PRICES[normalized];

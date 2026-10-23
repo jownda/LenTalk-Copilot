@@ -2231,7 +2231,10 @@ const RUNNINGHUB_VIDEO_JOB_POLL_MS = 3_000;
  * `transient`, 那时 `error` 里只是诊断文本(`...查询失败(网络): ...`), 拿它的
  * 文本判终态会把仍在平台跑到一半的付费任务判死。
  */
-async function runRunningHubVideoViaBackendJob(request: GenerateVideoRequest): Promise<string> {
+async function runRunningHubVideoViaBackendJob(
+  request: GenerateVideoRequest,
+  platformLabel = "RunningHub",
+): Promise<string> {
   const jobId = await submitGenerateVideoJob(request);
   const deadline = Date.now() + RUNNINGHUB_VIDEO_JOB_WAIT_MS;
   // 提交接口返回时任务才刚排上, 立刻查必然是 running —— 先让出一轮再查。
@@ -2240,20 +2243,29 @@ async function runRunningHubVideoViaBackendJob(request: GenerateVideoRequest): P
     const status = await getGenerateVideoJob(jobId);
     if (status.status === "succeeded") {
       if (status.result) return status.result;
-      throw new Error("RunningHub 视频任务已完成, 但后端没有返回成片地址");
+      throw new Error(`${platformLabel} 视频任务已完成, 但后端没有返回成片地址`);
     }
     if (status.status === "failed") {
-      throw new Error(status.error ?? "RunningHub 视频生成失败");
+      throw new Error(status.error ?? `${platformLabel} 视频生成失败`);
     }
     if (status.status === "not_found") {
       // 本地任务记录丢了(例如应用被重装), 平台侧任务还在跑也无从续查。
-      throw new Error(`RunningHub 视频任务 ${jobId} 的本地记录已丢失, 无法续查结果`);
+      throw new Error(`${platformLabel} 视频任务 ${jobId} 的本地记录已丢失, 无法续查结果`);
     }
     await new Promise((resolve) => setTimeout(resolve, RUNNINGHUB_VIDEO_JOB_POLL_MS));
   }
   throw new Error(
-    "RunningHub 视频任务仍在生成中(已等待 60 分钟), 请稍后在画布上查看结果, 不要重复提交",
+    `${platformLabel} 视频任务仍在生成中(已等待 60 分钟), 请稍后在画布上查看结果, 不要重复提交`,
   );
+}
+
+/** Dramaya 视频站判定。只认正典域名, 图片站(img.dramaya.us)是另一套协议。 */
+function isDramayaVideoHost(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl.trim()).hostname.toLowerCase() === "video.dramaya.us";
+  } catch {
+    return false;
+  }
 }
 
 export async function generateVideo(request: GenerateVideoRequest): Promise<string> {
@@ -2284,6 +2296,12 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   // 只靠 transport 标记在极端情况下会漏, 加域名兜底不改变其它平台的分支顺序)。
   if (request.extra_params?.video_transport === "zzdh-v8-video" || isZzdhBaseUrl(baseUrl)) {
     return await generateZzdhVideo(request, baseUrl, apiModel, headers);
+  }
+  // Dramaya(video.dramaya.us): 幂等键、素材上传、签名成片下载都在 Rust 侧实现,
+  // 前端直发路径(重试生成 / 模板重跑)直接交给后端任务执行器, 不在这里抄第二份。
+  // Base URL 兜底: 用户手动添加平台时 capabilities.videoTransport 可能为空。
+  if (request.extra_params?.video_transport === "dramaya-video" || isDramayaVideoHost(baseUrl)) {
+    return await runRunningHubVideoViaBackendJob(request, "Dramaya");
   }
   if (request.extra_params?.video_transport === "sub2api-video") {
     return await generateSub2ApiVideo(request, baseUrl, apiModel, headers);

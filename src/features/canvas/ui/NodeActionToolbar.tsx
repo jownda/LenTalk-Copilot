@@ -18,6 +18,7 @@ import {
   Trash2,
   Unlink2,
   LayoutTemplate,
+  LoaderCircle,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -60,6 +61,7 @@ import {
 } from "@/features/templates/createTemplate";
 import { UiInput, UiTextArea } from "@/components/ui/primitives";
 import { PajubenQuickExtractDialog } from "@/features/pajuben/PajubenQuickExtractDialog";
+import { usePajubenQuickRuns } from "@/features/pajuben/pajubenQuickRuns";
 import { VideoEditDialog } from "./VideoEditDialog";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
 import {
@@ -267,6 +269,11 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
   // 「扒视频」：从视频节点直接跑一次最精简的扒剧本，结果落成右侧文本节点
   const [isScriptDialogOpen, setIsScriptDialogOpen] = useState(false);
+  // 扒取跑在模块级登记表里（关卡片不中断），所以按钮本身要能反映「后台正在跑」，
+  // 否则用户关了窗口就以为任务没了。只订阅百分比与状态，避免被日志行刷屏。
+  const quickRunStatus = usePajubenQuickRuns((state) => state.runs[node.id]?.status ?? null);
+  const quickRunPercent = usePajubenQuickRuns((state) => state.runs[node.id]?.percent ?? 0);
+  const quickRunActive = quickRunStatus === "preparing" || quickRunStatus === "running";
   // 「视频编辑」：剪辑 + 音轨处理，导出成新的视频节点（保留原片）
   const [isVideoEditDialogOpen, setIsVideoEditDialogOpen] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
@@ -921,10 +928,20 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                   // 一键扒剧本: 弹窗里只选模型, 扒完把剧本落成右侧文本节点。
                   setIsScriptDialogOpen(true);
                 }}
-                title={t("pajuben.quickTitle", "扒视频")}
+                title={
+                  quickRunActive
+                    ? t("pajuben.quickReopenHint", "扒取在后台继续，点击查看进度")
+                    : t("pajuben.quickTitle", "扒视频")
+                }
               >
-                <FileText className="h-3.5 w-3.5" />
-                {t("pajuben.quickTitle", "扒视频")}
+                {quickRunActive ? (
+                  <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <FileText className="h-3.5 w-3.5" />
+                )}
+                {quickRunActive
+                  ? t("pajuben.quickRunningShort", "扒取中 {{percent}}%", { percent: quickRunPercent })
+                  : t("pajuben.quickTitle", "扒视频")}
               </UiChipButton>
             )}
             {canUpscaleImage && (

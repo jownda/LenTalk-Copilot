@@ -25,6 +25,8 @@ export type CanvasNodeType = (typeof CANVAS_NODE_TYPES)[keyof typeof CANVAS_NODE
 export const DEFAULT_ASPECT_RATIO = "1:1";
 export const AUTO_REQUEST_ASPECT_RATIO = "auto";
 export const DEFAULT_NODE_WIDTH = 220;
+/** 测量值缺失时的兜底高度（与画布历史默认 200 一致）。 */
+export const DEFAULT_NODE_HEIGHT = 200;
 // AI 结果节点默认采用紧凑尺寸，避免连续生成时快速占满画布。
 export const EXPORT_RESULT_NODE_DEFAULT_WIDTH = 192;
 export const EXPORT_RESULT_NODE_LAYOUT_HEIGHT = 144;

@@ -344,6 +344,12 @@ impl OpenAICompatibleProvider {
         if video_protocols::sub2api::matches(transport, base_url, provider_id) {
             return video_protocols::sub2api::submit(&protocol_ctx, &request).await;
         }
+        // Dramaya 与 Sub2API 同族但字段口径不同(seconds / aspect_ratio / image_urls,
+        // 签名成片下载不带 Bearer), 必须单独分派。sub2api 的 matches 在 transport
+        // 为空时只认 RJM 域名, 不会抢走这里的请求。
+        if video_protocols::dramaya::matches(transport, base_url, provider_id) {
+            return video_protocols::dramaya::submit(&protocol_ctx, &request).await;
+        }
         if video_protocols::wgspai::matches(transport, base_url, provider_id) {
             return video_protocols::wgspai::submit(&protocol_ctx, &request).await;
         }
