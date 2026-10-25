@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import {
   MEDIA_NODE_FIT_MAX_EDGE,
   MEDIA_NODE_FIT_MIN_EDGE,
+  isMediaNodeBoxRatioMatching,
   isMediaNodeSizeSettled,
   resolveMediaNodeFitSize,
 } from './mediaNodeSizing';
@@ -67,5 +68,28 @@ describe('isMediaNodeSizeSettled: 1px 取整误差内视为已贴合', () => {
   it('缺失尺寸一律视为未贴合', () => {
     expect(isMediaNodeSizeSettled(null, { width: 171, height: 96 })).toBe(false);
     expect(isMediaNodeSizeSettled({ width: 171, height: 96 }, null)).toBe(false);
+  });
+});
+
+describe('isMediaNodeBoxRatioMatching: 判断用户拖出来的盒子比例对不对', () => {
+  it('同比例(只是大小不同)视为贴合', () => {
+    expect(isMediaNodeBoxRatioMatching({ width: 640, height: 360 }, 1920, 1080)).toBe(true);
+    expect(isMediaNodeBoxRatioMatching({ width: 96, height: 54 }, 1920, 1080)).toBe(true);
+  });
+
+  it('取整误差在 1% 以内仍算贴合', () => {
+    // 1280x720 缩到 171 宽 → 高度取整 96, 实际比例 1.781 vs 1.778
+    expect(isMediaNodeBoxRatioMatching({ width: 171, height: 96 }, 1280, 720)).toBe(true);
+  });
+
+  it('被拖歪的盒子判为不贴合', () => {
+    expect(isMediaNodeBoxRatioMatching({ width: 640, height: 480 }, 1920, 1080)).toBe(false);
+    expect(isMediaNodeBoxRatioMatching({ width: 200, height: 400 }, 1920, 1080)).toBe(false);
+  });
+
+  it('尺寸或媒体宽高缺失/非法时判为不贴合', () => {
+    expect(isMediaNodeBoxRatioMatching(null, 1920, 1080)).toBe(false);
+    expect(isMediaNodeBoxRatioMatching({ width: 0, height: 360 }, 1920, 1080)).toBe(false);
+    expect(isMediaNodeBoxRatioMatching({ width: 640, height: 360 }, 0, 1080)).toBe(false);
   });
 });

@@ -34,3 +34,20 @@ export interface VideoEditResult {
 export async function renderVideoEdit(request: VideoEditRequest): Promise<VideoEditResult> {
   return invoke<VideoEditResult>("render_video_edit", { request });
 }
+
+export interface VideoAudioProbeResult {
+  /** 源文件里是否有音频流。 */
+  hasAudio: boolean;
+  durationSec: number | null;
+}
+
+/**
+ * 探测视频有没有音频流。
+ *
+ * 「扒视频」用它提前决定链路：有音轨就走「视觉模型 + 音频模型」双模型，
+ * 没有音轨就只用视觉模型拉片（否则音频听写阶段必然报错，整条链路白跑）。
+ * 探测本身失败（ffmpeg 缺失、文件不可读）时抛错，调用方按「未知」处理、保持旧行为。
+ */
+export async function probeVideoAudio(sourcePath: string): Promise<VideoAudioProbeResult> {
+  return invoke<VideoAudioProbeResult>("probe_video_audio", { sourcePath });
+}

@@ -113,6 +113,8 @@ import { SelectedNodeOverlay } from "./ui/SelectedNodeOverlay";
 import { NodeToolDialog } from "./ui/NodeToolDialog";
 import { TextNodeEditDialogHost } from "./ui/TextNodeEditDialogHost";
 import { ImageViewerModal } from "./ui/ImageViewerModal";
+import { NodePropertiesDialog } from "./ui/NodePropertiesDialog";
+import type { UpstreamGenerationSource } from "./application/nodeProperties";
 import { VideoViewerModal } from "./ui/VideoViewerModal";
 import { saveMediaSourceWithDialog } from "./application/mediaDownload";
 import { shouldFailRunningVideoJob } from "./application/videoJobPolling";
@@ -260,6 +262,78 @@ function resolveContextMenuMedia(node: CanvasNode): { url: string; mediaType: "i
     (value): value is string => typeof value === "string" && value.trim().length > 0,
   );
   return url ? { url: url.trim(), mediaType: "image" } : null;
+}
+
+/** 会产出媒体结果的生成节点类型: 平台/模型/提示词都记在它们身上。 */
+const MEDIA_GENERATION_NODE_TYPES = new Set<string>([
+  CANVAS_NODE_TYPES.imageEdit,
+  CANVAS_NODE_TYPES.videoGen,
+  CANVAS_NODE_TYPES.audioGen,
+  CANVAS_NODE_TYPES.storyboardGen,
+  CANVAS_NODE_TYPES.motionControl,
+]);
+
+function hasGenerationSnapshot(data: Record<string, unknown>): boolean {
+  const request = data.generationRequest;
+  return Boolean(
+    (typeof request === "object" && request !== null) ||
+      typeof data.generationProviderId === "string" ||
+      typeof data.generationModel === "string" ||
+      typeof data.model === "string",
+  );
+}
+
+function toUpstreamSource(node: CanvasNode): UpstreamGenerationSource {
+  return {
+    nodeId: node.id,
+    nodeType: node.type ?? "",
+    data: node.data as unknown as Record<string, unknown>,
+  };
+}
+
+/**
+ * 沿连线往上找「生成这份媒体的那个节点」。
+ *
+ * 结果节点(exportImageNode / audioNode)只负责存媒体, 且生成完成时平台字段会被清空,
+ * 所以属性面板要回到上游生成节点取平台、模型、画幅与提示词。最多找 3 层, 兼顾
+ * 「生成节点 → 中转节点 → 结果节点」这类多跳结构。
+ */
+function resolveUpstreamGenerationNode(
+  node: CanvasNode,
+  nodes: CanvasNode[],
+  edges: CanvasEdge[],
+): UpstreamGenerationSource | null {
+  const nodeById = new Map(nodes.map((item) => [item.id, item]));
+  const visited = new Set<string>([node.id]);
+  let frontier = [node.id];
+
+  for (let depth = 0; depth < 3 && frontier.length > 0; depth += 1) {
+    const nextFrontier: string[] = [];
+    let snapshotFallback: CanvasNode | null = null;
+    for (const edge of edges) {
+      if (!frontier.includes(edge.target) || visited.has(edge.source)) {
+        continue;
+      }
+      const source = nodeById.get(edge.source);
+      if (!source) {
+        continue;
+      }
+      visited.add(source.id);
+      nextFrontier.push(source.id);
+      if (MEDIA_GENERATION_NODE_TYPES.has(source.type ?? "")) {
+        return toUpstreamSource(source);
+      }
+      // 上一层不是生成节点(例如中转的结果节点)时, 只要它还留着生成快照就先用它。
+      if (!snapshotFallback && hasGenerationSnapshot(source.data as Record<string, unknown>)) {
+        snapshotFallback = source;
+      }
+    }
+    if (snapshotFallback) {
+      return toUpstreamSource(snapshotFallback);
+    }
+    frontier = nextFrontier;
+  }
+  return null;
 }
 
 function resolveCanvasNodeAbsolutePosition(nodeId: string, nodeMap: Map<string, CanvasNode>): { x: number; y: number } {
@@ -913,6 +987,8 @@ export function Canvas() {
   const [showNodeMenu, setShowNodeMenu] = useState(false);
   const [isNodeManagerOpen, setIsNodeManagerOpen] = useState(true);
   const [videoViewerUrl, setVideoViewerUrl] = useState<string | null>(null);
+  /** 「节点属性」面板正在查看的节点;null 表示面板关闭。 */
+  const [propertiesNodeId, setPropertiesNodeId] = useState<string | null>(null);
   const [canvasContextMenu, setCanvasContextMenu] = useState<{
     position: { x: number; y: number };
     flowPosition: { x: number; y: number };
@@ -3235,6 +3311,16 @@ export function Canvas() {
     scheduleCanvasPersist(0);
   }, [deleteNodes, failedGenerationNodeIds, scheduleCanvasPersist]);
 
+  /** 打开「属性」面板: 右键命中的节点自带媒体时才可用(菜单里已按同一条件渲染)。 */
+  const handleContextShowProperties = useCallback(() => {
+    const targetNodeId = canvasContextMenu?.nodeId;
+    if (!targetNodeId) {
+      return;
+    }
+    setPropertiesNodeId(targetNodeId);
+    setCanvasContextMenu(null);
+  }, [canvasContextMenu?.nodeId]);
+
   /**
    * 右键落在多选里的某个节点上时，按整片选区处理（和 Ctrl+C / Ctrl+X 一致）；
    * 只选中了这一个（或右键的是选区外的节点）就只处理这一个。
@@ -4822,6 +4908,21 @@ export function Canvas() {
     [canvasContextMenu?.nodeId, nodes],
   );
 
+  // 属性面板的节点与媒体来源: 每次都按 id 现查,节点被删/撤销后自动收敛为关闭。
+  const propertiesNode = useMemo(
+    () => (propertiesNodeId ? (nodes.find((node) => node.id === propertiesNodeId) ?? null) : null),
+    [propertiesNodeId, nodes],
+  );
+  const propertiesMedia = useMemo(
+    () => (propertiesNode ? resolveContextMenuMedia(propertiesNode) : null),
+    [propertiesNode],
+  );
+  // 结果节点自身往往没有生成记录(完成时被清空), 平台/模型从上游生成节点读。
+  const propertiesUpstream = useMemo(
+    () => (propertiesNode ? resolveUpstreamGenerationNode(propertiesNode, nodes, edges) : null),
+    [edges, nodes, propertiesNode],
+  );
+
   return (
     <div
       ref={wrapperRef}
@@ -5132,10 +5233,19 @@ export function Canvas() {
           onPaste={handleContextPaste}
           onAddMediaToLibrary={handleAddMediaToLibrary}
           onDownloadMedia={handleContextDownloadMedia}
+          onShowProperties={handleContextShowProperties}
           onToggleGroupFrozen={handleContextToggleGroupFrozen}
           onClose={() => setCanvasContextMenu(null)}
         />
       )}
+
+      <NodePropertiesDialog
+        node={propertiesNode}
+        mediaKind={propertiesMedia?.mediaType ?? null}
+        mediaUrl={propertiesMedia?.url ?? null}
+        upstream={propertiesUpstream}
+        onClose={() => setPropertiesNodeId(null)}
+      />
 
       <NodeToolDialog />
 

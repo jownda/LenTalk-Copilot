@@ -4,6 +4,7 @@ import {
   ClipboardPaste,
   Copy,
   Download,
+  Info,
   Library,
   Lock,
   LockOpen,
@@ -37,6 +38,8 @@ interface CanvasContextMenuProps {
   onPaste: () => void;
   onAddMediaToLibrary: (url: string, mediaType: "image" | "video" | "audio", categoryId: string) => void;
   onDownloadMedia: (url: string, mediaType: "image" | "video" | "audio") => void;
+  /** 打开「节点属性」: 查看媒体本体参数与生成信息。仅媒体节点可用。 */
+  onShowProperties?: () => void;
   onToggleGroupFrozen: () => void;
   onClose: () => void;
 }
@@ -60,6 +63,7 @@ export function CanvasContextMenu({
   onPaste,
   onAddMediaToLibrary,
   onDownloadMedia,
+  onShowProperties,
   onToggleGroupFrozen,
   onClose,
 }: CanvasContextMenuProps) {
@@ -162,6 +166,18 @@ export function CanvasContextMenu({
       )}
 
       {(nodeId || (!imageUrl && failedNodeCount > 0)) && <div className="my-1 border-t border-border-dark/70" />}
+
+      {/* 属性: 只对带媒体的节点出现(上传图、生成结果图、音频/视频媒体节点)。 */}
+      {downloadUrl && downloadMediaType && onShowProperties && (
+        <button
+          type="button"
+          onClick={onShowProperties}
+          className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
+        >
+          <Info className="h-4 w-4 text-accent" />
+          <span>{t("canvas.contextMenu.properties", "属性")}</span>
+        </button>
+      )}
 
       {downloadUrl && downloadMediaType && (
         <button

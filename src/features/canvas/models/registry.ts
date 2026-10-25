@@ -1360,15 +1360,102 @@ function resolveBinghuoVideoOptions(model: string): {
 }
 
 /**
- * 字子动画视频按秒计价(来源: 平台 /api/pricing, `price_display_unit=second`)。
- * 2026-09-12 同步: H3 五档 + Kling Omni + doubao-seedance 全系 + wan3.0 + happyhorse。
+ * 字子动画视频按秒计价（来源: 平台 `GET /api/pricing`，`price_display_unit=second`、
+ * `quota_type=1`、`model_price` 即元/秒，`group_ratio` 为 1 所以无需再乘倍率）。
+ *
+ * **2026-10-23 全量重同步**（190 个在售模型，视频按秒 91 档）。这次几乎每个家族都动了价：
+ * - doubao-seedance-2 主系列大降：480p 0.49→0.35、720p 1.09→0.70、1080p 2.7→2.00；
+ * - fast / mini 系列降得更狠：fast-480p 0.40→0.155、mini-480p 0.25→0.075；
+ * - `-video-` 变体与「优惠版」也各自重算，优惠版 720p 0.60→0.35、1080p 1.20→0.50；
+ * - 新增 wan3.0 / wan3.0-prime 全档、wan2.7 全系、wan2.6 系列、wan2.2 两档、
+ *   kling-omni-4.0、seedance-2.5 全系、H3「限时优惠」系列（含对口型，0.04/0.06）、
+ *   以及字字自研的 3D / 世界模型；
+ * - 已下架并从表里移除：`zzdh-minimax-h3-4k`、`kling-v3-omni`、`kling-3.0-omni-*` 八档。
+ *
+ * 每个模型的档位都写在名字里，所以键必须与平台模型名完全一致（小写比较）。
+ * 平台按 token 计价的模型（`quota_type=0`，如 MiniMax-M2.5）没有元/秒定价，表里不收。
+ * 超分服务（「字字动画视频超分-*」）被 `isVideoUpscaleModelName` 过滤掉，也不收。
  */
 const ZZDH_VIDEO_PRICE_PER_SECOND: Record<string, number> = {
+  // ── MiniMax H3（标准档 + 限时优惠系列）─────────────────────────────────
   "zzdh-minimax-h3-480p": 0.06,
   "zzdh-minimax-h3-720p": 0.09,
   "zzdh-minimax-h3-1080p": 0.12,
   "zzdh-minimax-h3-2k": 0.16,
-  "zzdh-minimax-h3-4k": 0.24,
+  "zzdh-minimax-h3-限时优惠-文生-480p": 0.04,
+  "zzdh-minimax-h3-限时优惠-文生-768p": 0.06,
+  "zzdh-minimax-h3-限时优惠-首尾帧-480p": 0.04,
+  "zzdh-minimax-h3-限时优惠-首尾帧-768p": 0.06,
+  "zzdh-minimax-h3-限时优惠-对口型-480p": 0.04,
+  "zzdh-minimax-h3-限时优惠-对口型-768p": 0.06,
+  "zzdh-minimax-h3-限时优惠-多参考图生-480p": 0.04,
+  "zzdh-minimax-h3-限时优惠-多参考图生-768p": 0.06,
+  "zzdh-minimax-h3-限时优惠-多图多音频-480p": 0.04,
+  "zzdh-minimax-h3-限时优惠-多图多音频-768p": 0.06,
+  // ── 豆包 Seedance 2 / 2.5（含 -video- 与「优惠版」变体）──────────────────
+  "doubao-seedance-2-480p": 0.35,
+  "doubao-seedance-2-720p": 0.7,
+  "doubao-seedance-2-1080p": 2,
+  "doubao-seedance-2-4k": 5.56,
+  "doubao-seedance-2-video-480p": 0.35,
+  "doubao-seedance-2-video-720p": 0.7,
+  "doubao-seedance-2-video-1080p": 2,
+  "doubao-seedance-2-video-4k": 3.42,
+  "doubao-seedance-2-优惠版-720p": 0.42,
+  "doubao-seedance-2-优惠版-1080p": 0.7,
+  "doubao-seedance-2-video-优惠版-720p": 0.35,
+  "doubao-seedance-2-video-优惠版-1080p": 0.5,
+  "doubao-seedance-2-0-fast-480p": 0.155,
+  "doubao-seedance-2-0-fast-720p": 0.33,
+  "doubao-seedance-2-0-fast-video-480p": 0.155,
+  "doubao-seedance-2-0-fast-video-720p": 0.33,
+  "doubao-seedance-2-0-mini-480p": 0.075,
+  "doubao-seedance-2-0-mini-720p": 0.155,
+  "doubao-seedance-2-0-mini-video-480p": 0.075,
+  "doubao-seedance-2-0-mini-video-720p": 0.155,
+  "doubao-seedance-2-5-480p": 0.58,
+  "doubao-seedance-2-5-720p": 1.18,
+  "doubao-seedance-2-5-video-480p": 0.58,
+  "doubao-seedance-2-5-video-720p": 1.18,
+  "doubao-seedance-2-5-优惠版-720p": 0.72,
+  "doubao-seedance-2-5-优惠版-1080p": 1.2,
+  "doubao-seedance-2-5-video-优惠版-720p": 0.72,
+  "doubao-seedance-2-5-video-优惠版-1080p": 1.2,
+  "doubao-seedance-2.5-优惠版-720p": 0.72,
+  "doubao-seedance-2.5-优惠版-1080p": 1.2,
+  "doubao-seedance-2.5-video-优惠版-720p": 0.72,
+  "doubao-seedance-2.5-video-优惠版-1080p": 1.2,
+  "seedance-2.5-优惠版-720p": 0.72,
+  "seedance-2.5-优惠版-1080p": 1.2,
+  // ── 万相 wan3.0 / prime / wan2.7 / wan2.6 / wan2.2 ───────────────────
+  "wan3.0-t2v-480p": 0.15,
+  "wan3.0-t2v-720p": 0.32,
+  "wan3.0-t2v-1080p": 0.38,
+  "wan3.0-i2v-480p": 0.15,
+  "wan3.0-i2v-720p": 0.32,
+  "wan3.0-i2v-1080p": 0.38,
+  "wan3.0-r2v-480p": 0.15,
+  "wan3.0-r2v-720p": 0.32,
+  "wan3.0-r2v-1080p": 0.38,
+  "wan3.0-prime-t2v-480p": 0.33,
+  "wan3.0-prime-t2v-720p": 0.4,
+  "wan3.0-prime-t2v-1080p": 0.44,
+  "wan3.0-prime-i2v-480p": 0.33,
+  "wan3.0-prime-i2v-720p": 0.4,
+  "wan3.0-prime-i2v-1080p": 0.44,
+  "wan3.0-prime-r2v-480p": 0.33,
+  "wan3.0-prime-r2v-720p": 0.4,
+  "wan3.0-prime-r2v-1080p": 0.44,
+  "wan2.7-t2v": 0.72,
+  "wan2.7-i2v": 0.72,
+  "wan2.7-r2v": 0.72,
+  "wan2.7-videoedit": 0.72,
+  "wan2.6-i2v": 0.72,
+  "wan2.6-r2v": 0.72,
+  "wan2.6-i2v-flash": 0.18,
+  "wan2.2-i2v-plus": 0.168,
+  "wan2.2-kf2v-flash": 0.12,
+  // ── 快乐马 happyhorse 1.0（t2v / i2v / r2v / video-edit，两档同价）────
   "happyhorse-1.0-t2v-720p": 1.08,
   "happyhorse-1.0-t2v-1080p": 1.92,
   "happyhorse-1.0-i2v-720p": 1.08,
@@ -1377,37 +1464,12 @@ const ZZDH_VIDEO_PRICE_PER_SECOND: Record<string, number> = {
   "happyhorse-1.0-r2v-1080p": 1.92,
   "happyhorse-1.0-video-edit-720p": 1.08,
   "happyhorse-1.0-video-edit-1080p": 1.92,
-  "kling-v3-omni": 0.8,
-  "kling-3.0-omni-720p-noref-mute": 0.51,
-  "kling-3.0-omni-720p-noref-audio": 0.68,
-  "kling-3.0-omni-720p-ref-mute": 0.77,
-  "kling-3.0-omni-720p-ref-audio": 0.94,
-  "kling-3.0-omni-1080p-noref-mute": 0.68,
-  "kling-3.0-omni-1080p-noref-audio": 0.85,
-  "kling-3.0-omni-1080p-ref-mute": 1.19,
-  "kling-3.0-omni-1080p-ref-audio": 1.02,
-  "doubao-seedance-2-480p": 0.49,
-  "doubao-seedance-2-720p": 1.09,
-  "doubao-seedance-2-1080p": 2.7,
-  "doubao-seedance-2-4k": 5.56,
-  "doubao-seedance-2-0-fast-480p": 0.4,
-  "doubao-seedance-2-0-fast-720p": 0.88,
-  "doubao-seedance-2-0-mini-480p": 0.25,
-  "doubao-seedance-2-0-mini-720p": 0.55,
-  "doubao-seedance-2-5-480p": 0.84,
-  "doubao-seedance-2-5-720p": 1.81,
-  "doubao-seedance-2-video-480p": 0.3,
-  "doubao-seedance-2-video-720p": 0.67,
-  "doubao-seedance-2-video-1080p": 1.66,
-  "doubao-seedance-2-video-4k": 3.42,
-  "doubao-seedance-2-0-fast-video-480p": 0.24,
-  "doubao-seedance-2-0-fast-video-720p": 0.52,
-  "doubao-seedance-2-0-mini-video-480p": 0.15,
-  "doubao-seedance-2-0-mini-video-720p": 0.33,
-  "doubao-seedance-2-5-video-480p": 0.51,
-  "doubao-seedance-2-5-video-720p": 1.09,
-  "doubao-seedance-2-video-优惠版-720p": 0.6,
-  "doubao-seedance-2-video-优惠版-1080p": 1.2,
+  // ── 可灵 / 字字自研 ────────────────────────────────────────────────
+  "kling-omni-4.0": 0.18,
+  "字字3d": 10,
+  "字字3d-flash": 5,
+  "字字世界模型": 20,
+  "字字世界模型pro": 35,
 };
 
 type BinghuoVideoPrice =
@@ -1528,18 +1590,41 @@ const BINGHUO_IMAGE_PRICES: Record<string, number> = {
   midjourney: 0.056,
 };
 
-/** 字子动画图片按次计价(来源: 平台 /api/pricing, `price_display_unit=call`)。 */
+/**
+ * 字子动画图片按次计价（来源: 平台 `GET /api/pricing`，`price_display_unit=call`，
+ * `model_price` 即元/张）。
+ *
+ * **2026-10-23 重同步**：新增 seedream-5.0 / omni-image-2.5 / Omni-Nano 系列；
+ * `qwen-image-edit-max`、`qwen-image-max` 平台已下架，随之下线（宁可不显示价，也不留旧价）。
+ * `Omni-Nano-pro-vip-1K/2K` 是 token 计价（`quota_type=0`），没有按次固定价，不收。
+ * `wan2.6-image` / `wan2.7-image` 平台标的是 `second`，但图片节点按一次请求计价，
+ * 这里仍按单张（0.24）记 —— 与节点右上角显示的口径一致。
+ */
 const ZZDH_IMAGE_PRICES: Record<string, number> = {
+  // ── 通义千问 ────────────────────────────────────────────────────────
   "qwen-image-2.0": 0.24,
   "qwen-image-2.0-pro": 0.6,
   "qwen-image-3.0": 0.21,
   "qwen-image-3.0-pro-1k": 0.3,
   "qwen-image-3.0-pro-2k": 0.6,
-  "qwen-image-edit-max": 0.6,
-  "qwen-image-max": 0.6,
+  // ── Omni / Nano ────────────────────────────────────────────────────
+  "omni-image2": 0.05,
+  "omni-image2-pro": 0.2,
+  "omni-image-2.5-flare": 0.08,
+  "omni-image-2.5-flare-stable": 0.12,
+  "omni-image-2.5-sunburst": 0.08,
+  "omni-image-2.5-sunburst-stable": 0.12,
+  "omni-nano": 0.2,
+  "omni-nano-2.1": 0.2,
+  "omni-nano-pro": 0.5,
+  "omni-nano-pro-1k": 0.5,
+  "omni-nano-pro-2k": 0.5,
+  // ── 豆包 / 万相 / 其它 ──────────────────────────────────────────────
+  "doubao-seedream-5-0-260128": 0.2,
   "z-image-turbo": 0.12,
   zimage: 1,
   "wan2.6-image": 0.24,
+  "wan2.6-t2i": 0.24,
   "wan2.7-image": 0.24,
 };
 

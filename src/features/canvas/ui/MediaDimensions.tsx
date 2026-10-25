@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 
+import { formatByteSize } from '@/features/canvas/application/mediaFormat';
+
 export interface MediaDimensions {
   width: number;
   height: number;
@@ -65,19 +67,8 @@ export function formatMediaDimensions(dimensions: MediaDimensions | null): strin
 
 /** 把字节数格式化成便于阅读的体积文本, 例如 `1.2 MB` / `356 KB`。 */
 export function formatMediaByteSize(bytes: number | null | undefined): string | null {
-  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) {
-    return null;
-  }
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let value = bytes;
-  let unitIndex = 0;
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
-    unitIndex += 1;
-  }
-  // B 与 KB 不带小数, 更大的单位保留一位, 避免出现 `1024.0 KB` 这类冗余精度。
-  const rounded = unitIndex <= 1 ? Math.round(value) : Math.round(value * 10) / 10;
-  return `${rounded} ${units[unitIndex]}`;
+  // 与「节点属性」面板共用同一实现, 避免同一张图在两处显示成不同数值。
+  return formatByteSize(bytes);
 }
 
 /**

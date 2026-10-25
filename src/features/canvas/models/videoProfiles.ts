@@ -7,7 +7,7 @@ import {
   RUNNINGHUB_QUERY_PATH,
 } from '@/commands/runningHubProtocol';
 
-export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'dramaya-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model' | 'jimeng-cli' | 'wan-cli';
+export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'dramaya-video' | 'likeai-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model' | 'jimeng-cli' | 'wan-cli';
 export type VideoProfileStatus = 'verified' | 'pending-adaptation';
 export type VideoReferenceTarget = 'data-url' | 'public-url' | 'platform-file';
 
@@ -178,6 +178,30 @@ const DRAMAYA_VIDEO_PROFILE: VideoModelProfile = {
   supportsReferenceAudio: true,
 };
 
+/**
+ * likeai520(api.likeai520.cc)Seedance 独立视频分组。
+ *
+ * 外形与 Sub2API / Dramaya 同族, 但字段与素材语义是 Seedance 的(见后端
+ * `video_protocols/likeai.rs`): 提交 `/v1/videos`、轮询 `/v1/videos/{taskId}`、
+ * 成片走受保护的 `/content` 固定接口; 时长 `duration`、画幅 `ratio`、
+ * 素材走 `content` 数组(角色 first_frame / last_frame / reference_image)。
+ *
+ * 参考素材是 `public-url`: 站点**没有上传接口**, 文档要求素材必须是上游可读的
+ * HTTPS 地址 —— 本机素材要么先在平台设置里配图床换 URL, 要么后端会直接给出
+ * 「必须是公网 HTTPS」的可行动报错, 不会把 data URL 硬塞进去换个看不懂的 400。
+ */
+const LIKEAI_VIDEO_PROFILE: VideoModelProfile = {
+  id: 'likeai-video',
+  status: 'verified',
+  protocolLabel: 'likeai520 Seedance 视频 / 已验证',
+  submitPath: '/v1/videos',
+  queryPath: '/v1/videos/{taskId}',
+  referenceImageTarget: 'public-url',
+  supportsReferenceImages: true,
+  supportsFirstLast: true,
+  supportsReferenceAudio: true,
+};
+
 const ZHENJIAN_TASK_PROFILE: VideoModelProfile = {
   id: 'zhenjian-task-api',
   status: 'verified',
@@ -264,6 +288,18 @@ function isDramayaVideoProvider(provider: string, providerBaseUrl?: string): boo
   return /^(?:https?:\/\/)?video\.dramaya\.us(?:[/:]|$)/i.test(baseUrl);
 }
 
+/**
+ * likeai520 的识别。同样**按 Base URL 判**: 推荐卡片连上后平台 id 由名称生成
+ * (`custom:likeai520`), 用户也可能自建「知鸟/中转」之类的中文 id。文档站
+ * `www.likeai520.cc` 一并认出来 —— 误填成文档站时能显示正确协议页签。
+ */
+function isLikeaiVideoProvider(provider: string, providerBaseUrl?: string): boolean {
+  if (provider === 'custom:likeai520') return true;
+  const baseUrl = providerBaseUrl?.trim().toLowerCase() ?? '';
+  if (!baseUrl) return false;
+  return /^(?:https?:\/\/)?(?:api\.|www\.)?likeai520\.cc(?:[/:]|$)/i.test(baseUrl);
+}
+
 export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: string): VideoModelProfile {
   if (modelId.startsWith('wan-cli/')) return wanCliVideoProfile;
   const provider = modelId.split('/')[0]?.trim().toLowerCase();
@@ -282,6 +318,7 @@ export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: stri
   // 字子动画的识别必须同时看 id 与 Base URL: 用户自建平台时 id 常是中文「字子动画」,
   // 只认 'custom:zizidonghua' 会掉到通用 OpenAI Video 档案(节点页签显示错误的协议)。
   if (isDramayaVideoProvider(provider, providerBaseUrl)) return DRAMAYA_VIDEO_PROFILE;
+  if (isLikeaiVideoProvider(provider, providerBaseUrl)) return LIKEAI_VIDEO_PROFILE;
   if (isZzdhProvider(provider, providerBaseUrl)) return ZZDH_V8_VIDEO_PROFILE;
   if (isBinghuoVideoProvider(provider, providerBaseUrl)) return BINGHUO_VIDEO_PROFILE;
   if (provider === 'custom:wgspai') return WGSPAI_VIDEO_PROFILE;
@@ -297,6 +334,7 @@ export function getVideoModelProfile(profileId?: string): VideoModelProfile {
     'seedance-v2': SEEDANCE_V2_PROFILE,
     'sub2api-video': SUB2API_VIDEO_PROFILE,
     'dramaya-video': DRAMAYA_VIDEO_PROFILE,
+    'likeai-video': LIKEAI_VIDEO_PROFILE,
     'zzdh-v8-video': ZZDH_V8_VIDEO_PROFILE,
     'binghuo-video': BINGHUO_VIDEO_PROFILE,
     'wgspai-video': WGSPAI_VIDEO_PROFILE,

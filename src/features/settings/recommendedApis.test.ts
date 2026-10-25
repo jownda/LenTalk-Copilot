@@ -156,6 +156,21 @@ describe('字子动画 推荐平台', () => {
   });
 });
 
+describe('likeai520 推荐条目', () => {
+  const likeai = recommendedApis.find((api) => api.id === 'likeai520');
+
+  it('注册链接带返利参数 aff', () => {
+    expect(likeai).toBeDefined();
+    expect(likeai?.registerUrl).toBe('https://www.likeai520.cc/register?aff=8AHYKY8NW3K8');
+    // 不能退化成裸首页: 那样新用户进去找不到注册入口
+    expect(likeai?.registerUrl).toContain('/register?aff=');
+  });
+
+  it('Base URL 指到 API 域, 与注册站分开', () => {
+    expect(likeai?.baseUrl).toBe('https://api.likeai520.cc');
+  });
+});
+
 describe('炳火 API 推荐平台', () => {
   const binghuo = recommendedApis.find((api) => api.id === 'binghuo');
 
@@ -321,6 +336,8 @@ describe('推荐平台可见白名单(密钥页展示内置推荐平台)', () =>
     expect(listVisibleRecommendedApis().map((api) => api.id)).toEqual([
       'zhiniao',
       'binghuo',
+      // likeai520: Seedance 独立视频分组(/v1/videos + content 数组素材)。
+      'likeai520',
       'runninghub',
       'runninghub-cn',
       'modelscope',
@@ -535,6 +552,9 @@ describe('推荐平台的余额查询声明', () => {
       modelscope: null,
       // api666888 有 /v1/skills/balance, 但尚未接入余额查询, 先不声明。
       api666888: null,
+      // likeai520 的额度走站内账本(视频按次/按秒/按 Token 结算), 没有可查的
+      // OpenAI 风格 billing 端点 —— 不猜一个数字出来。
+      likeai520: null,
     });
   });
 });

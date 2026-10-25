@@ -219,21 +219,55 @@ def vision_messages(frames, ep, known_roles, batch_no=1, batch_total=1):
     return [{"role": "user", "content": content}]
 
 
-def merge_prompt(ep, transcript, vision, known_roles):
-    return f"""你是短剧剧本整理师。把同一集的音频听写和画面拉片按时间戳严格对齐，整理为标准拉片剧本。
-
-硬性要求：
-- 台词、旁白和内心独白以音频听写为准，不能删减或改写含义。
+def merge_prompt(ep, transcript, vision, known_roles, has_audio=True):
+    # 无音轨的片子（AI 生成素材、渲染动画、纯画面录屏）没有可对齐的听写稿，
+    # 只剩画面一条证据链。提示词必须换一套规矩，否则模型会照着示例硬编台词 ——
+    # 那比「没有台词」更糟：观众会以为是原片对白。
+    if has_audio:
+        intro = "你是短剧剧本整理师。把同一集的音频听写和画面拉片按时间戳严格对齐，整理为标准拉片剧本。"
+        rule_lines = """- 台词、旁白和内心独白以音频听写为准，不能删减或改写含义。
 - 场景、动作、表情和人物反应以画面拉片为准，不能脑补。
 - 响度明显或推动剧情的音效（关门、脚步、打斗、雨声、电话铃声、音乐起落）写进对应△的
-  “音效：”后缀里；没有就省略，不要凭空添加。
+  “音效：”后缀里；没有就省略，不要凭空添加。"""
+        sources_block = f"""【音频听写】
+{transcript}
+
+【画面拉片】
+{vision}"""
+        sample_lines = """△【00:00】起镜，景别：全景｜动作、表情和反应。音效：关门声
+角色名：台词
+△【00:07】切镜，景别：中景｜动作、表情和反应。
+角色名：台词
+角色名（VO）：旁白
+角色名（OS）：内心独白"""
+        sample_tail = "角色名：台词"
+        voice_note = "只闻其声、从未出镜的角色（画外音/旁白）\n  不写进「人物形象」，只在台词处标 VO/OS。"
+    else:
+        intro = ("你是短剧剧本整理师。这一集只有画面拉片、没有任何声音素材，"
+                 "请依据画面整理为标准拉片剧本（无对白版）。")
+        rule_lines = """- 本片没有音轨，听不到任何台词、旁白与音效：**不得编造台词**，不得写“音效：”后缀，
+  不得使用（VO）旁白或（OS）内心独白 —— 这些都属于声音信息，画面里没有证据。
+- 只有画面里确实出现可见字幕、对白气泡或屏幕文字时才写台词行，格式
+  “角色名（字幕）：原文”，原文照抄，不润色、不改写、不补全。
+- 场景、动作、表情和人物反应仍以画面拉片为准，不能脑补；某场若没有任何可见文字，
+  该场就只写△动作行，不要用“（无对白）”之类的占位行。"""
+        sources_block = f"""【画面拉片】
+{vision}"""
+        sample_lines = """△【00:00】起镜，景别：全景｜动作、表情和反应。
+△【00:07】切镜，景别：中景｜动作、表情和反应。
+角色名（字幕）：画面里出现的字幕原文（这一场没有可见文字就不写这一行）"""
+        sample_tail = "角色名（字幕）：可见字幕原文"
+        voice_note = "本片没有声音，不写 VO/OS。"
+    return f"""{intro}
+
+硬性要求：
+{rule_lines}
 - 不得只写剧情摘要；完整保留动作链、神态、视线和反应镜头。
 - 【人物形象单开一段】紧跟“# 第{ep}集”标题之后、第一场之前，先输出一段「人物形象」：
   本集画面里出现过的每个角色独占一行，格式“角色名：发型与发色、服装款式与颜色、配饰、
   随身物品、明显体貌特征”。只写有辨识度且画面能看清的；看不清就不写。
   同一角色全程同一套装扮只写一行；出现换装、破损、沾血、淋湿、乔装时另起一行，写成
-  “角色名（{ep}-3场起换装）：……”，只写变化的部分。只闻其声、从未出镜的角色（画外音/旁白）
-  不写进「人物形象」，只在台词处标 VO/OS。
+  “角色名（{ep}-3场起换装）：……”，只写变化的部分。{voice_note}
 - 【人物形象是全文唯一写外貌的地方】发型、衣着、配饰、随身物品只允许出现在「人物形象」段：
   △行、场面调度、人物状态、人物行里一律不再重复描述服装与长相。唯一例外：某一处衣着此刻正在
   发生变化或本身成为剧情证据时（如“外套已被雨水浸透”“他脱下外套裹住她”），才在△里写这一处
@@ -261,11 +295,7 @@ def merge_prompt(ep, transcript, vision, known_roles):
 已知角色表：
 {known_roles or '暂无'}
 
-【音频听写】
-{transcript}
-
-【画面拉片】
-{vision}
+{sources_block}
 
 输出格式：
 # 第{ep}集
@@ -278,19 +308,14 @@ def merge_prompt(ep, transcript, vision, known_roles):
 人物：……
 场面调度：内/外景与陈设、光源、空间关系；角色A在画面左侧门边站着，角色B坐在右侧沙发上仰头看他
 人物状态：角色：状态（可见证据）
-△【00:00】起镜，景别：全景｜动作、表情和反应。音效：关门声
-角色名：台词
-△【00:07】切镜，景别：中景｜动作、表情和反应。
-角色名：台词
-角色名（VO）：旁白
-角色名（OS）：内心独白
+{sample_lines}
 
 {ep}-2场 日/夜 内/外 地点
 总时长：20秒
 一镜到底
 人物：……
 △【00:28】景别：近景｜动作、表情和反应。
-角色名：台词
+{sample_tail}
 
 角色表
 角色名：身份
@@ -372,6 +397,15 @@ def main():
         print(f"[合并] 复用已完成双模型结果：{final_out}", flush=True)
         return
 
+    # 先探一次音轨：无声视频（AI 生成素材、渲染动画、纯画面录屏）本来就没东西可听，
+    # 旧版让音频阶段直接抛「无法识别台词与音效」，整条链路白跑一趟。
+    # 现在改走视觉单模型：只用用户选的视觉模型拉片，合并时也不许编台词。
+    has_audio = pajuben.has_audio_stream(args.video)
+    if not has_audio:
+        args.audio_model = ""
+        print("⚠ 这个视频没有音轨：跳过音频听写，只用视觉模型"
+              f"「{args.vision_model}」扒画面", flush=True)
+
     workdir = tempfile.mkdtemp(prefix="dual_pajuben_")
     # 音频听写与画面识别互不依赖，串着跑等于把两段耗时相加，一集多等好几分钟。
     # 这里两段同时起跑，合并阶段再汇合。
@@ -400,6 +434,10 @@ def main():
 
     def audio_stage():
         try:
+            if not has_audio:
+                # 没有音轨就没有听写稿，这里直接收工；合并阶段会自动切到无对白版提示词。
+                result["transcript"] = None
+                return
             if os.path.exists(audio_out) and os.path.getsize(audio_out) > 100:
                 result["transcript"] = load(audio_out)
                 print(f"[音频] 复用已完成听写：{audio_out}", flush=True)
@@ -487,12 +525,19 @@ def main():
             mark_failure(error)
 
     try:
-        print(f"↻ 音频听写与画面识别同时开始（画面批次并发 {VISION_BATCH_WORKERS} 路）…",
-              flush=True)
-        workers = [
-            threading.Thread(target=audio_stage, name="pajuben-audio", daemon=True),
-            threading.Thread(target=vision_stage, name="pajuben-vision", daemon=True),
-        ]
+        if has_audio:
+            print(f"↻ 音频听写与画面识别同时开始（画面批次并发 {VISION_BATCH_WORKERS} 路）…",
+                  flush=True)
+            workers = [
+                threading.Thread(target=audio_stage, name="pajuben-audio", daemon=True),
+                threading.Thread(target=vision_stage, name="pajuben-vision", daemon=True),
+            ]
+        else:
+            # 没音轨就别起音频线程，省一路请求也省一次必然失败的报错。
+            print(f"↻ 只跑画面识别（画面批次并发 {VISION_BATCH_WORKERS} 路）…", flush=True)
+            workers = [
+                threading.Thread(target=vision_stage, name="pajuben-vision", daemon=True),
+            ]
         for worker in workers:
             worker.start()
         for worker in workers:
@@ -500,14 +545,18 @@ def main():
         if failure["error"] is not None:
             raise failure["error"]
         transcript, vision = result["transcript"], result["vision"]
-        if transcript is None or vision is None:
-            raise SystemExit("❌ 音频或画面阶段没有产出结果，请重试")
+        if vision is None:
+            raise SystemExit("❌ 画面阶段没有产出结果，请重试")
+        if has_audio and transcript is None:
+            raise SystemExit("❌ 音频阶段没有产出结果，请重试")
 
         # ---- 最后一步：按时间戳合并成剧情剧本 ----
-        print(f"[合并] 按时间戳合并剧本（复用视觉模型「{args.vision_model}」）…", flush=True)
+        print(f"[合并] {'按时间戳' if has_audio else '按画面时间码'}合并剧本"
+              f"（复用视觉模型「{args.vision_model}」）…", flush=True)
         final = call_stage(
             "merge", vision_base, vision_key, args.vision_model,
-            [{"role": "user", "content": merge_prompt(args.ep, transcript, vision, known)}])
+            [{"role": "user", "content": merge_prompt(
+                args.ep, transcript, vision, known, has_audio=has_audio)}])
         save(final_out, final)
         print(f"[合并] 完成：{final_out}", flush=True)
     except StageFailure as error:

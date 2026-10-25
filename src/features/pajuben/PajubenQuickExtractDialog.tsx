@@ -14,6 +14,7 @@ import { UiButton, UiModal } from "@/components/ui/primitives";
 import { useSettingsStore } from "@/stores/settingsStore";
 import type { CanvasNode } from "@/features/canvas/domain/canvasNodes";
 import { cancelPajuben, probePajubenEnvironment, runPajuben, type PajubenRunRequest } from "@/commands/pajuben";
+import { probeVideoAudio } from "@/commands/videoEdit";
 import { isQuickRunActive, usePajubenQuickRuns } from "./pajubenQuickRuns";
 
 import {
@@ -103,6 +104,34 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
     audioOption && !isPajubenAudioInputModel(audioOption.model),
   );
 
+  /**
+   * 有没有音轨：`null` = 还没探到 / 探测失败（按「有音频」处理，保持旧行为）。
+   *
+   * 无声视频（AI 生成素材、渲染动画、纯画面录屏）不该被卡在「音频模型」上：
+   * 引擎那边也没东西可听，硬跑只会得到「无法识别台词与音效」。探到没有音轨时
+   * 直接切视觉单模型 —— 只用这一个视觉模型拉片，音频模型整段跳过。
+   */
+  const [hasAudioTrack, setHasAudioTrack] = useState<boolean | null>(null);
+  const audioRequired = hasAudioTrack !== false;
+
+  useEffect(() => {
+    setHasAudioTrack(null);
+    if (!canExtract) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const probe = await probeVideoAudio(videoPath);
+        if (!cancelled) setHasAudioTrack(probe.hasAudio);
+      } catch {
+        // 探测失败不阻断流程：留 null 走原来的双模型校验，由引擎兜底判断。
+        if (!cancelled) setHasAudioTrack(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [canExtract, videoPath]);
+
   /** 上次选的渠道被删掉后存储里的 key 会悬空 —— 清掉，别让「生成」一直灰着不说原因。 */
   useEffect(() => {
     if (!visionKey) return;
@@ -159,11 +188,12 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
       return;
     }
     // 两个模型各自校验、各自报错：只说「请选择模型」时，用户不知道该补哪一个。
+    // 无声视频没有音频阶段，音频模型可以完全缺省 —— 这条校验只在有音轨时才成立。
     if (!visionOption) {
       setNotice(t("pajuben.quickNeedVisionModel", "请先选择视觉模型（负责识别场景、人物着装与动作）"));
       return;
     }
-    if (!audioOption) {
+    if (audioRequired && !audioOption) {
       setNotice(
         t(
           "pajuben.quickNeedAudioModel",
@@ -180,7 +210,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
       );
       return;
     }
-    if (!audioOption.apiKey.trim()) {
+    if (audioRequired && audioOption && !audioOption.apiKey.trim()) {
       setNotice(
         t("pajuben.quickAudioNoKey", "音频模型所在的渠道（{{provider}}）没有可用密钥，请先在「设置 → 密钥」里填写", {
           provider: audioOption.providerName,
@@ -229,17 +259,19 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
         maxFrames: qualityPreset.maxFrames,
         workers: 3,
         // 双模型流程里台词由音频模型单独听写，这一位只表示「这一集需要台词」。
-        audio: true,
+        // 无声视频没有台词可听，置 false 让引擎连音频阶段都不必准备。
+        audio: audioRequired,
         animeMode: false,
         faceEnabled: environment.faceReady,
         outputDir: null,
         roleSheet: null,
         dualVisionModel: visionOption.model,
-        dualAudioModel: audioOption.model,
+        // 没有音轨时不传音频模型：引擎会用视觉模型单跑，传了也不会被调用。
+        dualAudioModel: audioRequired ? (audioOption?.model ?? "") : "",
         dualVisionBaseUrl: visionOption.baseUrl,
-        dualAudioBaseUrl: audioOption.baseUrl,
+        dualAudioBaseUrl: audioRequired ? (audioOption?.baseUrl ?? "") : "",
         dualVisionApiKey: visionOption.apiKey,
-        dualAudioApiKey: audioOption.apiKey,
+        dualAudioApiKey: audioRequired ? (audioOption?.apiKey ?? "") : "",
         fromEpisode: null,
         toEpisode: null,
         limit: null,
@@ -268,6 +300,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
     }
   }, [
     audioOption,
+    audioRequired,
     bindRunId,
     canExtract,
     episode,
@@ -386,13 +419,19 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
                 {t("pajuben.quickAudioModel", "音频模型")}
               </span>
               <select
-                className={`nodrag nowheel ${FIELD_CLASS}`}
+                className={`nodrag nowheel ${FIELD_CLASS} ${
+                  audioRequired ? "" : "cursor-not-allowed opacity-50"
+                }`}
                 value={audioOption?.key ?? ""}
                 onChange={(event) => setAudioKey(event.target.value || null)}
                 onPointerDown={(event) => event.stopPropagation()}
                 onMouseDown={(event) => event.stopPropagation()}
-                disabled={running}
-                title={t("pajuben.quickAudioModel", "音频模型")}
+                disabled={running || !audioRequired}
+                title={
+                  audioRequired
+                    ? t("pajuben.quickAudioModel", "音频模型")
+                    : t("pajuben.quickAudioSkipped", "这个视频没有音轨，不会调用音频模型")
+                }
               >
                 <option value="">
                   {modelOptions.length > 0
@@ -412,17 +451,24 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
                 ))}
               </select>
               <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">
-                {t("pajuben.quickAudioHint", "听声音：台词、旁白与音效")}
+                {audioRequired
+                  ? t("pajuben.quickAudioHint", "听声音：台词、旁白与音效")
+                  : t("pajuben.quickAudioSkipped", "这个视频没有音轨，不会调用音频模型")}
               </p>
             </div>
           </div>
           <p className="mt-2 text-[11px] leading-relaxed text-text-muted">
-            {t(
-              "pajuben.quickDualHint",
-              "画面和声音分开识别，再合并成剧情：视觉模型看场景与动作，音频模型听台词与音效，两个模型可以来自不同渠道。",
-            )}
+            {audioRequired
+              ? t(
+                  "pajuben.quickDualHint",
+                  "画面和声音分开识别，再合并成剧情：视觉模型看场景与动作，音频模型听台词与音效，两个模型可以来自不同渠道。",
+                )
+              : t(
+                  "pajuben.quickNoAudioHint",
+                  "检测到这条视频没有音轨：只用上面的视觉模型拉片，按画面写场景、动作与人物，不编造台词与音效。",
+                )}
           </p>
-          {audioModelLooksUnsupported && (
+          {audioRequired && audioModelLooksUnsupported && (
             <p className="mt-1.5 flex items-start gap-1.5 text-[11px] leading-relaxed text-amber-400">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               {t(

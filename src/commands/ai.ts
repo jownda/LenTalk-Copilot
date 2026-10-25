@@ -2268,6 +2268,21 @@ function isDramayaVideoHost(baseUrl: string): boolean {
   }
 }
 
+/**
+ * likeai520 视频站判定(api.likeai520.cc)。
+ *
+ * 文档站(www.likeai520.cc)也一并认出来 —— 用户误把文档站填成 Base URL 时,
+ * 走到后端协议层能给出「接口地址应为 api.」这类可读错误, 而不是一个 404 重定向。
+ */
+function isLikeaiVideoHost(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl.trim()).hostname.toLowerCase();
+    return host === "api.likeai520.cc" || host === "likeai520.cc" || host === "www.likeai520.cc";
+  } catch {
+    return false;
+  }
+}
+
 export async function generateVideo(request: GenerateVideoRequest): Promise<string> {
   if (!isCustomModel(request.model)) {
     throw new Error("视频生成仅支持自定义平台(custom:*)模型");
@@ -2302,6 +2317,12 @@ export async function generateVideo(request: GenerateVideoRequest): Promise<stri
   // Base URL 兜底: 用户手动添加平台时 capabilities.videoTransport 可能为空。
   if (request.extra_params?.video_transport === "dramaya-video" || isDramayaVideoHost(baseUrl)) {
     return await runRunningHubVideoViaBackendJob(request, "Dramaya");
+  }
+  // likeai520(Seedance 独立分组): 同样是「提交 /v1/videos → 轮询 → 受保护地址下载」,
+  // 但正文/素材字段是 content 数组, 且素材必须公网 HTTPS —— 实现只在 Rust 侧,
+  // 前端直发路径同样交给后端任务执行器, 不再抄第二份。
+  if (request.extra_params?.video_transport === "likeai-video" || isLikeaiVideoHost(baseUrl)) {
+    return await runRunningHubVideoViaBackendJob(request, "likeai520");
   }
   if (request.extra_params?.video_transport === "sub2api-video") {
     return await generateSub2ApiVideo(request, baseUrl, apiModel, headers);

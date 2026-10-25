@@ -103,6 +103,27 @@ describe('resolveVideoModelProfile', () => {
       .toBe('binghuo-video');
   });
 
+  it('routes likeai520 Seedance models through the content-array video profile', () => {
+    const profile = resolveVideoModelProfile('custom:likeai520/doubao-seedance-2.0-mini');
+    expect(profile.id).toBe('likeai-video');
+    expect(profile.status).toBe('verified');
+    expect(profile.submitPath).toBe('/v1/videos');
+    expect(profile.queryPath).toBe('/v1/videos/{taskId}');
+    // 站点没有上传接口, 素材只能是公网 HTTPS —— 不能标成 platform-file。
+    expect(profile.referenceImageTarget).toBe('public-url');
+    expect(profile.supportsFirstLast).toBe(true);
+    expect(profile.supportsReferenceAudio).toBe(true);
+  });
+
+  it('recognizes the likeai520 base URL even when the custom platform id differs', () => {
+    // 用户自建平台时 id 可能是任意名字; Base URL 才是主判据。
+    expect(resolveVideoModelProfile('custom:中转/doubao-seedance-2.0-mini', 'https://api.likeai520.cc/v1').id)
+      .toBe('likeai-video');
+    // 误把文档站填成 Base URL 时也要显示正确协议页签, 否则会掉到通用 OpenAI Video。
+    expect(resolveVideoModelProfile('custom:my-relay/doubao-seedance-2.0-mini', 'https://www.likeai520.cc').id)
+      .toBe('likeai-video');
+  });
+
   it('炳火自售的 seedance 系模型不会被通用 Seedance 档案抢走', () => {
     // 炳火的 'seedance-2.0-480p' 命中下面的 /^seedance.../ 正则, 必须由前面的
     // Base URL 判据拦下来 —— 两个档案的参考素材目标与音频支持都不同。

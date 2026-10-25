@@ -101,3 +101,28 @@ export function isMediaNodeSizeSettled(
   }
   return Math.abs(current.width - target.width) <= 1 && Math.abs(current.height - target.height) <= 1;
 }
+
+/**
+ * 盒子当前的宽高比是否已经贴合媒体(默认允许 1% 偏差)。
+ *
+ * 用途: 用户手动拖过边框的媒体节点会被标记「手动尺寸」, 但那并不意味着它的比例
+ * 还和画面一致 —— 老工程里可能残留着被拖歪的盒子。只有比例对得上才保留用户尺寸,
+ * 对不上仍要按画面收敛, 否则画面会被拉伸或四周留黑边。
+ */
+export function isMediaNodeBoxRatioMatching(
+  box: MediaNodeBoxSize | null | undefined,
+  mediaWidth: number,
+  mediaHeight: number,
+  tolerance = 0.01
+): boolean {
+  if (!box || !isUsablePositive(box.width) || !isUsablePositive(box.height)) {
+    return false;
+  }
+  if (!isUsablePositive(mediaWidth) || !isUsablePositive(mediaHeight)) {
+    return false;
+  }
+
+  const boxRatio = box.width / box.height;
+  const mediaRatio = mediaWidth / mediaHeight;
+  return Math.abs(boxRatio - mediaRatio) / mediaRatio <= tolerance;
+}

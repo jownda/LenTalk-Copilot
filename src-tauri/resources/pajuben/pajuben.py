@@ -156,6 +156,39 @@ def duration_from_ffmpeg(video_path):
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
+_AUDIO_STREAM_PATTERN = re.compile(r"Stream #\S+.*Audio:")
+
+
+def has_audio_stream(video_path):
+    """视频里有没有音频流。
+
+    扒视频曾经默认「每条片子都能听声」：无声视频走到音频听写阶段才炸，
+    报的还是一句「无法识别台词与音效」。其实这类片子（AI 生成素材、
+    动画渲染、无声监控）只靠画面就够写出拉片剧本 —— 提前探一次，让上游
+    直接改走视觉单模型，而不是等失败。
+
+    探测不到（缺 ffprobe 又缺 ffmpeg、远程文件读不了）时返回 True：
+    保持旧行为，交给后续流程按原样报错，不要因为探测失败就把有声当无声。
+    """
+    if not video_path:
+        return True
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, check=True).stdout.strip()
+        return bool(out)
+    except FileNotFoundError:
+        try:
+            out = subprocess.run(["ffmpeg", "-hide_banner", "-i", video_path],
+                                 capture_output=True, text=True).stderr or ""
+        except Exception:
+            return True
+        return bool(_AUDIO_STREAM_PATTERN.search(out))
+    except Exception:
+        return True
+
+
 def probe_duration(video_path):
     # 有些发行版只随包 ffmpeg(没有 ffprobe)：这时回退到解析 ffmpeg 输出，
     # 否则时长恒为 0 会让分段策略退化成单段、每段抽帧密度算错。
@@ -1015,10 +1048,15 @@ def process_video(S, video, ep, known_roles):
         known = known_roles if known_roles.startswith("\n") else (
             f"\n已知角色表（角色名必须用这里的名字）：\n{known_roles}\n")
     subtitle_cues, subtitle_source = load_video_subtitles(video)
+    # 无声视频不必再抽音频：抽出来是空文件，模型收到空 audio 反而回一句
+    # 「请提供音频」，看起来像配置错。直接按「只看画面」的规矩走。
+    want_audio = S["want_audio"] and has_audio_stream(video)
     if subtitle_source:
         log(f"  第{ep}集 已读取字幕：{subtitle_source}")
-    elif not S["want_audio"]:
+    elif not want_audio:
         log(f"  第{ep}集 未找到外挂或内嵌字幕，将只根据画面记录")
+    if S["want_audio"] and not want_audio:
+        log(f"  第{ep}集 这个视频没有音轨：跳过音频，只按画面记录")
     parts = []
     for k, (start, seg_dur, eff_fps) in enumerate(segments, 1):
         base = 90.0 * (k - 1) / m
@@ -1045,7 +1083,7 @@ def process_video(S, video, ep, known_roles):
                 except Exception as e:
                     log(f"  ⚠ 第{ep}集 人物识别跳过：{e}")
             audio_path = (extract_audio(video, workdir, start, seg_dur)
-                          if S["want_audio"] else None)
+                          if want_audio else None)
             end = start + seg_dur if seg_dur else duration
             subtitle_text = subtitles_for_segment(subtitle_cues, start, seg_dur, duration)
             prompt = S["prompt_text"] + segment_tip(ep, k, m, start, end,
@@ -1135,7 +1173,7 @@ def should_use_dual_fallback(error):
 
 # 双模型缓存的格式版本：拉片/合并提示词或产出结构一变就 +1，让旧缓存整体失效。
 # 否则改完提示词重跑，拿回来的还是上一版提示词写出来的稿子。
-DUAL_CACHE_VERSION = "v6"
+DUAL_CACHE_VERSION = "v7"
 
 
 def video_fingerprint(path):
@@ -1169,7 +1207,13 @@ def run_dual_fallback(S, video, ep, out_dir, roles_file):
     use_single_native_model = native_gemini and not S.get("force_dual", False)
     audio_model = S["model"] if use_single_native_model else S["dual_audio_model"]
     vision_model = S["model"] if use_single_native_model else S["dual_vision_model"]
-    if not audio_model:
+    # 无声视频（AI 生成素材、渲染动画、纯画面录屏）没有可听的东西，
+    # 不该因为「没配音频模型」被拦在门外：子脚本会自己跳过音频阶段。
+    has_audio = has_audio_stream(video)
+    if not has_audio:
+        log("  ⚠ 这个视频没有音轨：跳过音频听写，只用视觉模型扒画面")
+        audio_model = ""
+    if not audio_model and has_audio:
         raise RuntimeError(
             "没有选音频模型：画面识别和音频识别要分开做，请先指定一个能听声的音频模型"
             "（例如 Gemini / Qwen-Omni / GPT-4o-Audio）")
@@ -1178,13 +1222,14 @@ def run_dual_fallback(S, video, ep, out_dir, roles_file):
             "没有选视觉模型：画面识别需要一个能看图的模型，请先指定视觉模型")
     cmd = [sys.executable, "-u", script, video, "--ep", str(ep),
            "--base", S["base_url"],
-           "--audio-model", audio_model,
            "--vision-model", vision_model,
            "--output-dir", cache_dir,
            # 画质档位同样作用于双模型流程：帧密度、清晰度、单集上限都跟工作台一致。
            "--fps", str(S.get("fps") or 2),
            "--longedge", str(S.get("longedge") or 768),
            "--max-frames", str(S.get("max_frames") or 240)]
+    if audio_model:
+        cmd += ["--audio-model", audio_model]
     # 两个模型可以分属两个渠道：各自带自己的 base_url，密钥走环境变量。
     audio_base = S.get("dual_audio_base") or ""
     vision_base = S.get("dual_vision_base") or ""

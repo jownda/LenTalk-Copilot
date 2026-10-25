@@ -83,6 +83,8 @@ export interface RecommendedVideoConfig {
     | 'sub2api-video'
     /** Dramaya(video.dramaya.us): 提交 /v1/videos, 成片签名地址不带 Bearer 下载。 */
     | 'dramaya-video'
+    /** likeai520(api.likeai520.cc): 提交 /v1/videos, 素材走 content 数组且只能公网 HTTPS。 */
+    | 'likeai-video'
     | 'binghuo-video'
     | 'wgspai-video'
     | 'zhiniao-video'
@@ -878,6 +880,36 @@ export const recommendedApis: RecommendedApi[] = [
       video: '¥0.16 ~ 45 / 次',
     },
   },
+  // likeai520 的「Seedance 独立视频分组」: 0.2.18.1 起单独计费, 与文本/图片分组
+  // 不互通(视频 Key 不能调聊天与图片)。协议是 OpenAI Videos 外形, 但**字段与素材
+  // 语义是 Seedance 的**: 时长 `duration`、画幅 `ratio`、素材走 `content` 数组,
+  // 且站点没有上传接口 —— 素材只能是上游可读的 HTTPS 地址。
+  //
+  // 型号清单以「该 Key 的 GET /v1/models」为准(`data[].id`), 这里只放官方文档示例
+  // 型号作为占位; 用户连上后可在模型列表里补自己分组的型号。
+  {
+    id: 'likeai520',
+    name: 'likeai520',
+    baseUrl: 'https://api.likeai520.cc',
+    registerUrl: 'https://www.likeai520.cc/register?aff=8AHYKY8NW3K8',
+    summary: 'Seedance 独立视频分组：异步任务 + 按次/按秒/按 Token 结算，型号以 Key 的 /v1/models 为准',
+    advantages: [
+      '提交 POST /v1/videos 后轮询 GET /v1/videos/{id}，成片走受保护的 /content 接口下载',
+      '时长用整数秒 duration、画幅用 ratio、分辨率用 resolution（720p / 1080p）显式填写',
+      '首帧 / 尾帧 / 普通参考图分别用 first_frame / last_frame / reference_image 角色提交',
+      '参考素材需为上游可读的 HTTPS 地址（本站无上传接口），本机素材请配图床转 URL',
+    ],
+    models: [],
+    videoModels: ['doubao-seedance-2.0-mini'],
+    videoModelsRevision: 1,
+    videoConfig: {
+      submitPath: '/v1/videos',
+      queryPath: '/v1/videos/{taskId}',
+      // 站点不收 data URL, 参考素材只能是公网地址。
+      referenceEncoding: 'url',
+      transport: 'likeai-video',
+    },
+  },
   {
     id: 'sub2api-video',
     name: 'Sub2API 视频',
@@ -1281,6 +1313,10 @@ export const visibleRecommendedApiIds: readonly string[] = [
   'modelscope',
   // api666888: 「暗苗」链路(9 个 seedance 模型, media + 方舟两种协议)。
   'api666888',
+  // likeai520: Seedance 独立视频分组(/v1/videos 异步任务 + content 数组素材)。
+  // 加进白名单才能从「推荐平台」一键添加; 不想展示时从这里移出即可, 链路不受影响
+  // (协议由 Base URL / video_transport 判定)。
+  'likeai520',
 ];
 
 /** 按白名单过滤出需要在设置界面展示的推荐平台（隐藏 ≠ 删除配置）。 */

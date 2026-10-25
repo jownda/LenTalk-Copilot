@@ -52,7 +52,10 @@ import {
   resolveMediaNodeAspectLock,
   type AspectLockedSize,
 } from '@/features/canvas/application/aspectLockedResize';
-import { resolveMediaNodeFitSize } from '@/features/canvas/application/mediaNodeSizing';
+import {
+  isMediaNodeBoxRatioMatching,
+  resolveMediaNodeFitSize,
+} from '@/features/canvas/application/mediaNodeSizing';
 import { reduceAspectRatio } from '@/features/canvas/application/imageData';
 
 export type {
@@ -868,6 +871,10 @@ function applyAspectLockedResizeToChanges(
 
     return {
       ...change,
+      // 边把手(右边框/下边框)只声明自己那一维(`setAttributes: 'width' | 'height'`),
+      // 但等比修正会同时改写**两**个维度 —— 不把 setAttributes 提成 true, 被推导出来的
+      // 那一维就写不进节点的 width/height, 节点只会朝一个方向变大变小、比例随即破掉。
+      setAttributes: true,
       dimensions: { ...change.dimensions, ...locked },
     } as NodeChange<CanvasNode>;
   });
@@ -1328,9 +1335,13 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       let nextNodes = applyNodeChanges<CanvasNode>(lockedChanges, state.nodes);
       if (resizedNodeIds.size > 0) {
         nextNodes = nextNodes.map((node) => {
-          // 只有面板型节点需要记住「用户手动调过尺寸」: 媒体节点的边框由画面反推,
-          // 记下手动标记反而会让它不再跟随画面。
-          if (!resizedNodeIds.has(node.id) || node.type !== CANVAS_NODE_TYPES.imageEdit) {
+          if (!resizedNodeIds.has(node.id)) {
+            return node;
+          }
+          // 面板型节点(AI 图片)的盒子是提示词面板, 记下手动尺寸即可;
+          // 媒体节点(结果图片/上传图片/视频)的盒子就是画面, 也要记 —— 否则重新打开
+          // 工程或媒体重新加载时, 自动贴合会把用户拖好的大小弹回默认值。
+          if (node.type !== CANVAS_NODE_TYPES.imageEdit && !isMediaBoxNodeType(node.type)) {
             return node;
           }
           return withManualSizeLock(node);
@@ -2217,9 +2228,17 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         return {};
       }
 
+      // 用户手动拖过大小(且盒子比例仍与画面一致)时保留他的尺寸: 媒体加载/重新挂载
+      // 会再触发一次同步, 无条件贴合会把刚拖好的大小弹回去, 看起来像「拖了没用」。
+      // 比例对不上(老工程被拖歪的盒子、换了不同比例的画面)仍照常收敛, 免得留黑边。
+      const manualSizeKept =
+        Boolean((node.data as CanvasNodeData & { isSizeManuallyAdjusted?: boolean }).isSizeManuallyAdjusted)
+        && isMediaNodeBoxRatioMatching(currentSize, mediaWidth, mediaHeight);
+
       const aspectChanged = nodeData.aspectRatio !== nextAspectRatio;
       const sizeChanged =
-        currentSize.width !== nextSize.width || currentSize.height !== nextSize.height;
+        !manualSizeKept
+        && (currentSize.width !== nextSize.width || currentSize.height !== nextSize.height);
       if (!aspectChanged && !sizeChanged) {
         return {};
       }

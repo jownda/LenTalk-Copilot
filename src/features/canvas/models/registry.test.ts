@@ -120,6 +120,61 @@ describe("listVideoModels", () => {
     }
   });
 
+  it("prices 字字动画 models from the 2026-10-23 platform sync", () => {
+    const previousCustomApis = useSettingsStore.getState().customApis;
+    const zzdh: CustomApiProvider = {
+      id: "zizidonghua",
+      name: "字字动画",
+      baseUrl: "https://zizidonghua.com",
+      apiKey: "",
+      models: ["qwen-image-3.0", "qwen-image-max"],
+      // 对口型是靠 ZZDH_LIP_SYNC_MODEL_NAMES 自动补进来的, 不需要用户手动登记。
+      videoModels: ["doubao-seedance-2-720p"],
+      audioModels: [],
+      chatModels: [],
+      modelPrices: {},
+      createdAt: Date.now(),
+      requestMode: "sync" as const,
+      protocol: "images" as const,
+      referenceImageField: "images" as const,
+      referenceImageEncoding: "auto" as const,
+      imageTransport: "generations_json" as const,
+    };
+
+    useSettingsStore.setState({ customApis: [zzdh] });
+    try {
+      const imageModels = listImageModels();
+      const videoModels = listVideoModels();
+      const qwenImage = imageModels.find((model) => model.id.endsWith("/qwen-image-3.0"));
+      const seedance = videoModels.find((model) => model.id.endsWith("/doubao-seedance-2-720p"));
+      const lipSync = videoModels.find((model) => model.id.includes("限时优惠-对口型-480p"));
+
+      // 图片按次: 0.21 元/张, 与分辨率档位无关。
+      expect(resolveModelPriceDisplay(qwenImage!, { resolution: "2K", language: "zh-CN" })?.label).toContain(
+        "0.21",
+      );
+      // 视频按秒: 0.70 元/秒 → 5 秒 3.50, 10 秒 7.00(2026-10-23 前是 1.09, 会算成 5.45)。
+      expect(
+        resolveModelPriceDisplay(seedance!, { resolution: "720P", extraParams: { duration: 5 }, language: "zh-CN" })
+          ?.label,
+      ).toContain("3.50");
+      expect(
+        resolveModelPriceDisplay(seedance!, { resolution: "720P", extraParams: { duration: 10 }, language: "zh-CN" })
+          ?.label,
+      ).toContain("7.00");
+      // 对口型限时优惠档 0.04 元/秒。
+      expect(
+        resolveModelPriceDisplay(lipSync!, { resolution: "480P", extraParams: { duration: 5 }, language: "zh-CN" })
+          ?.label,
+      ).toContain("0.20");
+      // 平台已下架的模型宁可不报价, 也不要留一个旧价格。
+      const delisted = imageModels.find((model) => model.id.endsWith("/qwen-image-max"));
+      expect(resolveModelPriceDisplay(delisted!, { resolution: "1K", language: "zh-CN" })).toBeNull();
+    } finally {
+      useSettingsStore.setState({ customApis: previousCustomApis });
+    }
+  });
+
   it("opens kling-v4 up to 30s and defaults brand-new 知鸟 models to 30s", () => {
     // 用户规则（2026-10-19）：可灵 v4 平台支持 30s，但之前被限制成 15s；
     // 以后平台新上、我们还没核过枚举的模型，一律先给到 30s 并默认 30s。

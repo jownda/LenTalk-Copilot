@@ -436,6 +436,39 @@ pub async fn render_video_edit(
         .map_err(|error| format!("导出视频失败: {error}"))?
 }
 
+/// 视频探测结果：画布「扒视频」用 `hasAudio` 决定要不要拉上音频模型那一路。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoAudioProbe {
+    pub has_audio: bool,
+    pub duration_sec: Option<f64>,
+}
+
+/// 探测视频有没有音频流。
+///
+/// 没有音轨的片子（AI 生成素材、渲染动画、纯画面录屏）在双模型链路里必然卡在
+/// 「音频听写」那一步，报出来的还是「无法识别台词与音效」——用户看到的是失败，
+/// 其实只靠画面就能写拉片剧本。这里提前问一次，前端直接改走视觉单模型。
+#[tauri::command]
+pub async fn probe_video_audio(
+    app: AppHandle,
+    source_path: String,
+) -> Result<VideoAudioProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let input = local_or_remote_video_source(&source_path)
+            .ok_or_else(|| "不支持的视频来源，无法探测音轨".to_string())?;
+        let ffmpeg = resolve_ffmpeg_path(&app)
+            .ok_or_else(|| "未找到 ffmpeg，无法探测音轨".to_string())?;
+        let probe = probe_media(&ffmpeg, &input);
+        Ok(VideoAudioProbe {
+            has_audio: probe.has_audio,
+            duration_sec: probe.duration_sec,
+        })
+    })
+    .await
+    .map_err(|error| format!("探测音轨失败: {error}"))?
+}
+
 fn render_video_edit_blocking(
     app: AppHandle,
     request: VideoEditRequest,

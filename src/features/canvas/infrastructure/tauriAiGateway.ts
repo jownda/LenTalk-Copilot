@@ -63,7 +63,8 @@ async function normalizeUrlsForCli(
  * 仍需前端兼容 worker 承载的视频协议 —— 本地 CLI 模型。
  *
  * 所有远端视频协议(kling-control / zhenjian-task-api / zzdh-v8-video /
- * sub2api-video / binghuo-video / wgspai-video / zhiniao-video / openai-video)
+ * sub2api-video / dramaya-video / likeai-video / binghuo-video / wgspai-video /
+ * zhiniao-video / openai-video)
  * 已迁到 Rust 后端任务执行器。协议判定统一以 `video_transport` 为准, 因为
  * `injectCustomApiRequestMode` 会按平台 id 与 Base URL 把它注入好; 这里不再做
  * Base URL 兜底 —— 兜底会让本该交给后端的任务退回 WebView 内存 Map(刷新即丢,
@@ -379,6 +380,16 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
     providerBaseUrl.includes("api.tokengo.love")
   ) {
     extraParams.video_transport = "zhiniao-video";
+  }
+  // likeai520(Seedance 独立分组): 用户手动添加平台时 capabilities.videoTransport 可能
+  // 为空, 按 Base URL 兜底 —— 否则会掉到通用 OpenAI Video 分支, 发出
+  // `/v1/videos/generations`(该站只有 `/v1/videos`)拿 404。
+  if (
+    providerId === "likeai520" ||
+    providerBaseUrl.includes("api.likeai520.cc") ||
+    providerBaseUrl.includes("likeai520.cc")
+  ) {
+    extraParams.video_transport = "likeai-video";
   }
   // RunningHub: 「模型」就是官方端点 ID(`kling-v3.0-pro/image-to-video`), 而且
   // **每个端点的参数 schema 都不一样**(参考图字段有 imageUrl / firstImageUrl +

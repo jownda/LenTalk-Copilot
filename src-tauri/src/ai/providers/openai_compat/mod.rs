@@ -350,6 +350,11 @@ impl OpenAICompatibleProvider {
         if video_protocols::dramaya::matches(transport, base_url, provider_id) {
             return video_protocols::dramaya::submit(&protocol_ctx, &request).await;
         }
+        // likeai520(Seedance 独立分组): 同样是 `/v1/videos` 异步任务, 但正文与素材
+        // 字段口径不同(content 数组 / ratio / duration), 必须单独分派。
+        if video_protocols::likeai::matches(transport, base_url, provider_id) {
+            return video_protocols::likeai::submit(&protocol_ctx, &request).await;
+        }
         if video_protocols::wgspai::matches(transport, base_url, provider_id) {
             return video_protocols::wgspai::submit(&protocol_ctx, &request).await;
         }

@@ -321,6 +321,7 @@ pub fn run() {
             video_cfr::remove_video_playback_file,
             video_cfr::extract_video_frame,
             video_edit::render_video_edit,
+            video_edit::probe_video_audio,
             pajuben::pajuben_probe,
             pajuben::pajuben_run,
             pajuben::pajuben_cancel,
