@@ -897,7 +897,7 @@ export const recommendedApis: RecommendedApi[] = [
       '提交 POST /v1/videos 后轮询 GET /v1/videos/{id}，成片走受保护的 /content 接口下载',
       '时长用整数秒 duration、画幅用 ratio、分辨率用 resolution（720p / 1080p）显式填写',
       '首帧 / 尾帧 / 普通参考图分别用 first_frame / last_frame / reference_image 角色提交',
-      '参考素材需为上游可读的 HTTPS 地址（本站无上传接口），本机素材请配图床转 URL',
+      '参考素材需为上游可读的 HTTPS 地址（本站无上传接口），本地素材会自动经「知鸟 AI」图床转直链',
     ],
     models: [],
     videoModels: ['doubao-seedance-2.0-mini'],
@@ -1287,6 +1287,41 @@ export const recommendedApis: RecommendedApi[] = [
       },
     },
   },
+  // 筷子AI(aiopenapi.kuaizi.cn): 火山方舟形态, 只有路径前缀不同
+  // (`/ai-open-platform-api/api/v3/...`)。协议层 ark.rs 按 Base URL 里的 `kuaizi.cn` 切路径。
+  {
+    id: 'kz-ai',
+    name: '筷子AI',
+    baseUrl: 'https://aiopenapi.kuaizi.cn',
+    registerUrl: 'https://www.kuaizi.ai',
+    summary: '火山方舟形态: Seedance 2.0 全系 + 2.5(30 秒 / 1080p), pro 支持 4K',
+    advantages: [
+      '提交 POST /ai-open-platform-api/api/v3/contents/generations/tasks, 查询同路径 /{id}',
+      '鉴权 Authorization: Bearer <平台 ApiKey>, 与方舟一致',
+      '模型: doubao-seedance-2-0-260128(pro, 支持 4K) / -fast-260128 / -mini-260615 / -2-5-260628(4~30 秒)',
+      '⚠ 参考素材只收 http(s):// 或 asset://, 不支持 base64 —— 本地图要先换成公网 URL',
+    ],
+    // 暂无图片 / 对话模型, 只有视频
+    models: [],
+    videoModelsRevision: 1,
+    videoModels: [
+      'doubao-seedance-2-0-260128',
+      'doubao-seedance-2-0-fast-260128',
+      'doubao-seedance-2-0-mini-260615',
+      'doubao-seedance-2-5-260628',
+    ],
+    // 与 api666888 的「满血版」共用同一套方舟协议实现(ark.rs 按 Base URL 切路径前缀)。
+    // transport 不写的话, 新加的平台会落到通用 OpenAI Video 分支发
+    // `/v1/videos/generations` —— 该站没有这个路径, 直接 404。
+    videoConfig: {
+      submitPath: '/ai-open-platform-api/api/v3/contents/generations/tasks',
+      queryPath: '/ai-open-platform-api/api/v3/contents/generations/tasks/{taskId}',
+      // 参考素材只收 http(s):// 或本平台 asset://, **拒绝 base64**;
+      // 本地素材的前置上传在 infrastructure/kuaiziReferences.ts 里完成。
+      referenceEncoding: 'url',
+      transport: 'ark-anmiao',
+    },
+  },
 ];
 
 /**
@@ -1317,6 +1352,8 @@ export const visibleRecommendedApiIds: readonly string[] = [
   // 加进白名单才能从「推荐平台」一键添加; 不想展示时从这里移出即可, 链路不受影响
   // (协议由 Base URL / video_transport 判定)。
   'likeai520',
+  // 筷子AI: 加进白名单才会出现在「推荐平台」里。
+  'kz-ai',
 ];
 
 /** 按白名单过滤出需要在设置界面展示的推荐平台（隐藏 ≠ 删除配置）。 */

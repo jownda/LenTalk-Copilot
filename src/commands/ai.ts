@@ -1,6 +1,8 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { remove } from "@tauri-apps/plugin-fs";
 import { CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from "@/stores/settingsStore";
+import { useJimengCanvasCliStore } from "@/stores/jimengCanvasCliStore";
+import { generateJimengCanvasImage } from "@/commands/jimengCanvasCli";
 import type { CustomApiCapabilities } from "@/stores/settingsStore";
 import { isWindowsDesktopRuntime } from "@/platform/runtime";
 import { isKnownOpenAiImagesBaseUrl } from "@/features/settings/recommendedApis";
@@ -41,7 +43,12 @@ import {
   type SunoMusicBodyInput,
 } from "@/commands/sunoMusic";
 import { createVideoIdempotencyKey, getVideoTaskFailureReason, resolveRjmVideoApiBaseUrl } from "@/commands/videoApi";
-import { isRunningHubBaseUrl, RUNNINGHUB_VIDEO_TRANSPORT } from "@/commands/runningHubProtocol";
+import {
+  buildRunningHubCharacterSwapNodeInfoList,
+  isRunningHubBaseUrl,
+  RUNNINGHUB_CHARACTER_SWAP_APP_ID,
+  RUNNINGHUB_VIDEO_TRANSPORT,
+} from "@/commands/runningHubProtocol";
 import {
   isZzdhBaseUrl,
   resolveZzdhAspectRatio,
@@ -178,6 +185,9 @@ interface GenerateJimengCliImageUpscaleRequest {
  * 这里不直接 import 是为了避免 commands 层反向依赖 features 层。
  */
 const JIMENG_CLI_IMAGE_MODEL_PREFIX = "jimeng-cli/image-";
+
+/** 即梦画布 CLI 的图片模型前缀(`jimeng-canvas/seedream_4.5` 这种)。 */
+const JIMENG_CANVAS_CLI_MODEL_PREFIX = "jimeng-canvas/";
 
 /**
  * 即梦 CLI 图片超清(image_upscale)的内部模型 id —— 注意它**不以**上面的
@@ -2285,7 +2295,10 @@ function isLikeaiVideoHost(baseUrl: string): boolean {
 
 export async function generateVideo(request: GenerateVideoRequest): Promise<string> {
   if (!isCustomModel(request.model)) {
-    throw new Error("视频生成仅支持自定义平台(custom:*)模型");
+    // 带上真实 model：排查「明明是本地 CLI 模型却落到这里」时，光看这句话没法定位。
+    throw new Error(
+      `视频生成仅支持自定义平台(custom:*)模型（实际收到的 model="${request.model}"）`
+    );
   }
   const providerId = request.model.split("/")[0] ?? "";
   const apiModel = request.model.split("/").slice(1).join("/").trim();
@@ -2738,6 +2751,8 @@ const RH_INDEXTTS25_APP_ID = "2088185966304518146";
 const RH_INDEXTTS25_POLYPHONE_APP_ID = "2089785773884268545";
 /** RunningHub AI App「Topaz Video 高清放大V1（非星光）」：2=视频、4=宽度、5=高度。 */
 const RH_TOPAZ_VIDEO_UPSCALE_APP_ID = "2098790412247982081";
+// 角色替换(RunningHub AI App「更换视频人物MinimaxH3」)的应用编号、节点号与画幅枚举
+// 全部放在 `@/commands/runningHubProtocol` —— 那里是 RunningHub 应用知识的唯一来源。
 
 function isRunningHubIndexTts2(baseUrl: string, apiModel: string): boolean {
   return isRunningHubBaseUrl(baseUrl) && /^(?:indextts2[_-]clone|index[-_ ]?tts2)$/i.test(apiModel.trim());
@@ -3003,6 +3018,132 @@ async function generateRunningHubTopazVideoUpscale(
     }
   }
   throw new Error(`RunningHub ${workflowName} 任务超时，请稍后重试`);
+}
+
+/**
+ * 角色替换（换人 / 动作迁移）的请求。
+ *
+ * 与普通视频生成的区别在于**它不是一个可选的模型**，而是一个具体的
+ * RunningHub AI 应用：两个必填素材（角色图 + 原视频）加上三个出片参数。
+ */
+export interface CharacterSwapVideoRequest {
+  /** 角色参考图：本地路径 / asset:// / 公网 URL。 */
+  characterImage: string;
+  /** 待替换的原视频（动作、镜头、场景都以它为准）。 */
+  videoSource: string;
+  /** 完整模型 id（含 provider 前缀），如 custom:runninghub/runninghub-character-swap */
+  model: string;
+  /**
+   * 提示词。**留空会用应用自带的那份人像模板** —— 它是围着一位具体角色写的，
+   * 通常不是你想要的。画布侧已由 `resolveCharacterSwapPrompt` 兜底成通用模板，
+   * 留空只发生在别的调用方直接调这个命令时。
+   */
+  prompt?: string;
+  /** 输出时长（秒）。应用里那个通用 Float 节点（node 386 / 字段 value）控制成片长度。 */
+  duration?: number;
+  /** 画幅标签，取值见 RUNNINGHUB_CHARACTER_SWAP_ASPECT_RATIOS。 */
+  aspectRatio?: string;
+  /** 输出总像素（MP），0.1~16。 */
+  megapixels?: number;
+  /** 采样步数，1~10000。 */
+  steps?: number;
+  extra_params?: Record<string, unknown>;
+}
+
+/**
+ * RunningHub AI App「更换视频人物MinimaxH3」：把原视频里的人物替换成参考图里的角色。
+ *
+ * 链路: 上传两张素材换公网 URL → `POST /openapi/v2/run/ai-app/{appId}`(nodeInfoList)
+ *      → `POST /openapi/v2/query` 轮询 → 成片地址。
+ *
+ * 节点号与画幅枚举由 `@/commands/runningHubProtocol` 负责, 这里只做「上传 + 提交 + 轮询」。
+ */
+export async function characterSwapVideo(request: CharacterSwapVideoRequest): Promise<string> {
+  if (!isCustomModel(request.model)) {
+    throw new Error("角色替换仅支持自定义平台(custom:*)模型");
+  }
+  const workflowName = "角色替换";
+  const providerId = request.model.split("/")[0] ?? "";
+  const configuredBaseUrl =
+    typeof request.extra_params?.provider_base_url === "string" ? request.extra_params.provider_base_url : "";
+  // 与 Topaz 超分共用同一套凭证解析：provider id 只是默认值，平台改名 / Key 只配在
+  // 另一个 RunningHub 条目上时也能找到可用的 Base URL + Key。
+  const credentials = resolveRunningHubUpscaleCredentials(providerId, configuredBaseUrl);
+  if (!credentials) {
+    throw new Error("请在设置中配置 RunningHub 的 Base URL 与 API Key（角色替换由 RunningHub 应用执行）");
+  }
+  const characterImage = request.characterImage?.trim();
+  const videoSource = request.videoSource?.trim();
+  if (!characterImage) throw new Error(`${workflowName}需要角色参考图`);
+  if (!videoSource) throw new Error(`${workflowName}需要待替换的原视频`);
+
+  const { baseUrl, apiKey } = credentials;
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
+
+  // 平台只接受公网可访问地址；本地素材必须先换 URL，否则应用侧下载不到。
+  const imageUrl = await uploadRunningHubMedia(characterImage, baseUrl, headers, "角色参考图");
+  const videoUrl = await uploadRunningHubMedia(videoSource, baseUrl, headers, "待替换视频");
+
+  const nodeInfoList = buildRunningHubCharacterSwapNodeInfoList({
+    imageUrl,
+    videoUrl,
+    prompt: request.prompt,
+    duration: request.duration,
+    aspectRatio: request.aspectRatio,
+    megapixels: request.megapixels,
+    steps: request.steps,
+  });
+
+  const submitUrl = `${baseUrl}/openapi/v2/run/ai-app/${RUNNINGHUB_CHARACTER_SWAP_APP_ID}`;
+  const response = await requestProviderJson(submitUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ nodeInfoList }),
+  });
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`RunningHub ${workflowName} 提交失败: ${buildHttpErrorSummary(response.status, raw, submitUrl)}`);
+  }
+  let payload: unknown;
+  try {
+    payload = raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new Error(`RunningHub ${workflowName} 提交返回了非 JSON`);
+  }
+  const immediate = findRunningHubVideoUrl(payload);
+  if (immediate) return immediate;
+  const taskId = findRunningHubTaskId(payload);
+  if (!taskId) throw new Error(`RunningHub ${workflowName} 未返回任务 ID: ${describeVideoResponse(payload)}`);
+
+  // 换人比超分慢（要先跑 VAE 校正再逐帧重绘），轮询窗口放到 20 分钟；超时只提示
+  // 用户去画布查结果，不重新提交 —— 任务已经建了、积分也已经预扣。
+  const queryUrl = `${baseUrl}/openapi/v2/query`;
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const result = await requestProviderJson(queryUrl, { method: "POST", headers, body: JSON.stringify({ taskId }) });
+    const resultRaw = await result.text();
+    if (!result.ok) {
+      throw new Error(`RunningHub ${workflowName} 查询失败: ${buildHttpErrorSummary(result.status, resultRaw, queryUrl)}`);
+    }
+    let resultPayload: unknown;
+    try {
+      resultPayload = resultRaw ? JSON.parse(resultRaw) : {};
+    } catch {
+      continue;
+    }
+    const video = findRunningHubVideoUrl(resultPayload);
+    if (video) return video;
+    const status = getVideoTaskStatus(resultPayload);
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
+      const reason = getRunningHubTaskFailureReason(resultPayload);
+      throw new Error(
+        `RunningHub ${workflowName} 生成失败（任务 ${taskId}，状态 ${status}）: ${reason ?? describeVideoResponse(resultPayload)}`,
+      );
+    }
+  }
+  throw new Error(
+    `RunningHub ${workflowName} 任务仍在生成中（任务 ${taskId}，已等待 20 分钟），请稍后在画布查看结果，不要重复提交`,
+  );
 }
 
 async function generateRunningHubIndexTts25(request: GenerateAudioRequest, baseUrl: string, headers: Record<string, string>): Promise<string> {
@@ -3654,6 +3795,52 @@ async function submitJimengCliImageJob(request: GenerateRequest): Promise<string
 }
 
 /**
+ * 即梦画布 CLI（`dreamina-canvas`）图片生成的 job 封装。
+ *
+ * 与即梦 CLI 走同一套「内存 job map」做法：CLI 是本地长任务，没有远端可查的任务 id，
+ * 所以提交后由前端把结果写回 job map，Canvas 那条统一轮询链路照常消费。
+ */
+async function submitJimengCanvasImageJob(request: GenerateRequest): Promise<string> {
+  const jobId = crypto.randomUUID();
+  browserGenerationJobs.set(jobId, { job_id: jobId, status: "running", result: null, error: null });
+
+  const model = request.model.slice(JIMENG_CANVAS_CLI_MODEL_PREFIX.length).trim();
+  const executable = useJimengCanvasCliStore.getState().executable;
+
+  void (async () => {
+    try {
+      const referenceImages = request.reference_images?.length
+        ? await Promise.all(
+            request.reference_images.map((source) => invoke<string>("load_media_data_url", { source }))
+          )
+        : undefined;
+
+      const result = await generateJimengCanvasImage({
+        executable,
+        prompt: request.prompt,
+        model,
+        // 有参考图就是图生图，否则是文生图（服务端是两套 mode，必须显式给）。
+        mode: referenceImages && referenceImages.length > 0 ? "i2i" : "t2i",
+        aspectRatio: request.aspect_ratio,
+        // size 就是档位（1K/1.5K/2K/4K），保留大小写 —— 各模型档位严格校验。
+        resolution: request.size || "2K",
+        referenceImages,
+      });
+      browserGenerationJobs.set(jobId, { job_id: jobId, status: "succeeded", result, error: null });
+    } catch (error) {
+      browserGenerationJobs.set(jobId, {
+        job_id: jobId,
+        status: "failed",
+        result: null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })();
+
+  return jobId;
+}
+
+/**
  * 即梦 CLI 图片超清(image_upscale)的 job 封装。
  *
  * 与图生图共用同一条内存 job 通道 —— 结果节点依旧由 Canvas 统一轮询消费, 所以
@@ -3716,11 +3903,75 @@ export interface JimengCliLoginCheckResult {
 }
 
 /** 开始即梦 CLI 登录: 返回设备码登录材料(验证地址/用户码/设备码), 由调用方打开浏览器并轮询检查 */
-export async function jimengCliLoginStart(executable: string): Promise<JimengCliLoginStartResult> {
+export async function jimengCliLoginStart(
+  executable: string,
+  options?: { force?: boolean }
+): Promise<JimengCliLoginStartResult> {
   if (!isTauri()) {
     throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。");
   }
-  return await invoke<JimengCliLoginStartResult>("jimeng_cli_login_start", { executable });
+  return await invoke<JimengCliLoginStartResult>("jimeng_cli_login_start", {
+    executable,
+    force: options?.force ?? false,
+  });
+}
+
+export interface JimengCliOpenAuthResult {
+  /** 后端是否已用无痕窗口打开; false 时调用方回退到系统默认浏览器 */
+  opened: boolean;
+  privateMode: boolean;
+  browser: string | null;
+}
+
+export interface JimengCliLoginWindowResult {
+  opened: boolean;
+  label: string | null;
+  message: string;
+}
+
+/**
+ * 在应用内用独立的 WebView 窗口打开即梦授权页（首选方式）。
+ * 该窗口有自己的一份会话数据，换号时 `resetSession=true` 直接把它清掉，
+ * 既不受系统浏览器里旧账号影响，也不会打扰用户自己的浏览器。
+ */
+export async function jimengCliOpenLoginWindow(
+  url: string,
+  options?: { resetSession?: boolean; title?: string }
+): Promise<JimengCliLoginWindowResult> {
+  if (!isTauri()) {
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。");
+  }
+  return await invoke<JimengCliLoginWindowResult>("jimeng_cli_open_login_window", {
+    url,
+    resetSession: options?.resetSession ?? false,
+    title: options?.title ?? null,
+  });
+}
+
+/** 登录流程结束（成功/取消）后关闭内置登录窗口。 */
+export async function jimengCliCloseLoginWindow(): Promise<void> {
+  if (!isTauri()) {
+    return;
+  }
+  await invoke("jimeng_cli_close_login_window");
+}
+
+/**
+ * 打开即梦授权页。
+ * `privateMode=true` 时优先后端用 Edge/Chrome 无痕窗口打开 —— 无痕会话没有旧 cookie,
+ * 才能真正切到另一个即梦账号; 返回 `opened=false` 时调用方用系统默认浏览器兜底。
+ */
+export async function jimengCliOpenLoginUrl(
+  url: string,
+  options?: { privateMode?: boolean }
+): Promise<JimengCliOpenAuthResult> {
+  if (!isTauri()) {
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。");
+  }
+  return await invoke<JimengCliOpenAuthResult>("jimeng_cli_open_login_url", {
+    url,
+    privateMode: options?.privateMode ?? false,
+  });
 }
 
 /** 查询即梦 CLI 设备码登录是否完成 */
@@ -4243,6 +4494,9 @@ export async function submitGenerateImageJob(request: GenerateRequest): Promise<
   // 即梦 CLI 图片走本机 CLI: Rust 侧自行提交并轮询, 结果经内存 job map 回传。
   if (request.model.startsWith(JIMENG_CLI_IMAGE_MODEL_PREFIX)) {
     return await submitJimengCliImageJob(request);
+  }
+  if (request.model.startsWith(JIMENG_CANVAS_CLI_MODEL_PREFIX)) {
+    return await submitJimengCanvasImageJob(request);
   }
 
   assertWindowsModelSupported(request);

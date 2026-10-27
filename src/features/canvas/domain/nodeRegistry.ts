@@ -617,6 +617,13 @@ const motionControlNodeDefinition: CanvasNodeDefinition<MotionControlNodeData> =
     audioPreviewUrl: null,
     faceSessionId: "",
     faceId: "",
+    // 角色替换（RunningHub 应用「更换视频人物MinimaxH3」）的默认档：
+    // 画幅取横屏、像素取 0.8（≈1216x672）、步数取作者调好的 8、时长取 5 秒。
+    swapAspectRatio: "16:9",
+    swapMegapixels: 0.8,
+    swapSteps: 8,
+    swapDuration: 5,
+    swapProviderId: "",
     isGenerating: false,
     generationError: null,
     outputVideoUrl: null,

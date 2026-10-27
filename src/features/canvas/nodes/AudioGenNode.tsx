@@ -40,7 +40,7 @@ import {
   resolveAudioFamilyLayout,
 } from "@/features/canvas/models";
 import type { AudioModelDefinition } from "@/features/canvas/models";
-import { RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
+import { isApiKeylessProvider, RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
 import { resolveModelPriceDisplay } from "@/features/canvas/pricing";
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
 import { NodePriceBadge } from "@/features/canvas/ui/NodePriceBadge";
@@ -566,7 +566,8 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
         }
       }
       const { apiKey, baseUrl } = resolveProviderContext(selectedModel);
-      if (!apiKey && selectedModel.providerId !== RUNNINGHUB_CLI_PROVIDER_ID) {
+      // 本地 CLI(即梦画布 / RunningHub)没有 API Key, 统一走 isApiKeylessProvider 判定。
+      if (!apiKey && !isApiKeylessProvider(selectedModel.providerId)) {
         const message = "请在设置中填写 API Key";
         setError(message);
         void showErrorDialog(message, t("common.error"));

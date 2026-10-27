@@ -343,6 +343,8 @@ describe('推荐平台可见白名单(密钥页展示内置推荐平台)', () =>
       'modelscope',
       // api666888: 「暗苗」链路(media 信封 + 火山方舟两种协议混挂)。
       'api666888',
+      // 筷子AI: 火山方舟形态, 只在路径前缀上与灵柯不同。
+      'kz-ai',
     ]);
   });
 
@@ -552,6 +554,8 @@ describe('推荐平台的余额查询声明', () => {
       modelscope: null,
       // api666888 有 /v1/skills/balance, 但尚未接入余额查询, 先不声明。
       api666888: null,
+      // 筷子AI 没有 OpenAI 风格 billing 端点, 不猜数字。
+      'kz-ai': null,
       // likeai520 的额度走站内账本(视频按次/按秒/按 Token 结算), 没有可查的
       // OpenAI 风格 billing 端点 —— 不猜一个数字出来。
       likeai520: null,

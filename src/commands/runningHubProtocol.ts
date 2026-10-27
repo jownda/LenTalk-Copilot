@@ -1209,3 +1209,235 @@ export function runningHubVideoExtraParams(endpointId: string): Record<string, u
     defaults: spec.defaults ?? {},
   };
 }
+
+// ---------------------------------------------------------------------------
+// AI 应用通道: 角色替换 (更换视频人物)
+// ---------------------------------------------------------------------------
+
+/**
+ * ## AI 应用与标准端点的区别
+ *
+ * 标准端点走 `POST /openapi/v2/{endpoint}`, 请求体就是**该端点自己的**参数字典;
+ * AI 应用没有 openapi 端点, 只有一个 `webappId`, 参数按 ComfyUI **节点粒度**提交:
+ *
+ * ```
+ * POST /openapi/v2/run/ai-app/{webappId}
+ * { "nodeInfoList": [{ "nodeId": "200", "fieldName": "image", "fieldValue": "<公网 URL>" }] }
+ * ```
+ *
+ * 所以应用知识(哪个节点是图、画幅枚举长什么样、默认值是多少)**只能写在这里** ——
+ * 后端 `runninghub.rs` 只认端点, 不认识 webappId。
+ */
+
+/** 应用「更换视频人物MinimaxH3」: https://www.runninghub.cn/ai-detail/2112763525239234562 */
+export const RUNNINGHUB_CHARACTER_SWAP_APP_ID = '2112763525239234562';
+
+/**
+ * 应用内的公开输入节点号（取自应用详情页, 2026-10 实测）。
+ *
+ * 其中 `resolution` 节点**同时提供两个字段**: `aspect_ratio` 与 `megapixels`,
+ * 靠 `fieldName` 区分 —— 这是最容易抄漏的一处。
+ */
+export const RUNNINGHUB_CHARACTER_SWAP_NODES = {
+  /**
+   * 提示词(多行)。应用自带一份完整的换人模板 —— 但它是围着一位具体角色写的,
+   * 所以**留空时不要提交这个节点**, 让调用方决定是补通用模板还是就用内置的那份。
+   */
+  prompt: '557',
+  /** 角色参考图(必填)。 */
+  image: '200',
+  /** 待替换的原视频(必填)。 */
+  video: '554',
+  /** Float: 输出时长(秒)。字段名是通用的 `value`, 靠节点号识别。 */
+  duration: '386',
+  /** ResolutionSelector: aspect_ratio + megapixels(同一节点两个字段)。 */
+  resolution: '515',
+  /** BasicScheduler: steps。 */
+  scheduler: '338',
+} as const;
+
+/**
+ * 画幅标签 → 应用里 ResolutionSelector 的 COMBO 取值。
+ *
+ * 平台收的是**带英文描述的整串**(`16:9 (Widescreen)`), 发裸 `16:9` 会被判非法选项。
+ */
+export const RUNNINGHUB_CHARACTER_SWAP_ASPECT_OPTIONS: Record<string, string> = {
+  '1:1': '1:1 (Square)',
+  '2:3': '2:3 (Portrait Photo)',
+  '3:2': '3:2 (Photo)',
+  '3:4': '3:4 (Portrait Standard)',
+  '4:3': '4:3 (Standard)',
+  '9:16': '9:16 (Portrait Widescreen)',
+  '16:9': '16:9 (Widescreen)',
+  '21:9': '21:9 (Ultrawide)',
+};
+
+/** 画幅档位（按官方 schema 顺序；UI 的展示顺序另有一份，两处只需集合一致）。 */
+export const RUNNINGHUB_CHARACTER_SWAP_ASPECT_RATIOS = Object.keys(
+  RUNNINGHUB_CHARACTER_SWAP_ASPECT_OPTIONS,
+);
+
+/** 输出像素的官方区间: 0.1~16 MP, 步长 0.1。 */
+export const RUNNINGHUB_CHARACTER_SWAP_MEGAPIXEL_RANGE = { min: 0.1, max: 16 } as const;
+/** 采样步数的官方区间。应用作者调好的档是 8(不是 schema 默认的 20)。 */
+export const RUNNINGHUB_CHARACTER_SWAP_STEP_RANGE = { min: 1, max: 10000 } as const;
+/**
+ * 输出时长(秒)的收敛区间。
+ *
+ * 应用侧节点是通用 `Float`(step 0.01), 本身不限范围; 这里按"一条短视频"的常识收在
+ * 1~60 秒, 并按 0.1 秒取整 —— 免得手输一个小数点错位的值把任务卡在排队里。
+ */
+export const RUNNINGHUB_CHARACTER_SWAP_DURATION_RANGE = { min: 1, max: 60 } as const;
+/** 应用默认画幅(其 schema 默认是 3:4, 这里跟画布习惯走横屏)。 */
+export const RUNNINGHUB_CHARACTER_SWAP_DEFAULT_ASPECT = '16:9';
+
+/** 数字收敛公共实现: 非有限数 / 非正数 → undefined(表示"不要提交这一项")。 */
+function clampPositive(value: unknown, min: number, max: number, round: (input: number) => number): number | undefined {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return round(Math.min(max, Math.max(min, parsed)));
+}
+
+/**
+ * 像素收敛: 越界夹到 0.1~16, 按 0.1 取整。
+ *
+ * 返回 `undefined` 表示"用户没设 / 值不可用" —— 调用方应当**整个键都不提交**,
+ * 让应用自己的默认值生效, 而不是发一个 0 过去。
+ */
+export function normalizeRunningHubCharacterSwapMegapixels(value: unknown): number | undefined {
+  return clampPositive(
+    value,
+    RUNNINGHUB_CHARACTER_SWAP_MEGAPIXEL_RANGE.min,
+    RUNNINGHUB_CHARACTER_SWAP_MEGAPIXEL_RANGE.max,
+    (input) => Math.round(input * 10) / 10,
+  );
+}
+
+/** 步数收敛: 取整, 夹到 1~10000。 */
+export function normalizeRunningHubCharacterSwapSteps(value: unknown): number | undefined {
+  return clampPositive(
+    value,
+    RUNNINGHUB_CHARACTER_SWAP_STEP_RANGE.min,
+    RUNNINGHUB_CHARACTER_SWAP_STEP_RANGE.max,
+    (input) => Math.round(input),
+  );
+}
+
+/** 时长收敛: 夹到 1~60 秒, 按 0.1 秒取整(应用节点是 step 0.01 的 Float)。 */
+export function normalizeRunningHubCharacterSwapDuration(value: unknown): number | undefined {
+  return clampPositive(
+    value,
+    RUNNINGHUB_CHARACTER_SWAP_DURATION_RANGE.min,
+    RUNNINGHUB_CHARACTER_SWAP_DURATION_RANGE.max,
+    (input) => Math.round(input * 10) / 10,
+  );
+}
+
+/**
+ * 画幅收敛: 标签精确命中 → 按宽高比就近 → 无法解析时回 `undefined`。
+ *
+ * 入参既可能是 UI 的标签(`16:9`), 也可能是像素串(`1280x720`) —— 后者按宽高比
+ * 折算, 否则从像素串复制过来的值会全部落到默认档(横屏请求被静默改成竖屏)。
+ */
+export function normalizeRunningHubCharacterSwapAspect(value: unknown): string | undefined {
+  const wanted = typeof value === 'string' ? value.trim() : '';
+  if (!wanted) return undefined;
+  if (RUNNINGHUB_CHARACTER_SWAP_ASPECT_OPTIONS[wanted]) return wanted;
+  const match = /(\d+(?:\.\d+)?)\s*[x*×:]\s*(\d+(?:\.\d+)?)/i.exec(wanted);
+  if (!match) return undefined;
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || height === 0) return undefined;
+  const target = width / height;
+  let best = RUNNINGHUB_CHARACTER_SWAP_DEFAULT_ASPECT;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const candidate of RUNNINGHUB_CHARACTER_SWAP_ASPECT_RATIOS) {
+    const [candidateWidth, candidateHeight] = candidate.split(':').map(Number);
+    if (!candidateWidth || !candidateHeight) continue;
+    const distance = Math.abs(candidateWidth / candidateHeight - target);
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+export interface RunningHubCharacterSwapInput {
+  /** 已换成公网 URL 的角色参考图。 */
+  imageUrl: string;
+  /** 已换成公网 URL 的待替换视频。 */
+  videoUrl: string;
+  /** 留空 = 用应用内置的换人模板(不提交提示词节点)。 */
+  prompt?: string;
+  /** 输出时长(秒)。 */
+  duration?: number;
+  aspectRatio?: string;
+  megapixels?: number;
+  steps?: number;
+}
+
+/** nodeInfoList 的一项, 与平台口径一致(全部是字符串)。 */
+export interface RunningHubNodeInfo {
+  nodeId: string;
+  fieldName: string;
+  fieldValue: string;
+}
+
+/**
+ * 装填 `nodeInfoList`。
+ *
+ * 两条铁律:
+ * 1. 图片与视频**永远提交**(应用侧没有默认素材);
+ * 2. 其余参数只在有值时提交 —— 应用详情页里那些默认值是作者调好的, 无脑全量提交
+ *    会把画幅压成 1:1、把步数拉到 20, 出片质量反而更差。
+ */
+export function buildRunningHubCharacterSwapNodeInfoList(
+  input: RunningHubCharacterSwapInput,
+): RunningHubNodeInfo[] {
+  const nodeInfoList: RunningHubNodeInfo[] = [
+    { nodeId: RUNNINGHUB_CHARACTER_SWAP_NODES.image, fieldName: 'image', fieldValue: input.imageUrl },
+    { nodeId: RUNNINGHUB_CHARACTER_SWAP_NODES.video, fieldName: 'video', fieldValue: input.videoUrl },
+  ];
+  const prompt = input.prompt?.trim();
+  if (prompt) {
+    nodeInfoList.push({
+      nodeId: RUNNINGHUB_CHARACTER_SWAP_NODES.prompt,
+      fieldName: 'text',
+      fieldValue: prompt,
+    });
+  }
+  const duration = normalizeRunningHubCharacterSwapDuration(input.duration);
+  if (duration !== undefined) {
+    nodeInfoList.push({
+      nodeId: RUNNINGHUB_CHARACTER_SWAP_NODES.duration,
+      fieldName: 'value',
+      fieldValue: String(duration),
+    });
+  }
+  const aspect = normalizeRunningHubCharacterSwapAspect(input.aspectRatio);
+  if (aspect) {
+    nodeInfoList.push({
+      nodeId: RUNNINGHUB_CHARACTER_SWAP_NODES.resolution,
+      fieldName: 'aspect_ratio',
+      fieldValue: RUNNINGHUB_CHARACTER_SWAP_ASPECT_OPTIONS[aspect]!,
+    });
+  }
+  const megapixels = normalizeRunningHubCharacterSwapMegapixels(input.megapixels);
+  if (megapixels !== undefined) {
+    nodeInfoList.push({
+      nodeId: RUNNINGHUB_CHARACTER_SWAP_NODES.resolution,
+      fieldName: 'megapixels',
+      fieldValue: String(megapixels),
+    });
+  }
+  const steps = normalizeRunningHubCharacterSwapSteps(input.steps);
+  if (steps !== undefined) {
+    nodeInfoList.push({
+      nodeId: RUNNINGHUB_CHARACTER_SWAP_NODES.scheduler,
+      fieldName: 'steps',
+      fieldValue: String(steps),
+    });
+  }
+  return nodeInfoList;
+}

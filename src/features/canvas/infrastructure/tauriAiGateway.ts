@@ -1,5 +1,6 @@
 import {
   cancelGenerateVideoJob,
+  characterSwapVideo as characterSwapVideoCommand,
   generateAudio,
   generateAudioAsset,
   generateSunoLyrics as generateAudioLyrics,
@@ -18,7 +19,9 @@ import {
 import { createCompactImageDataUrl, imageUrlToDataUrl } from "@/features/canvas/application/imageData";
 import { throwIfVideoSubmissionCanceled } from "@/features/canvas/application/videoGenerationCancel";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { JIMENG_CLI_PROVIDER_ID, resolveVideoModelProfile } from "@/features/canvas/models";
+import { useJimengCanvasCliStore } from "@/stores/jimengCanvasCliStore";
+import { generateJimengCanvasAudio, generateJimengCanvasVideo } from "@/commands/jimengCanvasCli";
+import { isApiKeylessProvider, JIMENG_CANVAS_CLI_PROVIDER_ID, JIMENG_CLI_PROVIDER_ID, resolveVideoModelProfile } from "@/features/canvas/models";
 import { RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
 import { useRunningHubCliStore } from "@/stores/runningHubCliStore";
 import { toVideoGenerationRequest } from "@/features/canvas/application/videoGeneration";
@@ -35,6 +38,9 @@ import {
   runningHubVideoExtraParams,
 } from "@/commands/runningHubProtocol";
 import { invoke } from "@tauri-apps/api/core";
+import { isKuaiziBaseUrl, resolveKuaiziVideoLimits } from "@/features/canvas/models/kuaiziModels";
+import { resolveKuaiziVideoReferences } from "./kuaiziReferences";
+import { uploadReferencesViaImageHost } from "./imageHostReferences";
 
 type LocalVideoJob = { job_id: string; status: string; result: string | null; error: string | null };
 // 本地 CLI 类视频链路(即梦 / Wan)只能在本机跑可执行文件, 仍由前端适配器承载;
@@ -76,7 +82,11 @@ async function normalizeUrlsForCli(
  */
 export function needsCompatibilityVideoWorker(payload: GenerateVideoPayload): boolean {
   return (
-    payload.model.startsWith("wan-cli/") || payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`) ||
+    payload.model.startsWith("wan-cli/") ||
+    payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`) ||
+    // 即梦画布 CLI 也是本地命令: 不进这个判定就会被打包成 OpenAI 兼容异步任务投给 Rust,
+    // 直接得到「视频生成仅支持自定义平台(custom:*)模型」—— 本地 CLI 分支根本没机会执行。
+    payload.model.startsWith("jimeng-canvas/") ||
     (payload.model.startsWith(`${RUNNINGHUB_CLI_PROVIDER_ID}/`) && !usesRunningHubCliDirectApi(payload.model))
   );
 }
@@ -88,6 +98,7 @@ import type {
   GenerateAudioPayload,
   GenerateImagePayload,
   GenerateVideoPayload,
+  CharacterSwapVideoPayload,
   UpscaleVideoPayload,
 } from "../application/ports";
 import { isMidjourneyImageModel } from "@/features/canvas/models/midjourney";
@@ -381,6 +392,13 @@ function injectCustomApiRequestMode<T extends { model: string; extraParams?: Rec
   ) {
     extraParams.video_transport = "zhiniao-video";
   }
+  // 筷子AI(aiopenapi.kuaizi.cn): 与火山方舟同形, 只有路径前缀不同
+  // (`/ai-open-platform-api/api/v3/contents/generations/tasks`)。不加这条会落到
+  // 通用 OpenAI Video 分支发 `/v1/videos/generations` —— 该站没有这个路径, 直接 404;
+  // 协议层(ark.rs)按 Base URL 自己切前缀, 所以这里只负责挑对 transport。
+  if (providerId === "kz-ai" || isKuaiziBaseUrl(providerBaseUrl)) {
+    extraParams.video_transport = "ark-anmiao";
+  }
   // likeai520(Seedance 独立分组): 用户手动添加平台时 capabilities.videoTransport 可能
   // 为空, 按 Base URL 兜底 —— 否则会掉到通用 OpenAI Video 分支, 发出
   // `/v1/videos/generations`(该站只有 `/v1/videos`)拿 404。
@@ -539,6 +557,55 @@ export function isPubliclyReachableHttpUrl(source: string): boolean {
   return true;
 }
 
+/**
+ * 「只收公网 URL 的平台」参考素材解析 —— 筷子AI 与 likeai520 共用。
+ *
+ * 它们**都没有素材上传接口**, 本地素材必须先换公网地址, 否则 4~14MB 的 data URL 会被
+ * 上游一句 `content[1].image_url.url is too long (…chars, max 4000)` 直接打回。
+ *
+ * 🔴 **视频生成有两条入口**, 两处都要调这个函数, 漏一处就会出现「有时能跑、有时报
+ * url too long」—— 取决于这一次走的是异步 job 还是同步直调:
+ *   1. `submitVideoGenerationJob`(画布默认走这条, 提交完轮询)
+ *   2. `generateVideo`(本地 CLI / 兼容 worker / 同步回退)
+ *
+ * 返回 `null` 表示该平台不吃这一套, 调用方继续用各自的既有逻辑(知鸟 / 通用 data URL)。
+ */
+async function resolveHostedVideoReferences(params: {
+  /** `custom:<平台 id>/<模型>` */
+  modelId: string;
+  extraParams?: Record<string, unknown>;
+  imageSources: string[];
+  audioSources: string[];
+}): Promise<{ images: string[]; audios: string[] } | null> {
+  const baseUrl =
+    typeof params.extraParams?.provider_base_url === "string"
+      ? params.extraParams.provider_base_url
+      : undefined;
+  const profile = resolveVideoModelProfile(params.modelId, baseUrl);
+  const providerKey = params.modelId.split("/")[0] ?? "";
+  if (profile.id === "kuaizi-video") {
+    return await resolveKuaiziVideoReferences({
+      images: params.imageSources,
+      audios: params.audioSources,
+      kuaiziBaseUrl: baseUrl,
+      kuaiziApiKey: useSettingsStore.getState().apiKeys[providerKey] ?? "",
+      ...resolveKuaiziVideoLimits(params.modelId.split("/").slice(1).join("/")),
+    });
+  }
+  if (profile.id === "likeai-video") {
+    // 用户在平台上显式配了自己的「素材上传地址」→ 保持原样交后端, 显式配置优先。
+    const ownUploadHostRaw = params.extraParams?.reference_asset_upload_url;
+    const ownUploadHost =
+      typeof ownUploadHostRaw === "string" && ownUploadHostRaw.trim().length > 0;
+    if (ownUploadHost) return null;
+    return await uploadReferencesViaImageHost({
+      images: params.imageSources,
+      audios: params.audioSources,
+    });
+  }
+  return null;
+}
+
 /** 视频参考图默认使用 OpenAI Video API 可接受的 URL / Data URL。 */
 async function normalizeVideoReferenceImages(
   imageUrls: string[] | undefined,
@@ -615,10 +682,23 @@ async function resolveZzdhReferenceDataUrl(
 
 const referenceDataUrlCache = new Map<string, string>();
 
+/**
+ * 即梦画布 CLI 的模型前缀。
+ * 刻意写成**字面量**而不复用 registry 的常量: 这是协议的一部分, 一旦 barrel 导出出问题
+ * 会变成 `${undefined}/` 从而静默落到通用 OpenAI 视频通道, 报「仅支持自定义平台」。
+ */
+const JIMENG_CANVAS_MODEL_PREFIX = "jimeng-canvas/";
+
 export const tauriAiGateway: AiGateway = {
   setApiKey: async (provider, apiKey) => {
     if (provider === RUNNINGHUB_CLI_PROVIDER_ID) {
       await setApiKey(`custom:${RUNNINGHUB_CLI_PROVIDER_ID}`, apiKey);
+      return;
+    }
+    // 🔴 本地 CLI 平台没有 API Key, 推给 Rust 只会变成 `Unknown provider: xxx`
+    // 并让整个生成任务失败。调用点散落在 Canvas 多处(提交前 / 轮询前), 逐个加条件必漏 ——
+    // 统一在这个唯一入口拦掉。注意必须放在 RunningHub 分支之后(它要转成 custom: 再推)。
+    if (isApiKeylessProvider(provider)) {
       return;
     }
     await setApiKey(provider, apiKey);
@@ -683,7 +763,9 @@ export const tauriAiGateway: AiGateway = {
     // 即梦 CLI 的画幅由 `--ratio` 直接决定, 不需要(也不该)往提示词里追加画幅约束;
     // 其余平台依赖这句英文兜底上游忽略 aspect_ratio 参数的情况。
     // 这里按整个 provider 前缀判断: 普通图片(`image-*`)与超清(`upscale`)都算。
-    const isJimengCliImage = payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`);
+    const isJimengCliImage =
+      payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`) ||
+      payload.model.startsWith(`${JIMENG_CANVAS_CLI_PROVIDER_ID}/`);
     const prompt = localizeReferenceTokens(
       isJimengCliImage ? payload.prompt : withAspectRatioRequirement(payload.prompt, payload.aspectRatio),
       payload.model,
@@ -764,12 +846,21 @@ export const tauriAiGateway: AiGateway = {
         : unifiedRequest.referenceImages;
     const imageSources = imageResources.map((resource) => resource.source);
     // 知鸟只收公网 URL(videoReferenceEncoding: url): 本地素材先经 /v1/files 换成 URL
-    // 再交给后端任务执行器; 其余平台仍走通用规整。
+    // 再交给后端任务执行器; 筷子AI / likeai520 同一类需求(走共用图床), 其余平台仍走通用规整。
     //
-    // 这两步是本链路最长的「还没送到平台」阶段(读本地文件 / 压图 / 上传换 URL),
+    // 这几步是本链路最长的「还没送到平台」阶段(读本地文件 / 压图 / 上传换 URL),
     // 也是「取消生成」最该起作用的窗口 —— 前后各查一次。
-    const referenceImages =
-      injected.extraParams?.video_transport === "zhiniao-video"
+    const hostedReferences = await resolveHostedVideoReferences({
+      modelId: routedPayload.model,
+      extraParams: injected.extraParams,
+      imageSources,
+      audioSources: unifiedRequest.referenceAudio
+        .map((resource) => resource.source.trim())
+        .filter(Boolean),
+    });
+    const referenceImages = hostedReferences
+      ? (hostedReferences.images.length ? hostedReferences.images : undefined)
+      : injected.extraParams?.video_transport === "zhiniao-video"
         ? await resolveZhiniaoImageReferences(imageSources, payload.model.split("/")[0] ?? "")
         : await normalizeVideoReferenceImages(imageSources, injected.extraParams);
     checkCanceled();
@@ -781,7 +872,9 @@ export const tauriAiGateway: AiGateway = {
       video_resolution: unifiedRequest.videoResolution,
       image_mode: routedPayload.imageMode,
       reference_images: referenceImages,
-      reference_audio: unifiedRequest.referenceAudio.map((resource) => resource.source.trim()).filter(Boolean),
+      reference_audio: hostedReferences
+        ? hostedReferences.audios
+        : unifiedRequest.referenceAudio.map((resource) => resource.source.trim()).filter(Boolean),
       extra_params: injected.extraParams,
     });
     // 后端已落任务、请求还在飞 —— 取消窗口继续开着, 等 `get_generate_video_job`
@@ -822,6 +915,30 @@ export const tauriAiGateway: AiGateway = {
         image_mode: payload.imageMode,
         reference_images: referenceImages,
         reference_audio: referenceAudio,
+      });
+    }
+    if (payload.model.trim().startsWith(JIMENG_CANVAS_MODEL_PREFIX)) {
+      const referenceImages = (await normalizeReferenceUrls(payload.referenceImages)) ?? [];
+      const model = payload.model.trim().slice(JIMENG_CANVAS_MODEL_PREFIX.length);
+      // 画布 CLI 的模式是显式的: 有首尾帧 → first_last_frame, 有参考图 → m2v, 都没有 → t2v。
+      const mode =
+        payload.imageMode === "first-last"
+          ? "first_last_frame"
+          : referenceImages.length > 0
+            ? "m2v"
+            : "t2v";
+      return await generateJimengCanvasVideo({
+        executable: useJimengCanvasCliStore.getState().executable,
+        prompt: payload.prompt,
+        model,
+        mode,
+        duration: payload.duration,
+        aspectRatio: payload.aspectRatio,
+        // 分辨率必须用该模型自己的写法（happyhorse/wan 是大写 720P, seedance 是小写 720p）。
+        resolution: payload.videoResolution ?? "720p",
+        referenceImages,
+        // 音频参考同样要带上: m2v 支持最多 10 个, 少了这一步模型只看到图片。
+        referenceAudio: payload.referenceAudio?.map((item) => item.trim()).filter(Boolean),
       });
     }
     if (payload.model.startsWith(`${RUNNINGHUB_CLI_PROVIDER_ID}/`)) {
@@ -892,16 +1009,30 @@ export const tauriAiGateway: AiGateway = {
             (resource): resource is NonNullable<typeof resource> => Boolean(resource),
           )
         : unifiedRequest.referenceImages;
-    const referenceImages = await normalizeVideoReferenceImages(
-      imageResources.map((resource) => resource.source),
-      injected.extraParams,
-    );
+    // 筷子AI / likeai520 都**没有素材上传接口**, 参考素材只能给公网 URL —— 与异步 job
+    // 入口共用同一份解析(见 resolveHostedVideoReferences), 两处必须同源。
+    const hostedReferences = await resolveHostedVideoReferences({
+      modelId: payload.model,
+      extraParams: injected.extraParams,
+      imageSources: imageResources.map((resource) => resource.source),
+      audioSources: unifiedRequest.referenceAudio
+        .map((resource) => resource.source.trim())
+        .filter(Boolean),
+    });
+    const referenceImages = hostedReferences
+      ? (hostedReferences.images.length ? hostedReferences.images : undefined)
+      : await normalizeVideoReferenceImages(
+          imageResources.map((resource) => resource.source),
+          injected.extraParams,
+        );
     // 音频直传: 直接把上游音频 URL 数组透传给后端(不做 /v1/files 上传),
     // 由后端按 audio_url / audio_urls 字段提交给平台。
-    const referenceAudio = unifiedRequest.referenceAudio
-      .map((resource) => resource.source)
-      .map((audioUrl) => audioUrl.trim())
-      .filter(Boolean);
+    const referenceAudio = hostedReferences
+      ? hostedReferences.audios
+      : unifiedRequest.referenceAudio
+          .map((resource) => resource.source)
+          .map((audioUrl) => audioUrl.trim())
+          .filter(Boolean);
     const generatedUrl = await generateVideo({
       prompt: unifiedRequest.prompt,
       model: unifiedRequest.modelId,
@@ -937,6 +1068,34 @@ export const tauriAiGateway: AiGateway = {
     return await persistVideoLocally(upscaledUrl);
   },
   /**
+   * 角色替换(换人 / 动作迁移)。
+   *
+   * 与超分一样是「本地素材先换公网 URL, 平台侧跑完再抓回本地」, 但素材从 1 份变成 2 份
+   * (角色图 + 原视频), 且参数走 RunningHub AI App 的 nodeInfoList 而不是端点 schema。
+   * 协议实现只在 `@/commands/ai` 一处, 这里只负责把 provider 的 Base URL 补进 extra_params。
+   */
+  characterSwapVideo: async (payload: CharacterSwapVideoPayload) => {
+    const api = useSettingsStore
+      .getState()
+      .customApis.find((item) => item.id === payload.model.split("/")[0]?.replace("custom:", ""));
+    const providerBaseUrl =
+      typeof payload.extraParams?.provider_base_url === "string"
+        ? payload.extraParams.provider_base_url
+        : (api?.baseUrl ?? "");
+    const swappedUrl = await characterSwapVideoCommand({
+      characterImage: payload.characterImage,
+      videoSource: payload.videoSource,
+      model: payload.model,
+      prompt: payload.prompt,
+      duration: payload.duration,
+      aspectRatio: payload.aspectRatio,
+      megapixels: payload.megapixels,
+      steps: payload.steps,
+      extra_params: { ...payload.extraParams, provider_base_url: providerBaseUrl },
+    });
+    return await persistVideoLocally(swappedUrl);
+  },
+  /**
    * 音频生成(语音合成 / 音效 / 音乐)。
    *
    * 三条互不相同的链路, 由适配层按模型名与平台分流:
@@ -946,6 +1105,20 @@ export const tauriAiGateway: AiGateway = {
    *   - 其余平台        → OpenAI 兼容 /v1/audio/speech
    */
   generateAudio: async (payload: GenerateAudioPayload) => {
+    if (payload.model.startsWith(`${JIMENG_CANVAS_CLI_PROVIDER_ID}/`)) {
+      const model = payload.model.slice(`${JIMENG_CANVAS_CLI_PROVIDER_ID}/`.length);
+      // 目前只有两个音频模型: legacy_tts(配音) 与 seed_music_1.0(音乐)。
+      const isMusic = model === "seed_music_1.0";
+      const referenceAudio = payload.referenceAudio?.trim() ? [payload.referenceAudio.trim()] : undefined;
+      return await generateJimengCanvasAudio({
+        executable: useJimengCanvasCliStore.getState().executable,
+        prompt: payload.prompt,
+        model,
+        mode: isMusic ? "music" : "tts",
+        duration: isMusic ? 30 : undefined,
+        referenceAudio,
+      });
+    }
     if (payload.model.startsWith(`${RUNNINGHUB_CLI_PROVIDER_ID}/`)) {
       const endpoint = payload.model.slice(`${RUNNINGHUB_CLI_PROVIDER_ID}/`.length);
       const params = [

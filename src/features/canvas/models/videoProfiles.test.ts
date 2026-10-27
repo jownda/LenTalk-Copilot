@@ -131,4 +131,23 @@ describe('resolveVideoModelProfile', () => {
       resolveVideoModelProfile('custom:炳火-api/seedance-2.0-480p', 'https://api.7tai.cc/v1').id,
     ).toBe('binghuo-video');
   });
+
+  it('routes 筷子AI models through the ark-shaped kuaizi profile', () => {
+    const profile = resolveVideoModelProfile('custom:kz-ai/doubao-seedance-2-0-260128');
+    expect(profile.id).toBe('kuaizi-video');
+    expect(profile.status).toBe('verified');
+    // 与方舟同形, 只有路径前缀不同。
+    expect(profile.submitPath).toBe('/ai-open-platform-api/api/v3/contents/generations/tasks');
+    expect(profile.queryPath).toBe('/ai-open-platform-api/api/v3/contents/generations/tasks/{taskId}');
+    // 只收 http(s) 或本平台 asset://, 拒绝 base64 —— 不能标成 data-url。
+    expect(profile.referenceImageTarget).toBe('public-url');
+    expect(profile.supportsReferenceImages).toBe(true);
+    expect(profile.supportsReferenceAudio).toBe(true);
+  });
+
+  it('recognizes the 筷子AI base URL even when the custom platform id differs', () => {
+    expect(
+      resolveVideoModelProfile('custom:筷子-ai/doubao-seedance-2-5-260628', 'https://aiopenapi.kuaizi.cn').id,
+    ).toBe('kuaizi-video');
+  });
 });

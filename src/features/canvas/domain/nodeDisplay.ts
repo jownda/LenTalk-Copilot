@@ -24,6 +24,14 @@ export const DEFAULT_NODE_DISPLAY_NAME: Record<CanvasNodeType, string> = {
   [CANVAS_NODE_TYPES.seamlessMosaic]: '无缝拼图',
 };
 
+/**
+ * 「角色替换」模式的默认标题。
+ *
+ * 动作控制节点有三个模式，但共用一个节点类型；默认标题还停在「动作控制 / 对口型」
+ * 时（用户没自己改过名字），切到角色替换就跟着换，免得标题与面板内容对不上。
+ */
+export const MOTION_CONTROL_SWAP_DISPLAY_NAME = '角色替换';
+
 export const EXPORT_RESULT_DISPLAY_NAME: Record<ExportImageNodeResultKind, string> = {
   generic: '结果图片',
   storyboardGenOutput: '分镜输出',

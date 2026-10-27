@@ -2,12 +2,13 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, ArrowLeft, ArrowRight, CheckCircle2, Mic, Replace, Search, Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { chatCompletion } from '@/commands/ai';
 import { UiButton, UiCheckbox, UiInput, UiModal, UiSelect, UiTextArea } from '@/components/ui';
 import { replaceAllText, replaceTextAt, resolveTextMatchIndexes } from '../application/textNodeEditing';
 import { isTextAnnotationNode, type CanvasNode } from '@/features/canvas/domain/canvasNodes';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { useTextAiEditStore } from '@/stores/textAiEditStore';
+import type { AiEditResult } from '../application/textAiEdit';
 
 type TextNodeEditDialogMode = 'ai' | 'find';
 
@@ -17,12 +18,6 @@ interface TextNodeEditDialogProps {
   onClose: () => void;
 }
 
-interface AiEditResult {
-  text: string;
-  assessment: string;
-  issues: string[];
-  changes: string[];
-}
 
 interface ChatModelOption {
   key: string;
@@ -56,52 +51,6 @@ function getSpeechRecognitionConstructor(): SpeechRecognitionConstructor | null 
     webkitSpeechRecognition?: SpeechRecognitionConstructor;
   };
   return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
-}
-
-const AI_EDIT_SYSTEM_PROMPT = `你是影视编剧和分镜连续性审校助手。你需要根据用户的自然语言要求修改一段文本，并对修改后的整段文本做逻辑审校。
-
-审校必须检查：
-1. 事件顺序、因果关系、时间线和人物身份是否前后一致。
-2. 人物所在空间、相互位置、视线和朝向是否与动作及身体部位一致。例如医生与病人面对面时，病人说膝盖痛通常面向医生；如果说腰椎痛，需要明确病人转身背对医生或医生从背后检查，不能让文字同时表达两种冲突的朝向。
-3. 场景转换、道具状态、动作主体和指代对象是否清楚。
-4. 修改要求没有覆盖的事实、语气、Markdown 结构尽量保持不变。
-发现逻辑、动作或朝向冲突时，必须优先在 text 中主动修复，让整段自洽；issues 只记录已修复的关键冲突或确实无法确认的事项，不能只指出问题而不修正文案。
-
-只返回 JSON，不要使用 Markdown 代码围栏，格式必须是：
-{"text":"修改后的完整文本","assessment":"通顺或存在问题","issues":["问题1"],"changes":["修改点1"]}
-如果没有问题，issues 返回空数组。text 必须是完整文本，不能只返回改动片段。`;
-
-function stripJsonFence(value: string): string {
-  return value.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-}
-
-function parseAiEditResult(raw: string): AiEditResult {
-  const cleaned = stripJsonFence(raw);
-  try {
-    const parsed = JSON.parse(cleaned) as Partial<AiEditResult>;
-    if (typeof parsed.text === 'string' && parsed.text.trim()) {
-      return {
-        text: parsed.text,
-        assessment: typeof parsed.assessment === 'string' ? parsed.assessment : '',
-        issues: Array.isArray(parsed.issues) ? parsed.issues.filter((item): item is string => typeof item === 'string') : [],
-        changes: Array.isArray(parsed.changes) ? parsed.changes.filter((item): item is string => typeof item === 'string') : [],
-      };
-    }
-  } catch {
-    // Some compatible endpoints ignore the JSON instruction. Keep their plain-text result usable.
-  }
-  return { text: cleaned, assessment: '', issues: [], changes: [] };
-}
-
-function buildAiUserPrompt(text: string, instruction: string, preserveMarkdown: boolean): string {
-  return [
-    '请修改下面的文本。',
-    `用户修改要求：${instruction.trim()}`,
-    preserveMarkdown ? '请保留原有 Markdown 标记和段落结构。' : '可以根据语义调整段落结构，但不要添加无关内容。',
-    '',
-    '原文：',
-    text,
-  ].join('\n');
 }
 
 function renderHighlightedText(text: string, query: string, caseSensitive: boolean, activeIndex: number): ReactNode {
@@ -138,8 +87,14 @@ export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogPr
   const [instruction, setInstruction] = useState('');
   const [preserveMarkdown, setPreserveMarkdown] = useState(true);
   const [selectedModelKey, setSelectedModelKey] = useState('');
-  const [aiResult, setAiResult] = useState<AiEditResult | null>(null);
-  const [isGenerating, setIsGenerating] = useState(false);
+  // 任务状态放在 store 里, 弹窗只是它的视图 —— 关窗后请求继续跑, 重开能接着看。
+  const aiTask = useTextAiEditStore((state) =>
+    state.task && state.task.nodeId === node.id ? state.task : null,
+  );
+  const startTextAiEdit = useTextAiEditStore((state) => state.start);
+  const applyTextAiEdit = useTextAiEditStore((state) => state.apply);
+  const aiResult: AiEditResult | null = aiTask?.result ?? null;
+  const isGenerating = aiTask?.status === 'running';
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
@@ -172,7 +127,6 @@ export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogPr
     if (isNewNode) {
       initializedNodeIdRef.current = node.id;
       setError(null);
-      setAiResult(null);
       setInstruction('');
       setQuery('');
       setReplacement('');
@@ -241,22 +195,20 @@ export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogPr
 
   const handleGenerate = async () => {
     if (!instruction.trim() || !selectedModel) return;
-    setIsGenerating(true);
     setError(null);
     setTextNodeAiSelection({ provider: selectedModel.providerId, model: selectedModel.model });
-    try {
-      const raw = await chatCompletion(selectedModel.baseUrl, selectedModel.apiKey, selectedModel.model, [
-        { role: 'system', content: AI_EDIT_SYSTEM_PROMPT },
-        { role: 'user', content: buildAiUserPrompt(text, instruction, preserveMarkdown) },
-      ]);
-      const result = parseAiEditResult(raw);
-      if (!result.text.trim()) throw new Error(t('textNodeEdit.aiEmptyResult'));
-      setAiResult(result);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setIsGenerating(false);
-    }
+    // 请求交给 store 跑: 这个 await 只等「本地记录写完」, 结果由 aiTask 订阅呈现,
+    // 所以中途关掉弹窗也不会中断生成。
+    void startTextAiEdit({
+      nodeId: node.id,
+      text,
+      instruction,
+      preserveMarkdown,
+      baseUrl: selectedModel.baseUrl,
+      apiKey: selectedModel.apiKey,
+      model: selectedModel.model,
+      modelLabel: `${selectedModel.providerName} · ${selectedModel.model}`,
+    });
   };
 
   const replaceAll = () => {
@@ -299,7 +251,7 @@ export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogPr
         mode === 'ai' ? (
           <>
             <UiButton variant="ghost" size="sm" onClick={onClose}>{t('common.cancel')}</UiButton>
-            {aiResult ? <UiButton variant="primary" size="sm" onClick={() => { updateNodeData(node.id, { content: aiResult.text }); onClose(); }}>{t('textNodeEdit.applyResult')}</UiButton> : null}
+            {aiResult ? <UiButton variant="primary" size="sm" onClick={() => { applyTextAiEdit(node.id); onClose(); }}>{t('textNodeEdit.applyResult')}</UiButton> : null}
           </>
         ) : (
           <UiButton variant="ghost" size="sm" onClick={onClose}>{t('common.close')}</UiButton>
@@ -318,7 +270,7 @@ export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogPr
             <label className="flex items-center gap-2 text-xs text-text-muted"><UiCheckbox checked={preserveMarkdown} onCheckedChange={setPreserveMarkdown} />{t('textNodeEdit.preserveMarkdown')}</label>
             <UiButton variant="primary" size="sm" disabled={isGenerating || !instruction.trim() || !selectedModel} onClick={() => void handleGenerate()}><Sparkles className="h-3.5 w-3.5" />{isGenerating ? t('textNodeEdit.generating') : t('textNodeEdit.run')}</UiButton>
           </div>
-          {error ? <div className="flex gap-2 rounded-lg border border-red-400/30 bg-red-400/10 p-2.5 text-xs text-red-200"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div> : null}
+          {(error || aiTask?.error) ? <div className="flex gap-2 rounded-lg border border-red-400/30 bg-red-400/10 p-2.5 text-xs text-red-200"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />{error || aiTask?.error}</div> : null}
           <div className="grid gap-3 md:grid-cols-2">
             <section className="min-w-0"><h3 className="mb-1.5 text-xs font-medium text-text-muted">{t('textNodeEdit.original')}</h3><div className="ui-scrollbar h-64 overflow-auto whitespace-pre-wrap rounded-lg border border-white/10 bg-bg-dark/35 p-3 text-xs leading-5 text-text-muted">{text || t('node.textAnnotation.empty')}</div></section>
             <section className="min-w-0"><h3 className="mb-1.5 text-xs font-medium text-text-muted">{t('textNodeEdit.preview')}</h3><div className="ui-scrollbar h-64 overflow-auto whitespace-pre-wrap rounded-lg border border-accent/30 bg-accent/5 p-3 text-xs leading-5 text-text-dark">{aiResult?.text || t('textNodeEdit.previewHint')}</div></section>

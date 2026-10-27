@@ -584,15 +584,51 @@ export interface AudioGenNodeData extends NodeDisplayData {
   [key: string]: unknown;
 }
 
-export type MotionControlMode = "motion-control" | "lip-sync";
+export type MotionControlMode = "motion-control" | "lip-sync" | "character-swap";
 export type MotionControlOrientation = "image" | "video";
 export type MotionControlLipSyncInput = "image" | "video";
 
 /**
- * 动作控制 / 对口型节点。
+ * 角色替换的画幅档位。
+ *
+ * 必须与 RunningHub 应用「更换视频人物MinimaxH3」里 ResolutionSelector 的选项
+ * **同集合** —— 平台按枚举校验，多发一个自定义比例会被判非法参数。
+ */
+export const CHARACTER_SWAP_ASPECT_RATIOS = [
+  "16:9",
+  "9:16",
+  "1:1",
+  "4:3",
+  "3:4",
+  "3:2",
+  "2:3",
+  "21:9",
+] as const;
+export type CharacterSwapAspectRatio = (typeof CHARACTER_SWAP_ASPECT_RATIOS)[number];
+
+/**
+ * 输出总像素档位（MP）。应用声明区间是 0.1~16，这里只暴露常用档：
+ * 0.8 ≈ 1216x672（16:9）、1.0 ≈ 1376x768、2.0 ≈ 1920x1088（16:9）。
+ */
+export const CHARACTER_SWAP_MEGAPIXEL_OPTIONS = [0.4, 0.6, 0.8, 1, 1.2, 1.5, 2] as const;
+
+/** 采样步数档位。应用作者调好的档是 8，档位表以它为中心。 */
+export const CHARACTER_SWAP_STEP_OPTIONS = [4, 6, 8, 10, 12, 16, 20] as const;
+
+/**
+ * 输出时长档位（秒）。
+ *
+ * 应用侧那个节点是 step 0.01 的通用 Float，本身不限制范围；这里只给短视频常用档，
+ * 免得用户在小方框里手打出一个 0.5 或 300 秒的时长。
+ */
+export const CHARACTER_SWAP_DURATION_OPTIONS = [3, 4, 5, 6, 8, 10, 12, 15] as const;
+
+/**
+ * 动作控制 / 对口型 / 角色替换节点。
  *
  * 这不是普通视频生成节点的别名：动作控制使用角色图 + 动作参考视频，
- * Kling 对口型使用已有视频 + 音频，字字动画对口型还支持人物图片 + 音频。
+ * Kling 对口型使用已有视频 + 音频，字字动画对口型还支持人物图片 + 音频，
+ * 角色替换则是 RunningHub 应用：角色图 + 原视频 → 只换人不换动作。
  */
 export interface MotionControlNodeData extends NodeDisplayData {
   mode: MotionControlMode;
@@ -613,6 +649,21 @@ export interface MotionControlNodeData extends NodeDisplayData {
   audioPreviewUrl?: string | null;
   faceSessionId?: string;
   faceId?: string;
+  /**
+   * 角色替换的四个应用参数。与 `resolution` / `characterOrientation` 分开存，
+   * 切换模式时不会互相覆盖。`prompt` 与角色图 / 原视频复用上面的公共字段。
+   */
+  swapAspectRatio?: CharacterSwapAspectRatio;
+  swapMegapixels?: number;
+  swapSteps?: number;
+  /** 输出时长（秒）：应用里的通用 Float 节点控制成片长度。 */
+  swapDuration?: number;
+  /**
+   * 角色替换固定走 RunningHub，不走 `model` 下拉。
+   * 单独记 provider id，避免在动作控制 ↔ 对口型 ↔ 角色替换之间来回切换时把
+   * 另一个模式选好的模型冲掉。
+   */
+  swapProviderId?: string;
   isGenerating?: boolean;
   generationError?: string | null;
   outputVideoUrl?: string | null;

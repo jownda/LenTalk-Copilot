@@ -8,6 +8,11 @@
 //   - 提交 `POST /v1/videos`, 轮询 `GET /v1/videos/{id}`, 成片 `GET /v1/videos/{id}/content`;
 //   - 时长字段是 `duration`(整数秒; `seconds` 只是别名, **两者不能同传**);
 //   - 画幅字段是 `ratio`(不是 aspect_ratio), 分辨率 `resolution`(720p / 1080p);
+//     🔴 **不做任何画幅改写/重试**: 平台按「该型号在该渠道已开放的值」校验, 报错原文
+//     `supported ratio is required`(校验顺序 分辨率 → 时长 → 画幅)。实测本机 Key 下
+//     `doubao-seedance-2.5` 与 `2.0-mini` **只开放 16:9**(连 adaptive 都拒), `2.0` 才
+//     全画幅 + 4K。可用值由前端按型号过滤(`models/likeaiModels.ts` 是同一份实测快照),
+//     这里只负责把被拒的画幅翻译成能照着做的文案;
 //   - **有素材时正文必须放进 `content` 数组, 且不能再传 `prompt`**(文档明确二选一);
 //   - 素材角色是 `first_frame` / `last_frame` / `reference_image` / `reference_audio`,
 //     URL 包在同名对象里(`{"image_url": {"url": ...}}`);
@@ -80,11 +85,54 @@ fn is_terminal_failure(status: &str) -> bool {
     )
 }
 
+/// 这条 400 是否属于「画幅取值不被接受」。
+///
+/// 平台原文形如 `supported ratio is required`(校验顺序: 分辨率 → 时长 → 画幅)。
+/// 只用来**把错误讲清楚**, 不做自动重试 —— 实测该渠道对 `doubao-seedance-2.5` 只开放
+/// `16:9`（连 `adaptive` 都拒），换哪个值猜都没用；能选的画幅已由前端按型号过滤
+/// （`src/features/canvas/models/likeaiModels.ts`，同一份实测快照）。
+fn is_ratio_rejected(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("supported ratio") || (lower.contains("ratio") && lower.contains("required"))
+}
+
+/// 创建任务的一发请求。返回 (HTTP 状态, 原始响应, 解析后的 JSON)。
+async fn post_create_task(
+    ctx: &SubmitContext,
+    body: &Value,
+) -> Result<(reqwest::StatusCode, String, Value), AIError> {
+    let submit_url = format!("{}{}", ctx.base_url.trim_end_matches('/'), SUBMIT_PATH);
+    let response = ctx
+        .client
+        .post(&submit_url)
+        .bearer_auth(&ctx.api_key)
+        .header("Accept-Encoding", "identity")
+        .json(body)
+        .send()
+        .await
+        .map_err(|error| {
+            AIError::Provider(format!(
+                "{} 视频请求失败(网络): {}",
+                PLATFORM_LABEL,
+                describe_reqwest_error(&error)
+            ))
+        })?;
+    let status = response.status();
+    let raw = response.text().await.unwrap_or_default();
+    let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    Ok((status, raw, payload))
+}
+
 /// 本机素材 → 图床换公网 URL。
 ///
 /// 平台本身没有上传接口, 所以这里**只走用户显式配置的图床**(设置页的
 /// `referenceAssetUploadUrl`)。没配就直接报错并说明怎么配 —— 把 data URL 硬发过去
 /// 只会换来一个 400(文档要求素材必须是 HTTPS), 用户看不出该改什么。
+///
+/// ⚠ 画布侧的常规路径**已经在前面做掉了**: `tauriAiGateway` 会把本地素材先传知鸟图床
+/// 换成 https 直链再送进来(见 `infrastructure/imageHostReferences.ts`), 所以正常情况
+/// 这里收到的都是公网 URL。走到这个报错说明绕过了前端(或知鸟没配好), 文案要同时给出
+/// 「配知鸟」和「填自定义图床」两条路。
 ///
 /// 鉴权用 `reference_asset_upload_token` 而**不是**平台 Key: 图床通常是第三方,
 /// 把 likeai520 的 Key 发给它等于泄露。
@@ -103,7 +151,8 @@ async fn material_url(
     if upload_url.is_empty() {
         return Err(AIError::InvalidRequest(format!(
             "{} 没有素材上传接口，参考{} {} 必须是公网 HTTPS 地址。\
-             想直接用画布上的本机素材，请在平台设置的「素材上传地址」里填一个图床(上传后返回 URL)。",
+             本地素材会先自动上传到「知鸟 AI」图床，请先在设置里添加知鸟 AI 并填写 Key；\
+             也可以在本平台设置里填一个自己的「素材上传地址」(上传后返回 URL)。",
             PLATFORM_LABEL,
             kind,
             index + 1
@@ -195,8 +244,13 @@ pub async fn submit(ctx: &SubmitContext, request: &GenerateVideoRequest) -> Resu
         content.push(material_item("音频", "reference_audio", &url));
     }
 
+    // 画幅原样发。不做「猜一个能过的值」的自动改写/重发:
+    // 该渠道按型号配置开放值, 实测 `doubao-seedance-2.5` 只开 16:9(adaptive 也拒),
+    // 换值只会再吃一次 400; 能选的画幅已由前端按型号过滤(likeaiModels.ts)。
+    let ratio = request.aspect_ratio.trim().to_string();
+
     let mut body = Map::new();
-    body.insert("model".into(), Value::String(model));
+    body.insert("model".into(), Value::String(model.clone()));
     if sources.is_empty() && audios.is_empty() {
         body.insert("prompt".into(), Value::String(request.prompt.clone()));
     } else {
@@ -207,9 +261,8 @@ pub async fn submit(ctx: &SubmitContext, request: &GenerateVideoRequest) -> Resu
     if request.duration > 0 {
         body.insert("duration".into(), json!(request.duration));
     }
-    let ratio = request.aspect_ratio.trim();
     if !ratio.is_empty() {
-        body.insert("ratio".into(), Value::String(ratio.to_string()));
+        body.insert("ratio".into(), Value::String(ratio.clone()));
     }
     if let Some(resolution) = request
         .video_resolution
@@ -228,26 +281,9 @@ pub async fn submit(ctx: &SubmitContext, request: &GenerateVideoRequest) -> Resu
         }
     }
 
-    let submit_url = format!("{}{}", ctx.base_url.trim_end_matches('/'), SUBMIT_PATH);
-    let response = ctx
-        .client
-        .post(&submit_url)
-        .bearer_auth(&ctx.api_key)
-        .header("Accept-Encoding", "identity")
-        .json(&Value::Object(body))
-        .send()
-        .await
-        .map_err(|error| {
-            AIError::Provider(format!(
-                "{} 视频请求失败(网络): {}",
-                PLATFORM_LABEL,
-                describe_reqwest_error(&error)
-            ))
-        })?;
-    let status = response.status();
-    let raw = response.text().await.unwrap_or_default();
-    let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let (status, raw, payload) = post_create_task(ctx, &Value::Object(body)).await?;
 
+    let submit_url = format!("{}{}", ctx.base_url.trim_end_matches('/'), SUBMIT_PATH);
     if !status.is_success() {
         // 文档: 错误响应里若带 task_id, 说明上游可能已经收到 —— 必须查原任务,
         // 不能重新提交(会二次扣费)。这里直接返回句柄, 让轮询流程去核实。
@@ -259,6 +295,19 @@ pub async fn submit(ctx: &SubmitContext, request: &GenerateVideoRequest) -> Resu
                 urlencoding::encode(&task_id)
             );
             return Ok(queued(task_id, &ctx.provider_id, TRANSPORT, query_url, None));
+        }
+        // 画幅被拒时给一句能照着做的: 平台原文只有 `supported ratio is required`,
+        // 用户看不出「是型号没开放这个比例」还是「自己填错了」。
+        if is_ratio_rejected(&raw) {
+            return Err(AIError::InvalidRequest(format!(
+                "{} 不接受画幅 {}：该渠道按型号开放画幅, 不是所有比例都能用\
+                 (实测 doubao-seedance-2.5 与 2.0-mini 只开放 16:9, 2.0 / 2.0-fast 才支持 9:16)。\
+                 请在节点的画幅下拉里重新选择(已按型号过滤可用项), 竖屏建议改用 doubao-seedance-2.0。\
+                 平台原文: {}",
+                PLATFORM_LABEL,
+                ratio,
+                truncate(&raw, 300)
+            )));
         }
         return Err(http_error(
             &format!("{} 视频请求失败", PLATFORM_LABEL),
@@ -365,6 +414,21 @@ mod tests {
         let audio = material_item("音频", "reference_audio", "https://cdn/a.mp3");
         assert_eq!(audio["type"], "audio_url");
         assert_eq!(audio["audio_url"]["url"], "https://cdn/a.mp3");
+    }
+
+    #[test]
+    fn 只有画幅类_400_会被翻译成可行动文案() {
+        assert!(is_ratio_rejected(
+            r#"{"error":{"message":"supported ratio is required","type":"video_error"}}"#
+        ));
+        // 分辨率 / 时长 / 鉴权的问题不能被当成画幅问题, 否则用户会一直改画幅
+        assert!(!is_ratio_rejected(
+            r#"{"error":{"message":"explicit supported resolution is required","type":"video_error"}}"#
+        ));
+        assert!(!is_ratio_rejected(
+            r#"{"error":{"message":"duration must be an integer within configured limits","type":"video_error"}}"#
+        ));
+        assert!(!is_ratio_rejected(r#"{"error":{"message":"invalid api key"}}"#));
     }
 
     #[test]

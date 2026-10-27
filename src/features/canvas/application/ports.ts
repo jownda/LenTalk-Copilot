@@ -70,6 +70,25 @@ export interface UpscaleVideoPayload {
   bitRate?: number | string;
   extraParams?: Record<string, unknown>;
 }
+
+/**
+ * 角色替换（换人 / 动作迁移）。
+ *
+ * 两条素材都是必填：`characterImage` 决定换成谁，`videoSource` 决定动作、镜头与场景。
+ * `prompt` 留空时用 RunningHub 应用内置的换人模板，而不是发一个空串过去。
+ */
+export interface CharacterSwapVideoPayload {
+  characterImage: string;
+  videoSource: string;
+  model: string;
+  prompt?: string;
+  /** 输出时长（秒）。 */
+  duration?: number;
+  aspectRatio?: string;
+  megapixels?: number;
+  steps?: number;
+  extraParams?: Record<string, unknown>;
+}
 export type GenerateAudioKind = "speech" | "sound-effects" | "music";
 
 /**
@@ -268,6 +287,8 @@ export interface AiGateway {
   generateVideo: (payload: GenerateVideoPayload) => Promise<string>;
   /** 视频超分：本地视频先上传换 URL，提交后轮询取片。 */
   upscaleVideo: (payload: UpscaleVideoPayload) => Promise<string>;
+  /** 角色替换：角色图 + 原视频，由 RunningHub AI 应用执行换人。 */
+  characterSwapVideo: (payload: CharacterSwapVideoPayload) => Promise<string>;
   generateAudio: (payload: GenerateAudioPayload) => Promise<string>;
   /** 创建音色资产(音色克隆 / 音色设计)。产出 voice_id, 不是音频。 */
   generateAudioAsset: (payload: GenerateAudioAssetPayload) => Promise<GenerateAudioAssetResultPayload>;

@@ -10,6 +10,7 @@ use std::os::windows::process::CommandExt;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
@@ -23,6 +24,19 @@ const CLI_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_SUBMIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CLI_TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const JIMENG_CLI_MAX_REFERENCE_IMAGES: usize = 9;
+
+/// 画布素材上传(`resource upload`)的单次超时: 4K 图和音频单个可能几十 MB,
+/// 30 秒的通用命令超时在慢网下必然不够。
+const CANVAS_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 画布素材上传的最大尝试次数与退避。
+///
+/// 与生成提交的保守策略(见 `JIMENG_SUBMIT_MAX_ATTEMPTS` 上方注释)不是一回事: 上传素材
+/// **不消耗积分**, 而且下面用内容哈希派生 `--resource-id` 幂等键, 重试不会在服务端留下
+/// 重复对象。最坏情况也只是多一个孤儿素材, 代价远小于把 `human_intervention` 原样甩给用户。
+const CANVAS_UPLOAD_MAX_ATTEMPTS: u32 = 3;
+const CANVAS_UPLOAD_RETRY_BACKOFF_MS: [u64; 2] = [1_500, 4_000];
+
 
 // 提交阶段的重试策略 —— 一切以即梦官方规则为准, 首要保证**不重复扣费**。
 //
@@ -823,7 +837,11 @@ fn humanize_jimeng_failure(reason: &str) -> Option<&'static str> {
     }
     if lowered.contains("aigccomplianceconfirmationrequired") {
         return Some(
-            "说明: 该模型首次使用需要在即梦 Web 端先完成一次合规确认(官方 CLI 说明里的 AigcComplianceConfirmationRequired)。\n             建议: 打开即梦官网, 用同一个模型先成功生成一次, 之后 CLI 就能正常提交。",
+            "需要先在即梦 Web 端用这个模型完成一次首次生成（即梦官方的 AIGC 合规确认，ret=4010）。\n\
+             影响: 请求在提交接口就被拒，任务从未创建 —— 所以即梦后台查不到记录、也没有扣积分，不是丢了任务。\n\
+             做法: 到「设置 - 密钥 - 即梦 CLI」点「打开即梦网页」，用**当前 CLI 登录的同一个账号**\
+             选「全能参考 / Seedance 2.5」生成一次并同意页面上的合规提示，再回来重试即可。\
+             合规确认按「账号 + 模型」记，换了账号要重新做一次。",
         );
     }
     if lowered.contains("not login")
@@ -943,6 +961,16 @@ fn describe_submit_failure_context(
         None => lines.push(probe_upload_host(Duration::from_millis(2_500))),
     }
     lines
+}
+
+/// 是否需要人工先去网页端完成一次「模型首次生成」的合规确认。
+///
+/// 这类失败是**硬前置**: 重试多少次都没用, 所以提示必须放在报错的最前面,
+/// 不能混在一堆技术细节后面。
+fn is_compliance_blocker(reason: &str) -> bool {
+    reason
+        .to_ascii_lowercase()
+        .contains("aigccomplianceconfirmationrequired")
 }
 
 /// 轮询阶段失败的完整说明。
@@ -1253,8 +1281,13 @@ fn submit_jimeng_command(
             // 这一类失败(参数错、审核拦截、无法核实的超时等)原来只回一句原始错误,
             // 补上中文说明、日志取证与官方日志位置, 用户才知道下一步该做什么。
             if let Some(hint) = humanize_jimeng_failure(&failure_reason) {
-                message.push('\n');
-                message.push_str(hint);
+                if is_compliance_blocker(&failure_reason) {
+                    // 必须人工去网页做一次, 顶到第一行。
+                    message = format!("{hint}\n{message}");
+                } else {
+                    message.push('\n');
+                    message.push_str(hint);
+                }
             }
             if let Some(note) = &diagnosis {
                 message.push('\n');
@@ -1275,8 +1308,12 @@ fn submit_jimeng_command(
                 message.push_str(&note.join("\n"));
             }
             if let Some(hint) = humanize_jimeng_failure(&failure_reason) {
-                message.push('\n');
-                message.push_str(hint);
+                if is_compliance_blocker(&failure_reason) {
+                    message = format!("{hint}\n{message}");
+                } else {
+                    message.push('\n');
+                    message.push_str(hint);
+                }
             }
             message.push('\n');
             message.push_str(&cli_log_hint());
@@ -1397,12 +1434,17 @@ fn run_cli_with_timeout(
 
 /// 与 `run_cli_with_timeout` 相同, 但可追加环境变量 —— 重试时用它把系统代理显式传给
 /// 即梦 CLI(它不读 Windows 系统代理, 只认 `HTTP_PROXY` / `HTTPS_PROXY`)。
-fn run_cli_with_timeout_env(
+/// 执行 CLI 并**保留退出码**: 返回 `(成功, 合并输出)`。
+///
+/// 设备码轮询(`auth wait`)这类命令会把「本轮没等到」编码成**非零退出码 + JSON 错误体**。
+/// 用 `run_cli` 会把它直接变成 Err, 于是永远读不到 `error.code`, 只能看到一个干巴巴的
+/// 「命令执行失败」。需要读错误体内部的调用方要用这个版本。
+fn spawn_cli_capture(
     executable: &str,
     arguments: &[String],
     timeout: Duration,
     extra_env: &[(String, String)],
-) -> Result<String, String> {
+) -> Result<(bool, String), String> {
     let lock = JIMENG_CLI_PROCESS_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1463,10 +1505,24 @@ fn run_cli_with_timeout_env(
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}\n{stderr}");
     drop(lock);
-    if output.status.success() {
+    Ok((output.status.success(), combined))
+}
+
+/// 常规调用: 非零退出码一律视为失败。
+fn run_cli_with_timeout_env(
+    executable: &str,
+    arguments: &[String],
+    timeout: Duration,
+    extra_env: &[(String, String)],
+) -> Result<String, String> {
+    let (success, combined) = spawn_cli_capture(executable, arguments, timeout, extra_env)?;
+    if success {
         Ok(combined)
     } else {
-        Err(format!("即梦 CLI 命令执行失败: {}", output_summary(&combined)))
+        Err(format!(
+            "即梦 CLI 命令执行失败: {}",
+            output_summary(&combined)
+        ))
     }
 }
 
@@ -1996,22 +2052,35 @@ pub struct JimengCliLoginCheckResult {
 /// 开始即梦 CLI 登录: 运行 `dreamina login --headless` 获取设备码登录材料。
 /// - 已登录 → need_auth=false
 /// - 未登录 → 解析出 verification_uri / user_code / device_code, 由前端打开浏览器并轮询 checklogin
+/// - `force=true` → 走 `dreamina relogin --headless`: 先清本地 OAuth 记录再**强制**发新材料,
+///   用于「切换账号」。普通 `login` 会复用仍有效的旧登录态, 这正是切号后仍进老账号的原因。
 #[tauri::command]
-pub async fn jimeng_cli_login_start(executable: String) -> Result<JimengCliLoginStartResult, String> {
+pub async fn jimeng_cli_login_start(
+    executable: String,
+    force: Option<bool>,
+) -> Result<JimengCliLoginStartResult, String> {
     let executable = executable.trim().to_string();
     if executable.is_empty() {
         return Err("请先在「设置 - 密钥 - 即梦 CLI」中填写 CLI 可执行命令".to_string());
     }
+    let force = force.unwrap_or(false);
     let value = executable.clone();
     let output = tokio::task::spawn_blocking(move || {
-        run_cli(&value, &["login".to_string(), "--headless".to_string()])
+        let subcommand = if force { "relogin" } else { "login" };
+        run_cli(&value, &[subcommand.to_string(), "--headless".to_string()])
     })
     .await
     .map_err(|error| format!("即梦 CLI 登录任务中断: {error}"))??;
 
+    // relogin 已经清掉了本地记录, 输出里不可能有「复用」; 这里只在普通模式
+    // 下认「已登录」, 否则强制换号会被误判成登录成功而直接返回。
     let lower = output.to_ascii_lowercase();
-    let already_logged_in = lower.contains("复用") || lower.contains("已登录")
-        || lower.contains("already logged") || lower.contains("reuse") || lower.contains("logged in");
+    let already_logged_in = !force
+        && (lower.contains("复用")
+            || lower.contains("已登录")
+            || lower.contains("already logged")
+            || lower.contains("reuse")
+            || lower.contains("logged in"));
     if already_logged_in {
         return Ok(JimengCliLoginStartResult {
             need_auth: false,
@@ -2082,6 +2151,304 @@ pub async fn jimeng_cli_login_check(
     })
 }
 
+/// 用无痕窗口打开授权页的结果。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JimengCliOpenAuthResult {
+    /// 后端是否已用无痕窗口打开; false 时由前端回退到系统默认浏览器。
+    pub opened: bool,
+    pub private_mode: bool,
+    /// 实际使用的浏览器名, 便于前端提示用户用的是哪一个。
+    pub browser: Option<String>,
+}
+
+/// 常见 Chromium 内核浏览器 + 各自的无痕开关。
+///
+/// 即梦的设备码授权认的是**浏览器里当前登录的即梦账号**, 所以「切换账号」必须
+/// 用一个没有旧 cookie 的会话, 否则授权页会直接把旧账号授出去 —— 这正是
+/// 「退出登录后重新授权, 还是老账号」的根因。
+fn browser_candidates() -> Vec<(&'static str, PathBuf, &'static str)> {
+    #[allow(unused_mut)]
+    let mut candidates: Vec<(&'static str, PathBuf, &'static str)> = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        for key in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"] {
+            let Some(base) = std::env::var_os(key).map(PathBuf::from) else {
+                continue;
+            };
+            candidates.push((
+                "Edge",
+                base.join("Microsoft").join("Edge").join("Application").join("msedge.exe"),
+                "--inprivate",
+            ));
+            candidates.push((
+                "Chrome",
+                base.join("Google").join("Chrome").join("Application").join("chrome.exe"),
+                "--incognito",
+            ));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push((
+            "Chrome",
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            "--incognito",
+        ));
+        candidates.push((
+            "Edge",
+            PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            "--inprivate",
+        ));
+    }
+    candidates
+}
+
+/// 授权链接只允许 http(s) —— 这个值会被直接交给浏览器进程, 不做 scheme 白名单
+/// 就等于把 `file://` / 自定义协议也放行了。
+fn is_allowed_login_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+/// 内置登录窗口的 label —— 同一个窗口反复复用, 避免点几次堆出几个登录窗。
+const JIMENG_LOGIN_WINDOW_LABEL: &str = "jimeng-login";
+
+/// 第三方登录弹窗(抖音等)的 label 序号。
+static JIMENG_LOGIN_POPUP_SEQ: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JimengCliLoginWindowResult {
+    pub opened: bool,
+    pub label: Option<String>,
+    pub message: String,
+}
+
+/// 清掉登录窗口专属会话里的账号态。
+///
+/// 只删 cookie 与本地存储 —— **不删整个 profile 目录**。整份目录 60MB / 800+ 文件,
+/// 删完 WebView2 还要重新初始化一份全新的用户数据目录(实测量级 1~3 秒), 而用户真正
+/// 要清掉的只是「这个窗口当前登录的是哪个账号」。
+fn clear_login_profile_session(profile_dir: &Path) {
+    let webview = profile_dir.join("EBWebView");
+    let default_dir = webview.join("Default");
+    let network = default_dir.join("Network");
+    // ⚠️ `EBWebView/Local State` 是环境级配置, 删了会让 WebView2 重新初始化, 不能动。
+    let targets = [
+        default_dir.join("Cookies"),
+        default_dir.join("Cookies-journal"),
+        default_dir.join("Local Storage"),
+        default_dir.join("Session Storage"),
+        network.join("Cookies"),
+        network.join("Cookies-journal"),
+    ];
+    for target in targets {
+        if !target.exists() {
+            continue;
+        }
+        let outcome = if target.is_dir() {
+            fs::remove_dir_all(&target)
+        } else {
+            fs::remove_file(&target)
+        };
+        if let Err(error) = outcome {
+            // 删不掉不致命: 窗口会继续用旧会话, 但至少还能打开授权页。
+            eprintln!("清理即梦登录会话失败（{}）：{error}", target.display());
+        }
+    }
+}
+
+/// 在应用内用独立 WebView 窗口打开即梦授权页。
+///
+/// 相比拉起系统浏览器, 这条路有三个好处:
+/// 1. **会话可控**: Windows 上给窗口单独指定 WebView2 数据目录, 换号时直接删目录,
+///    既不受系统浏览器里旧账号的影响, 也不会把用户的浏览器搞乱;
+/// 2. **不切应用**: 授权页就在应用里, 不用找标签页, 关掉就是关掉;
+/// 3. **零安装**: WebView2 是 Win10/11 自带的运行时, 不额外打包浏览器内核。
+///
+/// `reset_session=true` 用于「切换账号」: 连同窗口专属的会话目录一起删掉。
+#[tauri::command]
+pub async fn jimeng_cli_open_login_window(
+    app: AppHandle,
+    url: String,
+    reset_session: Option<bool>,
+    title: Option<String>,
+) -> Result<JimengCliLoginWindowResult, String> {
+    let url = url.trim().to_string();
+    if !is_allowed_login_url(&url) {
+        return Err("授权地址无效：只接受 http(s) 链接".to_string());
+    }
+    let parsed = url
+        .parse::<tauri::Url>()
+        .map_err(|error| format!("授权地址无法解析: {error}"))?;
+    let reset_session = reset_session.unwrap_or(false);
+    // 同一个窗口既用于「设备码授权」也用于「打开即梦网页做合规确认」, 标题跟着变。
+    let title = title
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "即梦账号登录".to_string());
+
+    if let Some(existing) = app.get_webview_window(JIMENG_LOGIN_WINDOW_LABEL) {
+        let _ = existing.close();
+        // 等窗口真正销毁, 否则紧接着删会话目录会因文件占用失败。
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    #[cfg(target_os = "windows")]
+    let profile_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录: {error}"))?
+        .join("jimeng-login-profile");
+
+    #[cfg(target_os = "windows")]
+    if reset_session && profile_dir.exists() {
+        clear_login_profile_session(&profile_dir);
+    }
+
+    // 抖音/微信等第三方登录都是 `window.open` 弹窗。WebView 默认把这类新窗口请求
+    // 直接丢掉且**不报错**, 表现就是「点了按钮没反应」。
+    //
+    // 光 `Allow` 不够: 那样 WebView2 会把链接甩给系统默认浏览器, 登录态落在浏览器里,
+    // 授权页这一侧仍然看不到。必须用 `window_features(features)` 继承 opener 的
+    // WebView2 environment, 再用 `Create` 在应用内开窗 —— 这样弹窗和授权页共用同一份
+    // 会话数据, 抖音登录完的 cookie 授权页立刻就能用上。
+    let popup_app = app.clone();
+    let mut builder = tauri::WebviewWindowBuilder::new(
+        &app,
+        JIMENG_LOGIN_WINDOW_LABEL,
+        tauri::WebviewUrl::External(parsed),
+    )
+    .title(&title)
+    .inner_size(460.0, 800.0)
+    .min_inner_size(360.0, 560.0)
+    .center()
+    .on_new_window(move |url, features| {
+        let label = format!(
+            "{JIMENG_LOGIN_WINDOW_LABEL}-popup-{}",
+            JIMENG_LOGIN_POPUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let has_requested_size = features.size().is_some();
+        let mut builder = tauri::WebviewWindowBuilder::new(
+            &popup_app,
+            &label,
+            tauri::WebviewUrl::External(url),
+        )
+        .window_features(features)
+        .title("登录");
+        if !has_requested_size {
+            builder = builder.inner_size(520.0, 720.0);
+        }
+        // 🔴 这里**不要**按「导航回 jimeng 域名」自动关窗。
+        // 抖音登录弹窗自己一打开就会先跳一次 jimeng(OAuth 中转), 之前靠导航判断
+        // 会在登录画面还没出来时就把窗口关掉。关窗改由前端在轮询到登录成功后
+        // 调 `jimeng_cli_close_login_window` —— 那时主窗口一关, 弹窗自然一起消失。
+        match builder.build() {
+            Ok(window) => tauri::webview::NewWindowResponse::Create { window },
+            // 兜底: 建不出来就交给 WebView2 默认处理, 至少不会「点了没反应」。
+            Err(error) => {
+                eprintln!("即梦第三方登录弹窗创建失败: {error}");
+                tauri::webview::NewWindowResponse::Allow
+            }
+        }
+    });
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = fs::create_dir_all(&profile_dir);
+        builder = builder.data_directory(profile_dir);
+    }
+
+    let window = builder
+        .build()
+        .map_err(|error| format!("无法打开内置登录窗口: {error}"))?;
+    let _ = window.set_focus();
+
+    Ok(JimengCliLoginWindowResult {
+        opened: true,
+        label: Some(JIMENG_LOGIN_WINDOW_LABEL.to_string()),
+        message: "已在内置窗口中打开授权页".to_string(),
+    })
+}
+
+/// 登录完成 / 用户取消后关掉所有登录相关窗口。
+///
+/// 注意要按**前缀**匹配: 第三方登录弹窗的 label 是 `jimeng-login-popup-N`,
+/// 只关主窗口会把抖音/微信登录窗留在屏幕上。
+#[tauri::command]
+pub async fn jimeng_cli_close_login_window(app: AppHandle) -> Result<(), String> {
+    let mut first_error: Option<String> = None;
+    for (label, window) in app.webview_windows() {
+        if !label.starts_with(JIMENG_LOGIN_WINDOW_LABEL) {
+            continue;
+        }
+        if let Err(error) = window.close() {
+            if first_error.is_none() {
+                first_error = Some(format!("关闭登录窗口失败: {error}"));
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// 打开即梦授权页。
+/// - `private_mode=true`: 优先用系统的 Edge/Chrome 无痕窗口打开, 用来切换账号;
+///   都不可用时返回 `opened=false`, 由前端回退到系统默认浏览器。
+/// - `private_mode=false`: 直接返回 `opened=false`(前端用系统默认浏览器, 复用现有登录态最快)。
+#[tauri::command]
+pub async fn jimeng_cli_open_login_url(
+    url: String,
+    private_mode: Option<bool>,
+) -> Result<JimengCliOpenAuthResult, String> {
+    let url = url.trim().to_string();
+    if !is_allowed_login_url(&url) {
+        return Err("授权地址无效：只接受 http(s) 链接".to_string());
+    }
+    if !private_mode.unwrap_or(false) {
+        return Ok(JimengCliOpenAuthResult {
+            opened: false,
+            private_mode: false,
+            browser: None,
+        });
+    }
+    for (name, path, flag) in browser_candidates() {
+        if !path.is_file() {
+            continue;
+        }
+        // 参数直接交给 CreateProcess / execve, 不经过 shell, URL 不会被当命令解析。
+        let spawned = Command::new(&path)
+            .arg(flag)
+            .arg(&url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(_) => {
+                // 不 wait: 浏览器是常驻 GUI 进程, 等它会把这个命令挂死。
+                return Ok(JimengCliOpenAuthResult {
+                    opened: true,
+                    private_mode: true,
+                    browser: Some(name.to_string()),
+                });
+            }
+            Err(error) => {
+                eprintln!("即梦授权页无痕打开失败（{name} @ {}）：{error}", path.display());
+            }
+        }
+    }
+    Ok(JimengCliOpenAuthResult {
+        opened: false,
+        private_mode: false,
+        browser: None,
+    })
+}
+
 /// 从 CLI 输出中提取 http(s) 验证地址(优先取 verification_uri/verification_url 字段, 兜底找任意 http 链接)。
 fn extract_url_field(output: &str) -> Option<String> {
     for name in [
@@ -2125,6 +2492,34 @@ fn extract_url_field(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_url_scheme_whitelist_rejects_non_http() {
+        assert!(is_allowed_login_url("https://jimeng.jianying.com/ai-tool/cli-auth?x=1"));
+        assert!(is_allowed_login_url("http://127.0.0.1:1420/cb"));
+        // 大小写/前后空白不该被当成非法链接
+        assert!(is_allowed_login_url("  HTTPS://example.com/x  "));
+        assert!(!is_allowed_login_url("file:///C:/Windows/System32/calc.exe"));
+        assert!(!is_allowed_login_url("javascript:alert(1)"));
+        assert!(!is_allowed_login_url("ms-settings:privacy"));
+        assert!(!is_allowed_login_url(""));
+    }
+
+    #[test]
+    fn browser_candidates_carry_private_flags() {
+        let candidates = browser_candidates();
+        #[cfg(target_os = "windows")]
+        {
+            assert!(candidates
+                .iter()
+                .any(|(name, _, flag)| *name == "Edge" && *flag == "--inprivate"));
+            assert!(candidates
+                .iter()
+                .any(|(name, _, flag)| *name == "Chrome" && *flag == "--incognito"));
+        }
+        // 每条候选都必须带无痕开关, 否则切号会复用浏览器里已有的旧账号。
+        assert!(candidates.iter().all(|(_, _, flag)| !flag.is_empty()));
+    }
 
     #[test]
     fn login_start_result_serializes_camel_case() {
@@ -2663,6 +3058,17 @@ device_code: 8f3a2b9c1d4e5f6a7b8c9d0e
     }
 
     #[test]
+    fn compliance_blocker_is_detected_case_insensitively() {
+        assert!(is_compliance_blocker(
+            "api error: ret=4010, message=AigcComplianceConfirmationRequired"
+        ));
+        assert!(is_compliance_blocker("aigccomplianceconfirmationrequired"));
+        // 别的失败不能被当成「必须去网页确认」, 否则提示会误导。
+        assert!(!is_compliance_blocker("context deadline exceeded"));
+        assert!(!is_compliance_blocker("CreditPreDeductNotEnough"));
+    }
+
+    #[test]
     fn prompt_is_read_from_submit_arguments() {
         let arguments = vec![
             "multimodal2video".to_string(),
@@ -2859,6 +3265,1182 @@ pub async fn jimeng_cli_logout(executable: String) -> Result<JimengCliLoginCheck
     })
 }
 
+// ==================== 即梦画布 CLI（dreamina-canvas） ====================
+//
+// 和 `dreamina` 是两个独立工具: 可执行名 `dreamina-canvas`, 输出是规整 JSON
+// (`{"schemaVersion":"1","ok":true,"data":{…}}`), 登录同样是 OAuth Device Flow。
+// 使用文档: https://bytedance.larkoffice.com/wiki/QO66wGahSiakEHkJbxIcNBtDnAc
+
+fn canvas_cli_args(args: &[&str]) -> Vec<String> {
+    args.iter().map(|value| (*value).to_string()).collect()
+}
+
+/// 解析 `dreamina-canvas` 的统一 JSON 信封, 返回 `data` 段。
+fn parse_canvas_payload(output: &str) -> Result<serde_json::Value, String> {
+    let raw = extract_json_object(output).ok_or_else(|| {
+        let preview: String = output.trim().chars().take(300).collect();
+        format!("即梦画布 CLI 未返回 JSON: {preview}")
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| "即梦画布 CLI 返回的 JSON 无法解析".to_string())?;
+    // 失败时 `ok=false`, 原因在 error.message —— 原样带出去比「解析失败」有用。
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        let message = value
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("即梦画布 CLI 返回失败");
+        let code = value
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        return Err(if code.is_empty() {
+            message.to_string()
+        } else {
+            format!("{message}（{code}）")
+        });
+    }
+    Ok(value
+        .get("data")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
+}
+
+/// 从素材内容派生**确定性**的 `--resource-id` 幂等键。
+///
+/// CLI 的契约(`dreamina-canvas resource upload --help`)写得很清楚:
+/// 「--resource-id 资源 UUID 幂等键; 省略时自动生成, **跨进程重试须复用同一值**」。
+/// 省略它的后果正是用户实报的那个报错: 上传阶段一旦「请求已发出但没拿到确认」, CLI
+/// 既无法证明远端有没有建对象, 也没法安全重传, 只能抛 `cli.upload_state_unknown` +
+/// `retryable:false`, 要求人工介入 —— 而调用方手里连那个自动生成的键都没有, 除了全量
+/// 重传别无选择。
+///
+/// 这里改用内容哈希派生: 同一份素材(同项目 / 同类型 / 同字节)在任何一次重试、乃至另一个
+/// 节点上都会落到同一个资源, 所以「重试」天然幂等, 也不需要把键持久化到前端。
+fn canvas_resource_key(project_id: &str, media_type: &str, bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    // 加一个域前缀, 避免和别处的 sha256 用途撞车。
+    hasher.update(b"lentalk-canvas-resource-v1\0");
+    hasher.update(project_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(media_type.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(&digest[..16]);
+    // 折成 RFC 4122 v4 形状(version=4, variant=10xx): CLI 只要求它是个 UUID。
+    raw[6] = (raw[6] & 0x0f) | 0x40;
+    raw[8] = (raw[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(raw).to_string()
+}
+
+/// 画布 CLI 调用。与 `run_cli` 的唯一区别在**失败怎么表达**。
+///
+/// 画布 CLI 的失败体是 `{"ok":false,"error":{"class":..,"code":..,"message":..}}`,
+/// `run_cli` 会把它压成 `error={...}` 一大坨 JSON 直接糊到用户脸上(用户实报的报错正是如此)。
+/// 这里改走 `parse_canvas_payload`, 只保留 `message（code）`。
+fn run_canvas_cli(executable: &str, arguments: &[String]) -> Result<String, String> {
+    run_canvas_cli_with_timeout(executable, arguments, CLI_COMMAND_TIMEOUT)
+}
+
+fn run_canvas_cli_with_timeout(
+    executable: &str,
+    arguments: &[String],
+    timeout: Duration,
+) -> Result<String, String> {
+    let (success, output) = spawn_cli_capture(executable, arguments, timeout, &[])?;
+    if success {
+        Ok(output)
+    } else {
+        Err(canvas_cli_failure_reason(&output))
+    }
+}
+
+/// 从失败输出里取最有用的一句话: 优先 `error.message（error.code）`, 没有信封时才退回原始摘要。
+fn canvas_cli_failure_reason(output: &str) -> String {
+    match parse_canvas_payload(output) {
+        Err(message) => message,
+        // 退出码非 0 但信封是 ok=true —— 结构和判定不一致, 这时原始摘要信息更多。
+        Ok(_) => output_summary(output),
+    }
+}
+
+/// 查一个素材在服务端的稳定状态(`resource get`), 并把 `running` 等到落定。
+///
+/// 查不到(资源不存在 / 接口本身拒绝)返回 `None` —— 调用方据此判断「远端确实没建成」,
+/// 可以放心用同一个幂等键重传。
+fn canvas_resource_status(
+    executable: &str,
+    project_id: &str,
+    resource_id: &str,
+    waits: u32,
+) -> Option<String> {
+    let arguments = [
+        "resource".to_string(),
+        "get".to_string(),
+        resource_id.to_string(),
+        format!("--project-id={project_id}"),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+
+    let mut state = None;
+    for round in 0..=waits {
+        let (success, output) =
+            spawn_cli_capture(executable, &arguments, CLI_COMMAND_TIMEOUT, &[]).ok()?;
+        if !success {
+            return None;
+        }
+        let data = parse_canvas_payload(&output).ok()?;
+        state = find_json_string_field(&data, "status").map(|value| value.to_lowercase());
+        if state.as_deref() != Some("running") || round == waits {
+            break;
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+    state
+}
+
+/// 这个失败是不是「远端可能已经有对象了」。命中时值得先查状态再决定, 而不是直接当失败。
+fn canvas_failure_means_resource_exists(reason: &str) -> bool {
+    let lowered = reason.to_ascii_lowercase();
+    lowered.contains("upload_state_unknown")
+        || lowered.contains("already submitted")
+        || lowered.contains("service.5")
+}
+
+/// 把一份本地素材登记成项目资源, 返回可直接塞进 `--ref` 的 `res:<id>`。
+///
+/// 🔴 幂等键由 `canvas_resource_key` 生成并**贯穿所有重试**, 这是把
+/// `cli.upload_state_unknown`(要求人工介入)变成自动恢复的关键: 失败后先 `resource get`
+/// 问一句远端建成了没有 —— 建好了就直接复用, 没建好就用同一个键重传。
+fn upload_canvas_resource(
+    executable: &str,
+    project_id: &str,
+    path: &Path,
+    media_type: &str,
+    label: &str,
+) -> Result<String, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("读取{label}失败({}): {error}", path.display()))?;
+    let resource_id = canvas_resource_key(project_id, media_type, &bytes);
+    let arguments = [
+        "resource".to_string(),
+        "upload".to_string(),
+        format!("--file={}", path.display()),
+        format!("--type={media_type}"),
+        format!("--project-id={project_id}"),
+        format!("--resource-id={resource_id}"),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+
+    let mut last_reason = String::new();
+    for attempt in 0..CANVAS_UPLOAD_MAX_ATTEMPTS {
+        if attempt > 0 {
+            // 上一轮已经把请求发出去了。先问服务端「这个键到底建成了没有」——
+            // 这正是 CLI 甩给我们 human_intervention 的那一步, 而幂等键在我们手里, 我们能自己回答。
+            if canvas_resource_status(executable, project_id, &resource_id, 3).as_deref()
+                == Some("success")
+            {
+                return Ok(format!("res:{resource_id}"));
+            }
+        }
+
+        let (success, output) =
+            spawn_cli_capture(executable, &arguments, CANVAS_UPLOAD_TIMEOUT, &[])?;
+        let parsed = parse_canvas_payload(&output);
+        if success {
+            if let Ok(data) = &parsed {
+                if let Some(id) = find_json_string_field(data, "resourceId") {
+                    return Ok(format!("res:{id}"));
+                }
+            }
+        }
+        last_reason = match &parsed {
+            Err(message) => message.clone(),
+            Ok(_) => output_summary(&output),
+        };
+
+        // `service.5 already submitted` = 同一个幂等键提交过了, 对象就在服务端。
+        // 再查一次就能确认, 不该把它当失败。
+        if canvas_failure_means_resource_exists(&last_reason)
+            && canvas_resource_status(executable, project_id, &resource_id, 3).as_deref()
+                == Some("success")
+        {
+            return Ok(format!("res:{resource_id}"));
+        }
+
+        if attempt + 1 < CANVAS_UPLOAD_MAX_ATTEMPTS {
+            let backoff = CANVAS_UPLOAD_RETRY_BACKOFF_MS
+                [(attempt as usize).min(CANVAS_UPLOAD_RETRY_BACKOFF_MS.len() - 1)];
+            thread::sleep(Duration::from_millis(backoff));
+        }
+    }
+
+    Err(describe_canvas_upload_failure(
+        label,
+        &resource_id,
+        project_id,
+        &last_reason,
+    ))
+}
+
+/// 上传最终失败时的用户可读说明。
+///
+/// `cli.upload_state_unknown` 的原始文案是给机器和工程师看的(「Do not automatically retry;
+/// inspect the operation or contact support」), 直接抛给用户只会让人以为素材或账号坏了。
+fn describe_canvas_upload_failure(
+    label: &str,
+    resource_id: &str,
+    project_id: &str,
+    reason: &str,
+) -> String {
+    let lowered = reason.to_ascii_lowercase();
+    let mut text = format!("上传{label}到即梦画布失败（幂等键 {resource_id}）: {reason}");
+
+    if canvas_failure_means_resource_exists(reason) {
+        text.push_str(&format!(
+            "\n说明: 上传请求已经发出, 但没拿到服务端的确认, 所以 CLI 判断不了远端到底建没建成 —— \
+             它要求人工介入, **不代表参考素材或提示词有问题**, 上传阶段也不消耗积分。\
+             本次已用同一个幂等键自动核对并重传 {} 次, 仍未确认成功。\
+             \n建议: ① 直接再点一次生成: 同一个素材会复用同一个幂等键, 不会重复上传; \
+             ② 换个网络(如手机热点)做对照; \
+             ③ 想手动确认远端有没有: dreamina-canvas resource get {resource_id} --project-id={project_id}",
+            CANVAS_UPLOAD_MAX_ATTEMPTS
+        ));
+    } else if lowered.contains("not login")
+        || lowered.contains("unauthorized")
+        || lowered.contains("credential")
+        || reason.contains("未登录")
+    {
+        text.push_str(
+            "\n说明: 即梦画布 CLI 的登录态已失效或凭据读取失败。\
+             \n建议: 到「设置 - 密钥 - 即梦画布 CLI」重新登录后再试。",
+        );
+    } else if lowered.contains("deadline exceeded")
+        || lowered.contains("timeout")
+        || lowered.contains("i/o timeout")
+        || reason.contains("超时")
+    {
+        text.push_str(
+            "\n说明: 上传时网络超时, 与素材内容无关; 即梦是国内服务, 走代理反而容易超时。\
+             \n建议: ① 先直接重试; ② 关掉系统代理 / VPN 再试一次做对照; ③ 换个网络(如手机热点)做对照。",
+        );
+    }
+
+    text
+}
+
+/// 从 `auth account` 的返回里挑一个能展示的账号名。
+/// 字段名在不同版本里可能不一样, 按常见顺序试, 再尝试剥一层嵌套对象。
+fn canvas_account_label(data: &serde_json::Value) -> Option<String> {
+    const KEYS: [&str; 6] = ["name", "nickname", "userName", "displayName", "email", "uid"];
+    for key in KEYS {
+        if let Some(text) = data.get(key).and_then(serde_json::Value::as_str) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    for wrapper in ["account", "user", "profile"] {
+        if let Some(inner) = data.get(wrapper) {
+            if inner.is_object() {
+                if let Some(label) = canvas_account_label(inner) {
+                    return Some(label);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JimengCanvasCliStatus {
+    /// 可执行文件能否跑起来(`dreamina-canvas version` 成功)。
+    pub found: bool,
+    pub version: Option<String>,
+    pub logged_in: bool,
+    /// 当前登录账号(`auth account`); 未登录或取不到时为 None。
+    pub account: Option<String>,
+    pub message: String,
+}
+
+/// 检测即梦画布 CLI: 版本 + 登录态 + 当前账号。
+#[tauri::command]
+pub async fn jimeng_canvas_cli_status(executable: String) -> Result<JimengCanvasCliStatus, String> {
+    let executable = executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先填写即梦画布 CLI 的可执行命令".to_string());
+    }
+    tokio::task::spawn_blocking(move || -> Result<JimengCanvasCliStatus, String> {
+        let version_output =
+            match run_cli(&executable, &canvas_cli_args(&["version", "--format", "json"])) {
+                Ok(output) => output,
+                // 跑不起来 = 没装 / 路径不对。这不是异常, 是要展示给用户的状态。
+                Err(error) => {
+                    return Ok(JimengCanvasCliStatus {
+                        found: false,
+                        version: None,
+                        logged_in: false,
+                        account: None,
+                        message: error,
+                    })
+                }
+            };
+        let version = parse_canvas_payload(&version_output)
+            .ok()
+            .and_then(|data| {
+                data.get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+
+        let logged_in = run_cli(
+            &executable,
+            &canvas_cli_args(&["auth", "status", "--format", "json"]),
+        )
+        .ok()
+        .and_then(|output| parse_canvas_payload(&output).ok())
+        .and_then(|data| data.get("loggedIn").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
+
+        let account = if logged_in {
+            run_cli(
+                &executable,
+                &canvas_cli_args(&["auth", "account", "--format", "json"]),
+            )
+            .ok()
+            .and_then(|output| parse_canvas_payload(&output).ok())
+            .and_then(|data| canvas_account_label(&data))
+        } else {
+            None
+        };
+
+        Ok(JimengCanvasCliStatus {
+            found: true,
+            version,
+            logged_in,
+            account,
+            message: if logged_in {
+                "已登录".to_string()
+            } else {
+                "未登录".to_string()
+            },
+        })
+    })
+    .await
+    .map_err(|error| format!("即梦画布 CLI 检测中断: {error}"))?
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JimengCanvasCliLoginStart {
+    pub need_auth: bool,
+    pub verification_uri: Option<String>,
+    pub user_code: Option<String>,
+    pub device_code: Option<String>,
+    pub expires_at: Option<String>,
+    pub message: String,
+}
+
+/// 申请即梦画布 CLI 的授权材料(OAuth Device Flow)。
+/// `force=true` 会带 `--force`: 清掉当前 profile 的登录态再重新授权(切换账号)。
+#[tauri::command]
+pub async fn jimeng_canvas_cli_login_start(
+    executable: String,
+    force: Option<bool>,
+) -> Result<JimengCanvasCliLoginStart, String> {
+    let executable = executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先填写即梦画布 CLI 的可执行命令".to_string());
+    }
+    let force = force.unwrap_or(false);
+    let output = tokio::task::spawn_blocking(move || {
+        let mut args = canvas_cli_args(&["auth", "login", "--non-interactive", "--format", "json"]);
+        if force {
+            args.push("--force".to_string());
+        }
+        run_canvas_cli(&executable, &args)
+    })
+    .await
+    .map_err(|error| format!("即梦画布 CLI 登录任务中断: {error}"))??;
+
+    let data = parse_canvas_payload(&output)?;
+    // 已经登录时不会返回 challenge —— 说明这次点的是「登录」而不是「切换账号」。
+    let Some(challenge) = data.get("challenge") else {
+        return Ok(JimengCanvasCliLoginStart {
+            need_auth: false,
+            verification_uri: None,
+            user_code: None,
+            device_code: None,
+            expires_at: None,
+            message: "当前已登录即梦画布账号".to_string(),
+        });
+    };
+    let field = |key: &str| {
+        challenge
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    Ok(JimengCanvasCliLoginStart {
+        need_auth: true,
+        // 优先用 Complete 版: 授权码已拼进链接, 少一步手输。
+        verification_uri: field("verificationUriComplete").or_else(|| field("verificationUri")),
+        user_code: field("userCode"),
+        device_code: field("deviceCode"),
+        expires_at: field("expiresAt"),
+        message: "请在内置窗口中完成授权".to_string(),
+    })
+}
+
+/// 等待并完成即梦画布 CLI 的登录(`auth wait --device-code`)。
+///
+/// 🔴 必须用 `auth wait` 而不是 `auth status`: status 只读本地登录态, **不会拿 device code
+/// 去后端换 token** —— 只用 status 轮询会一直 loggedIn=false, 直到授权码过期(表现为「等待授权超时」)。
+/// `wait` 是阻塞的, 这里给一个短超时(4s); 未完成时 CLI 回
+/// `error.code = cli.login_wait_timeout` + `retryable: true`, 前端据此继续下一轮。
+#[tauri::command]
+pub async fn jimeng_canvas_cli_login_check(
+    executable: String,
+    device_code: String,
+) -> Result<JimengCliLoginCheckResult, String> {
+    let executable = executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先填写即梦画布 CLI 的可执行命令".to_string());
+    }
+    let device_code = device_code.trim().to_string();
+    if device_code.is_empty() {
+        return Err("缺少设备授权码，请重新发起登录".to_string());
+    }
+    let (_exit_ok, output) = tokio::task::spawn_blocking(move || {
+        spawn_cli_capture(
+            &executable,
+            &[
+                "auth".to_string(),
+                "wait".to_string(),
+                format!("--device-code={device_code}"),
+                "--timeout=4s".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+            CLI_COMMAND_TIMEOUT,
+            &[],
+        )
+    })
+    .await
+    .map_err(|error| format!("即梦画布 CLI 登录检查中断: {error}"))??;
+
+    let raw = extract_json_object(&output).ok_or_else(|| {
+        let preview: String = output.trim().chars().take(200).collect();
+        format!("即梦画布 CLI 未返回 JSON: {preview}")
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| "即梦画布 CLI 返回的 JSON 无法解析".to_string())?;
+
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(JimengCliLoginCheckResult {
+            success: true,
+            message: "登录成功".to_string(),
+        });
+    }
+    let code = value
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    // 本轮没等到授权: 这是预期分支(CLI 以非零退出码表达), 不是失败。
+    if code == "cli.login_wait_timeout" {
+        return Ok(JimengCliLoginCheckResult {
+            success: false,
+            message: "等待授权完成…".to_string(),
+        });
+    }
+    let message = value
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("即梦画布授权失败");
+    Err(if code.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}（{code}）")
+    })
+}
+
+/// 退出即梦画布 CLI 的登录态(`auth logout`)。
+#[tauri::command]
+pub async fn jimeng_canvas_cli_logout(
+    executable: String,
+) -> Result<JimengCliLoginCheckResult, String> {
+    let executable = executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先填写即梦画布 CLI 的可执行命令".to_string());
+    }
+    let output =
+        tokio::task::spawn_blocking(move || run_canvas_cli(&executable, &canvas_cli_args(&["auth", "logout"])))
+            .await
+            .map_err(|error| format!("即梦画布 CLI 退出登录中断: {error}"))??;
+    Ok(JimengCliLoginCheckResult {
+        success: true,
+        message: output.trim().to_string(),
+    })
+}
+
+/// 在 JSON 里递归找第一个指定键的字符串值。
+///
+/// 即梦画布 CLI 的返回把 nodeId / resourceId 埋在 `data.node.nodeId`、
+/// `data.nodes[0].node.resources[0].resourceId` 这类深浅不一的位置, 而且不同小版本还会挪。
+/// 与其挨个写路径(错一个就白等一次生成), 不如按字段名找。
+fn find_json_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(found) = map.get(key).and_then(serde_json::Value::as_str) {
+                if !found.trim().is_empty() {
+                    return Some(found.trim().to_string());
+                }
+            }
+            map.values()
+                .find_map(|child| find_json_string_field(child, key))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_json_string_field(child, key)),
+        _ => None,
+    }
+}
+
+/// 保证有一个可用的画布项目: 只复用**名为 LenTalk 的专用画布**, 没有就新建。
+///
+/// 刻意不「取最近更新的一个」—— 用户自己的画布里全是他的作品节点, 往里塞自动生成的节点
+/// 会把他的画布搞乱。宁可新建一张专供 LenTalk 用的。
+fn ensure_canvas_project(executable: &str) -> Result<String, String> {
+    if let Ok(output) = run_cli(
+        executable,
+        &canvas_cli_args(&["canvas", "ls", "--format", "json"]),
+    ) {
+        if let Ok(data) = parse_canvas_payload(&output) {
+            if let Some(items) = data.get("items").and_then(|value| value.as_array()) {
+                for item in items {
+                    let named = item
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|name| name.trim() == "LenTalk")
+                        .unwrap_or(false);
+                    if !named {
+                        continue;
+                    }
+                    if let Some(project_id) = item
+                        .get("projectId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        return Ok(project_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let output = run_canvas_cli(
+        executable,
+        &canvas_cli_args(&["canvas", "create", "LenTalk", "--format", "json"]),
+    )?;
+    let data = parse_canvas_payload(&output)?;
+    find_json_string_field(&data, "projectId")
+        .ok_or_else(|| "即梦画布 CLI 新建画布后未返回 projectId".to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateJimengCanvasVideoRequest {
+    pub executable: String,
+    pub prompt: String,
+    /// 服务端模型标识, 如 `seedance_2.5`、`seedance_2.0_vip`
+    pub model: String,
+    /// `t2v` / `first_last_frame` / `m2v`
+    pub mode: String,
+    pub duration: u32,
+    pub aspect_ratio: String,
+    /// `480p` / `720P` / `1080P` / `4K`(大小写按 model list 原样)
+    pub resolution: String,
+    pub reference_images: Option<Vec<String>>,
+    /// 参考音频(`m2v` 模式支持, 最多 10 个)。漏传会表现为「音频素材没进生成」。
+    pub reference_audio: Option<Vec<String>>,
+    pub project_id: Option<String>,
+}
+
+/// 即梦画布 CLI 生成视频: 上传参考素材 → 建节点并运行 → 等终态 → 下载到本地。
+#[tauri::command]
+pub async fn generate_jimeng_canvas_video(
+    app: AppHandle,
+    request: GenerateJimengCanvasVideoRequest,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || generate_canvas_video_blocking(&app, request))
+        .await
+        .map_err(|error| format!("即梦画布 CLI 任务执行中断: {error}"))?
+}
+
+fn generate_canvas_video_blocking(
+    app: &AppHandle,
+    request: GenerateJimengCanvasVideoRequest,
+) -> Result<String, String> {
+    let executable = request.executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先在「设置 - 密钥 - 即梦画布 CLI」中填写可执行命令".to_string());
+    }
+    if request.prompt.trim().is_empty() {
+        return Err("即梦画布 CLI 视频生成需要提示词".to_string());
+    }
+    let project_id = match request
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value.to_string(),
+        None => ensure_canvas_project(&executable)?,
+    };
+
+    let run_id = Uuid::new_v4().to_string();
+    let input_dir = std::env::temp_dir().join(format!("lentalk-jimeng-canvas-{run_id}"));
+    fs::create_dir_all(&input_dir)
+        .map_err(|error| format!("无法创建即梦画布 CLI 临时目录: {error}"))?;
+
+    let result = (|| {
+        let images = materialize_data_urls(
+            request.reference_images.as_deref().unwrap_or_default(),
+            &input_dir,
+            "image",
+        )?;
+
+        // 参考图必须先登记成项目资源, `--ref` 才能用 `res:<id>` 引用。
+        let mut references: Vec<String> = Vec::new();
+        for path in &images {
+            references.push(upload_canvas_resource(
+                &executable,
+                &project_id,
+                path,
+                "image",
+                "参考图",
+            )?);
+        }
+
+        // 参考音频也要登记成项目资源, `--ref` 只认 `res:<id>`;
+        // 不登记就等于音频没传进去(模型只看到图片)。
+        let audio_files =
+            materialize_audio_files(request.reference_audio.as_deref().unwrap_or_default())?;
+        for path in &audio_files {
+            references.push(upload_canvas_resource(
+                &executable,
+                &project_id,
+                path,
+                "audio",
+                "参考音频",
+            )?);
+        }
+
+        // 走「建节点 → 报价 → 按报价批准 → 运行 → 等终态」,
+        // 而不是 `--run`: 只有这样才拿得到服务端报的真实积分, ceiling 也不用猜。
+        let mut content_args = vec![
+            format!("--model={}", request.model),
+            format!("--mode={}", request.mode),
+            format!("--prompt={}", request.prompt),
+            format!("--ratio={}", request.aspect_ratio),
+            format!("--resolution={}", request.resolution),
+            format!("--duration={}", request.duration),
+        ];
+        for reference in &references {
+            content_args.push(format!("--ref={reference}"));
+        }
+        let (node_id, quoted) =
+            create_quote_confirm_run(&executable, &project_id, "video", &content_args)?;
+        if let Some(credits) = quoted {
+            eprintln!("即梦画布 CLI 报价: {credits} 积分");
+        }
+
+        // 产物在节点视图的 resources 里; node.run 的返回不一定带, 统一再读一次。
+        let show_output = run_canvas_cli(
+            &executable,
+            &[
+                "node".to_string(),
+                "show".to_string(),
+                format!("--project-id={project_id}"),
+                format!("--node-id={node_id}"),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        )?;
+        let show_data = parse_canvas_payload(&show_output)?;
+        let resource_id = find_json_string_field(&show_data, "resourceId").ok_or_else(|| {
+            format!("即梦画布 CLI 节点 {node_id} 运行完成但没有产物资源, 请到即梦画布网页端确认")
+        })?;
+
+        let download_dir = resolve_download_dir(app, &run_id)?;
+        let target = download_dir.join(format!("canvas-{run_id}.mp4"));
+        let download_output = run_canvas_cli_with_timeout(
+            &executable,
+            &[
+                "resource".to_string(),
+                "download".to_string(),
+                resource_id.clone(),
+                format!("--project-id={project_id}"),
+                "-o".to_string(),
+                target.to_string_lossy().to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+            CLI_TASK_TIMEOUT,
+        );
+        if let Err(error) = download_output {
+            return Err(format!(
+                "视频已生成但下载失败（resourceId={resource_id}）: {error}。\
+                 可手动取回: dreamina-canvas resource download {resource_id} --project-id={project_id} -o <路径>"
+            ));
+        }
+        if !target.is_file() {
+            return Err(format!(
+                "视频已生成但本地没有落盘文件（resourceId={resource_id}, 期望 {})",
+                target.display()
+            ));
+        }
+        Ok(target.to_string_lossy().to_string())
+    })();
+
+    let _ = fs::remove_dir_all(&input_dir);
+    result
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateJimengCanvasImageRequest {
+    pub executable: String,
+    pub prompt: String,
+    pub model: String,
+    /// `t2i`（无参考图）/ `i2i`（有参考图）
+    pub mode: String,
+    pub aspect_ratio: String,
+    /// `1K` / `1.5K` / `2K` / `4K`（大小写按 model list 原样）
+    pub resolution: String,
+    pub reference_images: Option<Vec<String>>,
+    pub project_id: Option<String>,
+}
+
+/// 即梦画布 CLI 生成图片。
+#[tauri::command]
+pub async fn generate_jimeng_canvas_image(
+    app: AppHandle,
+    request: GenerateJimengCanvasImageRequest,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || generate_canvas_image_blocking(&app, request))
+        .await
+        .map_err(|error| format!("即梦画布 CLI 任务执行中断: {error}"))?
+}
+
+fn generate_canvas_image_blocking(
+    app: &AppHandle,
+    request: GenerateJimengCanvasImageRequest,
+) -> Result<String, String> {
+    let executable = request.executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先在「设置 - 密钥 - 即梦画布 CLI」中填写可执行命令".to_string());
+    }
+    if request.prompt.trim().is_empty() {
+        return Err("即梦画布 CLI 图片生成需要提示词".to_string());
+    }
+    let project_id = match request
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value.to_string(),
+        None => ensure_canvas_project(&executable)?,
+    };
+
+    let run_id = Uuid::new_v4().to_string();
+    let input_dir = std::env::temp_dir().join(format!("lentalk-jimeng-canvas-{run_id}"));
+    fs::create_dir_all(&input_dir)
+        .map_err(|error| format!("无法创建即梦画布 CLI 临时目录: {error}"))?;
+
+    let result = (|| {
+        let images = materialize_data_urls(
+            request.reference_images.as_deref().unwrap_or_default(),
+            &input_dir,
+            "image",
+        )?;
+        let mut references: Vec<String> = Vec::new();
+        for path in &images {
+            references.push(upload_canvas_resource(
+                &executable,
+                &project_id,
+                path,
+                "image",
+                "参考图",
+            )?);
+        }
+
+        let mut content_args = vec![
+            format!("--model={}", request.model),
+            format!("--mode={}", request.mode),
+            format!("--prompt={}", request.prompt),
+            format!("--ratio={}", request.aspect_ratio),
+            format!("--resolution={}", request.resolution),
+        ];
+        for reference in &references {
+            content_args.push(format!("--ref={reference}"));
+        }
+        let (node_id, _quoted) =
+            create_quote_confirm_run(&executable, &project_id, "image", &content_args)?;
+
+        let show_output = run_canvas_cli(
+            &executable,
+            &[
+                "node".to_string(),
+                "show".to_string(),
+                format!("--project-id={project_id}"),
+                format!("--node-id={node_id}"),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        )?;
+        let show_data = parse_canvas_payload(&show_output)?;
+        let resource_id = find_json_string_field(&show_data, "resourceId").ok_or_else(|| {
+            format!("即梦画布 CLI 节点 {node_id} 运行完成但没有产物资源, 请到即梦画布网页端确认")
+        })?;
+
+        let download_dir = resolve_download_dir(app, &run_id)?;
+        let target = download_dir.join(format!("canvas-{run_id}.png"));
+        if let Err(error) = run_canvas_cli_with_timeout(
+            &executable,
+            &[
+                "resource".to_string(),
+                "download".to_string(),
+                resource_id.clone(),
+                format!("--project-id={project_id}"),
+                "-o".to_string(),
+                target.to_string_lossy().to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+            CLI_TASK_TIMEOUT,
+        ) {
+            return Err(format!(
+                "图片已生成但下载失败（resourceId={resource_id}）: {error}。\
+                 可手动取回: dreamina-canvas resource download {resource_id} --project-id={project_id} -o <路径>"
+            ));
+        }
+        if !target.is_file() {
+            return Err(format!(
+                "图片已生成但本地没有落盘文件（resourceId={resource_id}, 期望 {}）",
+                target.display()
+            ));
+        }
+        Ok(target.to_string_lossy().to_string())
+    })();
+
+    let _ = fs::remove_dir_all(&input_dir);
+    result
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateJimengCanvasAudioRequest {
+    pub executable: String,
+    pub prompt: String,
+    pub model: String,
+    /// `tts`（文本转语音）/ `music`（音乐生成）
+    pub mode: String,
+    /// music 模式的时长（秒），tts 忽略
+    pub duration: Option<u32>,
+    /// 全能配音的参考音频（本地文件或 data URL）
+    pub reference_audio: Option<Vec<String>>,
+    pub project_id: Option<String>,
+}
+
+/// 即梦画布 CLI 生成音频(`node create audio --run --wait`)。
+#[tauri::command]
+pub async fn generate_jimeng_canvas_audio(
+    app: AppHandle,
+    request: GenerateJimengCanvasAudioRequest,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || generate_canvas_audio_blocking(&app, request))
+        .await
+        .map_err(|error| format!("即梦画布 CLI 任务执行中断: {error}"))?
+}
+
+fn generate_canvas_audio_blocking(
+    app: &AppHandle,
+    request: GenerateJimengCanvasAudioRequest,
+) -> Result<String, String> {
+    let executable = request.executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先在「设置 - 密钥 - 即梦画布 CLI」中填写可执行命令".to_string());
+    }
+    if request.prompt.trim().is_empty() {
+        return Err("即梦画布 CLI 音频生成需要提示词或台词".to_string());
+    }
+    let project_id = match request
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value.to_string(),
+        None => ensure_canvas_project(&executable)?,
+    };
+
+    let run_id = Uuid::new_v4().to_string();
+    let input_dir = std::env::temp_dir().join(format!("lentalk-jimeng-canvas-{run_id}"));
+    fs::create_dir_all(&input_dir)
+        .map_err(|error| format!("无法创建即梦画布 CLI 临时目录: {error}"))?;
+
+    let result = (|| {
+        // 参考音频同样要先登记成项目资源, `--ref` 只认 `res:<id>`。
+        let audio_files = materialize_audio_files(
+            request.reference_audio.as_deref().unwrap_or_default(),
+        )?;
+        let mut references: Vec<String> = Vec::new();
+        for path in &audio_files {
+            references.push(upload_canvas_resource(
+                &executable,
+                &project_id,
+                path,
+                "audio",
+                "参考音频",
+            )?);
+        }
+
+        let mut content_args = vec![
+            format!("--mode={}", request.mode),
+            format!("--model={}", request.model),
+            format!("--prompt={}", request.prompt),
+        ];
+        if request.mode == "music" {
+            if let Some(duration) = request.duration.filter(|value| *value >= 30) {
+                content_args.push(format!("--duration={duration}"));
+            }
+        }
+        for reference in &references {
+            content_args.push(format!("--ref={reference}"));
+        }
+        let (node_id, _quoted) =
+            create_quote_confirm_run(&executable, &project_id, "audio", &content_args)?;
+
+        let show_output = run_canvas_cli(
+            &executable,
+            &[
+                "node".to_string(),
+                "show".to_string(),
+                format!("--project-id={project_id}"),
+                format!("--node-id={node_id}"),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        )?;
+        let show_data = parse_canvas_payload(&show_output)?;
+        let resource_id = find_json_string_field(&show_data, "resourceId").ok_or_else(|| {
+            format!("即梦画布 CLI 节点 {node_id} 运行完成但没有产物资源, 请到即梦画布网页端确认")
+        })?;
+
+        // 音频服务端可能回 mp3 也可能回 wav, 先落成临时名再按实际扩展名修正。
+        let download_dir = resolve_download_dir(app, &run_id)?;
+        let target = download_dir.join(format!("canvas-{run_id}.mp3"));
+        if let Err(error) = run_canvas_cli_with_timeout(
+            &executable,
+            &[
+                "resource".to_string(),
+                "download".to_string(),
+                resource_id.clone(),
+                format!("--project-id={project_id}"),
+                "-o".to_string(),
+                target.to_string_lossy().to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+            CLI_TASK_TIMEOUT,
+        ) {
+            return Err(format!(
+                "音频已生成但下载失败（resourceId={resource_id}）: {error}。\
+                 可手动取回: dreamina-canvas resource download {resource_id} --project-id={project_id} -o <路径>"
+            ));
+        }
+        if !target.is_file() {
+            return Err(format!(
+                "音频已生成但本地没有落盘文件（resourceId={resource_id}, 期望 {}）",
+                target.display()
+            ));
+        }
+        Ok(target.to_string_lossy().to_string())
+    })();
+
+    let _ = fs::remove_dir_all(&input_dir);
+    result
+}
+
+/// 在 JSON 里递归找第一个数值字段（按候选 key 名依次试）。
+///
+/// 报价(`node quote`)返回的积分字段名在不同小版本里叫 `credits` / `totalCredits` /
+/// `total` 都有可能, 与其猜一个写死, 不如按候选名找。
+fn find_json_number_field(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in keys {
+                if let Some(number) = map.get(*key).and_then(serde_json::Value::as_f64) {
+                    return Some(number);
+                }
+            }
+            map.values()
+                .find_map(|child| find_json_number_field(child, keys))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_json_number_field(child, keys)),
+        _ => None,
+    }
+}
+
+const CANVAS_QUOTE_KEYS: [&str; 9] = [
+    // 实测 `node quote` 回的是 `{"items":[{"nodeId":…,"maxCredits":45}],"totalMaxCredits":45}`
+    "totalMaxCredits",
+    "maxCredits",
+    "credits",
+    "credit",
+    "totalCredits",
+    "total_credit",
+    "creditsAmount",
+    "amount",
+    "total",
+];
+
+/// 建节点 → 报价 → 按报价批准 → 运行 → 等终态。
+///
+/// 不用 `node create --run`: 那条命令虽然会在内部「报价 → 批准 → 运行」, 但**用户看不到
+/// 要花多少积分**, 而且 ceiling 只能猜一个写死的值。拆开之后:
+/// ① 积分是服务端报的真实数字; ② 批准额度按报价给, 不会因为猜小了被拒、猜大了失控。
+/// 返回 `(node_id, 报价积分)`。
+fn create_quote_confirm_run(
+    executable: &str,
+    project_id: &str,
+    node_kind: &str,
+    content_args: &[String],
+) -> Result<(String, Option<f64>), String> {
+    // 1) 建节点(不触发生成)
+    let mut create_args = vec![
+        "node".to_string(),
+        "create".to_string(),
+        node_kind.to_string(),
+        format!("--project-id={project_id}"),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+    create_args.extend(content_args.iter().cloned());
+    let created = run_canvas_cli(executable, &create_args)?;
+    let created_data = parse_canvas_payload(&created)?;
+    let node_id = find_json_string_field(&created_data, "nodeId")
+        .ok_or_else(|| "即梦画布 CLI 建节点后未返回 nodeId".to_string())?;
+
+    // 2) 报价 —— 失败不致命: 拿不到就退回让服务端在运行前自行判断。
+    let quoted = run_canvas_cli(
+        executable,
+        &canvas_cli_args(&[
+            "node",
+            "quote",
+            &format!("--node-id={node_id}"),
+            &format!("--project-id={project_id}"),
+            "--format",
+            "json",
+        ]),
+    )
+    .ok()
+    .and_then(|output| parse_canvas_payload(&output).ok())
+    .and_then(|data| find_json_number_field(&data, &CANVAS_QUOTE_KEYS));
+
+    // 3) 按报价批准(留 10% 余量, 服务端报价可能因分辨率微调), 拿短期凭证
+    let ceiling = quoted.map(|value| (value * 1.1).ceil() as i64).unwrap_or(2000);
+    let confirmed = run_canvas_cli(
+        executable,
+        &canvas_cli_args(&[
+            "node",
+            "confirm",
+            &format!("--node-id={node_id}"),
+            &format!("--project-id={project_id}"),
+            &format!("--credit-ceiling={ceiling}"),
+            "--non-interactive",
+            "--yes",
+            "--format",
+            "json",
+        ]),
+    )?;
+    let confirmed_data = parse_canvas_payload(&confirmed)?;
+    let credit_token = find_json_string_field(&confirmed_data, "creditConfirmationToken")
+        .or_else(|| find_json_string_field(&confirmed_data, "token"));
+
+    // 4) 提交运行
+    let mut run_args = vec![
+        "node".to_string(),
+        "run".to_string(),
+        format!("--node-id={node_id}"),
+        format!("--project-id={project_id}"),
+        "--non-interactive".to_string(),
+        "--yes".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+    if let Some(token) = &credit_token {
+        run_args.push(format!("--credit-token={token}"));
+    }
+    let _ = run_canvas_cli(executable, &run_args)?;
+
+    // 5) 等终态: 直接轮询 `node show` 读 status。
+    // 不走 `operation wait <submitId>` —— 那需要先拿到 submitId, 而 run 的返回结构没实测过;
+    // 而 show 是后面取产物必经的一步, status 字段已经确认存在(`success` / `empty` / `failed`)。
+    let deadline = std::time::Instant::now() + CLI_TASK_TIMEOUT;
+    loop {
+        let show = run_canvas_cli(
+            executable,
+            &canvas_cli_args(&[
+                "node",
+                "show",
+                &format!("--project-id={project_id}"),
+                &format!("--node-id={node_id}"),
+                "--format",
+                "json",
+            ]),
+        )?;
+        let data = parse_canvas_payload(&show)?;
+        let status = find_json_string_field(&data, "status")
+            .unwrap_or_default()
+            .to_lowercase();
+        match status.as_str() {
+            "success" => break,
+            "failed" | "canceled" | "cancelled" => {
+                // 失败原因通常在节点的 error 字段里, 原样带回比只说「失败」有用。
+                let detail = find_json_string_field(&data, "errorMessage")
+                    .or_else(|| find_json_string_field(&data, "error"))
+                    .or_else(|| find_json_string_field(&data, "message"))
+                    .unwrap_or_else(|| "未返回失败原因".to_string());
+                return Err(format!(
+                    "即梦画布 CLI 节点 {node_id} 生成失败: {detail}\
+                     （可在即梦画布网页端查看该节点, 或 dreamina-canvas node show --node-id={node_id}）"
+                ));
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "即梦画布 CLI 节点 {node_id} 等待超时（当前状态 {status}）。\
+                 任务可能仍在服务端运行, 稍后用 dreamina-canvas node show --node-id={node_id} 查看"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+
+    Ok((node_id, quoted))
+}
+
 /// 即梦 CLI 的账户积分(`dreamina user_credit`)。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2867,6 +4449,10 @@ pub struct JimengCliCredit {
     pub total_credit: f64,
     /// 会员等级(如 maestro), 未登录或字段缺失时为 None。
     pub vip_level: Option<String>,
+    /// 当前登录用户的 ID(v1.4.21+ 才返回)。
+    /// 切号后靠它才能确认「现在到底是哪个账号」—— CLI 拿不到昵称, ID 是唯一可靠标识。
+    pub user_id: Option<String>,
+    pub user_name: Option<String>,
 }
 
 /// CLI 输出里除 JSON 外还常夹带日志行, 取第一个 `{` 到最后一个 `}` 之间的部分。
@@ -2910,9 +4496,26 @@ pub async fn jimeng_cli_credit(executable: String) -> Result<JimengCliCredit, St
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    // `user_id` 在 JSON 里是数字(可能超出 i64, 一律按字符串取), 昵称常常是空串。
+    let user_id = payload.get("user_id").and_then(|value| match value {
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => None,
+    });
+    let user_name = payload
+        .get("user_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     Ok(JimengCliCredit {
         total_credit,
         vip_level,
+        user_id,
+        user_name,
     })
 }
 
@@ -3912,5 +5515,119 @@ mod image_tests {
     fn normalize_image_resolution_lowercases_tier() {
         assert_eq!(normalize_image_resolution(" 2K "), "2k");
         assert_eq!(normalize_image_resolution("1.5K"), "1.5k");
+    }
+
+    // ---- 画布素材上传的幂等键与恢复 ----
+
+    /// 幂等键必须**确定性**: 同一份素材在重试时必须落回同一个资源, 否则
+    /// `--resource-id` 就退化成 CLI 自己生成的随机键, `cli.upload_state_unknown` 也就恢复不了。
+    #[test]
+    fn canvas_resource_key_is_deterministic_per_content() {
+        let first = canvas_resource_key("project-a", "image", b"same-bytes");
+        let second = canvas_resource_key("project-a", "image", b"same-bytes");
+        assert_eq!(first, second, "同一份素材必须得到同一个幂等键");
+    }
+
+    #[test]
+    fn canvas_resource_key_separates_content_project_and_media_type() {
+        let base = canvas_resource_key("project-a", "image", b"bytes");
+        assert_ne!(base, canvas_resource_key("project-b", "image", b"bytes"));
+        assert_ne!(base, canvas_resource_key("project-a", "audio", b"bytes"));
+        assert_ne!(base, canvas_resource_key("project-a", "image", b"other-bytes"));
+    }
+
+    /// CLI 只校验「是个 UUID」, 但形状不对(非 v4)可能被服务端拒, 所以固定断言版本位与变体位。
+    #[test]
+    fn canvas_resource_key_is_uuid_v4_shaped() {
+        let key = canvas_resource_key("project-a", "image", b"bytes");
+        let parts: Vec<&str> = key.split('-').collect();
+        assert_eq!(parts.len(), 5, "应为 UUID 形状: {key}");
+        assert_eq!(
+            [parts[0].len(), parts[1].len(), parts[2].len(), parts[3].len(), parts[4].len()],
+            [8, 4, 4, 4, 12],
+            "分段长度不对: {key}"
+        );
+        assert!(parts[2].starts_with('4'), "version 位应为 4: {key}");
+        assert!(
+            matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b')),
+            "variant 位应为 8/9/a/b: {key}"
+        );
+    }
+
+    /// 用户实报的报错原文: 整坨 JSON 被 `output_summary` 糊出来后, 用户只看到
+    /// `error={"class":"human_intervention",...}`, 完全不知道该做什么。
+    #[test]
+    fn canvas_failure_reason_keeps_message_and_code_only() {
+        let output = serde_json::json!({
+            "schemaVersion": "1",
+            "ok": false,
+            "error": {
+                "class": "human_intervention",
+                "code": "cli.upload_state_unknown",
+                "message": "The upload may already have created a remote object. Do not automatically retry; inspect the operation or contact support.",
+                "retryable": false
+            }
+        })
+        .to_string();
+
+        let reason = canvas_cli_failure_reason(&output);
+        assert!(reason.contains("cli.upload_state_unknown"), "应带错误码: {reason}");
+        assert!(
+            reason.contains("Do not automatically retry"),
+            "应保留可读原因: {reason}"
+        );
+        assert!(
+            !reason.contains("\"class\"") && !reason.contains("human_intervention"),
+            "不应再把整坨信封 JSON 抛给用户: {reason}"
+        );
+    }
+
+    #[test]
+    fn canvas_failure_marks_unknown_upload_state_as_maybe_existing() {
+        assert!(canvas_failure_means_resource_exists(
+            "The upload may already have created a remote object.（cli.upload_state_unknown）"
+        ));
+        assert!(canvas_failure_means_resource_exists(
+            "This request was already submitted. Reuse the existing submission identity.（service.5）"
+        ));
+        assert!(!canvas_failure_means_resource_exists(
+            "即梦画布 CLI 的登录态已失效（cli.credential_missing）"
+        ));
+    }
+
+    /// 人话说明必须点明「不是素材/提示词的问题 + 不花钱 + 怎么手动核对」,
+    /// 否则用户只会以为是参考图坏了, 反复换图重试。
+    #[test]
+    fn canvas_upload_failure_explains_unknown_state() {
+        let text = describe_canvas_upload_failure(
+            "参考图",
+            "f8eafd66-b4a8-4e68-bae4-99f12044a6f0",
+            "3fa5626f-f323-4663-858c-7b8a8fa7266f",
+            "The upload may already have created a remote object.（cli.upload_state_unknown）",
+        );
+
+        assert!(text.contains("参考图"), "应指明是哪类素材: {text}");
+        assert!(text.contains("f8eafd66-b4a8-4e68-bae4-99f12044a6f0"), "应带幂等键: {text}");
+        assert!(text.contains("不代表参考素材或提示词有问题"), "应排除素材嫌疑: {text}");
+        assert!(text.contains("不消耗积分"), "应说明没有花钱: {text}");
+        assert!(
+            text.contains("dreamina-canvas resource get f8eafd66-b4a8-4e68-bae4-99f12044a6f0"),
+            "应给手动核对命令: {text}"
+        );
+        assert!(text.contains("--project-id=3fa5626f"), "核对命令应带项目: {text}");
+    }
+
+    #[test]
+    fn canvas_upload_failure_handles_login_and_timeout() {
+        let login = describe_canvas_upload_failure("参考音频", "rid", "pid", "not login, unauthorized");
+        assert!(login.contains("重新登录"), "未登录应引导重新登录: {login}");
+
+        let timeout = describe_canvas_upload_failure(
+            "参考图",
+            "rid",
+            "pid",
+            "context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+        );
+        assert!(timeout.contains("代理"), "超时应提示代理问题: {timeout}");
     }
 }

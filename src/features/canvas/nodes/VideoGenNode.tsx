@@ -58,6 +58,7 @@ import {
   getDefaultVideoModelId,
   getModelProvider,
   getVideoModelProfile,
+  JIMENG_CANVAS_CLI_PROVIDER_ID,
   JIMENG_CLI_PROVIDER_ID,
   RUNNINGHUB_CLI_PROVIDER_ID,
   listVideoModels,
@@ -440,6 +441,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     models.find((model) => model.id === getDefaultVideoModelId()) ??
     models[0];
   const isJimengCli = selectedModel?.providerId === JIMENG_CLI_PROVIDER_ID;
+  // 画布 CLI 同样是本地命令、没有 API Key, 必须一起跳过密钥校验, 否则报「请在设置中填写 API Key」。
+  const isJimengCanvasCli = selectedModel?.providerId === JIMENG_CANVAS_CLI_PROVIDER_ID;
   const isWanCli = selectedModel?.providerId === "wan-cli";
   const isRunningHubCli = selectedModel?.providerId === RUNNINGHUB_CLI_PROVIDER_ID;
   const selectedProfile = selectedModel ? getVideoModelProfile(selectedModel.profileId) : null;
@@ -1166,7 +1169,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       return;
     }
     const apiKey = apiKeys[selectedModel.providerId] ?? "";
-    if (!isJimengCli && !isWanCli && !isRunningHubCli && !apiKey) {
+    if (!isJimengCli && !isJimengCanvasCli && !isWanCli && !isRunningHubCli && !apiKey) {
       const message = "请在设置中填写 API Key";
       setError(message);
       void showErrorDialog(message, t("common.error"));
@@ -1177,7 +1180,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     beginCooldown();
     const customId = selectedModel.providerId.slice("custom:".length);
     const baseUrl =
-      isJimengCli || isWanCli || isRunningHubCli ? undefined : customApis.find((api) => api.id === customId)?.baseUrl;
+      isJimengCli || isJimengCanvasCli || isWanCli || isRunningHubCli
+        ? undefined
+        : customApis.find((api) => api.id === customId)?.baseUrl;
     const manualReferenceVideos = Array.isArray(data.binghuoReferenceVideos)
       ? data.binghuoReferenceVideos.filter(
           (source): source is string => typeof source === "string" && source.trim().length > 0,

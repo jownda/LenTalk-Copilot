@@ -3,7 +3,7 @@ import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Termin
 import { useTranslation } from 'react-i18next';
 import { buildCustomModelId, isAudioModelName, isChatCompletionModelName, isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
 import type { CustomApiCapabilities, CustomApiProvider } from '@/stores/settingsStore';
-import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck, jimengCliLogout, jimengCliDetect, jimengCliInstall } from '@/commands/ai';
+import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck, jimengCliLogout, jimengCliInstall, jimengCliOpenLoginUrl, jimengCliOpenLoginWindow, jimengCliCloseLoginWindow } from '@/commands/ai';
 import {
   formatProviderBalance,
   queryJimengCliCredit,
@@ -39,11 +39,15 @@ import { useDialogTransition } from '@/components/ui/useDialogTransition';
 import { listModelProviders } from '@/features/canvas/models';
 import type { SettingsCategory } from '@/features/settings/settingsEvents';
 import { WanCliSettings } from '@/features/settings/WanCliSettings';
+import { JimengCanvasCliSettings } from '@/features/settings/JimengCanvasCliSettings';
 import { RunningHubCliSettings } from '@/features/settings/RunningHubCliSettings';
 import { isZhenjianProvider } from '@/commands/zhenjianApi';
 
 const JIMENG_LOGIN_POLL_INTERVAL_MS = 3000;
-const JIMENG_LOGIN_MAX_ATTEMPTS = 200;
+// 授权码有效期约 10 分钟; 6 分钟封顶, 别等到过期后还在空转轮询。
+const JIMENG_LOGIN_MAX_ATTEMPTS = 120;
+/** 即梦网页端的视频生成页 —— 首次用某个模型时要在那里完成一次 AIGC 合规确认。 */
+const JIMENG_SITE_URL = 'https://jimeng.jianying.com/ai-tool/generate/?type=video';
 
 const JIMENG_LOGIN_NO_PERMISSION_MESSAGE = 'OAuth 授权成功，但当前账号没有 dreamina_cli 使用权限（仅限高级或高级以上的会员等级）。请升级会员后重试。';
 
@@ -282,7 +286,9 @@ export function SettingsDialog({
   const [showJimengCliSettings, setShowJimengCliSettings] = useState(false);
   const [localJimengCliExecutable, setLocalJimengCliExecutable] = useState(jimengCli.executable);
   const [jimengLoginState, setJimengLoginState] = useState<'idle' | 'opening' | 'polling' | 'success' | 'error'>('idle');
-  const [, setJimengLoginInfo] = useState<{ verificationUri: string; userCode: string; deviceCode: string } | null>(null);
+  const [jimengLoginInfo, setJimengLoginInfo] = useState<{ verificationUri: string; userCode: string; deviceCode: string } | null>(null);
+  /** 本次授权是否走「切换账号」(决定重开授权页时仍用无痕窗口)。 */
+  const jimengLoginForceRef = useRef(false);
   // 即梦 CLI 剩余积分(dreamina user_credit); 未登录或 CLI 不可用时保持 null。
   const [jimengCredit, setJimengCredit] = useState<JimengCliCredit | null>(null);
   const [jimengLoginMessage, setJimengLoginMessage] = useState('');
@@ -454,8 +460,10 @@ export function SettingsDialog({
     try {
       const credit = await queryJimengCliCredit(executable.trim() || 'dreamina');
       setJimengCredit(credit);
+      return credit;
     } catch {
       setJimengCredit(null);
+      return null;
     }
   }, []);
 
@@ -550,6 +558,8 @@ export function SettingsDialog({
   }, [jimengCli.executable]);
 
   // 打开设置时只探测本地登录态，不会发起新的授权或打开浏览器。
+  // 用 `user_credit` 探测是**只读**的: 旧的 `login --headless` 探测在未登录时会顺手
+  // 申请一个没人用的 device_code, 既多一次网络往返, 又会在服务端堆积待授权会话。
   const probeJimengLoginStatus = useCallback(async (executable: string) => {
     const value = executable.trim() || 'dreamina';
     if (jimengLoginProbeRef.current) {
@@ -557,12 +567,10 @@ export function SettingsDialog({
     }
     jimengLoginProbeRef.current = true;
     try {
-      const result = await jimengCliLoginStart(value);
-      if (!result.needAuth) {
+      const credit = await refreshJimengCredit(value);
+      if (credit) {
         setJimengLoginState('success');
-        setJimengLoginMessage(result.message || '已登录即梦账号');
-        // 已登录才有积分可查; 未登录时 CLI 会直接报错, 不浪费一次调用。
-        void refreshJimengCredit(value);
+        setJimengLoginMessage('已登录即梦账号');
       } else {
         setJimengLoginState('idle');
         setJimengLoginMessage('');
@@ -594,43 +602,107 @@ export function SettingsDialog({
     };
   }, []);
 
-  /** 一键登录即梦: 获取设备码 → 自动打开浏览器 → 轮询登录结果 */
-  const startJimengLogin = useCallback(async () => {
+  /**
+   * 申请登录材料(设备码/授权链接)。
+   * 正常路径**不做前置 CLI 检测**: `dreamina` 单次冷启动实测 4 秒以上, 先检测再登录等于白等一轮。
+   * 只有真的报「启动不了」时才自动安装并重试一次。
+   */
+  const requestJimengLoginMaterial = useCallback(
+    async (initialExecutable: string, force: boolean) => {
+      try {
+        return await jimengCliLoginStart(initialExecutable, { force });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const cliUnavailable = /无法启动|未找到|无法解析|not found|cannot find|could not find/i.test(
+          message
+        );
+        if (!cliUnavailable) {
+          throw error;
+        }
+        setJimengLoginMessage('未检测到可用的即梦 CLI，正在自动安装（约 1-2 分钟）…');
+        const install = await jimengCliInstall();
+        if (!install.success || !install.resolvedPath) {
+          throw new Error(`未检测到即梦 CLI 且自动安装失败：${install.message || '请手动安装'}`);
+        }
+        setJimengCliExecutable(install.resolvedPath);
+        setLocalJimengCliExecutable(install.resolvedPath);
+        return await jimengCliLoginStart(install.resolvedPath, { force });
+      }
+    },
+    [setJimengCliExecutable, setLocalJimengCliExecutable]
+  );
+
+  /**
+   * 打开即梦授权页, 逐级兜底: 应用内独立 WebView 窗口 → 无痕浏览器 → 系统默认浏览器。
+   * `resetSession` 只在「切换账号」第一次打开时为 true: 重建一份干净会话。
+   * 重新打开同一个授权页时必须为 false —— 否则会把用户刚登录好的会话清掉。
+   */
+  const openJimengAuthPage = useCallback(
+    async (
+      uri: string,
+      options: { privateMode: boolean; resetSession: boolean }
+    ): Promise<string> => {
+      try {
+        const result = await jimengCliOpenLoginWindow(uri, {
+          resetSession: options.resetSession,
+        });
+        if (result.opened) {
+          return options.resetSession
+            ? '（已在应用内打开干净的登录窗口，可直接登录要切换的账号）'
+            : '（已在应用内打开登录窗口）';
+        }
+      } catch {
+        // 内置窗口不可用（少见）时继续往下兜底。
+      }
+      try {
+        const opened = await jimengCliOpenLoginUrl(uri, { privateMode: options.privateMode });
+        if (opened.opened) {
+          return `（已用 ${opened.browser ?? '浏览器'} 无痕窗口打开）`;
+        }
+      } catch {
+        // 同上。
+      }
+      try {
+        await openUrl(uri);
+      } catch {
+        return `请在浏览器手动打开: ${uri}`;
+      }
+      return options.privateMode ? '（请在打开的页面里先「切换账号」再确认授权）' : '';
+    },
+    []
+  );
+
+  /**
+   * 一键登录即梦: 获取设备码 → 自动打开浏览器 → 轮询登录结果。
+   * `force=true` 走「切换账号」: 先清本地 OAuth 记录强制发新材料, 并用**干净会话**打开授权页
+   * —— 设备码授权认的是打开页面那个会话里登录的即梦账号, 复用旧会话会直接把旧账号授出去。
+   */
+  const startJimengLogin = useCallback(async (force = false) => {
     let executable = localJimengCliExecutable.trim() || 'dreamina';
+    jimengLoginForceRef.current = force;
     setJimengLoginState('opening');
-    setJimengLoginMessage('正在获取授权链接，稍后会自动打开浏览器，通常需要几秒钟，请稍候…');
+    setJimengLoginMessage(
+      force
+        ? '正在为「切换账号」重新申请授权，请稍候…'
+        : '正在获取授权链接，稍后会自动打开浏览器，通常需要几秒钟，请稍候…'
+    );
     setJimengLoginInfo(null);
+    if (force) {
+      // 换号后旧账号的积分不再有意义, 先清掉避免误读。
+      setJimengCredit(null);
+    }
     if (jimengLoginTimerRef.current) {
       clearInterval(jimengLoginTimerRef.current);
       jimengLoginTimerRef.current = null;
     }
-    // 前置：检测即梦 CLI，未安装时自动安装；安装失败不致命，仅中止登录并提示手动安装。
+    // 不再「先检测再登录」—— 即梦 CLI 单次冷启动实测 4 秒多, 检测一次纯属白等。
+    // 改成直接申请授权材料, 只有真正报「启动不了」时才去检测/安装再重试一次。
     try {
-      const detect = await jimengCliDetect(executable);
-      if (!detect.found) {
-        setJimengLoginMessage('正在自动安装即梦 CLI，请稍候…（约 1-2 分钟）');
-        const install = await jimengCliInstall();
-        if (!install.success || !install.resolvedPath) {
-          setJimengLoginState('error');
-          setJimengLoginMessage(
-            `未检测到即梦 CLI 且自动安装失败：${install.message || '请手动安装'}`
-          );
-          return;
-        }
-        setJimengCliExecutable(install.resolvedPath);
-        setLocalJimengCliExecutable(install.resolvedPath);
-        executable = install.resolvedPath;
-      }
-    } catch (error) {
-      setJimengLoginState('error');
-      setJimengLoginMessage(error instanceof Error ? error.message : String(error));
-      return;
-    }
-    try {
-      const result = await jimengCliLoginStart(executable);
+      const result = await requestJimengLoginMaterial(executable, force);
       if (!result.needAuth) {
         setJimengLoginState('success');
         setJimengLoginMessage(result.message || '已登录即梦账号');
+        void refreshJimengCredit(executable);
         return;
       }
       if (!result.verificationUri || !result.userCode || !result.deviceCode) {
@@ -641,11 +713,12 @@ export function SettingsDialog({
         userCode: result.userCode,
         deviceCode: result.deviceCode,
       });
-      try {
-        await openUrl(result.verificationUri);
-      } catch {
-        setJimengLoginMessage(`请在浏览器手动打开: ${result.verificationUri}`);
-      }
+      // 打开授权页: 优先应用内独立窗口, 失败再退到无痕/默认浏览器。
+      const authNote = await openJimengAuthPage(result.verificationUri, {
+        privateMode: force,
+        resetSession: force,
+      });
+      setJimengLoginMessage(`等待授权完成…${authNote}`);
       setJimengLoginState('polling');
 
       const deviceCode = result.deviceCode;
@@ -674,9 +747,19 @@ export function SettingsDialog({
           if (check.success) {
             stopPolling();
             setJimengLoginState('success');
-            setJimengLoginMessage(check.message || '登录成功');
-            // 刚登录进来才拿得到积分, 顺手刷新一次。
-            void refreshJimengCredit(executable);
+            setJimengLoginMessage(
+              force ? '已切换到新账号，授权完成' : check.message || '登录成功'
+            );
+            // 授权已完成, 内置登录窗口没有继续开着的必要。
+            void jimengCliCloseLoginWindow().catch(() => {});
+            // 刚登录进来才拿得到积分/用户 ID —— 顺手把账号尾号写进提示, 切号是否生效一眼可辨。
+            void refreshJimengCredit(executable).then((credit) => {
+              if (credit?.userId) {
+                setJimengLoginMessage(
+                  `${force ? '已切换到新账号' : '登录成功'}（账号 …${credit.userId.slice(-6)}）`
+                );
+              }
+            });
             return;
           }
           const lower = check.message.toLowerCase();
@@ -726,12 +809,63 @@ export function SettingsDialog({
     }
   }, [localJimengCliExecutable, refreshJimengCredit, setJimengCliExecutable, setLocalJimengCliExecutable]);
 
+  /**
+   * 打开即梦网页端的视频生成页。
+   * 首次使用某个模型时后端会回 `AigcComplianceConfirmationRequired`（ret=4010），
+   * 任务在提交接口就被拒、不会创建也不会扣费 —— 必须先在网页端用**同一个账号**
+   * 完成一次合规确认，CLI 才能提交。
+   */
+  const openJimengSite = useCallback(async () => {
+    try {
+      await jimengCliOpenLoginWindow(JIMENG_SITE_URL, {
+        resetSession: false,
+        title: '即梦网页',
+      });
+    } catch {
+      try {
+        await openUrl(JIMENG_SITE_URL);
+      } catch {
+        setJimengLoginMessage(`请手动在浏览器打开: ${JIMENG_SITE_URL}`);
+      }
+    }
+  }, []);
+
+  /**
+   * 用系统默认浏览器打开同一个授权页。
+   * 第三方登录（抖音等）在 WebView 里被风控拦下时的逃生口 —— device_code 不变, 在浏览器里
+   * 完成授权后这边的轮询照样能收到。
+   */
+  const openJimengAuthInBrowser = useCallback(async () => {
+    if (!jimengLoginInfo) {
+      return;
+    }
+    try {
+      await openUrl(jimengLoginInfo.verificationUri);
+      setJimengLoginMessage('已在系统浏览器中打开授权页，完成后这里会自动更新');
+    } catch {
+      setJimengLoginMessage(`请在浏览器手动打开: ${jimengLoginInfo.verificationUri}`);
+    }
+  }, [jimengLoginInfo]);
+
+  /** 重新打开授权页(polling 中窗口被关掉 / 找不到窗口时用)。复用当前会话, 不清登录态。 */
+  const reopenJimengAuthPage = useCallback(async () => {
+    if (!jimengLoginInfo) {
+      return;
+    }
+    const note = await openJimengAuthPage(jimengLoginInfo.verificationUri, {
+      privateMode: jimengLoginForceRef.current,
+      resetSession: false,
+    });
+    setJimengLoginMessage(`等待授权完成…${note}`);
+  }, [jimengLoginInfo, openJimengAuthPage]);
+
     const handleJimengLogout = useCallback(() => {
     setJimengLoginState('idle');
     setJimengLoginInfo(null);
     // 退出登录后积分不再代表当前账号, 直接清掉。
     setJimengCredit(null);
     setJimengLoginMessage('已退出登录');
+    void jimengCliCloseLoginWindow().catch(() => {});
     void jimengCliLogout(localJimengCliExecutable).catch((error) => {
       setJimengLoginState('error');
       setJimengLoginMessage(error instanceof Error ? error.message : String(error));
@@ -1935,6 +2069,8 @@ export function SettingsDialog({
                     </button>
                   </div>
 
+                  {/* 即梦 CLI 与即梦画布 CLI 是两个独立工具, 并排放在同一行。 */}
+                  <JimengCanvasCliSettings />
                   <WanCliSettings />
                   <RunningHubCliSettings />
                   </div>
@@ -2440,29 +2576,50 @@ export function SettingsDialog({
                         {t('settings.jimengCliLoginTitle', '即梦账号登录')}
                       </p>
                       <p className="mt-0.5 text-[11px] leading-4 text-text-muted">
-                        {t('settings.jimengCliLoginDesc', '点击后自动打开浏览器完成授权，无需手动执行命令')}
+                        {jimengLoginState === 'success'
+                          ? t(
+                              'settings.jimengCliLoginDescSwitching',
+                              '切换账号会用无痕窗口重新授权，不影响浏览器里原来的登录'
+                            )
+                          : t(
+                              'settings.jimengCliLoginDesc',
+                              '点击后自动打开浏览器完成授权，无需手动执行命令'
+                            )}
                       </p>
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
+{jimengLoginState === 'opening' || jimengLoginState === 'polling' ? (
 <button
-                      type="button"
-                      onClick={startJimengLogin}
-                      disabled={jimengLoginState === 'opening' || jimengLoginState === 'polling'}
-                      className="shrink-0 rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {jimengLoginState === 'opening' || jimengLoginState === 'polling'
-                        ? t('settings.jimengCliLogining', '获取授权中…')
-                        : jimengLoginState === 'success'
-                          ? t('settings.jimengCliLoggedIn', '已登录')
-                          : t('settings.jimengCliLoginBtn', '一键登录')}
-                    </button>
-{jimengLoginState === 'success' && (
+  type="button"
+  disabled
+  className="shrink-0 rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+>
+  {t('settings.jimengCliLogining', '获取授权中…')}
+</button>
+) : jimengLoginState === 'success' ? (
+<>
+<button
+  type="button"
+  onClick={() => void startJimengLogin(true)}
+  className="shrink-0 rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-50"
+>
+  {t('settings.jimengCliSwitchAccount', '切换账号')}
+</button>
 <button
   type="button"
   onClick={handleJimengLogout}
   className="shrink-0 rounded-md border border-border-dark bg-surface-dark px-3 py-1.5 text-xs font-medium text-text-dark transition-colors hover:bg-surface-dark/70 disabled:cursor-not-allowed disabled:opacity-50"
 >
   {t('settings.jimengCliLogout', '退出登录')}
+</button>
+</>
+) : (
+<button
+  type="button"
+  onClick={() => void startJimengLogin(false)}
+  className="shrink-0 rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-50"
+>
+  {t('settings.jimengCliLoginBtn', '一键登录')}
 </button>
 )}
 </div>
@@ -2478,6 +2635,32 @@ export function SettingsDialog({
                     </p>
                   )}
 
+                  {/* 授权中: 给出用户码 + 重开入口, 避免浏览器窗口被关掉后只能干等。 */}
+                  {jimengLoginState === 'polling' && jimengLoginInfo && (
+                    <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md bg-bg-dark px-2 py-1.5">
+                      <span className="text-[11px] text-text-muted">
+                        {t('settings.jimengCliUserCode', '用户码')}
+                      </span>
+                      <code className="select-all font-mono text-[11px] text-text-dark">
+                        {jimengLoginInfo.userCode}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={() => void reopenJimengAuthPage()}
+                        className="ml-auto shrink-0 text-[11px] font-medium text-accent hover:underline"
+                      >
+                        {t('settings.jimengCliReopenAuth', '重新打开授权页')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void openJimengAuthInBrowser()}
+                        className="shrink-0 text-[11px] font-medium text-text-muted hover:text-accent hover:underline"
+                      >
+                        {t('settings.jimengCliOpenInBrowser', '改用浏览器')}
+                      </button>
+                    </div>
+                  )}
+
                   {/* 即梦 CLI 剩余积分(dreamina user_credit); 未登录 / 查不到时整块不渲染。 */}
                   {jimengCredit && (
                     <div className="mt-2 flex items-center gap-2 rounded-md bg-accent/10 px-2 py-1.5">
@@ -2490,8 +2673,35 @@ export function SettingsDialog({
                       {jimengCredit.vipLevel && (
                         <span className="text-[10px] text-text-muted">{jimengCredit.vipLevel}</span>
                       )}
+                      {/* 切号后靠这个尾号核对到底登的是哪个账号 —— CLI 拿不到昵称。 */}
+                      {jimengCredit.userId && (
+                        <span
+                          className="ml-auto shrink-0 text-[10px] text-text-muted"
+                          title={`用户 ID：${jimengCredit.userId}`}
+                        >
+                          {t('settings.jimengCliAccount', '账号')} …{jimengCredit.userId.slice(-6)}
+                        </span>
+                      )}
                     </div>
                   )}
+
+                  {/* 首次用某个模型时后端回 4010 AigcComplianceConfirmationRequired:
+                      任务在提交接口就被拒、不扣费, 但必须先去网页端同账号点一次合规确认。 */}
+                  <div className="mt-2 border-t border-border-dark/60 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => void openJimengSite()}
+                      className="text-[11px] font-medium text-accent hover:underline"
+                    >
+                      {t('settings.jimengCliOpenSite', '打开即梦网页')}
+                    </button>
+                    <span className="ml-1.5 text-[11px] leading-4 text-text-muted">
+                      {t(
+                        'settings.jimengCliOpenSiteHint',
+                        '首次使用某个模型报 4010（合规确认）时，用同一个账号在这里生成一次即可'
+                      )}
+                    </span>
+                  </div>
                 </div>
 
                 <div className="space-y-3 rounded-md border border-border-dark bg-surface-dark/50 p-3 text-xs text-text-muted">

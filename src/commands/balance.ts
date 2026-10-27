@@ -20,6 +20,9 @@ export interface ProviderBalance {
 export interface JimengCliCredit {
   totalCredit: number;
   vipLevel?: string;
+  /** 当前登录用户 ID（CLI v1.4.21+ 才有）；切号后靠它核对到底登的是哪个账号 */
+  userId?: string | null;
+  userName?: string | null;
 }
 
 export interface WanCliCredits {

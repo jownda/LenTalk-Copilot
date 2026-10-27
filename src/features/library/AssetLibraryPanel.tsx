@@ -41,7 +41,6 @@ import type { PromptTemplate } from "@/features/prompts/promptLibraryStore";
 import { useCanvasStore } from "@/stores/canvasStore";
 import { CANVAS_NODE_TYPES } from "@/features/canvas/domain/canvasNodes";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
-import { nodeCatalog } from "@/features/canvas/application/nodeCatalog";
 import { UiButton, UiGhostIconButton, UiInput, UiSelect } from "@/components/ui/primitives";
 import CinematicAssetLibrary, {
   type CanvasAudioSource as CinematicCanvasAudioSource,
@@ -51,6 +50,7 @@ import type { ProjectV2, SceneV2 } from "@/features/cinematicStudio/shared-types
 import { copy, type CopyZh, type Locale } from "@/features/cinematicStudio/app/i18n";
 import { useCinematicProject } from "@/features/cinematicStudio/app/useCinematicProject";
 import { isAudioNode } from "@/features/canvas/domain/canvasNodes";
+import { AssetPreviewDialog } from "./AssetPreviewDialog";
 import { resolveNodeDisplayName } from "@/features/canvas/domain/nodeDisplay";
 // 资产库 tab 复用电影工作室组件,其样式类(asset-card/modal-* 等)与主题变量定义在该文件,
 // 工作台未挂载时也必须加载,否则侧边栏内的资产库完全没有样式。
@@ -94,15 +94,6 @@ export interface AssetLibraryPanelProps {
 
 const PANEL_WIDTH = 360;
 type MediaFilter = "all" | AssetMediaType;
-
-function resolveViewportCenterPosition(): { x: number; y: number } {
-  const { currentViewport, canvasViewportSize } = useCanvasStore.getState();
-  const zoom = Math.max(0.01, currentViewport.zoom || 1);
-  return {
-    x: Math.round((canvasViewportSize.width / 2 - currentViewport.x) / zoom - 110),
-    y: Math.round((canvasViewportSize.height / 2 - currentViewport.y) / zoom - 90),
-  };
-}
 
 function mediaIcon(mediaType: AssetMediaType) {
   if (mediaType === "video") return <Video className="h-3.5 w-3.5 text-text-muted" />;
@@ -194,7 +185,6 @@ export const AssetLibraryPanel = memo(
     const renameAsset = useAssetLibraryStore((state) => state.renameAsset);
     const classifyAssets = useAssetLibraryStore((state) => state.classifyAssets);
     const moveAssetsToCategory = useAssetLibraryStore((state) => state.moveAssetsToCategory);
-    const addNode = useCanvasStore((state) => state.addNode);
 
     const [cinematicNotice, setCinematicNotice] = useState("");
     useEffect(() => {
@@ -259,6 +249,13 @@ export const AssetLibraryPanel = memo(
     const [panelVisible, setPanelVisible] = useState(false);
     /** 侧边面板中「分组」列表折叠/展开 */
     const [categoriesCollapsed, setCategoriesCollapsed] = useState(false);
+    /**
+     * 单击放大查看的目标素材。
+     *
+     * 素材的「进入画布」只保留**拖拽**一条路(见 Canvas 的 ASSET_DRAG_DATA_TYPE 落点),
+     * 单击不再插入节点 —— 单击是为了看清素材本身。多选改为 Ctrl/⌘ + 单击。
+     */
+    const [previewAsset, setPreviewAsset] = useState<LibraryAsset | null>(null);
 
     // ── 资产库 tab（电影资产）────────────────────────────────────────────
     // 工作室打开时由 Canvas 持有实时 bridge（与工作室状态联动）；
@@ -455,35 +452,6 @@ export const AssetLibraryPanel = memo(
       [backupBusy, t],
     );
 
-    const insertAsset = useCallback(
-      (asset: LibraryAsset) => {
-        if (asset.mediaType === "image") {
-          const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.upload);
-          addNode(CANVAS_NODE_TYPES.upload, resolveViewportCenterPosition(), {
-            ...definition.createDefaultData(),
-            imageUrl: asset.sourcePath,
-            previewImageUrl: asset.previewImageUrl ?? asset.sourcePath,
-            aspectRatio: asset.aspectRatio ?? "1:1",
-            sourceFileName: asset.sourceFileName ?? null,
-            displayName: asset.name,
-          });
-          return;
-        }
-        if (asset.mediaType === "audio" || asset.mediaType === "video") {
-          const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.audio);
-          addNode(CANVAS_NODE_TYPES.audio, resolveViewportCenterPosition(), {
-            ...definition.createDefaultData(),
-            sourcePath: asset.sourcePath,
-            previewImageUrl: asset.previewImageUrl ?? null,
-            mediaType: asset.mediaType,
-            displayName: asset.name,
-          });
-          return;
-        }
-      },
-      [addNode],
-    );
-
     const toggleAssetSelection = useCallback((assetId: string) => {
       setSelectedAssetIds((current) => {
         const next = new Set(current);
@@ -637,6 +605,11 @@ export const AssetLibraryPanel = memo(
         document.body,
       );
 
+    /** 单击素材的放大查看(居中卡片, 非全屏) */
+    const assetPreviewNode = (
+      <AssetPreviewDialog asset={previewAsset} onClose={() => setPreviewAsset(null)} />
+    );
+
     /** 重命名/新建素材库共用对话框(Tauri 下 window.prompt 不可用) */
     const renameDialogNode = (
       <RenameDialog
@@ -698,13 +671,17 @@ export const AssetLibraryPanel = memo(
                 >
                   <button
                     type="button"
-                    className="block w-full text-left"
-                    onClick={() =>
-                      asset.mediaType === "image" || asset.mediaType === "audio" || asset.mediaType === "video"
-                        ? insertAsset(asset)
-                        : toggleAssetSelection(asset.id)
-                    }
-                    title={asset.mediaType === "image" ? t("assetLibrary.insertHint", "点击插入画布") : asset.name}
+                    className="block w-full cursor-zoom-in text-left"
+                    onClick={(event) => {
+                      // Ctrl/⌘ + 单击 = 多选(批量分类 / 移动 / 删除仍可用);
+                      // 普通单击 = 放大查看。进入画布只走拖拽。
+                      if (event.ctrlKey || event.metaKey) {
+                        toggleAssetSelection(asset.id);
+                        return;
+                      }
+                      setPreviewAsset(asset);
+                    }}
+                    title={t("assetLibrary.previewHint", "单击放大查看, 拖拽到画布可插入")}
                   >
                     <div className="aspect-square overflow-hidden">
                       <MediaPreview asset={asset} />
@@ -1172,6 +1149,7 @@ export const AssetLibraryPanel = memo(
             {backupStatusNotice}
             {cinematicNoticeNode}
             {assetMenuNode}
+            {assetPreviewNode}
             {renameDialogNode}
             <CategoryManagerDialog
               open={showCategoryManager && activeSection === "assets"}
@@ -1289,6 +1267,7 @@ export const AssetLibraryPanel = memo(
               {backupStatusNotice}
               {cinematicNoticeNode}
               {assetMenuNode}
+              {assetPreviewNode}
               {renameDialogNode}
               <CategoryManagerDialog
                 open={showCategoryManager && activeSection === "assets"}

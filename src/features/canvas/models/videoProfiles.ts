@@ -1,4 +1,5 @@
 import { wanCliVideoProfile } from './wanCli';
+import { isKuaiziBaseUrl } from './kuaiziModels';
 import { isZzdhProvider, ZZDH_VIDEO_QUERY_PATH, ZZDH_VIDEO_SUBMIT_PATH } from '@/commands/zzdhApi';
 import { isZhenjianProvider } from '@/commands/zhenjianApi';
 import {
@@ -7,7 +8,7 @@ import {
   RUNNINGHUB_QUERY_PATH,
 } from '@/commands/runningHubProtocol';
 
-export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'dramaya-video' | 'likeai-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'zhenjian-task-api' | 'runninghub-model' | 'jimeng-cli' | 'wan-cli';
+export type VideoProfileId = 'openai-video' | 'seedance-v2' | 'sub2api-video' | 'dramaya-video' | 'likeai-video' | 'zzdh-v8-video' | 'binghuo-video' | 'wgspai-video' | 'zhiniao-video' | 'kuaizi-video' | 'zhenjian-task-api' | 'runninghub-model' | 'jimeng-cli' | 'jimeng-canvas' | 'wan-cli';
 export type VideoProfileStatus = 'verified' | 'pending-adaptation';
 export type VideoReferenceTarget = 'data-url' | 'public-url' | 'platform-file';
 
@@ -62,6 +63,18 @@ const SUB2API_VIDEO_PROFILE: VideoModelProfile = {
 };
 
 /** 即梦 CLI(本地命令)专用: 不走 HTTP 平台协议, 由本地 CLI 自校验模型/时长/分辨率 */
+const JIMENG_CANVAS_CLI_VIDEO_PROFILE: VideoModelProfile = {
+  id: 'jimeng-canvas',
+  status: 'verified',
+  protocolLabel: '即梦画布 CLI / 本地命令',
+  // 参考图先 `resource upload` 登记成项目资源, 再用 `res:<id>` 引用。
+  referenceImageTarget: 'platform-file',
+  supportsReferenceImages: true,
+  supportsFirstLast: true,
+  // 画布 CLI 的视频节点目前只吃图片参考, 没有音频参考入参。
+  supportsReferenceAudio: false,
+};
+
 const JIMENG_CLI_VIDEO_PROFILE: VideoModelProfile = {
   id: 'jimeng-cli',
   status: 'verified',
@@ -152,6 +165,34 @@ const ZHINIAO_VIDEO_PROFILE: VideoModelProfile = {
   submitPath: '/v1/videos/generations',
   queryPath: '/v1/tasks/{taskId}',
   referenceImageTarget: 'platform-file',
+  supportsReferenceImages: true,
+  supportsFirstLast: true,
+  supportsReferenceAudio: true,
+};
+
+/**
+ * 筷子AI(aiopenapi.kuaizi.cn)视频链路。
+ *
+ * 与火山方舟**同形**, 只有路径前缀不同(提交/查询都在
+ * `/ai-open-platform-api/api/v3/contents/generations/tasks`), 协议实现在
+ * `video_protocols/ark.rs` —— 那段 `content` 数组逻辑与 api666888 的满血版共用,
+ * 按 Base URL 换路径与文案。
+ *
+ * 参考素材是 `public-url`: 文档明确 `image_url.url` / `audio_url.url` 只接受
+ * `http(s)://` 或**本平台**注册过的 `asset://<Id>`, **拒绝 base64**, 且前缀大小写
+ * 敏感。这一点与方舟原生接口相反, 所以本地素材必须先在节点侧换成公网 URL
+ * (见 `infrastructure/kuaiziReferences.ts`: 知鸟 `/v1/files` 上传 → 可选 CreateAsset)。
+ *
+ * 参考音视频: 2.0 系 ≤3 条音频 / ≤3 条视频, 2.5 系 ≤10 条; 2.5 还支持**纯音频参考**
+ * (只有 audio_url + text, 不搭配图片/视频)。
+ */
+const KZ_VIDEO_PROFILE: VideoModelProfile = {
+  id: 'kuaizi-video',
+  status: 'verified',
+  protocolLabel: '筷子AI 方舟视频 / 已验证',
+  submitPath: '/ai-open-platform-api/api/v3/contents/generations/tasks',
+  queryPath: '/ai-open-platform-api/api/v3/contents/generations/tasks/{taskId}',
+  referenceImageTarget: 'public-url',
   supportsReferenceImages: true,
   supportsFirstLast: true,
   supportsReferenceAudio: true,
@@ -300,16 +341,35 @@ function isLikeaiVideoProvider(provider: string, providerBaseUrl?: string): bool
   return /^(?:https?:\/\/)?(?:api\.|www\.)?likeai520\.cc(?:[/:]|$)/i.test(baseUrl);
 }
 
+/**
+ * 筷子AI 的识别。
+ *
+ * 平台 id 可能是推荐卡片连上后按名称生成的(`custom:筷子-ai`), 也可能被用户改成
+ * 任意值 —— **Base URL 才是主判据**。掉到通用 OpenAI Video 档案会发
+ * `/v1/videos/generations`(该站没有这个路径), 节点页签也会显示错协议。
+ *
+ * 模型名全叫 `doubao-seedance-2-0-260128` 这种内部 ID, 不命中下面的
+ * `/^seedance.../` 正则, 但仍要排在它前面 —— 语义上这是方舟形态, 不该被
+ * 通用 Seedance 档案吃掉。
+ */
+function isKuaiziVideoProvider(provider: string, providerBaseUrl?: string): boolean {
+  if (provider === 'custom:kz-ai' || provider === 'kz-ai') return true;
+  return isKuaiziBaseUrl(providerBaseUrl);
+}
+
 export function resolveVideoModelProfile(modelId: string, providerBaseUrl?: string): VideoModelProfile {
   if (modelId.startsWith('wan-cli/')) return wanCliVideoProfile;
   const provider = modelId.split('/')[0]?.trim().toLowerCase();
   const model = modelId.split('/').slice(1).join('/').trim().toLowerCase();
   // 即梦 CLI 是本地命令, seedance 系列由 CLI 自行校验, 不套用平台协议适配状态
   if (provider === 'jimeng-cli') return JIMENG_CLI_VIDEO_PROFILE;
+  // 即梦画布 CLI(`dreamina-canvas`)是另一个工具, 与 `dreamina` 的模型/命令都不通用。
+  if (provider === 'jimeng-canvas') return JIMENG_CANVAS_CLI_VIDEO_PROFILE;
   // RunningHub 必须排在下面的 seedance 正则之前: 它的端点 ID 里就带 seedance
   // (`seedance-v1.5-pro/text-to-video`), 认成通用 Seedance 平台会挑错协议页签。
   if (isRunningHubVideoProvider(provider, providerBaseUrl)) return RUNNINGHUB_VIDEO_PROFILE;
   if (isZhiniaoVideoProvider(provider, providerBaseUrl)) return ZHINIAO_VIDEO_PROFILE;
+  if (isKuaiziVideoProvider(provider, providerBaseUrl)) return KZ_VIDEO_PROFILE;
   if (isZhenjianProvider(provider, providerBaseUrl)) return ZHENJIAN_TASK_PROFILE;
   if (/^(?:https?:\/\/)?(?:video|sub2api)\.rjm\.us\.ci(?:[/:]|$)/i.test(providerBaseUrl?.trim() ?? '')
     || provider === 'custom:sub2api-video') {
@@ -339,9 +399,11 @@ export function getVideoModelProfile(profileId?: string): VideoModelProfile {
     'binghuo-video': BINGHUO_VIDEO_PROFILE,
     'wgspai-video': WGSPAI_VIDEO_PROFILE,
     'zhiniao-video': ZHINIAO_VIDEO_PROFILE,
+    'kuaizi-video': KZ_VIDEO_PROFILE,
     'zhenjian-task-api': ZHENJIAN_TASK_PROFILE,
     'runninghub-model': RUNNINGHUB_VIDEO_PROFILE,
     'jimeng-cli': JIMENG_CLI_VIDEO_PROFILE,
+    'jimeng-canvas': JIMENG_CANVAS_CLI_VIDEO_PROFILE,
   };
   return profiles[profileId as VideoProfileId] ?? OPENAI_VIDEO_PROFILE;
 }

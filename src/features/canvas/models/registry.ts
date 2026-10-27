@@ -64,6 +64,8 @@ import {
   isRunningHubDedicatedVideoEndpoint,
 } from "@/commands/runningHubProtocol";
 import { resolveApi666888VideoOptions } from "./lingkeVideoOptions";
+import { isKuaiziBaseUrl, resolveKuaiziVideoOptions } from "./kuaiziModels";
+import { isLikeaiBaseUrl, resolveLikeaiVideoOptions } from "./likeaiModels";
 
 const providerModules = import.meta.glob<{ provider: ModelProviderDefinition }>("./providers/*.ts", { eager: true });
 const modelModules = import.meta.glob<{ imageModel: ImageModelDefinition }>("./image/**/*.ts", { eager: true });
@@ -83,10 +85,23 @@ const imageModelMap = new Map<string, ImageModelDefinition>(imageModels.map((mod
 
 export const DEFAULT_IMAGE_MODEL_ID = "builtin:default";
 export const JIMENG_CLI_PROVIDER_ID = "jimeng-cli";
+/** 即梦画布 CLI（`dreamina-canvas`）—— 与 `jimeng-cli` 是两个独立工具，模型与命令都不通用。 */
+export const JIMENG_CANVAS_CLI_PROVIDER_ID = "jimeng-canvas";
 const JIMENG_CLI_PROVIDER: ModelProviderDefinition = {
   id: JIMENG_CLI_PROVIDER_ID,
   name: "即梦 CLI",
   label: "即梦 CLI",
+};
+/**
+ * 即梦画布 CLI(`dreamina-canvas`)。
+ * 🔴 必须登记: 模型选择器的「平台」标签是 `Set(models.providerId) → getModelProvider()`,
+ * 没登记就会落到兜底 `{id:"unknown"}`, 于是标签点进去按 providerId 过滤时一个模型都匹配不到
+ * —— 表现就是「模型根本选不出来」。
+ */
+const JIMENG_CANVAS_CLI_PROVIDER: ModelProviderDefinition = {
+  id: JIMENG_CANVAS_CLI_PROVIDER_ID,
+  name: "即梦画布 CLI",
+  label: "即梦画布 CLI",
 };
 
 /** RunningHub 官方 CLI 使用本机 rh 配置中的 Key，模型仍复用官方端点目录。 */
@@ -106,6 +121,7 @@ const RUNNINGHUB_CLI_PROVIDER: ModelProviderDefinition = {
  */
 const API_KEYLESS_PROVIDER_IDS: ReadonlySet<string> = new Set([
   JIMENG_CLI_PROVIDER_ID,
+  JIMENG_CANVAS_CLI_PROVIDER_ID,
   WAN_CLI_PROVIDER_ID,
   RUNNINGHUB_CLI_PROVIDER_ID,
 ]);
@@ -145,11 +161,12 @@ const imageModelAliasMap = new Map<string, string>([]);
 export function listImageModels(): ImageModelDefinition[] {
   // 即梦 CLI 在 Windows 上同样有原生制品(见 jimeng_cli.rs 的路径探测), 与视频侧一致放开。
   const jimengCliModels = buildJimengCliImageModels();
+  const jimengCanvasModels = buildJimengCanvasCliImageModels();
   if (isWindowsDesktopRuntime()) {
-    const available = [...buildCustomImageModels(), ...jimengCliModels];
+    const available = [...buildCustomImageModels(), ...jimengCliModels, ...jimengCanvasModels];
     return available.length > 0 ? available : [WINDOWS_UNCONFIGURED_IMAGE_MODEL];
   }
-  return [...imageModels, ...jimengCliModels, ...buildCustomImageModels()];
+  return [...imageModels, ...jimengCliModels, ...jimengCanvasModels, ...buildCustomImageModels()];
 }
 
 export function listModelProviders(): ModelProviderDefinition[] {
@@ -168,6 +185,12 @@ export function getImageModel(modelId: string): ImageModelDefinition {
 
   // 即梦 CLI 图片模型只出现在 listImageModels() 里, 不参与 imageModelMap 的构建 ——
   // 少了这一步, 重新打开工程时节点上的即梦模型会被兜底成内置模型(档位/画幅全错)。
+  const jimengCanvas = buildJimengCanvasCliImageModels().find(
+    (model) => model.id === resolvedModelId
+  );
+  if (jimengCanvas) {
+    return jimengCanvas;
+  }
   const jimengCli = buildJimengCliImageModels().find((model) => model.id === resolvedModelId);
   if (jimengCli) {
     return jimengCli;
@@ -273,6 +296,16 @@ export function listVideoModels(): VideoModelDefinition[] {
           api.baseUrl.trim().toLowerCase().includes(host),
         );
       const api666888Options = isApi666888 ? resolveApi666888VideoOptions(model) : undefined;
+      // 筷子AI(aiopenapi.kuaizi.cn): 四个官方模型的时长/分辨率上限**各不相同**
+      // (2.5 到 30 秒、pro 独有 4k), 档位表在 models/kuaiziModels.ts 里逐模型登记。
+      // 不加这段会落到下面的通用兜底(1~30 秒 / 无分辨率下拉), 用户就看不到 4K。
+      const isKuaizi = isKuaiziBaseUrl(api.baseUrl) || api.id.trim().toLowerCase() === "kz-ai";
+      const kuaiziOptions = isKuaizi ? resolveKuaiziVideoOptions(model) : undefined;
+      // likeai520: 平台按「该型号已开放的值」校验, 而开放值由渠道配置决定 —— 实测 2.5 与
+      // mini **只开放 16:9**、fast 只到 720p。照抄官方文档会让用户选到平台直接拒的值,
+      // 提交时吃一个 `supported ratio is required`。档位表见 models/likeaiModels.ts。
+      const isLikeai = isLikeaiBaseUrl(api.baseUrl) || api.id.trim().toLowerCase() === "likeai520";
+      const likeaiOptions = isLikeai ? resolveLikeaiVideoOptions(model) : undefined;
       // RunningHub 的档位表逐端点不同。这里的**空数组是有意义的返回值**: 表示该
       // 端点官方 schema 里没有这个参数(UI 应隐藏该控件), 或它的画幅字段收像素串、
       // 选项已在提交时折成像素。所以下面每处都先判 `.length` 再取用 —— 直接 `??`
@@ -299,7 +332,11 @@ export function listVideoModels(): VideoModelDefinition[] {
             )
           : ZZDH_VIDEO_DURATION_OPTIONS
         : undefined;
-      const resolutionValues = dramayaOptions?.resolutionValues.length
+      const resolutionValues = kuaiziOptions?.resolutionValues.length
+        ? kuaiziOptions.resolutionValues
+        : likeaiOptions?.resolutionValues.length
+        ? likeaiOptions.resolutionValues
+        : dramayaOptions?.resolutionValues.length
         ? dramayaOptions.resolutionValues
         : isSub2ApiSeedance
         ? normalizedModel === "seedance2.5"
@@ -319,7 +356,11 @@ export function listVideoModels(): VideoModelDefinition[] {
       // 字子动画画幅枚举只有 16:9 / 9:16 / 1:1(官方文档), 不要放 21:9 等超纲值。
       // WGSPAI 的白名单来自 `wgspaiProtocol`(seedance-v2 只认 9:16 / 16:9), 必须排在
       // 炳火前面 —— 两家现在是各自独立解析的, 顺序只影响可读性。
-      const aspectRatios = dramayaOptions
+      const aspectRatios = kuaiziOptions
+        ? kuaiziOptions.aspectRatios
+        : likeaiOptions
+        ? likeaiOptions.aspectRatios
+        : dramayaOptions
         ? dramayaOptions.aspectRatios
         : isSub2ApiSeedance
         ? ["16:9", "9:16"]
@@ -333,7 +374,11 @@ export function listVideoModels(): VideoModelDefinition[] {
               binghuoOptions?.aspectRatios ??
               CUSTOM_ASPECT_RATIOS);
       const durationOptions =
-        dramayaOptions?.durationOptions.length
+        kuaiziOptions?.durationOptions.length
+          ? kuaiziOptions.durationOptions
+          : likeaiOptions?.durationOptions.length
+          ? likeaiOptions.durationOptions
+          : dramayaOptions?.durationOptions.length
           ? dramayaOptions.durationOptions
           : sub2ApiDuration !== undefined
           ? [sub2ApiDuration]
@@ -349,6 +394,8 @@ export function listVideoModels(): VideoModelDefinition[] {
       // 端点 ID 里带斜杠, 原样显示在下拉里可读性太差。
       const runningHubEndpoint = isRunningHub ? resolveRunningHubVideoEndpoint(model) : undefined;
       const displayModelName =
+        (kuaiziOptions?.label || undefined) ??
+        (likeaiOptions?.label || undefined) ??
         (runningHubEndpoint ? resolveRunningHubVideoDisplayName(model) : undefined) ??
         (normalizedModel === "seedance2.5"
           ? "Seedance 2.5"
@@ -371,6 +418,8 @@ export function listVideoModels(): VideoModelDefinition[] {
         // WGSPAI 的 seedance2.5 档位只有 [30], 落到通用的 5 会让下拉显示一个
         // 并不存在的选项。
         defaultDuration:
+          kuaiziOptions?.defaultDuration ??
+          likeaiOptions?.defaultDuration ??
           dramayaOptions?.defaultDuration ??
           sub2ApiDuration ??
           runningHubOptions?.durationOptions[0] ??
@@ -401,6 +450,7 @@ export function listVideoModels(): VideoModelDefinition[] {
     ...customVideoModels,
     ...buildRunningHubCliVideoModels(),
     ...buildJimengCliVideoModels(),
+    ...buildJimengCanvasCliVideoModels(),
     ...wanCliVideoModels,
   ];
 }
@@ -553,8 +603,35 @@ function buildCustomAudioModels(): AudioModelDefinition[] {
   );
 }
 
+
+/**
+ * 即梦画布 CLI 的音频模型(`model list --type=audio`)。
+ * 只有两个: `legacy_tts`(配音) 与 `seed_music_1.0`(音乐, 30~360 秒)。
+ */
+function buildJimengCanvasCliAudioModels(): AudioModelDefinition[] {
+  const models = [
+    { model: "legacy_tts", label: "旧版配音", kind: "speech" as const },
+    { model: "seed_music_1.0", label: "Seed Audio 1.0", kind: "music" as const },
+  ];
+  return models.map(({ model, label, kind }) => ({
+    id: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
+    mediaType: "audio" as const,
+    displayName: `即梦画布 CLI · ${label}`,
+    providerId: JIMENG_CANVAS_CLI_PROVIDER_ID,
+    description: `即梦画布 CLI · ${label}`,
+    audioKind: kind,
+    family: "other" as const,
+    formatOptions: kind === "speech" ? ["mp3", "wav"] : undefined,
+    defaultFormat: kind === "speech" ? "mp3" : undefined,
+  }));
+}
+
 export function listAudioModels(): AudioModelDefinition[] {
-  return [...buildCustomAudioModels(), ...buildRunningHubCliAudioModels()];
+  return [
+    ...buildCustomAudioModels(),
+    ...buildRunningHubCliAudioModels(),
+    ...buildJimengCanvasCliAudioModels(),
+  ];
 }
 
 export function getAudioModel(modelId: string): AudioModelDefinition | undefined {
@@ -594,6 +671,47 @@ export function matchesAudioCreativePanel(model: AudioModelDefinition, mode: Aud
   if (mode === "voice-design") return operation === "voice-design";
   if (mode === "music") return model.audioKind === "music";
   return model.audioKind === "speech" && operation !== "voice-clone" && operation !== "voice-design";
+}
+
+/**
+ * 即梦画布 CLI 的视频模型。
+ *
+ * 型号 / 分辨率 / 时长档位全部照 `dreamina-canvas model list --type=video` 的返回值抄，
+ * **不要凭感觉写**：`happyhorse_1.1` 与 `wan_3.0` 的分辨率是大写 `720P/1080P`，
+ * seedance 系是小写 `720p`，服务端是严格校验的。`seedance_pro_fast` 是 5~10 秒，其余 4~15（2.5 到 30）。
+ * 价格不在本地估算 —— 以 CLI 运行前报价为准，所以这里不挂 pricing。
+ */
+function buildJimengCanvasCliVideoModels(): VideoModelDefinition[] {
+  const models = [
+    // 样片模式的专用模型（CLI 1.1.1 起）：只有 480p，便宜快速出小样；满意后用
+    // `node promote video-sample` 转成正式分辨率，别直接拿它当成品。
+    { model: "seedance_2.5_draft", label: "Seedance 2.5 样片", minDuration: 4, maxDuration: 30, resolutions: ["480p"] },
+    { model: "seedance_2.5", label: "Seedance 2.5", minDuration: 4, maxDuration: 30, resolutions: ["480p", "720p", "1080p"] },
+    { model: "seedance_2.0_vip", label: "Seedance 2.0 VIP", minDuration: 4, maxDuration: 15, resolutions: ["720p", "1080p", "4k"] },
+    { model: "seedance_2.0_fast_vip", label: "Seedance 2.0 Fast VIP", minDuration: 4, maxDuration: 15, resolutions: ["720p"] },
+    { model: "seedance_2.0_mini", label: "Seedance 2.0 Mini", minDuration: 4, maxDuration: 15, resolutions: ["720p"] },
+    { model: "seedance_pro_fast", label: "Seedance 1.0 Fast", minDuration: 5, maxDuration: 10, resolutions: ["720p", "1080p"] },
+    { model: "happyhorse_1.1", label: "HappyHorse 1.1", minDuration: 4, maxDuration: 15, resolutions: ["720P", "1080P"] },
+    { model: "wan_3.0", label: "Wan 3.0", minDuration: 4, maxDuration: 15, resolutions: ["720P", "1080P"] },
+  ] as const;
+
+  return models.map(({ model, label, minDuration, maxDuration, resolutions }) => ({
+    id: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
+    mediaType: "video" as const,
+    displayName: `即梦画布 CLI · ${label}`,
+    providerId: JIMENG_CANVAS_CLI_PROVIDER_ID,
+    description: `即梦画布 CLI · ${label}`,
+    expectedDurationMs: 600000,
+    aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
+    defaultAspectRatio: "16:9",
+    durationOptions: Array.from(
+      { length: maxDuration - minDuration + 1 },
+      (_, index) => index + minDuration
+    ),
+    defaultDuration: 5,
+    resolutions: resolutions.map((value) => ({ value, label: value.toUpperCase() })),
+    defaultResolution: resolutions[0],
+  }));
 }
 
 function buildJimengCliVideoModels(): VideoModelDefinition[] {
@@ -773,6 +891,51 @@ function resolveJimengCliImageResolutions(version: string): string[] {
  *
  * 有没有参考图决定走 `text2image` 还是 `image2image`, 由 Rust 侧按参考图数量决定。
  */
+/**
+ * 即梦画布 CLI 的图片模型（型号与档位照 `model list --type=image` 原样抄）。
+ *
+ * 显示名按即梦画布网页端的实际叫法（用户对照截图确认的）：
+ * `lib_f` = Image 2.5 Flash、`lib_s` = Image 2.5 Pro、`oa_it` = Image 2、
+ * `yc_mj82` = MJ 8.2、`gg_bp` / `gg_bp_21` = 图片 2.0 / 2.1（2.1 中文文字强）。
+ * CLI 只回 model/modes/flags，没有描述字段，这些对照关系是唯一能说清「这是什么」的来源。
+ */
+function buildJimengCanvasCliImageModels(): ImageModelDefinition[] {
+  const models = [
+    { model: "seedream_5.0_pro", label: "Seedream 5.0 Pro", tiers: ["1.5K", "2K", "4K"] },
+    { model: "seedream_5.0_lite", label: "Seedream 5.0 Lite", tiers: ["2K", "4K"] },
+    { model: "seedream_4.7", label: "Seedream 4.7", tiers: ["1K", "2K", "4K"] },
+    { model: "seedream_4.6", label: "Seedream 4.6", tiers: ["2K", "4K"] },
+    { model: "seedream_4.5", label: "Seedream 4.5", tiers: ["2K", "4K"] },
+    { model: "seedream_4.1", label: "Seedream 4.1", tiers: ["2K", "4K"] },
+    { model: "seedream_4.0", label: "Seedream 4.0", tiers: ["2K", "4K"] },
+    { model: "jm_image_model_lib_f", label: "GPT Image 2.5 Flash（高速）", tiers: ["1K", "2K", "4K"] },
+    { model: "jm_image_model_lib_s", label: "GPT Image 2.5 Pro（精细）", tiers: ["1K", "2K", "4K"] },
+    { model: "jm_image_model_oa_it", label: "GPT Image 2（生成与编辑）", tiers: ["1K", "2K", "4K"] },
+    { model: "jm_image_model_gg_bp_21", label: "香蕉 2.1（中文文字强）", tiers: ["1K", "2K", "4K"] },
+    { model: "jm_image_model_gg_bp", label: "香蕉 Pro", tiers: ["1K", "2K", "4K"] },
+    { model: "jm_image_model_yc_mj82", label: "MJ 8.2", tiers: ["1K", "2K"] },
+    { model: "high_aes_general_v50_flash", label: "图片 5.0 Flash", tiers: ["1.5K", "2K"] },
+  ] as const;
+
+  return models.map(({ model, label, tiers }) => ({
+    id: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
+    mediaType: "image" as const,
+    displayName: `即梦画布 CLI · ${label}`,
+    providerId: JIMENG_CANVAS_CLI_PROVIDER_ID,
+    description: `即梦画布 CLI · ${label}`,
+    eta: "1min",
+    expectedDurationMs: 180000,
+    defaultAspectRatio: "1:1",
+    defaultResolution: tiers[1] ?? tiers[0],
+    aspectRatios: JIMENG_CLI_IMAGE_ASPECT_RATIOS.map((value) => ({ value, label: value })),
+    resolutions: tiers.map((value) => ({ value, label: value })),
+    resolveRequest: ({ referenceImageCount }) => ({
+      requestModel: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
+      modeLabel: referenceImageCount > 0 ? "编辑模式" : "生成模式",
+    }),
+  }));
+}
+
 function buildJimengCliImageModels(): ImageModelDefinition[] {
   const models = [
     { version: "5.0Pro", label: "图片 5.0 Pro" },
@@ -884,6 +1047,9 @@ export function getModelProvider(providerId: string): ModelProviderDefinition {
   if (providerId === WAN_CLI_PROVIDER_ID) return wanCliProvider;
   if (providerId === JIMENG_CLI_PROVIDER_ID) {
     return JIMENG_CLI_PROVIDER;
+  }
+  if (providerId === JIMENG_CANVAS_CLI_PROVIDER_ID) {
+    return JIMENG_CANVAS_CLI_PROVIDER;
   }
   if (providerId === RUNNINGHUB_CLI_PROVIDER_ID) {
     return RUNNINGHUB_CLI_PROVIDER;

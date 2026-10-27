@@ -210,6 +210,19 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   const [quickGenerating, setQuickGenerating] = useState(() => isPersistedQuickRunActive);
   // 防止 React state 提交前的快速双击重复启动提示词生成并创建两个视频节点。
   const quickGenerationLockRef = useRef(false);
+  /**
+   * 本次「生成提示词」的运行凭证。
+   *
+   * 上游偶发不返回（连接活着但不再吐字节），而界面上的按钮一旦被 `disabled` 就没有
+   * 任何出口 —— 用户只能重启。取消按钮会把这个值 +1：
+   *   - 立刻解锁按钮（不必等那个 pending 的请求结束）；
+   *   - 迟到的响应对不上凭证，直接丢弃，**不允许再写节点 / 再建视频节点**；
+   *   - 被取消那一次的 `finally` 也不会去清新一代运行的状态（否则会误伤刚重开的一次）。
+   *
+   * 说明：底层 `request_provider_stream` 目前没有 abort 通道，取消只作用于界面与结果，
+   * 那条在途请求会自己跑完（不产生额外计费，也不会改任何东西）。
+   */
+  const quickRunTokenRef = useRef(0);
   useEffect(() => {
     if (isPersistedQuickRunActive) return;
     // 标记被清空(本轮 finally, 或上一个已卸载实例的 finally)即释放按钮;
@@ -951,6 +964,10 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       quickGenerationLockRef.current = true;
       setQuickError("");
       setQuickGenerating(true);
+      // 本次运行的凭证：取消后 +1，迟到结果据此判定「已作废」。
+      const runToken = quickRunTokenRef.current + 1;
+      quickRunTokenRef.current = runToken;
+      const isCurrentRun = () => quickRunTokenRef.current === runToken;
       // 落库(带运行时会话): 节点被卸载后重新挂载时靠它把按钮恢复成「生成中…」。
       updateNodeData(id, {
         quickGenerationStartedAt: Date.now(),
@@ -1020,6 +1037,9 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           // 节点上选的提示词格式决定用哪套规则生成
           quickPromptFormatId,
         );
+        // 取消发生在上游返回之前（或等待资产库读盘期间）：直接丢弃这次结果，
+        // 既不写 quickPrompt，也不建下游视频节点。
+        if (!isCurrentRun()) return;
         // 人物音频引用统一成人可读的规范句：`使用 @音频N 作为 @角色 的唯一人声参考。`
         // @音频N 同时是画布的规范标记（视频节点「引用」按钮插入的就是它），
         // AI 输出里可能写成 [audioN] / @audioN 或旧式「声音参考：」，在落节点前一次收敛。
@@ -1053,8 +1073,13 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           durationHintSources: [quickInputs.synopsis, quickInputs.style],
         });
       } catch (error) {
+        // 取消引起的失败（如请求被中断）不该弹成错误。
+        if (!isCurrentRun()) return;
         setQuickError(error instanceof Error ? error.message : "生成提示词失败，请稍后重试。");
       } finally {
+        // 只有仍是「当前这一代」才收尾：取消后用户可能马上又点了一次，
+        // 旧这次运行不能把新一次的状态清掉。
+        if (!isCurrentRun()) return;
         quickGenerationLockRef.current = false;
         setQuickGenerating(false);
         // 生成结束(成功或失败)即释放: 成功时下游视频节点已经建好。
@@ -1079,6 +1104,24 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       studioProjectId,
       updateNodeData,
     ],
+  );
+
+  /**
+   * 取消当前的「生成提示词」。
+   *
+   * 只做三件事：作废凭证、立刻解锁按钮、清掉落库的「进行中」标记。不尝试去中止
+   * 在途请求（底层没有 abort 通道），迟到结果会因凭证对不上而被丢弃。
+   */
+  const handleQuickCancel = useCallback(
+    (event: React.MouseEvent) => {
+      event.stopPropagation();
+      quickRunTokenRef.current += 1;
+      quickGenerationLockRef.current = false;
+      setQuickGenerating(false);
+      setQuickError("");
+      updateNodeData(id, { quickGenerationStartedAt: null, quickGenerationSessionId: null });
+    },
+    [id, updateNodeData],
   );
 
   const cachedTitle = typeof data.lastProjectTitle === "string" ? data.lastProjectTitle.trim() : "";
@@ -1464,15 +1507,18 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           <button
             type="button"
             className="shrink-0 flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={quickGenerating || chatModels.length === 0}
-            onClick={handleQuickGenerate}
+            // 生成中不再 disable —— 同一个按钮就地变成「取消生成」。
+            // 之前它被锁死，上游一旦不返回就只能重启客户端。
+            disabled={!quickGenerating && chatModels.length === 0}
+            onClick={quickGenerating ? handleQuickCancel : handleQuickGenerate}
+            title={quickGenerating ? "上游可能卡住，点击取消本次生成" : "按当前风格 / 梗概生成提示词"}
           >
             {quickGenerating ? (
               <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
             ) : (
               <Sparkles className="h-3.5 w-3.5" />
             )}
-            {quickGenerating ? "生成中…" : "生成提示词"}
+            {quickGenerating ? "取消生成" : "生成提示词"}
           </button>
         </div>
 

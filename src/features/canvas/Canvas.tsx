@@ -2085,7 +2085,12 @@ export function Canvas() {
             typeof currentData?.generationProviderId === "string"
               ? currentData.generationProviderId
               : (model.split("/")[0] ?? "");
-          if (providerId && !model.startsWith("jimeng-cli/") && !model.startsWith("wan-cli/")) {
+          if (
+            providerId &&
+            !model.startsWith("jimeng-cli/") &&
+            !model.startsWith("jimeng-canvas/") &&
+            !model.startsWith("wan-cli/")
+          ) {
             const providerApiKey = apiKeys[providerId] ?? "";
             if (providerApiKey) await canvasAiGateway.setApiKey(providerId, providerApiKey);
           }
@@ -3688,7 +3693,9 @@ export function Canvas() {
         return;
       }
 
-      // 提示词拖拽 → 创建 AI 图片节点
+      // 提示词拖拽 → 创建**文本节点**（原先建的是 AI 图片节点）。
+      // 口径: 拖一条提示词进画布, 期望得到的是「可以就地编辑、可以往外连线」的文本,
+      // 而不是一个已经绑好模型的生成节点 —— 后者会把提示词埋进节点内部, 想改还得先找到它。
       if (types.includes(PROMPT_DRAG_DATA_TYPE)) {
         const promptId = parsePromptDragPayload(event.dataTransfer.getData(PROMPT_DRAG_DATA_TYPE));
         if (!promptId) return;
@@ -3700,13 +3707,20 @@ export function Canvas() {
         // 拖进来的节点还没有输入框内容，等价于「空输入框 + 完整模式」。
         const mergedText = composePromptText(template, "full");
 
-        const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.imageEdit);
+        const definition = nodeCatalog.getDefinition(CANVAS_NODE_TYPES.textAnnotation);
         const position = reactFlowInstance.screenToFlowPosition({ x: event.clientX, y: event.clientY });
-        const nodeId = addNode(CANVAS_NODE_TYPES.imageEdit, position, {
-          ...definition.createDefaultData(),
-          prompt: mergedText,
-          displayName: template.name,
-        });
+        // 提示词模板动辄上千字, 用文本节点的默认小尺寸会挤成一列 —— 给一个偏高的初值,
+        // 用户仍可自由缩放。
+        const nodeId = addNode(
+          CANVAS_NODE_TYPES.textAnnotation,
+          position,
+          {
+            ...definition.createDefaultData(),
+            content: mergedText,
+            displayName: template.name,
+          },
+          { width: 360, height: 340 },
+        );
         setSelectedNode(nodeId);
         scheduleCanvasPersist(0);
         return;
