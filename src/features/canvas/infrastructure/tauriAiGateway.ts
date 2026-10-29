@@ -9,6 +9,8 @@ import {
   generateRunningHubCliModel,
   generateVideo,
   getGenerateVideoJob,
+  inspectRunningHubWorkflow as inspectRunningHubWorkflowCommand,
+  runRunningHubWorkflow as runRunningHubWorkflowCommand,
   upscaleVideo as upscaleVideoCommand,
   getGenerateImageJob,
   setApiKey,
@@ -16,7 +18,7 @@ import {
   submitGenerateVideoJob,
   uploadZhiniaoReferenceAsset,
 } from "@/commands/ai";
-import { createCompactImageDataUrl, imageUrlToDataUrl } from "@/features/canvas/application/imageData";
+import { createCompactImageDataUrl, imageUrlToDataUrl, persistImageLocally } from "@/features/canvas/application/imageData";
 import { throwIfVideoSubmissionCanceled } from "@/features/canvas/application/videoGenerationCancel";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useJimengCanvasCliStore } from "@/stores/jimengCanvasCliStore";
@@ -99,6 +101,8 @@ import type {
   GenerateImagePayload,
   GenerateVideoPayload,
   CharacterSwapVideoPayload,
+  InspectRunningHubWorkflowPayload,
+  RunRunningHubWorkflowPayload,
   UpscaleVideoPayload,
 } from "../application/ports";
 import { isMidjourneyImageModel } from "@/features/canvas/models/midjourney";
@@ -1094,6 +1098,48 @@ export const tauriAiGateway: AiGateway = {
       extra_params: { ...payload.extraParams, provider_base_url: providerBaseUrl },
     });
     return await persistVideoLocally(swappedUrl);
+  },
+  /**
+   * RunningHub 工作流（用户自己导入的 ComfyUI 图）。
+   *
+   * 产物类型来自解析阶段的推断（SaveImage / VHS_VideoCombine / SaveAudio），这里按它落盘：
+   * 图片与视频抓成本地文件；音频保持远端 URL —— 与 `generateAudio` 的 http 分支一致，
+   * 音频节点自己会处理远端地址。
+   */
+  runRunningHubWorkflow: async (payload: RunRunningHubWorkflowPayload) => {
+    const api = useSettingsStore
+      .getState()
+      .customApis.find((item) => item.id === payload.model.split("/")[0]?.replace("custom:", ""));
+    const providerBaseUrl =
+      typeof payload.extraParams?.provider_base_url === "string"
+        ? payload.extraParams.provider_base_url
+        : (api?.baseUrl ?? "");
+    const outputUrl = await runRunningHubWorkflowCommand({
+      model: payload.model,
+      workflowId: payload.workflowId,
+      nodeInfoList: payload.nodeInfoList,
+      outputKind: payload.outputKind,
+      extra_params: { ...payload.extraParams, provider_base_url: providerBaseUrl },
+    });
+    if (payload.outputKind === "image") return await persistImageLocally(outputUrl);
+    if (payload.outputKind === "audio") return outputUrl;
+    return await persistVideoLocally(outputUrl);
+  },
+  /** 拉取工作流 JSON：拿到的是原文，解析交给 `parseRunningHubWorkflow`。 */
+  inspectRunningHubWorkflow: async (payload: InspectRunningHubWorkflowPayload) => {
+    const api = useSettingsStore
+      .getState()
+      .customApis.find((item) => item.id === payload.model.split("/")[0]?.replace("custom:", ""));
+    const providerBaseUrl =
+      typeof payload.extraParams?.provider_base_url === "string"
+        ? payload.extraParams.provider_base_url
+        : (api?.baseUrl ?? "");
+    const result = await inspectRunningHubWorkflowCommand({
+      model: payload.model,
+      workflowId: payload.workflowId,
+      extra_params: { ...payload.extraParams, provider_base_url: providerBaseUrl },
+    });
+    return result.workflowJson;
   },
   /**
    * 音频生成(语音合成 / 音效 / 音乐)。

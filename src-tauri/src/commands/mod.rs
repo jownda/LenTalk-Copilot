@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod asset_library;
+pub mod audio_waveform;
 pub mod balance;
 pub mod cinematic_studio;
 pub mod clipboard;
@@ -16,6 +17,7 @@ pub mod project_state;
 pub mod project_archive;
 pub mod runninghub_cli;
 pub mod system;
+pub mod text_file;
 pub mod template_state;
 pub mod template_sync;
 pub mod thumbnail;
@@ -23,6 +25,7 @@ pub mod update;
 pub mod usage_log;
 pub mod video_cfr;
 pub mod video_edit;
+pub mod video_edit_advanced;
 
 pub use ai::*;
 pub use asset_library::*;
@@ -41,3 +44,4 @@ pub use update::*;
 pub use usage_log::*;
 pub use video_cfr::*;
 pub use video_edit::*;
+pub use video_edit_advanced::*;

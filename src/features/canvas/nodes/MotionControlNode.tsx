@@ -2,7 +2,6 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEve
 import { Handle, Position, type NodeProps, useUpdateNodeInternals } from "@xyflow/react";
 import { Accessibility, AudioLines, ImagePlus, LoaderCircle, Upload, UserRound, UserRoundCog, Video } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { isTauri } from "@tauri-apps/api/core";
 
 import {
   CANVAS_NODE_TYPES,
@@ -30,7 +29,7 @@ import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
 import { showErrorDialog } from "@/features/canvas/application/errorDialog";
 import { useCanvasStore } from "@/stores/canvasStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { persistLibraryAssetFile, persistLibraryAssetFromFile } from "@/commands/assetLibrary";
+import { mediaSourceLabel, persistNodeMediaFile } from "@/features/canvas/application/nodeMediaUpload";
 import { isZzdhLipSyncModel } from "@/commands/zzdhApi";
 import {
   isRunningHubBaseUrl,
@@ -46,35 +45,6 @@ type MotionControlNodeProps = NodeProps & {
 };
 
 type UploadKind = "image" | "motion-video" | "source-video" | "audio";
-
-function fileExtension(file: File): string {
-  const extension = file.name.split(".").pop()?.trim().toLowerCase();
-  return extension && /^[a-z0-9]{1,8}$/.test(extension) ? extension : "bin";
-}
-
-async function persistMediaFile(file: File): Promise<string> {
-  const path = (file as File & { path?: string }).path?.trim();
-  if (isTauri()) {
-    if (path) {
-      return await persistLibraryAssetFile(path, fileExtension(file));
-    }
-    return await persistLibraryAssetFromFile(file, fileExtension(file));
-  }
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
-    reader.onerror = () => reject(reader.error ?? new Error("读取文件失败"));
-    reader.readAsDataURL(file);
-  });
-  return dataUrl;
-}
-
-function sourceLabel(source: string | null | undefined, fallback: string): string {
-  if (!source) return fallback;
-  if (/^data:/i.test(source)) return fallback;
-  const clean = source.split(/[\\/]/).pop()?.trim();
-  return clean || fallback;
-}
 
 function resolveModeModelLabel(modelId: string): string {
   const model = modelId ? getVideoModel(modelId) : undefined;
@@ -273,7 +243,7 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
             imagePreviewUrl: prepared.previewImageUrl,
           });
         } else {
-          const source = await persistMediaFile(file);
+          const source = await persistNodeMediaFile(file);
           const preview = URL.createObjectURL(file);
           const fields: Partial<MotionControlNodeData> =
             kind === "motion-video"
@@ -515,7 +485,7 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
           openUpload(kind);
         }}
         onMouseDown={(event) => event.stopPropagation()}
-        title={sourceLabel(source, t("node.motionControl.notSet"))}
+        title={mediaSourceLabel(source, t("node.motionControl.notSet"))}
       >
         {preview ? (
           kind === "image" ? (
@@ -527,7 +497,7 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
           <Upload className="h-4 w-4 shrink-0" />
         )}
         <span className="truncate">
-          {source ? sourceLabel(source, t("node.motionControl.connected")) : t("node.motionControl.upload")}
+          {source ? mediaSourceLabel(source, t("node.motionControl.connected")) : t("node.motionControl.upload")}
         </span>
       </button>
     </div>

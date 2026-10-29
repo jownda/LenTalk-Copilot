@@ -18,17 +18,17 @@ use uuid::Uuid;
 use super::video_cfr::{hide_child_console, local_or_remote_video_source, resolve_ffmpeg_path};
 
 /// 最短可导出片段。0 长度片段会让 ffmpeg 产出空文件，提前挡掉。
-const MIN_TRIM_DURATION_SEC: f64 = 0.1;
+pub(crate) const MIN_TRIM_DURATION_SEC: f64 = 0.1;
 /// 判定最小时长时的浮点容差：`5.1 - 5` 在二进制浮点下是 `0.09999999999999964`，
 /// 不留容差会出现「前端显示 0.1s 合法、后端判成过短」的错杀。
-const TRIM_EPSILON_SEC: f64 = 1e-6;
+pub(crate) const TRIM_EPSILON_SEC: f64 = 1e-6;
 /// 音量上限（1.0 = 原声）。留出增强空间，但不至于随便就削波失真。
-const MAX_AUDIO_VOLUME: f64 = 4.0;
+pub(crate) const MAX_AUDIO_VOLUME: f64 = 4.0;
 /// 单侧淡入/淡出时长上限。
-const MAX_FADE_SEC: f64 = 30.0;
-const AUDIO_BITRATE: &str = "192k";
-const VIDEO_PRESET: &str = "veryfast";
-const VIDEO_CRF: &str = "20";
+pub(crate) const MAX_FADE_SEC: f64 = 30.0;
+pub(crate) const AUDIO_BITRATE: &str = "192k";
+pub(crate) const VIDEO_PRESET: &str = "veryfast";
+pub(crate) const VIDEO_CRF: &str = "20";
 
 /// 音轨处理方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,11 +67,21 @@ impl AudioMode {
     }
 }
 
+/// 一段保留下来的源区间（秒）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct VideoEditSegmentRequest {
+    pub start: f64,
+    pub end: f64,
+}
+
 /// 前端提交的编辑参数。字段全部可选：缺省即「不裁剪 + 保留原声」。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoEditRequest {
     pub source_path: String,
+    /// 保留的片段列表（升序、互不重叠）。传了就走多段拼接，忽略 `trim_start/trim_end`。
+    #[serde(default)]
+    pub segments: Option<Vec<VideoEditSegmentRequest>>,
     #[serde(default)]
     pub trim_start: Option<f64>,
     #[serde(default)]
@@ -101,25 +111,44 @@ pub struct VideoEditResult {
 
 /// `ffmpeg -i` 头部探测结果。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct MediaProbe {
-    duration_sec: Option<f64>,
-    has_audio: bool,
+pub(crate) struct MediaProbe {
+    pub(crate) duration_sec: Option<f64>,
+    pub(crate) has_audio: bool,
+    /// 帧率。ffmpeg 只给小数（如 `23.98 fps`），标准档位的还原交给前端。
+    pub(crate) fps: Option<f64>,
+    /// 视频像素尺寸。多源拼接时要统一到同一个画布尺寸。
+    pub(crate) width: Option<u32>,
+    pub(crate) height: Option<u32>,
+}
+
+/// 一段规范化后的保留区间。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TrimSegment {
+    start: f64,
+    end: f64,
+}
+
+impl TrimSegment {
+    fn duration(self) -> f64 {
+        (self.end - self.start).max(0.0)
+    }
 }
 
 /// 校验并收敛后的编辑参数，`build_ffmpeg_args` 只认这个结构。
 #[derive(Debug, Clone, PartialEq)]
 struct NormalizedEdit {
-    trim_start: f64,
-    /// 裁剪终点。`None` = 一直到片尾。
-    trim_end: Option<f64>,
-    /// 成片时长。`None` = 交给 ffmpeg 自己走到片尾。
-    duration: Option<f64>,
+    /// 至少一段。单段走 `-ss/-t` 快路径，多段走 concat 滤镜。
+    segments: Vec<TrimSegment>,
+    /// 成片总长（各段之和）。
+    total_duration: f64,
     mode: AudioMode,
     volume: f64,
     track_path: Option<String>,
     track_volume: f64,
     fade_in: f64,
     fade_out: f64,
+    /// 源视频是否有音轨。多段拼接时要靠它决定 concat 音频还是直接 `-an`。
+    has_audio: bool,
 }
 
 fn parse_hms(stamp: &str) -> Option<f64> {
@@ -152,14 +181,72 @@ fn parse_media_probe(text: &str) -> MediaProbe {
     let has_audio = text
         .lines()
         .any(|line| line.contains("Stream #") && line.contains("Audio:"));
+    let (width, height) = match parse_video_size(text) {
+        Some((width, height)) => (Some(width), Some(height)),
+        None => (None, None),
+    };
     MediaProbe {
         duration_sec,
         has_audio,
+        fps: parse_video_fps(text),
+        width,
+        height,
     }
 }
 
+/// 从 `ffmpeg -i` 头部里取视频像素尺寸（形如 `1920x1080`）。
+///
+/// 多源拼接必须统一画布尺寸：concat 滤镜对不同分辨率的输入直接报错。
+fn parse_video_size(text: &str) -> Option<(u32, u32)> {
+    for line in text.lines() {
+        if !line.contains("Video:") {
+            continue;
+        }
+        for token in line.split([',', ' ']) {
+            let Some((raw_width, raw_height)) = token.trim().split_once('x') else {
+                continue;
+            };
+            // `avc1 / 0x31637661` 这种编码标签也含 x，靠「宽度必须大于 0」排掉。
+            let (Ok(width), Ok(height)) = (raw_width.parse::<u32>(), raw_height.parse::<u32>())
+            else {
+                continue;
+            };
+            if width > 0 && height > 0 && width < 20_000 && height < 20_000 {
+                return Some((width, height));
+            }
+        }
+    }
+    None
+}
+
+/// 从 `ffmpeg -i` 头部里取视频帧率。
+///
+/// 形如 `..., 1920x1080, 23.98 fps, 23.98 tbr, 90k tbn` —— ffmpeg 只给小数，
+/// `23.98` 其实是 24000/1001。还原成标准有理数由前端 `parseProbeFrameRate` 负责，
+/// 这里不做猜测：猜错了会让每帧 tick 数偏几个，几十秒后音画就对不上。
+fn parse_video_fps(text: &str) -> Option<f64> {
+    for line in text.lines() {
+        if !line.contains("Video:") {
+            continue;
+        }
+        let Some(index) = line.find(" fps") else {
+            continue;
+        };
+        let token = line[..index]
+            .rsplit(|character| character == ' ' || character == ',')
+            .next()?
+            .trim();
+        if let Ok(value) = token.parse::<f64>() {
+            if value.is_finite() && value > 0.0 && value < 1_000.0 {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 /// 读一次头部信息。失败（文件不可读 / 远程不可达）时返回默认值，由后续步骤报错。
-fn probe_media(ffmpeg: &Path, input: &str) -> MediaProbe {
+pub(crate) fn probe_media(ffmpeg: &Path, input: &str) -> MediaProbe {
     let mut command = Command::new(ffmpeg);
     hide_child_console(&mut command);
     let Ok(result) = command
@@ -171,16 +258,16 @@ fn probe_media(ffmpeg: &Path, input: &str) -> MediaProbe {
     parse_media_probe(&String::from_utf8_lossy(&result.stderr))
 }
 
-fn sanitize_seconds(value: Option<f64>) -> Option<f64> {
+pub(crate) fn sanitize_seconds(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 /// 区间是否短到不能导出。带容差，避免浮点误差把刚好 0.1s 的片段判死。
-fn is_clip_too_short(start: f64, end: f64) -> bool {
+pub(crate) fn is_clip_too_short(start: f64, end: f64) -> bool {
     end - start < MIN_TRIM_DURATION_SEC - TRIM_EPSILON_SEC
 }
 
-fn clamp_volume(value: Option<f64>) -> f64 {
+pub(crate) fn clamp_volume(value: Option<f64>) -> f64 {
     match value {
         Some(value) if value.is_finite() => value.clamp(0.0, MAX_AUDIO_VOLUME),
         _ => 1.0,
@@ -228,58 +315,84 @@ fn normalize_edit(request: &VideoEditRequest, probe: MediaProbe) -> Result<Norma
     };
 
     let probed = probe.duration_sec;
-    let trim_start = sanitize_seconds(request.trim_start).unwrap_or(0.0);
-    if let Some(total) = probed {
-        if trim_start >= total {
-            return Err(format!("裁剪起点 {trim_start:.1}s 超出视频时长 {total:.1}s"));
-        }
-    }
 
-    let requested_end = sanitize_seconds(request.trim_end);
-    if let Some(end) = requested_end {
-        if is_clip_too_short(trim_start, end) {
-            return Err("裁剪区间太短，请至少保留 0.1 秒".to_string());
+    // ① 取出原始区间：新协议是列表，老协议是单区间（缺 end 表示到片尾）。
+    let raw: Vec<(f64, f64)> = match request.segments.as_ref().filter(|list| !list.is_empty()) {
+        Some(list) => list.iter().map(|segment| (segment.start, segment.end)).collect(),
+        None => {
+            let start = sanitize_seconds(request.trim_start).unwrap_or(0.0);
+            let end = match sanitize_seconds(request.trim_end).or(probed) {
+                Some(value) => value,
+                // 探测不到时长、用户也没给终点 —— 不能瞎猜一个长度，明确报错更省事。
+                None => return Err("无法读取视频时长，请指定裁剪终点".to_string()),
+            };
+            vec![(start, end)]
         }
-    }
-    // 用户给的值可能超过真实时长（前端拿到的是解码器估算值），按探测值收口。
-    let trim_end = requested_end.map(|end| match probed {
-        Some(total) if total > 0.0 => end.min(total),
-        _ => end,
-    });
-    if let Some(end) = trim_end {
-        if is_clip_too_short(trim_start, end) {
-            return Err("裁剪区间太短，请至少保留 0.1 秒".to_string());
-        }
-    }
-
-    let duration = match trim_end {
-        Some(end) => Some(end - trim_start),
-        None => probed
-            .map(|total| (total - trim_start).max(0.0))
-            .filter(|value| *value > MIN_TRIM_DURATION_SEC - TRIM_EPSILON_SEC),
     };
-    let (fade_in, fade_out) = resolve_fades(request.fade_in, request.fade_out, duration);
+
+    // ② 逐段校验，并按探测到的真实时长收口（前端拿到的是解码器估算值，常偏大）。
+    let mut segments: Vec<TrimSegment> = Vec::with_capacity(raw.len());
+    for (index, (start, end)) in raw.into_iter().enumerate() {
+        if !start.is_finite() || !end.is_finite() {
+            return Err(format!("第 {} 段的起止时间无效", index + 1));
+        }
+        let start = start.max(0.0);
+        let end = match probed {
+            Some(total) if total > 0.0 => end.min(total),
+            _ => end,
+        };
+        if is_clip_too_short(start, end) {
+            return Err("裁剪区间太短，请至少保留 0.1 秒".to_string());
+        }
+        segments.push(TrimSegment { start, end });
+    }
+    if segments.is_empty() {
+        return Err("没有可导出的片段".to_string());
+    }
+
+    // ③ 排序并合并重叠段。
+    // 重叠必须合并掉：同一段画面被导出两遍，在时间轴上完全看不出来，但成片里一定穿帮。
+    segments.sort_by(|left, right| {
+        left.start
+            .partial_cmp(&right.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut merged: Vec<TrimSegment> = Vec::with_capacity(segments.len());
+    for segment in segments {
+        match merged.last_mut() {
+            Some(last) if segment.start < last.end => {
+                last.end = last.end.max(segment.end);
+            }
+            _ => merged.push(segment),
+        }
+    }
+
+    let total_duration: f64 = merged.iter().map(|segment| segment.duration()).sum();
+    if total_duration < MIN_TRIM_DURATION_SEC - TRIM_EPSILON_SEC {
+        return Err("裁剪区间太短，请至少保留 0.1 秒".to_string());
+    }
+    let (fade_in, fade_out) = resolve_fades(request.fade_in, request.fade_out, Some(total_duration));
 
     Ok(NormalizedEdit {
-        trim_start,
-        trim_end,
-        duration,
+        segments: merged,
+        total_duration,
         mode,
         volume: clamp_volume(request.audio_volume),
         track_path,
         track_volume: clamp_volume(request.track_volume),
         fade_in,
         fade_out,
+        has_audio: probe.has_audio,
     })
 }
 
-fn fmt_seconds(value: f64) -> String {
+pub(crate) fn fmt_seconds(value: f64) -> String {
     format!("{value:.3}")
 }
 
 /// 只生成淡入淡出片段，供「保留 / 替换」直接接在 volume 之后，
 /// 供「混合」接在 amix 之后。
-fn fade_filter(fade_in: f64, fade_out: f64, duration: Option<f64>) -> Option<String> {
+pub(crate) fn fade_filter(fade_in: f64, fade_out: f64, duration: Option<f64>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if fade_in > 0.0 {
         parts.push(format!("afade=t=in:st=0:d={:.3}", fade_in));
@@ -316,20 +429,64 @@ fn audio_filter_chain(volume: f64, fade_in: f64, fade_out: f64, duration: Option
 
 /// 拼 ffmpeg 参数。纯函数，好断言。
 ///
-/// 约定：`edit.mode == Mix` 时调用方必须已确认源视频**自带音轨**
-/// （`normalize_edit` 会把无音轨的 `mix` 降级成 `replace`），
-/// 否则 filter_complex 里的 `[0:a]` 会直接匹配失败。
+/// 两条路径：
+/// - **单段** → `-ss` 定位 + `-t` 截长，不经过滤镜图，最快；
+/// - **多段** → 每段单独开一个输入再 concat，见 `build_multi_segment_args`。
 fn build_ffmpeg_args(input: &str, edit: &NormalizedEdit, output: &Path) -> Vec<String> {
-    let mut args: Vec<String> = ["-y", "-hide_banner", "-loglevel", "error"]
+    if edit.segments.len() > 1 {
+        build_multi_segment_args(input, edit, output)
+    } else {
+        build_single_segment_args(input, edit, output)
+    }
+}
+
+fn base_ffmpeg_args() -> Vec<String> {
+    ["-y", "-hide_banner", "-loglevel", "error"]
         .iter()
         .map(|value| value.to_string())
-        .collect();
+        .collect()
+}
+
+/// 视频编码参数。
+///
+/// `scale_in_graph` 为真时**不加 `-vf`**：多段路径的缩放已经写进 filter_complex，
+/// 同时给 `-vf` 会让 ffmpeg 报「simple filtergraph 与 complex filtergraph 冲突」。
+fn push_video_encode_args(args: &mut Vec<String>, scale_in_graph: bool, output: &Path) {
+    args.push("-c:v".to_string());
+    args.push("libx264".to_string());
+    args.push("-preset".to_string());
+    args.push(VIDEO_PRESET.to_string());
+    args.push("-crf".to_string());
+    args.push(VIDEO_CRF.to_string());
+    args.push("-pix_fmt".to_string());
+    args.push("yuv420p".to_string());
+    if !scale_in_graph {
+        // H.264 要求宽高为偶数，奇数尺寸的源（手机竖屏常见 1081）会让编码直接失败。
+        args.push("-vf".to_string());
+        args.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string());
+    }
+    args.push("-movflags".to_string());
+    args.push("+faststart".to_string());
+    args.push(output.to_string_lossy().to_string());
+}
+
+fn push_audio_encode_args(args: &mut Vec<String>) {
+    args.push("-c:a".to_string());
+    args.push("aac".to_string());
+    args.push("-b:a".to_string());
+    args.push(AUDIO_BITRATE.to_string());
+}
+
+/// 单段：原实现，走 `-ss/-t` 快路径。
+fn build_single_segment_args(input: &str, edit: &NormalizedEdit, output: &Path) -> Vec<String> {
+    let mut args = base_ffmpeg_args();
+    let segment = edit.segments[0];
 
     // `-ss` 放在 `-i` 之前：先按关键帧跳转再解码丢弃，配合重新编码可做到帧级准确，
     // 比放在后面（先全解码再丢弃）快得多。
-    if edit.trim_start > 0.0 {
+    if segment.start > 0.0 {
         args.push("-ss".to_string());
-        args.push(fmt_seconds(edit.trim_start));
+        args.push(fmt_seconds(segment.start));
     }
     args.push("-i".to_string());
     args.push(input.to_string());
@@ -337,16 +494,17 @@ fn build_ffmpeg_args(input: &str, edit: &NormalizedEdit, output: &Path) -> Vec<S
     if edit.mode.uses_external_track() {
         if let Some(track) = edit.track_path.as_deref() {
             // 新音轨与画面用同一个起点裁，保证「裁剪后音画仍然对得上」。
-            if edit.trim_start > 0.0 {
+            if segment.start > 0.0 {
                 args.push("-ss".to_string());
-                args.push(fmt_seconds(edit.trim_start));
+                args.push(fmt_seconds(segment.start));
             }
             args.push("-i".to_string());
             args.push(track.to_string());
         }
     }
 
-    if let Some(duration) = edit.duration.filter(|value| *value > 0.0) {
+    let duration = Some(segment.duration()).filter(|value| *value > 0.0);
+    if let Some(duration) = duration {
         args.push("-t".to_string());
         args.push(fmt_seconds(duration));
     }
@@ -360,14 +518,11 @@ fn build_ffmpeg_args(input: &str, edit: &NormalizedEdit, output: &Path) -> Vec<S
             // `?` = 源视频没有音轨时不报错，直接输出纯画面。
             args.push("-map".to_string());
             args.push("0:a:0?".to_string());
-            if let Some(chain) = audio_filter_chain(edit.volume, edit.fade_in, edit.fade_out, edit.duration) {
+            if let Some(chain) = audio_filter_chain(edit.volume, edit.fade_in, edit.fade_out, duration) {
                 args.push("-af".to_string());
                 args.push(chain);
             }
-            args.push("-c:a".to_string());
-            args.push("aac".to_string());
-            args.push("-b:a".to_string());
-            args.push(AUDIO_BITRATE.to_string());
+            push_audio_encode_args(&mut args);
         }
         AudioMode::Mute => {
             args.push("-an".to_string());
@@ -375,14 +530,11 @@ fn build_ffmpeg_args(input: &str, edit: &NormalizedEdit, output: &Path) -> Vec<S
         AudioMode::Replace => {
             args.push("-map".to_string());
             args.push("1:a:0".to_string());
-            if let Some(chain) = audio_filter_chain(edit.track_volume, edit.fade_in, edit.fade_out, edit.duration) {
+            if let Some(chain) = audio_filter_chain(edit.track_volume, edit.fade_in, edit.fade_out, duration) {
                 args.push("-af".to_string());
                 args.push(chain);
             }
-            args.push("-c:a".to_string());
-            args.push("aac".to_string());
-            args.push("-b:a".to_string());
-            args.push(AUDIO_BITRATE.to_string());
+            push_audio_encode_args(&mut args);
         }
         AudioMode::Mix => {
             // duration=first 让混音长度跟着画面走；normalize=0 保留各自音量，
@@ -391,7 +543,7 @@ fn build_ffmpeg_args(input: &str, edit: &NormalizedEdit, output: &Path) -> Vec<S
                 "[0:a]volume={:.3}[a0];[1:a]volume={:.3}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[am]",
                 edit.volume, edit.track_volume
             );
-            match fade_filter(edit.fade_in, edit.fade_out, edit.duration) {
+            match fade_filter(edit.fade_in, edit.fade_out, duration) {
                 Some(fades) => graph.push_str(&format!(";[am]{fades}[aout]")),
                 None => graph.push_str(";[am]anull[aout]"),
             }
@@ -399,28 +551,145 @@ fn build_ffmpeg_args(input: &str, edit: &NormalizedEdit, output: &Path) -> Vec<S
             args.push(graph);
             args.push("-map".to_string());
             args.push("[aout]".to_string());
-            args.push("-c:a".to_string());
-            args.push("aac".to_string());
-            args.push("-b:a".to_string());
-            args.push(AUDIO_BITRATE.to_string());
+            push_audio_encode_args(&mut args);
         }
     }
 
-    args.push("-c:v".to_string());
-    args.push("libx264".to_string());
-    args.push("-preset".to_string());
-    args.push(VIDEO_PRESET.to_string());
-    args.push("-crf".to_string());
-    args.push(VIDEO_CRF.to_string());
-    args.push("-pix_fmt".to_string());
-    args.push("yuv420p".to_string());
-    // H.264 要求宽高为偶数，奇数尺寸的源（手机竖屏常见 1081）会让编码直接失败。
-    args.push("-vf".to_string());
-    args.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string());
-    args.push("-movflags".to_string());
-    args.push("+faststart".to_string());
-    args.push(output.to_string_lossy().to_string());
+    push_video_encode_args(&mut args, false, output);
     args
+}
+
+/// 多段：每段一个输入，再 `concat`。
+///
+/// 🔴 **每段单独 `-ss/-t` 开输入**，而不是「一个输入 + 多个 trim 滤镜」：
+/// 后者会让 ffmpeg 把整片解码一遍再丢弃，长视频直接卡到不可用；前者每段只 seek 并解一小截。
+///
+/// 代价是同一文件被打开多次，但 ffmpeg 对本地文件 duplicate input 不会重复解码未用到的部分。
+fn build_multi_segment_args(input: &str, edit: &NormalizedEdit, output: &Path) -> Vec<String> {
+    let mut args = base_ffmpeg_args();
+    let count = edit.segments.len();
+
+    for segment in &edit.segments {
+        if segment.start > 0.0 {
+            args.push("-ss".to_string());
+            args.push(fmt_seconds(segment.start));
+        }
+        // 作为**输入**选项的 `-t` 只限制这一路的读取长度，不影响成片总长。
+        args.push("-t".to_string());
+        args.push(fmt_seconds(segment.duration()));
+        args.push("-i".to_string());
+        args.push(input.to_string());
+    }
+
+    let track_index = count;
+    let has_track_input = if edit.mode.uses_external_track() {
+        if let Some(track) = edit.track_path.as_deref() {
+            // 配乐对齐的是**成片**时间轴：从 0 开始，不是源视频的某个位置。
+            // 🔴 必须同时限长：配乐通常比成片长，不限的话容器时长会被拖到配乐长度，
+            // 末尾多出一段「黑场 + 声音还在响」。
+            args.push("-t".to_string());
+            args.push(fmt_seconds(edit.total_duration));
+            args.push("-i".to_string());
+            args.push(track.to_string());
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let (graph, audio_label) = build_multi_segment_graph(edit, track_index, has_track_input);
+    args.push("-filter_complex".to_string());
+    args.push(graph);
+    args.push("-map".to_string());
+    args.push("[vout]".to_string());
+
+    match audio_label {
+        Some(label) => {
+            args.push("-map".to_string());
+            args.push(label);
+            push_audio_encode_args(&mut args);
+        }
+        None => args.push("-an".to_string()),
+    }
+
+    push_video_encode_args(&mut args, true, output);
+    args
+}
+
+/// 多段的滤镜图。返回 `(graph, 音频输出标签)`；音频标签为 `None` 表示成片没有音轨。
+fn build_multi_segment_graph(
+    edit: &NormalizedEdit,
+    track_index: usize,
+    has_track_input: bool,
+) -> (String, Option<String>) {
+    let count = edit.segments.len();
+    let mut parts: Vec<String> = Vec::with_capacity(count * 2 + 4);
+
+    for index in 0..count {
+        // setpts 把每段的起点归零，否则 concat 会按原始时间戳拼接、段与段之间出现黑场。
+        parts.push(format!("[{index}:v]setpts=PTS-STARTPTS,setsar=1[v{index}]"));
+    }
+    let video_inputs: String = (0..count).map(|index| format!("[v{index}]")).collect();
+    parts.push(format!("{video_inputs}concat=n={count}:v=1:a=0[vcat]"));
+    parts.push("[vcat]scale=trunc(iw/2)*2:trunc(ih/2)*2[vout]".to_string());
+
+    // 只有真正要用原声时才拼源音频（Keep / Mix）。
+    // Mute 拼了没人接、Replace 拼了也没人接 —— 两种情况 ffmpeg 都会报
+    // "has an unconnected output" 直接失败，而不是忽略。
+    let uses_source_audio =
+        edit.has_audio && matches!(edit.mode, AudioMode::Keep | AudioMode::Mix);
+    let mut source_audio_label: Option<String> = None;
+    if uses_source_audio {
+        for index in 0..count {
+            parts.push(format!("[{index}:a]asetpts=PTS-STARTPTS[a{index}]"));
+        }
+        let audio_inputs: String = (0..count).map(|index| format!("[a{index}]")).collect();
+        parts.push(format!("{audio_inputs}concat=n={count}:v=0:a=1[acat]"));
+        source_audio_label = Some("[acat]".to_string());
+    }
+
+    let total = Some(edit.total_duration);
+    let audio_label = match edit.mode {
+        AudioMode::Mute => None,
+        AudioMode::Keep => source_audio_label.map(|label| {
+            let chain = audio_filter_chain(edit.volume, edit.fade_in, edit.fade_out, total)
+                .unwrap_or_else(|| "anull".to_string());
+            parts.push(format!("{label}{chain}[aout]"));
+            "[aout]".to_string()
+        }),
+        AudioMode::Replace => {
+            let chain = audio_filter_chain(edit.track_volume, edit.fade_in, edit.fade_out, total)
+                .unwrap_or_else(|| "anull".to_string());
+            parts.push(format!("[{track_index}:a]{chain}[aout]"));
+            Some("[aout]".to_string())
+        }
+        AudioMode::Mix => {
+            let Some(source_label) = source_audio_label else {
+                // 没有原声就谈不上混合；调用方已把这种情形降级，这里只做兜底。
+                if has_track_input {
+                    let chain = audio_filter_chain(edit.track_volume, edit.fade_in, edit.fade_out, total)
+                        .unwrap_or_else(|| "anull".to_string());
+                    parts.push(format!("[{track_index}:a]{chain}[aout]"));
+                    return (parts.join(";"), Some("[aout]".to_string()));
+                }
+                return (parts.join(";"), None);
+            };
+            parts.push(format!("{source_label}volume={:.3}[av]", edit.volume));
+            parts.push(format!("[{track_index}:a]volume={:.3}[at]", edit.track_volume));
+            parts.push(
+                "[av][at]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[am]".to_string(),
+            );
+            match fade_filter(edit.fade_in, edit.fade_out, total) {
+                Some(fades) => parts.push(format!("[am]{fades}[aout]")),
+                None => parts.push("[am]anull[aout]".to_string()),
+            }
+            Some("[aout]".to_string())
+        }
+    };
+
+    (parts.join(";"), audio_label)
 }
 
 /// 执行一次视频编辑，返回新文件路径。
@@ -442,6 +711,8 @@ pub async fn render_video_edit(
 pub struct VideoAudioProbe {
     pub has_audio: bool,
     pub duration_sec: Option<f64>,
+    /// 视频帧率（ffmpeg 报的小数，如 23.98）。前端负责还原成 24000/1001 这类有理数。
+    pub fps: Option<f64>,
 }
 
 /// 探测视频有没有音频流。
@@ -463,6 +734,7 @@ pub async fn probe_video_audio(
         Ok(VideoAudioProbe {
             has_audio: probe.has_audio,
             duration_sec: probe.duration_sec,
+            fps: probe.fps,
         })
     })
     .await
@@ -535,8 +807,9 @@ fn render_video_edit_blocking(
     }
 
     let output_path = output.to_string_lossy().to_string();
-    let duration_sec = edit
-        .duration
+    // 成片时长 = 各保留段之和（多段就是求和），拿不到再回头探测一次输出文件。
+    let duration_sec = Some(edit.total_duration)
+        .filter(|value| *value > 0.0)
         .or_else(|| probe_media(&ffmpeg, &output_path).duration_sec);
 
     Ok(VideoEditResult {
@@ -553,6 +826,7 @@ mod tests {
     fn base_request() -> VideoEditRequest {
         VideoEditRequest {
             source_path: "/tmp/clip.mp4".to_string(),
+            segments: None,
             trim_start: None,
             trim_end: None,
             audio_mode: None,
@@ -568,6 +842,9 @@ mod tests {
         MediaProbe {
             duration_sec: Some(duration),
             has_audio: true,
+            fps: Some(30.0),
+            width: Some(640),
+            height: Some(360),
         }
     }
 
@@ -593,6 +870,7 @@ At least one output file must be specified\n";
         let probe = parse_media_probe(stderr);
         assert_eq!(probe.duration_sec, Some(6.0));
         assert!(probe.has_audio);
+        assert_eq!(probe.fps, Some(30.0));
     }
 
     #[test]
@@ -645,9 +923,8 @@ At least one output file must be specified\n";
         request.trim_start = Some(1.0);
         request.trim_end = Some(99.0);
         let edit = normalize_edit(&request, probe_with_audio(6.0)).expect("normalizes");
-        assert_eq!(edit.trim_start, 1.0);
-        assert_eq!(edit.trim_end, Some(6.0));
-        assert_eq!(edit.duration, Some(5.0));
+        assert_eq!(edit.segments, vec![TrimSegment { start: 1.0, end: 6.0 }]);
+        assert_eq!(edit.total_duration, 5.0);
     }
 
     #[test]
@@ -655,8 +932,9 @@ At least one output file must be specified\n";
         let mut request = base_request();
         request.trim_start = Some(2.0);
         let edit = normalize_edit(&request, probe_with_audio(6.0)).expect("normalizes");
-        assert_eq!(edit.trim_end, None);
-        assert_eq!(edit.duration, Some(4.0));
+        // 没给终点 = 一直到片尾；探测到的 6.0 就是终点。
+        assert_eq!(edit.segments, vec![TrimSegment { start: 2.0, end: 6.0 }]);
+        assert_eq!(edit.total_duration, 4.0);
     }
 
     #[test]
@@ -678,7 +956,7 @@ At least one output file must be specified\n";
         request.trim_start = Some(5.0);
         request.trim_end = Some(5.1);
         let edit = normalize_edit(&request, probe_with_audio(10.0)).expect("0.1s clip is allowed");
-        assert!((edit.duration.expect("duration") - 0.1).abs() < 1e-6);
+        assert!((edit.total_duration - 0.1).abs() < 1e-6);
     }
 
     #[test]
@@ -689,6 +967,9 @@ At least one output file must be specified\n";
         let no_audio = MediaProbe {
             duration_sec: Some(6.0),
             has_audio: false,
+            fps: Some(30.0),
+            width: Some(640),
+            height: Some(360),
         };
         assert_eq!(normalize_edit(&request, no_audio).expect("normalizes").mode, AudioMode::Replace);
         assert_eq!(
@@ -809,6 +1090,117 @@ At least one output file must be specified\n";
         let args = args_of(&edit);
         assert_eq!(arg_value(&args, "-ss"), Some("1.500".to_string()));
         assert_eq!(arg_value(&args, "-t"), Some("2.500".to_string()));
+    }
+
+    fn segment_request(ranges: &[(f64, f64)]) -> VideoEditRequest {
+        let mut request = base_request();
+        request.segments = Some(
+            ranges
+                .iter()
+                .map(|(start, end)| VideoEditSegmentRequest { start: *start, end: *end })
+                .collect(),
+        );
+        request
+    }
+
+    #[test]
+    fn multi_segment_opens_one_input_per_segment() {
+        let request = segment_request(&[(0.0, 2.0), (6.0, 10.0)]);
+        let edit = normalize_edit(&request, probe_with_audio(10.0)).expect("normalizes");
+        let args = args_of(&edit);
+
+        // 两个输入都是同一个源文件 —— 每段各自 seek，不整片解码。
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "-i").count(), 2);
+        assert_eq!(arg_value(&args, "-t"), Some("2.000".to_string()));
+        let graph = arg_value(&args, "-filter_complex").expect("has filtergraph");
+        assert!(graph.contains("[0:v]setpts=PTS-STARTPTS"), "graph={graph}");
+        assert!(graph.contains("concat=n=2:v=1:a=0[vcat]"), "graph={graph}");
+        assert!(graph.contains("[vcat]scale=trunc"), "graph={graph}");
+        // 音频也要一段段拼起来，否则接缝处会断。
+        assert!(graph.contains("concat=n=2:v=0:a=1[acat]"), "graph={graph}");
+        assert!(graph.ends_with("[acat]anull[aout]"), "graph={graph}");
+        assert!(args.contains(&"[vout]".to_string()));
+        assert!(args.contains(&"[aout]".to_string()));
+    }
+
+    #[test]
+    fn multi_segment_does_not_emit_vf_alongside_filtergraph() {
+        let request = segment_request(&[(0.0, 2.0), (4.0, 5.0)]);
+        let edit = normalize_edit(&request, probe_with_audio(10.0)).expect("normalizes");
+        let args = args_of(&edit);
+        // 同时给 -vf 和 -filter_complex 会被 ffmpeg 直接拒绝，缩放必须只在图里做。
+        assert!(!args.contains(&"-vf".to_string()), "args={args:?}");
+    }
+
+    #[test]
+    fn multi_segment_mute_drops_audio_entirely() {
+        let mut request = segment_request(&[(0.0, 2.0), (4.0, 5.0)]);
+        request.audio_mode = Some("mute".to_string());
+        let edit = normalize_edit(&request, probe_with_audio(10.0)).expect("normalizes");
+        let args = args_of(&edit);
+        assert!(args.contains(&"-an".to_string()));
+        let graph = arg_value(&args, "-filter_complex").expect("has filtergraph");
+        assert!(!graph.contains("[acat]"), "graph={graph}");
+    }
+
+    #[test]
+    fn multi_segment_track_starts_at_zero_of_the_output() {
+        let mut request = segment_request(&[(2.0, 4.0), (6.0, 8.0)]);
+        request.audio_mode = Some("replace".to_string());
+        request.track_path = Some("/tmp/music.m4a".to_string());
+        let edit = normalize_edit(&request, probe_with_audio(10.0)).expect("normalizes");
+        let args = args_of(&edit);
+
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "-i").count(), 3);
+        // 三段输入里只有前两段（正片）带 -ss，配乐从成片 0 点开始。
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "-ss").count(), 2);
+        // 配乐必须限长到成片长度，否则容器时长会被拖到配乐长度。
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "-t").count(), 3);
+        let graph = arg_value(&args, "-filter_complex").expect("has filtergraph");
+        assert!(graph.contains("[2:a]"), "graph={graph}");
+        // 替换模式不需要原声，拼出来的 [acat] 没人接会让 ffmpeg 直接报错。
+        assert!(!graph.contains("[acat]"), "graph={graph}");
+    }
+
+    #[test]
+    fn multi_segment_sorts_and_merges_overlaps() {
+        // 乱序 + 重叠：合并后应该只剩两段，且不重复同一段画面。
+        let request = segment_request(&[(6.0, 9.0), (0.0, 3.0), (2.0, 5.0)]);
+        let edit = normalize_edit(&request, probe_with_audio(10.0)).expect("normalizes");
+        assert_eq!(
+            edit.segments,
+            vec![
+                TrimSegment { start: 0.0, end: 5.0 },
+                TrimSegment { start: 6.0, end: 9.0 },
+            ]
+        );
+        assert_eq!(edit.total_duration, 8.0);
+    }
+
+    #[test]
+    fn multi_segment_total_duration_is_the_sum() {
+        let request = segment_request(&[(0.0, 1.5), (3.0, 4.0)]);
+        let edit = normalize_edit(&request, probe_with_audio(10.0)).expect("normalizes");
+        assert!((edit.total_duration - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multi_segment_clamps_to_probed_duration() {
+        let request = segment_request(&[(0.0, 2.0), (8.0, 99.0)]);
+        let edit = normalize_edit(&request, probe_with_audio(10.0)).expect("normalizes");
+        assert_eq!(edit.segments[1], TrimSegment { start: 8.0, end: 10.0 });
+    }
+
+    #[test]
+    fn single_segment_still_uses_the_fast_path() {
+        let request = segment_request(&[(1.0, 4.0)]);
+        let edit = normalize_edit(&request, probe_with_audio(10.0)).expect("normalizes");
+        let args = args_of(&edit);
+        // 单段不进滤镜图：保持原来的 -ss/-t 快路径与 -vf 缩放。
+        assert!(!args.contains(&"-filter_complex".to_string()));
+        assert_eq!(arg_value(&args, "-ss"), Some("1.000".to_string()));
+        assert_eq!(arg_value(&args, "-t"), Some("3.000".to_string()));
+        assert!(args.contains(&"-vf".to_string()));
     }
 
     #[test]

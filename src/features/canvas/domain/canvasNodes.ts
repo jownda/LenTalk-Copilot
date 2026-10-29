@@ -18,6 +18,7 @@ export const CANVAS_NODE_TYPES = {
   motionControl: "motionControlNode",
   promptOptimizer: "promptOptimizerNode",
   seamlessMosaic: "seamlessMosaicNode",
+  runningHubWorkflow: "runningHubWorkflowNode",
 } as const;
 
 export type CanvasNodeType = (typeof CANVAS_NODE_TYPES)[keyof typeof CANVAS_NODE_TYPES];
@@ -670,6 +671,39 @@ export interface MotionControlNodeData extends NodeDisplayData {
   [key: string]: unknown;
 }
 
+/**
+ * RunningHub 工作流节点：跑用户自己导入的 ComfyUI 工作流。
+ *
+ * 和「动作控制 → 角色替换」的区别要说清楚：角色替换跑的是**平台上一个固定应用**，
+ * 参数写死在代码里；这里跑的是**用户从平台导入的任意工作流**，参数由
+ * `parseRunningHubWorkflow` 从导出的 JSON 解析出来。
+ *
+ * 这里**只存 JSON 原文，不存解析结果**：字段列表、节点数、输出类型都是渲染时
+ * `useMemo` 派生的。存一份缓存会带来"JSON 改了但字段没跟着变"的不一致，
+ * 而解析几十个节点本来就只有毫秒级。
+ */
+export interface RunningHubWorkflowNodeData extends NodeDisplayData {
+  /** RunningHub 渠道（customApis 的 id）。 */
+  providerId: string;
+  /** `/workflow/<id>` 里那串数字。 */
+  workflowId: string;
+  /** 导入的 JSON 原文 —— 解析的唯一事实来源。 */
+  workflowJson: string;
+  /**
+   * 工作流名字（卡片上显示、也用作保存文件的默认名）。
+   * 导入文件时取文件名，从平台拉取时留空，用户可在编辑器里改。
+   */
+  workflowName?: string;
+  /** 用户填的值：`${nodeId}.${inputName}` → 值。没填的用字段默认值。 */
+  workflowValues?: Record<string, string>;
+  /** 用户手选的产物类型；留空则用解析推断值（SaveImage / VHS_VideoCombine / SaveAudio）。 */
+  workflowOutputKind?: "image" | "video" | "audio";
+  isGenerating?: boolean;
+  generationError?: string | null;
+  outputUrl?: string | null;
+  [key: string]: unknown;
+}
+
 export type CanvasNodeData =
   | UploadImageNodeData
   | ExportImageNodeData
@@ -686,6 +720,7 @@ export type CanvasNodeData =
   | CinematicStudioNodeData
   | AudioNodeData
   | MotionControlNodeData
+  | RunningHubWorkflowNodeData
   | SeamlessMosaicNodeData;
 
 export type CanvasNode = Node<CanvasNodeData, CanvasNodeType>;
@@ -848,6 +883,12 @@ export function isMotionControlNode(
   node: CanvasNode | null | undefined,
 ): node is Node<MotionControlNodeData, typeof CANVAS_NODE_TYPES.motionControl> {
   return node?.type === CANVAS_NODE_TYPES.motionControl;
+}
+
+export function isRunningHubWorkflowNode(
+  node: CanvasNode | null | undefined,
+): node is Node<RunningHubWorkflowNodeData, typeof CANVAS_NODE_TYPES.runningHubWorkflow> {
+  return node?.type === CANVAS_NODE_TYPES.runningHubWorkflow;
 }
 
 export function isSeamlessMosaicNode(

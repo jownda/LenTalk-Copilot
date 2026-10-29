@@ -21,6 +21,7 @@ export const DEFAULT_NODE_DISPLAY_NAME: Record<CanvasNodeType, string> = {
   [CANVAS_NODE_TYPES.audio]: '媒体',
   [CANVAS_NODE_TYPES.audioGen]: 'AI 音频',
   [CANVAS_NODE_TYPES.motionControl]: '动作控制 / 对口型',
+  [CANVAS_NODE_TYPES.runningHubWorkflow]: 'RunningHub 工作流',
   [CANVAS_NODE_TYPES.seamlessMosaic]: '无缝拼图',
 };
 

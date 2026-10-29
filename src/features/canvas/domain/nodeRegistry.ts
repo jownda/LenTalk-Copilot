@@ -7,6 +7,7 @@ import {
   type AudioNodeData,
   type AudioGenNodeData,
   type MotionControlNodeData,
+  type RunningHubWorkflowNodeData,
   type CinematicStudioNodeData,
   type DirectorDeskNodeData,
   type ImageSize,
@@ -50,7 +51,8 @@ export type MenuIconKey =
   | "video"
   | "mosaic"
   | "clapperboard"
-  | "accessibility";
+  | "accessibility"
+  | "workflow";
 
 export interface CanvasNodeCapabilities {
   toolbar: boolean;
@@ -631,6 +633,36 @@ const motionControlNodeDefinition: CanvasNodeDefinition<MotionControlNodeData> =
   defaultSize: { width: 420, height: 560 },
 };
 
+/**
+ * RunningHub 工作流节点。
+ *
+ * 默认尺寸比其它生成节点高：它要容纳「工作流导入区 + 参数表单 + 素材槽」三段，
+ * 420×640 刚好让参数区在默认高度下能露出两三个节点分组，不用一进来就滚。
+ * 参数表单本身是可滚动的（`flex-1 min-h-0 overflow-y-auto`），拉高节点就能看更多。
+ */
+const runningHubWorkflowNodeDefinition: CanvasNodeDefinition<RunningHubWorkflowNodeData> = {
+  type: CANVAS_NODE_TYPES.runningHubWorkflow,
+  menuLabelKey: "node.menu.runningHubWorkflow",
+  menuIcon: "workflow",
+  visibleInMenu: true,
+  // promptInput 关掉：提示词由工作流自己的 CLIPTextEncode 节点承载，节点顶部的
+  // 通用提示词框在这里没有意义（会让人以为能直接写进模型）。
+  capabilities: { toolbar: true, promptInput: false },
+  connectivity: { sourceHandle: true, targetHandle: true, connectMenu: { fromSource: true, fromTarget: false } },
+  createDefaultData: () => ({
+    displayName: DEFAULT_NODE_DISPLAY_NAME[CANVAS_NODE_TYPES.runningHubWorkflow],
+    providerId: "",
+    workflowId: "",
+    workflowJson: "",
+    workflowValues: {},
+    workflowOutputKind: undefined,
+    isGenerating: false,
+    generationError: null,
+    outputUrl: null,
+  }),
+  defaultSize: { width: 420, height: 640 },
+};
+
 export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition> = {
   [CANVAS_NODE_TYPES.upload]: uploadNodeDefinition,
   [CANVAS_NODE_TYPES.imageEdit]: imageEditNodeDefinition,
@@ -646,6 +678,7 @@ export const canvasNodeDefinitions: Record<CanvasNodeType, CanvasNodeDefinition>
   [CANVAS_NODE_TYPES.audio]: audioNodeDefinition,
   [CANVAS_NODE_TYPES.audioGen]: audioGenNodeDefinition,
   [CANVAS_NODE_TYPES.motionControl]: motionControlNodeDefinition,
+  [CANVAS_NODE_TYPES.runningHubWorkflow]: runningHubWorkflowNodeDefinition,
   [CANVAS_NODE_TYPES.promptOptimizer]: promptOptimizerNodeDefinition,
   [CANVAS_NODE_TYPES.seamlessMosaic]: seamlessMosaicNodeDefinition,
 };

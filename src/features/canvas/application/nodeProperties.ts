@@ -135,6 +135,9 @@ const SOURCE_TYPE_BY_NODE_TYPE: Record<string, string> = {
   audioGenNode: "audioGen",
   storyboardGenNode: "storyboardGen",
   motionControlNode: "videoGen",
+  // 工作流产物类型由 Save* 节点决定（图片/视频/音频都可能有），来源归类统一按最重的
+  // 视频算 —— 这里只影响"生成来源"的显示文案，不影响实际落盘类型。
+  runningHubWorkflowNode: "videoGen",
 };
 
 const MEDIA_KIND_LABEL: Record<NodeMediaKind, string> = {

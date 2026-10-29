@@ -27,6 +27,13 @@ export interface CanvasMediaEntry {
   previewList: string[];
   /** 节点展示名, 为空时由 UI 回退到节点类型名。 */
   displayName: string;
+  /**
+   * 所属分组节点的 id（React Flow 的 `parentId`）；不在任何组里时为 null。
+   *
+   * 侧栏按它把条目归到画布上的分组节点下面 —— 分组是**画布本来的结构**，
+   * 不再另造一套「文件夹」，否则同一张图会有两个归属。
+   */
+  parentId: string | null;
 }
 
 function pickText(...values: Array<string | null | undefined>): string | null {
@@ -51,11 +58,13 @@ function uniqueUrls(values: Array<string | null | undefined>): string[] {
 
 function createEntry(
   node: CanvasNode,
-  input: Omit<CanvasMediaEntry, 'nodeId' | 'nodeType'>,
+  input: Omit<CanvasMediaEntry, 'nodeId' | 'nodeType' | 'parentId'>,
 ): CanvasMediaEntry {
   return {
     nodeId: node.id,
     nodeType: typeof node.type === 'string' ? node.type : '',
+    // 组内节点的 `parentId` 指向分组节点；顶层节点没有这个字段。
+    parentId: typeof node.parentId === 'string' && node.parentId.trim() ? node.parentId : null,
     ...input,
   };
 }
@@ -192,4 +201,62 @@ export function collectCanvasMediaEntries(
     }
   }
   return entries.reverse();
+}
+
+/** 侧栏的一节（一个画布分组，或末尾的「未分组」）。 */
+export interface NodeManagerSection {
+  id: string;
+  label: string;
+  entries: CanvasMediaEntry[];
+}
+
+/** 「未分组」这一节的固定 id（真实分组 id 不会与它冲突）。 */
+export const NODE_MANAGER_UNGROUPED_SECTION_ID = '__ungrouped__';
+
+/**
+ * 把条目按画布分组归节。
+ *
+ * 三条规则，都是踩过的坑：
+ * 1. **`parentId` 指向已删分组的条目要落回「未分组」** —— 直接按 id 分组会让它整条消失，
+ *    用户会以为节点丢了；
+ * 2. **空分组不出现**（画布上一堆空组会把真正的产物挤到看不见的地方）；
+ * 3. **「未分组」永远排在最后**，且只在有内容时出现。
+ */
+export function buildNodeManagerSections(
+  entries: readonly CanvasMediaEntry[],
+  groups: ReadonlyArray<{ id: string; label: string }>,
+  ungroupedLabel: string,
+): NodeManagerSection[] {
+  const knownGroupIds = new Set(groups.map((group) => group.id));
+  const byGroup = new Map<string, CanvasMediaEntry[]>();
+  const ungrouped: CanvasMediaEntry[] = [];
+
+  for (const entry of entries) {
+    if (entry.parentId && knownGroupIds.has(entry.parentId)) {
+      const list = byGroup.get(entry.parentId);
+      if (list) {
+        list.push(entry);
+      } else {
+        byGroup.set(entry.parentId, [entry]);
+      }
+    } else {
+      ungrouped.push(entry);
+    }
+  }
+
+  const sections: NodeManagerSection[] = [];
+  for (const group of groups) {
+    const groupEntries = byGroup.get(group.id);
+    if (groupEntries?.length) {
+      sections.push({ id: group.id, label: group.label, entries: groupEntries });
+    }
+  }
+  if (ungrouped.length) {
+    sections.push({
+      id: NODE_MANAGER_UNGROUPED_SECTION_ID,
+      label: ungroupedLabel,
+      entries: ungrouped,
+    });
+  }
+  return sections;
 }

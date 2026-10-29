@@ -1,37 +1,59 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { open as openNativeFile } from "@tauri-apps/plugin-dialog";
-import { Film, LoaderCircle, Scissors, Volume2, VolumeX, Wand2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { LoaderCircle, Maximize2, Pause, Play, Scissors, SkipBack, SkipForward, Trash2 } from "lucide-react";
 
-import { UiButton, UiModal, UiSelect } from "@/components/ui/primitives";
-import {
-  CANVAS_NODE_TYPES,
-  DEFAULT_ASPECT_RATIO,
-  isAudioNode,
-  type CanvasNode,
-} from "@/features/canvas/domain/canvasNodes";
-import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { probeVideoAudio, renderVideoEdit } from "@/commands/videoEdit";
+import { UiButton, UiModal } from "@/components/ui/primitives";
 import { isVideoTrackUndecoded } from "@/features/canvas/application/videoPlayback";
+import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import { showErrorDialog } from "@/features/canvas/application/errorDialog";
-import { renderVideoEdit, type VideoEditAudioMode } from "@/commands/videoEdit";
-import { useCanvasStore } from "@/stores/canvasStore";
+import { placeEditedVideoNode } from "@/features/canvas/application/videoEditExport";
+import { loadWaveformPeaks } from "@/features/canvas/application/waveform";
+import { AdvancedVideoEditor } from "@/features/canvas/ui/AdvancedVideoEditor";
+import { Waveform } from "@/features/canvas/ui/Waveform";
 import {
+  applySourceMeta,
+  buildTimelineTicks,
   buildVideoEditRequest,
-  createFullTrimRange,
   createVideoEditState,
-  formatTimecode,
-  moveTrimHandle,
-  pickNearestTrimHandle,
-  ratioToSeconds,
-  resolveAudioModeAfterTrackPick,
-  resolveOutputDuration,
-  resolveTimelineDuration,
-  secondsToRatio,
-  trimSelectionDuration,
+  deleteSegment,
+  findSegmentAt,
+  isTicksRemoved,
+  makeSegment,
+  moveSegmentEdge,
+  nextKeptTick,
+  ratioToTicks,
+  removedRanges,
+  splitSegmentsAt,
+  ticksToRatio,
+  timelineTicks,
+  totalKeptTicks,
   validateVideoEditState,
   type VideoEditState,
 } from "@/features/canvas/application/videoEdit";
+import {
+  TICKS_PER_SECOND,
+  formatTimecode,
+  parseProbeFrameRate,
+  snapTicksToFrame,
+  ticksFromSeconds,
+  ticksPerFrame,
+  ticksToSeconds,
+} from "@/features/canvas/application/mediaTime";
+import { isAudioNode, type CanvasNode } from "@/features/canvas/domain/canvasNodes";
+import { useCanvasStore } from "@/stores/canvasStore";
+
+/** 手柄抓取范围：至少 0.35 秒，长视频按 2% 放大 —— 几十像素宽的时间轴上手不抖。 */
+const HANDLE_GRAB_RATIO = 0.02;
+const MIN_HANDLE_GRAB_TICKS = TICKS_PER_SECOND * 0.35;
+/** 没有帧率时逐帧步进用的步长（约 1/30 秒）。 */
+const FALLBACK_STEP_TICKS = Math.round(TICKS_PER_SECOND / 30);
+
+/** 时间轴拖拽：拖播放头，或拖某段的入/出点。 */
+type DragState =
+  | { type: "playhead" }
+  | { type: "edge"; id: string; edge: "start" | "end" };
 
 export interface VideoEditDialogProps {
   open: boolean;
@@ -39,86 +61,30 @@ export interface VideoEditDialogProps {
   onClose: () => void;
 }
 
-/** 拖动时间轴时，鼠标与手柄多远算「抓到了」——按比例算，长视频才不至于要求像素级精准。 */
-const HANDLE_GRAB_RATIO = 0.02;
-const MIN_HANDLE_GRAB_SEC = 0.35;
-
-/** 音量/淡入淡出的滑杆步长。 */
-const VOLUME_STEP = 0.05;
-const FADE_STEP = 0.1;
-
-function resolveAudioModeLabelKey(mode: VideoEditAudioMode): string {
-  switch (mode) {
-    case "mute":
-      return "videoEdit.audioModeMute";
-    case "replace":
-      return "videoEdit.audioModeReplace";
-    case "mix":
-      return "videoEdit.audioModeMix";
-    default:
-      return "videoEdit.audioModeKeep";
-  }
-}
-
 /**
- * 秒数输入框。
+ * 基础剪辑窗口：**只做最核心的裁剪**。
  *
- * 不能把受控值直接绑到 `toFixed(1)` 上：输入 "1." 会被 `Number("1.") = 1` 立刻打回 "1"，
- * 小数点根本打不出来。所以编辑期间保留用户原样的草稿字符串，只在失焦时对齐显示值。
+ * 原来这里什么都塞一点（裁剪 + 音轨替换 + 混合 + 音量 + 淡入淡出），窗口越堆越高，
+ * 高频操作（切一刀、删一段）反而要在一堆滑块里找。这些搬到高级剪辑，这边只留：
+ * 预览、多段裁剪、切/删、逐帧、导出。
  */
-function SecondsInput({
-  value,
-  label,
-  onCommit,
-}: {
-  value: number;
-  label: string;
-  onCommit: (seconds: number) => void;
-}) {
-  const [draft, setDraft] = useState(() => value.toFixed(1));
-  const [isFocused, setIsFocused] = useState(false);
-
-  useEffect(() => {
-    if (!isFocused) setDraft(value.toFixed(1));
-  }, [isFocused, value]);
-
-  return (
-    <label className="flex items-center gap-1.5">
-      {label}
-      <input
-        type="text"
-        inputMode="decimal"
-        value={draft}
-        onFocus={() => setIsFocused(true)}
-        onBlur={() => {
-          setIsFocused(false);
-          setDraft(value.toFixed(1));
-        }}
-        onChange={(event) => {
-          setDraft(event.target.value);
-          const parsed = Number(event.target.value);
-          // 只把能解析出来的中间态写回；空串/半截小数点交给失焦时的对齐处理。
-          if (event.target.value.trim() !== "" && Number.isFinite(parsed)) {
-            onCommit(parsed);
-          }
-        }}
-        className="h-7 w-20 rounded border border-border-dark bg-bg-dark/50 px-2 text-[11px] tabular-nums text-text-dark"
-      />
-    </label>
-  );
-}
-
 export function VideoEditDialog({ open, node, onClose }: VideoEditDialogProps) {
   const { t } = useTranslation();
   const videoRef = useRef<HTMLVideoElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
-  const draggingRef = useRef<"start" | "end" | null>(null);
+  /**
+   * 时间轴上的拖拽状态。
+   *
+   * `playhead` 与 `edge` 必须分开：两者在 `pointermove` 里做的事完全不同 ——
+   * 前者只移动播放头（不动片段），后者改片段边界并顺带把播放头跟过去。
+   * 合成一个状态会导致「拖播放线时把段落边缘也拖了」。
+   */
+  const draggingRef = useRef<DragState | null>(null);
   const playbackTempPathRef = useRef<string | null>(null);
 
   const addNode = useCanvasStore((state) => state.addNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
-  const canvasNodes = useCanvasStore((state) => state.nodes);
 
   const sourcePath = useMemo(() => {
     const value = isAudioNode(node) ? node.data.sourcePath : null;
@@ -126,46 +92,78 @@ export function VideoEditDialog({ open, node, onClose }: VideoEditDialogProps) {
   }, [node]);
 
   const [state, setState] = useState<VideoEditState>(() => createVideoEditState());
-  const [currentTime, setCurrentTime] = useState(0);
+  const [currentTicks, setCurrentTicks] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [playbackSrc, setPlaybackSrc] = useState<string | null>(null);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const [hint, setHint] = useState<string | null>(null);
+  const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
+  /** 整段视频的音频波形（0~1）。`null` = 还没好或拿不到 —— 此时不画任何东西。 */
+  const [peaks, setPeaks] = useState<number[] | null>(null);
 
-  const duration = state.duration;
-  const timelineDuration = resolveTimelineDuration(duration);
-  const startRatio = secondsToRatio(state.trim.start, duration);
-  const endRatio = secondsToRatio(state.trim.end, duration);
-  const playheadRatio = secondsToRatio(currentTime, duration);
-  const clipLength = trimSelectionDuration(state.trim);
+  const durationTicks = timelineTicks(state);
+  const stepTicks = ticksPerFrame(state.frameRate) ?? FALLBACK_STEP_TICKS;
+  const keptTicks = totalKeptTicks(state.segments);
+  const selectedSegment = state.segments.find((segment) => segment.id === state.selectedId) ?? null;
+  /** 被剪掉的区间：波形要在这几段上面压暗，否则空隙里的波形比保留区还亮。 */
+  const gaps = useMemo(() => removedRanges(state.segments, durationTicks), [state.segments, durationTicks]);
 
-  /** 画布上可作为音轨的媒体节点（排除自己，否则等于把原声再叠一遍）。 */
-  const trackCandidates = useMemo(() => {
-    return canvasNodes
-      .filter((candidate) => candidate.id !== node.id && isAudioNode(candidate))
-      .map((candidate) => {
-        const path = candidate.data.sourcePath;
-        if (typeof path !== "string" || !path.trim()) return null;
-        return {
-          id: candidate.id,
-          path,
-          label: candidate.data.displayName?.trim() || (candidate.data.mediaType === "video" ? "视频节点" : "音频节点"),
-          kind: candidate.data.mediaType === "video" ? "video" : "audio",
-        };
-      })
-      .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate));
-  }, [canvasNodes, node.id]);
+  const segmentsRef = useRef(state.segments);
+  segmentsRef.current = state.segments;
 
-  // 每次打开都从零开始，避免上一段视频的区间/音轨被带过来。
   useEffect(() => {
     if (!open) return;
     setState(createVideoEditState());
-    setCurrentTime(0);
+    setCurrentTicks(0);
+    setIsPlaying(false);
+    setHint(null);
     setIsExporting(false);
     setPlaybackError(null);
+    setIsAdvancedOpen(false);
     setPlaybackSrc(sourcePath ? resolveImageDisplayUrl(sourcePath) : null);
   }, [open, sourcePath]);
 
-  // 卸载/关闭时回收播放兼容临时文件，与视频帧抽取弹窗保持一致。
+  // 探测帧率；失败就退回毫秒吸附，不影响剪切本身。远程 URL 不探（ffmpeg 会真去拉网络）。
+  useEffect(() => {
+    if (!open || !sourcePath || !isTauri()) return;
+    if (/^https?:\/\//i.test(sourcePath)) return;
+    let cancelled = false;
+    void probeVideoAudio(sourcePath)
+      .then((result) => {
+        if (cancelled) return;
+        const rate = result.fps ? parseProbeFrameRate(Math.round(result.fps * 1000), 1000) : null;
+        if (rate) setState((current) => ({ ...current, frameRate: rate }));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [open, sourcePath]);
+
+  /**
+   * 声音波形。
+   *
+   * 拿不到就**什么都不画**。曾经这里用「按路径生成确定性占位波形」兜底，但假峰值会让
+   * 用户照着它去找「有声的位置」——那条信息是编的，比空白更糟。
+   *
+   * 桶数给 600：轨道宽约 550px，260 根可见条，剩余精度留给缩放后仍然够用。
+   */
+  useEffect(() => {
+    if (!open || !sourcePath || !isTauri() || /^https?:\/\//i.test(sourcePath)) {
+      setPeaks(null);
+      return;
+    }
+    let cancelled = false;
+    setPeaks(null);
+    void loadWaveformPeaks(sourcePath, 600).then((result) => {
+      if (!cancelled) setPeaks(result);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, sourcePath]);
+
   useEffect(() => {
     return () => {
       const path = playbackTempPathRef.current;
@@ -176,37 +174,32 @@ export function VideoEditDialog({ open, node, onClose }: VideoEditDialogProps) {
     };
   }, []);
 
-  const updateState = useCallback((patch: Partial<VideoEditState>) => {
-    setState((current) => ({ ...current, ...patch }));
-  }, []);
-
-  const seekTo = useCallback((seconds: number) => {
+  const seekTo = useCallback((ticks: number) => {
+    const clamped = Math.max(0, Math.min(ticks, durationTicks));
     const video = videoRef.current;
-    if (video && Number.isFinite(seconds)) {
+    if (video && Number.isFinite(clamped)) {
       try {
-        video.currentTime = seconds;
+        video.currentTime = ticksToSeconds(clamped);
       } catch {
-        // 源还没 ready 时赋值会被忽略，交给 onLoadedMetadata 重新对齐。
+        // 元数据未就绪时忽略。
       }
     }
-    setCurrentTime(seconds);
-  }, []);
+    setCurrentTicks(clamped);
+  }, [durationTicks]);
 
-  /** 元数据到位前 duration 为 0，时间轴用的是占位时长；拿到真实值后重算整段区间。 */
-  /** 原生播放器解不了的编码（HEVC/ProRes/MOV）统一转成 H.264 播放代理。 */
   const handleVideoError = useCallback(() => {
     if (!isTauri() || !sourcePath || playbackTempPathRef.current) {
       setPlaybackError(t("videoEdit.playbackFailed"));
       return;
     }
     void invoke<string>("prepare_video_playback", { source: sourcePath })
-      .then((preparedPath) => {
-        playbackTempPathRef.current = preparedPath;
-        setPlaybackSrc(resolveImageDisplayUrl(preparedPath));
+      .then((prepared) => {
+        playbackTempPathRef.current = prepared;
+        setPlaybackSrc(resolveImageDisplayUrl(prepared));
         setPlaybackError(null);
       })
       .catch((error: unknown) => {
-        console.warn("[videoEdit] playback compatibility fallback failed", error);
+        console.warn("[videoEdit] playback fallback failed", error);
         setPlaybackError(t("videoEdit.playbackFailed"));
       });
   }, [sourcePath, t]);
@@ -214,71 +207,146 @@ export function VideoEditDialog({ open, node, onClose }: VideoEditDialogProps) {
   const handleLoadedMetadata = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
-    const nextDuration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
-    if (nextDuration <= 0) return;
+    const seconds = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+    if (seconds <= 0) return;
     setState((current) =>
-      current.duration === nextDuration
-        ? current
-        : { ...current, duration: nextDuration, trim: createFullTrimRange(nextDuration) },
+      applySourceMeta(current, { durationTicks: ticksFromSeconds(seconds), frameRate: current.frameRate }),
     );
-    setCurrentTime(video.currentTime || 0);
-    // HEVC/ProRes 的素材在 WebView2 上不报错、只被静默丢轨, 光等 onError 会一直停在
-    // 「只有声音」; 靠「时长已就绪但尺寸为 0」补一次 H.264 代理。
-    if (isVideoTrackUndecoded(video)) {
-      handleVideoError();
-    }
+    setCurrentTicks(ticksFromSeconds(video.currentTime || 0));
+    if (isVideoTrackUndecoded(video)) handleVideoError();
   }, [handleVideoError]);
 
-  const secondsFromPointer = useCallback(
-    (clientX: number) => {
-      const track = trackRef.current;
-      if (!track) return 0;
-      const rect = track.getBoundingClientRect();
-      const ratio = (clientX - rect.left) / Math.max(1, rect.width);
-      return ratioToSeconds(ratio, duration);
-    },
-    [duration],
-  );
+  /** 播放时跳过已剪掉的区间：否则删了中间一段按播放，画面照常播出来，用户以为没剪上。 */
+  const handleTimeUpdate = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const ticks = ticksFromSeconds(video.currentTime);
+    setCurrentTicks(ticks);
+    if (!isTicksRemoved(segmentsRef.current, ticks)) return;
+    const next = nextKeptTick(segmentsRef.current, ticks, durationTicks);
+    if (next === null) return;
+    try {
+      video.currentTime = ticksToSeconds(next);
+    } catch {
+      // 下次 timeupdate 再试。
+    }
+    setCurrentTicks(next);
+  }, [durationTicks]);
 
-  const beginHandleDrag = useCallback(
-    (handle: "start" | "end") => (event: ReactPointerEvent<HTMLElement>) => {
+  const togglePlay = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) {
+      void video.play().catch(() => undefined);
+      setIsPlaying(true);
+    } else {
+      video.pause();
+      setIsPlaying(false);
+    }
+  }, []);
+
+  const stepFrame = useCallback((frames: number) => {
+    const video = videoRef.current;
+    if (video && !video.paused) {
+      video.pause();
+      setIsPlaying(false);
+    }
+    setCurrentTicks((current) => {
+      const next = Math.max(
+        0,
+        Math.min(durationTicks, snapTicksToFrame(current + frames * stepTicks, state.frameRate)),
+      );
+      const element = videoRef.current;
+      if (element) {
+        try {
+          element.currentTime = ticksToSeconds(next);
+        } catch {
+          // 忽略。
+        }
+      }
+      return next;
+    });
+  }, [durationTicks, state.frameRate, stepTicks]);
+
+  const ticksFromPointer = useCallback((clientX: number) => {
+    const track = trackRef.current;
+    if (!track) return 0;
+    const rect = track.getBoundingClientRect();
+    const ratio = (clientX - rect.left) / Math.max(1, rect.width);
+    return snapTicksToFrame(ratioToTicks(ratio, durationTicks), state.frameRate);
+  }, [durationTicks, state.frameRate]);
+
+  const beginEdgeDrag = useCallback(
+    (id: string, edge: "start" | "end") => (event: React.PointerEvent<HTMLElement>) => {
+      if (event.button !== 0) return;
       event.stopPropagation();
-      draggingRef.current = handle;
+      draggingRef.current = { type: "edge", id, edge };
+      setState((current) => ({ ...current, selectedId: id }));
       trackRef.current?.setPointerCapture(event.pointerId);
     },
     [],
   );
 
+  /**
+   * 抓播放头。放在轨道最上层、并且 `stopPropagation`，所以**压在段落边缘上也依然拖播放头** ——
+   * 否则「线正好停在切点上」时怎么点都在改段落，播放头动不了。
+   */
+  const beginPlayheadDrag = useCallback((event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0) return;
+    event.stopPropagation();
+    draggingRef.current = { type: "playhead" };
+    trackRef.current?.setPointerCapture(event.pointerId);
+  }, []);
+
   const handleTrackPointerDown = useCallback(
-    (event: ReactPointerEvent<HTMLDivElement>) => {
-      const seconds = secondsFromPointer(event.clientX);
-      const grabWindow = Math.max(MIN_HANDLE_GRAB_SEC, timelineDuration * HANDLE_GRAB_RATIO);
-      const nearest = Math.min(Math.abs(seconds - state.trim.start), Math.abs(seconds - state.trim.end));
-      if (nearest <= grabWindow) {
-        draggingRef.current = pickNearestTrimHandle(seconds, state.trim);
-        event.currentTarget.setPointerCapture(event.pointerId);
-        return;
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      const ticks = ticksFromPointer(event.clientX);
+      const grabTicks = Math.max(MIN_HANDLE_GRAB_TICKS, durationTicks * HANDLE_GRAB_RATIO);
+      for (const segment of state.segments) {
+        if (Math.abs(ticks - segment.startTicks) <= grabTicks) {
+          draggingRef.current = { type: "edge", id: segment.id, edge: "start" };
+          setState((current) => ({ ...current, selectedId: segment.id }));
+          event.currentTarget.setPointerCapture(event.pointerId);
+          return;
+        }
+        if (Math.abs(ticks - segment.endTicks) <= grabTicks) {
+          draggingRef.current = { type: "edge", id: segment.id, edge: "end" };
+          setState((current) => ({ ...current, selectedId: segment.id }));
+          event.currentTarget.setPointerCapture(event.pointerId);
+          return;
+        }
       }
-      // 点空白处 = 定位播放头，方便先看画面再决定裁哪里。
-      seekTo(seconds);
+      const hit = findSegmentAt(state.segments, ticks);
+      if (hit) setState((current) => ({ ...current, selectedId: hit.id }));
+      seekTo(ticks);
+      // 点轨道任意位置 = 把播放头放过去并**按住就能继续拖**（擦洗）。
+      // 这是 NLE 的通用手感：不该要求用户精确抓住那条 1px 的线。
+      draggingRef.current = { type: "playhead" };
+      event.currentTarget.setPointerCapture(event.pointerId);
     },
-    [secondsFromPointer, seekTo, state.trim, timelineDuration],
+    [durationTicks, seekTo, state.segments, ticksFromPointer],
   );
 
   const handleTrackPointerMove = useCallback(
-    (event: ReactPointerEvent<HTMLDivElement>) => {
-      const handle = draggingRef.current;
-      if (!handle) return;
-      const seconds = secondsFromPointer(event.clientX);
-      const nextTrim = moveTrimHandle(handle, seconds, state.trim, duration);
-      updateState({ trim: nextTrim });
-      // 拖到哪儿就把画面跳到哪儿：用户要看的正是「这一刀切在这儿」的那一帧。
-      seekTo(handle === "start" ? nextTrim.start : nextTrim.end);
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      const drag = draggingRef.current;
+      if (!drag) return;
+      const ticks = ticksFromPointer(event.clientX);
+      if (drag.type === "playhead") {
+        seekTo(ticks);
+        return;
+      }
+      setState((current) => ({
+        ...current,
+        segments: moveSegmentEdge(current.segments, drag.id, drag.edge, ticks, current.frameRate, durationTicks),
+      }));
+      seekTo(ticks);
     },
-    [duration, secondsFromPointer, seekTo, state.trim, updateState],
+    [durationTicks, seekTo, ticksFromPointer],
   );
 
-  const endHandleDrag = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+  const endDrag = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (!draggingRef.current) return;
     draggingRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
@@ -286,31 +354,35 @@ export function VideoEditDialog({ open, node, onClose }: VideoEditDialogProps) {
     }
   }, []);
 
-  const applyTrack = useCallback((path: string, label: string) => {
-    setState((current) => ({
-      ...current,
-      trackPath: path,
-      trackPathLabel: label,
-      audioMode: resolveAudioModeAfterTrackPick(current.audioMode, true),
-    }));
-  }, []);
-
-  const handlePickLocalTrack = useCallback(async () => {
-    if (!isTauri()) {
-      void showErrorDialog(t("videoEdit.desktopOnly"), t("common.error"));
+  const splitAtPlayhead = useCallback(() => {
+    const next = splitSegmentsAt(state.segments, currentTicks, state.frameRate);
+    if (next.length === state.segments.length) {
+      setHint(t("videoEdit.hintSplitInvalid"));
       return;
     }
-    const selected = await openNativeFile({
-      multiple: false,
-      directory: false,
-      filters: [{ name: t("videoEdit.audioFileFilter"), extensions: ["mp3", "m4a", "wav", "aac", "flac", "ogg"] }],
-    });
-    if (typeof selected !== "string" || !selected.trim()) return;
-    applyTrack(selected, selected.split(/[\\/]/).pop() || selected);
-  }, [applyTrack, t]);
+    setHint(null);
+    const cut = snapTicksToFrame(currentTicks, state.frameRate);
+    const created = next.find((segment) => segment.startTicks === cut);
+    setState((current) => ({ ...current, segments: next, selectedId: created?.id ?? current.selectedId }));
+  }, [currentTicks, state.frameRate, state.segments, t]);
 
-  const clearTrack = useCallback(() => {
-    setState((current) => ({ ...current, trackPath: null, trackPathLabel: null, audioMode: "keep" }));
+  const removeSelected = useCallback(() => {
+    if (state.segments.length <= 1) {
+      setHint(t("videoEdit.hintLastSegment"));
+      return;
+    }
+    const next = deleteSegment(state.segments, state.selectedId ?? "");
+    setHint(null);
+    setState((current) => ({ ...current, segments: next, selectedId: next[0]?.id ?? null }));
+  }, [state.segments, state.selectedId, t]);
+
+  const resetSegments = useCallback(() => {
+    setHint(null);
+    setState((current) => ({
+      ...current,
+      segments: current.durationTicks > 0 ? [makeSegment(0, current.durationTicks)] : current.segments,
+      selectedId: null,
+    }));
   }, []);
 
   const handleExport = useCallback(async () => {
@@ -326,19 +398,15 @@ export function VideoEditDialog({ open, node, onClose }: VideoEditDialogProps) {
     setIsExporting(true);
     try {
       const result = await renderVideoEdit(buildVideoEditRequest(state, sourcePath as string));
-      const baseName = node.data.displayName?.trim() || t("videoEdit.defaultResultName");
-      const placement = findNodePosition(node.id, 360, 240);
-      const newNodeId = addNode(CANVAS_NODE_TYPES.audio, placement, {
-        displayName: `${baseName} ${t("videoEdit.resultSuffix")}`,
-        mediaType: "video",
-        sourcePath: result.outputPath,
-        previewImageUrl: null,
-        aspectRatio:
-          typeof node.data.aspectRatio === "string" && node.data.aspectRatio.trim()
-            ? node.data.aspectRatio
-            : DEFAULT_ASPECT_RATIO,
+      placeEditedVideoNode({
+        node,
+        outputPath: result.outputPath,
+        suffix: t("videoEdit.resultSuffix"),
+        fallbackName: t("videoEdit.defaultResultName"),
+        addNode,
+        addEdge,
+        findNodePosition,
       });
-      addEdge(node.id, newNodeId);
       onClose();
     } catch (error) {
       console.warn("[videoEdit] export failed", error);
@@ -348,309 +416,343 @@ export function VideoEditDialog({ open, node, onClose }: VideoEditDialogProps) {
     }
   }, [addEdge, addNode, findNodePosition, node, onClose, sourcePath, state, t]);
 
-  const hasTrack = Boolean(state.trackPath);
-  const fadesDisabled = clipLength <= 0;
-  const maxFade = Math.max(0.5, Math.min(5, timelineDuration / 2));
+  /**
+   * 快捷键同样走**窗口捕获阶段**。
+   *
+   * 画布在 `document` 上有全局 keydown（Delete = 删除选中节点），React 的 onKeyDown 之后
+   * 原生事件会继续冒到 document —— 结果是「在剪辑窗里按 Delete，整个视频节点被删掉」。
+   *
+   * 高级剪辑打开时这个监听必须让位，否则一次按键会同时触发两个窗口的删除。
+   */
+  /**
+   * Q = 裁掉播放线左边（入点移到播放线），W = 裁掉右边（出点移到播放线）。
+   *
+   * 裁完把播放线**跟着设到新的边界**：`moveSegmentEdge` 会做吸附 / 最短约束，边界可能
+   * 和播放线位置不完全一致（例如贴着前一段裁，会被 clamp 到前一段末尾），播放线跟过去才准。
+   */
+  const trimToPlayhead = useCallback(
+    (edge: "start" | "end") => {
+      const id = state.selectedId;
+      if (!id) return;
+      const segments = moveSegmentEdge(state.segments, id, edge, currentTicks, state.frameRate, durationTicks);
+      const segment = segments.find((item) => item.id === id);
+      const boundary = segment ? (edge === "start" ? segment.startTicks : segment.endTicks) : currentTicks;
+      setState((current) => ({ ...current, segments }));
+      setCurrentTicks(boundary);
+    },
+    [currentTicks, durationTicks, state.frameRate, state.selectedId, state.segments],
+  );
+
+  const keyActionsRef = useRef({ togglePlay, stepFrame, splitAtPlayhead, removeSelected, trimToPlayhead });
+  keyActionsRef.current = { togglePlay, stepFrame, splitAtPlayhead, removeSelected, trimToPlayhead };
+
+  useEffect(() => {
+    if (!open || isAdvancedOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) {
+        return;
+      }
+      const actions = keyActionsRef.current;
+      switch (event.key) {
+        case " ":
+          actions.togglePlay();
+          break;
+        case "ArrowLeft":
+          actions.stepFrame(event.shiftKey ? -10 : -1);
+          break;
+        case "ArrowRight":
+          actions.stepFrame(event.shiftKey ? 10 : 1);
+          break;
+        case "s":
+        case "S":
+          actions.splitAtPlayhead();
+          break;
+        case "b":
+        case "B":
+          if (event.ctrlKey || event.metaKey) {
+            actions.splitAtPlayhead();
+            break;
+          }
+          return;
+        case "q":
+        case "Q":
+          actions.trimToPlayhead("start");
+          break;
+        case "w":
+        case "W":
+          actions.trimToPlayhead("end");
+          break;
+        case "Delete":
+        case "Backspace":
+          actions.removeSelected();
+          break;
+        default:
+          // Escape 等交给 UiModal 自己处理，这里放行。
+          return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [isAdvancedOpen, open]);
 
   return (
-    <UiModal
-      isOpen={open}
-      title={t("videoEdit.title")}
-      onClose={onClose}
-      widthClassName="w-[min(680px,calc(100vw-32px))]"
-      footer={
-        <>
-          <UiButton variant="muted" onClick={onClose} disabled={isExporting}>
-            {t("common.cancel")}
-          </UiButton>
-          <UiButton variant="primary" onClick={() => void handleExport()} disabled={isExporting}>
-            {isExporting ? (
-              <>
-                <LoaderCircle className="h-4 w-4 animate-spin" />
-                {t("videoEdit.exporting")}
-              </>
+    <>
+      <UiModal
+        isOpen={open}
+        title={t("videoEdit.title")}
+        onClose={onClose}
+        widthClassName="w-[min(600px,calc(100vw-32px))]"
+        headerActions={
+          <button
+            type="button"
+            className="flex h-8 items-center gap-1.5 rounded-md border border-accent/40 bg-accent/10 px-2.5 text-[11px] font-medium text-accent transition-colors hover:bg-accent/20"
+            title={t("videoEdit.advancedHint")}
+            onClick={() => setIsAdvancedOpen(true)}
+          >
+            <Maximize2 className="h-3.5 w-3.5" />
+            {t("videoEdit.advanced")}
+          </button>
+        }
+        footer={
+          <>
+            <UiButton variant="muted" onClick={onClose} disabled={isExporting}>
+              {t("common.cancel")}
+            </UiButton>
+            <UiButton variant="primary" onClick={() => void handleExport()} disabled={isExporting}>
+              {isExporting ? (
+                <>
+                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                  {t("videoEdit.exporting")}
+                </>
+              ) : (
+                <>
+                  <Scissors className="h-4 w-4" />
+                  {t("videoEdit.export")}
+                </>
+              )}
+            </UiButton>
+          </>
+        }
+      >
+        <div className="space-y-3 outline-none">
+          <div className="overflow-hidden rounded-xl border border-border-dark bg-black">
+            {playbackSrc ? (
+              <video
+                ref={videoRef}
+                src={playbackSrc}
+                className="max-h-[min(240px,38vh)] w-full cursor-pointer"
+                draggable={false}
+                preload="metadata"
+                onClick={togglePlay}
+                onDragStart={(event) => event.preventDefault()}
+                onLoadedMetadata={handleLoadedMetadata}
+                onTimeUpdate={handleTimeUpdate}
+                onSeeked={handleTimeUpdate}
+                onPlay={() => setIsPlaying(true)}
+                onPause={() => setIsPlaying(false)}
+                onError={handleVideoError}
+              />
             ) : (
-              <>
-                <Scissors className="h-4 w-4" />
-                {t("videoEdit.export", "导出")}
-              </>
+              <div className="flex h-[160px] items-center justify-center text-xs text-text-muted">
+                {t("videoEdit.noSource")}
+              </div>
             )}
-          </UiButton>
-        </>
-      }
-    >
-      <div className="space-y-4">
-        {/* ── 画面预览 ────────────────────────────────────────────── */}
-        <div className="overflow-hidden rounded-xl border border-border-dark bg-black">
-          {playbackSrc ? (
-            <video
-              ref={videoRef}
-              src={playbackSrc}
-              className="max-h-[min(260px,40vh)] w-full"
-              controls
-              draggable={false}
-              preload="metadata"
-              onDragStart={(event) => event.preventDefault()}
-              onLoadedMetadata={handleLoadedMetadata}
-              onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-              onSeeked={(event) => setCurrentTime(event.currentTarget.currentTime)}
-              onError={handleVideoError}
-            />
-          ) : (
-            <div className="flex h-[180px] items-center justify-center text-xs text-text-muted">
-              {t("videoEdit.noSource")}
-            </div>
+          </div>
+          {playbackError && (
+            <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+              {playbackError}
+            </p>
           )}
-        </div>
-        {playbackError && (
-          <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-            {playbackError}
-          </p>
-        )}
 
-        {/* ── 剪辑时间轴 ──────────────────────────────────────────── */}
-        <div className="space-y-2">
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-text-muted">{t("videoEdit.trimSection")}</span>
             <span className="text-[11px] tabular-nums text-text-muted/80">
               {t("videoEdit.clipLength", {
-                duration: formatTimecode(clipLength),
-                total: formatTimecode(timelineDuration),
+                duration: formatTimecode(keptTicks, state.frameRate),
+                total: formatTimecode(durationTicks, state.frameRate),
               })}
+              {state.segments.length > 1 && ` · ${t("videoEdit.segmentCount", { count: state.segments.length })}`}
             </span>
           </div>
 
-          <div
-            ref={trackRef}
-            className="relative h-14 cursor-pointer touch-none select-none overflow-hidden rounded-lg border border-border-dark bg-bg-dark/60"
-            onPointerDown={handleTrackPointerDown}
-            onPointerMove={handleTrackPointerMove}
-            onPointerUp={endHandleDrag}
-            onPointerCancel={endHandleDrag}
-          >
-            {/* 选中区间 */}
-            <div
-              className="pointer-events-none absolute inset-y-0 bg-accent/25"
-              style={{ left: `${startRatio * 100}%`, width: `${Math.max(0, endRatio - startRatio) * 100}%` }}
-            />
-            {/* 被裁掉的两段压暗，一眼看出留了哪一截 */}
-            <div
-              className="pointer-events-none absolute inset-y-0 left-0 bg-black/45"
-              style={{ width: `${startRatio * 100}%` }}
-            />
-            <div
-              className="pointer-events-none absolute inset-y-0 right-0 bg-black/45"
-              style={{ width: `${Math.max(0, 1 - endRatio) * 100}%` }}
-            />
-            {/* 刻度 */}
-            {[0.25, 0.5, 0.75].map((ratio) => (
-              <div
-                key={ratio}
-                className="pointer-events-none absolute inset-y-0 w-px bg-white/10"
-                style={{ left: `${ratio * 100}%` }}
-              />
-            ))}
-            {/* 播放头 */}
-            <div
-              className="pointer-events-none absolute inset-y-0 w-px bg-white/80"
-              style={{ left: `${playheadRatio * 100}%` }}
-            />
-            {/* 起止手柄 */}
-            {(["start", "end"] as const).map((handle) => (
-              <div
-                key={handle}
-                role="slider"
-                tabIndex={0}
-                aria-label={handle === "start" ? t("videoEdit.trimStart") : t("videoEdit.trimEnd")}
-                aria-valuemin={0}
-                aria-valuemax={timelineDuration}
-                aria-valuenow={handle === "start" ? state.trim.start : state.trim.end}
-                className="absolute top-0 z-10 flex h-full w-4 -translate-x-1/2 cursor-ew-resize items-center justify-center"
-                style={{ left: `${(handle === "start" ? startRatio : endRatio) * 100}%` }}
-                onPointerDown={beginHandleDrag(handle)}
-              >
-                <span className="h-full w-1 rounded-full bg-accent shadow-[0_0_0_1px_rgba(255,255,255,0.35)]" />
-              </div>
-            ))}
-          </div>
-
-          <div className="flex items-center gap-3 text-[11px] text-text-muted">
-            <SecondsInput
-              value={state.trim.start}
-              label={t("videoEdit.trimStart")}
-              onCommit={(seconds) => updateState({ trim: moveTrimHandle("start", seconds, state.trim, duration) })}
-            />
-            <SecondsInput
-              value={state.trim.end}
-              label={t("videoEdit.trimEnd")}
-              onCommit={(seconds) => updateState({ trim: moveTrimHandle("end", seconds, state.trim, duration) })}
-            />
+          <div className="flex flex-wrap items-center gap-1">
             <button
               type="button"
-              className="rounded px-1.5 py-0.5 text-[11px] text-text-muted transition-colors hover:bg-white/10 hover:text-text-dark"
-              onClick={() => updateState({ trim: createFullTrimRange(duration) })}
+              className="flex h-7 items-center gap-1 rounded px-2 text-[11px] text-text-muted transition-colors hover:bg-white/10 hover:text-text-dark"
+              onClick={togglePlay}
+            >
+              {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+              {isPlaying ? t("videoEdit.pause") : t("videoEdit.play")}
+            </button>
+            <button
+              type="button"
+              className="flex h-7 w-7 items-center justify-center rounded text-text-muted transition-colors hover:bg-white/10 hover:text-text-dark"
+              title={t("videoEdit.stepBack")}
+              onClick={() => stepFrame(-1)}
+            >
+              <SkipBack className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              className="flex h-7 w-7 items-center justify-center rounded text-text-muted transition-colors hover:bg-white/10 hover:text-text-dark"
+              title={t("videoEdit.stepForward")}
+              onClick={() => stepFrame(1)}
+            >
+              <SkipForward className="h-3.5 w-3.5" />
+            </button>
+            <span className="mx-1 h-4 w-px bg-white/10" />
+            <button
+              type="button"
+              className="flex h-7 items-center gap-1 rounded px-2 text-[11px] text-text-muted transition-colors hover:bg-white/10 hover:text-text-dark"
+              title={t("videoEdit.splitHint")}
+              onClick={splitAtPlayhead}
+            >
+              <Scissors className="h-3.5 w-3.5" />
+              {t("videoEdit.split")}
+            </button>
+            <button
+              type="button"
+              className="flex h-7 items-center gap-1 rounded px-2 text-[11px] text-text-muted transition-colors hover:bg-white/10 hover:text-text-dark"
+              onClick={removeSelected}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              {t("videoEdit.deleteSelected")}
+            </button>
+            <button
+              type="button"
+              className="ml-auto flex h-7 items-center gap-1 rounded px-2 text-[11px] text-text-muted transition-colors hover:bg-white/10 hover:text-text-dark"
+              onClick={resetSegments}
             >
               {t("videoEdit.resetTrim")}
             </button>
           </div>
-        </div>
 
-        {/* ── 原声 ────────────────────────────────────────────────── */}
-        <div className="space-y-2 rounded-xl border border-border-dark p-3">
-          <div className="flex items-center justify-between">
-            <span className="flex items-center gap-1.5 text-xs font-medium text-text-muted">
-              {state.audioMode === "mute" ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
-              {t("videoEdit.audioSection")}
-            </span>
-            <div className="flex items-center gap-1">
-              {(["keep", "mute"] as const).map((mode) => (
-                <button
-                  key={mode}
-                  type="button"
-                  className={`rounded-full px-2.5 py-1 text-[11px] transition-colors ${
-                    state.audioMode === mode ||
-                    (mode === "keep" && (state.audioMode === "replace" || state.audioMode === "mix"))
-                      ? "bg-accent/25 text-text-dark"
-                      : "text-text-muted hover:bg-white/10"
-                  }`}
-                  onClick={() => updateState({ audioMode: mode === "keep" ? "keep" : "mute" })}
-                >
-                  {mode === "keep" ? t("videoEdit.audioModeKeep") : t("videoEdit.audioModeMute")}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className={`space-y-2 ${state.audioMode === "mute" ? "pointer-events-none opacity-40" : ""}`}>
-            <label className="flex items-center gap-3 text-[11px] text-text-muted">
-              <span className="w-16 shrink-0">{t("videoEdit.audioVolume")}</span>
-              <input
-                type="range"
-                min={0}
-                max={2}
-                step={VOLUME_STEP}
-                value={state.audioVolume}
-                onChange={(event) => updateState({ audioVolume: Number(event.target.value) })}
-                className="h-3 flex-1 accent-[var(--accent)]"
-              />
-              <span className="w-12 shrink-0 text-right tabular-nums">{Math.round(state.audioVolume * 100)}%</span>
-            </label>
-          </div>
-
-          {/* ── 附加音轨 ──────────────────────────────────────────── */}
-          <div className="space-y-2 border-t border-white/10 pt-2">
-            <div className="flex items-center justify-between gap-2">
-              <span className="flex items-center gap-1.5 text-xs font-medium text-text-muted">
-                <Film className="h-3.5 w-3.5" />
-                {t("videoEdit.trackSection")}
-              </span>
-              {hasTrack && (
-                <button
-                  type="button"
-                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-text-muted transition-colors hover:bg-white/10 hover:text-text-dark"
-                  onClick={clearTrack}
-                >
-                  <X className="h-3 w-3" />
-                  {t("videoEdit.clearTrack")}
-                </button>
-              )}
-            </div>
-
-            {hasTrack ? (
-              <p className="truncate rounded-md border border-border-dark bg-bg-dark/40 px-2.5 py-1.5 text-[11px] text-text-dark">
-                {state.trackPathLabel ?? state.trackPath}
-              </p>
-            ) : (
-              <div className="flex items-center gap-2">
-                <div className="min-w-0 flex-1">
-                  <UiSelect
-                    value=""
-                    className="h-8 text-[11px]"
-                    onChange={(event) => {
-                      const path = event.target.value;
-                      const candidate = trackCandidates.find((item) => item.path === path);
-                      if (candidate) applyTrack(candidate.path, candidate.label);
-                    }}
-                  >
-                    <option value="">
-                      {trackCandidates.length > 0 ? t("videoEdit.pickFromCanvas") : t("videoEdit.noCanvasTrack")}
-                    </option>
-                    {trackCandidates.map((candidate) => (
-                      <option key={candidate.id} value={candidate.path}>
-                        {candidate.kind === "video" ? `🎬 ${candidate.label}` : `🎵 ${candidate.label}`}
-                      </option>
-                    ))}
-                  </UiSelect>
-                </div>
-                <UiButton variant="muted" size="sm" onClick={() => void handlePickLocalTrack()}>
-                  {t("videoEdit.pickLocalTrack")}
-                </UiButton>
+          <div
+            ref={trackRef}
+            className="relative h-14 cursor-pointer touch-none select-none overflow-hidden rounded-lg border border-border-dark bg-black/55"
+            onPointerDown={handleTrackPointerDown}
+            onPointerMove={handleTrackPointerMove}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+          >
+            {/*
+              声音波形垫在最底层：段落块是半透明的，透上来就是「保留区间里的声音」。
+              拿不到波形时整层不渲染 —— 空白好过编出来的假峰值。
+            */}
+            {peaks && peaks.length > 0 && (
+              // 上下各留 7px：波形占满整条 56px 的轨道会顶到边框，看起来像把轨道填死了。
+              <div className="pointer-events-none absolute inset-x-0 inset-y-[7px] text-white/55">
+                <Waveform peaks={peaks} barCount={200} />
               </div>
             )}
 
-            {hasTrack && (
-              <>
-                <div className="flex items-center gap-1">
-                  {(["replace", "mix"] as const).map((mode) => (
-                    <button
-                      key={mode}
-                      type="button"
-                      className={`rounded-full px-2.5 py-1 text-[11px] transition-colors ${
-                        state.audioMode === mode ? "bg-accent/25 text-text-dark" : "text-text-muted hover:bg-white/10"
-                      }`}
-                      onClick={() => updateState({ audioMode: mode })}
-                    >
-                      {t(resolveAudioModeLabelKey(mode))}
-                    </button>
-                  ))}
-                </div>
-                <label className="flex items-center gap-3 text-[11px] text-text-muted">
-                  <span className="w-16 shrink-0">{t("videoEdit.trackVolume")}</span>
-                  <input
-                    type="range"
-                    min={0}
-                    max={2}
-                    step={VOLUME_STEP}
-                    value={state.trackVolume}
-                    onChange={(event) => updateState({ trackVolume: Number(event.target.value) })}
-                    className="h-3 flex-1 accent-[var(--accent)]"
+            {state.segments.map((segment) => {
+              const left = ticksToRatio(segment.startTicks, durationTicks) * 100;
+              const width = Math.max(
+                0,
+                (ticksToRatio(segment.endTicks, durationTicks) - ticksToRatio(segment.startTicks, durationTicks)) * 100,
+              );
+              const isSelected = segment.id === state.selectedId;
+              return (
+                <div
+                  key={segment.id}
+                  className={`absolute inset-y-0 border-x ${
+                    isSelected ? "border-accent/80 bg-accent/35" : "border-accent/40 bg-accent/20"
+                  }`}
+                  style={{ left: `${left}%`, width: `${width}%` }}
+                >
+                  {width > 9 && (
+                    <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[10px] tabular-nums text-text-dark/80">
+                      {formatTimecode(segment.endTicks - segment.startTicks, state.frameRate)}
+                    </span>
+                  )}
+                  <div
+                    className="absolute inset-y-0 left-0 w-2 cursor-ew-resize bg-accent/70"
+                    onPointerDown={beginEdgeDrag(segment.id, "start")}
                   />
-                  <span className="w-12 shrink-0 text-right tabular-nums">{Math.round(state.trackVolume * 100)}%</span>
-                </label>
-              </>
+                  <div
+                    className="absolute inset-y-0 right-0 w-2 cursor-ew-resize bg-accent/70"
+                    onPointerDown={beginEdgeDrag(segment.id, "end")}
+                  />
+                </div>
+              );
+            })}
+
+            {/*
+              被剪掉的区间压暗。波形是整段视频的，空隙里也有声 —— 不压的话那里没有段落块盖着，
+              反而比保留区更亮，视觉上会读成「这段才是要的」。
+            */}
+            {gaps.map((gap) => (
+              <div
+                key={`gap-${gap.startTicks}`}
+                className="pointer-events-none absolute inset-y-0 bg-black/60"
+                style={{
+                  left: `${ticksToRatio(gap.startTicks, durationTicks) * 100}%`,
+                  width: `${
+                    (ticksToRatio(gap.endTicks, durationTicks) - ticksToRatio(gap.startTicks, durationTicks)) * 100
+                  }%`,
+                }}
+              />
+            ))}
+
+            {/*
+              播放头。三层结构：
+              - 外层 z-20 压在所有片段之上，**任何位置按下去都拖播放头**（哪怕它正停在切点上）；
+              - 中间 14px 透明热区：可见的线只有 1px，靠它才抓得住；
+              - 顶部一个白描边胶囊当抓手，竖线盖在胶囊之上（NLE 的常见样式）。
+            */}
+            <div
+              className="absolute inset-y-0 z-20"
+              // 两端各留 5px：手柄居中于播放位置，贴到 0% / 100% 时会被轨道的 overflow-hidden
+              // 裁掉一半。夹住之后视觉上仍停得住，而拖动时的 seek 依然按真实鼠标位置算。
+              style={{ left: `clamp(5px, ${ticksToRatio(currentTicks, durationTicks) * 100}%, calc(100% - 5px))` }}
+              onPointerDown={beginPlayheadDrag}
+            >
+              <div className="absolute inset-y-0 left-1/2 w-3.5 -translate-x-1/2 cursor-ew-resize" />
+              <div className="pointer-events-none absolute left-1/2 top-1 h-4 w-2.5 -translate-x-1/2 rounded-[3px] border-[1.5px] border-white bg-[#141414] shadow-[0_0_0_1px_rgba(0,0,0,0.45)]" />
+              <div className="pointer-events-none absolute inset-y-0 left-1/2 z-10 w-px -translate-x-1/2 bg-white/85" />
+            </div>
+          </div>
+
+          <div className="relative h-4 select-none">
+            {buildTimelineTicks(durationTicks, state.frameRate, durationTicks >= TICKS_PER_SECOND * 60 ? 8 : 5).map(
+              (tick) => (
+                <span
+                  key={tick.ratio}
+                  className="absolute top-0 -translate-x-1/2 text-[10px] tabular-nums text-text-muted/70"
+                  style={{ left: `${tick.ratio * 100}%` }}
+                >
+                  {tick.label}
+                </span>
+              ),
             )}
           </div>
 
-          {/* ── 淡入淡出 ──────────────────────────────────────────── */}
-          <div className="space-y-2 border-t border-white/10 pt-2">
-            {(["fadeIn", "fadeOut"] as const).map((key) => (
-              <label key={key} className="flex items-center gap-3 text-[11px] text-text-muted">
-                <span className="w-16 shrink-0">
-                  {key === "fadeIn" ? t("videoEdit.fadeIn") : t("videoEdit.fadeOut")}
-                </span>
-                <input
-                  type="range"
-                  min={0}
-                  max={maxFade}
-                  step={FADE_STEP}
-                  value={key === "fadeIn" ? state.fadeIn : state.fadeOut}
-                  disabled={fadesDisabled}
-                  onChange={(event) => updateState({ [key]: Number(event.target.value) } as Partial<VideoEditState>)}
-                  className="h-3 flex-1 accent-[var(--accent)]"
-                />
-                <span className="w-12 shrink-0 text-right tabular-nums">
-                  {(key === "fadeIn" ? state.fadeIn : state.fadeOut).toFixed(1)}s
-                </span>
-              </label>
-            ))}
+          <div className="flex items-center gap-2 text-[11px] tabular-nums text-text-muted">
+            <span>{formatTimecode(currentTicks, state.frameRate)}</span>
+            <span className="h-3 w-px bg-white/10" />
+            <span>
+              {selectedSegment
+                ? t("videoEdit.selectionRange", {
+                    start: formatTimecode(selectedSegment.startTicks, state.frameRate),
+                    end: formatTimecode(selectedSegment.endTicks, state.frameRate),
+                  })
+                : t("videoEdit.selectHint")}
+            </span>
           </div>
-        </div>
 
-        <p className="flex items-start gap-1.5 text-[11px] leading-5 text-text-muted/80">
-          <Wand2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          {t("videoEdit.hint", { duration: formatTimecode(resolveOutputDuration(state)) })}
-        </p>
-      </div>
-    </UiModal>
+          {hint && (
+            <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-200">
+              {hint}
+            </p>
+          )}
+        </div>
+      </UiModal>
+
+      <AdvancedVideoEditor open={open && isAdvancedOpen} node={node} onClose={() => setIsAdvancedOpen(false)} />
+    </>
   );
 }

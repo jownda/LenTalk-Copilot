@@ -15,12 +15,14 @@
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 use image::codecs::jpeg::JpegEncoder;
 use image::ImageReader;
 use tauri::{AppHandle, Manager};
 
+use crate::commands::video_cfr::{hide_child_console, resolve_ffmpeg_path};
 use crate::database::app_data_dir;
 
 /// 缩略图缓存目录（位于 app data 下，落在这里才能被 `asset://` 协议读到：
@@ -205,6 +207,132 @@ pub async fn ensure_image_thumbnail(
     .map_err(|error| format!("缩略图任务执行失败: {error}"))??;
 
     Ok(result_path)
+}
+
+/// 视频胶片条缓存键：源路径 + 抽帧区间 + 帧数 + 源文件 size/mtime。
+///
+/// 区间用定点格式写，避免 `f64` 的默认 `Display` 把 0.1 打印成一串浮点尾巴、
+/// 让同一区间因精度抖动产生两个缓存文件。
+fn filmstrip_cache_key(
+    source: &Path,
+    start_sec: f64,
+    end_sec: f64,
+    frames: u32,
+    cell_width: u32,
+) -> String {
+    let metadata = std::fs::metadata(source).ok();
+    let length = metadata.as_ref().map(|item| item.len()).unwrap_or(0);
+    let modified = metadata
+        .and_then(|item| item.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let signature = format!(
+        "{}|{:.3}|{:.3}|{}|{}|{}|{}",
+        source.to_string_lossy(),
+        start_sec,
+        end_sec,
+        frames,
+        cell_width,
+        length,
+        modified
+    );
+    format!("{:x}", md5::compute(signature.as_bytes()))
+}
+
+/// 为视频抽一排缩略图（胶片条），供时间轴上的片段块铺满显示。
+///
+/// 做法：在 `[start, end]` 内均匀抽 `frame_count` 帧，`tile=Nx1` 拼成一张横排 JPEG，
+/// 前端用 `background-position` 切成 N 格、按片段宽度等分铺满。一次 IPC 拿一张图，
+/// 而不是 N 次 IPC 拿 N 张 —— 打开编辑器时缩略图可能同时要几十张，能省则省。
+///
+/// 失败（无音视频轨、ffmpeg 缺失、源不可读）一律返回 `None`，由前端退回纯色块，
+/// 缩略图是锦上添花，不该让编辑器因此报错或空白。
+#[tauri::command]
+pub async fn extract_video_filmstrip(
+    app: AppHandle,
+    video_path: String,
+    start_sec: f64,
+    end_sec: f64,
+    frame_count: u32,
+    // cell_aspect = 每格宽高比（宽 ÷ 高），由前端按「这格在轨道上实际占多宽」算出来。
+    cell_aspect: f64,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        extract_video_filmstrip_blocking(&app, &video_path, start_sec, end_sec, frame_count, cell_aspect)
+    })
+    .await
+    .map_err(|error| format!("生成视频胶片条失败: {error}"))?
+}
+
+fn extract_video_filmstrip_blocking(
+    app: &AppHandle,
+    video_path: &str,
+    start_sec: f64,
+    end_sec: f64,
+    frame_count: u32,
+    cell_aspect: f64,
+) -> Result<Option<String>, String> {
+    let Some(source) = normalize_source_path(video_path) else {
+        return Ok(None);
+    };
+    if !source.is_file() {
+        return Ok(None);
+    }
+    let frames = frame_count.clamp(1, 24);
+    let start = start_sec.max(0.0);
+    let end = end_sec.max(start + 0.05);
+    let duration = end - start;
+
+    // 每格高度固定 54，宽度按前端给的宽高比推。
+    // 🔴 为什么宽度必须**由前端决定**：片段块在时间轴上的宽度由「时长 × 缩放」决定，
+    // 和 16:9 没有关系。如果这里固定 96 宽（16:9），整张图的总宽就会和片段块宽度对不上，
+    // 图又是从左贴齐的 —— 于是「横坐标 → 时间」不再线性，「缩略图和播放位置不匹配」。
+    let cell_height = 54u32;
+    let cell_aspect = if cell_aspect.is_finite() { cell_aspect.clamp(0.16, 6.0) } else { 16.0 / 9.0 };
+    let cell_width = ((cell_height as f64 * cell_aspect).round() as u32).clamp(8, 480);
+
+    let directory = app_data_dir(app)?.join(THUMBNAIL_DIR);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("无法创建缩略图缓存目录: {error}"))?;
+    let target = directory.join(format!(
+        "{}.jpg",
+        filmstrip_cache_key(&source, start, end, frames, cell_width)
+    ));
+    if target.is_file() {
+        return Ok(Some(target.to_string_lossy().to_string()));
+    }
+
+    let Some(ffmpeg) = resolve_ffmpeg_path(app) else {
+        return Ok(None);
+    };
+
+    // `fps=N/时长` 均匀抽帧；scale+crop 把每格裁成 cell_width×54（不留黑边，按需裁边而不是拉伸）。
+    let fps = frames as f64 / duration;
+    let vf = format!(
+        "fps={fps:.6},scale={cell_width}:{cell_height}:force_original_aspect_ratio=increase,\
+crop={cell_width}:{cell_height},tile={frames}x1"
+    );
+    let mut command = Command::new(ffmpeg);
+    hide_child_console(&mut command);
+    let result = command
+        .args(["-v", "error", "-ss"])
+        .arg(format!("{start:.3}"))
+        .arg("-i")
+        .arg(&source)
+        .args(["-t"])
+        .arg(format!("{duration:.3}"))
+        .args(["-vf", &vf, "-frames:v", "1", "-q:v", "3", "-y"])
+        .arg(&target)
+        .output()
+        .map_err(|error| format!("无法启动 ffmpeg: {error}"))?;
+
+    if !result.status.success() || !target.is_file() {
+        let _ = std::fs::remove_file(&target);
+        return Ok(None);
+    }
+    prune_cache_if_needed(&directory);
+    Ok(Some(target.to_string_lossy().to_string()))
 }
 
 /// 启动时把缓存目录登记进 asset 协议作用域。

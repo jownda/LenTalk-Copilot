@@ -15,6 +15,7 @@ use commands::image;
 use commands::jimeng_cli;
 use commands::media_file;
 use commands::media_output;
+use commands::text_file;
 use commands::novel;
 use commands::pajuben;
 use commands::wan_cli;
@@ -28,6 +29,8 @@ use commands::thumbnail;
 use commands::update;
 use commands::usage_log;
 use commands::video_cfr;
+use commands::audio_waveform;
+use commands::video_edit_advanced;
 use commands::video_edit;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -316,11 +319,13 @@ pub fn run() {
             clipboard::read_clipboard_media,
             media_file::resolve_media_file_size,
             media_file::load_media_data_url,
+            audio_waveform::audio_waveform,
             video_cfr::normalize_video_cfr,
             video_cfr::prepare_video_playback,
             video_cfr::remove_video_playback_file,
             video_cfr::extract_video_frame,
             video_edit::render_video_edit,
+            video_edit_advanced::render_video_edit_advanced,
             video_edit::probe_video_audio,
             pajuben::pajuben_probe,
             pajuben::pajuben_run,
@@ -356,6 +361,9 @@ pub fn run() {
             asset_library::write_library_backup,
             asset_library::extract_video_thumbnail,
             thumbnail::ensure_image_thumbnail,
+            text_file::read_text_file,
+            text_file::write_text_file,
+            thumbnail::extract_video_filmstrip,
             cinematic_studio::project_save,
             cinematic_studio::project_load,
             cinematic_studio::prompt_save,

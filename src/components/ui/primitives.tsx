@@ -61,6 +61,8 @@ interface UiModalProps {
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
+  /** 标题栏右侧、关闭按钮之前的操作区（如「高级剪辑」入口）。 */
+  headerActions?: ReactNode;
   widthClassName?: string;
   containerClassName?: string;
 }
@@ -482,6 +484,7 @@ export function UiModal({
   onClose,
   children,
   footer,
+  headerActions,
   widthClassName = 'w-[460px]',
   containerClassName = '',
 }: UiModalProps) {
@@ -517,9 +520,12 @@ export function UiModal({
       >
         <div className="flex shrink-0 items-center justify-between border-b border-[rgba(255,255,255,0.1)] px-4 py-3">
           <h2 className="text-sm font-medium text-text-dark">{title}</h2>
-          <UiGhostIconButton className="h-8 w-8" onClick={onClose}>
-            <X className="h-4 w-4" />
-          </UiGhostIconButton>
+          <div className="flex items-center gap-1">
+            {headerActions}
+            <UiGhostIconButton className="h-8 w-8" onClick={onClose}>
+              <X className="h-4 w-4" />
+            </UiGhostIconButton>
+          </div>
         </div>
 
         {/* 内容区独立滚动：遮罩层顶部让出了 40px（UI_CONTENT_OVERLAY_INSET_CLASS

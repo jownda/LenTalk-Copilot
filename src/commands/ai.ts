@@ -43,6 +43,8 @@ import {
   type SunoMusicBodyInput,
 } from "@/commands/sunoMusic";
 import { createVideoIdempotencyKey, getVideoTaskFailureReason, resolveRjmVideoApiBaseUrl } from "@/commands/videoApi";
+import type { RunningHubWorkflowNodeValue } from "@/commands/runningHubWorkflow";
+import { extractRunningHubWorkflowJson } from "@/commands/runningHubWorkflow";
 import {
   buildRunningHubCharacterSwapNodeInfoList,
   isRunningHubBaseUrl,
@@ -2911,7 +2913,13 @@ function getRunningHubTaskFailureReason(value: unknown, depth = 0): string | nul
   return null;
 }
 
-async function uploadRunningHubMedia(
+/**
+ * 把本地素材换成 RunningHub 的公网地址。
+ *
+ * 工作流节点也要用它 —— 工作流里的 LoadImage / VHS_LoadVideo 只接受公网可下载地址，
+ * 本地 `asset://` 与 base64 一律读不到。导出而非在协议模块里重写一份。
+ */
+export async function uploadRunningHubMedia(
   source: string,
   baseUrl: string,
   headers: Record<string, string>,
@@ -3143,6 +3151,296 @@ export async function characterSwapVideo(request: CharacterSwapVideoRequest): Pr
   }
   throw new Error(
     `RunningHub ${workflowName} 任务仍在生成中（任务 ${taskId}，已等待 20 分钟），请稍后在画布查看结果，不要重复提交`,
+  );
+}
+
+/** 拉取工作流 JSON 的请求。 */
+export interface InspectRunningHubWorkflowRequest {
+  /** 完整模型 id（含 provider 前缀），只用于定位渠道与 Key。 */
+  model: string;
+  workflowId: string;
+  extra_params?: Record<string, unknown>;
+}
+
+/**
+ * 拉取一个 RunningHub 工作流的 **API 格式 JSON**。
+ *
+ * 用的是 `POST /api/openapi/getJsonApiFormat`（`{apiKey, workflowId}`）—— 这个接口
+ * **没写进公开文档**，但它存在且正是「填个工作流 ID 就能生成参数表单」的前提：
+ * 没有它，用户只能自己导出 JSON 再粘进来。
+ *
+ * 官方文档站里查不到任何 workflow 相关的 openapi 路径，`/openapi/v2/workflow/*`
+ * 也不存在 —— 所以这里的路径与请求体照实测形状写死，别按文档推断。
+ */
+export async function inspectRunningHubWorkflow(
+  request: InspectRunningHubWorkflowRequest,
+): Promise<{ workflowJson: string }> {
+  if (!isCustomModel(request.model)) {
+    throw new Error("工作流解析仅支持自定义平台(custom:*)模型");
+  }
+  const workflowId = request.workflowId.trim();
+  if (!/^\d{6,}$/.test(workflowId)) {
+    throw new Error("请填写有效的工作流 ID（/workflow/<数字>）");
+  }
+  const providerId = request.model.split("/")[0] ?? "";
+  const configuredBaseUrl =
+    typeof request.extra_params?.provider_base_url === "string" ? request.extra_params.provider_base_url : "";
+  const credentials = resolveRunningHubUpscaleCredentials(providerId, configuredBaseUrl);
+  if (!credentials) {
+    throw new Error("请在设置中配置 RunningHub 的 Base URL 与 API Key");
+  }
+  const { baseUrl, apiKey } = credentials;
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
+  const url = `${baseUrl}/api/openapi/getJsonApiFormat`;
+  const response = await requestProviderJson(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ apiKey, workflowId }),
+  });
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`拉取工作流失败: ${buildHttpErrorSummary(response.status, raw, url)}`);
+  }
+  let payload: unknown;
+  try {
+    payload = raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new Error("拉取工作流失败：平台返回了非 JSON");
+  }
+  const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
+  const code = Number(record?.code);
+  if (Number.isFinite(code) && code !== 0) {
+    const reason =
+      typeof record?.msg === "string" ? record.msg : typeof record?.message === "string" ? record.message : describeVideoResponse(payload);
+    throw new Error(`拉取工作流失败（code ${code}）: ${reason}`);
+  }
+  return { workflowJson: extractRunningHubWorkflowJson(payload) };
+}
+
+/**
+ * RunningHub 工作流任务的提交请求。
+ *
+ * 与两条既有 RunningHub 通道的区别：
+ *   - 标准端点 → `POST /openapi/v2/{endpoint}`，后端 `runninghub.rs` 认识；
+ *   - AI 应用   → `POST /openapi/v2/run/ai-app/{webappId}`，参数按节点粒度；
+ *   - **工作流** → `POST /task/openapi/create`，参数同样是节点粒度，但走的是**老网关**
+ *     (`/task/openapi/*`，apiKey 放在 body 里)，查询要两步：先 status 再 outputs。
+ */
+export interface RunRunningHubWorkflowRequest {
+  /** 完整模型 id（含 provider 前缀），如 custom:<providerId>/runninghub-workflow */
+  model: string;
+  /** 工作流模板 ID（就是 `/workflow/<id>` 里那串数字）。 */
+  workflowId: string;
+  /** 由 `buildRunningHubWorkflowNodeInfoList` 组装；带 `mediaKind` 的项会先换成公网 URL。 */
+  nodeInfoList: RunningHubWorkflowNodeValue[];
+  /** 期望的产物类型：一次返回多个文件时按它优先挑。 */
+  outputKind?: "image" | "video" | "audio";
+  extra_params?: Record<string, unknown>;
+}
+
+/** 产物扩展名判据（`fileType` 有时是 `png` 有时是 `.png`，两边都归一化成带点再比）。 */
+const RUNNINGHUB_OUTPUT_EXTENSIONS: Record<"image" | "video" | "audio", RegExp> = {
+  image: /\.(?:png|jpe?g|webp|gif|bmp|tiff?)$/i,
+  video: /\.(?:mp4|webm|mov|mkv|m4v|avi)$/i,
+  audio: /\.(?:mp3|wav|flac|m4a|ogg|aac|opus)$/i,
+};
+
+/** 递归收集产物条目（`/task/openapi/outputs` 返回 `{data:[{fileUrl,fileType,…}]}`）。 */
+function collectRunningHubOutputFiles(value: unknown, depth = 0): Array<{ url: string; fileType: string }> {
+  if (depth > 6 || value == null) return [];
+  if (Array.isArray(value)) return value.flatMap((item) => collectRunningHubOutputFiles(item, depth + 1));
+  if (typeof value !== "object") return [];
+  const record = value as Record<string, unknown>;
+  const url =
+    typeof record.fileUrl === "string"
+      ? record.fileUrl.trim()
+      : typeof record.file_url === "string"
+        ? record.file_url.trim()
+        : "";
+  if (/^https?:\/\//i.test(url)) {
+    const rawType =
+      typeof record.fileType === "string"
+        ? record.fileType
+        : typeof record.file_type === "string"
+          ? record.file_type
+          : "";
+    return [{ url, fileType: rawType.trim().toLowerCase() }];
+  }
+  return Object.values(record).flatMap((item) => collectRunningHubOutputFiles(item, depth + 1));
+}
+
+/** 按期望类型挑产物；挑不到就取第一个（工作流可能同时吐预览图和成片）。 */
+function pickRunningHubOutputFile(
+  files: Array<{ url: string; fileType: string }>,
+  kind?: "image" | "video" | "audio",
+): string | null {
+  if (!files.length) return null;
+  if (!kind) return files[0]!.url;
+  const pattern = RUNNINGHUB_OUTPUT_EXTENSIONS[kind];
+  const matches = (file: { url: string; fileType: string }) =>
+    pattern.test(file.url) || (file.fileType ? pattern.test(`.${file.fileType}`) : false);
+  return (files.find(matches) ?? files[0]!).url;
+}
+
+/**
+ * 读任务状态。
+ *
+ * 老网关的 status 接口把状态放在 **`data` 字符串**里（`{code:0, data:"SUCCESS"}`），
+ * 而共用的 `getVideoTaskStatus` 只梳理对象字段，够不着这种形态 —— 所以单独实现。
+ */
+function readRunningHubWorkflowStatus(payload: unknown, depth = 0): string {
+  if (depth > 6 || payload == null) return "";
+  if (typeof payload === "string") {
+    const text = payload.trim().toUpperCase();
+    return /^[A-Z][A-Z_]{2,}$/.test(text) ? text : "";
+  }
+  if (typeof payload !== "object") return "";
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const status = readRunningHubWorkflowStatus(item, depth + 1);
+      if (status) return status;
+    }
+    return "";
+  }
+  const record = payload as Record<string, unknown>;
+  for (const key of ["status", "state", "taskStatus", "task_status", "data", "result", "task"]) {
+    const status = readRunningHubWorkflowStatus(record[key], depth + 1);
+    if (status) return status;
+  }
+  return "";
+}
+
+/**
+ * 运行一个 RunningHub 工作流，返回**第一个产物**的地址。
+ *
+ * 链路: 素材换公网 URL → `POST /task/openapi/create` → `POST /task/openapi/status` 轮询
+ *      → `POST /task/openapi/outputs` 取文件。
+ *
+ * 注意老网关把 `apiKey` 放在 **body** 里（不是 Bearer），这里两者都带：文档要求 body，
+ * 而统一的请求头带上 Authorization 不会让老网关拒绝。
+ */
+export async function runRunningHubWorkflow(request: RunRunningHubWorkflowRequest): Promise<string> {
+  if (!isCustomModel(request.model)) {
+    throw new Error("RunningHub 工作流仅支持自定义平台(custom:*)模型");
+  }
+  const workflowName = "RunningHub 工作流";
+  const workflowId = request.workflowId.trim();
+  if (!/^\d{6,}$/.test(workflowId)) {
+    throw new Error("请填写有效的工作流 ID（就是 /workflow/<数字> 里那串数字）");
+  }
+  const providerId = request.model.split("/")[0] ?? "";
+  const configuredBaseUrl =
+    typeof request.extra_params?.provider_base_url === "string" ? request.extra_params.provider_base_url : "";
+  const credentials = resolveRunningHubUpscaleCredentials(providerId, configuredBaseUrl);
+  if (!credentials) {
+    throw new Error("请在设置中配置 RunningHub 的 Base URL 与 API Key（工作流由 RunningHub 执行）");
+  }
+  const { baseUrl, apiKey } = credentials;
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
+
+  // 素材必须换成公网地址：工作流里的 LoadImage / VHS_LoadVideo 只接受可下载的 URL，
+  // 本地 asset:// 与 base64 一律读不到，而且失败发生在平台侧，报错很难看懂。
+  const mediaItems = request.nodeInfoList.filter((item) => item.mediaKind);
+  const resolvedMedia = new Map<string, string>();
+  await Promise.all(
+    mediaItems.map(async (item) => {
+      const source = item.fieldValue?.trim();
+      if (!source) return;
+      // 已经是公网地址就别再上传一遍（同一张图重复传会多花上传时间和流量）。
+      if (/^https?:\/\//i.test(source)) {
+        resolvedMedia.set(item.nodeId + item.fieldName, source);
+        return;
+      }
+      const url = await uploadRunningHubMedia(source, baseUrl, headers, `素材 ${item.fieldName}`);
+      resolvedMedia.set(item.nodeId + item.fieldName, url);
+    }),
+  );
+
+  const nodeInfoList = request.nodeInfoList
+    .filter((item) => item.fieldValue !== "")
+    .map((item) => ({
+      nodeId: item.nodeId,
+      fieldName: item.fieldName,
+      fieldValue: resolvedMedia.get(item.nodeId + item.fieldName) ?? item.fieldValue,
+    }));
+
+  const createUrl = `${baseUrl}/task/openapi/create`;
+  const response = await requestProviderJson(createUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ apiKey, workflowId, nodeInfoList }),
+  });
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`${workflowName} 提交失败: ${buildHttpErrorSummary(response.status, raw, createUrl)}`);
+  }
+  let created: unknown;
+  try {
+    created = raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new Error(`${workflowName} 提交返回了非 JSON`);
+  }
+  const createdRecord = created && typeof created === "object" ? (created as Record<string, unknown>) : null;
+  const createdCode = Number(createdRecord?.code);
+  if (Number.isFinite(createdCode) && createdCode !== 0) {
+    const reason = getRunningHubTaskFailureReason(created) ?? describeVideoResponse(created);
+    throw new Error(`${workflowName} 提交失败（code ${createdCode}）: ${reason}`);
+  }
+  const taskId = findRunningHubTaskId(created);
+  if (!taskId) throw new Error(`${workflowName} 未返回任务 ID: ${describeVideoResponse(created)}`);
+
+  const statusUrl = `${baseUrl}/task/openapi/status`;
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const statusResponse = await requestProviderJson(statusUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ apiKey, taskId }),
+    });
+    const statusRaw = await statusResponse.text();
+    if (!statusResponse.ok) {
+      throw new Error(`${workflowName} 查询失败: ${buildHttpErrorSummary(statusResponse.status, statusRaw, statusUrl)}`);
+    }
+    let statusPayload: unknown;
+    try {
+      statusPayload = statusRaw ? JSON.parse(statusRaw) : {};
+    } catch {
+      continue;
+    }
+    const status = readRunningHubWorkflowStatus(statusPayload);
+    if (["FAILED", "FAILURE", "ERROR", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) {
+      const reason = getRunningHubTaskFailureReason(statusPayload);
+      throw new Error(
+        `${workflowName} 生成失败（任务 ${taskId}，状态 ${status}）: ${reason ?? describeVideoResponse(statusPayload)}`,
+      );
+    }
+    if (status !== "SUCCESS" && status !== "SUCCEEDED" && status !== "COMPLETED") continue;
+
+    const outputsUrl = `${baseUrl}/task/openapi/outputs`;
+    const outputsResponse = await requestProviderJson(outputsUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ apiKey, taskId }),
+    });
+    const outputsRaw = await outputsResponse.text();
+    if (!outputsResponse.ok) {
+      throw new Error(
+        `${workflowName} 取回产物失败: ${buildHttpErrorSummary(outputsResponse.status, outputsRaw, outputsUrl)}`,
+      );
+    }
+    let outputsPayload: unknown;
+    try {
+      outputsPayload = outputsRaw ? JSON.parse(outputsRaw) : {};
+    } catch {
+      throw new Error(`${workflowName} 产物返回了非 JSON`);
+    }
+    const files = collectRunningHubOutputFiles(outputsPayload);
+    const output = pickRunningHubOutputFile(files, request.outputKind);
+    if (output) return output;
+    throw new Error(`${workflowName} 任务成功但没有拿到文件地址: ${describeVideoResponse(outputsPayload)}`);
+  }
+  throw new Error(
+    `${workflowName} 任务仍在生成中（任务 ${taskId}，已等待 20 分钟），请稍后在画布查看结果，不要重复提交`,
   );
 }
 

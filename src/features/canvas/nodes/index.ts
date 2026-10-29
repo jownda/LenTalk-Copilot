@@ -3,6 +3,7 @@ import type { NodeTypes } from '@xyflow/react';
 import { AudioGenNode } from './AudioGenNode';
 import { AudioNode } from './AudioNode';
 import { MotionControlNode } from './MotionControlNode';
+import { RunningHubWorkflowNode } from './RunningHubWorkflowNode';
 import { CinematicStudioNode } from './CinematicStudioNode';
 import { DirectorDeskNode } from './DirectorDeskNode';
 import { GroupNode } from './GroupNode';
@@ -21,6 +22,7 @@ export const nodeTypes: NodeTypes = {
   audioGenNode: AudioGenNode,
   audioNode: AudioNode,
   motionControlNode: MotionControlNode,
+  runningHubWorkflowNode: RunningHubWorkflowNode,
   cinematicStudioNode: CinematicStudioNode,
   directorDeskNode: DirectorDeskNode,
   exportImageNode: ImageNode,
@@ -39,6 +41,7 @@ export const nodeTypes: NodeTypes = {
 export {
   AudioNode,
   MotionControlNode,
+  RunningHubWorkflowNode,
   CinematicStudioNode,
   DirectorDeskNode,
   GroupNode,

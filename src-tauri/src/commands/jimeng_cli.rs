@@ -3283,26 +3283,56 @@ fn parse_canvas_payload(output: &str) -> Result<serde_json::Value, String> {
     })?;
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|_| "即梦画布 CLI 返回的 JSON 无法解析".to_string())?;
-    // 失败时 `ok=false`, 原因在 error.message —— 原样带出去比「解析失败」有用。
+    // 失败时 `ok=false`：正文在 error.message，但**真正能救人的信息在 error.reason /
+    // validation.detail** 里（例如 `oauth_scope_insufficient` 会告诉我们「重新登录」）。
+    // 只带 message 的话用户看到的永远是 "Access was denied"，完全不知道下一步做什么。
     if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
-        let message = value
-            .pointer("/error/message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("即梦画布 CLI 返回失败");
-        let code = value
-            .pointer("/error/code")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        return Err(if code.is_empty() {
-            message.to_string()
-        } else {
-            format!("{message}（{code}）")
-        });
+        return Err(describe_canvas_failure(&value));
     }
     Ok(value
         .get("data")
         .cloned()
         .unwrap_or(serde_json::Value::Null))
+}
+
+/// 把画布 CLI 的失败信封翻成一句**能照着做**的中文。
+///
+/// CLI 的错误结构比 `message` 丰富得多：
+/// ```json
+/// {"error":{"code":"service.10000","message":"Access was denied for this operation.",
+///           "reason":"oauth_scope_insufficient","requiredAction":"login",
+///           "validation":{"detail":"... Run auth login --force ..."}}}
+/// ```
+/// `service.10000` + `Access was denied` 本身没有信息量 —— 真正的原因是
+/// **本地登录凭证的授权范围不够**（CLI 升级后要求的 scope 变多了，旧 token 没到期但不含新权限）。
+/// 这种情况光看报错会以为是模型/参数/配额问题，实测排查花了很久，所以在这里直接给出解法。
+fn describe_canvas_failure(value: &serde_json::Value) -> String {
+    let message = value
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("即梦画布 CLI 返回失败");
+    let code = value
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let reason = value
+        .pointer("/error/reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let base = if code.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}（{code}）")
+    };
+    match reason {
+        "oauth_scope_insufficient" => format!(
+            "{base}：即梦画布 CLI 的登录凭证权限不足（不是模型、参数或积分问题）。请到「设置 → 即梦画布 CLI」点【切换账号】重新授权；或在终端执行 `dreamina-canvas auth login --force`。若重新授权后仍报同一错误，说明 CLI 版本太旧，用官方脚本更新后再授权"
+        ),
+        // 其它已知原因点名，避免它们也被埋在 "Access was denied" 后面。
+        "credit_insufficient" => format!("{base}：即梦积分不足"),
+        "" => base,
+        other => format!("{base}（reason: {other}）"),
+    }
 }
 
 /// 从素材内容派生**确定性**的 `--resource-id` 幂等键。
@@ -3364,6 +3394,71 @@ fn canvas_cli_failure_reason(output: &str) -> String {
         // 退出码非 0 但信封是 ok=true —— 结构和判定不一致, 这时原始摘要信息更多。
         Ok(_) => output_summary(output),
     }
+}
+
+/// 产物下载的重试策略。
+///
+/// 为什么必须重试: 走到这一步**积分已经扣了、视频已经在服务端生成好了**, 下载只是一次
+/// 普通的 HTTP 传输。CDN 偶发不可达(用户实际遇到过 `cli.download_transport_failed`)
+/// 就把整次生成判为失败、还要用户手打命令取回 —— 代价完全不对等。
+/// CLI 自身没有重试开关(`resource download --help` 只有 `-o` / `--project-id`), 只能在这里补。
+///
+/// 单次上限 10 分钟、三次合计 30 分钟: **总量与原来一次 30 分钟相同**, 但瞬时错误(连接被拒、
+/// DNS 抖动、代理掉线)会立刻重试而不是直接判死。
+const CLI_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const CLI_DOWNLOAD_ATTEMPTS: usize = 3;
+/// 第 1、2 次失败后的等待秒数(长度 = ATTEMPTS - 1)。
+const CLI_DOWNLOAD_RETRY_DELAYS: [u64; CLI_DOWNLOAD_ATTEMPTS - 1] = [2, 6];
+
+/// 下载产物资源到本地, 失败自动重试。
+fn download_canvas_resource(
+    executable: &str,
+    project_id: &str,
+    resource_id: &str,
+    target: &Path,
+) -> Result<(), String> {
+    let arguments = [
+        "resource".to_string(),
+        "download".to_string(),
+        resource_id.to_string(),
+        format!("--project-id={project_id}"),
+        "-o".to_string(),
+        target.to_string_lossy().to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+
+    let mut last_error = String::new();
+    // 首次尝试前也清一次: 目标路径若残留同名文件(上次运行留下的), 会让「退出码 0 + 文件存在」
+    // 的判定把一个旧文件当成这次刚下载成功的产物。
+    let _ = fs::remove_file(target);
+    for attempt in 0..CLI_DOWNLOAD_ATTEMPTS {
+        if attempt > 0 {
+            // 半截文件留着会让下一次写入进入未知状态, 先删干净。
+            let _ = fs::remove_file(target);
+            std::thread::sleep(Duration::from_secs(CLI_DOWNLOAD_RETRY_DELAYS[attempt - 1]));
+        }
+        match run_canvas_cli_with_timeout(executable, &arguments, CLI_DOWNLOAD_TIMEOUT) {
+            // CLI 说成功还要确认真的落盘了 —— 退出码 0 但文件不存在这种情况必须当失败处理,
+            // 否则调用方拿到一个指向空文件的路径。
+            Ok(_) if target.is_file() => {
+                if attempt > 0 {
+                    eprintln!("即梦产物下载第 {} 次尝试成功（{resource_id}）", attempt + 1);
+                }
+                return Ok(());
+            }
+            Ok(_) => {
+                last_error = format!("CLI 报告成功但本地没有落盘文件（期望 {}）", target.display())
+            }
+            Err(error) => last_error = error,
+        }
+        eprintln!(
+            "即梦产物下载第 {}/{} 次失败（{resource_id}）: {last_error}",
+            attempt + 1,
+            CLI_DOWNLOAD_ATTEMPTS
+        );
+    }
+    Err(format!("重试 {CLI_DOWNLOAD_ATTEMPTS} 次仍失败: {last_error}"))
 }
 
 /// 查一个素材在服务端的稳定状态(`resource get`), 并把 `running` 等到落定。
@@ -3794,6 +3889,21 @@ pub async fn jimeng_canvas_cli_logout(
 /// 即梦画布 CLI 的返回把 nodeId / resourceId 埋在 `data.node.nodeId`、
 /// `data.nodes[0].node.resources[0].resourceId` 这类深浅不一的位置, 而且不同小版本还会挪。
 /// 与其挨个写路径(错一个就白等一次生成), 不如按字段名找。
+/// 把即梦画布节点的数字错误码翻译成人能读的一句话。
+///
+/// ⚠️ 即梦**没有公开的错误码表**，下面的对照只来自实测定点，别当成全量字典：
+///   - `20110` —— 2026-10-28 一次 4 张参考图（其中两张是真人肖像）的视频生成失败，
+///     同一节点在平台网页端显示「审核失败，参考图使用了公众人物形象」，`node show`
+///     只返回 `{status:"failed", errorCode:20110}`。据此推断为**内容审核未通过**。
+///
+/// 未知码原样输出：编一个假原因比不给解释更糟。
+fn describe_canvas_error_code(code: i64) -> String {
+    match code {
+        20110 => "错误码 20110：内容审核未通过。参考图含真人肖像 / 公众人物 / 品牌标识时最常见 —— 换成非写实素材（手绘、素描）或去掉清晰人脸后再试".to_string(),
+        _ => format!("错误码 {code}（CLI 未提供文字原因，可在即梦画布网页端查看该节点详情）"),
+    }
+}
+
 fn find_json_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
     match value {
         serde_json::Value::Object(map) => {
@@ -3980,26 +4090,14 @@ fn generate_canvas_video_blocking(
 
         let download_dir = resolve_download_dir(app, &run_id)?;
         let target = download_dir.join(format!("canvas-{run_id}.mp4"));
-        let download_output = run_canvas_cli_with_timeout(
-            &executable,
-            &[
-                "resource".to_string(),
-                "download".to_string(),
-                resource_id.clone(),
-                format!("--project-id={project_id}"),
-                "-o".to_string(),
-                target.to_string_lossy().to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-            ],
-            CLI_TASK_TIMEOUT,
-        );
-        if let Err(error) = download_output {
-            return Err(format!(
-                "视频已生成但下载失败（resourceId={resource_id}）: {error}。\
-                 可手动取回: dreamina-canvas resource download {resource_id} --project-id={project_id} -o <路径>"
-            ));
-        }
+        download_canvas_resource(&executable, &project_id, &resource_id, &target).map_err(
+            |error| {
+                format!(
+                    "视频已生成但下载失败（resourceId={resource_id}）: {error}。\
+                     可手动取回: dreamina-canvas resource download {resource_id} --project-id={project_id} -o <路径>"
+                )
+            },
+        )?;
         if !target.is_file() {
             return Err(format!(
                 "视频已生成但本地没有落盘文件（resourceId={resource_id}, 期望 {})",
@@ -4113,25 +4211,14 @@ fn generate_canvas_image_blocking(
 
         let download_dir = resolve_download_dir(app, &run_id)?;
         let target = download_dir.join(format!("canvas-{run_id}.png"));
-        if let Err(error) = run_canvas_cli_with_timeout(
-            &executable,
-            &[
-                "resource".to_string(),
-                "download".to_string(),
-                resource_id.clone(),
-                format!("--project-id={project_id}"),
-                "-o".to_string(),
-                target.to_string_lossy().to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-            ],
-            CLI_TASK_TIMEOUT,
-        ) {
-            return Err(format!(
-                "图片已生成但下载失败（resourceId={resource_id}）: {error}。\
-                 可手动取回: dreamina-canvas resource download {resource_id} --project-id={project_id} -o <路径>"
-            ));
-        }
+        download_canvas_resource(&executable, &project_id, &resource_id, &target).map_err(
+            |error| {
+                format!(
+                    "图片已生成但下载失败（resourceId={resource_id}）: {error}。\
+                     可手动取回: dreamina-canvas resource download {resource_id} --project-id={project_id} -o <路径>"
+                )
+            },
+        )?;
         if !target.is_file() {
             return Err(format!(
                 "图片已生成但本地没有落盘文件（resourceId={resource_id}, 期望 {}）",
@@ -4248,25 +4335,14 @@ fn generate_canvas_audio_blocking(
         // 音频服务端可能回 mp3 也可能回 wav, 先落成临时名再按实际扩展名修正。
         let download_dir = resolve_download_dir(app, &run_id)?;
         let target = download_dir.join(format!("canvas-{run_id}.mp3"));
-        if let Err(error) = run_canvas_cli_with_timeout(
-            &executable,
-            &[
-                "resource".to_string(),
-                "download".to_string(),
-                resource_id.clone(),
-                format!("--project-id={project_id}"),
-                "-o".to_string(),
-                target.to_string_lossy().to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-            ],
-            CLI_TASK_TIMEOUT,
-        ) {
-            return Err(format!(
-                "音频已生成但下载失败（resourceId={resource_id}）: {error}。\
-                 可手动取回: dreamina-canvas resource download {resource_id} --project-id={project_id} -o <路径>"
-            ));
-        }
+        download_canvas_resource(&executable, &project_id, &resource_id, &target).map_err(
+            |error| {
+                format!(
+                    "音频已生成但下载失败（resourceId={resource_id}）: {error}。\
+                     可手动取回: dreamina-canvas resource download {resource_id} --project-id={project_id} -o <路径>"
+                )
+            },
+        )?;
         if !target.is_file() {
             return Err(format!(
                 "音频已生成但本地没有落盘文件（resourceId={resource_id}, 期望 {}）",
@@ -4418,10 +4494,19 @@ fn create_quote_confirm_run(
             "success" => break,
             "failed" | "canceled" | "cancelled" => {
                 // 失败原因通常在节点的 error 字段里, 原样带回比只说「失败」有用。
+                //
+                // 但**内容审核失败是个例外**: CLI 的 `node show` 只给 `errorCode`,
+                // 一个字的文本都不给（2026-10-28 实测:
+                // `resources[0] = {status:"failed", errorCode:20110}`，全 JSON 里没有
+                // message / errorMessage / reason / audit 任何一项）。这种情况下再说
+                // 「未返回失败原因」等于什么都没说 —— 把码带出来, 用户至少能去平台网页对号。
                 let detail = find_json_string_field(&data, "errorMessage")
                     .or_else(|| find_json_string_field(&data, "error"))
                     .or_else(|| find_json_string_field(&data, "message"))
-                    .unwrap_or_else(|| "未返回失败原因".to_string());
+                    .unwrap_or_else(|| match find_json_number_field(&data, &["errorCode"]) {
+                        Some(code) => describe_canvas_error_code(code as i64),
+                        None => "未返回失败原因".to_string(),
+                    });
                 return Err(format!(
                     "即梦画布 CLI 节点 {node_id} 生成失败: {detail}\
                      （可在即梦画布网页端查看该节点, 或 dreamina-canvas node show --node-id={node_id}）"
@@ -5630,4 +5715,40 @@ mod image_tests {
         );
         assert!(timeout.contains("代理"), "超时应提示代理问题: {timeout}");
     }
+    /// 真机抓到的原始错误（即梦画布 CLI 1.1.1，`service.10000`）。
+    const OAUTH_SCOPE_ERROR: &str = r#"{"schemaVersion":"1","ok":false,"error":{"code":"service.10000","serviceCode":10000,"class":"auth_required","message":"Access was denied for this operation.","reason":"oauth_scope_insufficient","retryable":false,"requiredAction":"login","requestId":"202610291410359A6EE970D5FD614C611E","validation":{"reasonCode":"oauth_scope_insufficient","fieldPath":"authorization","detail":"Insufficient permissions."}}}"#;
+
+    #[test]
+    fn oauth_scope_failure_explains_how_to_fix_it() {
+        let value: serde_json::Value = serde_json::from_str(OAUTH_SCOPE_ERROR).expect("valid json");
+        let message = describe_canvas_failure(&value);
+        // 原始 code 要保留，方便用户搜索/反馈。
+        assert!(message.contains("service.10000"), "{message}");
+        // 必须点名真实原因，而不是只说 "Access was denied"。
+        assert!(message.contains("权限不足"), "{message}");
+        // 必须给出可执行的两条路（界面按钮 / 终端命令）。
+        assert!(message.contains("切换账号"), "{message}");
+        assert!(message.contains("auth login --force"), "{message}");
+    }
+
+    #[test]
+    fn unknown_reason_is_still_surfaced() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"ok":false,"error":{"code":"service.5","message":"already submitted","reason":"idempotent_reuse"}}"#,
+        )
+        .expect("valid json");
+        let message = describe_canvas_failure(&value);
+        assert!(message.contains("already submitted"), "{message}");
+        assert!(message.contains("idempotent_reuse"), "未知原因也要带出来: {message}");
+    }
+
+    #[test]
+    fn failure_without_reason_falls_back_to_message_and_code() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"ok":false,"error":{"code":"cli.invalid_flag","message":"Invalid flag"}}"#,
+        )
+        .expect("valid json");
+        assert_eq!(describe_canvas_failure(&value), "Invalid flag（cli.invalid_flag）");
+    }
+
 }

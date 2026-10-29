@@ -89,6 +89,34 @@ export interface CharacterSwapVideoPayload {
   steps?: number;
   extraParams?: Record<string, unknown>;
 }
+
+/**
+ * RunningHub 工作流提交。
+ *
+ * `nodeInfoList` 由 `@/commands/runningHubWorkflow` 的解析器组装好 —— 网关不关心
+ * 工作流里有什么节点，只负责把带 `mediaKind` 的那些换成公网地址再发出去。
+ */
+export interface RunRunningHubWorkflowPayload {
+  model: string;
+  /** `/workflow/<id>` 里那串数字。 */
+  workflowId: string;
+  nodeInfoList: Array<{
+    nodeId: string;
+    fieldName: string;
+    fieldValue: string;
+    mediaKind?: 'image' | 'video' | 'audio';
+  }>;
+  /** 期望产物类型：一次返回多个文件时按它优先挑。 */
+  outputKind?: 'image' | 'video' | 'audio';
+  extraParams?: Record<string, unknown>;
+}
+
+/** 拉取工作流 JSON：只需要渠道 + 工作流 ID。 */
+export interface InspectRunningHubWorkflowPayload {
+  model: string;
+  workflowId: string;
+  extraParams?: Record<string, unknown>;
+}
 export type GenerateAudioKind = "speech" | "sound-effects" | "music";
 
 /**
@@ -289,6 +317,10 @@ export interface AiGateway {
   upscaleVideo: (payload: UpscaleVideoPayload) => Promise<string>;
   /** 角色替换：角色图 + 原视频，由 RunningHub AI 应用执行换人。 */
   characterSwapVideo: (payload: CharacterSwapVideoPayload) => Promise<string>;
+  /** RunningHub 工作流：按 nodeInfoList 提交后端已发布的 ComfyUI 工作流。 */
+  runRunningHubWorkflow: (payload: RunRunningHubWorkflowPayload) => Promise<string>;
+  /** 拉取工作流的 API 格式 JSON（填 ID 自动生成参数表单用）。 */
+  inspectRunningHubWorkflow: (payload: InspectRunningHubWorkflowPayload) => Promise<string>;
   generateAudio: (payload: GenerateAudioPayload) => Promise<string>;
   /** 创建音色资产(音色克隆 / 音色设计)。产出 voice_id, 不是音频。 */
   generateAudioAsset: (payload: GenerateAudioAssetPayload) => Promise<GenerateAudioAssetResultPayload>;

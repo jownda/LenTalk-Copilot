@@ -17,10 +17,13 @@ describe('likeai520 视频档位表（按渠道实测能力）', () => {
     expect(isLikeaiBaseUrl(undefined)).toBe(false);
   });
 
-  it('2.5 与 2.0-mini 只开放 16:9（实测都不支持 9:16 / adaptive）', () => {
-    expect(resolveLikeaiVideoOptions('doubao-seedance-2.5').aspectRatios).toEqual(['16:9']);
+  it('2.5 已放开全画幅（2026-10-28 平台更新），mini 仍只有 16:9', () => {
+    // 用户 10-28 反馈「平台说更新了 2.5 的 9:16」→ 实测确实放开，而且不只 9:16。
+    const seedance25 = resolveLikeaiVideoOptions('doubao-seedance-2.5');
+    expect(seedance25.aspectRatios).toEqual(['16:9', '9:16', '1:1', '4:3', '3:4', '21:9', 'adaptive']);
+    expect(likeaiModelSupportsPortrait('doubao-seedance-2.5')).toBe(true);
+    // mini 没变：9:16 / 1:1 / 21:9 / adaptive 在平台侧仍报 supported ratio is required。
     expect(resolveLikeaiVideoOptions('doubao-seedance-2.0-mini').aspectRatios).toEqual(['16:9']);
-    expect(likeaiModelSupportsPortrait('doubao-seedance-2.5')).toBe(false);
     expect(likeaiModelSupportsPortrait('doubao-seedance-2.0-mini')).toBe(false);
   });
 
@@ -34,8 +37,11 @@ describe('likeai520 视频档位表（按渠道实测能力）', () => {
     expect(resolveLikeaiVideoOptions('doubao-seedance-2.5').resolutionValues).not.toContain('4k');
   });
 
-  it('时长上限实测为 15 秒（16 秒起被拒，与官方 2.5 的 30 秒口径不同）', () => {
-    for (const model of Object.keys(LIKEAI_VIDEO_OPTION_TABLE)) {
+  it('时长：2.5 开放到 30 秒，其余型号仍是 15 秒（31 秒起被拒）', () => {
+    const seedance25 = resolveLikeaiVideoOptions('doubao-seedance-2.5');
+    expect(seedance25.durationOptions[0]).toBe(4);
+    expect(last(seedance25.durationOptions)).toBe(30);
+    for (const model of ['doubao-seedance-2.0', 'doubao-seedance-2.0-fast', 'doubao-seedance-2.0-mini']) {
       const options = resolveLikeaiVideoOptions(model);
       expect(options.durationOptions[0], `${model} 起始秒数`).toBe(4);
       expect(last(options.durationOptions), `${model} 时长上限`).toBe(15);

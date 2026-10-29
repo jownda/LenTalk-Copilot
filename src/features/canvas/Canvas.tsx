@@ -66,13 +66,14 @@ import {
   CURRENT_RUNTIME_SESSION_ID,
 } from "@/features/canvas/application/generationErrorReport";
 import { showErrorDialog } from "@/features/canvas/application/errorDialog";
+import { resolveNodeDisplayName } from "@/features/canvas/domain/nodeDisplay";
 import { recordGenerationOutcome } from "@/features/canvas/application/usageRecording";
 import {
   getConnectMenuNodeTypes,
   nodeHasSourceHandle,
   nodeHasTargetHandle,
 } from "@/features/canvas/domain/nodeRegistry";
-import { embedStoryboardImageMetadata } from "@/commands/image";
+import { embedStoryboardImageMetadata, saveImageSourceToDownloads } from "@/commands/image";
 import { persistLibraryAssetFromFile } from "@/commands/assetLibrary";
 import { readClipboardMediaSnapshot, type ClipboardMediaSnapshot } from "@/commands/clipboard";
 import {
@@ -271,6 +272,7 @@ const MEDIA_GENERATION_NODE_TYPES = new Set<string>([
   CANVAS_NODE_TYPES.audioGen,
   CANVAS_NODE_TYPES.storyboardGen,
   CANVAS_NODE_TYPES.motionControl,
+  CANVAS_NODE_TYPES.runningHubWorkflow,
 ]);
 
 function hasGenerationSnapshot(data: Record<string, unknown>): boolean {
@@ -3581,6 +3583,55 @@ export function Canvas() {
   );
 
   // 点击条目: 平滑移动视口到该节点(组内子节点按累加后的绝对坐标定位)。
+  // 节点管理侧栏的分节依据：直接用画布上的分组节点。
+  // 另造一套「文件夹」会和画布分组打架（同一个节点两个归属），所以这里只做投影。
+  const nodeManagerGroups = useMemo(() => {
+    const result: Array<{ id: string; label: string }> = [];
+    for (const node of nodes) {
+      if (node.type !== CANVAS_NODE_TYPES.group) continue;
+      result.push({ id: node.id, label: resolveNodeDisplayName(CANVAS_NODE_TYPES.group, node.data) });
+    }
+    return result;
+  }, [nodes]);
+
+  const handleMediaEntryRename = useCallback(
+    (nodeId: string, displayName: string) => {
+      updateNodeData(nodeId, { displayName });
+    },
+    [updateNodeData],
+  );
+
+  const handleMediaEntryDuplicate = useCallback((nodeId: string) => {
+    // 复用画布自己的复制逻辑（带偏移迭代、写历史），不在侧栏另写一份。
+    duplicateNodesRef.current?.([nodeId]);
+  }, []);
+
+  const handleMediaEntryDownload = useCallback((entry: CanvasMediaEntry) => {
+    const source = entry.previewUrl?.trim();
+    if (!source) {
+      void showErrorDialog("这个节点还没有可下载的文件", "无法下载", "节点可能仍在生成中，或产物已被清理。");
+      return;
+    }
+    const fileName = (entry.displayName?.trim() || entry.nodeId).replace(/[\\/:*?"<>|]/g, "_");
+    void saveImageSourceToDownloads(source, fileName).catch((error) => {
+      // 静默失败会让用户以为按钮没反应，必须报出来。
+      const message = error instanceof Error ? error.message : String(error);
+      void showErrorDialog(message, "下载失败", source);
+    });
+  }, []);
+
+  const handleMediaEntryDelete = useCallback(
+    (nodeId: string) => {
+      // 走画布的批量删除：会一并处理连线、分组与历史，单节点同样适用。
+      deleteNodes([nodeId]);
+    },
+    [deleteNodes],
+  );
+
+  // 侧栏是 memo 的，这两个开关回调必须是稳定引用，否则每次画布重渲染都会把它带崩。
+  const handleNodeManagerClose = useCallback(() => setIsNodeManagerOpen(false), []);
+  const handleNodeManagerOpenToggle = useCallback(() => setIsNodeManagerOpen(true), []);
+
   const handleMediaEntryLocate = useCallback(
     (nodeId: string) => {
       const target = nodes.find((node) => node.id === nodeId);
@@ -5031,12 +5082,17 @@ export function Canvas() {
         <NodeManagerSidebar
           open={isNodeManagerOpen}
           entries={mediaEntries}
-          onToggle={() => setIsNodeManagerOpen(false)}
+          groups={nodeManagerGroups}
+          onToggle={handleNodeManagerClose}
           onPreview={handleMediaEntryPreview}
           onLocate={handleMediaEntryLocate}
+          onRename={handleMediaEntryRename}
+          onDuplicate={handleMediaEntryDuplicate}
+          onDownload={handleMediaEntryDownload}
+          onDelete={handleMediaEntryDelete}
         />
       ) : (
-        <NodeManagerToggle onClick={() => setIsNodeManagerOpen(true)} />
+        <NodeManagerToggle onClick={handleNodeManagerOpenToggle} />
       )}
 
       {dragSelectRect && (
