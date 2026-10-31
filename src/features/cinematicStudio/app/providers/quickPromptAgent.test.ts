@@ -60,6 +60,31 @@ describe('buildQuickPromptRequest', () => {
     expect(system).toContain('only for a character who actually speaks a line in the synopsis');
   });
 
+  it('renders every staged scene when the node holds more than one location', () => {
+    const { user } = buildQuickPromptRequest({
+      style: '胶片颗粒',
+      synopsis: '侦探先在站台等车，再走进后巷。',
+      sceneAssets: [
+        { id: 'loc', name: '站台', mediaType: 'image', referenceIndex: 1 },
+        { id: 'alley', name: '后巷', mediaType: 'image', referenceIndex: 2 },
+      ],
+      characterAssets: [],
+      staging: {
+        locationName: '站台',
+        locations: [
+          { locationId: 'loc', locationName: '站台', locationDescription: '雨夜月台' },
+          { locationId: 'alley', locationName: '后巷', locationDescription: '湿滑的窄巷' },
+        ],
+      },
+    }, 'zh');
+
+    expect(user).toContain('LOCATION 1 (场景站位地点，出场顺序 1/2): @站台 — 雨夜月台');
+    expect(user).toContain('LOCATION 2 (场景站位地点，出场顺序 2/2): @后巷 — 湿滑的窄巷');
+    expect(user).toContain('MULTI-LOCATION (本片段有 2 个场景)');
+    // 单场景的旧写法不能再出现，否则模型会以为只有第一个地点。
+    expect(user).not.toContain('LOCATION (场景站位地点): @站台');
+  });
+
   it('keeps audio references out of ACTIVE REFERENCES and places them in voice locks', () => {
     const { system, user } = buildQuickPromptRequest({
       style: '电影感',

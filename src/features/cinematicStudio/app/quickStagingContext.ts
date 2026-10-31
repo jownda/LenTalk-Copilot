@@ -152,20 +152,35 @@ export function buildQuickStagingContext(input: QuickStagingContextInput): Quick
     if (propAsset) props.push(toPropAsset(propAsset));
   }
 
-  const locationAsset = staging?.locationAssetId ? byId.get(staging.locationAssetId) : undefined;
+  // 场景站位槽是多选：locationAssetIds 里的每一项都是一个场景（顺序即出场顺序），
+  // locationAssetId 是其中的主地点，老数据只有它。两者合并去重，主地点排最前。
+  const locationIds = dedupe([
+    ...(staging?.locationAssetId ? [staging.locationAssetId] : []),
+    ...(staging?.locationAssetIds ?? []),
+  ]);
+  const locationAssets = locationIds
+    .map((id) => byId.get(id))
+    .filter((asset): asset is Asset => Boolean(asset));
+  const locationEntry = (asset: Asset) => {
+    const description = localized(asset.descriptionZh, asset.description, locale);
+    return {
+      locationId: asset.id,
+      locationName: nameOf(asset.id),
+      ...(description ? { locationDescription: description } : {}),
+    };
+  };
+  const primaryLocation = locationAssets[0];
+  // 只有真的挂了第二个场景时才补 locations：单场景的输出与旧版逐字一致，
+  // 既有提示词不会因为这次改动漂移。
+  const locationList = locationAssets.map(locationEntry);
   const anchorDescription = text(staging?.anchorDescription);
   const spacing = text(staging?.spacing);
   const priorContext = text(staging?.priorContext);
-  const hasStaging = Boolean(locationAsset || anchorDescription || spacing || priorContext || orderIds.length);
+  const hasStaging = Boolean(primaryLocation || anchorDescription || spacing || priorContext || orderIds.length);
   const stagingContext: QuickPromptStaging | undefined = hasStaging
     ? {
-      ...(locationAsset ? {
-        locationId: locationAsset.id,
-        locationName: nameOf(locationAsset.id),
-        ...(localized(locationAsset.descriptionZh, locationAsset.description, locale)
-          ? { locationDescription: localized(locationAsset.descriptionZh, locationAsset.description, locale) }
-          : {}),
-      } : {}),
+      ...(primaryLocation ? locationEntry(primaryLocation) : {}),
+      ...(locationList.length > 1 ? { locations: locationList } : {}),
       ...(anchorDescription ? { anchorDescription } : {}),
       ...(orderIds.length ? { characterOrderNames: orderIds.map(nameOf) } : {}),
       ...(spacing ? { spacing } : {}),

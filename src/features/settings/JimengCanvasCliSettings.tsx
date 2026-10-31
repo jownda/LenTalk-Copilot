@@ -37,6 +37,14 @@ export function JimengCanvasCliSettings() {
   const pollingRef = useRef(false);
   const statusRequestRef = useRef<Promise<JimengCanvasCliStatus | null> | null>(null);
   const forceRef = useRef(false);
+  /**
+   * 每次发起授权自增，用来作废上一轮的轮询回调。
+   *
+   * 与「即梦 CLI」同一类坑：授权码一次一码、发新码即废旧码。上一轮那个还在飞行的
+   * `auth wait` 回来报过期后，会把**新一轮**的计时器停掉并写错误信息 ——
+   * 表现就是点了几次都停在「授权码已过期」。
+   */
+  const loginSeqRef = useRef(0);
 
   const stopPolling = useCallback(() => {
     if (timerRef.current !== null) {
@@ -46,7 +54,13 @@ export function JimengCanvasCliSettings() {
     pollingRef.current = false;
   }, []);
 
-  useEffect(() => stopPolling, [stopPolling]);
+  useEffect(
+    () => () => {
+      loginSeqRef.current += 1;
+      stopPolling();
+    },
+    [stopPolling],
+  );
 
   const refreshStatus = useCallback(async () => {
     // 卡片挂载、打开面板、每次 executable 变化都会触发一次。复用同一个在途请求 ——
@@ -107,8 +121,16 @@ export function JimengCanvasCliSettings() {
       setFailed(false);
       setMessage(force ? "正在为「切换账号」重新申请授权…" : "正在申请授权链接…");
       stopPolling();
+      // 作废上一轮：它可能正带着已被新码废掉的 device_code 在飞行中。
+      const seq = (loginSeqRef.current += 1);
+      /** 只允许本轮结束自己的计时器，避免旧回调把新一轮的轮询停掉。 */
+      const stopThisPolling = () => {
+        if (seq !== loginSeqRef.current) return;
+        stopPolling();
+      };
       try {
         const result = await startJimengCanvasCliLogin(executable, { force });
+        if (seq !== loginSeqRef.current) return;
         if (!result.needAuth) {
           setLoginState("idle");
           setMessage(result.message || "当前已登录");
@@ -124,18 +146,22 @@ export function JimengCanvasCliSettings() {
           deviceCode: result.deviceCode ?? "",
         });
         await openAuthPage(result.verificationUri, force);
+        if (seq !== loginSeqRef.current) return;
         setLoginState("polling");
         setMessage("等待在窗口中完成授权…");
         const deviceCode = result.deviceCode ?? "";
         const startedAt = Date.now();
         timerRef.current = window.setInterval(async () => {
+          // 队列里可能还压着上一轮的定时器，带着旧码的错误结果不许影响本轮。
+          if (seq !== loginSeqRef.current) return;
           // 上一轮 `auth wait` 还没返回就别叠进程。
           if (pollingRef.current) return;
           pollingRef.current = true;
           try {
             const check = await checkJimengCanvasCliLogin(executable, deviceCode);
+            if (seq !== loginSeqRef.current) return;
             if (check.success) {
-              stopPolling();
+              stopThisPolling();
               setLoginState("idle");
               setChallenge(null);
               void jimengCliCloseLoginWindow().catch(() => {});
@@ -146,7 +172,7 @@ export function JimengCanvasCliSettings() {
               return;
             }
             if (Date.now() - startedAt >= LOGIN_TIMEOUT_MS) {
-              stopPolling();
+              stopThisPolling();
               setLoginState("idle");
               setFailed(true);
               setMessage("等待授权超时，请重新点登录。");
@@ -156,16 +182,26 @@ export function JimengCanvasCliSettings() {
               `等待授权完成…（已等待 ${Math.round((Date.now() - startedAt) / 1000)} 秒）`
             );
           } catch (error) {
+            if (seq !== loginSeqRef.current) return;
             // 授权码过期 / profile 冲突这类错误要立刻报出来, 别干等到 5 分钟。
-            stopPolling();
+            stopThisPolling();
             setLoginState("idle");
             setFailed(true);
-            setMessage(error instanceof Error ? error.message : String(error));
+            const message = error instanceof Error ? error.message : String(error);
+            setMessage(
+              /过期|expired/i.test(message)
+                ? "这次授权码已失效：每点一次授权都会发放新码并作废上一个。请重新点一次，并在窗口里一次完成授权，中间不要再点。"
+                : message
+            );
           } finally {
-            pollingRef.current = false;
+            // 只有本轮才能释放防重入闸门，否则会和下一轮的请求叠在一起。
+            if (seq === loginSeqRef.current) {
+              pollingRef.current = false;
+            }
           }
         }, POLL_INTERVAL_MS);
       } catch (error) {
+        if (seq !== loginSeqRef.current) return;
         stopPolling();
         setLoginState("idle");
         setFailed(true);

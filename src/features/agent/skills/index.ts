@@ -7,13 +7,18 @@
  *
  * 顺序即浮层里的展示顺序，按需要排。
  */
+import { realisticHumanPortraits } from "./realistic-human-portraits";
 import { seedanceBuliangrenWuxia } from "./seedance-buliangren-wuxia";
 import { tiangonxieyi } from "./tiangonxieyi";
 import type { AgentSkill } from "./types";
 
 export type { AgentSkill };
 
-export const AGENT_SKILLS: AgentSkill[] = [tiangonxieyi, seedanceBuliangrenWuxia];
+export const AGENT_SKILLS: AgentSkill[] = [
+  tiangonxieyi,
+  realisticHumanPortraits,
+  seedanceBuliangrenWuxia,
+];
 
 /**
  * 按 id 取 SKILL。

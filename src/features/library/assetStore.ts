@@ -23,6 +23,10 @@ import {
   sanitizeAssetFileStem,
 } from './assetFileNaming';
 import { applyAssetPathRemap } from './assetPathRemap';
+import {
+  THUMBNAIL_MAX_EDGE,
+  requestThumbnail,
+} from '@/features/canvas/application/thumbnailCache';
 
 const LEGACY_STORAGE_KEY = 'storyboard-asset-library-v1-v1';
 
@@ -308,7 +312,55 @@ async function alignAssetFileNamesOnHydrate(): Promise<void> {
   }
 }
 
-function suggestCategoryId(asset: LibraryAsset, categories: AssetCategory[]): string | null {  const searchable = [asset.name, asset.sourceFileName ?? '', ...asset.tags].join(' ').toLocaleLowerCase();
+/**
+ * 丢掉「源文件还在」时多余的**内嵌 base64 预览图**。
+ *
+ * 这是「画布上的素材加载慢」的上游：素材记录一旦把预览图存成 `data:`，它就会被
+ * 原样复制进节点数据 —— 提示词工作室的 `quickReferenceImages` / `studioReferenceImages`
+ * 和下游 AI 视频节点会各存一份。实测某个 220 节点的工程 nodes_json 有 17 MB，
+ * 其中 16 MB 全是这几份 base64；打开工程要传、要 `JSON.parse`、要逐张解码。
+ *
+ * 预览图本来就是「原图的缩小版」，而 `AssetThumb` 早就能从 `sourcePath` 按需生成
+ * 256 缩略图（带并发闸门与内存缓存）。所以源文件可读时，base64 预览纯属冗余，直接置空。
+ *
+ * 🔴 **必须先确认源文件可读**：`requestThumbnail` 成功即代表源文件还在（它要 stat +
+ * 解码原图）。源文件已被删掉的素材保留 base64，那是它仅存的画面。
+ *
+ * 幂等：置空后 `previewImageUrl` 不再以 `data:` 开头，下次启动不会重复处理。
+ */
+async function dropRedundantInlinePreviews(): Promise<void> {
+  if (!isTauri()) return;
+  const state = useAssetLibraryStore.getState();
+  const targets = state.assets.filter((asset) => {
+    const preview = (asset.previewImageUrl ?? '').trim();
+    const source = (asset.sourcePath ?? '').trim();
+    return preview.startsWith('data:') && source.length > 0 && !source.startsWith('data:');
+  });
+  if (targets.length === 0) return;
+
+  const droppable = new Set<string>();
+  for (const asset of targets) {
+    const source = (asset.sourcePath ?? '').trim();
+    try {
+      const thumbnail = await requestThumbnail(source, THUMBNAIL_MAX_EDGE);
+      if (thumbnail) {
+        droppable.add(asset.id);
+      }
+    } catch (error) {
+      console.warn('[assetLibrary] probe asset source failed', source, error);
+    }
+  }
+  if (droppable.size === 0) return;
+
+  const latest = useAssetLibraryStore.getState();
+  const assets = latest.assets.map((asset) =>
+    droppable.has(asset.id) ? { ...asset, previewImageUrl: null } : asset,
+  );
+  updateStore((partial) => useAssetLibraryStore.setState(partial), { ...latest, assets });
+}
+
+function suggestCategoryId(asset: LibraryAsset, categories: AssetCategory[]): string | null {
+  const searchable = [asset.name, asset.sourceFileName ?? '', ...asset.tags].join(' ').toLocaleLowerCase();
   const groups: Array<{ category: RegExp; clues: RegExp }> = [
     { category: /角色|人物|character|portrait/i, clues: /角色|人物|肖像|头像|男|女|儿童|老人|character|portrait|person|actor/i },
     { category: /场景|背景|scene|background/i, clues: /场景|背景|室内|室外|街道|建筑|城市|森林|房间|scene|background|street|city|room|landscape/i },
@@ -338,8 +390,10 @@ export const useAssetLibraryStore = create<AssetLibraryStore>((set, get) => ({
         }
       }
       set({ ...state, isHydrated: true });
-      // 磁盘文件名对齐（老数据的一次性搬家）放到水合之后异步跑，不阻塞首屏。
-      void alignAssetFileNamesOnHydrate();
+      // 磁盘文件名对齐（老数据的一次性搬家）放到水合之后异步跑，不阻塞首屏；
+      // 内嵌 base64 预览图清理排在它之后 —— 改名会重写 previewImageUrl，
+      // 两边同时跑会互相覆盖。
+      void alignAssetFileNamesOnHydrate().then(() => dropRedundantInlinePreviews());
     } catch (error) {
       console.warn('[assetLibrary] hydrate failed', error);
       set({ ...readBrowserState(), isHydrated: true });

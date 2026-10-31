@@ -24,6 +24,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { useJimengCanvasCliStore } from "@/stores/jimengCanvasCliStore";
 import { generateJimengCanvasAudio, generateJimengCanvasVideo } from "@/commands/jimengCanvasCli";
 import { isApiKeylessProvider, JIMENG_CANVAS_CLI_PROVIDER_ID, JIMENG_CLI_PROVIDER_ID, resolveVideoModelProfile } from "@/features/canvas/models";
+import { getVideoModel } from "@/features/canvas/models";
 import { RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
 import { useRunningHubCliStore } from "@/stores/runningHubCliStore";
 import { toVideoGenerationRequest } from "@/features/canvas/application/videoGeneration";
@@ -931,6 +932,25 @@ export const tauriAiGateway: AiGateway = {
           : referenceImages.length > 0
             ? "m2v"
             : "t2v";
+      // 分辨率必须用该模型自己的写法（happyhorse/wan 是大写 720P, seedance 是小写 720p）。
+      // 顺手校验一遍：换过模型的节点会留下旧分辨率（例如样片模型只有 480p，
+      // 节点上却还写着 720p），服务端只会甩一句含糊的 `service.2`（"request as invalid"），
+      // 完全看不出是分辨率不合法。
+      const definition = getVideoModel(payload.model.trim());
+      const requestedResolution = (payload.videoResolution ?? "").trim();
+      const supportedResolutions = definition?.resolutions?.map((item) => item.value) ?? [];
+      if (
+        requestedResolution &&
+        supportedResolutions.length > 0 &&
+        !supportedResolutions.some(
+          (value) => value.toLowerCase() === requestedResolution.toLowerCase(),
+        )
+      ) {
+        throw new Error(
+          `${definition?.displayName ?? model} 只支持 ${supportedResolutions.join(" / ")}，` +
+            `当前节点选的是 ${requestedResolution}。请先把分辨率改成 ${supportedResolutions[0]} 再生成`
+        );
+      }
       return await generateJimengCanvasVideo({
         executable: useJimengCanvasCliStore.getState().executable,
         prompt: payload.prompt,
@@ -938,8 +958,7 @@ export const tauriAiGateway: AiGateway = {
         mode,
         duration: payload.duration,
         aspectRatio: payload.aspectRatio,
-        // 分辨率必须用该模型自己的写法（happyhorse/wan 是大写 720P, seedance 是小写 720p）。
-        resolution: payload.videoResolution ?? "720p",
+        resolution: requestedResolution || definition?.defaultResolution || "720p",
         referenceImages,
         // 音频参考同样要带上: m2v 支持最多 10 个, 少了这一步模型只看到图片。
         referenceAudio: payload.referenceAudio?.map((item) => item.trim()).filter(Boolean),

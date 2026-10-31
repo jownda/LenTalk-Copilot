@@ -9,6 +9,7 @@ import {
   isImageEditsNetworkError,
   isProxyRequired65535NetworkError,
   resolveErrorContent,
+  splitErrorHeadline,
 } from './errorDialog';
 
 describe('isBalanceInsufficientError', () => {
@@ -116,5 +117,33 @@ describe('resolveErrorContent with balance errors', () => {
     expect(result.message).toContain('积分不足');
     expect(result.message).toContain('充值');
     expect(result.details).toContain('CreditPreDeductNotEnough');
+  });
+});
+
+describe('splitErrorHeadline', () => {
+  it('第一行当标题、其余进详情', () => {
+    const raw =
+      '参考音频只有 1.46 秒，服务端要求每段参考音频至少 1.8 秒。请换一条更长的音频（或把这条补长到 1.8 秒以上）再生成\n' +
+      '（The node run was rejected…（cli.node_run_rejected） serviceCode=2）\n' +
+      '服务端原文：An audio content is 1.463 seconds long…（字段 materials.types.audio.duration_seconds）';
+    const result = resolveErrorContent(raw, '生成失败');
+
+    expect(result.message).toBe(
+      '参考音频只有 1.46 秒，服务端要求每段参考音频至少 1.8 秒。请换一条更长的音频（或把这条补长到 1.8 秒以上）再生成'
+    );
+    expect(result.message).not.toContain('\n');
+    // 详情保留完整原文，折叠区里能看到 serviceCode 与字段路径。
+    expect(result.details).toContain('serviceCode=2');
+    expect(result.details).toContain('materials.types.audio.duration_seconds');
+  });
+
+  it('单行错误原样不动', () => {
+    expect(splitErrorHeadline('HTTP 500 Internal Server Error')).toEqual({
+      message: 'HTTP 500 Internal Server Error',
+    });
+  });
+
+  it('只有换行没有内容时不拆', () => {
+    expect(splitErrorHeadline('\n')).toEqual({ message: '' });
   });
 });

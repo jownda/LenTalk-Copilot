@@ -11,6 +11,7 @@ import {
   PenLine,
   RefreshCw,
   RotateCw,
+  ScanSearch,
   Search,
   Scissors,
   SlidersHorizontal,
@@ -53,6 +54,11 @@ import {
 } from "@/features/canvas/application/generationErrorReport";
 import { showErrorDialog } from "@/features/canvas/application/errorDialog";
 import { saveMediaSourceWithDialog } from "@/features/canvas/application/mediaDownload";
+import {
+  reversePromptFromImages,
+  VisionImageUnreadableError,
+  VisionModelMissingError,
+} from "@/features/canvas/application/visionPromptReverse";
 import { importVideoUrlToAsset } from "@/features/library/importAssets";
 import {
   buildTemplateFromCanvas,
@@ -266,6 +272,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isUpscaleModelPickerOpen, setIsUpscaleModelPickerOpen] = useState(false);
   const [isUpscalingImage, setIsUpscalingImage] = useState(false);
   const [isSavingToLibrary, setIsSavingToLibrary] = useState(false);
+  // 「反推提示词」：拿本节点的图问视觉模型，结果落成右侧文本节点。
+  const [isReversingPrompt, setIsReversingPrompt] = useState(false);
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
   // 「扒视频」：从视频节点直接跑一次最精简的扒剧本，结果落成右侧文本节点
   const [isScriptDialogOpen, setIsScriptDialogOpen] = useState(false);
@@ -321,6 +329,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const canHandleMedia = Boolean(downloadSource);
   // 「图片高清」只对带图的图片类节点开放(AI 图片节点自己那排按钮走的是另一套渲染)。
   const canUpscaleImage = !isImageEdit && Boolean(imageSource) && !videoSource;
+  // 「反推提示词」和「图片高清」同一批节点：只要盒子里的是一张静态图就能反推。
+  const canReversePromptImage = !isImageEdit && Boolean(imageSource) && !videoSource;
   const upscaleModelOptions = useMemo<ImageModelDefinition[]>(
     () => (isImageUpscaleDialogOpen ? listImageUpscaleModels() : []),
     [isImageUpscaleDialogOpen],
@@ -536,6 +546,60 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
       );
     }
   }, [downloadSource, node.id, videoSource]);
+  /**
+   * 反推提示词：把本节点的图交给视觉模型，反推出一段可直接用的提示词，
+   * 落成右侧文本节点（和「扒视频」「提示词优化」保持同一种交付形态：结果是可编辑的文本节点）。
+   *
+   * 一定要用原图 `imageUrl` 而不是预览缩略图 —— 缩略图的细节被压掉之后，
+   * 反推出来的描述会明显失真。
+   */
+  const handleReversePrompt = useCallback(async () => {
+    const source = imageSource;
+    if (!source || isReversingPrompt) {
+      return;
+    }
+
+    setIsReversingPrompt(true);
+    try {
+      const lang = i18n.language?.startsWith('zh') ? 'zh' : 'en';
+      const { prompt } = await reversePromptFromImages({
+        imageSources: [source],
+        lang,
+      });
+      if (!prompt.trim()) {
+        throw new Error('empty-response');
+      }
+      const newNodeId = addNode(
+        CANVAS_NODE_TYPES.textAnnotation,
+        findNodePosition(node.id, 320, 200),
+        {
+          displayName: t("nodeToolbar.reversePromptNodeName"),
+          content: prompt,
+        },
+      );
+      addEdge(node.id, newNodeId);
+    } catch (error) {
+      if (error instanceof VisionModelMissingError) {
+        void showErrorDialog(t("nodeToolbar.reversePromptNoModel"), t("common.error"));
+      } else if (error instanceof VisionImageUnreadableError) {
+        void showErrorDialog(t("nodeToolbar.reversePromptImageUnreadable"), t("common.error"));
+      } else {
+        const message = error instanceof Error ? error.message : String(error);
+        void showErrorDialog(t("nodeToolbar.reversePromptFailed"), t("common.error"), message);
+      }
+    } finally {
+      setIsReversingPrompt(false);
+    }
+  }, [
+    addEdge,
+    addNode,
+    findNodePosition,
+    i18n.language,
+    imageSource,
+    isReversingPrompt,
+    node.id,
+    t,
+  ]);
   const libraryCategories = useMemo(
     () => categories.filter((category) => category.libraryId === (activeLibraryId || libraries[0]?.id)),
     [activeLibraryId, categories, libraries],
@@ -942,6 +1006,28 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 {quickRunActive
                   ? t("pajuben.quickRunningShort", "扒取中 {{percent}}%", { percent: quickRunPercent })
                   : t("pajuben.quickTitle", "扒视频")}
+              </UiChipButton>
+            )}
+            {canReversePromptImage && (
+              <UiChipButton
+                key="image-reverse-prompt"
+                className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+                disabled={isReversingPrompt}
+                title={t("nodeToolbar.reversePromptHint")}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  // 用视觉模型读本节点的图，反推出一段提示词落到右侧文本节点。
+                  void handleReversePrompt();
+                }}
+              >
+                {isReversingPrompt ? (
+                  <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <ScanSearch className="h-3.5 w-3.5" />
+                )}
+                {isReversingPrompt
+                  ? t("nodeToolbar.reversePromptRunning")
+                  : t("nodeToolbar.reversePrompt")}
               </UiChipButton>
             )}
             {canUpscaleImage && (

@@ -295,6 +295,15 @@ export function SettingsDialog({
   const jimengLoginTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const jimengLoginCheckingRef = useRef(false);
   const jimengLoginProbeRef = useRef(false);
+  /**
+   * 每次发起登录自增，用来作废**上一轮**轮询的回调。
+   *
+   * 即梦的设备码是「一次一码、发新码即废旧码」：点第二次「登录/切换账号」后，
+   * 上一轮那个还在飞行的 `checklogin` 会拿旧码回来报「登录已过期，请重新执行
+   * dreamina login --headless」。而旧回调里的 `stopPolling()` 按 ref 清的是**当前**
+   * 计时器 —— 于是新轮询被误杀，界面永远停在过期提示上。
+   */
+  const jimengLoginSeqRef = useRef(0);
   const customApiSectionRef = useRef<HTMLDivElement>(null);
   const [showAddCustomApi, setShowAddCustomApi] = useState(false);
   const [editingCustomApiId, setEditingCustomApiId] = useState<string | null>(null);
@@ -594,6 +603,9 @@ export function SettingsDialog({
   // 组件卸载/关闭时清理登录轮询
   useEffect(() => {
     return () => {
+      // 关闭设置后，飞行中的 checklogin 回调必须一起失效，否则它会用一句
+      // 「登录已过期」把重开后的界面又打成错误态。
+      jimengLoginSeqRef.current += 1;
       if (jimengLoginTimerRef.current) {
         clearInterval(jimengLoginTimerRef.current);
         jimengLoginTimerRef.current = null;
@@ -678,7 +690,7 @@ export function SettingsDialog({
    * —— 设备码授权认的是打开页面那个会话里登录的即梦账号, 复用旧会话会直接把旧账号授出去。
    */
   const startJimengLogin = useCallback(async (force = false) => {
-    let executable = localJimengCliExecutable.trim() || 'dreamina';
+    const executable = localJimengCliExecutable.trim() || 'dreamina';
     jimengLoginForceRef.current = force;
     setJimengLoginState('opening');
     setJimengLoginMessage(
@@ -695,10 +707,14 @@ export function SettingsDialog({
       clearInterval(jimengLoginTimerRef.current);
       jimengLoginTimerRef.current = null;
     }
+    // 作废上一轮的回调：它可能正带着已被新码废掉的 device_code 在飞行中。
+    const seq = (jimengLoginSeqRef.current += 1);
     // 不再「先检测再登录」—— 即梦 CLI 单次冷启动实测 4 秒多, 检测一次纯属白等。
     // 改成直接申请授权材料, 只有真正报「启动不了」时才去检测/安装再重试一次。
     try {
       const result = await requestJimengLoginMaterial(executable, force);
+      // 申请材料期间用户可能又点了一次；此时这一份材料已经作废，直接丢弃。
+      if (seq !== jimengLoginSeqRef.current) return;
       if (!result.needAuth) {
         setJimengLoginState('success');
         setJimengLoginMessage(result.message || '已登录即梦账号');
@@ -718,12 +734,16 @@ export function SettingsDialog({
         privateMode: force,
         resetSession: force,
       });
+      if (seq !== jimengLoginSeqRef.current) return;
       setJimengLoginMessage(`等待授权完成…${authNote}`);
       setJimengLoginState('polling');
 
       const deviceCode = result.deviceCode;
       let attempts = 0;
       jimengLoginTimerRef.current = setInterval(async () => {
+        // 上一轮的计时器可能还没被 clear 掉（回调已在队列里），带着旧码的错误结果
+        // 绝不能影响本轮的状态。
+        if (seq !== jimengLoginSeqRef.current) return;
         // A CLI keyring write can take longer than the polling interval. Do
         // not overlap checklogin processes, otherwise concurrent OAuth saves
         // can make the CLI report "store unavailable".
@@ -731,6 +751,9 @@ export function SettingsDialog({
         jimengLoginCheckingRef.current = true;
         attempts += 1;
         const stopPolling = () => {
+          // 只允许本轮结束自己的计时器。旧轮次的回调若在这里清表，会把新一轮
+          // 刚建好的计时器一起清掉 —— 界面就永远停在「登录已过期」上了。
+          if (seq !== jimengLoginSeqRef.current) return;
           if (jimengLoginTimerRef.current) {
             clearInterval(jimengLoginTimerRef.current);
             jimengLoginTimerRef.current = null;
@@ -738,6 +761,8 @@ export function SettingsDialog({
         };
         try {
           const check = await jimengCliLoginCheck(executable, deviceCode);
+          // 结果回来时，用户可能已经点了新的一次登录；这一份已经作废，丢弃。
+          if (seq !== jimengLoginSeqRef.current) return;
           if (check.message.includes('使用权限') || check.message.includes('没有权限')) {
             stopPolling();
             setJimengLoginState('error');
@@ -777,6 +802,8 @@ export function SettingsDialog({
           }
           setJimengLoginMessage(`等待浏览器授权完成…（已等待 ${attempts * (JIMENG_LOGIN_POLL_INTERVAL_MS / 1000)} 秒）`);
         } catch (error) {
+          // 旧轮次的失败（多半就是「登录已过期」）不能污染本轮界面。
+          if (seq !== jimengLoginSeqRef.current) return;
           const errorMessage = error instanceof Error ? error.message : String(error);
           const errorLower = errorMessage.toLowerCase();
           const pendingError = errorLower.includes('not logged in') || errorLower.includes('pending') || errorLower.includes('waiting') || errorMessage.includes('未登录') || errorMessage.includes('等待') || errorMessage.includes('尚未');
@@ -795,15 +822,25 @@ export function SettingsDialog({
           } else if (terminalError) {
             stopPolling();
             setJimengLoginState('error');
-            setJimengLoginMessage(errorMessage);
+            // 即梦的设备码「一次一码、发新码即废旧码」：这条原文几乎总是重复点击导致的，
+            // 直接照抄给用户只会让他一直重试同一个死循环，这里翻成人话 + 下一步。
+            setJimengLoginMessage(
+              errorMessage.includes('登录已过期')
+                ? '这次授权码已失效：每点一次「登录 / 切换账号」都会发放新码并作废上一个（等超过 10 分钟也会失效）。请重新点一次，然后在弹出的窗口里一次完成授权，中间不要再点。'
+                : errorMessage
+            );
           } else {
             setJimengLoginMessage('等待浏览器授权完成…（已等待 ' + (attempts * (JIMENG_LOGIN_POLL_INTERVAL_MS / 1000)) + ' 秒）');
           }
         } finally {
-          jimengLoginCheckingRef.current = false;
+          // 只有本轮才能释放防重入闸门，否则会和下一轮的请求叠在一起。
+          if (seq === jimengLoginSeqRef.current) {
+            jimengLoginCheckingRef.current = false;
+          }
         }
       }, JIMENG_LOGIN_POLL_INTERVAL_MS);
     } catch (error) {
+      if (seq !== jimengLoginSeqRef.current) return;
       setJimengLoginState('error');
       setJimengLoginMessage(error instanceof Error ? error.message : String(error));
     }

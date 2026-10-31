@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
+use crate::commands::video_cfr::resolve_ffmpeg_path;
+use crate::commands::video_edit::probe_media;
+
 // The Dreamina CLI refreshes and persists the OAuth record during normal
 // commands. Running two CLI processes at once can make its keyring backend
 // return "store unavailable" (especially on Windows Credential Manager).
@@ -29,13 +32,105 @@ const JIMENG_CLI_MAX_REFERENCE_IMAGES: usize = 9;
 /// 30 秒的通用命令超时在慢网下必然不够。
 const CANVAS_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// 画布素材上传的最大尝试次数与退避。
-///
+/// 画布素材上传的最大尝试次数与退避。///
 /// 与生成提交的保守策略(见 `JIMENG_SUBMIT_MAX_ATTEMPTS` 上方注释)不是一回事: 上传素材
 /// **不消耗积分**, 而且下面用内容哈希派生 `--resource-id` 幂等键, 重试不会在服务端留下
 /// 重复对象。最坏情况也只是多一个孤儿素材, 代价远小于把 `human_intervention` 原样甩给用户。
 const CANVAS_UPLOAD_MAX_ATTEMPTS: u32 = 3;
 const CANVAS_UPLOAD_RETRY_BACKOFF_MS: [u64; 2] = [1_500, 4_000];
+/// 上传成功后再等资源「可用」的轮数（每轮 2s，合计 30s）。
+///
+/// 🔴 上传接口回 `resourceId` **不等于**服务端已经处理完这份素材：大图要转码/校验。
+/// 拿还在 `running` 的资源去 `node create`，服务端会用 `service.2`
+/// （"The service rejected the request as invalid"）把建节点拒掉 —— 这句报错一个字都
+/// 没提素材，实测排查了很久才定位到「素材还没 ready」。所以在返回 `res:<id>` 之前
+/// 先问一句状态，比事后猜便宜得多。
+const CANVAS_UPLOAD_READY_WAITS: u32 = 15;
+
+/// 画布视频「参考音频」的最短时长（秒）。
+///
+/// 服务端会对 `materials.types.audio.duration_seconds` 做校验，实测 1.463 秒的音频被
+/// `service.2 / FIELD_VALUE_INVALID` 拒掉，原文是「An audio content is 1.463 seconds long;
+/// the selected model currently requires at least 1.8 seconds」。这条下限 **CLI 的
+/// `model list` 里没有**（那里只写 audio 数量 0~10），只能到提交时才炸，所以本地先拦一道，
+/// 免得白跑一遍上传 + 建节点 + 报价。
+const CANVAS_AUDIO_MIN_SECONDS: f64 = 1.8;
+
+/// 参考音频太短时提前报错。
+///
+/// 探测失败（没有 ffmpeg / 文件读不了）一律放行：拦不住的错误交给服务端，不该在这里
+/// 变成一个假的「音频不合格」。
+fn ensure_canvas_audio_long_enough(app: &AppHandle, files: &[PathBuf]) -> Result<(), String> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let Some(ffmpeg) = resolve_ffmpeg_path(app) else {
+        return Ok(());
+    };
+    for path in files {
+        let probe = probe_media(&ffmpeg, &path.to_string_lossy());
+        if let Some(duration) = probe.duration_sec {
+            if duration > 0.0 && duration < CANVAS_AUDIO_MIN_SECONDS {
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("参考音频");
+                return Err(format!(
+                    "参考音频「{name}」只有 {duration:.2} 秒，即梦画布要求每段音频至少 \
+                     {CANVAS_AUDIO_MIN_SECONDS:.1} 秒才能当音色参考（服务端会直接拒掉这次提交）。\
+                     请换一条更长的音频，或先把它补长到 {CANVAS_AUDIO_MIN_SECONDS:.1} 秒以上"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 各视频模型的 `--prompt` 字数上限，来源 `dreamina-canvas model list --type=video`（CLI 1.1.1）。
+///
+/// 服务端对所有模式（t2v / m2v / first_last_frame）用的是同一个上限，返回 `None`
+/// 表示这个型号没登记过 —— 那种情况**不拦**，交给服务端判，别拿猜的数字误杀。
+fn canvas_prompt_max_length(model: &str) -> Option<usize> {
+    match model.trim() {
+        "happyhorse_1.1" => Some(2500),
+        "seedance_pro_fast" => Some(2000),
+        "seedance_2.5" | "seedance_2.5_draft" => Some(15000),
+        "wan_3.0" => Some(20000),
+        "seedance_2.0_vip" | "seedance_2.0_fast_vip" | "seedance_2.0_mini" => Some(4000),
+        _ => None,
+    }
+}
+
+/// 提示词超长时本地先拦一道。
+///
+/// 真机抓到的拒绝体（`seedance_2.0_vip`，6604 字）：
+/// ```json
+/// {"ok":false,"error":{"code":"service.2","class":"invalid_input",
+///   "message":"The service rejected the request as invalid. Check the command input and retry.",
+///   "validation":{"reasonCode":"FIELD_VALUE_INVALID","fieldPath":"params.prompt",
+///                 "detail":"Use no more than 4000 characters (currently 6604)."}}}
+/// ```
+/// CLI 的**本地校验放行**（`node create --dry-run` 也不拦），所以不提前算字数的话，
+/// 用户只会拿到一句不含主语的 `service.2`，而字数这个唯一线索被埋在 validation 里。
+fn ensure_canvas_prompt_fits(model: &str, prompt: &str) -> Result<(), String> {
+    let Some(limit) = canvas_prompt_max_length(model) else {
+        return Ok(());
+    };
+    // 服务端按字符计数（一个汉字算 1），不是字节 —— 用 chars() 才和它一致。
+    let characters = prompt.trim().chars().count();
+    if characters <= limit {
+        return Ok(());
+    }
+    let alternative = if limit < 15000 {
+        "；提示词不便压缩时可换 Seedance 2.5（上限 15000 字）或 Wan 3.0（上限 20000 字）"
+    } else {
+        ""
+    };
+    Err(format!(
+        "提示词 {characters} 字，超过 {model} 的上限 {limit} 字（服务端只会回一句 \
+         service.2，看不出是字数问题）。请删到 {limit} 字以内再生成{alternative}"
+    ))
+}
 
 
 // 提交阶段的重试策略 —— 一切以即梦官方规则为准, 首要保证**不重复扣费**。
@@ -3319,20 +3414,174 @@ fn describe_canvas_failure(value: &serde_json::Value) -> String {
         .pointer("/error/reason")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let base = if code.is_empty() {
+    // 明细的位置随失败阶段变：建节点/上传时在 `error.validation`，
+    // 提交被拒（`cli.node_run_rejected`）时在 `error.submissionError.validation`。
+    // 两个都找 —— 否则最有用的一句还是会被丢掉。
+    let detail = ["/error/validation/detail", "/error/submissionError/validation/detail"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_str))
+        .unwrap_or("")
+        .trim();
+    let field_path = ["/error/validation/fieldPath", "/error/submissionError/validation/fieldPath"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_str))
+        .unwrap_or("")
+        .trim();
+    let service_code = value
+        .pointer("/error/serviceCode")
+        .or_else(|| value.pointer("/error/submissionError/serviceCode"))
+        .and_then(serde_json::Value::as_i64);
+    let mut base = if code.is_empty() {
         message.to_string()
     } else {
         format!("{message}（{code}）")
     };
-    match reason {
-        "oauth_scope_insufficient" => format!(
-            "{base}：即梦画布 CLI 的登录凭证权限不足（不是模型、参数或积分问题）。请到「设置 → 即梦画布 CLI」点【切换账号】重新授权；或在终端执行 `dreamina-canvas auth login --force`。若重新授权后仍报同一错误，说明 CLI 版本太旧，用官方脚本更新后再授权"
-        ),
-        // 其它已知原因点名，避免它们也被埋在 "Access was denied" 后面。
-        "credit_insufficient" => format!("{base}：即梦积分不足"),
-        "" => base,
-        other => format!("{base}（reason: {other}）"),
+    if let Some(number) = service_code {
+        // `service.2` 里的数字已经写了就别重复；`cli.node_run_rejected` 这种壳子把
+        // 真实服务码藏在 serviceCode 里，必须带出来 —— CLI 自己那句提示就是
+        // 「Use its serviceCode and correct the input」。
+        if !code.ends_with(&number.to_string()) {
+            base.push_str(&format!(" serviceCode={number}"));
+        }
     }
+    // 提交被拒（`node run`）单独走一条路：CLI 只给一句英文壳子，真实原因是
+    // 服务端对某个字段的校验，用户既看不懂也猜不到怎么改。这里按字段路径翻成人话，
+    // 能算数的地方把数字也写进句子；原文仍留在最后一行，方便反馈和搜索。
+    if code == "cli.node_run_rejected" {
+        // 第一行必须是**用户能直接照做**的那句话：弹窗和错误报告都把第一行当标题，
+        // 「The node run was rejected…」放前面等于把有用的信息埋进了折叠区。
+        let explanation = describe_rejected_field(field_path, detail);
+        let mut text = explanation;
+        // 第二行只留「哪个错误码」，CLI 那句英文壳子对用户没有信息量，但对反馈/搜索有用的是
+        // `cli.node_run_rejected` 与 `serviceCode`。
+        let suffix = service_code
+            .map(|number| format!("，serviceCode={number}"))
+            .unwrap_or_default();
+        text.push_str(&format!("\n（即梦画布拒绝提交：{code}{suffix}）"));
+        if !detail.is_empty() && !message.contains(detail) {
+            text.push_str(&format!("\n服务端原文：{detail}"));
+            if !field_path.is_empty() {
+                text.push_str(&format!("（字段 {field_path}）"));
+            }
+        }
+        return text;
+    }
+
+    if !detail.is_empty() && !message.contains(detail) {
+        if field_path.is_empty() {
+            base.push_str(&format!("\n{detail}"));
+        } else {
+            base.push_str(&format!("\n{detail}（字段 {field_path}）"));
+        }
+    }
+
+    // 先按 reason（信息最足），再按 code 兜底，最后才退回原始 reason 文本。
+    if let Some(hint) = match reason {
+        "oauth_scope_insufficient" => Some(
+            "即梦画布 CLI 的登录凭证权限不足（不是模型、参数或积分问题）。请到「设置 → 即梦画布 CLI」点【切换账号】重新授权；或在终端执行 `dreamina-canvas auth login --force`。若重新授权后仍报同一错误，说明 CLI 版本太旧，用官方脚本更新后再授权",
+        ),
+        "credit_insufficient" => Some("即梦积分不足"),
+        _ => None,
+    } {
+        return format!("{base}：{hint}");
+    }
+
+    if let Some(hint) = match code {
+        // 服务端把请求判成非法。走到这一步时 CLI 的**本地校验已经通过** ——
+        // 我们甚至已经建好节点、拿到过报价，所以问题不在这条命令的写法上，而在
+        // 服务端那一刻还不认这份输入：最常见的是参考素材刚上传完、服务端仍在转码/校验，
+        // 拿未就绪的 `res:<id>` 去建节点就会被这样拒掉（报错里完全没提素材）。
+        "service.2" => Some(
+            "服务端判定这次请求非法。多半是参考素材刚上传、服务端还在处理，等十几秒重试一次即可；若每次都卡在同一组素材上，请换一组参考图/音频，或改用 Seedance 2.5（正式版）重试",
+        ),
+        // 我们按报价×1.1 报上限，但服务端有自己的 minCreditCeiling，报价与它不一致时会撞这里。
+        "service.7" => Some(
+            "本次批准的积分上限低于服务端的下限（报价与最低上限不一致）。程序会按服务端返回的最小上限自动重试一次；若仍失败，请到即梦网页端确认积分余额",
+        ),
+        // 回执没拿到（`cli.invalid_service_response` 等）：见 describe_run_rejection。
+        other => describe_run_rejection(other),
+    } {
+        return format!("{base}：{hint}");
+    }
+
+    if reason.is_empty() {
+        base
+    } else {
+        format!("{base}（reason: {reason}）")
+    }
+}
+
+/// 取 `marker` 之前紧跟在它前面的那个数字。
+///
+/// 服务端原文是固定句式（`An audio content is 1.463 seconds long`），
+/// 取「seconds long 前最后一个数字」就够了，不引入正则依赖。
+fn number_before(text: &str, marker: &str) -> Option<f64> {
+    let head = &text[..text.find(marker)?];
+    head.split_whitespace().rev().find_map(|token| {
+        let cleaned = token.trim_matches(|character: char| {
+            !character.is_ascii_digit() && character != '.'
+        });
+        cleaned.parse::<f64>().ok()
+    })
+}
+
+/// 取 `marker` 之后出现的第一个数字（`requires at least 1.8 seconds`）。
+fn number_after(text: &str, marker: &str) -> Option<f64> {
+    let rest = &text[text.find(marker)? + marker.len()..];
+    rest.split_whitespace().find_map(|token| {
+        let cleaned = token.trim_matches(|character: char| {
+            !character.is_ascii_digit() && character != '.'
+        });
+        cleaned.parse::<f64>().ok()
+    })
+}
+
+/// 把服务端的英文字段校验翻成「用户看懂就能改」的一句话。
+///
+/// 服务端只给 `FIELD_VALUE_INVALID` + 字段路径 + 一句英文原文。默认直接甩给用户等于
+/// 什么都没说 —— 那句 `materials.types.audio.duration_seconds` 更是不可能看着它想到
+/// 「把参考音频换长一点」。所以按字段路径归类，能算出具体数值的就写进句子里。
+fn describe_rejected_field(field_path: &str, detail: &str) -> String {
+    let lowered = field_path.to_ascii_lowercase();
+    let actual = number_before(detail, "seconds long");
+    let minimum = number_after(detail, "at least");
+
+    if lowered.contains("audio") && lowered.contains("duration") {
+        return match (actual, minimum) {
+            (Some(actual), Some(minimum)) => format!(
+                "参考音频只有 {actual:.2} 秒，服务端要求每段参考音频至少 {minimum:.1} 秒。\
+                 请换一条更长的音频（或把这条补长到 {minimum:.1} 秒以上）再生成"
+            ),
+            (Some(actual), None) => format!(
+                "参考音频只有 {actual:.2} 秒，太短了。请换一条更长的音频再生成"
+            ),
+            _ => "参考音频太短。请换一条更长的音频（建议每段 2 秒以上）再生成".to_string(),
+        };
+    }
+    if lowered.contains("audio") {
+        return "参考音频不合法（格式或时长不符合要求）。请换一条音频再生成".to_string();
+    }
+    if lowered.contains("image") && (lowered.contains("count") || lowered.contains("number")) {
+        return "参考图片数量超出了这个模型的上限。删掉几张再生成".to_string();
+    }
+    if lowered.contains("resolution") {
+        return "这个模型不支持当前分辨率。在节点里换一个分辨率再生成".to_string();
+    }
+    if lowered.contains("ratio") || lowered.contains("aspect") {
+        return "这个模型不支持当前画幅比例。在节点里换一个画幅再生成".to_string();
+    }
+    if lowered.contains("duration") {
+        return "选择的时长超出了这个模型支持的范围。调整时长后重试".to_string();
+    }
+    if lowered.contains("prompt") {
+        return "提示词没通过服务端校验（可能过长或含被限制的内容）。精简后再试".to_string();
+    }
+    if lowered.is_empty() {
+        return "提交被服务端拒绝了，但没说明具体是哪个字段。换一组参考素材试试，\
+                或改用 Seedance 2.5（正式版）重试"
+            .to_string();
+    }
+    format!("提交被服务端拒绝，问题出在这个字段：{field_path}。按字段名调整后重试")
 }
 
 /// 从素材内容派生**确定性**的 `--resource-id` 幂等键。
@@ -3505,6 +3754,35 @@ fn canvas_failure_means_resource_exists(reason: &str) -> bool {
         || lowered.contains("service.5")
 }
 
+/// 上传拿到 `resourceId` 之后，等它真正可用再交给调用方。
+///
+/// 查不到状态时（`canvas_resource_status` 返回 `None`，例如 `resource get` 本身失败）
+/// **放行** —— 诊断能力不足不该变成硬失败，真正的兜底是 `node create` 那一步会报错。
+fn await_canvas_resource_ready(
+    label: &str,
+    executable: &str,
+    project_id: &str,
+    resource_id: &str,
+) -> Result<String, String> {
+    let status = canvas_resource_status(
+        executable,
+        project_id,
+        resource_id,
+        CANVAS_UPLOAD_READY_WAITS,
+    );
+    match status.as_deref() {
+        None | Some("success") => Ok(format!("res:{resource_id}")),
+        Some("failed") | Some("canceled") => Err(format!(
+            "{label}上传后被服务端判为失败（资源 {resource_id}）。请换一份素材重试；\
+             这个资源可以在即梦画布网页端删掉"
+        )),
+        Some(other) => Err(format!(
+            "{label}上传成功但服务端还在处理（状态 {other}，资源 {resource_id}）。\
+             等十几秒重试本节点即可 —— 素材已经登记进画布，重试不会重复上传、也不会扣积分"
+        )),
+    }
+}
+
 /// 把一份本地素材登记成项目资源, 返回可直接塞进 `--ref` 的 `res:<id>`。
 ///
 /// 🔴 幂等键由 `canvas_resource_key` 生成并**贯穿所有重试**, 这是把
@@ -3549,7 +3827,7 @@ fn upload_canvas_resource(
         if success {
             if let Ok(data) = &parsed {
                 if let Some(id) = find_json_string_field(data, "resourceId") {
-                    return Ok(format!("res:{id}"));
+                    return await_canvas_resource_ready(label, executable, project_id, &id);
                 }
             }
         }
@@ -4004,6 +4282,11 @@ fn generate_canvas_video_blocking(
     if request.prompt.trim().is_empty() {
         return Err("即梦画布 CLI 视频生成需要提示词".to_string());
     }
+    // 提示词长度必须在**上传参考素材之前**拦：超长时服务端只回一句
+    // `service.2 / invalid_input`（"The service rejected the request as invalid"），
+    // 真正的句子藏在 `validation.detail` 里（`Use no more than 4000 characters (currently 6604).`）。
+    // 等 `node create` 才炸，前面那几轮素材上传就白跑了，而且用户完全看不出是字数问题。
+    ensure_canvas_prompt_fits(&request.model, &request.prompt)?;
     let project_id = match request
         .project_id
         .as_deref()
@@ -4042,6 +4325,7 @@ fn generate_canvas_video_blocking(
         // 不登记就等于音频没传进去(模型只看到图片)。
         let audio_files =
             materialize_audio_files(request.reference_audio.as_deref().unwrap_or_default())?;
+        ensure_canvas_audio_long_enough(app, &audio_files)?;
         for path in &audio_files {
             references.push(upload_canvas_resource(
                 &executable,
@@ -4391,12 +4675,111 @@ const CANVAS_QUOTE_KEYS: [&str; 9] = [
     "total",
 ];
 
+/// 批准积分上限，拿短期凭证。
+///
+/// `service.7`（ceiling too low）说明我们给的上限低于服务端的**下限**：报价是
+/// `maxCredits`，而 confirm 校验的是 `minimumCreditCeiling`，两者并不总是相等
+/// （活动价 / 按秒计费的四舍五入都会让 ×1.1 之后仍然偏小）。服务端会在
+/// `creditConfirmation.minimumCreditCeiling` 里给出真实下限，照着它重试一次即可，
+/// 不必让用户看到一句没法自己解决的 "ceiling too low"。
+fn confirm_canvas_node(
+    executable: &str,
+    project_id: &str,
+    node_id: &str,
+    ceiling: i64,
+) -> Result<String, String> {
+    let build = |value: i64| {
+        canvas_cli_args(&[
+            "node",
+            "confirm",
+            &format!("--node-id={node_id}"),
+            &format!("--project-id={project_id}"),
+            &format!("--credit-ceiling={value}"),
+            "--non-interactive",
+            "--yes",
+            "--format",
+            "json",
+        ])
+    };
+
+    let (success, output) = spawn_cli_capture(executable, &build(ceiling), CLI_COMMAND_TIMEOUT, &[])?;
+    if success {
+        return Ok(output);
+    }
+
+    // 失败时要原始 JSON 才拿得到 minimumCreditCeiling（信封里 `ok=false` 时
+    // `parse_canvas_payload` 会直接把正文换成描述文案，数字就丢了）。
+    let minimum = serde_json::from_str::<serde_json::Value>(output.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/creditConfirmation/minimumCreditCeiling")
+                .and_then(serde_json::Value::as_i64)
+        });
+
+    if let Some(minimum) = minimum {
+        if minimum > ceiling {
+            let (retry_success, retry_output) =
+                spawn_cli_capture(executable, &build(minimum), CLI_COMMAND_TIMEOUT, &[])?;
+            if retry_success {
+                return Ok(retry_output);
+            }
+            return Err(canvas_cli_failure_reason(&retry_output));
+        }
+    }
+
+    Err(canvas_cli_failure_reason(&output))
+}
+
 /// 建节点 → 报价 → 按报价批准 → 运行 → 等终态。
 ///
 /// 不用 `node create --run`: 那条命令虽然会在内部「报价 → 批准 → 运行」, 但**用户看不到
 /// 要花多少积分**, 而且 ceiling 只能猜一个写死的值。拆开之后:
 /// ① 积分是服务端报的真实数字; ② 批准额度按报价给, 不会因为猜小了被拒、猜大了失控。
 /// 返回 `(node_id, 报价积分)`。
+/// 节点是否已经进入「服务端在跑」的状态。
+///
+/// `node run` 的回应可能在传输中丢掉（CLI 报 `cli.invalid_service_response`），但
+/// **节点状态不会说谎**：真受理了就是 running/queued，被拒了还是 empty。用它来区分
+/// 「提交失败」与「只是没收到回执」，避免让用户重试一次白扣积分。
+fn canvas_node_is_active(executable: &str, project_id: &str, node_id: &str) -> bool {
+    let Ok(output) = run_canvas_cli(
+        executable,
+        &canvas_cli_args(&[
+            "node",
+            "show",
+            &format!("--node-id={node_id}"),
+            &format!("--project-id={project_id}"),
+            "--format",
+            "json",
+        ]),
+    ) else {
+        return false;
+    };
+    let Ok(data) = parse_canvas_payload(&output) else {
+        return false;
+    };
+    let status = find_json_string_field(&data, "status")
+        .unwrap_or_default()
+        .to_lowercase();
+    matches!(
+        status.as_str(),
+        "running" | "queued" | "pending" | "success" | "partial_success"
+    )
+}
+
+/// 提交被拒（`node run`）的英文壳子 → 人话。
+///
+/// 这几句都在同一处：服务端接受了提交但回执没回来。
+fn describe_run_rejection(code: &str) -> Option<&'static str> {
+    match code {
+        "cli.invalid_service_response" => Some(
+            "服务端的回应不完整（网络或服务端瞬断）。程序会先核对节点状态：如果已经在生成就继续等，不会重复扣积分；若节点确实还是空的，重试一次即可",
+        ),
+        _ => None,
+    }
+}
+
 fn create_quote_confirm_run(
     executable: &str,
     project_id: &str,
@@ -4436,20 +4819,7 @@ fn create_quote_confirm_run(
 
     // 3) 按报价批准(留 10% 余量, 服务端报价可能因分辨率微调), 拿短期凭证
     let ceiling = quoted.map(|value| (value * 1.1).ceil() as i64).unwrap_or(2000);
-    let confirmed = run_canvas_cli(
-        executable,
-        &canvas_cli_args(&[
-            "node",
-            "confirm",
-            &format!("--node-id={node_id}"),
-            &format!("--project-id={project_id}"),
-            &format!("--credit-ceiling={ceiling}"),
-            "--non-interactive",
-            "--yes",
-            "--format",
-            "json",
-        ]),
-    )?;
+    let confirmed = confirm_canvas_node(executable, project_id, &node_id, ceiling)?;
     let confirmed_data = parse_canvas_payload(&confirmed)?;
     let credit_token = find_json_string_field(&confirmed_data, "creditConfirmationToken")
         .or_else(|| find_json_string_field(&confirmed_data, "token"));
@@ -4468,7 +4838,16 @@ fn create_quote_confirm_run(
     if let Some(token) = &credit_token {
         run_args.push(format!("--credit-token={token}"));
     }
-    let _ = run_canvas_cli(executable, &run_args)?;
+    // 提交这一步的失败分两类，处理方式完全不同：
+    // ① 服务端明确拒绝（节点仍是 `empty`，没扣分）→ 原样报错，用户改参数；
+    // ② CLI **没看懂回应**（`cli.invalid_service_response` / 传输中断）→ 服务端往往
+    //    已经受理并开始扣分（实测 26 秒 480p 样片 234 积分）。这时直接抛错会让用户
+    //    重试一次，等于白扣一遍积分。所以先问节点状态：已经在跑就当作提交成功往下等。
+    if let Err(error) = run_canvas_cli(executable, &run_args) {
+        if !canvas_node_is_active(executable, project_id, &node_id) {
+            return Err(error);
+        }
+    }
 
     // 5) 等终态: 直接轮询 `node show` 读 status。
     // 不走 `operation wait <submitId>` —— 那需要先拿到 submitId, 而 run 的返回结构没实测过;
@@ -5742,9 +6121,128 @@ mod image_tests {
         assert!(message.contains("idempotent_reuse"), "未知原因也要带出来: {message}");
     }
 
+    /// 真机抓到的原始错误（即梦画布 CLI 1.1.1，`service.2`，用户实报）。
+    const INVALID_REQUEST_ERROR: &str = r#"{"schemaVersion":"1","ok":false,"error":{"code":"service.2","serviceCode":2,"class":"invalid_request","message":"The service rejected the request as invalid. Check the command input and retry.","retryable":false,"requiredAction":"none"}}"#;
+
     #[test]
-    fn failure_without_reason_falls_back_to_message_and_code() {
+    fn service_2_points_at_unready_references() {
+        let value: serde_json::Value =
+            serde_json::from_str(INVALID_REQUEST_ERROR).expect("valid json");
+        let message = describe_canvas_failure(&value);
+        // 原始 code 保留，方便搜索。
+        assert!(message.contains("service.2"), "{message}");
+        // 必须点名最常见的原因（素材没就绪），而不是只复述 "rejected as invalid"。
+        assert!(message.contains("参考素材"), "{message}");
+        // 必须给出下一步动作。
+        assert!(message.contains("重试"), "{message}");
+    }
+
+    /// 真机抓到的第二种 `service.2`：**提示词超长**（2026-10-31，`seedance_2.0_vip`，6604 字）。
+    ///
+    /// 这条的价值在于 `validation.detail` 里写着唯一有用的那句
+    /// `Use no more than 4000 characters (currently 6604).` —— 丢了它，
+    /// 用户就只能看到「request as invalid」，完全猜不到是字数。
+    const PROMPT_TOO_LONG_ERROR: &str = r#"{"schemaVersion":"1","ok":false,"error":{"code":"service.2","serviceCode":2,"class":"invalid_input","message":"The service rejected the request as invalid. Check the command input and retry.","retryable":false,"requiredAction":"none","requestId":"20261031110009C3F0A94A14D47C924FF6","traceId":"20261031110009C3F0A94A14D47C924FF6","validation":{"reasonCode":"FIELD_VALUE_INVALID","fieldPath":"params.prompt","detail":"Use no more than 4000 characters (currently 6604)."}}}"#;
+
+    #[test]
+    fn service_2_keeps_prompt_length_detail() {
+        let value: serde_json::Value =
+            serde_json::from_str(PROMPT_TOO_LONG_ERROR).expect("valid json");
+        let message = describe_canvas_failure(&value);
+        assert!(message.contains("4000 characters"), "{message}");
+        assert!(message.contains("params.prompt"), "{message}");
+    }
+
+    /// 超长提示词本地就该拦，别等 `node create` 被服务端回一句 service.2。
+    #[test]
+    fn rejects_prompt_over_model_limit() {
+        let long = "字".repeat(6604);
+        let error = ensure_canvas_prompt_fits("seedance_2.0_vip", &long).expect_err("必须拦下");
+        assert!(error.contains("6604"), "{error}");
+        assert!(error.contains("4000"), "{error}");
+        // 给出可执行的替代方案，而不是只说「超了」。
+        assert!(error.contains("Seedance 2.5"), "{error}");
+
+        // 刚好到上限要放行（服务端是 `<= maxLength`）。
+        let exact = "字".repeat(4000);
+        assert!(ensure_canvas_prompt_fits("seedance_2.0_vip", &exact).is_ok());
+
+        // 上限更高的型号不能被 4000 误杀。
+        let wide = "字".repeat(6604);
+        assert!(ensure_canvas_prompt_fits("seedance_2.5", &wide).is_ok());
+        // 没登记过的型号一律放行，交给服务端判。
+        assert!(ensure_canvas_prompt_fits("some_future_model", &wide).is_ok());
+    }
+
+    /// 用户实报的第二次失败：`node run` 被服务端拒，真实原因藏在
+    /// `serviceCode` + `submissionError.validation`（参考音频只有 1.463 秒）。
+    #[test]
+    fn node_run_rejected_surfaces_service_code_and_detail() {
         let value: serde_json::Value = serde_json::from_str(
+            r#"{"schemaVersion":"1","ok":false,"error":{"code":"cli.node_run_rejected","class":"invalid_input","message":"The node run was rejected. Use its serviceCode and correct the input before retrying.","serviceCode":2,"submissionError":{"serviceCode":2,"message":"invalid request","retryable":false,"validation":{"reasonCode":"FIELD_VALUE_INVALID","fieldPath":"materials.types.audio.duration_seconds","detail":"An audio content is 1.463 seconds long; the selected model currently requires at least 1.8 seconds."}}}}"#,
+        )
+        .expect("valid json");
+        let message = describe_canvas_failure(&value);
+        // 第一行必须是用户能直接照做的那句中文 —— 弹窗把它当标题。
+        let headline = message.lines().next().unwrap_or("");
+        assert!(headline.contains("参考音频只有 1.46 秒"), "{message}");
+        assert!(headline.contains("至少 1.8 秒"), "{message}");
+        // 真实服务码要留在壳子那行，方便搜索与反馈。
+        assert!(message.contains("serviceCode=2"), "{message}");
+        // 原文保留在最后。
+        assert!(message.contains("服务端原文"), "{message}");
+        assert!(message.contains("1.8 seconds"), "{message}");
+        assert!(
+            message.contains("materials.types.audio.duration_seconds"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejected_field_without_detail_still_says_something_useful() {
+        let message = describe_rejected_field("", "");
+        assert!(message.contains("换一组参考素材"), "{message}");
+
+        // 认不出的字段路径也要点名，别退化成一句「失败」。
+        let unknown = describe_rejected_field("materials.types.foo", "something odd");
+        assert!(unknown.contains("materials.types.foo"), "{unknown}");
+    }
+
+    #[test]
+    fn invalid_service_response_explains_receipt_loss() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"ok":false,"error":{"code":"cli.invalid_service_response","message":"The service returned an invalid response. Contact support with traceId."}}"#,
+        )
+        .expect("valid json");
+        let message = describe_canvas_failure(&value);
+        // 不能说「参数错」，要告诉用户「可能已经在生成，别急着重复提交」。
+        assert!(message.contains("已经在生成"), "{message}");
+        assert!(message.contains("扣积分"), "{message}");
+    }
+
+    #[test]
+    fn service_7_explains_credit_ceiling() {        let value: serde_json::Value = serde_json::from_str(
+            r#"{"ok":false,"error":{"code":"service.7","serviceCode":7,"class":"confirmation_required","message":"The approved credit ceiling is too low."}}"#,
+        )
+        .expect("valid json");
+        let message = describe_canvas_failure(&value);
+        assert!(message.contains("积分上限"), "{message}");
+    }
+
+    #[test]
+    fn validation_detail_is_appended_to_the_message() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"ok":false,"error":{"code":"cli.invalid_flag","message":"Invalid flag","validation":{"detail":"unknown flag --ref"}}}"#,
+        )
+        .expect("valid json");
+        let message = describe_canvas_failure(&value);
+        assert!(message.contains("Invalid flag（cli.invalid_flag）"), "{message}");
+        // detail 是唯一带「哪个字段不合法」的地方，丢了就等于没诊断信息。
+        assert!(message.contains("unknown flag --ref"), "{message}");
+    }
+
+    #[test]
+    fn failure_without_reason_falls_back_to_message_and_code() {        let value: serde_json::Value = serde_json::from_str(
             r#"{"ok":false,"error":{"code":"cli.invalid_flag","message":"Invalid flag"}}"#,
         )
         .expect("valid json");

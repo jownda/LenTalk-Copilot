@@ -693,10 +693,15 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
   );
   const legacySceneAssetIds = stringArray(data.quickSceneAssetIds);
   const legacyCharacterAssetIds = stringArray(data.quickCharacterAssetIds);
+  // 场景站位槽可挂多个场景：主地点（locationAssetId，高级编辑 / 编译器认它）排在
+  // 最前，其余按用户添加顺序续在后面。老节点只有主地点，走同一条合并逻辑。
   const sceneAssetIds = hasQuickStaging
-    ? quickStaging.locationAssetId
-      ? [quickStaging.locationAssetId]
-      : []
+    ? [
+        ...new Set([
+          ...(quickStaging.locationAssetId ? [quickStaging.locationAssetId] : []),
+          ...(quickStaging.locationAssetIds ?? []),
+        ]),
+      ]
     : legacySceneAssetIds;
   const characterAssetIds = hasQuickStaging
     ? [...new Set(quickStaging.characterRoster ?? [])]
@@ -715,8 +720,9 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
     () => selectedCinematicAssets(propAssetIds, libraryAssets),
     [libraryAssets, propAssetIds.join("|")],
   );
-  // 与高级编辑器一致：地点是单一的场景站位资产；场景角色候选由
-  // characterRoster 维护。镜像库中的多张参考图仍属于同一电影资产。
+  // 场景站位槽可挂多个地点：数组里的每一项都是同一段片子里会出现的场景，
+  // 第一项即主地点。角色候选仍由 characterRoster 维护，镜像库中的多张参考图
+  // 仍属于同一电影资产。
   const locationAssets = useMemo(() => cinematicImageAssets(libraryAssets, "location"), [libraryAssets]);
   const characterAssets = useMemo(() => cinematicImageAssets(libraryAssets, "character"), [libraryAssets]);
   const characterCandidates = useMemo(
@@ -805,9 +811,15 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       const asset = libraryAssets.find((item) => item.id === assetId);
       const cinematicId = asset ? cinematicAssetKey(asset) : assetId;
       if (kind === "scene") {
+        // 场景站位是多选槽：点一次加一个场景，再点一次移除。第一项始终写回
+        // locationAssetId，高级编辑与编译器只认那个字段。
+        const locationAssetIds = sceneAssetIds.includes(cinematicId)
+          ? sceneAssetIds.filter((item) => item !== cinematicId)
+          : [...sceneAssetIds, cinematicId];
         const staging = {
           ...quickStaging,
-          locationAssetId: sceneAssetIds.includes(cinematicId) ? undefined : cinematicId,
+          locationAssetIds,
+          locationAssetId: locationAssetIds[0],
         };
         updateNodeData(id, {
           quickStaging: staging,
@@ -1079,11 +1091,12 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       } finally {
         // 只有仍是「当前这一代」才收尾：取消后用户可能马上又点了一次，
         // 旧这次运行不能把新一次的状态清掉。
-        if (!isCurrentRun()) return;
-        quickGenerationLockRef.current = false;
-        setQuickGenerating(false);
-        // 生成结束(成功或失败)即释放: 成功时下游视频节点已经建好。
-        updateNodeData(id, { quickGenerationStartedAt: null, quickGenerationSessionId: null });
+        if (isCurrentRun()) {
+          quickGenerationLockRef.current = false;
+          setQuickGenerating(false);
+          // 生成结束(成功或失败)即释放: 成功时下游视频节点已经建好。
+          updateNodeData(id, { quickGenerationStartedAt: null, quickGenerationSessionId: null });
+        }
       }
     },
     [
@@ -1265,7 +1278,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                 "scene",
                 "场景站位",
                 "地点",
-                "选择地点资产",
+                "选择场景（可多选）",
                 QUICK_INPUT_HANDLES.sceneAssets,
                 selectedSceneAssets,
                 quickPickerItems.scene,
@@ -1306,7 +1319,13 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                 className="!left-[-13px] !top-1/2 !h-2.5 !w-2.5 !-translate-y-1/2 !border-surface-dark !bg-accent"
               />
               <p className="mb-1 flex items-center justify-between gap-2 text-[10px] text-text-muted">
-                <span>{label}</span>
+                <span className="flex min-w-0 items-center gap-1">
+                  <span className="truncate">{label}</span>
+                  {/* 场景站位可多选：多于一个时点明数量，避免用户以为只挂了一个场景。 */}
+                  {kind === "scene" && chosen.length > 1 ? (
+                    <span className="shrink-0 text-[9px] text-accent">{chosen.length} 个</span>
+                  ) : null}
+                </span>
                 {connectedMedia.images.length + connectedMedia.audio.length + connectedMedia.videos.length > 0 ? (
                   <span className="text-[9px] text-accent">
                     已接入 {connectedMedia.images.length + connectedMedia.audio.length + connectedMedia.videos.length}
@@ -1370,7 +1389,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
                   </div>
                 ))}
                 <QuickAssetPicker
-                  addLabel={`添加${label}`}
+                  addLabel={kind === "scene" ? "添加场景" : `添加${label}`}
                   active={activeAssetPicker === kind}
                   onToggleOpen={(next) => setActiveAssetPicker(next ? kind : null)}
                   title={pickerLabel}

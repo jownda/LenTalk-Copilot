@@ -41,6 +41,7 @@ import type { PromptTemplate } from "@/features/prompts/promptLibraryStore";
 import { useCanvasStore } from "@/stores/canvasStore";
 import { CANVAS_NODE_TYPES } from "@/features/canvas/domain/canvasNodes";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { AssetThumb } from "@/features/library/AssetThumb";
 import { UiButton, UiGhostIconButton, UiInput, UiSelect } from "@/components/ui/primitives";
 import CinematicAssetLibrary, {
   type CanvasAudioSource as CinematicCanvasAudioSource,
@@ -105,14 +106,8 @@ function VideoPreview({ asset }: { asset: LibraryAsset }) {
   const [isPreviewActive, setIsPreviewActive] = useState(false);
 
   if (asset.previewImageUrl) {
-    return (
-      <img
-        src={resolveImageDisplayUrl(asset.previewImageUrl)}
-        alt={asset.name}
-        className="h-full w-full object-cover"
-        draggable={false}
-      />
-    );
+    // 有系统封面时同样走懒加载缩略图，不再一挂载就解码。
+    return <AssetThumb asset={asset} />;
   }
 
   // 没有系统缩略图的旧视频不再让每张卡片自动解码。只有鼠标停在当前卡片上时才
@@ -147,14 +142,8 @@ function VideoPreview({ asset }: { asset: LibraryAsset }) {
 
 function MediaPreview({ asset }: { asset: LibraryAsset }) {
   if (asset.mediaType === "image") {
-    return (
-      <img
-        src={resolveImageDisplayUrl(asset.previewImageUrl || asset.sourcePath)}
-        alt={asset.name}
-        className="h-full w-full object-cover"
-        draggable={false}
-      />
-    );
+    // 懒加载 + 256 缩略图：素材库有几百条时，一次全渲染会把主线程和磁盘打满。
+    return <AssetThumb asset={asset} />;
   }
   if (asset.mediaType === "video") {
     return <VideoPreview asset={asset} />;
@@ -623,6 +612,7 @@ export const AssetLibraryPanel = memo(
 
     const assetGrid = (
       <div
+        data-asset-scroll-root
         className={`relative flex-1 overflow-y-auto p-3 ${isDragOver ? "bg-accent/5" : ""}`}
         onDragEnter={(event) => {
           event.preventDefault();
@@ -733,11 +723,11 @@ export const AssetLibraryPanel = memo(
     const cinematicAssetGrid = cinematicProps ? (
       // cinematic-studio-app class 提供工作室主题 CSS 变量(--surface/--text 等),
       // 侧边栏内嵌时同样需要;组件内部新增/编辑/AI 填写/表演母版全部可用。
-      <div className="cinematic-studio-app ui-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+      <div data-asset-scroll-root className="cinematic-studio-app ui-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
         <CinematicAssetLibrary {...cinematicProps} />
       </div>
     ) : (
-      <div className="ui-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+      <div data-asset-scroll-root className="ui-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
         <EmptyState label={t("assetLibrary.cinematicLoading", "资产库加载中…")} />
       </div>
     );

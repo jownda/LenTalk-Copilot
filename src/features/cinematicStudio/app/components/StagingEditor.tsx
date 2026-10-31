@@ -65,6 +65,8 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
   const locationAssets = (project.assets ?? []).filter((asset) => asset.kind === "location");
   const characterAssets = (project.assets ?? []).filter((asset) => asset.kind === "character");
   const locationAsset = locationAssets.find((asset) => asset.id === staging.locationAssetId);
+  // 节点上多选出来的附加场景：高级编辑不展示它们，只提示数量。
+  const extraLocationCount = (staging.locationAssetIds ?? []).filter((id) => id !== staging.locationAssetId).length;
   const nameOf = (id: string) => (project.assets ?? []).find((a) => a.id === id)?.name ?? id;
   const order = staging.characterOrder ?? [];
   const roster = staging.characterRoster ?? [];
@@ -143,7 +145,7 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
               ? <button className="staging-location-card" onClick={() => setPickingLocation(true)}>
                   {thumb ? <img src={resolveImageDisplayUrl(thumb)} alt={locationAsset.name} /> : <span className="staging-location-fallback small">{locationAsset.name.slice(0, 1)}</span>}
                   <b>{locationAsset.name}</b>
-                  <span className="staging-location-remove" title={t.deleteAsset} onClick={(event) => { event.stopPropagation(); onChange({ locationAssetId: undefined }); }}><X size={12} /></span>
+                  <span className="staging-location-remove" title={t.deleteAsset} onClick={(event) => { event.stopPropagation(); onChange({ locationAssetId: undefined, locationAssetIds: [] }); }}><X size={12} /></span>
                 </button>
               : <button className="staging-location-add" onClick={() => setPickingLocation(true)}><Plus size={18} /><span>{t.addFromAssets}</span></button>}
             <div className="staging-reference-control">
@@ -156,6 +158,14 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
               {staging.stagingReferenceImage && <button type="button" className="staging-reference-remove" title={t.deleteAsset} onClick={() => onChange({ stagingReferenceImage: undefined })}><X size={12} /></button>}
             </div>
           </div>
+
+          {/* 画布节点上的「场景站位」槽可以挂多个场景；高级编辑每场只有一个地点，
+              这里只做提示，避免用户以为节点上多选的场景丢了。 */}
+          {extraLocationCount > 0 ? (
+            <p className="hint-text">
+              画布节点上另有 {extraLocationCount} 个附加场景（共 {extraLocationCount + 1} 个），在这里改地点会重置为单一地点。
+            </p>
+          ) : null}
 
           {stagingReferencePickerOpen && <div className="staging-reference-picker">
             <div className="reference-source-tabs">
@@ -182,7 +192,7 @@ export default function StagingEditor({ project, scene, t, canvasImageSources, o
               ? <p className="hint-text">{t.stagingNoLocationHint}</p>
               : <div className="staging-location-picker-grid">
                   {locationAssets.map((asset: Asset) => (
-                    <button key={asset.id} className={asset.id === staging.locationAssetId ? "active" : ""} onClick={() => { onChange({ locationAssetId: asset.id }); setPickingLocation(false); }}>
+                    <button key={asset.id} className={asset.id === staging.locationAssetId ? "active" : ""} onClick={() => { onChange({ locationAssetId: asset.id, locationAssetIds: [asset.id] }); setPickingLocation(false); }}>
                       {asset.referencePaths?.[0] ? <img src={resolveImageDisplayUrl(asset.referencePaths[0])} alt={asset.name} /> : <span className="staging-location-fallback">{asset.name.slice(0, 1)}</span>}
                       <span>{asset.name}</span>
                     </button>

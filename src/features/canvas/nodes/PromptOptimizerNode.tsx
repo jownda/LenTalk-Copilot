@@ -14,7 +14,11 @@ import { optimizeLiraPrompt } from '@/features/canvas/domain/liraRules';
 import { reversePromptSystemPrompt, reversePromptUserMessage, reversePromptCombineUserMessage } from '@/features/canvas/domain/reversePrompt';
 import { graphImageResolver } from '@/features/canvas/application/canvasServices';
 import { findReferenceTokens, insertReferenceToken } from '@/features/canvas/application/referenceTokenEditing';
-import { imageUrlToDataUrl, resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
+import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
+import {
+  stripThinkingBlock,
+  toVisionImageSource,
+} from '@/features/canvas/application/visionPromptReverse';
 import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
 import { clampTextViewScrollTop } from '@/features/canvas/application/textViewScroll';
 import { useCanvasInputGraph } from '@/features/canvas/application/useCanvasInputGraph';
@@ -44,29 +48,6 @@ const MIN_HEIGHT = 220;
 const MAX_WIDTH = 820;
 const MAX_HEIGHT = 900;
 
-
-function stripThinkingBlock(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return trimmed;
-  }
-
-  const wrapper = /^(?:<thinking>[\s\S]*?<\/thinking>|\\?\s*(?:thinking|reason)\s*:?[\s\S]*?)\\?\s*(?:response|answer|output|final_answer)\s*:?\s*/i;
-  const match = trimmed.match(wrapper);
-  if (match) {
-    const rest = trimmed.slice((match.index ?? 0) + match[0].length).trim();
-    if (rest) {
-      return rest;
-    }
-  }
-
-  const enclosed = trimmed.replace(/^(?:<thinking>[\s\S]*?<\/thinking>|<reason>[\s\S]*?<\/reason>)\s*/i, '').trim();
-  if (enclosed && enclosed !== trimmed) {
-    return enclosed;
-  }
-
-  return trimmed;
-}
 
 interface ReferencePreviewState {
   url: string;
@@ -241,29 +222,6 @@ function buildAiUserMessage(draft: string, skeleton: string, taskType: string, l
   ].join('\n');
 }
 
-async function toVisionImageSource(source: string): Promise<string> {
-  const trimmed = source.trim();
-  if (trimmed.startsWith('data:')) {
-    return trimmed;
-  }
-  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-    return trimmed;
-  }
-  const dataUrl = await imageUrlToDataUrl(trimmed);
-  if (dataUrl.startsWith('data:')) {
-    return dataUrl;
-  }
-  const mime = /\.png$/i.test(trimmed)
-    ? 'image/png'
-    : /\.jpe?g$/i.test(trimmed)
-      ? 'image/jpeg'
-      : /\.webp$/i.test(trimmed)
-        ? 'image/webp'
-        : /\.gif$/i.test(trimmed)
-          ? 'image/gif'
-          : 'image/png';
-  return `data:${mime};base64,${dataUrl}`;
-}
 function collectReferencedImages(text: string, incomingImages: string[]): string[] {
   const references = findReferenceTokens(text, incomingImages.length);
   const seen = new Set<number>();

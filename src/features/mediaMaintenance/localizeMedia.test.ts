@@ -41,6 +41,7 @@ vi.mock('@/stores/projectStore', () => ({
 import {
   createMediaLocalizer,
   isDownloadableRemoteSource,
+  isLocalizableMediaSource,
   localizeMediaInPlace,
   localizeProjectRecord,
   runExistingMediaLocalization,
@@ -73,6 +74,17 @@ describe('isDownloadableRemoteSource', () => {
     expect(isDownloadableRemoteSource('data:image/png;base64,AAAA')).toBe(false);
     expect(isDownloadableRemoteSource('asset://localhost/a.png')).toBe(false);
     expect(isDownloadableRemoteSource('C:/Users/me/a.png')).toBe(false);
+  });
+});
+
+describe('isLocalizableMediaSource', () => {
+  it('http(s) 与够大的内嵌 base64 都要搬，小图标不动', () => {
+    expect(isLocalizableMediaSource(REMOTE)).toBe(true);
+    // 几 KB 以下的小 data URL 搬成文件只是增加噪声。
+    expect(isLocalizableMediaSource('data:image/png;base64,AAAA')).toBe(false);
+    expect(isLocalizableMediaSource(`data:image/png;base64,${'A'.repeat(6000)}`)).toBe(true);
+    expect(isLocalizableMediaSource('asset://localhost/a.png')).toBe(false);
+    expect(isLocalizableMediaSource('__img_ref__:2')).toBe(false);
   });
 });
 

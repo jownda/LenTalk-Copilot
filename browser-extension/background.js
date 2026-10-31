@@ -134,6 +134,43 @@ async function grabInPage(url, limit, range) {
     return btoa(binary);
   };
 
+  // 拿到的字节其实是网页（右键落在卡片/链接上、或站点把图片地址重定向到了登录页）。
+  // 这类字节送进素材库只会变成一张永远加载不出来的破图，所以在这里就断掉。
+  const looksLikeMarkup = (bytes) => {
+    let index = 0;
+    // 跳过 UTF-8 BOM 与前导空白。
+    if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) index = 3;
+    while (index < bytes.length && index < 32) {
+      const code = bytes[index];
+      if (code === 0x20 || code === 0x0a || code === 0x0d || code === 0x09) index += 1;
+      else break;
+    }
+    // '<' 只可能是 HTML/XML；真正的图片与音视频容器不会以它开头。
+    return bytes[index] === 0x3c;
+  };
+
+  const markupError = (bytes) => {
+    let snippet = '';
+    try {
+      snippet = new TextDecoder('utf-8')
+        .decode(bytes.subarray(0, 400))
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 80);
+    } catch (error) {
+      snippet = '';
+    }
+    return {
+      ok: false,
+      error:
+        '这个地址返回的是网页而不是图片/视频' +
+        (snippet ? `（内容开头：${snippet}）` : '') +
+        ' —— 多半是页面地址，请右键图片本身，或从列表里挑带图片后缀的地址',
+    };
+  };
+
   // BYTERANGE 型 HLS（整支视频编成一个文件、再按字节区间切成几十段写进清单，
   // Pinterest 就是这种）必须**按区间取**。不带 Range 会把整份文件拉下来 ——
   // 实测 28 MB，当场撞上体积上限，表现成「预览一直转圈」。
@@ -154,9 +191,11 @@ async function grabInPage(url, limit, range) {
     if (!response.body) {
       const buffer = await response.arrayBuffer();
       if (buffer.byteLength > limit) return { ok: false, tooLarge: true };
+      const bytes = new Uint8Array(buffer);
+      if (looksLikeMarkup(bytes)) return markupError(bytes);
       return {
         ok: true,
-        base64: toBase64(new Uint8Array(buffer)),
+        base64: toBase64(bytes),
         size: buffer.byteLength,
         contentType: response.headers.get('content-type') || '',
       };
@@ -182,6 +221,7 @@ async function grabInPage(url, limit, range) {
       merged.set(chunk, offset);
       offset += chunk.byteLength;
     }
+    if (looksLikeMarkup(merged)) return markupError(merged);
     return {
       ok: true,
       base64: toBase64(merged),
@@ -258,6 +298,33 @@ function base64ToBlob(base64, contentType) {
   return new Blob([bytes], { type: contentType || 'application/octet-stream' });
 }
 
+/**
+ * 响应头已经说明是网页/文本时直接判否。
+ * 只认这几种：媒体文件的 content-type 偶尔会缺、会写错，靠头判断会误杀，
+ * 所以头只用来**否定**，不用来肯定（首发字节的判断见 blobLooksLikeMarkup）。
+ */
+function isMarkupContentType(contentType) {
+  const value = String(contentType || '').toLowerCase();
+  if (!value) return false;
+  return (
+    value.startsWith('text/html') ||
+    value.startsWith('application/xhtml') ||
+    value.startsWith('application/json') ||
+    value.startsWith('text/plain')
+  );
+}
+
+/** Blob 的前几十字节是不是 `<`（HTML/XML 的开头）。 */
+async function blobLooksLikeMarkup(blob) {
+  let head = '';
+  try {
+    head = await blob.slice(0, 64).text();
+  } catch (error) {
+    return false;
+  }
+  return head.replace(/^\uFEFF/, '').trimStart().startsWith('<');
+}
+
 function uploadParams(item, categoryId) {
   const fileName = item.fileName || fileNameFromUrl(item.url) || 'asset';
   const params = new URLSearchParams();
@@ -321,6 +388,12 @@ async function importStreamed(uploadUrl, item) {
   if (!response.ok) {
     throw new Error(`拉取源文件被拒绝（HTTP ${response.status}）`);
   }
+  // 同一条底线在后台这条路也要守：回的若是网页，就别送进素材库。
+  if (isMarkupContentType(response.headers.get('content-type'))) {
+    throw new Error(
+      `这个地址返回的是网页（${response.headers.get('content-type')}），不是媒体文件 —— 多半是页面地址`
+    );
+  }
   const declared = Number(response.headers.get('content-length') || 0);
   if (declared > MAX_ASSET_BYTES) {
     throw new Error(`超过 ${Math.round(MAX_ASSET_BYTES / 1024 / 1024)} MB 上限`);
@@ -343,6 +416,11 @@ async function importStreamed(uploadUrl, item) {
   if (blob.size === 0) {
     // 签名 URL 失效、或源站只回了空体时，最容易在这里露馅：拿到 200 但一个字节都没有。
     throw new Error(`下载到 0 字节（等待 ${seconds} 秒，源站可能已让链接失效）`);
+  }
+  if (await blobLooksLikeMarkup(blob)) {
+    throw new Error(
+      `下载到的是网页而不是媒体文件（${(blob.size / 1024).toFixed(0)} KB）—— 多半是页面地址，不是图片直链`
+    );
   }
 
   // ③ 整块上传：与小文件**完全同一条**路径，只是体积大一些。
@@ -885,13 +963,28 @@ function findPageStreamsInPage() {
     // blob:/data: 正是要绕开的东西；其它协议也不是网页资源。
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
     const index = url.pathname.lastIndexOf('.');
-    if (index < 0) return;
-    const extension = url.pathname.slice(index + 1).toLowerCase();
+    const extension = index < 0 ? '' : url.pathname.slice(index + 1).toLowerCase();
     let bucket = '';
     if (PLAYLISTS.includes(extension)) bucket = 'playlists';
     else if (VIDEOS.includes(extension)) bucket = 'videos';
     else if (AUDIOS.includes(extension)) bucket = 'audios';
-    else return;
+    else {
+      // 没有后缀的媒体地址（抖音整套 CDN 都这样：`…/video/tos/…?mime_type=video_mp4`）。
+      // 只认确定性高的标记，不猜。
+      const host = url.hostname.toLowerCase();
+      const pathname = url.pathname.toLowerCase();
+      const mime = (url.searchParams.get('mime_type') || '').toLowerCase();
+      if (mime.includes('video') || pathname.includes('/video/tos/')) bucket = 'videos';
+      else if (mime.includes('audio')) bucket = 'audios';
+      else if (
+        /(^|\.)douyinvod\.com$|(^|\.)bytevcloudvod\.com$|(^|\.)bytevcloudvod\.net$/.test(host)
+      ) {
+        bucket = 'videos';
+      } else if (/(^|\.)(amemv\.com|snssdk\.com)$/.test(host) && pathname.includes('/play/')) {
+        bucket = 'videos';
+      }
+    }
+    if (!bucket) return;
     if (seen.has(url.href)) return;
     seen.add(url.href);
     found[bucket].push(url.href);

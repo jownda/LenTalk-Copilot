@@ -264,7 +264,16 @@ export interface IdentityRule {
 
 /** 场景空间站位 */
 export interface SceneStaging {
+  /** 主地点资产（高级编辑与编译器只认这一个）。 */
   locationAssetId?: string;
+  /**
+   * 附加场景：极简节点上的「场景站位」槽可以挂多个地点资产，顺序即出场顺序。
+   *
+   * 第一项始终与 `locationAssetId` 对齐（由节点的选择器维护），因此
+   * 高级编辑 / 编译器这类单地点消费方不需要改动；这里多出来的只是
+   * 「这段片子还会出现的其他场景」，用于给模型补参考图与地点描述。
+   */
+  locationAssetIds?: string[];
   /** 人物空间布局参考图：只约束站位、轴线、间距、排序与空间锚点，不替代地点资产。 */
   stagingReferenceImage?: string;
   priorContext?: string;

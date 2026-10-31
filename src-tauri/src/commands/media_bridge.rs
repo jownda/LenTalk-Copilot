@@ -338,6 +338,41 @@ fn import_asset(
         return Err("收到的素材内容为空".to_string());
     }
 
+    // 内容嗅探：扩展只知道「从哪个地址取」，并不知道那个地址回的到底是什么。
+    // 页面地址、登录页、防盗链的 200 HTML 都会被原样送过来 —— 只看后缀的话，
+    // 素材库里就会多出一张永远加载不出来的「png」（文件头其实是 <!DOCTYPE html>）。
+    // 所以落盘后按首字节核对一次：不是媒体就整份删掉并直接报错，
+    // 是媒体但后缀不符就按真实格式改名（webp 存成 .png 之类的也要纠正）。
+    let mut destination = destination;
+    match sniff_file(&destination) {
+        Ok(ContentKind::Media(real_extension)) => {
+            if real_extension != safe_extension(&request.extension) {
+                let renamed = destination.with_extension(real_extension);
+                match fs::rename(&destination, &renamed) {
+                    Ok(()) => {
+                        info!(
+                            "[media-bridge] 后缀已按真实格式纠正：{} -> {}",
+                            request.extension, real_extension
+                        );
+                        destination = renamed;
+                    }
+                    Err(error) => warn!("[media-bridge] 按真实格式改名失败: {error}"),
+                }
+            }
+        }
+        Ok(ContentKind::Text(what, preview)) => {
+            let _ = fs::remove_file(&destination);
+            return Err(format!(
+                "收到的不是媒体文件，而是{what}（多半是页面地址，或站点直接回了网页/错误页）：{preview}"
+            ));
+        }
+        Ok(ContentKind::Unknown(preview)) => {
+            let _ = fs::remove_file(&destination);
+            return Err(format!("收到的内容不是可识别的图片或音视频：{preview}"));
+        }
+        Err(error) => warn!("[media-bridge] 内容嗅探失败，按原后缀入库: {error}"),
+    }
+
     let source_path = destination.to_string_lossy().to_string();
     register_local_asset(
         app,
@@ -1381,6 +1416,128 @@ fn default_extension(media_type: &str) -> &'static str {
     }
 }
 
+/// 落盘内容的第一层身份：媒体、文本（网页/JSON 之类）、还是认不出来的东西。
+enum ContentKind {
+    /// 识别出的真实格式后缀。
+    Media(&'static str),
+    /// 人类可读的类型名 + 首段预览，直接拼进错误信息里方便排查。
+    Text(&'static str, String),
+    Unknown(String),
+}
+
+/// 嗅探用多少字节。够看清所有常见容器头，也够从文本里取一段预览。
+const SNIFF_BYTES: usize = 512;
+
+fn sniff_file(path: &Path) -> std::io::Result<ContentKind> {
+    let mut file = fs::File::open(path)?;
+    let mut buffer = vec![0u8; SNIFF_BYTES];
+    let read = file.read(&mut buffer)?;
+    buffer.truncate(read);
+    Ok(sniff_bytes(&buffer))
+}
+
+/// 按文件头判断真实格式。
+///
+/// 只认**能确定**的魔术字节，认不出来就交给调用方按原后缀入库 —— 宁可放过一个
+/// 少见的容器，也不要误杀用户真正的素材。
+fn sniff_bytes(bytes: &[u8]) -> ContentKind {
+    if bytes.is_empty() {
+        return ContentKind::Unknown("空文件".to_string());
+    }
+    let preview = |text: &str| {
+        let snippet: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cut: String = snippet.chars().take(80).collect();
+        if cut.is_empty() {
+            "（无可见文本）".to_string()
+        } else {
+            format!("「{cut}」")
+        }
+    };
+
+    // —— 图片 ——
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return ContentKind::Media("png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return ContentKind::Media("jpg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return ContentKind::Media("gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return ContentKind::Media("webp");
+    }
+    if bytes.starts_with(b"BM") && bytes.len() >= 14 {
+        return ContentKind::Media("bmp");
+    }
+    // —— ISO BMFF 家族：mp4 / mov / m4a / avif / heic 共用 `ftyp` ——
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        let extension = match brand {
+            b"avif" | b"avis" => "avif",
+            b"qt  " => "mov",
+            b"M4A " | b"M4B " | b"M4P " => "m4a",
+            b"heic" | b"heix" | b"hevc" | b"mif1" | b"msf1" => "heic",
+            _ => "mp4",
+        };
+        return ContentKind::Media(extension);
+    }
+    // —— EBML：webm 与 mkv 同族，靠 DocType 字符串区分 ——
+    if bytes.starts_with(b"\x1a\x45\xdf\xa3") {
+        let is_webm = bytes
+            .windows(4)
+            .any(|window| window == b"webm");
+        return ContentKind::Media(if is_webm { "webm" } else { "mkv" });
+    }
+    // —— 音频 ——
+    if bytes.starts_with(b"ID3") {
+        return ContentKind::Media("mp3");
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xff && (bytes[1] & 0xe0) == 0xe0 {
+        // MPEG 帧同步字：mp3 / aac(adts) 都在这里，按扩展名很难分，统一给 mp3。
+        return ContentKind::Media("mp3");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return ContentKind::Media("wav");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"AVI " {
+        return ContentKind::Media("avi");
+    }
+    if bytes.starts_with(b"fLaC") {
+        return ContentKind::Media("flac");
+    }
+    if bytes.starts_with(b"OggS") {
+        return ContentKind::Media("ogg");
+    }
+    if bytes.starts_with(b"#EXTM3U") {
+        return ContentKind::Media("m3u8");
+    }
+
+    // —— 文本：网页 / JSON / XML。这些一旦被当成图片入库，就是一张永远加载不出来的破图 ——
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("<!doctype html") || lower.starts_with("<html") || lower.starts_with("<head") {
+        return ContentKind::Text("网页（HTML）", preview(trimmed));
+    }
+    if lower.starts_with("<?xml") || lower.starts_with("<svg") {
+        // svg 是合法图片，别误杀。
+        if lower.contains("<svg") {
+            return ContentKind::Media("svg");
+        }
+        return ContentKind::Text("XML 文本", preview(trimmed));
+    }
+    if lower.starts_with('{') || lower.starts_with('[') {
+        return ContentKind::Text("JSON 文本", preview(trimmed));
+    }
+    if lower.starts_with("<!doctype") {
+        return ContentKind::Text("网页（HTML）", preview(trimmed));
+    }
+
+    ContentKind::Unknown(preview(trimmed))
+}
+
+
 fn extension_from_name(file_name: &str) -> Option<String> {
     let (_, extension) = file_name.rsplit_once('.')?;
     let trimmed = extension.trim();
@@ -1473,6 +1630,60 @@ fn respond_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 网页被当成图片入库，是素材库里「破图」的主因：扩展只知道地址、不知道内容。
+    #[test]
+    fn rejects_html_uploaded_as_image() {
+        let page = b"<!DOCTYPE html><html><head><title>x</title></head></html>";
+        match sniff_bytes(page) {
+            ContentKind::Text(kind, preview) => {
+                assert!(kind.contains("网页"), "{kind}");
+                assert!(preview.contains("DOCTYPE"), "{preview}");
+            }
+            _ => panic!("HTML 必须被判成文本"),
+        }
+    }
+
+    #[test]
+    fn recognises_real_media_by_magic_bytes() {
+        match sniff_bytes(b"\x89PNG\r\n\x1a\n....") {
+            ContentKind::Media(extension) => assert_eq!(extension, "png"),
+            _ => panic!("PNG 没被识别"),
+        }
+        match sniff_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF") {
+            ContentKind::Media(extension) => assert_eq!(extension, "jpg"),
+            _ => panic!("JPEG 没被识别"),
+        }
+        // 后缀写 png、内容其实是 webp —— 这类也要按真实格式纠正。
+        match sniff_bytes(b"RIFF\x24\x00\x00\x00WEBPVP8 ") {
+            ContentKind::Media(extension) => assert_eq!(extension, "webp"),
+            _ => panic!("WebP 没被识别"),
+        }
+        match sniff_bytes(&[0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'M', b'4', b'A', b' ']) {
+            ContentKind::Media(extension) => assert_eq!(extension, "m4a"),
+            _ => panic!("m4a 没被识别"),
+        }
+    }
+
+    /// svg 是合法图片，不能被「以 < 开头」误杀。
+    #[test]
+    fn keeps_svg_as_image() {
+        match sniff_bytes(br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"></svg>"#) {
+            ContentKind::Media(extension) => assert_eq!(extension, "svg"),
+            _ => panic!("SVG 必须仍算图片"),
+        }
+    }
+
+    #[test]
+    fn reports_json_error_bodies() {
+        match sniff_bytes(br#"{"error":"login required"}"#) {
+            ContentKind::Text(kind, preview) => {
+                assert!(kind.contains("JSON"), "{kind}");
+                assert!(preview.contains("login required"), "{preview}");
+            }
+            _ => panic!("JSON 必须被判成文本"),
+        }
+    }
 
     #[test]
     fn parses_query_values_with_url_decoding() {

@@ -143,19 +143,43 @@ function resolveBalanceInsufficient(
   return { message: BALANCE_INSUFFICIENT_MESSAGE, details: rawDetails?.trim() || undefined };
 }
 
+/**
+ * 多行错误 → 第一行当标题，其余进详情。
+ *
+ * Rust 侧的失败文案是「第一行给用户能照做的那句话，后面几行是壳子码 / 服务端原文」。
+ * 把整段塞进标题会被弹窗截断成半句，用户反而看不到要他做什么。
+ */
+export function splitErrorHeadline(text: string): ResolvedErrorContent {
+  const trimmed = text.trim();
+  const newline = trimmed.indexOf('\n');
+  if (!trimmed || newline < 0) {
+    return { message: trimmed };
+  }
+  const head = trimmed.slice(0, newline).trim();
+  const rest = trimmed.slice(newline + 1).trim();
+  if (!head || !rest) {
+    return { message: trimmed };
+  }
+  return { message: head, details: rest };
+}
+
 export function resolveErrorContent(error: unknown, fallbackMessage: string): ResolvedErrorContent {
   let resolved: ResolvedErrorContent;
   if (error instanceof Error) {
     const errorWithDetails = error as ErrorWithDetails;
     const details = stringifyUnknown(errorWithDetails.details);
+    const split = splitErrorHeadline(error.message?.trim() || fallbackMessage);
     resolved = {
-      message: error.message?.trim() || fallbackMessage,
-      details: details?.trim() || undefined,
+      message: split.message,
+      details:
+        [split.details, details?.trim()].filter(Boolean).join('\n') || undefined,
     };
   } else if (typeof error === 'string') {
     const content = error.trim();
+    const split = splitErrorHeadline(content || fallbackMessage);
+    // 详情仍保留完整文本：折叠区里要能一次看到全部原文。
     resolved = {
-      message: content || fallbackMessage,
+      message: split.message,
       details: content || undefined,
     };
   } else if (error && typeof error === 'object') {
@@ -167,8 +191,9 @@ export function resolveErrorContent(error: unknown, fallbackMessage: string): Re
       (typeof record.msg === 'string' && record.msg) ||
       '';
     const details = stringifyUnknown(record);
+    const split = splitErrorHeadline(candidate.trim() || fallbackMessage);
     resolved = {
-      message: candidate.trim() || fallbackMessage,
+      message: split.message,
       details: details?.trim() || undefined,
     };
   } else {
@@ -189,12 +214,16 @@ export async function showErrorDialog(
   details?: string,
   copyText?: string
 ): Promise<void> {
-  const content = text.trim();
+  const split = splitErrorHeadline(text);
+  const content = split.message;
   if (!content) {
     return;
   }
+  // 标题只留第一行，其余整段进详情（调用方额外给的 details 也接在后面）。
+  const mergedDetails =
+    [split.details, details?.trim()].filter(Boolean).join('\n') || undefined;
 
-  const balanceResolved = resolveBalanceInsufficient(content, details?.trim() || undefined);
+  const balanceResolved = resolveBalanceInsufficient(content, mergedDetails);
   const jimengResolved = resolveJimengCreditInsufficient(balanceResolved.message, balanceResolved.details);
   const resolved = isImageEditsNetworkError(jimengResolved.message, jimengResolved.details)
     ? resolveImageEditsNetworkError(jimengResolved.message, jimengResolved.details)

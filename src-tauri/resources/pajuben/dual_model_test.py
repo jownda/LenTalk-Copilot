@@ -4,8 +4,9 @@
 为什么拆成两步：
 - 只有原生 Gemini 这类「一个请求里同时吃图 + 吃音频」的模型能一次做完，
   其它普通多模态模型收到 input_audio 会直接报错或返回一段「请提供音频」；
-- 拆开之后，画面交给任意能看图的视觉模型，台词与音效交给任意能听声的音频
+- 拆开之后，画面交给任意能看图的视觉模型，台词交给任意能听声的音频
   模型，两个模型还可以来自不同渠道（各自的 base_url / key）。
+  音效/配乐不属于记录内容：听写阶段就只收人声，成稿里也不写。
 
 两段互不依赖，所以**并行跑**（画面批次再并发 2 路），最后一步合并才汇合；
 任何一段失败会立刻掐断另一段在途的请求，不必等对方超时。
@@ -124,6 +125,16 @@ def diagnose(stage, model, message):
     return ""
 
 
+def is_audio_capability_error(error):
+    """这次音频失败是不是「渠道/模型根本收不了音频」？
+
+    只认能力不匹配（input_audio 被拒）。鉴权、余额、限流、网络这些是**真错误**，
+    必须如实上报 —— 用户改模型也解决不了，只会白换一遍。
+    """
+    text = f"{getattr(error, 'reason', '')} {error}".lower()
+    return any(marker in text for marker in AUDIO_UNSUPPORTED_MARKERS)
+
+
 def compact_error(detail, limit=300):
     """把网关那坨嵌套 JSON 压成一句人能读的话。
 
@@ -171,12 +182,10 @@ def audio_messages(audio_path, ep):
 要求：
 1. 按时间顺序输出，约每5至10秒标一次【分:秒】时间戳。
 2. 完整保留所有人物台词、旁白、内心独白，不得总结或改写。
-3. 单独记录有意义的声音效果，格式写在该时间戳所在行的末尾，用「音效：」开头，
-   例如「音效：关门声、急促脚步、手机铃声、雨声、打斗撞击、背景音乐转紧张」；
-   音乐只描述情绪与起落，不要抄歌词之外的旋律描述。
+3. 只记人声：台词、旁白、内心独白。**不要记录音效、环境声、动作声、拟声和配乐**，
+   也不要出现“音效：”“声音：”“BGM：”这类标记；听不清处写【听不清】，不要编造。
 4. 能判断说话人就写姓名，不能确定写“未知角色”，不要猜姓名。
-5. 听不清处写【听不清】，不要编造。
-6. 只输出带时间戳的听写稿。"""
+5. 只输出带时间戳的听写稿。"""
     return [{"role": "user", "content": [
         {"type": "text", "text": prompt},
         {"type": "input_audio", "input_audio": {"data": data, "format": "mp3"}},
@@ -193,7 +202,7 @@ def vision_messages(frames, ep, known_roles, batch_no=1, batch_total=1):
 另起一行标时间点，写“角色名（约【分:秒】起换装）：只写变化的部分”。
 只闻其声、本批没出现在画面里的角色不要写。若本批没有新角色也没有换装，写“人物形象：本批无新增”。
 
-【第二段：逐镜头记录】每条△=一个镜头，格式为“△【分:秒】切镜方式，景别：X｜动作和表情”，
+【第二段：逐镜头记录】每条△=一个镜头，格式为“△【分:秒】景别｜动作和表情”，
 只写：场景、动作链、表情神态、站位与走位。具体：
 1. 场景：内外景、日夜、具体地点、可见陈设与光线；同一地点连续戏不拆场。
 2. 动作链：谁对谁做了什么、起势→过程→结果，以及对方的反应镜头。
@@ -202,11 +211,11 @@ def vision_messages(frames, ep, known_roles, batch_no=1, batch_total=1):
    换位、进出、靠近/拉开或转身必须另起一条。
 △行里不写发型、不写衣着、不写配饰（这些只属于上面的“人物形象”）——唯一例外是某一处衣着
 此刻正在发生变化或成为剧情证据（如“外套被雨水浸透”“他扯下领带缠住伤口”），只写这一处变化。
-切镜方式紧跟在时间码之后，取 起镜（只用于每场第一条）/切镜（硬切）/叠化/淡入/淡出/白闪/划像/甩镜，
-按画面实际过渡选，看不到过渡就写“切镜”，不许凭空编转场；时间只标该镜头开始的那一秒，
+时间码之后直接写景别，**不写切镜方式或任何转场词**（起镜/切镜/叠化/淡入/淡出/白闪/划像/甩镜一律不写）；
+时间只标该镜头开始的那一秒，
 景别从远景/全景/中景/近景/特写/大特写中选；同一镜头内的连续动作、反应和情绪加深合并进同一条，
-只有切镜（景别、机位或角度跳变，切入反应镜头或空镜）才另起一条。严禁按秒逐帧铺画面，
-不得把几十秒内容概括成一句。若某场全程无切镜，须在场景标题下写“一镜到底”，该场△省略切镜方式。
+只有换镜（景别、机位或角度跳变，切入反应镜头或空镜）才另起一条。严禁按秒逐帧铺画面，
+不得把几十秒内容概括成一句。若某场全程无换镜，须在场景标题下写“一镜到底”。
 已知角色表如下，能确认时必须使用其中姓名：
 {known_roles or '暂无'}
 只输出上述两段内容。"""
@@ -227,16 +236,16 @@ def merge_prompt(ep, transcript, vision, known_roles, has_audio=True):
         intro = "你是短剧剧本整理师。把同一集的音频听写和画面拉片按时间戳严格对齐，整理为标准拉片剧本。"
         rule_lines = """- 台词、旁白和内心独白以音频听写为准，不能删减或改写含义。
 - 场景、动作、表情和人物反应以画面拉片为准，不能脑补。
-- 响度明显或推动剧情的音效（关门、脚步、打斗、雨声、电话铃声、音乐起落）写进对应△的
-  “音效：”后缀里；没有就省略，不要凭空添加。"""
+- **剧本里不写音效**：关门、脚步、打斗、雨声、电话铃声、配乐起落等声音信息一律不写，
+  也不要出现“音效：”“声音：”“BGM：”这类标记；△行只写画面（时间 + 景别 + 动作和表情）。"""
         sources_block = f"""【音频听写】
 {transcript}
 
 【画面拉片】
 {vision}"""
-        sample_lines = """△【00:00】起镜，景别：全景｜动作、表情和反应。音效：关门声
+        sample_lines = """△【00:00】全景｜动作、表情和反应。
 角色名：台词
-△【00:07】切镜，景别：中景｜动作、表情和反应。
+△【00:07】中景｜动作、表情和反应。
 角色名：台词
 角色名（VO）：旁白
 角色名（OS）：内心独白"""
@@ -253,8 +262,8 @@ def merge_prompt(ep, transcript, vision, known_roles, has_audio=True):
   该场就只写△动作行，不要用“（无对白）”之类的占位行。"""
         sources_block = f"""【画面拉片】
 {vision}"""
-        sample_lines = """△【00:00】起镜，景别：全景｜动作、表情和反应。
-△【00:07】切镜，景别：中景｜动作、表情和反应。
+        sample_lines = """△【00:00】全景｜动作、表情和反应。
+△【00:07】中景｜动作、表情和反应。
 角色名（字幕）：画面里出现的字幕原文（这一场没有可见文字就不写这一行）"""
         sample_tail = "角色名（字幕）：可见字幕原文"
         voice_note = "本片没有声音，不写 VO/OS。"
@@ -262,6 +271,8 @@ def merge_prompt(ep, transcript, vision, known_roles, has_audio=True):
 
 硬性要求：
 {rule_lines}
+- 全篇不写音效：环境声、动作声、拟声词、配乐与音乐起落一律不写，也不得出现“音效：”
+  “声音：”“BGM：”等标记 —— 剧本只保留画面（△行）与人声（台词、VO、OS）。
 - 不得只写剧情摘要；完整保留动作链、神态、视线和反应镜头。
 - 【人物形象单开一段】紧跟“# 第{ep}集”标题之后、第一场之前，先输出一段「人物形象」：
   本集画面里出现过的每个角色独占一行，格式“角色名：发型与发色、服装款式与颜色、配饰、
@@ -279,12 +290,12 @@ def merge_prompt(ep, transcript, vision, known_roles, has_audio=True):
   必须在对应△中记录。
 - 每场可见状态有明确证据时，必须输出“人物状态：角色：状态（表情/动作证据）”；情绪只能根据
   可见证据归纳，不能编造心理活动。人物状态只写当前情绪与可见证据，不写衣着。
-- 每条△=一个镜头，格式为“△【分:秒】切镜方式，景别：X｜动作与表情”：切镜方式取
-  起镜/切镜/叠化/淡入/淡出/白闪/划像/甩镜（起镜只用于每场第一条△），时间只标该镜头开始的秒数、
-  景别必填；同一镜头内的连续内容合并为一条，只有切镜才另起一条。动作按“起势→过程→结果/对方
+- 每条△=一个镜头，格式为“△【分:秒】景别｜动作与表情”：时间码之后**直接写景别**（取
+  远景/全景/中景/近景/特写/大特写），不写切镜方式或任何转场词，时间只标该镜头开始的秒数、
+  景别必填；同一镜头内的连续内容合并为一条，只有换镜才另起一条。动作按“起势→过程→结果/对方
   反应”写清主体、对象和方向，严禁按秒逐帧铺画面；△里不写衣着。
-- 一镜到底的场次：场景标题下单独一行写“一镜到底”，该场每条△省略切镜方式（写成
-  “△【分:秒】景别：X｜动作与表情”）；画面里只要出现过一次真正的切换就不能算一镜到底。
+- 剪辑方式只写在“总时长”那一行行尾（例：总时长：9秒 一镜到底），△行里不重复；
+  画面里只要出现过一次真正的切换就不能算一镜到底。
 - 同一地点连续戏不拆场；地点或日夜/内外改变才开新场。
 - 场号严格为 {ep}-1、{ep}-2……
 - 每个场景标题下一行必须输出该场总时长，格式严格为“总时长：N秒”（只写这一场持续多少秒，
@@ -405,6 +416,12 @@ def main():
         args.audio_model = ""
         print("⚠ 这个视频没有音轨：跳过音频听写，只用视觉模型"
               f"「{args.vision_model}」扒画面", flush=True)
+    elif not args.audio_model:
+        # 没指定音频模型同样按「无对白」跑：画面那条线不依赖它，
+        # 卡在门口不让扒，比少一段台词更糟。
+        has_audio = False
+        print("⚠ 没有指定音频模型：跳过音频听写，只用视觉模型"
+              f"「{args.vision_model}」扒画面", flush=True)
 
     workdir = tempfile.mkdtemp(prefix="dual_pajuben_")
     # 音频听写与画面识别互不依赖，串着跑等于把两段耗时相加，一集多等好几分钟。
@@ -420,7 +437,20 @@ def main():
         VISION_BATCH_WORKERS = 2
     result = {"transcript": None, "vision": None}
     failure = {"error": None}
+    # 音频阶段降级原因（None = 正常）。
+    #
+    # 音频模型听不到声音不是致命错：渠道拒收 input_audio、模型回「听不到音频」、
+    # 或者抽出来的音频是空的 —— 这三种都只是「这集没台词」，画面那条线完全独立，
+    # 照样能出拉片剧本。旧版把它当硬失败，用户明明只想扒画面也拿不到任何东西。
+    degraded = {"audio": None}
     guard = threading.Lock()
+
+    def degrade_audio(reason):
+        """记下降级原因并提示；不设 cancel，画面阶段继续跑。"""
+        with guard:
+            if degraded["audio"] is None:
+                degraded["audio"] = reason
+        print(f"⚠ 音频阶段降级：{reason}；本集不写台词，改用纯画面拉片", flush=True)
 
     def mark_failure(error):
         """记下第一个失败，并立刻掐掉另一阶段在途的请求，别让用户干等超时。"""
@@ -442,20 +472,34 @@ def main():
                 result["transcript"] = load(audio_out)
                 print(f"[音频] 复用已完成听写：{audio_out}", flush=True)
                 return
-            print(f"[音频] 提取音频并用「{args.audio_model}」听写台词与音效…", flush=True)
+            print(f"[音频] 提取音频并用「{args.audio_model}」听写台词…", flush=True)
             audio = pajuben.extract_audio(args.video, workdir)
             if not audio:
-                raise SystemExit("❌ 这个视频没有可用音轨，无法识别台词与音效")
+                # 有音轨但抽不出音频（空轨 / 编码异常）：画面照样能扒。
+                degrade_audio("这个视频抽不出可用音频（可能是空音轨）")
+                return
             if cancel.is_set():
                 return
-            transcript = call_stage(
-                "audio", audio_base, audio_key, args.audio_model,
-                audio_messages(audio, args.ep))
+            try:
+                transcript = call_stage(
+                    "audio", audio_base, audio_key, args.audio_model,
+                    audio_messages(audio, args.ep))
+            except StageFailure as error:
+                # 渠道直接拒收 input_audio（模型/中转不支持音频输入）同样降级。
+                # 鉴权、余额、限流这些真错误仍然照旧上报。
+                if is_audio_capability_error(error):
+                    degrade_audio(
+                        f"音频模型「{args.audio_model}」收不到音频输入"
+                        "（该渠道/模型不支持 input_audio），请改选 Gemini / Qwen-Omni / "
+                        "GPT-4o-Audio 等能听声的模型")
+                    return
+                raise
             if looks_like_refusal(transcript, AUDIO_REFUSAL_PATTERNS):
-                raise StageFailure(
-                    "audio", args.audio_model,
-                    "模型没有真正接收到音频（返回的是「听不到音频」之类的说明）。"
-                    "这个模型不支持音频输入，请改选 Gemini / Qwen-Omni / GPT-4o-Audio 等能听声的模型")
+                degrade_audio(
+                    f"音频模型「{args.audio_model}」没有真正接收到音频"
+                    "（返回的是「听不到音频」之类的说明），请改选 Gemini / Qwen-Omni / "
+                    "GPT-4o-Audio 等能听声的模型")
+                return
             save(audio_out, transcript)
             result["transcript"] = transcript
             print(f"[音频] 已保存：{audio_out}", flush=True)
@@ -548,15 +592,19 @@ def main():
         if vision is None:
             raise SystemExit("❌ 画面阶段没有产出结果，请重试")
         if has_audio and transcript is None:
-            raise SystemExit("❌ 音频阶段没有产出结果，请重试")
+            if degraded["audio"] is None:
+                raise SystemExit("❌ 音频阶段没有产出结果，请重试")
+            # 音频降级：合并阶段按「无对白版」处理，绝不编台词。
+            print(f"⚠ 本集没有台词：{degraded['audio']}", flush=True)
+        with_audio = has_audio and transcript is not None
 
         # ---- 最后一步：按时间戳合并成剧情剧本 ----
-        print(f"[合并] {'按时间戳' if has_audio else '按画面时间码'}合并剧本"
+        print(f"[合并] {'按时间戳' if with_audio else '按画面时间码'}合并剧本"
               f"（复用视觉模型「{args.vision_model}」）…", flush=True)
         final = call_stage(
             "merge", vision_base, vision_key, args.vision_model,
             [{"role": "user", "content": merge_prompt(
-                args.ep, transcript, vision, known, has_audio=has_audio)}])
+                args.ep, transcript, vision, known, has_audio=with_audio)}])
         save(final_out, final)
         print(f"[合并] 完成：{final_out}", flush=True)
     except StageFailure as error:

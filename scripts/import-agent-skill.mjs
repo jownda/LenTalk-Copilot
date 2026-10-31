@@ -133,6 +133,54 @@ function safeFileName(slug) {
   return slug.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "skill";
 }
 
+/**
+ * 收集 skill 目录下 `references/*.md`。
+ *
+ * 必须内联的理由：SKILL.md 常写「模板见 references/prompt-templates.md」，
+ * 但 rules 是**整段进 system prompt 的纯文本**，运行时没有任何文件系统可读。
+ * 不内联的话，这句等于给模型指了一个不存在的文件 —— 它会自己现编模板顶上。
+ */
+function collectReferences(skillDir) {
+  const dir = join(skillDir, "references");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && extname(entry.name).toLowerCase() === ".md")
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b, "en", { numeric: true, sensitivity: "base" }))
+    .map((name) => ({
+      name,
+      text: readFileSync(join(dir, name), "utf8").replace(/^\uFEFF/, "").trim(),
+    }))
+    .filter((item) => item.text.length > 0);
+}
+
+/** 正文里的 `[文字](references/x.md)` → `《附录 x.md》`，避免模型去找不存在的文件 */
+function rewriteReferenceLinks(body, references) {
+  let out = body;
+  for (const ref of references) {
+    const escaped = ref.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(
+      new RegExp(`\\[([^\\]]*)\\]\\(references/${escaped}\\)`, "g"),
+      `《附录 ${ref.name}》`,
+    );
+  }
+  return out;
+}
+
+/** 正文 + 附录区；附录顺序按文件名自然序，标题保留原路径便于对照源目录 */
+function withReferences(body, references) {
+  if (references.length === 0) return body;
+  return [
+    rewriteReferenceLinks(body, references),
+    "",
+    "---",
+    "",
+    "# 附录（随 SKILL 一同加载的完整参考文档，直接按此执行，不要去读取文件）",
+    "",
+    references.map((ref) => `## 附录：references/${ref.name}\n\n${ref.text}`).join("\n\n"),
+  ].join("\n");
+}
+
 const { input, id: idFlag } = parseArgs(process.argv.slice(2));
 if (!input) {
   die('用法: node scripts/import-agent-skill.mjs "<skill 目录 或 SKILL.md 路径>" [--id <slug>]');
@@ -144,7 +192,8 @@ const skillDir = dirname(skillFile);
 
 const raw = readFileSync(skillFile, "utf8").replace(/^\uFEFF/, "");
 const { data: front, body } = splitFrontmatter(raw);
-const rules = body.trim();
+const references = collectReferences(skillDir);
+const rules = withReferences(body.trim(), references);
 if (!rules) die("SKILL.md 正文为空，拒绝生成空规则");
 
 let meta = {};
@@ -208,5 +257,8 @@ console.log(
     : "  ⚠️ skill 目录里没有图片，未生成缩略图（放一张 *.webp/*.png 进去后重跑即可）",
 );
 console.log(`  规则 ${rules.length} 字符 / ${rules.split(/\r?\n/).length} 行`);
+if (references.length > 0) {
+  console.log(`  已内联 references：${references.map((ref) => ref.name).join(" / ")}`);
+}
 console.log("");
 console.log("还剩一步：把它加进 src/features/agent/skills/index.ts 的 AGENT_SKILLS");

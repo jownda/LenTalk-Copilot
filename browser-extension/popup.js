@@ -139,10 +139,56 @@ function scanPageMedia() {
 
   const kindFromUrl = (url) => {
     const extension = extensionOf(url);
-    if (!extension) return null;
     if (IMAGE_EXTENSIONS.includes(extension)) return 'image';
     if (VIDEO_EXTENSIONS.includes(extension)) return 'video';
     if (AUDIO_EXTENSIONS.includes(extension)) return 'audio';
+    // 没有后缀的地址交给下面那条「按主机名与查询参数判断」的规则，
+    // 抖音这类站点的媒体地址全都长这样：`…/video/tos/cn/…/?a=6383&mime_type=video_mp4&…`
+    return kindFromExtensionlessUrl(url);
+  };
+
+  /**
+   * 没有扩展名的媒体地址怎么认。
+   *
+   * 抖音（以及整套字节 CDN）把视频放在 `…/video/tos/…/?mime_type=video_mp4` 这种
+   * 路径没有一点后缀的地址上，播放器再用 fetch/range 把它喂给 MSE —— `<video>` 的 src
+   * 是 `blob:`，performance 里的真实地址又没有后缀，于是**两路都落空**，
+   * 表现就是「这个网页的视频识别不到」。
+   * 所以这里只认几种**确定性高**的标记，认不出来的一律返回 null（宁可少收，不要瞎收）。
+   */
+  const kindFromExtensionlessUrl = (url) => {
+    let target;
+    try {
+      target = new URL(url);
+    } catch {
+      return null;
+    }
+    const host = target.hostname.toLowerCase();
+    const pathname = target.pathname.toLowerCase();
+
+    // ① 查询参数直接写了媒体类型（抖音/TikTok：mime_type=video_mp4、audio_mp4）
+    const mime = (target.searchParams.get('mime_type') || '').toLowerCase();
+    if (mime) {
+      if (mime.includes('video')) return 'video';
+      if (mime.includes('audio')) return 'audio';
+      if (mime.includes('image')) return 'image';
+    }
+    // ② 字节系 CDN 的固定路径段
+    if (pathname.includes('/video/tos/')) return 'video';
+    // ③ 主机名兜底（都在字节系域名下，且这些域只发视频）
+    if (/(^|\.)douyinvod\.com$|(^|\.)bytevcloudvod\.com$|(^|\.)bytevcloudvod\.net$/.test(host)) {
+      return 'video';
+    }
+    // ④ 图片 CDN：抖音封面之类（这些域只发图片）
+    if (/(^|\.)douyinpic\.com$|(^|\.)pstatp\.com$/.test(host)) return 'image';
+    // ⑤ 图床的图片处理参数（七牛 / 阿里 OSS）
+    if (target.searchParams.has('imageView2') || /x-oss-process=image/.test(target.search)) {
+      return 'image';
+    }
+    // ⑥ 抖音开放播放接口（移动端/嵌入页）：`…/aweme/v1/play/?video_id=…`
+    if (/(^|\.)(amemv\.com|snssdk\.com)$/.test(host) && pathname.includes('/play/')) {
+      return 'video';
+    }
     return null;
   };
 
@@ -157,12 +203,20 @@ function scanPageMedia() {
     } catch {
       fileName = '';
     }
+    // 无后缀地址的名字常常是一串哈希（抖音 `…/oQ8XkA…/?…`），当素材名毫无意义。
+    // 这种时候退到页面标题 —— 抖音的标题就是文案，比哈希有信息量得多。
+    const hashLike = !/\.[a-z0-9]{1,12}$/i.test(fileName);
+    const fallbackName = String(document.title || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 60);
+    const name = hashLike && fallbackName ? fallbackName : fileName.replace(/\.[^.]+$/, '');
     results.push({
       url,
       mediaType,
       width: extra && extra.width ? extra.width : 0,
       height: extra && extra.height ? extra.height : 0,
-      name: fileName.replace(/\.[^.]+$/, ''),
+      name,
       fileName,
       extension: '',
       poster: (extra && extra.poster) || '',
@@ -228,11 +282,15 @@ function scanPageMedia() {
    */
   let mseVideoShot = null;
   let anyVideoShot = null;
+  /** 页面上有 blob: 的播放器 → 说明视频是 MSE 喂进去的，真实地址只在网络记录里。 */
+  let msePlaybackDetected = false;
 
   document.querySelectorAll('video').forEach((video) => {
+    const blobSource = (video.currentSrc || video.getAttribute('src') || '').startsWith('blob:');
+    if (blobSource) msePlaybackDetected = true;
     if (video.poster && normalize(video.poster)) {
       const shot = { poster: video.poster, width: video.videoWidth, height: video.videoHeight };
-      if ((video.currentSrc || video.getAttribute('src') || '').startsWith('blob:')) {
+      if (blobSource) {
         mseVideoShot = mseVideoShot || shot;
       }
       anyVideoShot = anyVideoShot || shot;
@@ -268,6 +326,9 @@ function scanPageMedia() {
       audio.getAttribute('data-src'),
       ...Array.from(audio.querySelectorAll('source')).map((node) => node.getAttribute('src')),
     ];
+    if ((audio.currentSrc || audio.getAttribute('src') || '').startsWith('blob:')) {
+      msePlaybackDetected = true;
+    }
     for (const candidate of candidates) {
       if (normalize(candidate)) {
         add(candidate, 'audio', {});
@@ -315,15 +376,40 @@ function scanPageMedia() {
    * 不认识的（fetch 出来的 /api/xxx）一律不猜 —— 宁可少收，不要把接口地址塞进素材库。
    */
   const kindByInitiator = { img: 'image', imageset: 'image', video: 'video', audio: 'audio' };
+  /**
+   * 抖音这类地址每次请求都会换一套签名参数（`t=` `sn=` `rc=` …），同一个视频在时间线里
+   * 会出现好几条「看起来不一样」的 URL。按 主机 + 路径 去重，否则列表里全是一个视频的副本。
+   */
+  const pathSeen = new Set();
   try {
     const entries = performance.getEntriesByType('resource') || [];
     entries.forEach((entry) => {
       const url = normalize(entry && entry.name);
       if (!url || seen.has(url)) return;
-      const kind = kindFromUrl(url) || kindByInitiator[entry.initiatorType];
-      if (!kind) return;
-      // DOM 之外的图片没有尺寸可比，只能用传输体积粗略挡掉小图标和埋点像素。
       const bytes = entry.transferSize || entry.decodedBodySize || 0;
+      let kind = kindFromUrl(url) || kindByInitiator[entry.initiatorType];
+      if (!kind) {
+        // 最后一道兜底：页面确实在用 MSE 播（`<video src="blob:">`），而这条 XHR/fetch
+        // 又大到不可能是 JSON —— 抖音这类「无后缀 + 签名参数 + fetch 取流」的站点，
+        // 除了体积之外没有任何可读标记。门槛压到 512 KB，宁可漏掉小片段，不猜接口地址。
+        const bigTransfer =
+          (entry.initiatorType === 'xmlhttprequest' || entry.initiatorType === 'fetch') &&
+          bytes >= 512 * 1024;
+        if (msePlaybackDetected && bigTransfer) kind = 'video';
+      }
+      if (!kind) return;
+      if (!extensionOf(url)) {
+        let key = url;
+        try {
+          const parsed = new URL(url);
+          key = `${parsed.hostname}${parsed.pathname}`;
+        } catch {
+          key = url;
+        }
+        if (pathSeen.has(key)) return;
+        pathSeen.add(key);
+      }
+      // DOM 之外的图片没有尺寸可比，只能用传输体积粗略挡掉小图标和埋点像素。
       if (kind === 'image' && bytes > 0 && bytes < MIN_TRANSFER_BYTES) return;
       // 清单自己不可能有封面，借页面上播放器那张 —— 卡片才有图可看。
       const shot =

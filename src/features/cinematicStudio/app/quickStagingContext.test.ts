@@ -46,6 +46,28 @@ describe('buildQuickStagingContext', () => {
     });
   });
 
+  it('carries every staged scene when the node picked more than one location', () => {
+    const assets: Asset[] = [
+      asset({ id: 'loc', kind: 'location', name: '站台', descriptionZh: '雨夜的废弃站台' }),
+      asset({ id: 'alley', kind: 'location', name: '后巷', descriptionZh: '湿滑的窄巷' }),
+      asset({ id: 'roof', kind: 'location', name: '天台' }),
+    ];
+
+    const context = buildQuickStagingContext({
+      assets,
+      // 主地点排在列表首位（节点维护），附加场景按添加顺序续在后面。
+      staging: { locationAssetId: 'alley', locationAssetIds: ['alley', 'loc', 'roof', 'missing'] },
+      locale: 'zh',
+    });
+
+    expect(context.staging?.locationName).toBe('后巷');
+    expect(context.staging?.locations?.map((item) => [item.locationName, item.locationDescription])).toEqual([
+      ['后巷', '湿滑的窄巷'],
+      ['站台', '雨夜的废弃站台'],
+      ['天台', undefined],
+    ]);
+  });
+
   it('reads the acting master and voice lock from the character asset with locale fallback', () => {
     const assets: Asset[] = [
       asset({

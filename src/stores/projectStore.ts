@@ -196,7 +196,25 @@ function extractProjectThumbnailRefs(nodes: CanvasNode[]): string[] {
   return refs;
 }
 
-function mapNodeImageReferences(
+/**
+ * 值本身就是「一组媒体来源」的字段，和标量字段一样进 `imagePool`。
+ *
+ * 为什么必须收藏数组：同一个参考图数组会同时被三处各存一份 ——
+ * 提示词工作室的 `quickReferenceImages`、它的 `studioReferenceImages`，以及下游
+ * AI 视频节点的 `studioReferenceImages`。值是几十 KB 的 data URL 时，一个工程能因此
+ * 涨到十几 MB（实测某个 220 节点的工程 nodes_json = 17 MB，其中 16 MB 全是这几份数组），
+ * 打开工程要多传、多解析、多解码十几次，这正是「画布上的素材加载慢」的主因。
+ * 池化之后同一张图只留一份，读盘与解析的开销按「去重后的张数」算，而不是引用次数。
+ */
+const POOLED_MEDIA_ARRAY_KEYS = [
+  'studioReferenceImages',
+  'quickReferenceImages',
+  'referenceImages',
+  'excludedReferenceSources',
+  'referencePaths',
+] as const;
+
+export function mapNodeImageReferences(
   nodes: CanvasNode[],
   mapImageUrl: (imageUrl: string | null | undefined) => string | null | undefined
 ): CanvasNode[] {
@@ -257,6 +275,23 @@ function mapNodeImageReferences(
         nextRequest.referenceAudio = [...requestRecord.referenceAudio];
       }
       nextData.generationRequest = nextRequest;
+    }
+
+    // 参考图 / 参考素材数组：编码时进池、解码时出池，同一张图只落一份。
+    for (const key of POOLED_MEDIA_ARRAY_KEYS) {
+      const value = nextData[key];
+      if (!Array.isArray(value)) {
+        continue;
+      }
+      nextData[key] = value.map((item) => {
+        if (typeof item !== 'string') {
+          return item;
+        }
+        // 解码失败（imagePool 缺失，例如浏览器降级模式）时保留原值，
+        // 宁可留一个解不开的引用，也不要把它变成 null 打乱数组顺序
+        // —— 首尾帧这类字段的位置是有语义的。
+        return mapImageUrl(item) ?? item;
+      });
     }
 
     if (Array.isArray(nextData.frames)) {

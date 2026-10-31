@@ -1395,6 +1395,8 @@ export function checkContext(project: ProjectV2, scene: SceneV2, _options: Conti
     for (const state of shot.propStatesAtStart ?? []) set.add(state.propId);
     for (const state of shot.propStatesAtEnd ?? []) set.add(state.propId);
     if (scene.staging?.locationAssetId) set.add(scene.staging.locationAssetId);
+    // 节点上多选的附加场景同样是这场明确引用的资产。
+    for (const locationId of scene.staging?.locationAssetIds ?? []) set.add(locationId);
     return set;
   };
   const textFields = (shot: SceneV2["shots"][number]) => [

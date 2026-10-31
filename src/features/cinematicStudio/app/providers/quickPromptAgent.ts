@@ -18,11 +18,24 @@ export interface QuickPromptAsset {
  * 场景站位里的空间契约。节点上的选择器只存资产 id，
  * 锚点、左右站位、间距这些文字只存在于电影工程里，需要单独带进模型上下文。
  */
+export interface QuickPromptLocation {
+  locationId?: string;
+  locationName: string;
+  /** 地点资产的描述（与活动引用同义，供模型确认「哪个 @标签 是这个场景」）。 */
+  locationDescription?: string;
+}
+
 export interface QuickPromptStaging {
+  /** 主地点（= locations[0]，单场景时是唯一的地点）。 */
   locationId?: string;
   locationName?: string;
   /** 地点资产的描述（与活动引用同义，供模型确认「哪个 @标签 是这个场景」）。 */
   locationDescription?: string;
+  /**
+   * 多场景：节点「场景站位」槽里挂的全部地点，顺序即出场顺序（含主地点）。
+   * 只有一个场景时不填，输出与旧版逐字一致。
+   */
+  locations?: QuickPromptLocation[];
   /** 空间锚点：人物相对固定参照物的位置。 */
   anchorDescription?: string;
   /** 左到右的站位顺序（角色名）。 */
@@ -165,10 +178,31 @@ function renderCharacterVoiceReference(
 /** 场景站位：只输出有内容的行，避免空标题干扰模型。 */
 function renderStaging(staging: QuickPromptStaging, refs: QuickAssetRefNames): string[] {
   const lines: string[] = [];
-  if (staging.locationName) {
-    const description = staging.locationDescription?.trim();
+  // 单个场景走原来的行；多个场景每个一行并编号，再补一句「都要用到」的提示 ——
+  // 否则模型很容易只挑第一个地点写，把其余的场景参考图当废图。
+  const locations =
+    staging.locations?.length
+      ? staging.locations
+      : staging.locationName
+        ? [{ locationName: staging.locationName, locationDescription: staging.locationDescription }]
+        : [];
+  const locationLine = (prefix: string, location: QuickPromptLocation) => {
+    const description = location.locationDescription?.trim();
+    return `${prefix}@${refNameOfText(refs, location.locationName)}${description ? ` — ${description}` : ""}`;
+  };
+  if (locations.length === 1) {
+    lines.push(locationLine("LOCATION (场景站位地点): ", locations[0]));
+  } else if (locations.length > 1) {
+    locations.forEach((location, index) => {
+      lines.push(
+        locationLine(
+          `LOCATION ${index + 1} (场景站位地点，出场顺序 ${index + 1}/${locations.length}): `,
+          location,
+        ),
+      );
+    });
     lines.push(
-      `LOCATION (场景站位地点): @${refNameOfText(refs, staging.locationName)}${description ? ` — ${description}` : ""}`,
+      `MULTI-LOCATION (本片段有 ${locations.length} 个场景): 每个场景都要出现在成片里，按故事梗概的叙述顺序分配段落；同一个镜头内只使用一个地点的空间关系，跨地点用硬切或明确的空间过渡。`,
     );
   }
   if (staging.anchorDescription?.trim()) lines.push(`SPATIAL ANCHOR (空间锚点): ${staging.anchorDescription.trim()}`);

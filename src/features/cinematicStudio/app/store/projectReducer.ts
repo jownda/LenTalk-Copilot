@@ -4,7 +4,7 @@
  * 场景/镜头/节拍操作在 P0.2-P0.4 分批迁入。
  */
 import { deriveProjectCode, withAssetReferenceTag } from "../../engine";
-import type { Asset, AssetKind, FinalAuditLogEntry, ProjectV2 } from "../../shared-types";
+import type { Asset, AssetKind, FinalAuditLogEntry, ProjectV2, SceneStaging } from "../../shared-types";
 
 export const newId = () => crypto.randomUUID();
 
@@ -23,6 +23,21 @@ export type ProjectAction =
 
 export function assetKindLabel(kind: AssetKind): string {
   return { character: "character", location: "location", prop: "prop", "style-reference": "style-reference", "audio-reference": "audio-reference" }[kind];
+}
+
+/**
+ * 删掉一个地点资产后，场景站位的多场景列表要跟着收敛。
+ *
+ * 节点的「场景站位」槽是多选，删掉的若是主地点，必须把下一个场景顶上
+ * `locationAssetId` —— 否则编译器会认为这场没有地点，而节点上还挂着别的场景。
+ */
+function stagingWithoutLocation(staging: SceneStaging, assetId: string): Partial<SceneStaging> {
+  const ids = (staging.locationAssetIds ?? []).filter((id) => id !== assetId);
+  const primary = staging.locationAssetId === assetId ? ids[0] : staging.locationAssetId;
+  return {
+    ...(primary !== staging.locationAssetId ? { locationAssetId: primary } : {}),
+    ...(staging.locationAssetIds ? { locationAssetIds: ids } : {}),
+  };
 }
 
 export function projectReducer(state: ProjectV2, action: ProjectAction): ProjectV2 {
@@ -115,7 +130,7 @@ export function projectReducer(state: ProjectV2, action: ProjectAction): Project
           staging: scene.staging
             ? {
                 ...scene.staging,
-                ...(scene.staging.locationAssetId === action.id ? { locationAssetId: undefined } : {}),
+                ...stagingWithoutLocation(scene.staging, action.id),
                 characterRoster: (scene.staging.characterRoster ?? []).filter((id) => id !== action.id),
                 characterOrder: (scene.staging.characterOrder ?? []).filter((id) => id !== action.id),
                 propRoster: (scene.staging.propRoster ?? []).filter((id) => id !== action.id),

@@ -23,6 +23,10 @@ import { useProjectStore } from '@/stores/projectStore';
  * 这个模块做的是「一次性搬家」：把存量数据里指向远端的媒体下载到本地落盘目录
  * （`设置 → 通用 → 默认落盘位置`），并把引用改写成本地路径。
  *
+ * 除了远端链接，**内嵌的 base64（`data:`）也一起搬**：它比死链更隐蔽 —— 数据永远在，
+ * 但每个工程都完整复制一份，打工程就要多传、多解析、多解码十几 MB。
+ * 判定见 `isLocalizableMediaSource`。
+ *
  * ⚠️ 这里**不能**盲目扫描所有 `http` 字符串 —— 提示词里出现一条参考链接是很正常的，
  * 把它换成本地路径等于把用户的提示词改坏。所以只认下面这份**字段名白名单**
  * （枚举自 `canvasNodes.ts` / `cinematicStudio/shared-types` 的媒体字段），
@@ -91,6 +95,29 @@ export function isDownloadableRemoteSource(source: string): boolean {
   return /^https?:\/\//i.test(source.trim());
 }
 
+/**
+ * 内嵌 base64 的最小落盘长度。
+ *
+ * `data:` 也是「应该搬成文件」的来源：它被**完整复制进每个仓库工程**，一个 220 节点的
+ * 工程实测 nodes_json 有 17 MB，其中 16 MB 就是参考图数组里的 base64 ——
+ * 打开工程要传、要 `JSON.parse`、要逐张解码，这就是「画布上的素材加载慢」的主因。
+ * 但几 KB 的小图标（个别 SVG 占位）搬成文件反而多一次 IPC + 一个文件，
+ * 收益抵不上噪声，所以设一道门槛。
+ */
+const INLINE_DATA_MIN_LENGTH = 4096;
+
+/** 需要搬成本地文件的来源：远端临时链接，以及够大的内嵌 base64。 */
+export function isLocalizableMediaSource(source: string): boolean {
+  const value = source.trim();
+  if (!value) {
+    return false;
+  }
+  if (isDownloadableRemoteSource(value)) {
+    return true;
+  }
+  return /^data:/i.test(value) && value.length >= INLINE_DATA_MIN_LENGTH;
+}
+
 export interface MediaLocalizeFailure {
   source: string;
   reason: string;
@@ -125,7 +152,7 @@ function createContext(resolve: MediaSourceResolver): WalkContext {
 
 async function localizeSource(source: string, context: WalkContext): Promise<string> {
   const trimmed = source.trim();
-  if (!isDownloadableRemoteSource(trimmed)) {
+  if (!isLocalizableMediaSource(trimmed)) {
     return source;
   }
 
@@ -140,7 +167,7 @@ async function localizeSource(source: string, context: WalkContext): Promise<str
 
   try {
     const localPath = (await context.resolve(trimmed)).trim();
-    if (!localPath || localPath === trimmed || isDownloadableRemoteSource(localPath)) {
+    if (!localPath || localPath === trimmed || isLocalizableMediaSource(localPath)) {
       context.failed.add(trimmed);
       context.stats.failed.push({ source: trimmed, reason: '未拿到本地路径' });
       return source;
