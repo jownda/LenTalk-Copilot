@@ -84,6 +84,13 @@ export interface VideoModelDefinition {
   /** 仅在供应商公开了视频分辨率约束时显示。 */
   resolutions?: ResolutionOption[];
   defaultResolution?: string;
+  /**
+   * 单次最多可带几张参考图。`undefined` = 平台未声明上限。
+   *
+   * 节点据此显示「已选 N / 上限」并在提交时截断 —— 有的模型(如 muse-video 只收 4 张)
+   * 超量会直接报错, 而不是静默忽略。
+   */
+  maxReferenceImages?: number;
   pricing?: ModelPricingDefinition;
   profileId?: string;
   profileStatus?: "verified" | "pending-adaptation";

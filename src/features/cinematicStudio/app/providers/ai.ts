@@ -19,6 +19,7 @@ import { describeProviderFailure, isUpstreamPromptPolicyRejection } from "@/comm
 import { createProviderStreamWatchdog } from "./providerStreamWatchdog";
 import type { Locale } from "../i18n";
 import { buildQuickPromptRequest, type QuickPromptInput } from "./quickPromptAgent";
+import { findQuickPromptFormat, type QuickPromptFormat } from "./quickPromptFormats";
 import { cameraMoveTemplateLibrary } from "../cameraMoveTemplates";
 import { cameraMovementVocab, normalizeCameraMovement } from "../cameraMovements";
 
@@ -346,7 +347,17 @@ function extractJSON<T>(text: string): T {
 export async function readChatCompletionText(
   response: Response,
   onChunk?: (receivedChars: number) => void,
-  options?: { allowUnterminatedEof?: boolean },
+  options?: {
+    allowUnterminatedEof?: boolean;
+    /**
+     * 把 `finish_reason: length` 当成「被截断」而不是「正常结束」。
+     *
+     * 推理模型的思考 token 也算在输出预算里，预算不够时它会先吐一句开场说明
+     * （「我将把这段梗概转成……」）就停住。默认行为把这个半截结果当成功返回，
+     * 用户拿到的是几十个字的散文而不是提示词。开启后交给调用方走续写。
+     */
+    treatLengthAsInterruption?: boolean;
+  },
 ): Promise<string> {
   const extractContent = (value: unknown): string => {
     if (!value || typeof value !== "object") return "";
@@ -380,6 +391,8 @@ export async function readChatCompletionText(
   let content = "";
   let sawStreamEvent = false;
   let completed = false;
+  /** 上游给的结束原因：`length` = 撞到输出上限，不是写完。 */
+  let finishReason = "";
   const consumeLine = (line: string) => {
     raw += `${line}\n`;
     const payload = line.trim().startsWith("data:") ? line.trim().slice(5).trim() : "";
@@ -390,7 +403,11 @@ export async function readChatCompletionText(
       const data = JSON.parse(payload) as { choices?: { finish_reason?: unknown }[] };
       content += extractContent(data);
       if (content) onChunk?.(content.length);
-      if (data.choices?.[0]?.finish_reason) completed = true;
+      const reason = data.choices?.[0]?.finish_reason;
+      if (reason) {
+        finishReason = String(reason);
+        completed = true;
+      }
     } catch {
       // Keep the complete body for the ordinary JSON fallback below.
     }
@@ -430,6 +447,10 @@ export async function readChatCompletionText(
     if (content) throw new ChatCompletionInterruptedError(content);
     throw new Error("模型流式响应未正常结束");
   }
+  // 撞到输出上限：内容是半截的，交给调用方续写，别当成品保存。
+  if (content && options?.treatLengthAsInterruption && finishReason.toLowerCase() === "length") {
+    throw new ChatCompletionInterruptedError(content, undefined, "模型输出达到上限被截断，已保留已收到的内容");
+  }
   if (content) return content;
 
   try {
@@ -440,6 +461,24 @@ export async function readChatCompletionText(
 }
 
 const STREAM_UNSUPPORTED_RE = /stream(?:ing)?(?:\s+parameter|\s+field)?[^\n]{0,80}(?:unsupported|not supported|unknown|invalid)|(?:unsupported|not supported|unknown|invalid)[^\n]{0,80}stream/i;
+
+/** OpenAI 推理模型：思考 token 与正文共用输出预算，且只认 `max_completion_tokens`。 */
+const REASONING_MODEL_RE = /^(?:o[1-9](?:[-.]|$)|gpt-(?:[5-9]))/i;
+
+/**
+ * 输出预算。不显式给，很多渠道会按一个偏小的默认值截断；给了又不认字段的渠道
+ * 由 `isOutputBudgetRejection` 兜底摘掉重发。
+ */
+export function outputBudgetField(model: string): Record<string, number> {
+  const reasoning = REASONING_MODEL_RE.test(model.trim());
+  const budget = reasoning ? 16000 : 8000;
+  return reasoning ? { max_completion_tokens: budget } : { max_tokens: budget };
+}
+
+function isOutputBudgetRejection(body: string): boolean {
+  if (!/max_(?:completion_)?tokens/i.test(body)) return false;
+  return /unsupported|not supported|unknown|invalid|too large|exceed|greater than|out of range/i.test(body);
+}
 
 function continuationMessages(messages: unknown[], partialText: string): unknown[] {
   return [
@@ -713,7 +752,15 @@ async function audioSourceToInputPart(source: string): Promise<AudioInputPart> {
 async function chatCompletionsTextRaw(settings: AISettings, system: string, user: string, onProgress?: SceneCompileProgressListener): Promise<string> {
   const endpoint = `${openAICompatibleBaseUrl(settings.baseUrl)}/chat/completions`;
   const baseMessages = [{ role: "system", content: system }, { role: "user", content: user }];
-  const request = (streaming: boolean, messages: unknown[] = baseMessages) => remoteFetch(endpoint, {
+  /**
+   * `withBudget` 用来在渠道拒收输出预算字段时降级重发。
+   *
+   * 为什么必须显式给额度：不传时，很多中转站按一个很小的默认值截断，而推理模型的
+   * 思考 token 与正文共享这份预算。规则包很长（搏斗格式 9.4 万字符）时，思考先把
+   * 预算吃光，正文只剩一句开场说明（「我将把这段梗概转成……」）就结束 ——
+   * 这正是「出不来，只输出一段英文」的实际成因。
+   */
+  const request = (streaming: boolean, messages: unknown[] = baseMessages, withBudget = true) => remoteFetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -724,6 +771,7 @@ async function chatCompletionsTextRaw(settings: AISettings, system: string, user
       temperature: settings.temperature ?? 0.4,
       stream: streaming,
       ...(settings.reasoningEffort ? { reasoning_effort: settings.reasoningEffort } : {}),
+      ...(withBudget ? outputBudgetField(settings.model) : {}),
       messages,
     }),
   });
@@ -733,6 +781,9 @@ async function chatCompletionsTextRaw(settings: AISettings, system: string, user
     const raw = await response.clone().text().catch(() => "");
     if ((response.status === 400 || response.status === 422) && STREAM_UNSUPPORTED_RE.test(raw)) {
       response = await request(false);
+    } else if ((response.status === 400 || response.status === 422) && isOutputBudgetRejection(raw)) {
+      // 少数渠道只认其中一个字段名，或模型上限比我们给的小：摘掉重发，不要为此失败。
+      response = await request(true, baseMessages, false);
     } else if (isUpstreamPromptPolicyRejection(raw)) {
       // 上游输入内容预检是偶发判定（与提示词长度相关性高、随模型和时段波动）：原样
       // 重发一次，命中率不低；被预检拦下的请求根本没执行，重发不会产生额外计费。
@@ -745,38 +796,50 @@ async function chatCompletionsTextRaw(settings: AISettings, system: string, user
     throw new Error(describeProviderFailure(response.status, { raw, model: settings.model }));
   }
   try {
-    const content = (await readChatCompletionText(response, (receivedChars) => onProgress?.("streaming", receivedChars))).trim();
+    const content = (await readChatCompletionText(
+      response,
+      (receivedChars) => onProgress?.("streaming", receivedChars),
+      { treatLengthAsInterruption: true },
+    )).trim();
     if (!content) throw new Error("响应中没有最终提示词文本");
     onProgress?.("parsing");
     return content;
   } catch (error) {
     if (!(error instanceof ChatCompletionInterruptedError) || !error.partialText.trim()) throw error;
-    const continueFrom = async (partialText: string): Promise<string> => {
+    const continueFrom = async (partialText: string, depth = 1): Promise<string> => {
       onProgress?.("resuming");
+      // 截断续写最多三轮：预算确实太小时，继续追问只会把同一句话重复到超时。
+      if (depth > 3) {
+        throw new ChatCompletionInterruptedError(partialText, undefined, `模型连续 ${depth - 1} 次撞到输出上限仍未写完，已保留 ${partialText.length} 个字符`);
+      }
       let resumedResponse: Response;
       try {
         resumedResponse = await request(true, continuationMessages(baseMessages, partialText));
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
-        throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText), `续写请求失败，已保留 ${partialText.length} 个字符：${detail}`);
+        throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText, depth + 1), `续写请求失败，已保留 ${partialText.length} 个字符：${detail}`);
       }
       if (!resumedResponse.ok) {
         const raw = await resumedResponse.text().catch(() => "");
         throw new ChatCompletionInterruptedError(
           partialText,
-          () => continueFrom(partialText),
+          () => continueFrom(partialText, depth + 1),
           `续写请求 HTTP ${resumedResponse.status}${raw ? `：${raw.slice(0, 260)}` : ""}`,
         );
       }
       let resumed: string;
       try {
-        resumed = await readChatCompletionText(resumedResponse, (receivedChars) => onProgress?.("resuming", partialText.length + receivedChars));
+        resumed = await readChatCompletionText(
+          resumedResponse,
+          (receivedChars) => onProgress?.("resuming", partialText.length + receivedChars),
+          { treatLengthAsInterruption: true },
+        );
       } catch (resumeError) {
         if (resumeError instanceof ChatCompletionInterruptedError) {
           const merged = mergeContinuationText(partialText, resumeError.partialText);
-          throw new ChatCompletionInterruptedError(merged, () => continueFrom(merged));
+          throw new ChatCompletionInterruptedError(merged, () => continueFrom(merged, depth + 1));
         }
-        throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText));
+        throw new ChatCompletionInterruptedError(partialText, () => continueFrom(partialText, depth + 1));
       }
       onProgress?.("parsing");
       return mergeContinuationText(partialText, resumed).trim();
@@ -1852,8 +1915,39 @@ export async function generateQuickPrompt(
   if (!isRemoteConfigured(settings)) {
     throw new Error("AI 未配置，请先在 LenTalk「设置 → 自定义平台」配置 Chat 模型与 API Key。");
   }
+  const format = findQuickPromptFormat(formatId);
   const request = buildQuickPromptRequest(input, locale, formatId);
-  return chatCompletionsTextRaw(settings, request.system, request.user);
+  const first = await chatCompletionsTextRaw(settings, request.system, request.user);
+  if (isQuickPromptResultComplete(first, format)) return first;
+  // 只拿到开场说明（「我将把这段梗概转成……一镜到底的动作序列」）就停住：
+  // 规则包很长时推理模型容易这样收尾。再追一次，把「直接出成品」说到最前面。
+  const retry = await chatCompletionsTextRaw(
+    settings,
+    request.system,
+    `${request.user}\n\n上一次回答只写出了 ${first.length} 个字符的开场说明就停了，没有给出成品。这次直接从第一个段落标题开始输出完整成品：不要任何前言、不要复述任务、不要说明你打算怎么做。`,
+  );
+  if (isQuickPromptResultComplete(retry, format)) return retry;
+  throw new Error(
+    `模型连续两次只返回了开场说明（${first.length} / ${retry.length} 字符），没有按「${format.name}」输出成品。`
+    + "这类格式的规则正文很长，输出预算大多被思考占用。可以：① 再点一次生成；"
+    + "② 换输出预算更宽裕的模型；③ 在节点上改用段落更少的格式。",
+  );
+}
+
+/**
+ * 判断一次生成是不是「真成品」。
+ *
+ * 只看长度不够：失败样本恰好是有句子的英文散文。格式声明了 `requiredHeadings` 时
+ * 要求至少命中两个段名；没声明的格式退回长度门槛。
+ */
+export function isQuickPromptResultComplete(text: string, format: QuickPromptFormat): boolean {
+  const body = (text ?? "").trim();
+  const headings = format.requiredHeadings ?? [];
+  if (headings.length === 0) return body.length >= 600;
+  if (body.length < 300) return false;
+  const upper = body.toUpperCase();
+  const hit = headings.filter((heading) => upper.includes(heading.toUpperCase())).length;
+  return hit >= 2;
 }
 
 /**

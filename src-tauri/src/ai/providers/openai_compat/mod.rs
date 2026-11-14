@@ -37,6 +37,43 @@ pub struct OpenAICompatibleProvider {
 /// 它是**审核判定**而不是参数/格式错误: 官方社区反馈它和提示词**长度**的相关性高于内容
 /// 本身, 且随模型 / 账号 / 时段波动 —— 同一段提示词换个模型或再点一次往往就能过。
 /// 直译这串英文给用户没有任何可操作信息, 所以补一句中文指引。
+/// 知鸟 AI 的参考素材只能给**公网 URL**。
+///
+/// 画布节点里绝大多数是本地文件或 `data:` URL，直接塞进 `images` / `audios`，
+/// 平台会在提交阶段整单拒绝，报的是一句「参考素材无法访问」—— 用户完全看不出是
+/// 「我们不支持 base64」。所以这里先 `POST {base}/v1/files` 换公网地址再提交。
+async fn upload_zhiniao_reference(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    source: &str,
+    index: usize,
+) -> Result<String, AIError> {
+    use crate::ai::providers::video_protocols::assets::{
+        extract_asset_url, resolve_reference_asset, upload_reference_asset_multipart, ReferenceAsset,
+    };
+
+    let asset = resolve_reference_asset(source, "知鸟 AI").await?;
+    let extension = match &asset {
+        // 已经是公网直链：平台自己下载即可，不重复上传。
+        ReferenceAsset::Url(url) => return Ok(url.clone()),
+        ReferenceAsset::File { extension, .. } => extension.clone(),
+    };
+    let filename = format!("reference-{}.{}", index + 1, extension);
+    let payload = upload_reference_asset_multipart(
+        client,
+        &format!("{}/v1/files", base_url.trim_end_matches('/')),
+        api_key,
+        &filename,
+        &asset,
+        "知鸟 AI",
+    )
+    .await?;
+    extract_asset_url(&payload).ok_or_else(|| {
+        AIError::TaskFailed("知鸟 AI 参考素材上传后未返回公网 URL".to_string())
+    })
+}
+
 fn prompt_policy_hint(body: &str) -> &'static str {
     let lower = body.to_ascii_lowercase();
     if lower.contains("invalid_prompt") || lower.contains("flagged as potentially violating") {
@@ -378,6 +415,8 @@ impl OpenAICompatibleProvider {
         }
 
         let is_zhiniao = transport == "zhiniao-video";
+        // 上传与提交共用同一个 client（超时/连接池一致）。
+        let client = Self::build_client();
 
         let endpoint_for = |configured: Option<&Value>, fallback: &str, task_id: Option<&str>| {
             let configured = configured.and_then(Value::as_str).filter(|value| !value.trim().is_empty()).unwrap_or(fallback);
@@ -396,6 +435,36 @@ impl OpenAICompatibleProvider {
         } else if is_zhiniao {
             request.reference_images.as_ref().map(|items| items.iter().take(30).cloned().collect())
         } else { request.reference_images.clone() };
+        // 知鸟只收公网 URL：本地文件 / data URL 先换成 /v1/files 返回的地址。
+        let (zhiniao_images, zhiniao_audios) = if is_zhiniao {
+            let mut resolved_images: Vec<String> = Vec::new();
+            if let Some(items) = images.clone() {
+                for (index, source) in items.iter().enumerate() {
+                    resolved_images.push(
+                        upload_zhiniao_reference(&client, base_url, &api_key, source, index).await?,
+                    );
+                }
+            }
+            let mut resolved_audios: Vec<String> = Vec::new();
+            if let Some(items) = request.reference_audio.clone() {
+                for (index, source) in items.iter().take(10).enumerate() {
+                    resolved_audios.push(
+                        upload_zhiniao_reference(
+                            &client,
+                            base_url,
+                            &api_key,
+                            source,
+                            resolved_images.len() + index,
+                        )
+                        .await?,
+                    );
+                }
+            }
+            (Some(resolved_images), Some(resolved_audios))
+        } else {
+            (None, None)
+        };
+
         let mut body = if is_zhiniao {
             // 知鸟 AI(TokenGo) 的扁平入口: 参数全部放顶层, 不接受 params 信封。
             // 参考图的用途由 mode 决定(取值与前端 resolveZhiniaoVideoMode 严格一致),
@@ -428,15 +497,20 @@ impl OpenAICompatibleProvider {
             })
         };
         if let Some(object) = body.as_object_mut() {
-            if let Some(images) = images.filter(|items| !items.is_empty()) {
-                object.insert("images".into(), serde_json::json!(images));
-                if is_first_last && !is_zhiniao { object.insert("generation_type".into(), Value::String("frame".into())); }
-            }
-            if let Some(audio) = request.reference_audio.filter(|items| !items.is_empty()) {
-                if is_zhiniao {
-                    // 知鸟用 audios 数组(单次最多 10 条), 不是 audio_url / audio_urls。
-                    object.insert("audios".into(), serde_json::json!(audio.into_iter().take(10).collect::<Vec<_>>()));
-                } else {
+            if is_zhiniao {
+                // 知鸟用 images / audios 两个数组，值必须是公网 URL（已在上一步上传）。
+                if let Some(list) = zhiniao_images.as_ref().filter(|items| !items.is_empty()) {
+                    object.insert("images".into(), serde_json::json!(list));
+                }
+                if let Some(list) = zhiniao_audios.as_ref().filter(|items| !items.is_empty()) {
+                    object.insert("audios".into(), serde_json::json!(list));
+                }
+            } else {
+                if let Some(images) = images.filter(|items| !items.is_empty()) {
+                    object.insert("images".into(), serde_json::json!(images));
+                    if is_first_last { object.insert("generation_type".into(), Value::String("frame".into())); }
+                }
+                if let Some(audio) = request.reference_audio.filter(|items| !items.is_empty()) {
                     object.insert("audio_url".into(), Value::String(audio[0].clone()));
                     if audio.len() > 1 { object.insert("audio_urls".into(), serde_json::json!(audio)); }
                 }
@@ -444,7 +518,6 @@ impl OpenAICompatibleProvider {
             if let Some(resolution) = request.video_resolution.filter(|value| !value.trim().is_empty()) { object.insert("resolution".into(), Value::String(resolution)); }
         }
 
-        let client = Self::build_client();
         let submit_url = endpoint_for(extras.and_then(|params| params.get("video_submit_path")), "/v1/videos/generations", None);
         let response = client.post(&submit_url).bearer_auth(api_key.clone()).header("Accept-Encoding", "identity").json(&body).send().await?;
         let status = response.status();

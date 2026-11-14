@@ -75,10 +75,17 @@ fn parse_runninghub_balance(payload: &serde_json::Value) -> Result<ProviderBalan
         .ok_or_else(|| "RunningHub 账户信息里没有余额字段".to_string())?;
     // 并行任务数只是补充信息; 部分账号类型没有这个字段。
     let running_tasks = read_number(data, &["currentTaskCounts"]).unwrap_or(0.0) as i64;
+    // `remainPoint` 是 **API 调用扣的那本账**, 与 `remainCoins`(RH 币, 网页端算力)互不相通。
+    // 必须一并显示: 否则用户看到"还有几千 RH 币"会以为报余额不足是误判 ——
+    // 2026-11-12 实测就是这样(3209 RH 币 + 30 积分, 消费级 Key 调 AI 应用仍 821)。
+    let detail = match read_number(data, &["remainPoint"]) {
+        Some(point) => format!("API 积分 {point:.0} · 运行中任务 {running_tasks}"),
+        None => format!("运行中任务 {running_tasks}"),
+    };
     Ok(ProviderBalance {
         amount: coins,
         unit: "RH".to_string(),
-        detail: Some(format!("运行中任务 {running_tasks}")),
+        detail: Some(detail),
     })
 }
 
@@ -212,6 +219,26 @@ mod tests {
         assert_eq!(balance.amount, 150.0);
         assert_eq!(balance.unit, "RH");
         assert_eq!(balance.detail.as_deref(), Some("运行中任务 2"));
+    }
+
+    #[test]
+    fn runninghub_balance_shows_api_points_beside_coins() {
+        // 实测信封(2026-11-12 国内版): RH 币与 API 积分是两本互不相通的账, 都要露出来,
+        // 否则用户看到"还有 3209 币"会以为 821 付费积分不足是误判。
+        let payload = serde_json::json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "remainCoins": "3209",
+                "remainPoint": 30.0,
+                "currentTaskCounts": "0",
+                "apiType": "NORMAL"
+            }
+        });
+        let balance = parse_runninghub_balance(&payload).expect("parses");
+        assert_eq!(balance.amount, 3209.0);
+        assert_eq!(balance.unit, "RH");
+        assert_eq!(balance.detail.as_deref(), Some("API 积分 30 · 运行中任务 0"));
     }
 
     #[test]

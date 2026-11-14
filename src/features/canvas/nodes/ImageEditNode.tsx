@@ -51,7 +51,6 @@ import {
   findReferenceTokens,
   insertReferenceToken,
   remapImageReferenceTokens,
-  removeOutOfRangeReferenceTokens,
   removeTextRange,
   resolveReferenceAwareDeleteRange,
 } from '@/features/canvas/application/referenceTokenEditing';
@@ -624,12 +623,14 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   // 上游图片断连或重排时，按原始图片来源重映射 @图N；断开的图片
   // 只删除自己的引用，后续图片不会继承错误编号。
   useEffect(() => {
-    const remapped = remapImageReferenceTokens(
+    const previousImages = previousIncomingImagesRef.current;
+    // 同 VideoGenNode：只按来源身份重映射，不按当前数量删越界标记（异步解析期间
+    // 数量抖动会把 [imageN] 整段删掉）。
+    const cleaned = remapImageReferenceTokens(
       promptDraftRef.current,
-      previousIncomingImagesRef.current,
+      previousImages,
       incomingImages,
     );
-    const cleaned = removeOutOfRangeReferenceTokens(remapped, incomingImages.length);
     previousIncomingImagesRef.current = incomingImages;
     if (cleaned !== promptDraftRef.current) {
       promptDraftRef.current = cleaned;

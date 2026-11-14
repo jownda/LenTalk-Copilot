@@ -5,6 +5,7 @@ import {
   JIMENG_CLI_PROVIDER_ID,
   RUNNINGHUB_CLI_PROVIDER_ID,
   getImageModel,
+  getVideoModel,
   isApiKeylessProvider,
   listAudioModels,
   matchesAudioCreativePanel,
@@ -595,6 +596,17 @@ describe("listVideoModels", () => {
       expect(resolutions("viduq3")).toEqual(["540p", "720p", "1080p"]);
       expect(resolutions("minimax-h3")).toEqual(["768p", "2k"]);
       expect(aspects("happyhorse-1-1")).toContain("9:21");
+
+      // Meta Muse Video: 知鸟链路上唯一能到 60 秒的模型。
+      // 实测 2026-11-12 网关把 duration=999 改写成 60(nearest_supported), 上限确认。
+      expect(durations("muse-video")).toEqual([5, 6, 8, 10, 15, 20, 25, 30, 40, 50, 60]);
+      expect(aspects("muse-video")).toEqual(["16:9", "9:16"]);
+      // 输出恒 720p, 1080p 直接 400 —— 只给一档, 不让用户选到必失败的值。
+      expect(resolutions("muse-video")).toEqual(["720p"]);
+      // 参考图 1~4 张, 第 5 张平台报 400。
+      expect(byModel("muse-video")?.maxReferenceImages).toBe(4);
+      // 其余知鸟模型没有这个约束, 不要顺手给个默认值(否则 UI 会冒出一条并不存在的上限)。
+      expect(byModel("seedance-2-5")?.maxReferenceImages).toBeUndefined();
     } finally {
       useSettingsStore.setState({ customApis: previousCustomApis });
     }
@@ -1224,5 +1236,51 @@ describe("图片超清", () => {
     } finally {
       useSettingsStore.setState({ customApis: previousCustomApis });
     }
+  });
+});
+
+describe("即梦积分价目(两个 CLI 共用一张表)", () => {
+  const price = (modelId: string, resolution: string, extraParams?: Record<string, unknown>) => {
+    // 视频必须先查: getImageModel 找不到会回落默认图片模型, 顺序反了会拿到错价。
+    const video = getVideoModel(modelId);
+    const model = video ?? getImageModel(modelId);
+    expect(model).toBeDefined();
+    expect(model!.id).toBe(modelId);
+    return resolveModelPriceDisplay(model!, { resolution, extraParams, language: "zh-CN" })?.label;
+  };
+
+  it("画布 CLI 图片按型号 x 档位计价", () => {
+    // 2026-11-12 `node quote` 实测: Seedream 5.5 1.5K=4 / 2K=6
+    expect(price("jimeng-canvas/seedream_5.5", "1.5K")).toBe("4 积分/次");
+    expect(price("jimeng-canvas/seedream_5.5", "2K")).toBe("6 积分/次");
+    expect(price("jimeng-canvas/seedream_4.7", "4K")).toBe("2 积分/次");
+  });
+
+  it("免费档位不显示价格(0 积分不等于 '0 积分/次')", () => {
+    expect(price("jimeng-canvas/seedream_5.0_pro", "2K")).toBeUndefined();
+  });
+
+  it("画布 CLI 视频按 型号 x 分档 x 秒 计价", () => {
+    // 720p 20/秒、480p 12/秒、1080p 64/秒
+    expect(price("jimeng-canvas/seedance_2.5", "720p", { duration: 5 })).toBe("100 积分/次");
+    expect(price("jimeng-canvas/seedance_2.5", "480p", { duration: 5 })).toBe("60 积分/次");
+    expect(price("jimeng-canvas/seedance_2.5", "1080p", { duration: 5 })).toBe("320 积分/次");
+    // 样片 480p 9/秒
+    expect(price("jimeng-canvas/seedance_2.5_draft", "480p", { duration: 4 })).toBe("36 积分/次");
+    expect(price("jimeng-canvas/seedance_2.0_vip", "4k", { duration: 4 })).toBe("320 积分/次");
+  });
+
+  it("即梦 CLI 与画布 CLI 同价(命名差异不影响)", () => {
+    // 真实扣费: seedance2.5 720p 10s = 200 积分; 480p 15s = 180 积分
+    expect(price("jimeng-cli/seedance2.5", "720p", { duration: 10 })).toBe("200 积分/次");
+    expect(price("jimeng-cli/seedance2.5", "480p", { duration: 15 })).toBe("180 积分/次");
+    // 真实扣费: seedance2.0fast_vip 720p 4s = 24 积分
+    expect(price("jimeng-cli/seedance2.0fast_vip", "720p", { duration: 4 })).toBe("24 积分/次");
+  });
+
+  it("即梦 CLI 图片同样按档位计价, 未实测的 3.x 不出价", () => {
+    expect(price("jimeng-cli/image-4.0", "2K")).toBe("1 积分/次");
+    expect(price("jimeng-cli/image-5.0", "4K")).toBe("4 积分/次");
+    expect(price("jimeng-cli/image-3.0", "2K")).toBeUndefined();
   });
 });

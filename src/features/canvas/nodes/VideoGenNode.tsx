@@ -82,11 +82,12 @@ import {
   insertReferenceToken,
   remapAudioReferenceTokens,
   remapImageReferenceTokens,
-  removeOutOfRangeReferenceTokens,
   removeTextRange,
   resolveReferenceAwareDeleteRange,
 } from "@/features/canvas/application/referenceTokenEditing";
 import { useDebouncedNodeTextCommit } from "@/features/canvas/application/useDebouncedNodeTextCommit";
+import { applyLocalReferenceSection, type LocalReferenceAsset } from "@/features/canvas/domain/referenceSection";
+import { anchorImageReferenceTags } from "@/features/canvas/domain/referenceTagAnchors";
 import { readLiveInputText } from "@/features/canvas/application/liveInputText";
 import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -331,6 +332,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     },
     [],
   );
+  const [jimengCliStatus, setJimengCliStatus] = useState<JimengCliStatus | null>(null);
   const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
   const isCoolingDown = cooldownRemainingMs > 0;
   const cooldownSeconds = Math.max(1, Math.ceil(cooldownRemainingMs / 1000));
@@ -373,8 +375,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       closeVideoCancellationWindow(outputId);
     }
     setIsGenerating(stillRunning.length > 0);
+    // 下游全部结束（含被用户取消）时收掉 CLI 的「排队中」—— 取消走的是后端检查点，
+    // 不会有任何 CLI 事件回来，不清的话源节点会永远挂着一个排队标记。
+    if (stillRunning.length === 0) setJimengCliStatus(null);
   }, [activeGenerationKey, id, nodes, processingRevision, updateNodeData]);
-  const [jimengCliStatus, setJimengCliStatus] = useState<JimengCliStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showImagePicker, setShowImagePicker] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
@@ -445,6 +449,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const isJimengCanvasCli = selectedModel?.providerId === JIMENG_CANVAS_CLI_PROVIDER_ID;
   const isWanCli = selectedModel?.providerId === "wan-cli";
   const isRunningHubCli = selectedModel?.providerId === RUNNINGHUB_CLI_PROVIDER_ID;
+  // 参考图上限：优先读模型自带的 `maxReferenceImages`（知鸟 muse-video 只收 4 张），
+  // 没有声明时退回「即梦 CLI 固定 9 张」这条老规则，其余模型不显示上限。
+  const referenceImageLimit =
+    selectedModel?.maxReferenceImages ?? (isJimengCli ? JIMENG_CLI_MAX_REFERENCE_IMAGES : undefined);
   const selectedProfile = selectedModel ? getVideoModelProfile(selectedModel.profileId) : null;
   useEffect(() => {
     if (isZzdhLipSyncModel(data.model) && selectedModel && data.model !== selectedModel.id) {
@@ -819,24 +827,80 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     if (imageMode !== "reference") {
       return;
     }
+    const previousImages = previousReferenceImagesRef.current;
+    // 只按**来源身份**重映射：真正的断连由 remap 精确删掉它自己的标记。
+    // 绝不再按「当前数量」删越界标记 —— 参考图是异步解析的，节点挂载后数量会经历
+    // 5 → 0 → 5 这种抖动，任何一次抖动都会把 `[imageN]` 整段删掉并写回节点，
+    // 等图片到齐也不会恢复，表现为「引用刚生成就全掉了」。
     const remappedPrompt = remapImageReferenceTokens(
       promptDraftRef.current,
-      previousReferenceImagesRef.current,
+      previousImages,
       referenceInputImages,
     );
-    const cleanedPrompt = removeOutOfRangeReferenceTokens(
-      remappedPrompt,
-      referenceInputImages.length,
-      usableInputAudio.length,
-    );
     previousReferenceImagesRef.current = referenceInputImages;
-    if (cleanedPrompt !== promptDraftRef.current) {
-      promptDraftRef.current = cleanedPrompt;
-      setPromptDraft(cleanedPrompt);
+    if (remappedPrompt !== promptDraftRef.current) {
+      promptDraftRef.current = remappedPrompt;
+      setPromptDraft(remappedPrompt);
       cancelPromptCommit();
-      updateNodeData(id, { prompt: cleanedPrompt });
+      updateNodeData(id, { prompt: remappedPrompt });
     }
   }, [cancelPromptCommit, id, imageMode, referenceInputImages, usableInputAudio.length, updateNodeData]);
+
+  /**
+   * 自愈：提示词里一个引用标记都没有，但节点挂着参考图 —— 说明标记被某条链路删过
+   * （历史版本的「按数量清理」就这么干过）。这时用工作室写进节点的资产清单重建引用段，
+   * 用户不必重新生成一遍。
+   *
+   * 只在「一个标记都没有」时动手：正常提示词绝不会被这里改写。
+   */
+  useEffect(() => {
+    const current = data.prompt ?? "";
+    if (!current.trim()) return;
+    if (findReferenceTokens(current).length > 0) return;
+
+    // ① 自己有清单：按资产表重建引用段 + 正文补齐。
+    const anchors = (Array.isArray(data.referenceAnchors) ? data.referenceAnchors : [])
+      .map((item) => {
+        const record = (item ?? {}) as Record<string, unknown>;
+        const name = typeof record.name === "string" ? record.name.trim() : "";
+        const imageIndex = Number(record.imageIndex);
+        const description = typeof record.description === "string" ? record.description : "";
+        return { name, imageIndex, description };
+      })
+      .filter((item) => item.name && Number.isFinite(item.imageIndex) && item.imageIndex >= 1);
+
+    if (anchors.length > 0) {
+      const healed = anchorImageReferenceTags(
+        applyLocalReferenceSection(current, anchors as LocalReferenceAsset[]),
+        anchors.map(({ name, imageIndex }) => ({ name, imageIndex })),
+      );
+      if (healed !== current) {
+        promptDraftRef.current = healed;
+        setPromptDraft(healed);
+        updateNodeData(id, { prompt: healed });
+      }
+      return;
+    }
+
+    // ② 老节点没有清单：从上游提示词工作室节点整段借回（它的 quickPrompt 是本地生成的、
+    //    标记完整）。只有「去掉标记后逐字相同」才借 —— 也就是确实只是被删了标记，
+    //    用户自己改过内容就不动。
+    const upstreamStudio = edges
+      .filter((edge) => edge.target === id)
+      .map((edge) => nodes.find((node) => node.id === edge.source))
+      .find((node) => node?.type === CANVAS_NODE_TYPES.cinematicStudio);
+    const upstreamPrompt =
+      typeof upstreamStudio?.data?.quickPrompt === "string" ? upstreamStudio.data.quickPrompt : "";
+    if (!upstreamPrompt.trim()) return;
+    if (findReferenceTokens(upstreamPrompt).length === 0) return;
+
+    const stripTokens = (text: string) => text.replace(/(\[image\d+\]|@图\d+)/g, "").replace(/\s+/g, "");
+    if (stripTokens(upstreamPrompt) !== stripTokens(current)) return;
+
+    promptDraftRef.current = upstreamPrompt;
+    setPromptDraft(upstreamPrompt);
+    updateNodeData(id, { prompt: upstreamPrompt });
+  }, [data.prompt, data.referenceAnchors, edges, id, nodes, updateNodeData]);
 
   useEffect(() => {
     if (referencePickerItems.length === 0) {
@@ -883,6 +947,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         queueCount: payload.queue_count,
         message: payload.message,
       });
+      // 收到 queued 就代表 submit_id 已经拿到、任务已在平台创建并预缴积分：
+      // 本地 CLI 的「取消生成」入口到此为止，再取消只会把已计费的结果丢掉。
+      if (payload.status === "queued") {
+        for (const outputId of cancelWindowNodeIdsRef.current) closeVideoCancellationWindow(outputId);
+        cancelWindowNodeIdsRef.current.clear();
+      }
     }).then((remove) => {
       if (disposed) {
         remove();
@@ -1611,14 +1681,14 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         )}
         <span
           className={`ml-auto shrink-0 text-[11px] ${
-            isJimengCli && videoReferenceImages.length > JIMENG_CLI_MAX_REFERENCE_IMAGES
+            referenceImageLimit !== undefined && videoReferenceImages.length > referenceImageLimit
               ? "text-red-400"
               : "text-text-muted"
           }`}
-          title={isJimengCli ? t("node.videoGen.referenceImageLimit") : undefined}
+          title={referenceImageLimit !== undefined ? t("node.videoGen.referenceImageLimit") : undefined}
         >
           {t("node.videoGen.referenceImageCount", { count: videoReferenceImages.length })}
-          {isJimengCli ? ` / ${JIMENG_CLI_MAX_REFERENCE_IMAGES}` : ""}
+          {referenceImageLimit !== undefined ? ` / ${referenceImageLimit}` : ""}
         </span>
       </div>
       {imageMode === "first-last" && (

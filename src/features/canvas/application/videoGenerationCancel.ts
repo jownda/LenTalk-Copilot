@@ -21,6 +21,9 @@
  * (后端的取消表也是内存态)。
  */
 
+/** 取消文案（前端哨兵错误与后端本地 CLI 取消共用同一句）。 */
+export const VIDEO_GENERATION_CANCELED_MESSAGE = "已取消生成";
+
 interface CancellationWindow {
   /** 用户是否已经点过「取消生成」。 */
   canceled: boolean;
@@ -36,13 +39,25 @@ function emit(): void {
 /** 提交被用户取消时抛出的哨兵错误 —— 调用方据此走"已取消"而不是"失败"分支。 */
 export class VideoGenerationCanceledError extends Error {
   constructor() {
-    super("已取消生成");
+    super(VIDEO_GENERATION_CANCELED_MESSAGE);
     this.name = "VideoGenerationCanceledError";
   }
 }
 
 export function isVideoGenerationCanceledError(error: unknown): error is VideoGenerationCanceledError {
   return error instanceof VideoGenerationCanceledError;
+}
+
+/**
+ * 后端本地 CLI 取消时的错误文案 —— **必须与 Rust 的 `LOCAL_CLI_CANCELED_MESSAGE` 逐字一致**。
+ *
+ * 本地 CLI 走的是阻塞式 invoke，取消只能由后端在提交检查点抛错上报，没有哨兵实例可用，
+ * 所以这里额外按文案识别一次；`Error` 与裸字符串两种形态都可能出现。
+ */
+export function isVideoGenerationCanceledMessage(value: unknown): boolean {
+  const text =
+    typeof value === "string" ? value : value instanceof Error ? value.message : "";
+  return text.trim() === VIDEO_GENERATION_CANCELED_MESSAGE;
 }
 
 /** 打开窗口: 下游节点已挂上画布、请求还没交出去。 */

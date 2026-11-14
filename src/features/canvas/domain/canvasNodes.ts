@@ -387,7 +387,24 @@ export interface MosaicLayerItem {
   /** 图层顺序: 越大越靠上(叠加顺序) */
   order: number;
   opacity?: number;
+  /** 顺时针旋转角度(度), 以图层中心为轴; 缺省 0 */
+  rotation?: number;
+  /** 与下层混合方式; 缺省 normal(直接覆盖) */
+  blendMode?: MosaicBlendMode;
+  /** 锁定后节点内不能拖动/缩放/旋转(仍可在全屏编辑器里改数值) */
+  locked?: boolean;
 }
+
+/** 图层混合模式(与 canvas globalCompositeOperation 一一对应, 见 `domain/mosaicBlend.ts`)。 */
+export type MosaicBlendMode =
+  | "normal"
+  | "multiply"
+  | "screen"
+  | "overlay"
+  | "darken"
+  | "lighten"
+  | "soft-light"
+  | "difference";
 
 export type MosaicTemplateId = "grid" | "h-strip" | "v-strip" | "free";
 
@@ -404,6 +421,11 @@ export interface SeamlessMosaicNodeData extends NodeImageData {
   backgroundColor?: string;
   /** 已自动导入的上游图片 URL 集合(去重, 避免重复导入) */
   importedSourceKeys?: string[];
+  /**
+   * 画幅已经做过一次「贴合图片」的自愈(单图层场景)。
+   * 有标记就不再自动收画幅 —— 用户自己拖边框加出来的空白是刻意为之。
+   */
+  canvasFitted?: boolean;
   /** 最后一次导出的合并图(可选, 作为节点缩略图) */
   outputImageUrl?: string | null;
   outputPreviewImageUrl?: string | null;

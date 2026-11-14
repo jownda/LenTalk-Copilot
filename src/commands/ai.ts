@@ -6,7 +6,7 @@ import { generateJimengCanvasImage } from "@/commands/jimengCanvasCli";
 import type { CustomApiCapabilities } from "@/stores/settingsStore";
 import { isWindowsDesktopRuntime } from "@/platform/runtime";
 import { isKnownOpenAiImagesBaseUrl } from "@/features/settings/recommendedApis";
-import { persistImageBinary } from "@/commands/image";
+import { persistImageBinary, persistImageSource } from "@/commands/image";
 import { localPathFromReferenceSource, resolveReferenceAssetSource } from "@/commands/referenceAssetSource";
 import {
   MMX_AUDIO_SPEECH_PATH,
@@ -47,6 +47,7 @@ import type { RunningHubWorkflowNodeValue } from "@/commands/runningHubWorkflow"
 import { extractRunningHubWorkflowJson } from "@/commands/runningHubWorkflow";
 import {
   buildRunningHubCharacterSwapNodeInfoList,
+  explainRunningHubFailure,
   isRunningHubBaseUrl,
   RUNNINGHUB_CHARACTER_SWAP_APP_ID,
   RUNNINGHUB_VIDEO_TRANSPORT,
@@ -501,6 +502,14 @@ function describeVideoResponse(payload: unknown): string {
   } catch {
     return truncateText(String(payload), 600);
   }
+}
+
+/**
+ * 提交被平台拒绝时的错误描述：已知业务错误（如 RunningHub 821 付费积分不足）
+ * 翻成人话，认不出才退回原始 JSON —— 原始信封对用户毫无指导意义。
+ */
+function describeRunningHubSubmitFailure(payload: unknown): string {
+  return explainRunningHubFailure(payload) ?? describeVideoResponse(payload);
 }
 
 function normalizeVideoProviderBaseUrl(baseUrl: string): string {
@@ -1564,6 +1573,19 @@ export function resolveZhiniaoVideoMode(
 }
 
 /**
+ * 知鸟链路「参考图张数」的逐模型上限；未登记 = 30（沿用既有行为）。
+ *
+ * 🔴 这与 `features/canvas/models/registry.ts` 的 `ZHINIAO_VIDEO_OPTION_TABLE`
+ * 里同名 `maxReferenceImages` 是**同一条事实的两处落地**：那边管节点上的「N / 上限」
+ * 与提示，这边管真正发给平台的张数。加模型必须两处同改 —— 只改一边会出现
+ * 「界面写着 4 张、实际发出去 5 张」，平台回 400，用户看不出是谁的错。
+ */
+const ZHINIAO_MAX_REFERENCE_IMAGES: Record<string, number> = {
+  // Meta Muse Video: 官方 1~4 张，第 5 张直接 400（不是静默忽略）。
+  "muse-video": 4,
+};
+
+/**
  * 知鸟 AI(TokenGo)视频链路:
  * - 提交 POST /v1/videos/generations, 全部参数放**顶层**(扁平形状, 不接受 params 信封)
  * - 轮询 GET /v1/tasks/{task_id}, 终态看 state(success/failed) 或 status(completed/failed)
@@ -1575,7 +1597,10 @@ async function generateZhiniaoVideo(
   apiModel: string,
   headers: Record<string, string>,
 ): Promise<string> {
-  const maxImages = request.image_mode === "first-last" ? 2 : 30;
+  // 首尾帧恒为 2 张(首帧 + 尾帧); 参考生按模型上限截断 —— 超量有的平台报 400、
+  // 有的静默丢弃, 两种都会让用户以为「传了但没生效」。
+  const modelReferenceLimit = ZHINIAO_MAX_REFERENCE_IMAGES[apiModel.trim().toLowerCase()] ?? 30;
+  const maxImages = request.image_mode === "first-last" ? 2 : modelReferenceLimit;
   const rawImages = (request.reference_images ?? []).slice(0, maxImages);
   const imageSources = await Promise.all(
     rawImages.map((source, index) => uploadZhiniaoReferenceAsset(source, baseUrl, headers, index)),
@@ -3001,7 +3026,7 @@ async function generateRunningHubTopazVideoUpscale(
   const immediate = findRunningHubVideoUrl(payload);
   if (immediate) return immediate;
   const taskId = findRunningHubTaskId(payload);
-  if (!taskId) throw new Error(`RunningHub ${workflowName} 未返回任务 ID: ${describeVideoResponse(payload)}`);
+  if (!taskId) throw new Error(`RunningHub ${workflowName} 未返回任务 ID: ${describeRunningHubSubmitFailure(payload)}`);
 
   const queryUrl = `${baseUrl}/openapi/v2/query`;
   for (let attempt = 0; attempt < 240; attempt += 1) {
@@ -3121,7 +3146,7 @@ export async function characterSwapVideo(request: CharacterSwapVideoRequest): Pr
   const immediate = findRunningHubVideoUrl(payload);
   if (immediate) return immediate;
   const taskId = findRunningHubTaskId(payload);
-  if (!taskId) throw new Error(`RunningHub ${workflowName} 未返回任务 ID: ${describeVideoResponse(payload)}`);
+  if (!taskId) throw new Error(`RunningHub ${workflowName} 未返回任务 ID: ${describeRunningHubSubmitFailure(payload)}`);
 
   // 换人比超分慢（要先跑 VAE 校正再逐帧重绘），轮询窗口放到 20 分钟；超时只提示
   // 用户去画布查结果，不重新提交 —— 任务已经建了、积分也已经预扣。
@@ -3383,11 +3408,11 @@ export async function runRunningHubWorkflow(request: RunRunningHubWorkflowReques
   const createdRecord = created && typeof created === "object" ? (created as Record<string, unknown>) : null;
   const createdCode = Number(createdRecord?.code);
   if (Number.isFinite(createdCode) && createdCode !== 0) {
-    const reason = getRunningHubTaskFailureReason(created) ?? describeVideoResponse(created);
+    const reason = getRunningHubTaskFailureReason(created) ?? describeRunningHubSubmitFailure(created);
     throw new Error(`${workflowName} 提交失败（code ${createdCode}）: ${reason}`);
   }
   const taskId = findRunningHubTaskId(created);
-  if (!taskId) throw new Error(`${workflowName} 未返回任务 ID: ${describeVideoResponse(created)}`);
+  if (!taskId) throw new Error(`${workflowName} 未返回任务 ID: ${describeRunningHubSubmitFailure(created)}`);
 
   const statusUrl = `${baseUrl}/task/openapi/status`;
   for (let attempt = 0; attempt < 400; attempt += 1) {
@@ -3482,7 +3507,7 @@ async function generateRunningHubIndexTts25(request: GenerateAudioRequest, baseU
   if (!response.ok) throw new Error(`RunningHub ${workflowName} 提交失败: ${buildHttpErrorSummary(response.status, raw, submitUrl)}`);
   let payload: unknown; try { payload = raw ? JSON.parse(raw) : {}; } catch { throw new Error("RunningHub 任务提交返回了非 JSON"); }
   const immediate = findRunningHubAudioUrl(payload); if (immediate) return await persistAudioSource(immediate, "mp3");
-  const taskId = findRunningHubTaskId(payload); if (!taskId) throw new Error(`RunningHub 未返回任务 ID: ${describeVideoResponse(payload)}`);
+  const taskId = findRunningHubTaskId(payload); if (!taskId) throw new Error(`RunningHub 未返回任务 ID: ${describeRunningHubSubmitFailure(payload)}`);
   const queryUrl = `${baseUrl}/openapi/v2/query`;
   for (let attempt = 0; attempt < 240; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 2500));
@@ -4023,6 +4048,18 @@ export async function generateJimengCliVideo(request: GenerateJimengCliVideoRequ
   return await invoke<string>("generate_jimeng_cli_video", { request });
 }
 
+/**
+ * 取消一次**还没提交到平台**的本地 CLI 视频任务（即梦 CLI / 即梦画布 CLI 共用）。
+ *
+ * 本地 CLI 是阻塞式 invoke，前端没法直接打断调用，只能置位后端提交链路上的取消标志；
+ * 后端在「上传素材 / 建节点 / node run」之间逐步检查。返回 `false` 说明这条任务已经
+ * 不在取消表里（已完成，或已经交到平台并开始计费）—— 调用方不能谎报取消成功。
+ */
+export async function cancelLocalCliVideo(clientJobId: string): Promise<boolean> {
+  if (!isTauri()) return false;
+  return await invoke<boolean>("cancel_local_cli_video", { clientJobId });
+}
+
 /** 即梦 CLI 图片生成(文生图 / 图生图), 返回落盘后的本地图片路径或远端 URL。 */
 export async function generateJimengCliImage(request: GenerateJimengCliImageRequest): Promise<string> {
   if (!isTauri()) {
@@ -4113,7 +4150,7 @@ async function submitJimengCanvasImageJob(request: GenerateRequest): Promise<str
           )
         : undefined;
 
-      const result = await generateJimengCanvasImage({
+      const generated = await generateJimengCanvasImage({
         executable,
         prompt: request.prompt,
         model,
@@ -4124,6 +4161,15 @@ async function submitJimengCanvasImageJob(request: GenerateRequest): Promise<str
         resolution: request.size || "2K",
         referenceImages,
       });
+      // 画布 CLI 把图下到 `%APPDATA%\...\jimeng-cli\videos\<run_id>\`（它只有这一个
+      // 下载目录），要搬进「默认落盘位置」才算真落盘。搬失败就用原路径 ——
+      // 图已经生成好了，不能因为搬家失败把结果丢掉。
+      let result = generated;
+      try {
+        result = (await persistImageSource(generated)).trim() || generated;
+      } catch (error) {
+        console.warn("[jimeng-canvas] 图片落盘失败，保留 CLI 下载路径", { generated, error });
+      }
       browserGenerationJobs.set(jobId, { job_id: jobId, status: "succeeded", result, error: null });
     } catch (error) {
       browserGenerationJobs.set(jobId, {

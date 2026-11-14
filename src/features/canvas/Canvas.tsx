@@ -73,7 +73,7 @@ import {
   nodeHasSourceHandle,
   nodeHasTargetHandle,
 } from "@/features/canvas/domain/nodeRegistry";
-import { embedStoryboardImageMetadata, saveImageSourceToDownloads } from "@/commands/image";
+import { embedStoryboardImageMetadata } from "@/commands/image";
 import { persistLibraryAssetFromFile } from "@/commands/assetLibrary";
 import { readClipboardMediaSnapshot, type ClipboardMediaSnapshot } from "@/commands/clipboard";
 import {
@@ -111,6 +111,7 @@ import {
 } from "./application/nodeClipboardSnapshot";
 import { CanvasContextMenu } from "./CanvasContextMenu";
 import { SelectedNodeOverlay } from "./ui/SelectedNodeOverlay";
+import { UnpersistedMediaNotice } from "./ui/UnpersistedMediaNotice";
 import { NodeToolDialog } from "./ui/NodeToolDialog";
 import { TextNodeEditDialogHost } from "./ui/TextNodeEditDialogHost";
 import { ImageViewerModal } from "./ui/ImageViewerModal";
@@ -118,6 +119,9 @@ import { NodePropertiesDialog } from "./ui/NodePropertiesDialog";
 import type { UpstreamGenerationSource } from "./application/nodeProperties";
 import { VideoViewerModal } from "./ui/VideoViewerModal";
 import { saveMediaSourceWithDialog } from "./application/mediaDownload";
+import { buildDownloadFileName } from "./application/downloadFileName";
+import { hasCanvasTextSelection, readSelectedTextInside } from "./application/textSelection";
+import { CanvasToast } from "./ui/CanvasToast";
 import { shouldFailRunningVideoJob } from "./application/videoJobPolling";
 import { closeVideoCancellationWindow } from "./application/videoGenerationCancel";
 import { VideoFrameExtractDialog } from "./ui/VideoFrameExtractDialog";
@@ -988,6 +992,8 @@ export function Canvas() {
 
   const [showNodeMenu, setShowNodeMenu] = useState(false);
   const [isNodeManagerOpen, setIsNodeManagerOpen] = useState(true);
+  /** 下载成功的轻提示（文案 + 落盘路径）；下载写盘是静默的，不给提示就是「点了没反应」。 */
+  const [downloadToast, setDownloadToast] = useState<{ fileName: string; path: string } | null>(null);
   const [videoViewerUrl, setVideoViewerUrl] = useState<string | null>(null);
   /** 「节点属性」面板正在查看的节点;null 表示面板关闭。 */
   const [propertiesNodeId, setPropertiesNodeId] = useState<string | null>(null);
@@ -999,6 +1005,8 @@ export function Canvas() {
     downloadMediaType: "image" | "video" | "audio" | null;
     nodeId: string | null;
     textContent: string | null;
+    /** 右键时节点内被选中的文字（有选区才有），菜单据此提供「复制选中文字」。 */
+    selectedText: string | null;
   } | null>(null);
   const [saveTextPromptDialog, setSaveTextPromptDialog] = useState<{
     name: string;
@@ -3092,7 +3100,17 @@ export function Canvas() {
       const isPaste = matchesBinding(event, shortcuts.paste);
       const isDelete = matchesBinding(event, shortcuts.delete);
 
+      // 画布里正选中一段文字时，复制/剪切/删除都交给浏览器：用户此刻要动的是那几行字，
+      // 不是整个节点。以前缺这层判断 —— 选中文字按 Ctrl+C 复制走的是节点，
+      // 按 Delete 更狠，直接把节点删了。
+      const textSelectionActive = hasCanvasTextSelection();
+
       if (isCopy) {
+        if (textSelectionActive) {
+          // 让原生复制生效；顺手作废节点快照，免得下一秒 Ctrl+V 凭空粘出一个节点。
+          forgetCopiedNodes();
+          return;
+        }
         if (selectedNodeIds.length === 0) {
           return;
         }
@@ -3106,6 +3124,9 @@ export function Canvas() {
       }
 
       if (isCut) {
+        if (textSelectionActive) {
+          return;
+        }
         if (selectedNodeIds.length === 0) {
           return;
         }
@@ -3160,6 +3181,11 @@ export function Canvas() {
         return;
       }
 
+      // 选中文字时 Backspace/Delete 是在删字，不能连带把节点删掉。
+      if (textSelectionActive) {
+        return;
+      }
+
       const idsToDelete = selectedNodeIds.length > 0 ? selectedNodeIds : selectedNodeId ? [selectedNodeId] : [];
       if (idsToDelete.length === 0) {
         return;
@@ -3186,6 +3212,7 @@ export function Canvas() {
     cutNodesToClipboard,
     deleteNode,
     deleteNodes,
+    forgetCopiedNodes,
     groupNodes,
     handleGroupSelected,
     rememberCopiedNodes,
@@ -3248,7 +3275,12 @@ export function Canvas() {
   );
 
   const openCanvasContextMenu = useCallback(
-    (event: MouseEvent | ReactMouseEvent, imageUrl: string | null, nodeId: string | null = null) => {
+    (
+      event: MouseEvent | ReactMouseEvent,
+      imageUrl: string | null,
+      nodeId: string | null = null,
+      selectedText: string | null = null,
+    ) => {
       event.preventDefault();
       const containerRect = wrapperRef.current?.getBoundingClientRect();
       if (!containerRect) {
@@ -3286,6 +3318,7 @@ export function Canvas() {
         downloadMediaType: contextMedia?.mediaType ?? null,
         nodeId,
         textContent: contextNode && isTextAnnotationNode(contextNode) ? contextNode.data.content : null,
+        selectedText,
       });
     },
     [nodes, reactFlowInstance],
@@ -3304,7 +3337,17 @@ export function Canvas() {
 
   const handleNodeContextMenu = useCallback(
     (event: ReactMouseEvent, node: CanvasNode) => {
-      openCanvasContextMenu(event, resolveContextMenuImageUrl(node), node.id);
+      // 输入框里的右键是「复制 / 粘贴这几行字」，必须交给系统原生菜单。
+      // 抢过来只会让用户一点「复制」就把整个节点复制走 —— 这正是以前那个坑。
+      if (isTypingTarget(event.target)) {
+        return;
+      }
+      openCanvasContextMenu(
+        event,
+        resolveContextMenuImageUrl(node),
+        node.id,
+        readSelectedTextInside(event.currentTarget),
+      );
     },
     [openCanvasContextMenu],
   );
@@ -3358,6 +3401,37 @@ export function Canvas() {
     },
     [cutNodesToClipboard, resolveContextTargetIds],
   );
+
+  /**
+   * 右键「复制选中文字」：只把节点里选中的那一段写进系统剪贴板。
+   *
+   * 顺带清掉节点剪贴板快照：用户最后一次复制的是文字，之后在画布上按 Ctrl+V
+   * 应该什么都不发生，而不是凭空落下一个节点副本。
+   */
+  const handleContextCopySelectedText = useCallback(() => {
+    const text = canvasContextMenu?.selectedText?.trim();
+    setCanvasContextMenu(null);
+    if (!text) {
+      return;
+    }
+    forgetCopiedNodes();
+    void navigator.clipboard?.writeText?.(text).catch((error) => {
+      console.warn("[Canvas] 复制选中文字失败", error);
+    });
+  }, [canvasContextMenu?.selectedText, forgetCopiedNodes]);
+
+  /** 右键「复制全部文本」：文本节点整段内容进剪贴板（菜单里的一键入口）。 */
+  const handleContextCopyAllText = useCallback(() => {
+    const text = canvasContextMenu?.textContent ?? "";
+    setCanvasContextMenu(null);
+    if (!text.trim()) {
+      return;
+    }
+    forgetCopiedNodes();
+    void navigator.clipboard?.writeText?.(text).catch((error) => {
+      console.warn("[Canvas] 复制文本失败", error);
+    });
+  }, [canvasContextMenu?.textContent, forgetCopiedNodes]);
 
   /** 右键「冻结组 / 解冻组」: 冻结后组与其内部节点位置锁定 */
   const handleContextToggleGroupFrozen = useCallback(() => {
@@ -3612,12 +3686,25 @@ export function Canvas() {
       void showErrorDialog("这个节点还没有可下载的文件", "无法下载", "节点可能仍在生成中，或产物已被清理。");
       return;
     }
-    const fileName = (entry.displayName?.trim() || entry.nodeId).replace(/[\\/:*?"<>|]/g, "_");
-    void saveImageSourceToDownloads(source, fileName).catch((error) => {
-      // 静默失败会让用户以为按钮没反应，必须报出来。
-      const message = error instanceof Error ? error.message : String(error);
-      void showErrorDialog(message, "下载失败", source);
-    });
+    // 标题可能是整段提示词（几千字、带换行），必须先压成合法且不过长的文件名。
+    const fileName = buildDownloadFileName(entry.displayName, entry.nodeId);
+    // 与 AI 视频节点「下载」一致：弹系统保存对话框，由用户决定存哪。
+    // （原来是直接写进系统下载目录，成功后界面毫无变化，看起来像「点了没反应」。）
+    void saveMediaSourceWithDialog({
+      source,
+      nodeId: entry.nodeId,
+      mediaType: entry.kind === "video" ? "video" : "image",
+      fileName,
+    })
+      .then((savedPath) => {
+        if (!savedPath) return; // 用户取消：不提示、不报错。
+        setDownloadToast({ fileName, path: savedPath });
+      })
+      .catch((error) => {
+        // 静默失败会让用户以为按钮没反应，必须报出来。
+        const message = error instanceof Error ? error.message : String(error);
+        void showErrorDialog(message, "下载失败", source);
+      });
   }, []);
 
   const handleMediaEntryDelete = useCallback(
@@ -5095,6 +5182,20 @@ export function Canvas() {
         <NodeManagerToggle onClick={handleNodeManagerOpenToggle} />
       )}
 
+      {downloadToast && (
+        <CanvasToast
+          message={`已下载：${downloadToast.fileName}`}
+          detail={downloadToast.path}
+          actionLabel="打开文件夹"
+          onAction={() => {
+            void import("@tauri-apps/plugin-opener")
+              .then(({ revealItemInDir }) => revealItemInDir(downloadToast.path))
+              .catch(() => undefined);
+          }}
+          onDismiss={() => setDownloadToast(null)}
+        />
+      )}
+
       {dragSelectRect && (
         <div
           className="pointer-events-none absolute z-30 border border-accent/70 bg-accent/15"
@@ -5106,6 +5207,11 @@ export function Canvas() {
           }}
         />
       )}
+
+      {/* 生成时落盘失败是静默的（只 warn 一句就退回远端 URL），这里把「还挂在
+          平台临时链接上的素材」顶到画布上，并给一键保存到本地。
+          左偏移跟着节点管理器走：面板是 `left-3 w-64`，展开时固定 left-16 会被压住。 */}
+      <UnpersistedMediaNotice leftOffsetPx={isNodeManagerOpen ? 280 : 64} />
 
       <div className="absolute right-4 top-4 z-10 flex items-center gap-2">
         <button
@@ -5287,6 +5393,7 @@ export function Canvas() {
           downloadMediaType={canvasContextMenu.downloadMediaType}
           nodeId={canvasContextMenu.nodeId}
           textContent={canvasContextMenu.textContent}
+          selectedText={canvasContextMenu.selectedText}
           isGroupNode={isGroupNode(canvasContextMenuNode)}
           groupFrozen={isFrozenGroupNode(canvasContextMenuNode)}
           canPaste={
@@ -5299,6 +5406,8 @@ export function Canvas() {
           onClearFailedNodes={handleClearFailedNodes}
           onCopyNode={handleContextCopyNode}
           onCutNode={handleContextCutNode}
+          onCopySelectedText={handleContextCopySelectedText}
+          onCopyAllText={handleContextCopyAllText}
           onSaveTextToPrompt={handleContextSaveTextToPrompt}
           onPaste={handleContextPaste}
           onAddMediaToLibrary={handleAddMediaToLibrary}

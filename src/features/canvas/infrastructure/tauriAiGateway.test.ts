@@ -4,6 +4,7 @@ import {
   isPubliclyReachableHttpUrl,
   localizeReferenceTokens,
   needsCompatibilityVideoWorker,
+  supportsLocalCliCancellation,
   tauriAiGateway,
   usesRunningHubCliDirectApi,
   withZhiniaoImageMode,
@@ -16,6 +17,23 @@ import {
   requestVideoCancellation,
   throwIfVideoSubmissionCanceled,
 } from "@/features/canvas/application/videoGenerationCancel";
+
+describe("supportsLocalCliCancellation", () => {
+  it("只有接了后端取消表的两条即梦链路可以「提交前取消」", () => {
+    expect(supportsLocalCliCancellation(`${JIMENG_CLI_PROVIDER_ID}/seedance2.0`)).toBe(true);
+    expect(supportsLocalCliCancellation("jimeng-canvas/seedance_2.5")).toBe(true);
+    // 前后空格来自节点上手工填写, 判定必须先 trim。
+    expect(supportsLocalCliCancellation("  jimeng-canvas/seedance_2.0_vip  ")).toBe(true);
+  });
+
+  it("Wan / RunningHub CLI 与远端平台仍保持「点下去就收掉入口」", () => {
+    // 这两条本地 CLI 没有取消通道: 若误判成可取消, 按钮会点了没反应。
+    expect(supportsLocalCliCancellation("wan-cli/2.2")).toBe(false);
+    expect(supportsLocalCliCancellation(`${RUNNINGHUB_CLI_PROVIDER_ID}/some-endpoint`)).toBe(false);
+    expect(supportsLocalCliCancellation("custom:relay/veo3")).toBe(false);
+    expect(supportsLocalCliCancellation("")).toBe(false);
+  });
+});
 
 describe("needsCompatibilityVideoWorker", () => {
   const withTransport = (model: string, transport?: string) =>

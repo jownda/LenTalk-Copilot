@@ -1,4 +1,4 @@
-import { Suspense, lazy, useMemo, useState, useEffect, useCallback } from 'react';
+import { Suspense, lazy, useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import {
@@ -47,6 +47,8 @@ export function NodeToolDialog() {
   const [options, setOptions] = useState<ToolOptions>({});
   const [isSplitImageReady, setIsSplitImageReady] = useState(true);
   const [displayToolDialog, setDisplayToolDialog] = useState(activeToolDialog);
+  /** 已经初始化过参数的那个对话框（`nodeId:toolType`）。同一个对话框不重复初始化，见下面的 effect。 */
+  const initializedDialogKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (activeToolDialog) {
@@ -54,6 +56,8 @@ export function NodeToolDialog() {
       return;
     }
 
+    // 关掉之后放行下一次初始化：重开同一个节点的同一个工具，应该回到默认参数。
+    initializedDialogKeyRef.current = null;
     const timer = setTimeout(() => {
       setDisplayToolDialog(null);
     }, UI_DIALOG_TRANSITION_MS);
@@ -99,6 +103,19 @@ export function NodeToolDialog() {
     if (!sourceNode || !activePlugin) {
       return;
     }
+
+    // 🔴 只在「换了一个工具对话框」时初始化参数，绝不能因为节点对象变了就重置。
+    //
+    // 这个 effect 以前依赖 `sourceNode`（它来自 `nodes.find(...)`，每次 store 里
+    // nodes 数组换新就换一个对象身份）。于是画布上**任何**节点更新 —— 后台某个
+    // 生成任务完成、节点改名、批量改数据 —— 都会让这里重跑一遍
+    // `setOptions(createInitialOptions())`，把用户刚框好的 `cropX/cropY/cropWidth/
+    // cropHeight` 抹掉。裁剪编辑器随后按「空参数」重建默认框，用户点应用时拿到的
+    // 是居中的默认裁切区，而不是自己框的那块 —— 实报「裁剪结果和实际操作不符」。
+    if (initializedDialogKeyRef.current === dialogKey) {
+      return;
+    }
+    initializedDialogKeyRef.current = dialogKey;
 
     let cancelled = false;
     setError(null);

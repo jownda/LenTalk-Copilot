@@ -6,6 +6,7 @@ import {
   isVideoCancellationRequested,
   isVideoCancellationWindowOpen,
   isVideoGenerationCanceledError,
+  isVideoGenerationCanceledMessage,
   openVideoCancellationWindow,
   requestVideoCancellation,
   subscribeVideoCancellation,
@@ -63,6 +64,17 @@ describe("videoGenerationCancel", () => {
   it("哨兵错误可被类型判定识别, 普通错误不会误判", () => {
     expect(isVideoGenerationCanceledError(new VideoGenerationCanceledError())).toBe(true);
     expect(isVideoGenerationCanceledError(new Error("已取消生成"))).toBe(false);
+  });
+
+  it("后端本地 CLI 取消按文案识别: Error 与裸字符串两种形态都要认", () => {
+    // 本地 CLI 走阻塞式 invoke, 后端只能把取消当成字符串错误上报, 没有哨兵实例。
+    expect(isVideoGenerationCanceledMessage(new Error("已取消生成"))).toBe(true);
+    expect(isVideoGenerationCanceledMessage("已取消生成")).toBe(true);
+    expect(isVideoGenerationCanceledMessage("  已取消生成\n")).toBe(true);
+    // 近义的失败文案不能被当成取消, 否则真实报错会被静默成「已取消」。
+    expect(isVideoGenerationCanceledMessage(new Error("即梦 CLI 任务执行中断: 已取消生成"))).toBe(false);
+    expect(isVideoGenerationCanceledMessage(new Error("网络错误"))).toBe(false);
+    expect(isVideoGenerationCanceledMessage(undefined)).toBe(false);
   });
 
   it("订阅者在开窗/取消/关窗时被通知, 退订后不再收到", () => {

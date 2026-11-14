@@ -15,6 +15,7 @@ pub mod pajuben;
 pub mod wan_cli;
 pub mod project_state;
 pub mod project_archive;
+pub mod storage_paths;
 pub mod runninghub_cli;
 pub mod system;
 pub mod text_file;

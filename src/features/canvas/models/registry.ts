@@ -129,14 +129,101 @@ const API_KEYLESS_PROVIDER_IDS: ReadonlySet<string> = new Set([
 export function isApiKeylessProvider(providerId: string): boolean {
   return API_KEYLESS_PROVIDER_IDS.has(providerId);
 }
-const JIMENG_CLI_VIDEO_POINTS_PER_SECOND: Record<string, number> = {
-  "seedance2.0_vip": 14,
-  "seedance2.5": 26,
-  "seedance2.0mini": 6,
-  "seedance2.0fast_vip": 6,
-  "seedance2.0fast": 2,
-  "seedance2.0": 3,
+/**
+ * 即梦积分价目（2026-11-12 实测，两个 CLI 共用一套价）。
+ *
+ * 取数方式：`dreamina-canvas node quote` 是**只报价、不扣分**的预估价接口, 逐型号逐档
+ * 取数即可；再与 `dreamina` 本地任务库 `%USERPROFILE%\.dreamina_cli\tasks.db` 的
+ * `commerce_info.credit_count`(真实扣费) 交叉核对 —— seedance2.5 480p/720p、
+ * seedance2.0fast_vip 720p、5.0Pro 2K/4K 全部逐一吻合, 所以两条链路的价可以合并成一张表。
+ *
+ * `0` = 当前账号在该档免费(会员权益), 展示层按「无价格」处理
+ * ({@link createPointsOnlyPricing} 在 pointsCost<=0 时返回 null)。
+ * `jm_image_model_*`(GPT Image 2 / 香蕉系) 报价被服务端拒绝(`serviceCode 10000`), 暂不登记。
+ */
+const JIMENG_IMAGE_CREDITS: Record<string, Record<string, number>> = {
+  "5.5": { "1.5k": 4, "2k": 6 },
+  "5.0pro": { "1.5k": 0, "2k": 0, "4k": 12 },
+  "5.0lite": { "2k": 3, "4k": 4 },
+  "4.7": { "1k": 1, "2k": 1, "4k": 2 },
+  "4.6": { "2k": 1, "4k": 2 },
+  "4.5": { "2k": 3, "4k": 4 },
+  "4.1": { "2k": 1, "4k": 2 },
+  "4.0": { "2k": 1, "4k": 0 },
+  "5.0flash": { "1.5k": 3, "2k": 3 },
+  // `jm_image_model_yc_mj82` 固定一次出 4 张, 报价 1K=20 / 2K=28 → 单张 5 / 7。
+  "mj82": { "1k": 5, "2k": 7 },
 };
+
+/** 画布 CLI 的 `--model` → 价目键。表里没有的(如 jm_image_model_lib_f)就是无价可查。 */
+const JIMENG_CANVAS_IMAGE_MODEL_KEYS: Record<string, string> = {
+  "seedream_5.5": "5.5",
+  "seedream_5.0_pro": "5.0pro",
+  "seedream_5.0_lite": "5.0lite",
+  "seedream_4.7": "4.7",
+  "seedream_4.6": "4.6",
+  "seedream_4.5": "4.5",
+  "seedream_4.1": "4.1",
+  "seedream_4.0": "4.0",
+  "high_aes_general_v50_flash": "5.0flash",
+  "jm_image_model_yc_mj82": "mj82",
+};
+
+/** 即梦 CLI 的 `--model_version` → 价目键。3.0/3.1 无实测数据, 故意不登记。 */
+const JIMENG_CLI_IMAGE_MODEL_KEYS: Record<string, string> = {
+  "5.0Pro": "5.0pro",
+  // 即梦网页端的「图片 5.0」= 画布 CLI 的 Seedream 5.0 Lite, 同一个型号两个叫法。
+  "5.0": "5.0lite",
+  "4.7": "4.7",
+  "4.6": "4.6",
+  "4.5": "4.5",
+  "4.1": "4.1",
+  "4.0": "4.0",
+};
+
+/**
+ * 即梦视频「每秒积分」, 按型号 + 分档两级记 —— 同一型号 480p 与 1080p 差 5 倍以上,
+ * 只按型号记一个数必然报错价(旧表把 seedance2.5 记成 26/秒, 实测 720p 是 20/秒)。
+ * 键是模型名去掉 `_`/`-` 后的小写形式, 两个 CLI 的命名差异(seedance_2.5 / seedance2.5)自动归一。
+ */
+const JIMENG_VIDEO_CREDITS_PER_SECOND: Record<string, Record<string, number>> = {
+  "seedance2.5draft": { "480p": 9 },
+  "seedance2.5": { "480p": 12, "720p": 20, "1080p": 64 },
+  "seedance2.0vip": { "720p": 14, "1080p": 33, "4k": 80 },
+  "seedance2.0fastvip": { "720p": 6 },
+  "seedance2.0mini": { "720p": 6 },
+  "seedance2.0fast": { "720p": 2 },
+  "seedance2.0": { "720p": 3 },
+  "seedanceprofast": { "720p": 2, "1080p": 4 },
+  "happyhorse1.1": { "720p": 14, "1080p": 18 },
+  "wan3.0": { "720p": 14, "1080p": 33 },
+};
+
+function normalizeJimengPriceKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9.]/g, "");
+}
+
+/** 单张图片的积分。`key` 为 undefined / 表内无该档 → 0(不展示价格)。 */
+function jimengImageCredits(key: string | undefined, resolution: string): number {
+  if (!key) return 0;
+  return JIMENG_IMAGE_CREDITS[key]?.[normalizeJimengPriceKey(resolution)] ?? 0;
+}
+
+/** 视频每秒积分。`fallbackResolution` 在节点还没选分辨率时兜底用模型默认档。 */
+function jimengVideoCreditsPerSecond(
+  model: string,
+  resolution: string,
+  fallbackResolution: string
+): number {
+  const table = JIMENG_VIDEO_CREDITS_PER_SECOND[normalizeJimengPriceKey(model)];
+  if (!table) return 0;
+  return (
+    table[normalizeJimengPriceKey(resolution)] ??
+    table[normalizeJimengPriceKey(fallbackResolution)] ??
+    0
+  );
+}
+
 const WINDOWS_UNCONFIGURED_IMAGE_MODEL_ID = "custom:unconfigured/configure-api";
 const WINDOWS_UNCONFIGURED_IMAGE_MODEL: ImageModelDefinition = {
   id: WINDOWS_UNCONFIGURED_IMAGE_MODEL_ID,
@@ -437,6 +524,10 @@ export function listVideoModels(): VideoModelDefinition[] {
               defaultResolution: resolutionValues.includes("720p") ? "720p" : resolutionValues[0],
             }
           : {}),
+        // 只有知鸟链路会逐模型声明参考图上限(目前是 muse-video 的 4 张)。
+        ...(zhiniaoOptions?.maxReferenceImages
+          ? { maxReferenceImages: zhiniaoOptions.maxReferenceImages }
+          : {}),
         pricing: resolveCustomVideoPricing(api.name, api.baseUrl, model, isBinghuo),
         profileId: profile.id,
         profileStatus: profile.status,
@@ -711,6 +802,11 @@ function buildJimengCanvasCliVideoModels(): VideoModelDefinition[] {
     defaultDuration: 5,
     resolutions: resolutions.map((value) => ({ value, label: value.toUpperCase() })),
     defaultResolution: resolutions[0],
+    pricing: createPointsOnlyPricing(
+      ({ resolution, extraParams }) =>
+        jimengVideoCreditsPerSecond(model, resolution, resolutions[0]) *
+        Math.max(1, Number(extraParams?.duration) || 5)
+    ),
   }));
 }
 
@@ -738,8 +834,9 @@ function buildJimengCliVideoModels(): VideoModelDefinition[] {
     resolutions: resolutions.map((value) => ({ value, label: value.toUpperCase() })),
     defaultResolution: resolutions[0],
     pricing: createPointsOnlyPricing(
-      ({ extraParams }) =>
-        (JIMENG_CLI_VIDEO_POINTS_PER_SECOND[version] ?? 0) * Math.max(1, Number(extraParams?.duration) || 5),
+      ({ resolution, extraParams }) =>
+        jimengVideoCreditsPerSecond(version, resolution, resolutions[0]) *
+        Math.max(1, Number(extraParams?.duration) || 5)
     ),
   }));
 }
@@ -901,6 +998,7 @@ function resolveJimengCliImageResolutions(version: string): string[] {
  */
 function buildJimengCanvasCliImageModels(): ImageModelDefinition[] {
   const models = [
+    { model: "seedream_5.5", label: "Seedream 5.5", tiers: ["1.5K", "2K"] },
     { model: "seedream_5.0_pro", label: "Seedream 5.0 Pro", tiers: ["1.5K", "2K", "4K"] },
     { model: "seedream_5.0_lite", label: "Seedream 5.0 Lite", tiers: ["2K", "4K"] },
     { model: "seedream_4.7", label: "Seedream 4.7", tiers: ["1K", "2K", "4K"] },
@@ -929,6 +1027,9 @@ function buildJimengCanvasCliImageModels(): ImageModelDefinition[] {
     defaultResolution: tiers[1] ?? tiers[0],
     aspectRatios: JIMENG_CLI_IMAGE_ASPECT_RATIOS.map((value) => ({ value, label: value })),
     resolutions: tiers.map((value) => ({ value, label: value })),
+    pricing: createPointsOnlyPricing(({ resolution }) =>
+      jimengImageCredits(JIMENG_CANVAS_IMAGE_MODEL_KEYS[model], resolution || tiers[0])
+    ),
     resolveRequest: ({ referenceImageCount }) => ({
       requestModel: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
       modeLabel: referenceImageCount > 0 ? "编辑模式" : "生成模式",
@@ -963,6 +1064,9 @@ function buildJimengCliImageModels(): ImageModelDefinition[] {
       defaultResolution: (tiers[0] ?? "2k").toUpperCase(),
       aspectRatios: JIMENG_CLI_IMAGE_ASPECT_RATIOS.map((value) => ({ value, label: value })),
       resolutions: tiers.map((value) => ({ value: value.toUpperCase(), label: value.toUpperCase() })),
+      pricing: createPointsOnlyPricing(({ resolution }) =>
+        jimengImageCredits(JIMENG_CLI_IMAGE_MODEL_KEYS[version], resolution || tiers[0])
+      ),
       resolveRequest: ({ referenceImageCount }) => ({
         requestModel: `${JIMENG_CLI_PROVIDER_ID}/image-${version}`,
         modeLabel: referenceImageCount > 0 ? "编辑模式" : "生成模式",
@@ -1133,6 +1237,8 @@ interface ZhiniaoVideoOptionEntry {
    * 不写就按通用规则：有 5 选 5，否则取首个合法档。新上线的长镜头模型在这里写 30。
    */
   defaultDuration?: number;
+  /** 单次最多收几张参考图；不写表示平台未声明（沿用链路默认 30）。 */
+  maxReferenceImages?: number;
 }
 
 const ZHINIAO_VIDEO_OPTION_TABLE: Record<string, ZhiniaoVideoOptionEntry> = {
@@ -1299,6 +1405,23 @@ const ZHINIAO_VIDEO_OPTION_TABLE: Record<string, ZhiniaoVideoOptionEntry> = {
     durationOptions: [3, 5, 10, 15],
     resolutionValues: ["720p", "1080p"],
   },
+  // Meta Muse Video —— 知鸟链路上唯一能到 **60 秒**的模型, 同时也是参考图卡得最死的。
+  //
+  // 时长: 实测(2026-11-12 网关直连)传 `duration=999` 被 `param_adjustments` 改写成
+  //   `{"applied":"60","reason":"nearest_supported"}` —— 上限确实是 60。档位按官方口径
+  //   (精确出片档 5/6/8/10/15/20/25/30, 长版 40/50/60)登记, **不虚构中间值**: 平台会把
+  //   非精确秒数向上取整, 用户选了 12 秒实际按 15 秒出片并计费, 属于隐性多扣钱。
+  // 参考图: **1~4 张**, 传第 5 张平台直接 400(Meta 官方限制), 与「首帧」二选一;
+  //   参考图模式下任何一张都不会被当成首帧。
+  // 画幅/分辨率: 只有 16:9(1280x720) 与 9:16(720x1280), 输出恒 720p —— 1080p 请求 400,
+  //   所以分辨率只登记一档, 别让用户选到必失败的值。
+  "muse-video": {
+    aspectRatios: ["16:9", "9:16"],
+    durationOptions: [5, 6, 8, 10, 15, 20, 25, 30, 40, 50, 60],
+    resolutionValues: ["720p"],
+    maxReferenceImages: 4,
+    defaultDuration: 5,
+  },
   // xAI Grok Imagine 视频族 —— 曾因名字含 imagine 被判成图片, 这里给出各自档位
   "grok-imagine-1.5": {
     aspectRatios: ["16:9", "9:16", "1:1"],
@@ -1354,6 +1477,13 @@ interface ZhiniaoVideoOptions {
   durationOptions: number[];
   resolutionValues: string[];
   /**
+   * 该模型单次最多收几张参考图。`undefined` = 平台没有声明上限（沿用链路的 30）。
+   *
+   * 必须逐模型登记: muse-video(Meta Muse)只吃 **1~4 张**参考图, 传第 5 张平台直接
+   * 400, 而不是像 seedance 那样静默忽略 —— 节点上照旧摆 30 个槽位会让用户白传。
+   */
+  maxReferenceImages?: number;
+  /**
    * 是否来自逐模型登记表（只有登记表分支会置 true，族兜底一律缺省）。
    *
    * false/undefined = 平台新上、我们还没核过档位的模型。这类模型按「新模型先按
@@ -1376,6 +1506,7 @@ function resolveZhiniaoVideoOptions(model: string): ZhiniaoVideoOptions {
       durationOptions: exact.durationOptions.length ? exact.durationOptions : ZHINIAO_FALLBACK_DURATIONS,
       // 分辨率保持空数组: 注册表把「空」当作「该模型没有这个参数」, 直接隐藏控件。
       resolutionValues: exact.resolutionValues,
+      maxReferenceImages: exact.maxReferenceImages,
       listed: true,
       defaultDuration: exact.defaultDuration,
     };

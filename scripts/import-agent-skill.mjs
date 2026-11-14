@@ -4,7 +4,7 @@
  * LenTalk AI Agent 可直接加载的 TS 模块。
  *
  * 用法：
- *   node scripts/import-agent-skill.mjs "<skill 目录 或 SKILL.md 路径>" [--id <slug>]
+ *   node scripts/import-agent-skill.mjs "<skill 目录 或 SKILL.md 路径>" [--id <slug>] [--extra templates,examples]
  *
  * 产物：`src/features/agent/skills/<slug>.ts`
  * 之后把它登记进 `src/features/agent/skills/index.ts` 的 `AGENT_SKILLS` 即可被面板加载。
@@ -32,15 +32,25 @@ function die(message) {
 function parseArgs(argv) {
   const positional = [];
   let id = null;
+  let extraDirs = [];
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--id") {
       id = argv[index + 1] ?? null;
       index += 1;
       continue;
     }
+    if (argv[index] === "--extra") {
+      // 逗号分隔的额外目录（`templates,examples`）。默认不读，保持既有 skill 的产物不变。
+      extraDirs = String(argv[index + 1] ?? "")
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+      index += 1;
+      continue;
+    }
     positional.push(argv[index]);
   }
-  return { input: positional[0] ?? null, id };
+  return { input: positional[0] ?? null, id, extraDirs };
 }
 
 /**
@@ -148,21 +158,59 @@ function collectReferences(skillDir) {
     .map((entry) => entry.name)
     .sort((a, b) => a.localeCompare(b, "en", { numeric: true, sensitivity: "base" }))
     .map((name) => ({
-      name,
+      // 名字带 `references/` 前缀：附录标题直接用 name 拼，不能再在标题里硬编码目录，
+      // 否则 `--extra` 收进来的 templates/examples 会被错误地拼成 references/templates/…
+      name: `references/${name}`,
       text: readFileSync(join(dir, name), "utf8").replace(/^\uFEFF/, "").trim(),
     }))
     .filter((item) => item.text.length > 0);
 }
 
-/** 正文里的 `[文字](references/x.md)` → `《附录 x.md》`，避免模型去找不存在的文件 */
+/**
+ * 收集 `references/` 之外的额外目录（默认不读）。
+ *
+ * 有的 skill 把输出骨架放在 `templates/`、把回归样例放在 `examples/`，而那些目录同样会被
+ * SKILL.md 以路径形式引用；不内联的话模型会自己现编模板。名字带上子目录前缀，
+ * 附录标题里能看出原始位置。
+ */
+function collectExtraDocs(skillDir, dirs) {
+  const collected = [];
+  for (const dirName of dirs) {
+    const dir = join(skillDir, dirName);
+    if (!existsSync(dir)) {
+      console.warn(`! --extra 指定的目录不存在，已跳过：${dirName}`);
+      continue;
+    }
+    const files = readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && extname(entry.name).toLowerCase() === ".md")
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b, "en", { numeric: true, sensitivity: "base" }));
+    for (const name of files) {
+      const text = readFileSync(join(dir, name), "utf8").replace(/^\uFEFF/, "").trim();
+      if (text.length > 0) collected.push({ name: `${dirName}/${name}`, text });
+    }
+  }
+  return collected;
+}
+
+/**
+ * 正文里的路径引用 → 「《附录 …》」，避免模型去找不存在的文件。
+ *
+ * 两种写法都要处理：
+ * - markdown 链接 `[文字](references/x.md)`
+ * - 反引号裸路径 `` `templates/prompt-template.md` ``（很多 skill 是这么写的）
+ */
 function rewriteReferenceLinks(body, references) {
   let out = body;
   for (const ref of references) {
-    const escaped = ref.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    out = out.replace(
-      new RegExp(`\\[([^\\]]*)\\]\\(references/${escaped}\\)`, "g"),
-      `《附录 ${ref.name}》`,
-    );
+    const base = ref.name.split("/").pop();
+    const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out
+      .replace(
+        new RegExp(`\\[([^\\]]*)\\]\\((?:[A-Za-z0-9_-]+/)?${escaped}\\)`, "g"),
+        `《附录 ${ref.name}》`,
+      )
+      .replace(new RegExp("\\`(?:[A-Za-z0-9_-]+/)?" + escaped + "\\`", "g"), `《附录 ${ref.name}》`);
   }
   return out;
 }
@@ -177,11 +225,11 @@ function withReferences(body, references) {
     "",
     "# 附录（随 SKILL 一同加载的完整参考文档，直接按此执行，不要去读取文件）",
     "",
-    references.map((ref) => `## 附录：references/${ref.name}\n\n${ref.text}`).join("\n\n"),
+    references.map((ref) => `## 附录：${ref.name}\n\n${ref.text}`).join("\n\n"),
   ].join("\n");
 }
 
-const { input, id: idFlag } = parseArgs(process.argv.slice(2));
+const { input, id: idFlag, extraDirs } = parseArgs(process.argv.slice(2));
 if (!input) {
   die('用法: node scripts/import-agent-skill.mjs "<skill 目录 或 SKILL.md 路径>" [--id <slug>]');
 }
@@ -192,7 +240,7 @@ const skillDir = dirname(skillFile);
 
 const raw = readFileSync(skillFile, "utf8").replace(/^\uFEFF/, "");
 const { data: front, body } = splitFrontmatter(raw);
-const references = collectReferences(skillDir);
+const references = [...collectReferences(skillDir), ...collectExtraDocs(skillDir, extraDirs)];
 const rules = withReferences(body.trim(), references);
 if (!rules) die("SKILL.md 正文为空，拒绝生成空规则");
 
@@ -258,7 +306,7 @@ console.log(
 );
 console.log(`  规则 ${rules.length} 字符 / ${rules.split(/\r?\n/).length} 行`);
 if (references.length > 0) {
-  console.log(`  已内联 references：${references.map((ref) => ref.name).join(" / ")}`);
+  console.log(`  已内联参考文档：${references.map((ref) => ref.name).join(" / ")}`);
 }
 console.log("");
 console.log("还剩一步：把它加进 src/features/agent/skills/index.ts 的 AGENT_SKILLS");

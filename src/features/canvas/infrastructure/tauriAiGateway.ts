@@ -1,5 +1,6 @@
 import {
   cancelGenerateVideoJob,
+  cancelLocalCliVideo,
   characterSwapVideo as characterSwapVideoCommand,
   generateAudio,
   generateAudioAsset,
@@ -19,7 +20,7 @@ import {
   uploadZhiniaoReferenceAsset,
 } from "@/commands/ai";
 import { createCompactImageDataUrl, imageUrlToDataUrl, persistImageLocally } from "@/features/canvas/application/imageData";
-import { throwIfVideoSubmissionCanceled } from "@/features/canvas/application/videoGenerationCancel";
+import { throwIfVideoSubmissionCanceled, isVideoGenerationCanceledMessage } from "@/features/canvas/application/videoGenerationCancel";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useJimengCanvasCliStore } from "@/stores/jimengCanvasCliStore";
 import { generateJimengCanvasAudio, generateJimengCanvasVideo } from "@/commands/jimengCanvasCli";
@@ -28,7 +29,7 @@ import { getVideoModel } from "@/features/canvas/models";
 import { RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
 import { useRunningHubCliStore } from "@/stores/runningHubCliStore";
 import { toVideoGenerationRequest } from "@/features/canvas/application/videoGeneration";
-import { persistVideoLocally } from "@/features/canvas/application/mediaPersistence";
+import { persistAudioLocally, persistVideoLocally } from "@/features/canvas/application/mediaPersistence";
 import { isRjmVideoApiBaseUrl } from "@/commands/videoApi";
 import { isZhenjianProvider } from "@/commands/zhenjianApi";
 import { isZzdhProvider } from "@/commands/zzdhApi";
@@ -45,7 +46,14 @@ import { isKuaiziBaseUrl, resolveKuaiziVideoLimits } from "@/features/canvas/mod
 import { resolveKuaiziVideoReferences } from "./kuaiziReferences";
 import { uploadReferencesViaImageHost } from "./imageHostReferences";
 
-type LocalVideoJob = { job_id: string; status: string; result: string | null; error: string | null };
+type LocalVideoJob = {
+  job_id: string;
+  status: string;
+  result: string | null;
+  error: string | null;
+  /** 提交时用的 clientJobId —— 后端取消表按它记账（本地 CLI 只有这一条通道能取消）。 */
+  client_job_id: string;
+};
 // 本地 CLI 类视频链路(即梦 / Wan)只能在本机跑可执行文件, 仍由前端适配器承载;
 // 其余视频协议全部由 Rust 后端任务执行器承载 —— 它们与后端任务共用同一套 job
 // 状态接口, 画布无需区分轮询方式。
@@ -92,6 +100,18 @@ export function needsCompatibilityVideoWorker(payload: GenerateVideoPayload): bo
     payload.model.startsWith("jimeng-canvas/") ||
     (payload.model.startsWith(`${RUNNINGHUB_CLI_PROVIDER_ID}/`) && !usesRunningHubCliDirectApi(payload.model))
   );
+}
+
+/**
+ * 哪些本地 CLI 支持「提交前取消」。
+ *
+ * 只有接了后端取消表的两条即梦链路：视频命令都带 `client_job_id`，后端在素材规整 /
+ * 上传素材 / 建节点 / `node run` 之间逐段检查取消标志，平台受理前取消 = 不扣积分。
+ * Wan / RunningHub CLI 没有这条通道，继续保持「点下去就收掉入口」的旧行为。
+ */
+export function supportsLocalCliCancellation(modelId: string): boolean {
+  const model = modelId.trim();
+  return model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`) || model.startsWith(`${JIMENG_CANVAS_CLI_PROVIDER_ID}/`);
 }
 
 import type {
@@ -789,14 +809,20 @@ export const tauriAiGateway: AiGateway = {
   getGenerateImageJob,
   getGenerateVideoJob: async (jobId: string) => {
     const localJob = compatibilityVideoJobs.get(jobId);
-    // 本地 CLI 任务没有后端可取消的窗口(进程已经跑出去了), 所以对前端一律声明
-    // cancelable: false —— 下游节点会立刻收掉「取消生成」入口。
-    return localJob ? { ...localJob, cancelable: false } : await getGenerateVideoJob(jobId);
+    // 本地 CLI 任务只要还在跑就仍可能停在「提交前」阶段: 即梦两条链路的后端都按
+    // clientJobId 记账, 在素材上传 / 建节点 / node run 之间逐段检查取消标志。
+    // 这里如实报 cancelable: true; 真正来不及取消时 cancelGenerateVideoJob 会回
+    // too_late, 节点上的取消入口随之收掉 —— 不能在前端假装一个已经晚了的状态。
+    return localJob ? { ...localJob, cancelable: localJob.status === "running" } : await getGenerateVideoJob(jobId);
   },
   cancelGenerateVideoJob: async (jobId: string) => {
-    // 本地兼容任务(jimeng / wan / runninghub CLI)没有中止通道: 进程已经交出去了。
-    if (compatibilityVideoJobs.has(jobId)) return "too_late" as const;
-    return await cancelGenerateVideoJob(jobId);
+    const localJob = compatibilityVideoJobs.get(jobId);
+    if (!localJob) return await cancelGenerateVideoJob(jobId);
+    // 本地 CLI: 先让后端置位取消标志。返回 false 说明这条任务已经不在取消表里
+    // (已提交到平台 / 已结束), 对前端就是 too_late。Wan / RunningHub CLI 没有
+    // 接这条通道, 后端同样回 false, 行为与旧版一致。
+    const accepted = await cancelLocalCliVideo(localJob.client_job_id).catch(() => false);
+    return accepted ? ("canceled" as const) : ("too_late" as const);
   },
   submitGenerateVideoJob: async (payload: GenerateVideoPayload, options?: { cancellationNodeId?: string }) => {
     // 提交流水线里的取消检查点。窗口由下游节点持有, 这里只读; 已经取消就抛哨兵,
@@ -819,7 +845,16 @@ export const tauriAiGateway: AiGateway = {
     checkCanceled();
     if (needsCompatibilityVideoWorker(routedPayload) || needsCompatibilityVideoWorker(normalized)) {
       const jobId = crypto.randomUUID();
-      compatibilityVideoJobs.set(jobId, { job_id: jobId, status: "running", result: null, error: null });
+      // 后端取消表按 clientJobId 记账。即梦两条链路都会带上它（VideoGenNode 传的
+      // payload.clientJobId）；缺省时退回本次 jobId，至少保证取消表不会互相串键。
+      const localClientJobId = routedPayload.clientJobId?.trim() || jobId;
+      compatibilityVideoJobs.set(jobId, {
+        job_id: jobId,
+        status: "running",
+        result: null,
+        error: null,
+        client_job_id: localClientJobId,
+      });
       // 这里仍传原始 payload: 注入交给 generateVideo 内部统一处理 —— 它还会顺带
       // 保留「节点显式选择的 transport 优先」的补偿分支(见下 :619), 提前注入会把
       // 用户的选择覆盖掉。注意本分支现在只承载本地 CLI 模型；RunningHub 官网
@@ -827,17 +862,29 @@ export const tauriAiGateway: AiGateway = {
       // 8 条远程协议已全部由后端任务执行器承载, 不再走这里。
       void tauriAiGateway.generateVideo(routedPayload).then(
         (result: string) =>
-          compatibilityVideoJobs.set(jobId, { job_id: jobId, status: "succeeded", result, error: null }),
-        (error: unknown) =>
           compatibilityVideoJobs.set(jobId, {
             job_id: jobId,
-            status: "failed",
-            result: null,
-            error: error instanceof Error ? error.message : String(error),
+            status: "succeeded",
+            result,
+            error: null,
+            client_job_id: localClientJobId,
           }),
+        (error: unknown) => {
+          // 用户主动取消不是失败: 后端在检查点抛「已取消生成」, 这里把任务记成
+          // canceled, 画布轮询会把节点落成中性的「已取消生成」, 不弹红色错误框。
+          const canceled = isVideoGenerationCanceledMessage(error);
+          compatibilityVideoJobs.set(jobId, {
+            job_id: jobId,
+            status: canceled ? "canceled" : "failed",
+            result: null,
+            error: canceled ? null : error instanceof Error ? error.message : String(error),
+            client_job_id: localClientJobId,
+          });
+        },
       );
-      // 本地 CLI 进程拦不住, 窗口到此为止。
-      return { jobId, cancelable: false };
+      // 即梦 CLI / 画布 CLI 在「还没交到平台」这一段可以取消（后端逐段检查）;
+      // Wan / RunningHub CLI 没有接这条通道, 仍然立刻收掉入口。
+      return { jobId, cancelable: supportsLocalCliCancellation(routedPayload.model) };
     }
     // 复用上面已注入的结果, 不再二次注入。能走到这里说明该平台确实由后端
     // OpenAI 兼容视频任务执行器承载(transport 为空或 openai-video)。
@@ -887,40 +934,53 @@ export const tauriAiGateway: AiGateway = {
     return { jobId, cancelable: true };
   },
   generateVideo: async (payload: GenerateVideoPayload) => {
+    // 🔴 四个本地 CLI 分支（wan / 即梦 CLI / 即梦画布 CLI / RunningHub）返回的都是
+    // **它们自己的下载目录**，不是「默认落盘位置」：即梦两条会把产物下到
+    // `%APPDATA%\...\jimeng-cli\videos\<run_id>\`，节点从此寄居在 AppData 里，
+    // 清缓存 / 重装 / 换机就整批丢。所以每个分支都必须过一遍 `persistVideoLocally`。
+    //
+    // 漏写的症状不是报错，而是「视频看着好好的，一个月后重装全没了」——
+    // `tauriAiGateway.cliPersistence.test.ts` 会扫这份源码守住这条约束。
+    //
+    // 注意不能只在函数末尾统一包一层：这四个分支都是提前 `return`，末尾那行走不到。
     if (usesRunningHubCliDirectApi(payload.model)) {
       return await tauriAiGateway.generateVideo(await prepareRunningHubCliDirectVideo(payload));
     }
     if (payload.model.startsWith("wan-cli/")) {
-      return generateWanCliVideo({
-        client_job_id: payload.clientJobId,
-        executable: useWanCliStore.getState().executable,
-        prompt: payload.prompt,
-        model_version: payload.model.slice("wan-cli/".length),
-        duration: payload.duration,
-        aspect_ratio: payload.aspectRatio,
-        video_resolution: payload.videoResolution,
-        image_mode: payload.imageMode,
-        reference_images: await normalizeReferenceUrls(payload.referenceImages),
-        reference_audio: payload.referenceAudio,
-      });
+      return await persistVideoLocally(
+        await generateWanCliVideo({
+          client_job_id: payload.clientJobId,
+          executable: useWanCliStore.getState().executable,
+          prompt: payload.prompt,
+          model_version: payload.model.slice("wan-cli/".length),
+          duration: payload.duration,
+          aspect_ratio: payload.aspectRatio,
+          video_resolution: payload.videoResolution,
+          image_mode: payload.imageMode,
+          reference_images: await normalizeReferenceUrls(payload.referenceImages),
+          reference_audio: payload.referenceAudio,
+        }),
+      );
     }
     if (payload.model.startsWith(`${JIMENG_CLI_PROVIDER_ID}/`)) {
       const referenceImages = await normalizeReferenceUrls(payload.referenceImages);
       const referenceAudio = payload.referenceAudio?.map((audioUrl) => audioUrl.trim()).filter(Boolean);
       const modelVersion = payload.model.slice(`${JIMENG_CLI_PROVIDER_ID}/`.length);
 
-      return await generateJimengCliVideo({
-        client_job_id: payload.clientJobId,
-        executable: useSettingsStore.getState().jimengCli.executable,
-        prompt: payload.prompt,
-        model_version: modelVersion,
-        duration: payload.duration,
-        aspect_ratio: payload.aspectRatio,
-        video_resolution: payload.videoResolution,
-        image_mode: payload.imageMode,
-        reference_images: referenceImages,
-        reference_audio: referenceAudio,
-      });
+      return await persistVideoLocally(
+        await generateJimengCliVideo({
+          client_job_id: payload.clientJobId,
+          executable: useSettingsStore.getState().jimengCli.executable,
+          prompt: payload.prompt,
+          model_version: modelVersion,
+          duration: payload.duration,
+          aspect_ratio: payload.aspectRatio,
+          video_resolution: payload.videoResolution,
+          image_mode: payload.imageMode,
+          reference_images: referenceImages,
+          reference_audio: referenceAudio,
+        }),
+      );
     }
     if (payload.model.trim().startsWith(JIMENG_CANVAS_MODEL_PREFIX)) {
       const referenceImages = (await normalizeReferenceUrls(payload.referenceImages)) ?? [];
@@ -951,18 +1011,21 @@ export const tauriAiGateway: AiGateway = {
             `当前节点选的是 ${requestedResolution}。请先把分辨率改成 ${supportedResolutions[0]} 再生成`
         );
       }
-      return await generateJimengCanvasVideo({
-        executable: useJimengCanvasCliStore.getState().executable,
-        prompt: payload.prompt,
-        model,
-        mode,
-        duration: payload.duration,
-        aspectRatio: payload.aspectRatio,
-        resolution: requestedResolution || definition?.defaultResolution || "720p",
-        referenceImages,
-        // 音频参考同样要带上: m2v 支持最多 10 个, 少了这一步模型只看到图片。
-        referenceAudio: payload.referenceAudio?.map((item) => item.trim()).filter(Boolean),
-      });
+      return await persistVideoLocally(
+        await generateJimengCanvasVideo({
+          executable: useJimengCanvasCliStore.getState().executable,
+          clientJobId: payload.clientJobId,
+          prompt: payload.prompt,
+          model,
+          mode,
+          duration: payload.duration,
+          aspectRatio: payload.aspectRatio,
+          resolution: requestedResolution || definition?.defaultResolution || "720p",
+          referenceImages,
+          // 音频参考同样要带上: m2v 支持最多 10 个, 少了这一步模型只看到图片。
+          referenceAudio: payload.referenceAudio?.map((item) => item.trim()).filter(Boolean),
+        }),
+      );
     }
     if (payload.model.startsWith(`${RUNNINGHUB_CLI_PROVIDER_ID}/`)) {
       const canonicalEndpoint = payload.model.slice(`${RUNNINGHUB_CLI_PROVIDER_ID}/`.length);
@@ -992,18 +1055,20 @@ export const tauriAiGateway: AiGateway = {
             resolution: payload.videoResolution,
           })
         : {};
-      return await generateRunningHubCliModel({
-        executable: useRunningHubCliStore.getState().executable,
-        endpoint,
-        prompt: payload.prompt,
-        images: sources,
-        video: videos?.[0],
-        audio: audios?.[0],
-        params: Object.entries(body)
-          .filter(([key]) => key !== (spec?.fields.prompt ?? "prompt") && ![spec?.fields.image, spec?.fields.imageList, spec?.fields.video, spec?.fields.videoList, spec?.fields.audio, spec?.fields.audioList].includes(key))
-          .map(([key, value]) => `${key}=${typeof value === "boolean" ? String(value) : String(value)}`),
-        output_kind: "video",
-      });
+      return await persistVideoLocally(
+        await generateRunningHubCliModel({
+          executable: useRunningHubCliStore.getState().executable,
+          endpoint,
+          prompt: payload.prompt,
+          images: sources,
+          video: videos?.[0],
+          audio: audios?.[0],
+          params: Object.entries(body)
+            .filter(([key]) => key !== (spec?.fields.prompt ?? "prompt") && ![spec?.fields.image, spec?.fields.imageList, spec?.fields.video, spec?.fields.videoList, spec?.fields.audio, spec?.fields.audioList].includes(key))
+            .map(([key, value]) => `${key}=${typeof value === "boolean" ? String(value) : String(value)}`),
+          output_kind: "video",
+        }),
+      );
     }
 
     // 视频语义固定为异步任务(提交+轮询), 不受图片默认 sync 影响
@@ -1068,8 +1133,8 @@ export const tauriAiGateway: AiGateway = {
       extra_params: injected.extraParams,
     });
     // 平台回的是自家 CDN 的**临时**链接，这里统一抓成本地文件再交给上层。
-    // 本地 CLI 分支（即梦 / Wan / RunningHub）本来返回的就是本地路径，
-    // persistVideoLocally 会原样放行；落盘失败也会回退远端 URL，不会丢结果。
+    // 本地 CLI 分支走不到这里（它们各自提前 return，已在上面各分支里落盘）；
+    // 落盘失败也会回退远端 URL，不会丢结果。
     return await persistVideoLocally(generatedUrl);
   },
   upscaleVideo: async (payload: UpscaleVideoPayload) => {
@@ -1175,14 +1240,16 @@ export const tauriAiGateway: AiGateway = {
       // 目前只有两个音频模型: legacy_tts(配音) 与 seed_music_1.0(音乐)。
       const isMusic = model === "seed_music_1.0";
       const referenceAudio = payload.referenceAudio?.trim() ? [payload.referenceAudio.trim()] : undefined;
-      return await generateJimengCanvasAudio({
-        executable: useJimengCanvasCliStore.getState().executable,
-        prompt: payload.prompt,
-        model,
-        mode: isMusic ? "music" : "tts",
-        duration: isMusic ? 30 : undefined,
-        referenceAudio,
-      });
+      return await persistAudioLocally(
+        await generateJimengCanvasAudio({
+          executable: useJimengCanvasCliStore.getState().executable,
+          prompt: payload.prompt,
+          model,
+          mode: isMusic ? "music" : "tts",
+          duration: isMusic ? 30 : undefined,
+          referenceAudio,
+        }),
+      );
     }
     if (payload.model.startsWith(`${RUNNINGHUB_CLI_PROVIDER_ID}/`)) {
       const endpoint = payload.model.slice(`${RUNNINGHUB_CLI_PROVIDER_ID}/`.length);
@@ -1200,13 +1267,15 @@ export const tauriAiGateway: AiGateway = {
           : "",
         endpoint.includes("music-2.6") ? `lyrics=${payload.lyrics ?? payload.prompt}` : "",
       ].filter(Boolean);
-      return await generateRunningHubCliModel({
-        executable: useRunningHubCliStore.getState().executable,
-        endpoint,
-        prompt: endpoint.includes("speech") || endpoint.includes("doubao") ? payload.prompt : undefined,
-        params,
-        output_kind: "audio",
-      });
+      return await persistAudioLocally(
+        await generateRunningHubCliModel({
+          executable: useRunningHubCliStore.getState().executable,
+          endpoint,
+          prompt: endpoint.includes("speech") || endpoint.includes("doubao") ? payload.prompt : undefined,
+          params,
+          output_kind: "audio",
+        }),
+      );
     }
     const injected = injectCustomApiRequestMode(payload);
     return await generateAudio({

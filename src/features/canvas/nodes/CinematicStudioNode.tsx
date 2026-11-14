@@ -25,6 +25,8 @@ import { resolveNodeDisplayName, isNodeUsingDefaultDisplayName } from "@/feature
 import { resolveVideoNodeModelId, resolveVideoNodeParams } from "@/features/canvas/domain/videoNodeDefaults";
 import { resolveVideoDurationHintFromTexts } from "@/features/canvas/domain/videoDurationHint";
 import { applyVoiceReferenceFormat } from "@/features/canvas/domain/voiceReferenceFormat";
+import { anchorImageReferenceTags, type ImageReferenceAnchor } from "@/features/canvas/domain/referenceTagAnchors";
+import { applyLocalReferenceSection, type LocalReferenceAsset } from "@/features/canvas/domain/referenceSection";
 import { getDefaultVideoModelId, getVideoModel } from "@/features/canvas/models";
 import { graphImageResolver } from "@/features/canvas/application/canvasServices";
 import { readLiveInputText } from "@/features/canvas/application/liveInputText";
@@ -513,6 +515,8 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
       prompt: string;
       referenceImages: string[];
       referenceAudio: string[];
+      /** 参考图的「名字 → 序号」清单：下游节点靠它自愈引用段。 */
+      referenceAnchors?: readonly LocalReferenceAsset[];
       /** 除提示词外还要一起找秒数的原文：用户自己写的故事梗概 / 风格。 */
       durationHintSources?: readonly string[];
     }) => {
@@ -565,6 +569,8 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         ...(durationHint !== null ? { duration: durationHint } : {}),
         studioReferenceImages: payload.referenceImages,
         studioReferenceAudio: payload.referenceAudio,
+        // 名字↔序号清单：万一后续有哪条链路把标记删了，视频节点能据此重建引用段。
+        ...(payload.referenceAnchors?.length ? { referenceAnchors: payload.referenceAnchors } : {}),
       });
       addEdge(id, videoNodeId);
       setSelectedNode(videoNodeId);
@@ -1056,13 +1062,51 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
         // @音频N 同时是画布的规范标记（视频节点「引用」按钮插入的就是它），
         // AI 输出里可能写成 [audioN] / @audioN 或旧式「声音参考：」，在落节点前一次收敛。
         // 角色名走与 ACTIVE REFERENCES 同一套解析（电影工程资产名），保证与 @角色 标签一致。
-        const prompt = applyVoiceReferenceFormat(
+        // 角色图片序号：绑定句要写成「使用 @音频N 作为 @角色 [imageM] 的唯一人声参考」，
+        // 否则模型只能靠名字猜声线配哪张脸，常把声线贴到同场的另一个角色上。
+        const characterImageIndexById = new Map<string, number>();
+        for (const asset of quickPromptAssets.characterAssets) {
+          if ((asset.mediaType ?? "image") !== "image") continue;
+          if (typeof asset.referenceIndex !== "number") continue;
+          const assetId = cinematicAssetIdFromMirrorId(asset.id);
+          if (!characterImageIndexById.has(assetId)) {
+            characterImageIndexById.set(assetId, asset.referenceIndex);
+          }
+        }
+        const withVoice = applyVoiceReferenceFormat(
           rawPrompt,
           quickPromptAssets.voiceBindings.map(({ audioIndex, characterId }) => ({
             audioIndex,
             characterName: projectAssetNames.get(characterId) ?? cinematicMirrorNames.get(characterId) ?? "",
+            imageIndex: characterImageIndexById.get(characterId),
           })),
           quickPromptLang,
+        );
+        // 引用段不再信任模型：`ACTIVE REFERENCES` 由资产表**本地生成**（名字 + 序号 + 说明），
+        // 模型漏写的资产补在段末、瞎编的序号按资产表改写。之后再做一次正文补齐，
+        // 让正文里的 `@角色` 也带上同一套序号。
+        const localAssets: LocalReferenceAsset[] = [];
+        for (const asset of [
+          ...quickPromptAssets.sceneAssets,
+          ...quickPromptAssets.characterAssets,
+          ...quickPromptAssets.propAssets,
+          ...stagingContext.props,
+        ]) {
+          if ((asset.mediaType ?? "image") !== "image") continue;
+          if (typeof asset.referenceIndex !== "number" || asset.referenceIndex < 1) continue;
+          const assetId = cinematicAssetIdFromMirrorId(asset.id);
+          const name = (projectAssetNames.get(assetId) ?? asset.name ?? "").trim();
+          if (!name || localAssets.some((item) => item.name === name)) continue;
+          const description = (descriptionByAssetId.get(assetId) ?? asset.description ?? "").trim();
+          localAssets.push({ name, imageIndex: asset.referenceIndex, description });
+        }
+        const imageAnchors: ImageReferenceAnchor[] = localAssets.map(({ name, imageIndex }) => ({
+          name,
+          imageIndex,
+        }));
+        const prompt = anchorImageReferenceTags(
+          applyLocalReferenceSection(withVoice, localAssets),
+          imageAnchors,
         );
         // 道具参考图续在场景 / 角色之后，既有 [imageN] 顺序完全不变。
         const referenceImages = [...quickPromptAssets.referenceImages, ...stagingContext.referenceImages];
@@ -1080,6 +1124,7 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
           prompt,
           referenceImages,
           referenceAudio,
+          referenceAnchors: localAssets,
           // Agent 的输出语言未必保留用户原话里的「5秒」，所以把自己写的故事梗概 /
           // 风格也一起找一遍；两者都已并上上游接进来的文本。
           durationHintSources: [quickInputs.synopsis, quickInputs.style],
@@ -1446,9 +1491,12 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
 
             {isChatModelPickerOpen && chatModelGroups.length ? (
               <div
-                className="absolute bottom-[calc(100%+8px)] left-0 z-50 w-[min(420px,calc(100vw-40px))] rounded-lg border border-[rgba(255,255,255,0.16)] bg-[#171b25] p-2 shadow-2xl"
+                // `nowheel` 是 React Flow 约定的「滚轮别缩放画布」标记：它按
+                // `event.target.closest('.nowheel')` 过滤掉缩放。只写 onWheel 不管用 ——
+                // d3-zoom 的监听挂在 pane 的原生事件上，React 的合成事件拦不住它。
+                className="nowheel absolute bottom-[calc(100%+8px)] left-0 z-50 w-[min(420px,calc(100vw-40px))] rounded-lg border border-[rgba(255,255,255,0.16)] bg-[#171b25] p-2 shadow-2xl"
                 onPointerDown={(event) => event.stopPropagation()}
-                onWheel={(event) => event.stopPropagation()}
+                onWheelCapture={(event) => event.stopPropagation()}
               >
                 <div className="ui-scrollbar max-h-60 overflow-y-auto overscroll-contain pr-0.5">
                   <section>
@@ -1565,9 +1613,12 @@ export const CinematicStudioNode = memo(({ id, data, selected, width, height }: 
 
             {isPromptFormatPickerOpen ? (
               <div
-                className="absolute bottom-[calc(100%+8px)] left-0 z-50 w-[min(420px,calc(100vw-40px))] rounded-lg border border-[rgba(255,255,255,0.16)] bg-[#171b25] p-2 shadow-2xl"
+                // `nowheel` 是 React Flow 约定的「滚轮别缩放画布」标记：它按
+                // `event.target.closest('.nowheel')` 过滤掉缩放。只写 onWheel 不管用 ——
+                // d3-zoom 的监听挂在 pane 的原生事件上，React 的合成事件拦不住它。
+                className="nowheel absolute bottom-[calc(100%+8px)] left-0 z-50 w-[min(420px,calc(100vw-40px))] rounded-lg border border-[rgba(255,255,255,0.16)] bg-[#171b25] p-2 shadow-2xl"
                 onPointerDown={(event) => event.stopPropagation()}
-                onWheel={(event) => event.stopPropagation()}
+                onWheelCapture={(event) => event.stopPropagation()}
               >
                 <div className="ui-scrollbar max-h-60 overflow-y-auto overscroll-contain pr-0.5">
                   {QUICK_PROMPT_FORMATS.map((format) => {

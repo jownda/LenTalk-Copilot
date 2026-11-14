@@ -18,7 +18,7 @@ export async function saveMediaSourceWithDialog({
   nodeId,
   mediaType,
   fileName,
-}: MediaDownloadRequest): Promise<void> {
+}: MediaDownloadRequest): Promise<string | null> {
   const extension = mediaType === "video" ? "mp4" : mediaType === "audio" ? "mp3" : "png";
   const defaultPath = fileName?.trim() || `node-${nodeId}.${extension}`;
 
@@ -35,7 +35,7 @@ export async function saveMediaSourceWithDialog({
     anchor.click();
     anchor.remove();
     URL.revokeObjectURL(blobUrl);
-    return;
+    return null;
   }
 
   const isWindows = isWindowsDesktopRuntime();
@@ -57,8 +57,10 @@ export async function saveMediaSourceWithDialog({
   );
 
   if (!selectedPath || Array.isArray(selectedPath)) {
-    return;
+    // 用户取消了保存框：不是失败，调用方不要弹错。
+    return null;
   }
 
   await saveImageSourceToPath(source, selectedPath);
+  return selectedPath;
 }

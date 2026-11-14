@@ -3640,6 +3640,8 @@
   display: inline-flex; align-items: center; gap: 6px;
   height: 30px; margin-top: 7px; font-size: 11px;
 }
+/* 「从素材库添加」与「上传本地音频」并排：只补间距，不改按钮尺寸。 */
+.voice-library-trigger + .voice-library-trigger { margin-left: 8px; }
 
 /* ────────── P0.4 导演简报卡 ────────── */
 .director-brief-card {

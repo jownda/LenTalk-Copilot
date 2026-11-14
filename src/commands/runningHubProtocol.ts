@@ -1441,3 +1441,34 @@ export function buildRunningHubCharacterSwapNodeInfoList(
   }
   return nodeInfoList;
 }
+
+/**
+ * 把 RunningHub 的已知业务错误码翻成用户能照着办的话；认不出返回 `null`，
+ * 调用方退回原始 JSON。
+ *
+ * 为什么需要这层：RunningHub 有两套互不相通的账 ——
+ * - **RH 币**（`accountStatus.remainCoins`）：网页端跑工作流/AI 应用扣它；
+ * - **积分**（`accountStatus.remainPoint`）：API 调用扣它，且**消费级 Key 只认付费积分**，
+ *   注册赠送/活动赠送的免费积分一律不可用于 API。
+ *
+ * 实测（2026-11-12，国内版 `apiType: NORMAL`）：账户 `remainCoins` 3209、`remainPoint` 30，
+ * 提交 IndexTTS2 仍然 `errorCode 821`。用户看到「还有 3209 币」会以为是被误判，
+ * 所以这里必须点明两套账，并说明充值要买的是「积分」而不是钱包 RH 币。
+ */
+export function explainRunningHubFailure(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const record = payload as Record<string, unknown>;
+  const rawCode = record.errorCode;
+  const code =
+    typeof rawCode === 'string' ? rawCode.trim() : typeof rawCode === 'number' ? String(rawCode) : '';
+  const message = typeof record.errorMessage === 'string' ? record.errorMessage.trim() : '';
+  // 821 是官方「付费积分余额不足」；消息文本再兜一层，防止平台换码。
+  if (code === '821' || /付费积分|免费积分/.test(message)) {
+    return (
+      'RunningHub 付费积分不足：消费级 API Key 只能扣「付费积分」，' +
+      '账户里的 RH 币（网页端算力）和赠送的免费积分都不能用于 API 调用。' +
+      '请在 runninghub.cn 充值「积分」（不是充值钱包 RH 币），或改用企业级-共享 API Key。'
+    );
+  }
+  return null;
+}

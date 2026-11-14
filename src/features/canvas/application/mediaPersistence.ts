@@ -1,6 +1,6 @@
 import { isTauri } from '@tauri-apps/api/core';
 
-import { persistVideoSource } from '@/commands/mediaOutput';
+import { persistMediaSourceAuto, persistVideoSource } from '@/commands/mediaOutput';
 
 /**
  * 生成媒体的本地化。
@@ -18,24 +18,79 @@ export function isRemoteMediaSource(source: string): boolean {
   return /^(https?:|data:|blob:|asset:|\/\/)/i.test(source.trim());
 }
 
+const MEDIA_FILE_EXTENSION =
+  /\.(mp4|m4v|mov|mkv|webm|avi|flv|wmv|mpg|mpeg|ts|mp3|wav|m4a|aac|flac|ogg|opus|amr|png|jpe?g|webp|gif|bmp)$/i;
+
+/** 盘符开头的绝对路径（Windows）或 `/` 开头（macOS / Linux）。 */
+export function isLocalAbsoluteMediaPath(source: string): boolean {
+  const value = source.trim();
+  if (!value) return false;
+  return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('/');
+}
+
+/**
+ * 「本地文件，但不在落盘目录里」。
+ *
+ * 真实来源：即梦 CLI / 画布 CLI 把产物下到
+ * `%APPDATA%\com.storyboard.copilot\jimeng-cli\videos\<run_id>\canvas-<run_id>.mp4`
+ * 就把这个绝对路径返回给前端，节点于是存着一条**寄居在 AppData** 的路径。
+ * 它不会像 CDN 链接那样过期，但清缓存 / 重装 / 换机就整批丢，而且完全不归
+ * 「设置 → 默认落盘位置」管 —— 对用户来说风险和远端链接是同一类。
+ *
+ * 只认 AppData / Application Support 这一类应用私有目录：用户自己放在「桌面」「素材盘」
+ * 的文件不该被我们搬走（那是他的资产，不是我们的缓存）。
+ */
+export function isDetachedLocalMediaSource(source: string): boolean {
+  const value = source.trim();
+  if (!isLocalAbsoluteMediaPath(value)) return false;
+  if (!MEDIA_FILE_EXTENSION.test(value)) return false;
+  return /[\\/]AppData[\\/]/i.test(value) || /[\\/]Application Support[\\/]/i.test(value);
+}
+
+/** 需要落盘才能长期留住的来源：远端临时链接，以及寄居在应用目录里的本地文件。 */
+export function needsLocalPersistence(source: string): boolean {
+  const value = source.trim();
+  if (!value) return false;
+  return isRemoteMediaSource(value) || isDetachedLocalMediaSource(value);
+}
+
 /**
  * 把生成出来的视频抓成本地文件，返回本地路径。
  *
- * 落盘失败**不能**毁掉已经生成好的结果：退回远端 URL，用户至少还能看到视频，只是它
+ * 落盘失败**不能**毁掉已经生成好的结果：退回原地址，用户至少还能看到视频，只是它
  * 仍然依赖那条随时会失效的外部链接。所以这里吞掉异常并 warn，绝不向上抛 ——
  * 调用方拿到的一定是一个可以用的地址。
  */
 export async function persistVideoLocally(source: string): Promise<string> {
   const trimmed = source.trim();
   if (!trimmed) return source;
-  if (!isRemoteMediaSource(trimmed)) return source;
+  if (!needsLocalPersistence(trimmed)) return source;
   if (!isTauri()) return source;
 
   try {
     const localPath = await persistVideoSource(trimmed);
     return localPath.trim() || source;
   } catch (error) {
-    console.warn('[mediaPersistence] 视频落盘失败，回退远端 URL', { source: trimmed, error });
+    console.warn('[mediaPersistence] 视频落盘失败，回退原地址', { source: trimmed, error });
+    return source;
+  }
+}
+
+/**
+ * 音频同理。类型由 Rust 侧按真实扩展名决定（`audio/` 子目录），
+ * 所以不需要在这里再判一次是语音还是音乐。
+ */
+export async function persistAudioLocally(source: string): Promise<string> {
+  const trimmed = source.trim();
+  if (!trimmed) return source;
+  if (!needsLocalPersistence(trimmed)) return source;
+  if (!isTauri()) return source;
+
+  try {
+    const localPath = await persistMediaSourceAuto(trimmed);
+    return localPath.trim() || source;
+  } catch (error) {
+    console.warn('[mediaPersistence] 音频落盘失败，回退原地址', { source: trimmed, error });
     return source;
   }
 }

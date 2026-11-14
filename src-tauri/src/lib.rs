@@ -214,6 +214,12 @@ pub fn run() {
                 warn!("缩略图缓存目录未加入 asset 协议作用域: {error}");
             }
 
+            // 素材库根目录可在设置里改到别的盘，改完必须能在运行时补登记作用域，
+            // 否则「文件写得进去、却显示不出来」（asset:// 被 403，且没有任何报错）。
+            if let Err(error) = asset_library::register_asset_scope(app.handle()) {
+                warn!("素材库目录未加入 asset 协议作用域: {error}");
+            }
+
             // 专有视频协议里有一部分成片只能带鉴权下载回来(帧间 / Sub2API 等),
             // 后端要把字节落盘再把本地路径交回画布。AI 层不依赖 tauri, 因此落盘
             // 实现由命令层在这里注入一次。
@@ -360,6 +366,9 @@ pub fn run() {
             asset_library::rename_library_asset_file,
             asset_library::write_library_backup,
             asset_library::extract_video_thumbnail,
+            asset_library::resolve_library_directory,
+            asset_library::set_library_directory,
+            asset_library::migrate_library_files,
             thumbnail::ensure_image_thumbnail,
             text_file::read_text_file,
             text_file::write_text_file,
@@ -387,6 +396,8 @@ pub fn run() {
             ai_commands::cancel_generate_video_job,
             ai_commands::generate_image,
             jimeng_cli::generate_jimeng_cli_video,
+            // 本地 CLI 提交是阻塞式 invoke, 前端只能通过这个命令把「取消生成」传进来。
+            jimeng_cli::cancel_local_cli_video,
             jimeng_cli::generate_jimeng_cli_image,
             jimeng_cli::generate_jimeng_cli_image_upscale,
             wan_cli::generate_wan_cli_video,

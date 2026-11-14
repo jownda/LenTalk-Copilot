@@ -22,6 +22,15 @@ import {
 } from '@/commands/mediaOutput';
 import { runExistingMediaLocalization } from '@/features/mediaMaintenance/localizeMedia';
 import {
+  chooseLibraryDirectory,
+  migrateLibraryFiles,
+  resolveLibraryDirectory,
+  setLibraryDirectory,
+  type LibraryDirectoryInfo,
+} from '@/commands/assetLibrary';
+import { applyAssetPathRemap } from '@/features/library/assetPathRemap';
+import { useAssetLibraryStore } from '@/features/library/assetStore';
+import {
   findRecommendedApiByBaseUrl,
   listVisibleRecommendedApis,
   visibleRecommendedApiIds,
@@ -263,6 +272,13 @@ export function SettingsDialog({
   const [localMediaOutputDir, setLocalMediaOutputDir] = useState('');
   const [defaultMediaOutputDir, setDefaultMediaOutputDir] = useState('');
   const [mediaOutputError, setMediaOutputError] = useState<string | null>(null);
+  // 素材库位置：默认在 AppData 下，可改到别的盘（素材原文件通常几个 GB）。
+  const [libraryDirInfo, setLibraryDirInfo] = useState<LibraryDirectoryInfo | null>(null);
+  const [localLibraryDir, setLocalLibraryDir] = useState('');
+  const [libraryDirError, setLibraryDirError] = useState<string | null>(null);
+  const [libraryDirStatus, setLibraryDirStatus] = useState<string | null>(null);
+  const [isSavingLibraryDir, setIsSavingLibraryDir] = useState(false);
+  const [isMigratingLibrary, setIsMigratingLibrary] = useState(false);
   const [isLocalizingMedia, setIsLocalizingMedia] = useState(false);
   const [mediaLocalizeStatus, setMediaLocalizeStatus] = useState<string | null>(null);
   const [isMigratingMedia, setIsMigratingMedia] = useState(false);
@@ -1411,6 +1427,20 @@ export function SettingsDialog({
       }
     })();
 
+    // 素材库位置同理：不在 settingsStore 里，单独从 app_settings 读。
+    setLibraryDirError(null);
+    setLibraryDirStatus(null);
+    void (async () => {
+      try {
+        const info = await resolveLibraryDirectory();
+        setLibraryDirInfo(info);
+        // 输入框只在「自定义」时填值；用默认位置时留空、由占位符显示默认路径。
+        setLocalLibraryDir(info.isCustom ? info.root : '');
+      } catch (error) {
+        console.warn('[SettingsDialog] 读取素材库位置失败', error);
+      }
+    })();
+
     // 面板内的弹窗/表单状态也要复位：设置面板只是 return null，state 并不会随关闭清空。
     // 不重置的话，上次没关干净的「新增/编辑平台」弹窗会在下次打开设置、切到「密钥」时自己弹出来。
     setShowAddCustomApi(false);
@@ -1552,6 +1582,82 @@ export function SettingsDialog({
       setIsMigratingMedia(false);
     }
   }, [isMigratingMedia, localMediaOutputDir, t]);
+
+  /** 保存素材库位置（只影响之后导入的素材，已有文件不搬）。 */
+  const handleSaveLibraryDir = useCallback(async () => {
+    if (isSavingLibraryDir) return;
+    setIsSavingLibraryDir(true);
+    setLibraryDirError(null);
+    setLibraryDirStatus(null);
+    try {
+      const info = await setLibraryDirectory(localLibraryDir.trim());
+      setLibraryDirInfo(info);
+      setLocalLibraryDir(info.isCustom ? info.root : '');
+      setLibraryDirStatus(t('settings.libraryDirSaved', { path: info.root }));
+    } catch (error) {
+      setLibraryDirError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsSavingLibraryDir(false);
+    }
+  }, [isSavingLibraryDir, localLibraryDir, t]);
+
+  /**
+   * 把已有素材搬进当前素材库位置。
+   *
+   * 两步：Rust 侧只做**复制**（旧文件保留，避免中途失败丢素材），返回旧→新路径映射；
+   * 前端再用这个映射改写素材记录、画布节点、工程与模板里的引用 —— 少改任何一处，
+   * 那些地方就会指向一个已经不存在的路径，表现为白屏。
+   */
+  const handleMigrateLibrary = useCallback(async () => {
+    if (isMigratingLibrary) return;
+    setIsMigratingLibrary(true);
+    setLibraryDirError(null);
+    setLibraryDirStatus(null);
+    try {
+      // 先把输入框里的位置落库，迁移才会复制到「用户刚填的那个目录」。
+      const info = await setLibraryDirectory(localLibraryDir.trim());
+      setLibraryDirInfo(info);
+      setLocalLibraryDir(info.isCustom ? info.root : '');
+
+      const report = await migrateLibraryFiles();
+      const pathMap = new Map(
+        Object.entries(report.pathMap).filter(([from, to]) => from && to && from !== to),
+      );
+
+      if (pathMap.size > 0) {
+        const store = useAssetLibraryStore.getState();
+        const assets = store.assets.map((asset) => {
+          const next = { ...asset };
+          const mappedSource = pathMap.get(asset.sourcePath);
+          if (mappedSource) next.sourcePath = mappedSource;
+          const mappedPreview = asset.previewImageUrl
+            ? pathMap.get(asset.previewImageUrl)
+            : undefined;
+          if (mappedPreview) next.previewImageUrl = mappedPreview;
+          return next;
+        });
+        useAssetLibraryStore.getState().upsertAssets(assets);
+        await applyAssetPathRemap(pathMap);
+      }
+
+      setLibraryDirStatus(
+        report.failed.length > 0
+          ? t('settings.libraryDirMigrateDonePartial', {
+              files: report.copiedFiles,
+              skipped: report.skippedFiles,
+              failed: report.failed.length,
+            })
+          : t('settings.libraryDirMigrateDone', {
+              files: report.copiedFiles,
+              skipped: report.skippedFiles,
+            }),
+      );
+    } catch (error) {
+      setLibraryDirError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsMigratingLibrary(false);
+    }
+  }, [isMigratingLibrary, localLibraryDir, t]);
 
   /**
    * 把落盘目录里已经没人引用的文件清掉（图片/视频/音频都清）。
@@ -3110,6 +3216,105 @@ export function SettingsDialog({
                     {mediaCleanupStatus && (
                       <p className="text-xs text-text-muted">{mediaCleanupStatus}</p>
                     )}
+                  </div>
+
+                  {/* 素材库位置：素材原文件通常几个 GB，允许整体放到别的盘 */}
+                  <div className="rounded-lg border border-border-dark bg-bg-dark p-4 space-y-3">
+                    <div>
+                      <p className="text-sm font-medium text-text-dark">
+                        {t('settings.libraryDir')}
+                      </p>
+                      <p className="mt-1 text-xs text-text-muted">
+                        {t('settings.libraryDirDesc')}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={localLibraryDir}
+                        placeholder={libraryDirInfo?.defaultRoot ?? ''}
+                        onChange={(event) => {
+                          setLocalLibraryDir(event.target.value);
+                          setLibraryDirError(null);
+                          setLibraryDirStatus(null);
+                        }}
+                        spellCheck={false}
+                        className="min-w-0 flex-1 rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark placeholder:text-text-muted focus:border-accent focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void (async () => {
+                            try {
+                              const picked = await chooseLibraryDirectory();
+                              if (!picked) return;
+                              setLocalLibraryDir(picked);
+                              setLibraryDirError(null);
+                              setLibraryDirStatus(null);
+                            } catch (error) {
+                              setLibraryDirError(
+                                error instanceof Error ? error.message : String(error),
+                              );
+                            }
+                          })();
+                        }}
+                        className="shrink-0 rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark transition-colors hover:bg-bg-dark"
+                      >
+                        {t('settings.libraryDirChoose')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLocalLibraryDir('');
+                          setLibraryDirError(null);
+                          setLibraryDirStatus(null);
+                        }}
+                        disabled={!localLibraryDir.trim()}
+                        className="shrink-0 rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {t('settings.libraryDirReset')}
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleSaveLibraryDir();
+                        }}
+                        disabled={isSavingLibraryDir || isMigratingLibrary}
+                        className="rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isSavingLibraryDir
+                          ? t('settings.libraryDirSaving')
+                          : t('settings.libraryDirSave')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleMigrateLibrary();
+                        }}
+                        disabled={isSavingLibraryDir || isMigratingLibrary}
+                        className="rounded border border-border-dark bg-surface-dark px-3 py-2 text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isMigratingLibrary
+                          ? t('settings.libraryDirMigrateRunning')
+                          : t('settings.libraryDirMigrateStart')}
+                      </button>
+                    </div>
+                    <p className="text-xs text-text-muted">
+                      {libraryDirInfo
+                        ? libraryDirInfo.isCustom
+                          ? t('settings.libraryDirCustom', { path: libraryDirInfo.root })
+                          : t('settings.libraryDirUsingDefault', {
+                              path: libraryDirInfo.defaultRoot,
+                            })
+                        : t('settings.libraryDirLoading')}
+                    </p>
+                    <p className="text-xs text-text-muted">
+                      {t('settings.libraryDirMigrateDesc')}
+                    </p>
+                    {libraryDirError && <p className="text-xs text-red-400">{libraryDirError}</p>}
+                    {libraryDirStatus && <p className="text-xs text-text-muted">{libraryDirStatus}</p>}
                   </div>
 
                   {/* 更新(原「关于」页移入) */}

@@ -1,6 +1,8 @@
 use md5;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Manager};
 
 use crate::database;
@@ -71,6 +73,92 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("Failed to create app data directory: {error}"))?;
     Ok(dir)
+}
+
+/// 设置键：素材库根目录（纯文本绝对路径；空值 = 用默认位置）。
+///
+/// 素材原文件是这套应用里体积最大的一块（本机 1.5 GB / 真机常见 5~7 GB），用户经常想
+/// 整体放到别的盘。默认位置是 `app_data/library-assets`，可在
+/// 「设置 → 通用 → 素材库位置」改。改根目录**只影响之后导入的素材** —— 已有记录存的是
+/// 绝对路径，想真正搬走要用「迁移现有素材」（见 `migrate_library_files`）。
+pub const LIBRARY_DIR_SETTING_KEY: &str = "asset.library-dir";
+
+/// 素材库根目录的缓存。
+///
+/// 每次导入都要解析一次根目录，而 `database::open` 会跑一轮建表/迁移检查，
+/// 逐文件调用时开销放大得厉害 —— 缓存起来，改设置时清掉。
+static LIBRARY_ROOT_CACHE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+/// 已经登记进 asset 协议作用域的素材库目录（避免重复登记让它无限增长）。
+static ALLOWED_LIBRARY_DIRS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn normalize_directory_setting(raw: Option<&str>) -> Option<PathBuf> {
+    let trimmed = raw?.trim().trim_matches('"').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    // 相对路径会随进程工作目录漂移，比「用默认值」更糟。
+    path.is_absolute().then_some(path)
+}
+
+fn default_library_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    crate::commands::storage_paths::default_library_dir(app)
+}
+
+fn compute_library_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let conn = database::open(app)?;
+    let stored = database::get_setting(&conn, LIBRARY_DIR_SETTING_KEY)?;
+    if let Some(path) = normalize_directory_setting(stored.as_deref()) {
+        return Ok(path);
+    }
+    default_library_directory(app)
+}
+
+/// 当前生效的素材库根目录：设置优先，否则 AppData 下的默认位置。
+pub fn library_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let cache = LIBRARY_ROOT_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some(path) = guard.as_ref() {
+            return Ok(path.clone());
+        }
+    }
+    let resolved = compute_library_root(app)?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(resolved.clone());
+    }
+    Ok(resolved)
+}
+
+/// 让 WebView 的 `asset://` 协议能读到素材库目录。
+///
+/// 默认位置在 `$APPDATA` 下，配置文件里的作用域本来就覆盖；但根目录一旦改到别的盘，
+/// 就必须在运行时补登记 —— 否则文件**写得进去、却显示不出来**，而且没有任何报错。
+fn allow_library_asset_access(app: &AppHandle, dir: &Path) -> Result<(), String> {
+    let key = dir.to_string_lossy().to_string();
+    let cache = ALLOWED_LIBRARY_DIRS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(guard) = cache.lock() {
+        if guard.contains(&key) {
+            return Ok(());
+        }
+    }
+
+    app.asset_protocol_scope()
+        .allow_directory(dir, true)
+        .map_err(|error| format!("无法为素材库目录 {} 开放本地读取权限: {error}", dir.display()))?;
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key);
+    }
+    Ok(())
+}
+
+/// 启动时把当前素材库目录登记进 asset 作用域（失败只记日志，不阻断启动）。
+pub fn register_asset_scope(app: &AppHandle) -> Result<(), String> {
+    let root = library_root(app)?;
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("无法创建素材库目录 {}: {error}", root.display()))?;
+    allow_library_asset_access(app, &root)
 }
 
 fn legacy_state_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -252,9 +340,10 @@ pub fn save_asset_library_state(
 /// 只有落在这个目录下的文件才允许被「重命名素材」改写 —— 用户从外面拖进来的文件
 /// （画布临时目录、项目 bundle 等）一律不碰。
 fn library_asset_directory(app: &AppHandle) -> Result<PathBuf, String> {
-    let directory = app_data_dir(app)?.join("library-assets");
+    let directory = library_root(app)?;
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("Failed to create asset directory: {error}"))?;
+    allow_library_asset_access(app, &directory)?;
     Ok(directory)
 }
 
@@ -404,9 +493,7 @@ pub fn persist_library_asset_binary_chunk(
         return Err("Asset chunk file id is empty".to_string());
     }
 
-    let directory = app_data_dir(&app)?.join("library-assets");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("Failed to create asset directory: {error}"))?;
+    let directory = library_asset_directory(&app)?;
     let path = directory.join(format!("backup-{}.{}", safe_id, safe_extension(&extension)));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true);
@@ -631,6 +718,149 @@ pub(crate) fn extract_video_thumbnail_blocking(
         }
         Ok(None)
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryDirectoryInfo {
+    pub root: String,
+    pub default_root: String,
+    pub is_custom: bool,
+}
+
+fn library_directory_info(app: &AppHandle) -> Result<LibraryDirectoryInfo, String> {
+    let root = library_root(app)?;
+    let default_root = default_library_directory(app)?;
+    Ok(LibraryDirectoryInfo {
+        is_custom: root != default_root,
+        root: root.to_string_lossy().to_string(),
+        default_root: default_root.to_string_lossy().to_string(),
+    })
+}
+
+/// 当前素材库位置（设置页显示用）。
+#[tauri::command]
+pub fn resolve_library_directory(app: AppHandle) -> Result<LibraryDirectoryInfo, String> {
+    library_directory_info(&app)
+}
+
+/// 改素材库根目录；`path` 传空串表示恢复默认位置。
+///
+/// 只改「以后往哪写」：已有素材记录里存的是绝对路径，不会被这次修改动到。
+/// 真要连文件一起搬走，紧跟着调 `migrate_library_files`（它会返回旧→新路径映射，
+/// 前端用它把工程/模板里的引用一并改写）。
+#[tauri::command]
+pub fn set_library_directory(app: AppHandle, path: String) -> Result<LibraryDirectoryInfo, String> {
+    let trimmed = path.trim().trim_matches('"').trim().to_string();
+    let conn = database::open(&app)?;
+
+    if trimmed.is_empty() {
+        database::put_setting(&conn, LIBRARY_DIR_SETTING_KEY, "")?;
+    } else {
+        let target = PathBuf::from(&trimmed);
+        if !target.is_absolute() {
+            return Err("素材库位置必须是绝对路径（例如 D:\\lentalk素材库）".to_string());
+        }
+        std::fs::create_dir_all(&target)
+            .map_err(|error| format!("无法创建素材库目录 {}: {error}", target.display()))?;
+        // 先试写一次：不可写要当场报错，而不是等用户导入素材时才失败。
+        let probe = target.join(".lentalk-write-probe");
+        std::fs::write(&probe, b"ok")
+            .map_err(|error| format!("素材库目录不可写 {}: {error}", target.display()))?;
+        let _ = std::fs::remove_file(&probe);
+        allow_library_asset_access(&app, &target)?;
+        database::put_setting(&conn, LIBRARY_DIR_SETTING_KEY, &trimmed)?;
+    }
+
+    // 设置变了，缓存的旧根目录立刻作废。
+    if let Some(cache) = LIBRARY_ROOT_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+    library_directory_info(&app)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryMigrationReport {
+    pub target_root: String,
+    /// 旧路径 → 新路径。前端拿它改写素材记录、画布节点、工程与模板里的引用。
+    pub path_map: std::collections::HashMap<String, String>,
+    pub copied_files: usize,
+    pub skipped_files: usize,
+    pub copied_bytes: u64,
+    pub failed: Vec<String>,
+}
+
+/// 把「不在当前根目录下」的素材原文件复制进当前根目录，返回旧→新映射。
+///
+/// 只复制、不删除：旧文件留在原处，用户确认没问题后自己清理即可 —— 迁移做一半断电
+/// 也不会丢素材。目标目录已有同名同大小文件时直接跳过（视作上次已复制过）。
+#[tauri::command]
+pub async fn migrate_library_files(app: AppHandle) -> Result<LibraryMigrationReport, String> {
+    tauri::async_runtime::spawn_blocking(move || migrate_library_files_blocking(&app))
+        .await
+        .map_err(|error| format!("素材迁移任务执行失败: {error}"))?
+}
+
+fn migrate_library_files_blocking(app: &AppHandle) -> Result<LibraryMigrationReport, String> {
+    let root = library_root(app)?;
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("无法创建素材库目录 {}: {error}", root.display()))?;
+    allow_library_asset_access(app, &root)?;
+
+    let state = load_asset_library_state(app.clone())?;
+    let mut report = LibraryMigrationReport {
+        target_root: root.to_string_lossy().to_string(),
+        path_map: std::collections::HashMap::new(),
+        copied_files: 0,
+        skipped_files: 0,
+        copied_bytes: 0,
+        failed: Vec::new(),
+    };
+
+    for asset in &state.assets {
+        let source = PathBuf::from(asset.source_path.trim());
+        if asset.source_path.trim().is_empty() || !source.is_file() {
+            continue;
+        }
+        if source.parent() == Some(root.as_path()) {
+            continue;
+        }
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let destination = root.join(name);
+        if destination == source {
+            continue;
+        }
+        let source_size = source.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if destination.is_file() {
+            let existing = destination.metadata().map(|meta| meta.len()).unwrap_or(0);
+            if existing == source_size {
+                report
+                    .path_map
+                    .insert(asset.source_path.clone(), destination.to_string_lossy().to_string());
+                report.skipped_files += 1;
+                continue;
+            }
+        }
+        match std::fs::copy(&source, &destination) {
+            Ok(bytes) => {
+                report
+                    .path_map
+                    .insert(asset.source_path.clone(), destination.to_string_lossy().to_string());
+                report.copied_files += 1;
+                report.copied_bytes += bytes;
+            }
+            Err(error) => report
+                .failed
+                .push(format!("{}: {error}", asset.source_path)),
+        }
+    }
+
+    Ok(report)
 }
 
 #[cfg(test)]

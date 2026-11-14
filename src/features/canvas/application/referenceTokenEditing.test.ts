@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { findReferenceTokens, remapImageReferenceTokens } from "./referenceTokenEditing";
+import {
+  findReferenceTokens,
+  remapImageReferenceTokens,
+  shouldPruneReferenceTokens,
+} from "./referenceTokenEditing";
 
 describe("cinematic prompt reference tokens", () => {
   it("recognizes Seedance @audioN references alongside existing editor tokens", () => {
@@ -20,5 +24,19 @@ describe("cinematic prompt reference tokens", () => {
       ["image-a", "image-b", "image-c"],
       ["image-a", "image-c"],
     )).toBe("保留 @图1，断开的 ，继续使用 [image2]。");
+  });
+});
+
+describe("shouldPruneReferenceTokens", () => {
+  it("参考图变少（上游断连）时才清理越界标记", () => {
+    expect(shouldPruneReferenceTokens(6, 4)).toBe(true);
+    expect(shouldPruneReferenceTokens(1, 0)).toBe(true);
+  });
+
+  it("图片后接、提示词先到时不清理（否则 [imageN] 会被整段删掉）", () => {
+    // 真机时序：提示词工作室先把成品写进节点，参考图还在异步解析，数量短暂为 0。
+    expect(shouldPruneReferenceTokens(0, 6)).toBe(false);
+    // 数量不变（含重排）也不该清理，重编号交给 remap。
+    expect(shouldPruneReferenceTokens(6, 6)).toBe(false);
   });
 });

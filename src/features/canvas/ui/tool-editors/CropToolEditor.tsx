@@ -3,6 +3,7 @@ import ReactCrop, {
   centerCrop,
   makeAspectCrop,
   type Crop,
+  type PercentCrop,
   type PixelCrop,
 } from 'react-image-crop';
 import 'react-image-crop/dist/ReactCrop.css';
@@ -10,6 +11,7 @@ import 'react-image-crop/dist/ReactCrop.css';
 import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import type { ToolSelectField } from '@/features/canvas/tools';
 import type { VisualToolEditorProps } from './types';
+import { toImageSpaceCrop, toRenderedCrop } from '@/features/canvas/application/cropGeometry';
 
 const VIEWPORT_PADDING_PX = 20;
 const VIEWPORT_MIN_WIDTH_PX = 220;
@@ -48,46 +50,6 @@ function parseCustomRatio(value: string): number | null {
 
 function toNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-function toImageSpaceCrop(
-  crop: PixelCrop,
-  renderedWidth: number,
-  renderedHeight: number,
-  naturalWidth: number,
-  naturalHeight: number
-) {
-  const scaleX = naturalWidth / renderedWidth;
-  const scaleY = naturalHeight / renderedHeight;
-
-  return {
-    cropX: Math.round(crop.x * scaleX),
-    cropY: Math.round(crop.y * scaleY),
-    cropWidth: Math.round(crop.width * scaleX),
-    cropHeight: Math.round(crop.height * scaleY),
-  };
-}
-
-function toRenderedCrop(
-  cropX: number,
-  cropY: number,
-  cropWidth: number,
-  cropHeight: number,
-  renderedWidth: number,
-  renderedHeight: number,
-  naturalWidth: number,
-  naturalHeight: number
-): Crop {
-  const scaleX = renderedWidth / naturalWidth;
-  const scaleY = renderedHeight / naturalHeight;
-
-  return {
-    unit: 'px',
-    x: Math.max(0, cropX * scaleX),
-    y: Math.max(0, cropY * scaleY),
-    width: Math.max(1, cropWidth * scaleX),
-    height: Math.max(1, cropHeight * scaleY),
-  };
 }
 
 function buildDefaultCrop(width: number, height: number, aspect: number | undefined): Crop {
@@ -227,13 +189,14 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
     setCustomRatioInput(typeof options.customAspectRatio === 'string' ? options.customAspectRatio : '');
   }, [options.customAspectRatio]);
 
-  const syncCropToOptions = useCallback((pixelCrop: PixelCrop) => {
+  const syncCropToOptions = useCallback((pixelCrop: PixelCrop, percentCrop?: PercentCrop | null) => {
     if (!renderedImageSize || naturalSize.width <= 0 || naturalSize.height <= 0) {
       return;
     }
 
     const imageCrop = toImageSpaceCrop(
       pixelCrop,
+      percentCrop ?? null,
       renderedImageSize.width,
       renderedImageSize.height,
       naturalSize.width,
@@ -276,18 +239,16 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
       return false;
     }
 
-    setCrop(
-      toRenderedCrop(
-        cropX,
-        cropY,
-        cropWidth,
-        cropHeight,
+    setCrop({
+      unit: 'px',
+      ...toRenderedCrop(
+        { cropX, cropY, cropWidth, cropHeight },
         renderedImageSize.width,
         renderedImageSize.height,
         naturalSize.width,
         naturalSize.height
-      )
-    );
+      ),
+    });
     return true;
   }, [naturalSize.height, naturalSize.width, options.cropHeight, options.cropWidth, options.cropX, options.cropY, renderedImageSize]);
 
@@ -414,7 +375,7 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
             <ReactCrop
               crop={crop}
               onChange={(nextCrop) => setCrop(nextCrop)}
-              onComplete={(pixelCrop) => syncCropToOptions(pixelCrop)}
+              onComplete={(pixelCrop, percentCrop) => syncCropToOptions(pixelCrop, percentCrop)}
               aspect={resolvedAspect}
               minWidth={24}
               minHeight={24}

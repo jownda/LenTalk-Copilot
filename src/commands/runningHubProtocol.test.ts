@@ -4,6 +4,7 @@ import {
   RUNNINGHUB_VIDEO_ENDPOINTS,
   RUNNINGHUB_VIDEO_TRANSPORT,
   buildRunningHubRequestBody,
+  explainRunningHubFailure,
   isRunningHubBaseUrl,
   isRunningHubVideoEndpoint,
   resolveRunningHubAspectRatioOptions,
@@ -542,5 +543,31 @@ describe('UI 档位取值', () => {
 
   it('未知端点也回落到默认档', () => {
     expect(resolveRunningHubDurationOptions('unknown-model', [4, 8])).toEqual([4, 8]);
+  });
+});
+
+describe('explainRunningHubFailure', () => {
+  it('821 付费积分不足翻成人话, 并点明 RH 币与积分是两本账', () => {
+    // 实测信封(2026-11-12, 国内版消费级 Key)。
+    const message = explainRunningHubFailure({
+      taskId: '',
+      status: '',
+      errorCode: '821',
+      errorMessage: '付费积分余额不足，消费级 API 调用仅支持使用付费积分，免费积分不可用于 API 调用',
+      results: null,
+    });
+    expect(message).toContain('付费积分不足');
+    expect(message).toContain('RH 币');
+    expect(message).toContain('企业级-共享');
+  });
+
+  it('换码但消息仍是付费积分时照样识别', () => {
+    expect(explainRunningHubFailure({ errorCode: '9999', errorMessage: '付费积分不足' })).not.toBeNull();
+  });
+
+  it('认不出的错误返回 null, 交给调用方退回原始 JSON', () => {
+    expect(explainRunningHubFailure({ errorCode: '1001', errorMessage: 'Invalid URL' })).toBeNull();
+    expect(explainRunningHubFailure(null)).toBeNull();
+    expect(explainRunningHubFailure('boom')).toBeNull();
   });
 });

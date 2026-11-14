@@ -86,14 +86,8 @@ pub fn kind_for_extension(extension: &str) -> MediaKind {
 /// 取不到系统下载目录（少见，比如被组策略禁用）时回退到 AppData —— 落盘必须永远有一个
 /// 可用位置，不能因为取不到下载目录就把生成结果丢了。
 pub fn default_output_root(app: &AppHandle) -> Result<PathBuf, String> {
-    if let Ok(downloads) = app.path().download_dir() {
-        return Ok(downloads.join(MEDIA_OUTPUT_FOLDER_NAME));
-    }
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法定位落盘目录（下载目录与 AppData 均不可用）: {error}"))?;
-    Ok(app_data.join(MEDIA_OUTPUT_FOLDER_NAME))
+    // 新机器优先落到 D 盘（缓存常常十几 GB）；已有产物的老机器保持原位。
+    crate::commands::storage_paths::default_media_root(app)
 }
 
 /// 从设置值里解析出一个可用的根目录。

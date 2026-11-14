@@ -171,6 +171,18 @@ fn shared_template_ids(templates_root: &Path) -> Result<HashSet<String>, String>
     Ok(ids)
 }
 
+/// 目录是不是「上次同步留下的空壳」：有目录、但没写成 `template.json`。
+///
+/// 同步的顺序是「建目录 → 下载媒体 → 写 JSON」，中途断网、共享盘掉线或进程被杀，
+/// 就会留下一个只有目录的残骸。导入端只认 `template.json`，所以这种目录等于什么都没有；
+/// 但批量同步以前用 `path.exists()` 判断「共享盘已有该模板」，于是这个模板
+/// **从此再也同步不上去** —— 用户看到的就是「明明上传过，共享盘里却是空的」。
+///
+/// 补写只会往里新增/覆盖同名文件，不删任何东西，所以对残留目录是安全的。
+fn is_residual_empty_package(package_dir: &Path) -> bool {
+    package_dir.is_dir() && !package_dir.join("template.json").exists()
+}
+
 /// 按模板 ID 在共享盘上认领已有包目录。
 ///
 /// 包目录名是「模板名-ID」拼出来的，本地改过名之后就再也按名字碰不上旧目录，
@@ -595,8 +607,9 @@ pub async fn template_sync_to_share(app: AppHandle, shared_root: String) -> Resu
             continue;
         }
         let package_dir = templates_root.join(format!("{}-{}", safe_name(&record.name), safe_name(&record.id)));
-        // 兼容旧的/手工创建的目录: 即使 template.json 缺失或损坏, 也不能覆盖已有目录。
-        if package_dir.exists() {
+        // 只有真正写过内容的目录才算「共享盘已有该模板」。空壳（上次没写完）要补写，
+        // 否则这个模板以后永远同步不上去。
+        if package_dir.exists() && !is_residual_empty_package(&package_dir) {
             continue;
         }
         let outcome = push_template_package(&root, &package_dir, record).await?;
@@ -730,10 +743,30 @@ fn chrono_like_timestamp(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_shared_package_dir, normalize_share_path, rewrite_import_media_paths, rewrite_media_paths, safe_name, should_import_template, shared_template_ids, validate_shared_write_path};
+    use super::{find_shared_package_dir, is_residual_empty_package, normalize_share_path, rewrite_import_media_paths, rewrite_media_paths, safe_name, should_import_template, shared_template_ids, validate_shared_write_path};
     use std::collections::HashMap;
     use std::path::Path;
     use serde_json::json;
+
+    /// 上次同步在「建目录 → 下载媒体 → 写 JSON」中途断掉，会留下没有 template.json 的空壳。
+    /// 批量同步若按 `exists()` 跳过它，这个模板从此再也传不上去。
+    #[test]
+    fn package_without_payload_counts_as_residual_residue() {
+        let dir = std::env::temp_dir().join(format!("lentalk-pkg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("videos")).expect("create videos dir");
+        // 没有 template.json = 空壳，必须允许补写。
+        assert!(is_residual_empty_package(&dir));
+
+        std::fs::write(dir.join("template.json"), "{}").expect("write payload");
+        // 写过内容的就是正常包，批量同步要继续跳过（不覆盖共享盘现有内容）。
+        assert!(!is_residual_empty_package(&dir));
+
+        // 连目录都不存在时不是空壳，交给 create_dir_all 去建。
+        let missing = dir.join("nope");
+        assert!(!is_residual_empty_package(&missing));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn shared_path_requires_unc_root() {

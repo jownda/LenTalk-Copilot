@@ -1,6 +1,7 @@
 import { isTauri } from '@tauri-apps/api/core';
 
 import { persistMediaSourceAuto } from '@/commands/mediaOutput';
+import { isDetachedLocalMediaSource } from '@/features/canvas/application/mediaPersistence';
 import {
   getProjectRecord,
   listProjectSummaries,
@@ -94,7 +95,6 @@ const MEDIA_ARRAY_KEYS = new Set([
 export function isDownloadableRemoteSource(source: string): boolean {
   return /^https?:\/\//i.test(source.trim());
 }
-
 /**
  * 内嵌 base64 的最小落盘长度。
  *
@@ -106,13 +106,24 @@ export function isDownloadableRemoteSource(source: string): boolean {
  */
 const INLINE_DATA_MIN_LENGTH = 4096;
 
-/** 需要搬成本地文件的来源：远端临时链接，以及够大的内嵌 base64。 */
+/**
+ * 需要搬成本地文件的来源：
+ *
+ * - 远端临时链接（`http(s)://`，几小时后可能就 404）；
+ * - 寄居在应用私有目录里的本地文件（`%APPDATA%\...\jimeng-cli\videos\<run_id>\...`）——
+ *   即梦两条 CLI 只往自己的下载目录写，节点于是存着一条 AppData 路径：不会过期，
+ *   但清缓存 / 重装 / 换机就整批丢，而且完全不归「设置 → 默认落盘位置」管；
+ * - 够大的内嵌 base64。
+ */
 export function isLocalizableMediaSource(source: string): boolean {
   const value = source.trim();
   if (!value) {
     return false;
   }
   if (isDownloadableRemoteSource(value)) {
+    return true;
+  }
+  if (isDetachedLocalMediaSource(value)) {
     return true;
   }
   return /^data:/i.test(value) && value.length >= INLINE_DATA_MIN_LENGTH;
@@ -230,6 +241,63 @@ async function walkValue(value: unknown, context: WalkContext): Promise<void> {
       await walkValue(child, context);
     }
   }
+}
+
+export interface LocalizableMediaEntry {
+  /** 命中的字段名；数组元素带下标（`referenceImages[2]`）。 */
+  key: string;
+  source: string;
+}
+
+/**
+ * 只读扫描：列出这个 JSON 里所有**还没落盘**的媒体来源。
+ *
+ * 与 `walkValue` 共用同一份字段白名单 —— 扫描结果必须和「点本地化会改哪些」完全一致，
+ * 否则提示条会报出一批点下去毫无变化的东西。这里只读，不改传入值。
+ */
+export function listLocalizableMediaSources(value: unknown): LocalizableMediaEntry[] {
+  const found: LocalizableMediaEntry[] = [];
+
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        if (item && typeof item === 'object') visit(item);
+      }
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+
+    const record = node as Record<string, unknown>;
+    for (const key of Object.keys(record)) {
+      const child = record[key];
+
+      if (typeof child === 'string') {
+        if (MEDIA_STRING_KEYS.has(key) && isLocalizableMediaSource(child)) {
+          found.push({ key, source: child.trim() });
+        }
+        continue;
+      }
+
+      if (Array.isArray(child)) {
+        if (MEDIA_ARRAY_KEYS.has(key)) {
+          child.forEach((item, index) => {
+            if (typeof item === 'string' && isLocalizableMediaSource(item)) {
+              found.push({ key: `${key}[${index}]`, source: item.trim() });
+            }
+          });
+        }
+        for (const item of child) {
+          if (item && typeof item === 'object') visit(item);
+        }
+        continue;
+      }
+
+      if (child && typeof child === 'object') visit(child);
+    }
+  };
+
+  visit(value);
+  return found;
 }
 
 /** 一次本地化会话：共享下载缓存与失败记账，跨模板/工程复用。 */

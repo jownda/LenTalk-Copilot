@@ -611,8 +611,10 @@ describe('预设视频模型的增量同步', () => {
 
   it('知鸟已纳入同步: 老配置能把 2026-10-07 新增的视频模型补出来', () => {
     const resolved = resolveNewRecommendedVideoModels('https://cuai.token6688.com', [], undefined);
-    expect(resolved?.revision).toBe(1);
+    // revision 2 = 2026-11-12 补 Meta muse-video(60 秒长镜头)。
+    expect(resolved?.revision).toBe(2);
     expect(resolved?.models).toContain('grok-imagine-1-5-7tu-special');
+    expect(resolved?.models).toContain('muse-video');
   });
 
   it('两条 RunningHub 预设的 revision 必须同步推进', () => {

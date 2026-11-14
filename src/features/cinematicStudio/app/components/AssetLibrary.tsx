@@ -6,14 +6,16 @@
  * 参考图压缩后存入 Asset.referencePaths（P3 SQLite 前暂存 localStorage）。
  */
 import { createPortal } from "react-dom";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Asset, AssetActingProfile, AssetKind, LockLevel, ProjectV2, SceneV2 } from "../../shared-types";
-import { AudioLines, FolderOpen, CheckCircle2, AlertCircle, ChevronDown, Cpu, ImagePlus, Lock, LockKeyhole, Plus, Sparkles, Trash2, X, Zap } from "lucide-react";
+import { AudioLines, FolderOpen, CheckCircle2, AlertCircle, ChevronDown, Cpu, ImagePlus, Lock, LockKeyhole, Plus, Sparkles, Trash2, Upload, X, Zap } from "lucide-react";
 import type { ProjectAction } from "../store/projectReducer";
 import type { Locale } from "../i18n";
 import { classifyError, fillAssetDetails, testAIConnection } from "../providers/ai";
 import { isRemoteConfigured, listLenTalkChatModels, loadAISettings, resolveLenTalkChatModel, saveAISettings, type LenTalkChatModelOption } from "../providers/aiSettings";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { persistLibraryAssetFromFile } from "@/commands/assetLibrary";
+import { isTauri } from "@tauri-apps/api/core";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
 import { isCinematicMirrorAsset, pickableAudioAssets } from "@/features/library/cinematicMirror";
 import type { LibraryAsset } from "@/features/library/types";
@@ -76,6 +78,45 @@ function readFileAsDataUrl(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error("file read failed"));
     reader.readAsDataURL(file);
   });
+}
+
+const AUDIO_FILE_EXTENSIONS = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus"];
+
+/** 音频上传的扩展名：优先文件名后缀，其次 MIME，最后 mp3。 */
+function audioExtensionOf(file: File): string {
+  const fromName = file.name.split(".").pop()?.trim().toLowerCase() ?? "";
+  if (fromName && AUDIO_FILE_EXTENSIONS.includes(fromName)) return fromName;
+  const fromMime = file.type.split("/")[1]?.split(";")[0]?.trim().toLowerCase() ?? "";
+  if (fromMime === "mpeg") return "mp3";
+  if (fromMime === "x-m4a" || fromMime === "mp4") return "m4a";
+  if (fromMime === "x-wav" || fromMime === "wave") return "wav";
+  return AUDIO_FILE_EXTENSIONS.includes(fromMime) ? fromMime : "mp3";
+}
+
+function audioFileStem(file: File, fallback: string): string {
+  return file.name.replace(/\.[^.]+$/, "").trim() || fallback.trim() || "voice";
+}
+
+function isAudioFile(file: File): boolean {
+  if (file.type.startsWith("audio/")) return true;
+  const extension = file.name.split(".").pop()?.trim().toLowerCase() ?? "";
+  return AUDIO_FILE_EXTENSIONS.includes(extension);
+}
+
+/**
+ * 本地音频的落盘入口：桌面端写进素材库音频目录并返回绝对路径，
+ * 与「从素材库添加」得到的 voiceClip 完全同形；浏览器模式没有可持久化的
+ * 文件系统，只能退回 data URL。
+ */
+async function persistLocalAudio(file: File, fallbackName: string): Promise<string> {
+  if (!isTauri()) return await readFileAsDataUrl(file);
+  return await persistLibraryAssetFromFile(file, audioExtensionOf(file), audioFileStem(file, fallbackName));
+}
+
+function describeUploadError(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) return `：${error.message.trim()}`;
+  const text = String(error ?? "").trim();
+  return text ? `：${text}` : "";
 }
 
 type Copy = import("../i18n").CopyZh;
@@ -262,6 +303,9 @@ function LibraryPickerModal({ items, emptyHint, t, onClose }: {
 function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, canvasAudioSources, onCreateVariant, onClose }: { project: ProjectV2; scene: SceneV2; asset: Asset; locale: Locale; t: Copy; dispatch: (action: ProjectAction) => void; setNotice: (message: string) => void; canvasAudioSources: CanvasAudioSource[]; onCreateVariant(id: string): void; onClose(): void }) {
   const [imageBusy, setImageBusy] = useState(false);
   const [audioBusy, setAudioBusy] = useState(false);
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  /** 声音音色的本地文件选择器：按钮触发，避免 label 包裹 input 时吃不到按钮样式。 */
+  const voiceFileInputRef = useRef<HTMLInputElement | null>(null);
   const [propImageBusy, setPropImageBusy] = useState(false);
   const [propPickerOpen, setPropPickerOpen] = useState(false);
   const [propPickerMode, setPropPickerMode] = useState<"choices" | "library" | "create">("choices");
@@ -326,10 +370,18 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
     if (asset.kind === "audio-reference") {
       setAudioBusy(true);
       try {
-        const dataUrl = await readFileAsDataUrl(file);
-        update({ referencePaths: [dataUrl] });
+        if (!isAudioFile(file)) {
+          setNotice(`${t.uploadFailed}${t.audioUploadInvalid}`);
+          return;
+        }
+        // 音频必须落盘成素材库文件，不能塞 data URL：几 MB 的样音会让工程 JSON 膨胀，
+        // 保存 / 镜像 / 编译逐环节报错（「素材库添加正常、本地直接上传报错」的真正原因）。
+        const source = await persistLocalAudio(file, asset.name);
+        update({ referencePaths: [source] });
         setNotice(t.audioUploaded);
-      } catch { setNotice(t.uploadFailed); } finally { setAudioBusy(false); }
+      } catch (error) {
+        setNotice(`${t.uploadFailed}${describeUploadError(error)}`);
+      } finally { setAudioBusy(false); }
       return;
     }
     setImageBusy(true);
@@ -377,6 +429,30 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
     } catch { setNotice(t.uploadFailed); } finally { setPropImageBusy(false); }
   };
 
+  /**
+   * 本地音频上传为角色声音音色。
+   *
+   * 落点必须和「从素材库添加」一致：文件进素材库音频目录，voiceClip 存绝对路径。
+   * 旧实现把文件读成 data URL 直接写进 voiceClip，几 MB 的样音会让工程数据膨胀，
+   * 保存 / 镜像同步 / 编译逐个环节报错 —— 用户看到的就是「素材库添加正常、
+   * 本地直接上传报错」。
+   */
+  const uploadVoiceClip = async (file?: File) => {
+    if (!file) return;
+    setVoiceBusy(true);
+    try {
+      if (!isAudioFile(file)) {
+        setNotice(`${t.voiceUploadFailed}${t.audioUploadInvalid}`);
+        return;
+      }
+      const source = await persistLocalAudio(file, asset.name);
+      update({ voiceClip: source, voiceAssetId: undefined, voiceAssetName: audioFileStem(file, asset.name) });
+      setNotice(t.voiceUploaded);
+    } catch (error) {
+      setNotice(`${t.voiceUploadFailed}${describeUploadError(error)}`);
+    } finally { setVoiceBusy(false); }
+  };
+
   const replaceVoiceFromCanvas = (source: string) => {
     const selected = canvasAudioSources.find((item) => item.source === source);
     if (!selected) return;
@@ -388,7 +464,9 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
   const libraryAssets = useAssetLibraryStore((state) => state.assets);
   const hydrateLibrary = useAssetLibraryStore((state) => state.hydrate);
   useEffect(() => {
-    if (libraryPicker) void hydrateLibrary();
+    // 每次打开弹窗都强制重读：扩展导入等 Rust 侧写入不会经过这份 store，
+    // 用旧快照会出现「刚存进素材库的图这里看不到」。
+    if (libraryPicker) void hydrateLibrary({ force: true });
   }, [libraryPicker, hydrateLibrary]);
   const libraryImages = useMemo(() => {
     const existing = new Set(asset.referencePaths ?? []);
@@ -708,6 +786,26 @@ function AssetEditor({ project, scene, asset, locale, t, dispatch, setNotice, ca
             >
               <AudioLines size={13} /> {t.voiceFromLibrary}
             </button>
+            <button
+              type="button"
+              className="outline-button voice-library-trigger"
+              title={t.voiceUploadHint}
+              disabled={voiceBusy}
+              onClick={() => voiceFileInputRef.current?.click()}
+            >
+              {voiceBusy ? <span className="spin-dot" /> : <Upload size={13} />} {t.voiceUploadLocal}
+            </button>
+            <input
+              ref={voiceFileInputRef}
+              className="hidden"
+              type="file"
+              accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                void uploadVoiceClip(file);
+              }}
+            />
             {canvasAudioSources.length > 0 ? <div className="voice-canvas-picker">
               <span>{t.voiceCanvasSource}</span>
               <select value="" aria-label={t.voiceCanvasChoose} onChange={(event) => replaceVoiceFromCanvas(event.target.value)}>

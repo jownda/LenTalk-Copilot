@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -27,6 +29,87 @@ const CLI_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_SUBMIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CLI_TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const JIMENG_CLI_MAX_REFERENCE_IMAGES: usize = 9;
+
+/// 本地 CLI 视频任务的取消表 —— 键是前端传进来的 `client_job_id`。
+///
+/// 本地 CLI 是**阻塞式 invoke**：前端没法直接中断已经交出去的调用，所以取消只能由后端
+/// 在提交链路的检查点上自行发现。语义与远端任务一致：平台受理前取消 = 零成本；
+/// 受理之后（`submit_id` 已拿到 / 画布 `node run` 已发出）检查点早已走过，表里也不再有
+/// 这条记录，取消会返回 `false`，前端不能谎报成功。
+static LOCAL_CLI_VIDEO_CANCELS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+
+/// 用户主动取消时的统一错误文案 —— 前端据此把节点落成「已取消生成」而不是红色失败。
+pub const LOCAL_CLI_CANCELED_MESSAGE: &str = "已取消生成";
+
+fn cancel_registry() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    LOCAL_CLI_VIDEO_CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 一次提交的取消标志；随 blocking 任务结束（含出错/取消）自动摘表，不会堆积。
+struct LocalCliCancelGuard {
+    key: Option<String>,
+    flag: Arc<AtomicBool>,
+}
+
+impl LocalCliCancelGuard {
+    fn new(client_job_id: Option<&str>) -> Self {
+        let key = client_job_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Some(key) = &key {
+            if let Ok(mut table) = cancel_registry().lock() {
+                table.insert(key.clone(), flag.clone());
+            }
+        }
+        Self { key, flag }
+    }
+
+    fn flag(&self) -> &Arc<AtomicBool> {
+        &self.flag
+    }
+}
+
+impl Drop for LocalCliCancelGuard {
+    fn drop(&mut self) {
+        if let Some(key) = &self.key {
+            if let Ok(mut table) = cancel_registry().lock() {
+                table.remove(key);
+            }
+        }
+    }
+}
+
+/// 检查点：用户已点取消就中止本次提交。放在「还没送到平台」的每一段之间。
+fn ensure_local_cli_not_canceled(flag: &Arc<AtomicBool>) -> Result<(), String> {
+    if flag.load(Ordering::SeqCst) {
+        return Err(LOCAL_CLI_CANCELED_MESSAGE.to_string());
+    }
+    Ok(())
+}
+
+/// 取消一次还没提交到平台的本地 CLI 视频任务。
+///
+/// - `true`：已置位，阻塞中的提交会在下一个检查点中止并把节点落成「已取消生成」；
+/// - `false`：这条任务已经不在表里（已完成 / 已交到平台），前端应立刻收掉取消入口。
+#[tauri::command]
+pub fn cancel_local_cli_video(client_job_id: String) -> bool {
+    let key = client_job_id.trim();
+    if key.is_empty() {
+        return false;
+    }
+    let Ok(table) = cancel_registry().lock() else {
+        return false;
+    };
+    match table.get(key) {
+        Some(flag) => {
+            flag.store(true, Ordering::SeqCst);
+            true
+        }
+        None => false,
+    }
+}
 
 /// 画布素材上传(`resource upload`)的单次超时: 4K 图和音频单个可能几十 MB,
 /// 30 秒的通用命令超时在慢网下必然不够。
@@ -70,11 +153,19 @@ fn ensure_canvas_audio_long_enough(app: &AppHandle, files: &[PathBuf]) -> Result
     for path in files {
         let probe = probe_media(&ffmpeg, &path.to_string_lossy());
         if let Some(duration) = probe.duration_sec {
-            if duration > 0.0 && duration < CANVAS_AUDIO_MIN_SECONDS {
-                let name = path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("参考音频");
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("参考音频");
+            // 0.0x 秒几乎只能说明「拿到的是一帧画面，不是音轨」——典型是被误存成图片的
+            // 文件，或者用户把一张图挂到了音色参考上。说「只有 0.04 秒」只会让人发懵。
+            if duration < 0.1 {
+                return Err(format!(
+                    "参考音频「{name}」里没有任何音轨（探测时长 {duration:.2} 秒），这个文件不是音频。\
+                     请重新选择音频节点，或换一条真正的音频文件"
+                ));
+            }
+            if duration < CANVAS_AUDIO_MIN_SECONDS {
                 return Err(format!(
                     "参考音频「{name}」只有 {duration:.2} 秒，即梦画布要求每段音频至少 \
                      {CANVAS_AUDIO_MIN_SECONDS:.1} 秒才能当音色参考（服务端会直接拒掉这次提交）。\
@@ -263,11 +354,15 @@ fn generate_video_blocking(
     validate_model_and_duration(&request.model_version, request.duration, &video_resolution)?;
 
     let run_id = Uuid::new_v4().to_string();
+    // 从这一刻起这次提交进入「可取消」状态：前端节点上的「取消生成」会按
+    // client_job_id 置位，下面的检查点在还没送到平台之前中止本次提交。
+    let cancel = LocalCliCancelGuard::new(request.client_job_id.as_deref());
     let input_dir = std::env::temp_dir().join(format!("lentalk-jimeng-cli-{run_id}"));
     fs::create_dir_all(&input_dir)
         .map_err(|error| format!("无法创建即梦 CLI 临时目录: {error}"))?;
 
     let result = (|| {
+        ensure_local_cli_not_canceled(cancel.flag())?;
         let reference_images = materialize_data_urls(
             request.reference_images.as_deref().unwrap_or_default(),
             &input_dir,
@@ -282,6 +377,7 @@ fn generate_video_blocking(
         }
         let reference_audio = materialize_audio_files(
             request.reference_audio.as_deref().unwrap_or_default(),
+            &input_dir,
         )?;
         let command = resolve_video_command(
             request.image_mode.as_deref(),
@@ -295,6 +391,8 @@ fn generate_video_blocking(
             return Err("即梦 CLI 的纯音频参考需要选择 Seedance 2.5".to_string());
         }
         let download_dir = resolve_download_dir(app, &run_id)?;
+        // 素材已经规整成临时文件，但一个字节都还没传给平台 —— 最后一个零成本检查点。
+        ensure_local_cli_not_canceled(cancel.flag())?;
         run_jimeng_video_task(
             app,
             executable,
@@ -304,6 +402,7 @@ fn generate_video_blocking(
             &reference_images,
             &reference_audio,
             &download_dir,
+            cancel.flag(),
         )
     })();
 
@@ -390,19 +489,225 @@ fn materialize_data_urls(
         .collect()
 }
 
-fn materialize_audio_files(sources: &[String]) -> Result<Vec<PathBuf>, String> {
+/// 把参考音频物化成**本地文件**（`resource upload --file` / `--ref` 只认本地路径）。
+///
+/// 画布里的音频节点来源并不总是本地文件：
+/// - 远端生成或从外部导入的音频是 `https://…`；
+/// - 素材库里的小片段可能是 `data:audio/…;base64,…`；
+/// - 前端展示用的 `asset://localhost/…` 也是常见形态。
+///
+/// 以前这里只认本地路径，其余一律报「必须来自已连接的本地音频节点」——
+/// 用户明明连了节点，看到这句无从下手。现在统一落到临时目录再交给 CLI。
+fn materialize_audio_files(
+    sources: &[String],
+    directory: &Path,
+) -> Result<Vec<PathBuf>, String> {
     sources
         .iter()
         .filter(|source| !source.trim().is_empty())
-        .map(|source| {
-            let path = source_path(source);
-            if path.is_file() {
-                Ok(path)
-            } else {
-                Err("即梦 CLI 的音频参考必须来自已连接的本地音频节点".to_string())
-            }
-        })
+        .enumerate()
+        .map(|(index, source)| materialize_audio_source(source, directory, index))
         .collect()
+}
+
+/// 单个音频来源 → 本地文件路径。
+fn materialize_audio_source(
+    source: &str,
+    directory: &Path,
+    index: usize,
+) -> Result<PathBuf, String> {
+    let trimmed = source.trim();
+
+    // ① data URL：直接解码落盘
+    if trimmed.starts_with("data:") {
+        let (meta, encoded) = trimmed
+            .split_once(',')
+            .ok_or_else(|| "参考音频的 data URL 格式无效".to_string())?;
+        let mime = meta.trim_start_matches("data:").split(';').next().unwrap_or("");
+        if !mime.starts_with("audio/") && !mime.starts_with("video/") {
+            return Err(format!("参考音频不是音频数据（{mime}）"));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("无法解码参考音频: {error}"))?;
+        let extension = audio_extension(mime, "");
+        let path = directory.join(format!("audio-{}.{extension}", index + 1));
+        fs::write(&path, bytes).map_err(|error| format!("无法写入参考音频: {error}"))?;
+        return Ok(path);
+    }
+
+    // ② asset:// / http://asset.localhost：前端展示地址，真实文件就在本机
+    if let Some(local) = local_path_from_asset_url(trimmed) {
+        if local.is_file() {
+            return normalize_audio_extension(local, directory, index);
+        }
+    }
+
+    // ③ http(s)：下载到临时目录
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return download_audio_to_file(trimmed, directory, index);
+    }
+
+    // ④ 本地路径
+    let path = source_path(trimmed);
+    if path.is_file() {
+        return normalize_audio_extension(path, directory, index);
+    }
+    Err(format!(
+        "参考音频文件不存在：{}。请重新连接音频节点，或把它导入素材库后再试",
+        if trimmed.is_empty() { "(空)".to_string() } else { trimmed.to_string() }
+    ))
+}
+
+/// 扩展名和实际内容对不上时，给一份扩展名正确的临时副本。
+///
+/// 真机踩到过：`images/<md5>.png` 里装的其实是 mp3（落盘时 MIME 认不出来、兜底成了 png）。
+/// 直接把 `.png` 交给 CLI，ffmpeg 会按图片解析、只算出 0.04 秒 —— 一个十几秒的音频
+/// 就这样被当成「太短」拒掉，报错还指着 `.png` 说事，用户完全看不懂问题在哪。
+fn normalize_audio_extension(
+    path: PathBuf,
+    directory: &Path,
+    index: usize,
+) -> Result<PathBuf, String> {
+    let Some(actual) = crate::commands::image::sniff_media_extension(&read_file_head(&path, 12))
+    else {
+        return Ok(path);
+    };
+    // 只有「确认是音频」才动手：未知格式原样交给 CLI，别自作聪明。
+    if !matches!(
+        actual,
+        "mp3" | "wav" | "m4a" | "aac" | "ogg" | "flac" | "opus" | "amr"
+    ) {
+        return Ok(path);
+    }
+    let current = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if current == actual {
+        return Ok(path);
+    }
+    // ① 同一落盘根下的兄弟目录里已经有正确扩展名的同内容文件 —— 直接用那份，
+    //    一个字节都不复制。真机的形态就是 `audio/<md5>.mp3` 与 `images/<md5>.png` 并存。
+    if let Some(sibling) = sibling_media_file(&path, actual) {
+        return Ok(sibling);
+    }
+    // ② 实在找不到才复制一份扩展名正确的临时副本（原始文件保持不动）。
+    let target = directory.join(format!("audio-{}.{actual}", index + 1));
+    fs::copy(&path, &target)
+        .map_err(|error| format!("无法准备参考音频（扩展名与内容不一致）: {error}"))?;
+    Ok(target)
+}
+
+/// 在落盘根的兄弟子目录里找 `<stem>.<extension>`（目录布局：`<根>/{images,audio,videos}/`）。
+///
+/// 只认一层：`<根>/images/x.png` → 试 `<根>/audio/x.mp3`。找不到就返回 None，
+/// 由调用方决定要不要复制 —— 别去全盘找，那会把简单问题拖成卡顿。
+fn sibling_media_file(path: &Path, extension: &str) -> Option<PathBuf> {
+    let media_root = path.parent()?.parent()?;
+    let stem = path.file_stem()?.to_str()?;
+    for sub in ["audio", "images", "videos"] {
+        let candidate = media_root.join(sub).join(format!("{stem}.{extension}"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn read_file_head(path: &Path, length: usize) -> Vec<u8> {
+    use std::io::Read;
+    let Ok(mut file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buffer = vec![0_u8; length];
+    let read = file.read(&mut buffer).unwrap_or(0);
+    buffer.truncate(read);
+    buffer
+}
+
+/// `asset://localhost/<path>` / `http://asset.localhost/<path>` → 本机路径。
+fn local_path_from_asset_url(source: &str) -> Option<PathBuf> {
+    let rest = source
+        .strip_prefix("asset://localhost/")
+        .or_else(|| source.strip_prefix("http://asset.localhost/"))
+        .or_else(|| source.strip_prefix("https://asset.localhost/"))?;
+    let decoded = urlencoding::decode(rest).ok()?;
+    let decoded_str: &str = decoded.as_ref();
+    // Windows 下 `asset://localhost/C:/…` 会多一个前导斜杠。
+    #[cfg(target_os = "windows")]
+    let decoded_str = decoded_str.strip_prefix('/').unwrap_or(decoded_str);
+    Some(PathBuf::from(decoded_str))
+}
+
+/// 远端音频下载到临时文件。
+///
+/// `Accept-Encoding: identity` 是必须的：开了压缩后大文件常常「HTTP 200 但响应体中断」，
+/// 报错只显示 transport 错误，看起来像网络问题。
+fn download_audio_to_file(url: &str, directory: &Path, index: usize) -> Result<PathBuf, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|error| format!("无法创建下载客户端: {error}"))?;
+    let response = client
+        .get(url)
+        .header("Accept-Encoding", "identity")
+        .send()
+        .map_err(|error| format!("参考音频下载失败（网络）: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        // 远端链接过期是最常见的 403/404：音频节点存的是当年的临时地址。
+        // 这种情况只能重新导入/重新生成，必须把话说清楚。
+        let hint = if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::NOT_FOUND
+        {
+            "这条音频存的是远端临时链接且已失效，请在音频节点里重新导入或重新生成后再试"
+        } else {
+            "请检查网络或该链接是否可用"
+        };
+        return Err(format!("参考音频下载失败：HTTP {status}。{hint}（{url}）"));
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = response
+        .bytes()
+        .map_err(|error| format!("参考音频下载失败（响应体中断）: {error}"))?;
+    if bytes.is_empty() {
+        return Err(format!("参考音频下载失败：内容为空（{url}）"));
+    }
+    let extension = audio_extension(&content_type, url);
+    let path = directory.join(format!("audio-{}.{extension}", index + 1));
+    fs::write(&path, &bytes).map_err(|error| format!("无法写入参考音频: {error}"))?;
+    Ok(path)
+}
+
+/// 音频扩展名：先看 URL 后缀，再看 Content-Type。CLI 靠后缀判断类型，给错会被服务端拒。
+fn audio_extension(content_type: &str, url: &str) -> String {
+    let from_url = url
+        .split('?')
+        .next()
+        .and_then(|path| path.rsplit('.').next())
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| matches!(value.as_str(), "mp3" | "wav" | "m4a" | "aac" | "ogg" | "flac"));
+    if let Some(value) = from_url {
+        return value;
+    }
+    let mime = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    match mime.as_str() {
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/mp4" | "audio/x-m4a" | "video/mp4" => "m4a",
+        "audio/aac" => "aac",
+        "audio/ogg" => "ogg",
+        "audio/flac" => "flac",
+        _ => "mp3",
+    }
+    .to_string()
 }
 
 fn source_path(source: &str) -> PathBuf {
@@ -467,6 +772,7 @@ fn run_jimeng_video_task(
     images: &[PathBuf],
     audio: &[PathBuf],
     download_dir: &Path,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<String, String> {
     let mut arguments = vec![command.to_string()];
     append_generation_args(
@@ -487,6 +793,7 @@ fn run_jimeng_video_task(
         request.client_job_id.as_deref(),
         download_dir,
         JimengArtifactKind::Video,
+        Some(cancel),
     )
 }
 
@@ -508,12 +815,17 @@ fn submit_and_poll_jimeng_task(
     client_job_id: Option<&str>,
     download_dir: &Path,
     artifact: JimengArtifactKind,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<String, String> {
     let label = match artifact {
         JimengArtifactKind::Video => "视频",
         JimengArtifactKind::Image => "图片",
     };
 
+    // 最后一个零成本检查点：submit 之前用户还能反悔，submit 之后就是真金白银的任务了。
+    if let Some(flag) = cancel {
+        ensure_local_cli_not_canceled(flag)?;
+    }
     let submission = submit_jimeng_command(app, client_job_id, executable, &arguments, label)?;
     // --poll=0 通常只提交任务；保留即时结果分支，兼容 CLI 后端直接返回成品的情况。
     if is_succeeded(&submission) {
@@ -2588,6 +2900,91 @@ fn extract_url_field(output: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// 传输层失败必须被认出来（用户 App 1.2.44 实际踩到 `cli.transport_failed`：
+    /// 平台已经生成完成，只是轮询那一次连不上）。
+    #[test]
+    fn canvas_transport_reasons_are_recognized() {
+        for reason in [
+            "The service could not be reached. Check network and proxy access, then retry safely.（cli.transport_failed）",
+            "CLI.DOWNLOAD_TRANSPORT_FAILED",
+            "failed to connect: connection refused",
+            "即梦 CLI 命令超过 30 秒未返回",
+            "即梦画布 CLI 未返回 JSON: ",
+        ] {
+            assert!(
+                is_canvas_transport_reason(reason),
+                "应判为传输失败: {reason}"
+            );
+        }
+    }
+
+    /// 反向: 服务端明确拒绝/本地逻辑错误**不能**被当成传输失败, 否则会白等 6 轮退避,
+    /// 还会把「参数错了」误导成「网络问题」。
+    #[test]
+    fn canvas_business_failures_are_not_transport() {
+        for reason in [
+            // 这个最容易误伤: 文案里也有「未返回」, 但它是建节点后的逻辑错误。
+            "即梦画布 CLI 建节点后未返回 nodeId",
+            "Access was denied for this operation.（service.10000 / oauth_scope_insufficient）",
+            "内容审核未通过（errorCode 20110）",
+            "即梦画布 CLI 返回的 JSON 无法解析",
+            "",
+        ] {
+            assert!(
+                !is_canvas_transport_reason(reason),
+                "不该判为传输失败: {reason}"
+            );
+        }
+    }
+
+    /// 放弃等待时的提示必须能让用户把**已经付费生成好的**产物捞回来:
+    /// 带 nodeId、带查状态与下载两条命令、并明确劝阻重新生成。
+    #[test]
+    fn orphan_node_message_tells_user_how_to_recover() {
+        let text = canvas_orphan_node_message("proj-1", "node-9", "transport_failed");
+        assert!(text.contains("node-9"));
+        assert!(text.contains("--project-id=proj-1"));
+        assert!(text.contains("node show"));
+        assert!(text.contains("resource download"));
+        assert!(text.contains("不要重新生成"));
+        // 应用里没有「取回已生成产品」这个入口，文案不能把用户指向一个不存在的按钮。
+        assert!(!text.contains("取回已生成产品"));
+    }
+
+    /// 「提交前取消」的记账: 置位后检查点必须抛统一的取消文案, 且 guard 一结束
+    /// 就摘表 —— 否则同一个 clientJobId 的旧标志会误杀下一次提交。
+    #[test]
+    fn local_cli_video_cancel_flags_reach_check_points() {
+        let key = format!("cancel-test-{}", Uuid::new_v4());
+        {
+            let cancel = LocalCliCancelGuard::new(Some(&key));
+            // 未取消时检查点必须放行。
+            assert!(ensure_local_cli_not_canceled(cancel.flag()).is_ok());
+            // 外部(前端命令)置位后, 检查点抛的必须是那句统一文案。
+            assert!(cancel_local_cli_video(key.clone()));
+            let error = ensure_local_cli_not_canceled(cancel.flag())
+                .expect_err("取消后检查点必须中止");
+            assert_eq!(error, LOCAL_CLI_CANCELED_MESSAGE);
+        }
+        // guard drop 之后表里不该还留着这条键: 任务已结束, 再取消没有意义。
+        assert!(!cancel_local_cli_video(key));
+    }
+
+    #[test]
+    fn local_cli_video_cancel_ignores_unknown_and_empty_keys() {
+        assert!(!cancel_local_cli_video("".to_string()));
+        assert!(!cancel_local_cli_video("   ".to_string()));
+        assert!(!cancel_local_cli_video(format!("never-registered-{}", Uuid::new_v4())));
+    }
+
+    #[test]
+    fn local_cli_video_cancel_without_key_is_noop() {
+        // 非画布调用(没传 clientJobId)时全部是空操作, 检查点永远放行。
+        let cancel = LocalCliCancelGuard::new(None);
+        assert!(ensure_local_cli_not_canceled(cancel.flag()).is_ok());
+        assert!(cancel.key.is_none());
+    }
+
     #[test]
     fn login_url_scheme_whitelist_rejects_non_http() {
         assert!(is_allowed_login_url("https://jimeng.jianying.com/ai-tool/cli-auth?x=1"));
@@ -3746,12 +4143,55 @@ fn canvas_resource_status(
     state
 }
 
-/// 这个失败是不是「远端可能已经有对象了」。命中时值得先查状态再决定, 而不是直接当失败。
+/// 这次失败是不是「远端可能已经有对象了」。命中时值得先查状态再决定, 而不是直接当失败。
 fn canvas_failure_means_resource_exists(reason: &str) -> bool {
     let lowered = reason.to_ascii_lowercase();
     lowered.contains("upload_state_unknown")
         || lowered.contains("already submitted")
         || lowered.contains("service.5")
+}
+
+/// 这次失败是不是**传输层**问题（连不上服务端 / 中途断连 / 本地 CLI 超时被杀），
+/// 而不是服务端明确拒绝。
+///
+/// 两者的处理方式完全相反：
+/// - 服务端拒绝（参数错、审核不过、额度不足）→ 当终态，原样报给用户；
+/// - 传输层失败 → **绝不能当终态**。要么什么都没发生（重试就好），
+///   要么已经发生了但回执没回来（重试会重复扣积分，只能先去问状态）。
+///
+/// 用户实际踩到 `cli.transport_failed`（App 1.2.44）：平台已经生成完成，只是轮询那一次
+/// 连不上，整单被判失败、还要手动取回 —— 代价和一次网络抖动完全不对等。
+fn is_canvas_transport_reason(reason: &str) -> bool {
+    let lowered = reason.to_ascii_lowercase();
+    [
+        "transport_failed",
+        "service_unreachable",
+        "connection refused",
+        "connection reset",
+        "network error",
+        "timed out",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+        // 本地 CLI 被自己的超时杀掉（`spawn_cli_capture` 的文案）—— 服务端可能只是回得慢。
+        || reason.contains("命令超过")
+        // 只拿到半截输出，本质还是传输不完整；注意别和「建节点后未返回 nodeId」混淆。
+        || reason.contains("未返回 JSON")
+}
+
+/// 轮询彻底断了之后给用户的提示。
+///
+/// 关键是**说清「平台可能已经生成好了、别重新生成」**，并把 nodeId 和手工命令给全 ——
+/// 走到这一步积分已经扣了，用户最不需要的就是"生成失败"四个字。
+fn canvas_orphan_node_message(project_id: &str, node_id: &str, reason: &str) -> String {
+    format!(
+        "即梦画布 CLI 多次联系不上服务端，已停止等待节点 {node_id}。最后一次错误：{reason}\n\
+         ⚠ 任务很可能**已经在平台生成完成**（积分已扣），请先不要重新生成。\n\
+         网络恢复后先查状态：\n\
+         dreamina-canvas node show --project-id={project_id} --node-id={node_id}\n\
+         状态是 success 时，用返回里的 resourceId 取回产物：\n\
+         dreamina-canvas resource download <resourceId> --project-id={project_id} -o <保存路径>"
+    )
 }
 
 /// 上传拿到 `resourceId` 之后，等它真正可用再交给调用方。
@@ -4258,6 +4698,8 @@ pub struct GenerateJimengCanvasVideoRequest {
     /// 参考音频(`m2v` 模式支持, 最多 10 个)。漏传会表现为「音频素材没进生成」。
     pub reference_audio: Option<Vec<String>>,
     pub project_id: Option<String>,
+    /// 前端节点的 clientJobId，用来把「取消生成」按键映射到这次提交。
+    pub client_job_id: Option<String>,
 }
 
 /// 即梦画布 CLI 生成视频: 上传参考素材 → 建节点并运行 → 等终态 → 下载到本地。
@@ -4298,11 +4740,15 @@ fn generate_canvas_video_blocking(
     };
 
     let run_id = Uuid::new_v4().to_string();
+    // 从这一刻起这次提交进入「可取消」状态。画布 CLI 最贵的一步是 `node run`
+    // （真实扣积分），所以检查点铺在素材规整、每张素材上传、以及 run 之前。
+    let cancel = LocalCliCancelGuard::new(request.client_job_id.as_deref());
     let input_dir = std::env::temp_dir().join(format!("lentalk-jimeng-canvas-{run_id}"));
     fs::create_dir_all(&input_dir)
         .map_err(|error| format!("无法创建即梦画布 CLI 临时目录: {error}"))?;
 
     let result = (|| {
+        ensure_local_cli_not_canceled(cancel.flag())?;
         let images = materialize_data_urls(
             request.reference_images.as_deref().unwrap_or_default(),
             &input_dir,
@@ -4312,6 +4758,7 @@ fn generate_canvas_video_blocking(
         // 参考图必须先登记成项目资源, `--ref` 才能用 `res:<id>` 引用。
         let mut references: Vec<String> = Vec::new();
         for path in &images {
+            ensure_local_cli_not_canceled(cancel.flag())?;
             references.push(upload_canvas_resource(
                 &executable,
                 &project_id,
@@ -4324,9 +4771,10 @@ fn generate_canvas_video_blocking(
         // 参考音频也要登记成项目资源, `--ref` 只认 `res:<id>`;
         // 不登记就等于音频没传进去(模型只看到图片)。
         let audio_files =
-            materialize_audio_files(request.reference_audio.as_deref().unwrap_or_default())?;
+            materialize_audio_files(request.reference_audio.as_deref().unwrap_or_default(), &input_dir)?;
         ensure_canvas_audio_long_enough(app, &audio_files)?;
         for path in &audio_files {
+            ensure_local_cli_not_canceled(cancel.flag())?;
             references.push(upload_canvas_resource(
                 &executable,
                 &project_id,
@@ -4335,6 +4783,8 @@ fn generate_canvas_video_blocking(
                 "参考音频",
             )?);
         }
+        // 素材全部传完、一个积分都还没花：这里和 run 之前是仅有的两个零成本窗口。
+        ensure_local_cli_not_canceled(cancel.flag())?;
 
         // 走「建节点 → 报价 → 按报价批准 → 运行 → 等终态」,
         // 而不是 `--run`: 只有这样才拿得到服务端报的真实积分, ceiling 也不用猜。
@@ -4349,8 +4799,14 @@ fn generate_canvas_video_blocking(
         for reference in &references {
             content_args.push(format!("--ref={reference}"));
         }
-        let (node_id, quoted) =
-            create_quote_confirm_run(&executable, &project_id, "video", &content_args)?;
+        let (node_id, quoted) = create_quote_confirm_run(
+            &executable,
+            &project_id,
+            "video",
+            &canvas_node_title(&request.prompt),
+            &content_args,
+            Some(cancel.flag()),
+        )?;
         if let Some(credits) = quoted {
             eprintln!("即梦画布 CLI 报价: {credits} 积分");
         }
@@ -4474,8 +4930,14 @@ fn generate_canvas_image_blocking(
         for reference in &references {
             content_args.push(format!("--ref={reference}"));
         }
-        let (node_id, _quoted) =
-            create_quote_confirm_run(&executable, &project_id, "image", &content_args)?;
+        let (node_id, _quoted) = create_quote_confirm_run(
+            &executable,
+            &project_id,
+            "image",
+            &canvas_node_title(&request.prompt),
+            &content_args,
+            None,
+        )?;
 
         let show_output = run_canvas_cli(
             &executable,
@@ -4572,6 +5034,7 @@ fn generate_canvas_audio_blocking(
         // 参考音频同样要先登记成项目资源, `--ref` 只认 `res:<id>`。
         let audio_files = materialize_audio_files(
             request.reference_audio.as_deref().unwrap_or_default(),
+            &input_dir,
         )?;
         let mut references: Vec<String> = Vec::new();
         for path in &audio_files {
@@ -4597,8 +5060,14 @@ fn generate_canvas_audio_blocking(
         for reference in &references {
             content_args.push(format!("--ref={reference}"));
         }
-        let (node_id, _quoted) =
-            create_quote_confirm_run(&executable, &project_id, "audio", &content_args)?;
+        let (node_id, _quoted) = create_quote_confirm_run(
+            &executable,
+            &project_id,
+            "audio",
+            &canvas_node_title(&request.prompt),
+            &content_args,
+            None,
+        )?;
 
         let show_output = run_canvas_cli(
             &executable,
@@ -4743,29 +5212,40 @@ fn confirm_canvas_node(
 /// **节点状态不会说谎**：真受理了就是 running/queued，被拒了还是 empty。用它来区分
 /// 「提交失败」与「只是没收到回执」，避免让用户重试一次白扣积分。
 fn canvas_node_is_active(executable: &str, project_id: &str, node_id: &str) -> bool {
-    let Ok(output) = run_canvas_cli(
-        executable,
-        &canvas_cli_args(&[
-            "node",
-            "show",
-            &format!("--node-id={node_id}"),
-            &format!("--project-id={project_id}"),
-            "--format",
-            "json",
-        ]),
-    ) else {
-        return false;
-    };
-    let Ok(data) = parse_canvas_payload(&output) else {
-        return false;
-    };
-    let status = find_json_string_field(&data, "status")
-        .unwrap_or_default()
-        .to_lowercase();
-    matches!(
-        status.as_str(),
-        "running" | "queued" | "pending" | "success" | "partial_success"
-    )
+    let arguments = canvas_cli_args(&[
+        "node",
+        "show",
+        &format!("--node-id={node_id}"),
+        &format!("--project-id={project_id}"),
+        "--format",
+        "json",
+    ]);
+    // 传输失败时**保守返回 true**：`node run` 很可能已经受理并开始扣积分，
+    // 这时判成「没提交」会让用户重试一次、白扣一遍（实测 26 秒 480p 样片 234 积分）。
+    // 真正的兜底交给后续轮询 —— 它会重新查状态，连续连不上时也会给出可照做的提示。
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(2 * attempt as u64));
+        }
+        let output = match run_canvas_cli(executable, &arguments) {
+            Ok(output) => output,
+            // 服务端明确报错（不是连不上）→ 当作没提交，原样把原因交回去。
+            Err(reason) if !is_canvas_transport_reason(&reason) => return false,
+            Err(_) => continue,
+        };
+        let Ok(data) = parse_canvas_payload(&output) else {
+            return false;
+        };
+        let status = find_json_string_field(&data, "status")
+            .unwrap_or_default()
+            .to_lowercase();
+        return matches!(
+            status.as_str(),
+            "running" | "queued" | "pending" | "success" | "partial_success"
+        );
+    }
+    true
 }
 
 /// 提交被拒（`node run`）的英文壳子 → 人话。
@@ -4780,18 +5260,45 @@ fn describe_run_rejection(code: &str) -> Option<&'static str> {
     }
 }
 
+/// 给画布节点起标题。
+///
+/// 🔴 必须给：`node create image` 的 `--title` 是**纯保存时必填**的（CLI 1.2.1
+/// `--help` 原话：「纯保存时必填; 带 --run 时省略则取非空 prompt 摘要」）。
+/// 我们这条链路刻意拆成「建节点 → 报价 → 批准 → 运行」，**没有 `--run`**，
+/// 所以不传就必炸 `cli.invalid_node_input` / `Provide a non-empty value for this
+/// argument.（字段 title）` —— 而且报错发生在建节点这一步，一个积分都没花，
+/// 用户只会看到一句跟图片无关的英文。
+///
+/// 同时「提供时不能为空」：prompt 是空的或全是空白时也得给个兜底，不能传 `--title=`。
+/// 上限 512 个 UTF-16 code unit，这里掐到 40 个字符，远低于限制，也够在画布上认出来。
+fn canvas_node_title(prompt: &str) -> String {
+    const MAX_CHARS: usize = 40;
+    // 提示词常带换行（多行场景描述），标题里压成单行，否则画布节点标题栏会被撑开。
+    let flattened = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title: String = flattened.chars().take(MAX_CHARS).collect();
+    if title.trim().is_empty() {
+        "LenTalk 生成".to_string()
+    } else {
+        title
+    }
+}
+
 fn create_quote_confirm_run(
     executable: &str,
     project_id: &str,
     node_kind: &str,
+    title: &str,
     content_args: &[String],
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<(String, Option<f64>), String> {
     // 1) 建节点(不触发生成)
+    // `--title` 必带：纯保存（不带 --run）时 CLI 要求非空标题，见 `canvas_node_title`。
     let mut create_args = vec![
         "node".to_string(),
         "create".to_string(),
         node_kind.to_string(),
         format!("--project-id={project_id}"),
+        format!("--title={title}"),
         "--format".to_string(),
         "json".to_string(),
     ];
@@ -4825,6 +5332,11 @@ fn create_quote_confirm_run(
         .or_else(|| find_json_string_field(&confirmed_data, "token"));
 
     // 4) 提交运行
+    // 建节点和报价都不花钱，`node run` 才是扣积分的那一步 —— 在这里再查一次：
+    // 用户在上传素材 / 等报价的几十秒里点了取消，就到此为止，一个积分都不扣。
+    if let Some(flag) = cancel {
+        ensure_local_cli_not_canceled(flag)?;
+    }
     let mut run_args = vec![
         "node".to_string(),
         "run".to_string(),
@@ -4843,18 +5355,31 @@ fn create_quote_confirm_run(
     // ② CLI **没看懂回应**（`cli.invalid_service_response` / 传输中断）→ 服务端往往
     //    已经受理并开始扣分（实测 26 秒 480p 样片 234 积分）。这时直接抛错会让用户
     //    重试一次，等于白扣一遍积分。所以先问节点状态：已经在跑就当作提交成功往下等。
-    if let Err(error) = run_canvas_cli(executable, &run_args) {
-        if !canvas_node_is_active(executable, project_id, &node_id) {
-            return Err(error);
+    // 记下「提交这一步报过错、但节点仍可能在跑」：后面轮询若长时间停在 `empty`，
+    // 能据此判断是提交真的没落地（此时原样重试安全、不扣积分），而不是傻等到超时。
+    let run_error = match run_canvas_cli(executable, &run_args) {
+        Ok(_) => None,
+        Err(error) => {
+            if !canvas_node_is_active(executable, project_id, &node_id) {
+                return Err(error);
+            }
+            Some(error)
         }
-    }
+    };
 
     // 5) 等终态: 直接轮询 `node show` 读 status。
     // 不走 `operation wait <submitId>` —— 那需要先拿到 submitId, 而 run 的返回结构没实测过;
     // 而 show 是后面取产物必经的一步, status 字段已经确认存在(`success` / `empty` / `failed`)。
     let deadline = std::time::Instant::now() + CLI_TASK_TIMEOUT;
+    // 轮询期间的传输失败不能当终态：一次网络抖动就把已经扣过费、很可能已经生成好的任务判死，
+    // 代价完全不对等。连续失败到上限才放弃，且放弃时把 nodeId 与手工取回命令一起给出去。
+    const MAX_TRANSPORT_STREAK: usize = 6;
+    const TRANSPORT_BACKOFF_SECS: [u64; MAX_TRANSPORT_STREAK] = [2, 5, 10, 20, 30, 30];
+    let mut transport_streak = 0usize;
+    // run 报过错时，节点若一直停在 `empty` 就说明提交确实没落地。
+    let mut empty_streak_with_run_error = 0usize;
     loop {
-        let show = run_canvas_cli(
+        let show = match run_canvas_cli(
             executable,
             &canvas_cli_args(&[
                 "node",
@@ -4864,7 +5389,27 @@ fn create_quote_confirm_run(
                 "--format",
                 "json",
             ]),
-        )?;
+        ) {
+            Ok(output) => {
+                transport_streak = 0;
+                output
+            }
+            Err(reason) if is_canvas_transport_reason(&reason) => {
+                transport_streak += 1;
+                if transport_streak >= MAX_TRANSPORT_STREAK
+                    || std::time::Instant::now() >= deadline
+                {
+                    return Err(canvas_orphan_node_message(project_id, &node_id, &reason));
+                }
+                let wait = TRANSPORT_BACKOFF_SECS[transport_streak - 1];
+                eprintln!(
+                    "即梦画布轮询第 {transport_streak} 次传输失败，{wait} 秒后重试：{reason}"
+                );
+                std::thread::sleep(Duration::from_secs(wait));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let data = parse_canvas_payload(&show)?;
         let status = find_json_string_field(&data, "status")
             .unwrap_or_default()
@@ -4893,6 +5438,23 @@ fn create_quote_confirm_run(
             }
             _ => {}
         }
+
+        // 提交报过错 + 节点长时间仍是 `empty` = `node run` 确实没落地。
+        // 这时原样重试是安全的（一个积分都没扣），比傻等到 30 分钟超时有用得多。
+        if status == "empty" && run_error.is_some() {
+            empty_streak_with_run_error += 1;
+            if empty_streak_with_run_error >= 12 {
+                let reason = run_error.as_deref().unwrap_or("未知原因");
+                return Err(format!(
+                    "即梦画布节点 {node_id} 提交后一直为空（60 秒内没有进入生成）。\
+                     提交这一步报的是：{reason}\n\
+                     任务没有真正开始，重新点生成即可，不会重复扣积分。"
+                ));
+            }
+        } else if status != "empty" {
+            empty_streak_with_run_error = 0;
+        }
+
         if std::time::Instant::now() >= deadline {
             return Err(format!(
                 "即梦画布 CLI 节点 {node_id} 等待超时（当前状态 {status}）。\
@@ -5816,6 +6378,8 @@ fn generate_image_blocking(
             request.client_job_id.as_deref(),
             &download_dir,
             JimengArtifactKind::Image,
+            // 图片链路暂未接取消窗口（视频节点是当前唯一需要它的入口）。
+            None,
         )
     })();
 
@@ -5868,6 +6432,8 @@ fn upscale_image_blocking(
             request.client_job_id.as_deref(),
             &download_dir,
             JimengArtifactKind::Image,
+            // 图片链路暂未接取消窗口（视频节点是当前唯一需要它的入口）。
+            None,
         )
     })();
 
@@ -6174,6 +6740,32 @@ mod image_tests {
         assert!(ensure_canvas_prompt_fits("some_future_model", &wide).is_ok());
     }
 
+    /// 用户实报的第三次失败：`cli.invalid_node_input` / 字段 `title`。
+    ///
+    /// 画布 CLI 1.2.1 起，`node create image` 的 `--title` 在**纯保存**时必填；
+    /// 我们拆成「建节点 → 报价 → 批准 → 运行」，没有 `--run`，所以必须自己给。
+    #[test]
+    fn canvas_node_title_is_never_empty() {
+        // 正常提示词：压成单行、截断到 40 字符。
+        let title = canvas_node_title("生成场景图，桌子上的肩周模型改为腰椎模型");
+        assert_eq!(title, "生成场景图，桌子上的肩周模型改为腰椎模型");
+        assert!(title.chars().count() <= 40);
+
+        // 多行提示词：换行不能进标题。
+        assert_eq!(canvas_node_title("第一行\n第二行\t 第三行"), "第一行 第二行 第三行");
+
+        // 超长提示词：截断但不为空，且不切出半个字符。
+        let long = "字".repeat(200);
+        let clamped = canvas_node_title(&long);
+        assert_eq!(clamped.chars().count(), 40);
+
+        // 空白提示词：必须给兜底，绝不能传 `--title=`（CLI 明确「提供时不能为空」）。
+        assert_eq!(canvas_node_title("   \n\t "), "LenTalk 生成");
+        assert_eq!(canvas_node_title(""), "LenTalk 生成");
+        // 首尾空白不能变成「看起来像空」的标题。
+        assert_eq!(canvas_node_title("  abc  "), "abc");
+    }
+
     /// 用户实报的第二次失败：`node run` 被服务端拒，真实原因藏在
     /// `serviceCode` + `submissionError.validation`（参考音频只有 1.463 秒）。
     #[test]
@@ -6218,6 +6810,101 @@ mod image_tests {
         // 不能说「参数错」，要告诉用户「可能已经在生成，别急着重复提交」。
         assert!(message.contains("已经在生成"), "{message}");
         assert!(message.contains("扣积分"), "{message}");
+    }
+
+    /// 真机：`studioReferenceAudio` 指向 `images/<md5>.png`，但里面装的是 mp3。
+    /// 这种文件直接交给 CLI，ffmpeg 只会探出 0.04 秒，被当成「音频太短」拒掉。
+    #[test]
+    fn audio_with_wrong_extension_gets_a_fixed_copy() {
+        let dir = std::env::temp_dir().join(format!("lentalk-audio-ext-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        // 内容是 mp3（ID3 头），扩展名却是 .png。
+        let mut bytes = b"ID3\x03\x00\x00\x00\x00\x00\x00".to_vec();
+        bytes.extend_from_slice(&[0_u8; 64]);
+        let wrong = dir.join("sample.png");
+        std::fs::write(&wrong, &bytes).expect("write sample");
+
+        let fixed = normalize_audio_extension(wrong.clone(), &dir, 0).expect("normalize");
+        assert_eq!(fixed.extension().and_then(|value| value.to_str()), Some("mp3"));
+        assert_eq!(std::fs::read(&fixed).expect("read fixed"), bytes);
+        // 原文件不动，用户的数据结构保持原样。
+        assert!(wrong.is_file());
+
+        // 扩展名本来就对：原样返回，不复制。
+        let ok = dir.join("good.mp3");
+        std::fs::write(&ok, &bytes).expect("write good");
+        let same = normalize_audio_extension(ok.clone(), &dir, 1).expect("keep");
+        assert_eq!(same, ok);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 兄弟目录里已经有正确扩展名的同内容文件时，直接引用它，不复制。
+    /// 真机形态：`audio/<md5>.mp3` 与 `images/<md5>.png` 并存（同一份字节）。
+    #[test]
+    fn existing_sibling_audio_is_reused_instead_of_copied() {
+        let root = std::env::temp_dir().join(format!("lentalk-sibling-{}", uuid::Uuid::new_v4()));
+        let images = root.join("images");
+        let audio = root.join("audio");
+        std::fs::create_dir_all(&images).expect("images dir");
+        std::fs::create_dir_all(&audio).expect("audio dir");
+
+        let bytes = b"ID3\x03\x00\x00\x00\x00\x00\x00padding".to_vec();
+        let mislabeled = images.join("abc.png");
+        let correct = audio.join("abc.mp3");
+        std::fs::write(&mislabeled, &bytes).expect("write mislabeled");
+        std::fs::write(&correct, &bytes).expect("write correct");
+
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let resolved =
+            normalize_audio_extension(mislabeled.clone(), &work, 0).expect("resolve sibling");
+
+        // 直接命中兄弟目录那份，既没有复制新文件，也没动原文件。
+        assert_eq!(resolved, correct);
+        assert_eq!(std::fs::read_dir(&work).expect("list work").count(), 0);
+        assert!(mislabeled.is_file());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn audio_extension_prefers_url_suffix_then_content_type() {
+        // URL 后缀最可靠：CLI 靠扩展名判断类型，给错会被服务端拒。
+        assert_eq!(audio_extension("audio/mpeg", "https://x/a.wav"), "wav");
+        assert_eq!(audio_extension("", "https://x/a.m4a?sign=1"), "m4a");
+        assert_eq!(audio_extension("audio/wav", "https://x/download"), "wav");
+        assert_eq!(audio_extension("audio/mp4", ""), "m4a");
+        // 认不出来时退回 mp3（即梦最宽松的格式）。
+        assert_eq!(audio_extension("application/octet-stream", "https://x/audio"), "mp3");
+    }
+
+    #[test]
+    fn asset_url_maps_back_to_a_local_path() {
+        // 前端展示地址 `asset://localhost/C%3A/...` 要能还原成本机路径，
+        // 否则本机文件会被当成「远端地址」再去下载一遍。
+        let from_asset = local_path_from_asset_url("asset://localhost/C%3A/Users/a.mp3")
+            .expect("asset url should decode");
+        assert_eq!(from_asset.to_string_lossy(), "C:/Users/a.mp3");
+
+        let from_http = local_path_from_asset_url("http://asset.localhost/C%3A/Users/b.mp3")
+            .expect("asset.localhost url should decode");
+        assert_eq!(from_http.to_string_lossy(), "C:/Users/b.mp3");
+
+        // 普通远端地址不该被当成 asset 地址。
+        assert!(local_path_from_asset_url("https://example.com/a.mp3").is_none());
+    }
+
+    #[test]
+    fn missing_local_audio_reports_the_path() {
+        let dir = std::env::temp_dir().join("lentalk-audio-materialize-test");
+        std::fs::create_dir_all(&dir).ok();
+        let error = materialize_audio_source("C:////no////such////clip.mp3", &dir, 0)
+            .expect_err("不存在的路径必须报错");
+        // 报错要点名具体路径，而不是只丢一句「必须来自本地音频节点」。
+        assert!(error.contains("clip.mp3"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

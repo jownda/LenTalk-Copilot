@@ -1,9 +1,15 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, ArrowLeft, ArrowRight, CheckCircle2, Mic, Replace, Search, Sparkles } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, Pencil, Plus, Replace, Search, Sparkles, Trash2, Zap } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { UiButton, UiCheckbox, UiInput, UiModal, UiSelect, UiTextArea } from '@/components/ui';
 import { replaceAllText, replaceTextAt, resolveTextMatchIndexes } from '../application/textNodeEditing';
+import {
+  appendQuickPhrase,
+  loadQuickPhrases,
+  saveQuickPhrases,
+} from '../application/quickPhrases';
 import { isTextAnnotationNode, type CanvasNode } from '@/features/canvas/domain/canvasNodes';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -19,6 +25,12 @@ interface TextNodeEditDialogProps {
 }
 
 
+/** 快捷句式浮层：宽度、兜底高度、与按钮的间距、离视口的最小边距。 */
+const QUICK_PANEL_WIDTH = 288;
+const QUICK_PANEL_FALLBACK_HEIGHT = 300;
+const QUICK_PANEL_GAP = 8;
+const QUICK_PANEL_MARGIN = 8;
+
 interface ChatModelOption {
   key: string;
   providerId: string;
@@ -26,31 +38,6 @@ interface ChatModelOption {
   model: string;
   baseUrl: string;
   apiKey: string;
-}
-
-interface SpeechRecognitionEventLike extends Event {
-  results: { length: number; [index: number]: { [index: number]: { transcript: string } } };
-}
-
-interface SpeechRecognitionLike {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: (() => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-}
-
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
-
-function getSpeechRecognitionConstructor(): SpeechRecognitionConstructor | null {
-  const speechWindow = window as Window & {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  };
-  return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
 }
 
 function renderHighlightedText(text: string, query: string, caseSensitive: boolean, activeIndex: number): ReactNode {
@@ -77,7 +64,7 @@ function renderHighlightedText(text: string, query: string, caseSensitive: boole
 }
 
 export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogProps) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const customApis = useSettingsStore((state) => state.customApis);
   const apiKeys = useSettingsStore((state) => state.apiKeys);
@@ -85,6 +72,14 @@ export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogPr
   const textNodeAiSelection = useSettingsStore((state) => state.textNodeAiSelection);
   const setTextNodeAiSelection = useSettingsStore((state) => state.setTextNodeAiSelection);
   const [instruction, setInstruction] = useState('');
+  // 快捷句式：本地持久化的一批「常用修改要求」，点一下直接追加到输入框。
+  const [quickPhrases, setQuickPhrases] = useState<string[]>(() => loadQuickPhrases());
+  const [quickPanelOpen, setQuickPanelOpen] = useState(false);
+  const [quickEditing, setQuickEditing] = useState(false);
+  const quickPanelRef = useRef<HTMLDivElement | null>(null);
+  const quickButtonRef = useRef<HTMLButtonElement | null>(null);
+  // 面板 portal 到 body 上，坐标得自己算（见 updateQuickPanelPosition）。
+  const [quickPanelPosition, setQuickPanelPosition] = useState<{ left: number; top: number } | null>(null);
   const [preserveMarkdown, setPreserveMarkdown] = useState(true);
   const [selectedModelKey, setSelectedModelKey] = useState('');
   // 任务状态放在 store 里, 弹窗只是它的视图 —— 关窗后请求继续跑, 重开能接着看。
@@ -95,7 +90,6 @@ export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogPr
   const applyTextAiEdit = useTextAiEditStore((state) => state.apply);
   const aiResult: AiEditResult | null = aiTask?.result ?? null;
   const isGenerating = aiTask?.status === 'running';
-  const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [replacement, setReplacement] = useState('');
@@ -103,7 +97,6 @@ export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogPr
   const [activeMatchIndex, setActiveMatchIndex] = useState(0);
   const [replaceNotice, setReplaceNotice] = useState<string | null>(null);
   const previewRef = useRef<HTMLDivElement | null>(null);
-  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const initializedNodeIdRef = useRef<string | null>(null);
 
   const text = isTextAnnotationNode(node) ? node.data.content : '';
@@ -161,37 +154,105 @@ export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogPr
     previewRef.current.querySelector<HTMLElement>('[data-active="true"]')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }, [activeMatchIndex, mode, query]);
 
-  useEffect(() => () => speechRecognitionRef.current?.stop(), []);
-
-  const toggleVoiceInput = () => {
-    if (isListening) {
-      speechRecognitionRef.current?.stop();
-      setIsListening(false);
-      return;
-    }
-    const Recognition = getSpeechRecognitionConstructor();
-    if (!Recognition) {
-      setError(t('textNodeEdit.voiceUnsupported'));
-      return;
-    }
-    const recognition = new Recognition();
-    recognition.lang = i18n.language.startsWith('zh') ? 'zh-CN' : 'en-US';
-    recognition.continuous = true;
-    recognition.interimResults = false;
-    recognition.onresult = (event) => {
-      const transcript = event.results[event.results.length - 1]?.[0]?.transcript?.trim();
-      if (transcript) setInstruction((current) => `${current.trim()}${current.trim() ? ' ' : ''}${transcript}`);
-    };
-    recognition.onerror = () => {
-      setIsListening(false);
-      setError(t('textNodeEdit.voiceFailed'));
-    };
-    recognition.onend = () => setIsListening(false);
-    speechRecognitionRef.current = recognition;
-    setError(null);
-    setIsListening(true);
-    recognition.start();
+  /** 点一条句式 → 追加到输入框末尾，并收起面板（选完即走，不挡视线）。 */
+  const applyQuickPhrase = (phrase: string) => {
+    setInstruction((current) => appendQuickPhrase(current, phrase));
+    closeQuickPanel();
   };
+
+  /** 编辑态只改内存；离开编辑态（或收起面板）时统一落盘，避免每敲一个字就写一次。 */
+  const commitQuickPhrases = () => {
+    setQuickPhrases((current) => saveQuickPhrases(current));
+  };
+
+  const closeQuickPanel = () => {
+    commitQuickPhrases();
+    setQuickPanelOpen(false);
+    setQuickEditing(false);
+  };
+
+  const toggleQuickEditing = () => {
+    if (quickEditing) commitQuickPhrases();
+    setQuickEditing((current) => !current);
+  };
+
+  const updateQuickPhraseAt = (index: number, value: string) => {
+    setQuickPhrases((current) =>
+      current.map((item, position) => (position === index ? value : item)),
+    );
+  };
+
+  const addQuickPhrase = () => {
+    setQuickEditing(true);
+    setQuickPhrases((current) => [...current, '']);
+  };
+
+  const removeQuickPhrase = (index: number) => {
+    setQuickPhrases((current) =>
+      saveQuickPhrases(current.filter((_, position) => position !== index)),
+    );
+  };
+
+  /**
+   * 面板贴住按钮弹出：右边缘对齐按钮、优先往上翻。
+   *
+   * 面板是 portal 到 body 的，不能靠父级的 `absolute` —— 弹窗内容区是可滚动的，
+   * 绝对定位会被 `overflow` 裁掉一截（表现为「卡片下半截消失」）。所以这里用
+   * `position: fixed` + 视口坐标，并做四边夹取，保证永远留在可视区内。
+   */
+  const updateQuickPanelPosition = useCallback(() => {
+    const trigger = quickButtonRef.current;
+    if (!trigger || typeof window === 'undefined') return;
+    const rect = trigger.getBoundingClientRect();
+    const panel = quickPanelRef.current;
+    const width = panel?.offsetWidth || QUICK_PANEL_WIDTH;
+    const height = panel?.offsetHeight || QUICK_PANEL_FALLBACK_HEIGHT;
+    const margin = QUICK_PANEL_MARGIN;
+    const gap = QUICK_PANEL_GAP;
+
+    const left = Math.min(
+      Math.max(margin, rect.right - width),
+      Math.max(margin, window.innerWidth - width - margin),
+    );
+    // 上方放得下就往上，否则往下；两种都放不下时贴着视口底边。
+    const aboveTop = rect.top - gap - height;
+    const belowTop = rect.bottom + gap;
+    const top = aboveTop >= margin
+      ? aboveTop
+      : Math.min(belowTop, Math.max(margin, window.innerHeight - height - margin));
+
+    setQuickPanelPosition({ left, top });
+  }, []);
+
+  // 打开时定位一次；之后跟随窗口缩放与滚动（捕获阶段才能收到内层容器的滚动）。
+  useEffect(() => {
+    if (!quickPanelOpen) return;
+    updateQuickPanelPosition();
+    window.addEventListener('resize', updateQuickPanelPosition);
+    window.addEventListener('scroll', updateQuickPanelPosition, true);
+    return () => {
+      window.removeEventListener('resize', updateQuickPanelPosition);
+      window.removeEventListener('scroll', updateQuickPanelPosition, true);
+    };
+  }, [quickPanelOpen, quickEditing, quickPhrases.length, updateQuickPanelPosition]);
+
+  /**
+   * 点面板外面即收起。
+   *
+   * 用**捕获阶段**监听：弹窗（UiModal）内部多处会 `stopPropagation`，
+   * 冒泡到 document 的 mousedown 会被吞掉，表现为「点旁边没反应」。
+   */
+  useEffect(() => {
+    if (!quickPanelOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (quickPanelRef.current?.contains(target)) return;
+      if (quickButtonRef.current?.contains(target)) return;
+      closeQuickPanel();
+    };
+    document.addEventListener('mousedown', handlePointerDown, true);
+    return () => document.removeEventListener('mousedown', handlePointerDown, true);
+  }, [quickPanelOpen]);
 
   const handleGenerate = async () => {
     if (!instruction.trim() || !selectedModel) return;
@@ -261,7 +322,50 @@ export function TextNodeEditDialog({ mode, node, onClose }: TextNodeEditDialogPr
       {mode === 'ai' ? (
         <div className="space-y-3">
           <div className="grid gap-3 md:grid-cols-[1fr_230px]">
-            <label className="space-y-1.5"><span className="block text-xs text-text-muted">{t('textNodeEdit.instruction')}</span><div className="relative"><UiTextArea value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder={t('textNodeEdit.instructionPlaceholder')} className="h-24 pr-11" /><button type="button" aria-label={isListening ? t('textNodeEdit.stopVoice') : t('textNodeEdit.startVoice')} title={isListening ? t('textNodeEdit.stopVoice') : t('textNodeEdit.startVoice')} onClick={toggleVoiceInput} className={`absolute bottom-2 right-2 inline-flex h-7 w-7 items-center justify-center rounded-md border transition-colors ${isListening ? 'border-red-400/60 bg-red-400/20 text-red-200' : 'border-white/15 text-text-muted hover:bg-bg-dark hover:text-text-dark'}`}><Mic className="h-3.5 w-3.5" /></button></div></label>
+            <label className="space-y-1.5">
+              <span className="block text-xs text-text-muted">{t('textNodeEdit.instruction')}</span>
+              <div className="relative">
+                <UiTextArea value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder={t('textNodeEdit.instructionPlaceholder')} className="h-24 pr-11" />
+                {/* 快捷句式：常用修改要求一键追加，句式由用户自己维护 */}
+                <button ref={quickButtonRef} type="button" aria-label={t('textNodeEdit.quickPhrases')} title={t('textNodeEdit.quickPhrases')} onClick={() => (quickPanelOpen ? closeQuickPanel() : setQuickPanelOpen(true))} className={`absolute bottom-2 right-2 inline-flex h-7 w-7 items-center justify-center rounded-md border transition-colors ${quickPanelOpen ? 'border-accent/60 bg-accent/20 text-accent' : 'border-white/15 text-text-muted hover:bg-bg-dark hover:text-text-dark'}`}>
+                  <Zap className="h-3.5 w-3.5" />
+                </button>
+                {quickPanelOpen && typeof document !== 'undefined' && createPortal(
+                  <div
+                    ref={quickPanelRef}
+                    style={{
+                      left: quickPanelPosition?.left ?? 0,
+                      top: quickPanelPosition?.top ?? 0,
+                      // 首次渲染还没量到尺寸，先藏起来，避免在错误位置闪一下。
+                      visibility: quickPanelPosition ? 'visible' : 'hidden',
+                    }}
+                    className="fixed z-[1200] w-72 rounded-lg border border-border-dark bg-surface-dark p-2 shadow-2xl">
+                    <div className="flex items-center justify-between px-1 pb-1.5">
+                      <span className="text-[11px] font-medium text-text-dark">{t('textNodeEdit.quickPhrases')}</span>
+                      <button type="button" onClick={toggleQuickEditing} className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-text-muted transition-colors hover:bg-bg-dark hover:text-text-dark">
+                        {quickEditing ? <><Check className="h-3 w-3" />{t('textNodeEdit.quickPhrasesDone')}</> : <><Pencil className="h-3 w-3" />{t('textNodeEdit.quickPhrasesEdit')}</>}
+                      </button>
+                    </div>
+                    <div className="ui-scrollbar max-h-56 space-y-1 overflow-y-auto">
+                      {quickPhrases.length === 0 && <p className="px-1 py-2 text-[11px] text-text-muted">{t('textNodeEdit.quickPhrasesEmpty')}</p>}
+                      {quickPhrases.map((phrase, index) => (quickEditing ? (
+                        <div key={`phrase-edit-${index}`} className="flex items-center gap-1">
+                          <UiInput value={phrase} onChange={(event) => updateQuickPhraseAt(index, event.target.value)} placeholder={t('textNodeEdit.quickPhrasesPlaceholder')} spellCheck={false} className="h-7 px-2 py-1 text-xs" />
+                          <button type="button" onClick={() => removeQuickPhrase(index)} title={t('textNodeEdit.quickPhrasesRemove')} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border border-white/15 text-text-muted transition-colors hover:bg-bg-dark hover:text-red-300"><Trash2 className="h-3 w-3" /></button>
+                        </div>
+                      ) : (
+                        <button key={`phrase-${index}`} type="button" onClick={() => applyQuickPhrase(phrase)} title={phrase} className="block w-full truncate rounded px-1.5 py-1 text-left text-[11px] text-text-dark transition-colors hover:bg-bg-dark">{phrase}</button>
+                      )))}
+                    </div>
+                    <div className="mt-1.5 flex items-center justify-between border-t border-border-dark pt-1.5">
+                      <button type="button" onClick={addQuickPhrase} className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-text-muted transition-colors hover:bg-bg-dark hover:text-text-dark"><Plus className="h-3 w-3" />{t('textNodeEdit.quickPhrasesAdd')}</button>
+                      {!quickEditing && <span className="text-[10px] text-text-muted">{t('textNodeEdit.quickPhrasesHint')}</span>}
+                    </div>
+                  </div>,
+                  document.body,
+                )}
+              </div>
+            </label>
             <label className="space-y-1.5"><span className="block text-xs text-text-muted">{t('textNodeEdit.model')}</span><UiSelect value={selectedModelKey} onChange={(event) => { const nextKey = event.target.value; setSelectedModelKey(nextKey); const nextModel = chatModels.find((option) => option.key === nextKey); if (nextModel) setTextNodeAiSelection({ provider: nextModel.providerId, model: nextModel.model }); }} disabled={chatModels.length === 0} aria-label={t('textNodeEdit.model')}>
               {chatModels.length === 0 ? <option value="">{t('textNodeEdit.noModel')}</option> : chatModels.map((option) => <option key={option.key} value={option.key}>{option.providerName} / {option.model}</option>)}
             </UiSelect></label>

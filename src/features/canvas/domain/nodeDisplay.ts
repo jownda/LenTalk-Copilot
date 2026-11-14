@@ -22,7 +22,7 @@ export const DEFAULT_NODE_DISPLAY_NAME: Record<CanvasNodeType, string> = {
   [CANVAS_NODE_TYPES.audioGen]: 'AI 音频',
   [CANVAS_NODE_TYPES.motionControl]: '动作控制 / 对口型',
   [CANVAS_NODE_TYPES.runningHubWorkflow]: 'RunningHub 工作流',
-  [CANVAS_NODE_TYPES.seamlessMosaic]: '无缝拼图',
+  [CANVAS_NODE_TYPES.seamlessMosaic]: '图片编辑',
 };
 
 /**
@@ -66,6 +66,12 @@ export function resolveNodeDisplayName(type: CanvasNodeType, data: Partial<Canva
     if (
       type === CANVAS_NODE_TYPES.upload &&
       (customTitle === '上传图片' || customTitle === 'Upload Image')
+    ) {
+      return DEFAULT_NODE_DISPLAY_NAME[type];
+    }
+    if (
+      type === CANVAS_NODE_TYPES.seamlessMosaic &&
+      (customTitle === '无缝拼图' || customTitle === 'Seamless Mosaic')
     ) {
       return DEFAULT_NODE_DISPLAY_NAME[type];
     }

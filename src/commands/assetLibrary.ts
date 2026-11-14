@@ -153,3 +153,41 @@ export async function extractVideoThumbnail(videoPath: string): Promise<string |
     return null;
   }
 }
+
+export interface LibraryDirectoryInfo {
+  root: string;
+  defaultRoot: string;
+  isCustom: boolean;
+}
+
+export interface LibraryMigrationReport {
+  targetRoot: string;
+  /** 旧路径 → 新路径，供调用方改写素材记录、画布节点、工程与模板里的引用。 */
+  pathMap: Record<string, string>;
+  copiedFiles: number;
+  skippedFiles: number;
+  copiedBytes: number;
+  failed: string[];
+}
+
+/** 当前素材库位置（含默认位置，设置页用来显示"正在使用默认位置"）。 */
+export async function resolveLibraryDirectory(): Promise<LibraryDirectoryInfo> {
+  return await invoke<LibraryDirectoryInfo>("resolve_library_directory");
+}
+
+/** 改素材库位置；传空串恢复默认。只影响之后导入的素材。 */
+export async function setLibraryDirectory(path: string): Promise<LibraryDirectoryInfo> {
+  return await invoke<LibraryDirectoryInfo>("set_library_directory", { path });
+}
+
+/** 把不在当前根目录下的素材复制进来，返回旧→新映射（不删除原文件）。 */
+export async function migrateLibraryFiles(): Promise<LibraryMigrationReport> {
+  return await invoke<LibraryMigrationReport>("migrate_library_files");
+}
+
+/** 弹系统目录选择框，返回选中的绝对路径（取消时返回 null）。 */
+export async function chooseLibraryDirectory(): Promise<string | null> {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({ directory: true, multiple: false, title: "选择素材库位置" });
+  return typeof selected === "string" && selected.trim() ? selected.trim() : null;
+}

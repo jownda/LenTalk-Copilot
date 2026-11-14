@@ -1,8 +1,11 @@
 /**
  * 人物音频引用格式：把「角色 ↔ 音频参考」的绑定统一写成人可读的规范句。
  *
- * 中文规范句：`使用 @音频N 作为 @角色 的唯一人声参考。`
- * 英文规范句：`Use @音频N as the only voice reference for @角色.`
+ * 中文规范句：`使用 @音频N 作为 @角色 [imageM] 的唯一人声参考。`
+ * 英文规范句：`Use @音频N as the only voice reference for @角色 [imageM].`
+ *
+ * `[imageM]` 是角色的**图片**序号（可选）：音频与图片在视频模型那边是两条独立通道，
+ * 只给名字时它只能猜「这段声线配哪张脸」。拿不到图片序号时省略这一段，不要瞎编号。
  *
  * 背景：`@音频N` 是画布的规范引用标记 —— 视频节点「引用」按钮插入的就是 `@音频N`
  * （见 VideoGenNode 的 marker 拼装），重编号与越界清理（`remapAudioReferenceTokens` /
@@ -27,6 +30,14 @@ export interface VoiceReferenceBinding {
   audioIndex: number;
   /** 该音频所属角色在提示词里的标签（不含 `@`）。 */
   characterName: string;
+  /**
+   * 该角色**图片**参考的序号（1 起），可选。
+   *
+   * 带上它，绑定句里会补一个 `[imageM]`：视频模型拿到的音频与图片是两条独立通道，
+   * 只写 `@角色` 时它只能靠名字猜「这段声线对应哪张脸」——实测经常猜错（声线贴到
+   * 同场另一个角色身上）。写明图片序号后，声音与外观才是同一个锚。
+   */
+  imageIndex?: number;
 }
 
 /** 规范引用标记：与视频节点「引用」按钮插入的写法完全一致。 */
@@ -34,16 +45,21 @@ export function canonicalAudioToken(audioIndex: number): string {
   return `@音频${audioIndex}`;
 }
 
-/** 规范句：一条音频参考只绑一个角色。 */
+/** 规范句：一条音频参考只绑一个角色；有图片序号时一并写进去。 */
 export function renderVoiceReferenceSentence(
   binding: VoiceReferenceBinding,
   locale: VoiceReferenceLocale = 'zh',
 ): string {
   const token = canonicalAudioToken(binding.audioIndex);
   const name = binding.characterName.trim();
+  const imageIndex =
+    typeof binding.imageIndex === 'number' && Number.isFinite(binding.imageIndex) && binding.imageIndex >= 1
+      ? Math.floor(binding.imageIndex)
+      : null;
+  const anchor = imageIndex ? ` [image${imageIndex}]` : '';
   return locale === 'en'
-    ? `Use ${token} as the only voice reference for @${name}.`
-    : `使用 ${token} 作为 @${name} 的唯一人声参考。`;
+    ? `Use ${token} as the only voice reference for @${name}${anchor}.`
+    : `使用 ${token} 作为 @${name}${anchor} 的唯一人声参考。`;
 }
 
 /**
@@ -61,7 +77,11 @@ export function normalizeVoiceReferenceBindings(
     const characterName = binding.characterName.trim();
     if (!characterName || seen.has(audioIndex)) continue;
     seen.add(audioIndex);
-    normalized.push({ audioIndex, characterName });
+    const imageIndex =
+      typeof binding.imageIndex === 'number' && Number.isFinite(binding.imageIndex) && binding.imageIndex >= 1
+        ? Math.floor(binding.imageIndex)
+        : undefined;
+    normalized.push(imageIndex ? { audioIndex, characterName, imageIndex } : { audioIndex, characterName });
   }
   return normalized.sort((left, right) => left.audioIndex - right.audioIndex);
 }

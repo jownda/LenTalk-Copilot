@@ -111,7 +111,26 @@ describe('buildQuickPromptRequest', () => {
     expect(user).toContain('@现场音频 [audio2] (prop audio)');
     expect(system).toContain('Audio @asset tags and [audioN] tokens come only from VOICE LOCK REFERENCES');
     expect(system).toContain('must not be moved into ACTIVE REFERENCES');
-    expect(system).toContain('使用 @音频N 作为 @角色 的唯一人声参考。');
+    expect(system).toContain('使用 @音频N 作为 @角色 [imageM] 的唯一人声参考。');
+  });
+
+  it('binds the voice sentence to the character image index when the mirror ids match', () => {
+    // 真实链路里角色音频条目的 id 形如 `cinematic-<角色id>-<序号>`，
+    // 靠它反查同一个角色的图片序号，绑定句才会写成 `@藏医 [image2]`。
+    const { user } = buildQuickPromptRequest({
+      style: '写实',
+      synopsis: '藏医给患者贴膏药。',
+      sceneAssets: [],
+      characterAssets: [
+        { id: 'cinematic-doctor-0', name: '藏医', mediaType: 'image', referenceIndex: 1 },
+        { id: 'cinematic-doctor-1', name: '藏医', mediaType: 'audio', referenceIndex: 2 },
+      ],
+    }, 'zh');
+
+    // 音频条目不该抢走角色名去变成 `@藏医-2`。
+    expect(user).not.toContain('@藏医-2');
+    // 绑定句带上角色的图片序号。
+    expect(user).toContain('使用 @音频2 作为 @藏医 [image1] 的唯一人声参考。');
   });
 
   it('switches the required output language with the locale', () => {

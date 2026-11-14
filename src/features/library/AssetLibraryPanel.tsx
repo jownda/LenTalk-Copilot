@@ -269,9 +269,17 @@ export const AssetLibraryPanel = memo(
       setActiveSection(initialSection);
     }, [open, initialSection]);
 
+    // 启动时先铺一次底（面板常驻挂载，其它界面也读这份数据）。
     useEffect(() => {
       void hydrate();
     }, [hydrate]);
+
+    // 每次打开面板再强制重读：扩展导入等 Rust 侧写入不经过这份 store，
+    // 旧快照会让「刚导入的素材」在面板里缺席。
+    useEffect(() => {
+      if (!open) return;
+      void hydrate({ force: true });
+    }, [open, hydrate]);
 
     useEffect(() => {
       if (!open) return;

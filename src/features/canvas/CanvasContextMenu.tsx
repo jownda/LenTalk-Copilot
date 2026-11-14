@@ -25,6 +25,8 @@ interface CanvasContextMenuProps {
   downloadMediaType?: "image" | "video" | "audio" | null;
   nodeId?: string | null;
   textContent?: string | null;
+  /** 右键时节点内被选中的文字：有值时菜单顶部给「复制选中文字」，与「复制节点」分开。 */
+  selectedText?: string | null;
   /** 右键命中的节点是分组时提供冻结/解冻入口 */
   isGroupNode?: boolean;
   groupFrozen?: boolean;
@@ -34,6 +36,10 @@ interface CanvasContextMenuProps {
   onClearFailedNodes: () => void;
   onCopyNode: (nodeId: string) => void;
   onCutNode: (nodeId: string) => void;
+  /** 复制节点里选中的那段文字（不复制节点）。 */
+  onCopySelectedText: () => void;
+  /** 复制文本节点的整段内容。 */
+  onCopyAllText: () => void;
   onSaveTextToPrompt: () => void;
   onPaste: () => void;
   onAddMediaToLibrary: (url: string, mediaType: "image" | "video" | "audio", categoryId: string) => void;
@@ -51,6 +57,7 @@ export function CanvasContextMenu({
   downloadMediaType,
   nodeId,
   textContent,
+  selectedText,
   isGroupNode = false,
   groupFrozen = false,
   canPaste,
@@ -59,6 +66,8 @@ export function CanvasContextMenu({
   onClearFailedNodes,
   onCopyNode,
   onCutNode,
+  onCopySelectedText,
+  onCopyAllText,
   onSaveTextToPrompt,
   onPaste,
   onAddMediaToLibrary,
@@ -70,6 +79,8 @@ export function CanvasContextMenu({
   const { t } = useTranslation();
   const menuRef = useRef<HTMLDivElement>(null);
   const [isCategoryPickerOpen, setIsCategoryPickerOpen] = useState(false);
+  // 有选中文字时，「复制」要明确写成「复制整个节点」，否则用户点下去才发现复制错了东西。
+  const hasSelectedText = Boolean(selectedText && selectedText.trim());
 
   const handleClear = useCallback(() => {
     if (failedNodeCount === 0) {
@@ -108,6 +119,22 @@ export function CanvasContextMenu({
       className="absolute z-50 min-w-[184px] overflow-hidden rounded-lg border border-border-dark bg-surface-dark p-1 shadow-xl"
       style={{ left: position.x, top: position.y }}
     >
+      {hasSelectedText && (
+        <button
+          type="button"
+          onClick={onCopySelectedText}
+          className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
+        >
+          <Copy className="h-4 w-4 text-accent" />
+          <span>{t("canvas.contextMenu.copySelectedText", "复制选中文字")}</span>
+          <span className="ml-auto text-[10px] tabular-nums text-text-muted">
+            {(selectedText ?? "").trim().length}
+          </span>
+        </button>
+      )}
+
+      {hasSelectedText && nodeId && <div className="my-1 border-t border-border-dark/70" />}
+
       {nodeId && (
         <>
           <button
@@ -116,7 +143,11 @@ export function CanvasContextMenu({
             className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
           >
             <Scissors className="h-4 w-4 text-text-muted" />
-            <span>{t("canvas.contextMenu.cut", "剪切")}</span>
+            <span>
+              {hasSelectedText
+                ? t("canvas.contextMenu.cutWholeNode", "剪切整个节点")
+                : t("canvas.contextMenu.cut", "剪切")}
+            </span>
           </button>
           <button
             type="button"
@@ -124,7 +155,11 @@ export function CanvasContextMenu({
             className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
           >
             <Copy className="h-4 w-4 text-text-muted" />
-            <span>{t("canvas.contextMenu.copy", "复制")}</span>
+            <span>
+              {hasSelectedText
+                ? t("canvas.contextMenu.copyWholeNode", "复制整个节点")
+                : t("canvas.contextMenu.copy", "复制")}
+            </span>
           </button>
         </>
       )}
@@ -141,15 +176,26 @@ export function CanvasContextMenu({
       )}
 
       {textContent !== null && textContent !== undefined && (
-        <button
-          type="button"
-          disabled={!textContent.trim()}
-          onClick={onSaveTextToPrompt}
-          className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:text-text-muted/50 disabled:hover:bg-transparent"
-        >
-          <Save className="h-4 w-4 text-accent" />
-          <span>{t("canvas.contextMenu.saveTextToPrompt", "保存到提示词库")}</span>
-        </button>
+        <>
+          <button
+            type="button"
+            disabled={!textContent.trim()}
+            onClick={onCopyAllText}
+            className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:text-text-muted/50 disabled:hover:bg-transparent"
+          >
+            <Copy className="h-4 w-4 text-text-muted" />
+            <span>{t("canvas.contextMenu.copyAllText", "复制全部文本")}</span>
+          </button>
+          <button
+            type="button"
+            disabled={!textContent.trim()}
+            onClick={onSaveTextToPrompt}
+            className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark disabled:cursor-not-allowed disabled:text-text-muted/50 disabled:hover:bg-transparent"
+          >
+            <Save className="h-4 w-4 text-accent" />
+            <span>{t("canvas.contextMenu.saveTextToPrompt", "保存到提示词库")}</span>
+          </button>
+        </>
       )}
 
 

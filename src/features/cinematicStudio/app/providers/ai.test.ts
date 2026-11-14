@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { Asset, ProjectV2, SceneV2 } from "../../shared-types";
-import { AI_RESPONSE_TIMEOUT_MS, assembleHybridFinalPrompt, buildFinalGenerationSource, buildFinalPromptRequest, ChatCompletionInterruptedError, classifyError, collectSceneAssetIds, normalizeContinuityRepairPatch, normalizeSceneDraft, prepareReferenceImageSource, readChatCompletionText, sanitizeFinalPromptResponse, SCENE_DRAFT_JSON_SCHEMA } from "./ai";
+import { AI_RESPONSE_TIMEOUT_MS, assembleHybridFinalPrompt, buildFinalGenerationSource, buildFinalPromptRequest, ChatCompletionInterruptedError, classifyError, collectSceneAssetIds, isQuickPromptResultComplete, normalizeContinuityRepairPatch, normalizeSceneDraft, outputBudgetField, prepareReferenceImageSource, readChatCompletionText, sanitizeFinalPromptResponse, SCENE_DRAFT_JSON_SCHEMA } from "./ai";
 import { buildQuickPromptRequest } from "./quickPromptAgent";
+import { findQuickPromptFormat } from "./quickPromptFormats";
 import { LocalSuggestionProvider } from "../../engine/ai/assistant";
 import { extractFirstPersonPovLock, renderFirstPersonPovLock } from "../../engine/story-supplement";
 
@@ -712,5 +713,72 @@ describe("prepareReferenceImageSource", () => {
 
   it("空地址直接报错，不把空图片发给模型", async () => {
     await expect(prepareReferenceImageSource("   ")).rejects.toThrow(/为空/);
+  });
+});
+
+/**
+ * 现象：选「写实近身搏斗」点生成，节点上只出现一段 271 字符的英文开场说明
+ * （"I'm translating the brief into a single continuous, camera-executable
+ * sequence. I'll preserve ..."），没有任何段落标题。
+ *
+ * 成因：规则包 9.4 万字符进 system，推理模型的思考 token 与正文共用输出预算；
+ * 预算不够时先吐一句「我打算怎么做」就撞 `finish_reason: length`，而流式解析把
+ * 任何 finish_reason 都当正常结束。下面三条守的就是这条链路。
+ */
+describe("截断与「只写开场说明」不再冒充成品", () => {
+  const lengthStream = (text: string) => new Response(
+    [
+      `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}`,
+      `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "length" }] })}`,
+      "data: [DONE]",
+    ].join("\n") + "\n",
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+
+  it("finish_reason=length 按截断处理，交给续写", async () => {
+    await expect(readChatCompletionText(lengthStream("我打算先把梗概"), undefined, { treatLengthAsInterruption: true }))
+      .rejects.toMatchObject({
+        name: "ChatCompletionInterruptedError",
+        partialText: "我打算先把梗概",
+      } satisfies Partial<ChatCompletionInterruptedError>);
+  });
+
+  it("不开启该选项时保持旧行为（其它调用方不受影响）", async () => {
+    await expect(readChatCompletionText(lengthStream("半截 JSON"))).resolves.toBe("半截 JSON");
+  });
+
+  it("推理模型要 max_completion_tokens，普通模型要 max_tokens", () => {
+    expect(outputBudgetField("gpt-6.1-sol")).toEqual({ max_completion_tokens: 16000 });
+    expect(outputBudgetField("o3-mini")).toEqual({ max_completion_tokens: 16000 });
+    expect(outputBudgetField("deepseek-v4-pro")).toEqual({ max_tokens: 8000 });
+    expect(outputBudgetField("gemini-3.8-flash")).toEqual({ max_tokens: 8000 });
+  });
+
+  it("只有开场说明的结果被判为未完成（用真实失败样本）", () => {
+    const combat = findQuickPromptFormat("realistic-close-combat");
+    const preamble = "I’m translating the brief into a single continuous, camera-executable sequence. I’ll preserve the fixed character, weapon, powder-bag, broom, and ending conditions while keeping every half-second action cell explicit and maintaining readable weapon and injury continuity.";
+    expect(isQuickPromptResultComplete(preamble, combat)).toBe(false);
+
+    const finished = [
+      "SCENE CONTEXT", "雨夜巷道，积水反射钠灯，只有一名男子与一名看门人。整体为手持实拍质感，保留皮肤毛孔与衣物磨损。",
+      "CHARACTER / WEAPON ANCHORS", "@男子 [image1]：短棍握在右手，握位在棍尾三分之一处。@看门人 [image2]：双手空置。",
+      "LOCATION AND SPATIAL BLOCKING", "巷道宽 2 米，垃圾箱在右侧，铁门在男子身后。首帧男子位于画面左侧三分之一，看门人位于右侧，间距约 1.2 米。",
+      "FORMAT MODE", "单次生成，一个连续长镜头，无切点。",
+      "OPTICS / CAMERA", "35mm 等效，低对比度，轻微光学柔光；摄影机在人物胸口高度，随交手侧移。",
+      "SHOT RHYTHM", "一个镜头负责全程，切点为零，动作线始终从画面左向右推进。",
+      "ACTION TIMING", "[0.0–0.5s] 男子右脚蹬地，短棍沿斜线自右上落下，看门人抬前臂截住，袖口在接触处挤皱。",
+      "PHYSICS AND CONTINUITY", "棍端与前臂接触处压出凹陷，右肩随之后撤，鞋底在积水里拖出水痕；衣物湿痕逐格扩大。",
+      "IMPACT DELIVERY", "接触瞬间用两帧表现，随后半秒交出重量：看门人后退半个身位，脚跟离地，撞上垃圾箱。",
+      "LIGHTING", "钠灯从画面右后方进入，人物左颊偏暗，积水反光随移动闪烁。",
+      "AUDIO", "只保留现场声：脚步踩水、棍击前臂的钝响、垃圾箱铁皮震动，无配乐。",
+      "POSITIVE CONSTRAINTS", "全程手持、低对比度、保留噪点与压缩痕迹；短棍握位不变，伤势与湿痕连续。",
+    ].join("\n");
+    expect(isQuickPromptResultComplete(finished, combat)).toBe(true);
+  });
+
+  it("没有声明段落名的格式退回长度门槛", () => {
+    const seedance = findQuickPromptFormat("seedance-2.5");
+    expect(isQuickPromptResultComplete("太短", seedance)).toBe(false);
+    expect(isQuickPromptResultComplete("正".repeat(700), seedance)).toBe(true);
   });
 });

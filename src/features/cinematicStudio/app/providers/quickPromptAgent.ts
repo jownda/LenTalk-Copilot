@@ -1,6 +1,7 @@
 import type { Locale } from "../i18n";
 import { renderVoiceReferenceSentence } from "@/features/canvas/domain/voiceReferenceFormat";
 import { assetToken } from "@/features/cinematicStudio/engine/asset-naming";
+import { cinematicAssetIdFromMirrorId } from "@/features/library/cinematicMirror";
 
 import { findQuickPromptFormat } from "./quickPromptFormats";
 
@@ -163,13 +164,14 @@ function renderCharacterVoiceReference(
   asset: QuickPromptAsset,
   locale: Locale,
   refs: QuickAssetRefNames,
+  imageIndex?: number,
 ): string {
   const description = asset.description?.trim() ? ` — ${asset.description.trim()}` : "";
   const referenceName = refNameOfAsset(refs, asset);
   const audioIndex = asset.referenceIndex;
   if (!audioIndex) return `@${referenceName} (character audio)${description}`;
   const sentence = renderVoiceReferenceSentence(
-    { audioIndex, characterName: referenceName },
+    { audioIndex, characterName: referenceName, imageIndex },
     locale === "zh" ? "zh" : "en",
   );
   return `${sentence}${description}`;
@@ -269,7 +271,15 @@ export function buildQuickPromptRequest(
   ];
   // 引用名对照表：整篇共用一份（重名加后缀、空格标点规整），否则同一个角色
   // 在不同段落里名字不同，模型会当成两个人。
-  const refs = buildQuickAssetRefNames(allReferenceAssets.map(({ asset }) => asset));
+  //
+  // 🔴 **只收视觉资产**：角色的音频镜像是「同一个角色的另一份素材」，名字天然与角色
+  // 图片相同。把它也算进重名表，会把「藏医」的第二份改成 `藏医-2` —— 于是成品里出现
+  // 一个根本不存在的 `@藏医-2`，而音频绑定句又指向它，模型只能瞎猜是谁的声线。
+  const refs = buildQuickAssetRefNames(
+    allReferenceAssets
+      .filter(({ asset }) => asset.mediaType !== "audio")
+      .map(({ asset }) => asset),
+  );
   // ACTIVE REFERENCES is the visual-reference block. Audio references are voice locks:
   // keeping them separate prevents the video model from treating a voice clip as an image.
   const references = allReferenceAssets
@@ -277,10 +287,25 @@ export function buildQuickPromptRequest(
     .map(({ asset, kind }) => renderAsset(asset, kind, refs));
   // 角色声线走绑定句（成品里要出现的那句话）；场景 / 道具音频（环境音、音效）保持
   // 原来的标记写法 —— 它们不是任何人的声线，不该被写成「唯一人声参考」。
+  // 角色声线的镜像是「角色 id + 第几张」，用它反查出同一个角色的图片序号，
+  // 绑定句才能写成 `使用 @音频N 作为 @角色 [imageM] 的唯一人声参考`。
+  // 只写名字时模型只能靠猜，实测经常把声线贴到同场另一个角色身上。
+  const characterImageIndex = new Map<string, number>();
+  for (const { asset } of allReferenceAssets) {
+    if ((asset.mediaType ?? "image") !== "image") continue;
+    if (typeof asset.referenceIndex !== "number") continue;
+    const key = cinematicAssetIdFromMirrorId(asset.id);
+    if (!characterImageIndex.has(key)) characterImageIndex.set(key, asset.referenceIndex);
+  }
   const voiceReferences = allReferenceAssets
     .filter(({ asset }) => asset.mediaType === "audio")
     .map(({ asset, kind }) => (kind === "character"
-      ? renderCharacterVoiceReference(asset, locale, refs)
+      ? renderCharacterVoiceReference(
+        asset,
+        locale,
+        refs,
+        characterImageIndex.get(cinematicAssetIdFromMirrorId(asset.id)),
+      )
       : renderAsset(asset, kind, refs)));
   const visualProps = props.filter((asset) => asset.mediaType !== "audio");
   const propByName = new Map(props.map((prop) => [prop.id, prop.name]));

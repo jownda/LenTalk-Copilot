@@ -247,6 +247,20 @@ export function removeTextRange(
 }
 
 /**
+ * 是否该清理「越界」引用标记。
+ *
+ * 判据只有一条：**参考数量确实变少了**（上游断连）。
+ *
+ * 为什么不能无条件按当前数量清理：提示词工作室把成品写进下游节点的那一刻，节点的参考图
+ * 往往还没解析完（资源地址异步解析）或还没接线，此时数量短暂为 0/偏小。按数量清理会把
+ * 整段 `[imageN]` 当成越界删掉，并且**写回节点数据** —— 等图片到齐也不会恢复了。
+ * 用户看到的现象就是「刚生成时有图片引用，过一会儿全消失了」。
+ */
+export function shouldPruneReferenceTokens(previousCount: number, nextCount: number): boolean {
+  return nextCount < previousCount;
+}
+
+/**
  * 移除提示词中超出当前图片或音频数量的引用标记(上游断连后调用)。
  * 从后往前删除, 连同 token 前紧邻的空格一并移除, 避免残留多余空格。
  */

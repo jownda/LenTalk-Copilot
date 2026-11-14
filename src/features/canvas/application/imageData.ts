@@ -6,6 +6,7 @@ import {
   persistImageSource,
   prepareNodeImageSource,
 } from '@/commands/image';
+import { isDetachedLocalMediaSource } from '@/features/canvas/application/mediaPersistence';
 
 export function parseAspectRatio(value: string): number {
   const [width, height] = value.split(':').map((item) => Number(item));
@@ -179,7 +180,10 @@ function computeImageDisplayUrl(imageUrl: string): string {
 }
 
 export async function persistImageLocally(source: string): Promise<string> {
-  if (isLikelyLocalImagePath(source)) {
+  // 本机路径通常直接放行（已经是文件了），但**寄居在 AppData 里**的除外：
+  // 即梦 CLI / 画布 CLI 的产物下在 `%APPDATA%\...\jimeng-cli\videos\<run_id>\`，
+  // 那是它自己的临时目录，清缓存 / 重装就没了，必须搬进「默认落盘位置」。
+  if (isLikelyLocalImagePath(source) && !isDetachedLocalMediaSource(source)) {
     return source;
   }
 

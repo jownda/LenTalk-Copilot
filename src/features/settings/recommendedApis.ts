@@ -300,6 +300,9 @@ export const recommendedApis: RecommendedApi[] = [
       'grok-imagine-1.5-special',
       'grok-imagine-video',
       'grok-imagine-video-special',
+      // Meta Muse —— 知鸟链路上唯一能出 60 秒的模型(其余最长 30 秒),
+      // 代价是参考图最多 4 张、只出 720p。档位登记见 registry.ts 的 muse-video 条目。
+      'muse-video',
       // 其它
       'omni-flash-1-1',
       'aliyun-video-superres',
@@ -308,7 +311,9 @@ export const recommendedApis: RecommendedApi[] = [
     // Seedance 2.0 特价按次 / PixVerse C1 / Kling 数字人·对口型, 并移除文档中已不存在的
     // wan-2-6 / doubao-seedance-1-5-pro。revision=1 让已添加过知鸟的老配置也能把新视频
     // 模型**增量补进来**(只追加, 不覆盖用户手改)。
-    videoModelsRevision: 1,
+    // 2026-11-12 revision=2: 补 Meta `muse-video`(60 秒长镜头)。老配置同样靠 revision
+    // 提升自动补上, 不必让用户删了重加知鸟。
+    videoModelsRevision: 2,
     chatModels: [
       // OpenAI(GT)
       'gpt-6-astra',

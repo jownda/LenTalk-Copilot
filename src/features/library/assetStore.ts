@@ -46,7 +46,7 @@ const BUILTIN_CATEGORY_DEFINITIONS = [
 
 interface AssetLibraryStore extends AssetLibraryState {
   isHydrated: boolean;
-  hydrate: () => Promise<void>;
+  hydrate: (options?: { force?: boolean }) => Promise<void>;
   setActiveLibrary: (libraryId: string) => void;
   createLibrary: (name: string) => string;
   renameLibrary: (libraryId: string, name: string) => void;
@@ -377,8 +377,12 @@ export const useAssetLibraryStore = create<AssetLibraryStore>((set, get) => ({
   ...defaultState(),
   isHydrated: false,
 
-  hydrate: async () => {
-    if (get().isHydrated) return;
+  hydrate: async (options?: { force?: boolean }) => {
+    // 默认只水合一次。但素材库不是只有本 store 会写：浏览器扩展导入走的是 Rust 侧
+    // `media_bridge`，它**直接改 app_settings 里的同一份状态**，前端这份快照根本不知情。
+    // 于是「刚导入的图，在电影工作室的『从素材库选图』里看不到，重启才出现」。
+    // 打开选择弹窗/素材库面板时传 `force` 重新读一次即可，代价是一次设置表读取。
+    if (get().isHydrated && !options?.force) return;
     try {
       let state = isTauri() ? await loadAssetLibraryState() : readBrowserState();
       state = normalizeState(state);

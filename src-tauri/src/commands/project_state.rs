@@ -303,13 +303,69 @@ fn collect_asset_library_paths(
     Ok(())
 }
 
+/// 模板里引用到的本地媒体也必须算「仍被引用」。
+///
+/// 模板是独立于工程的快照：它会记住成品视频、参考图/音频的绝对路径，而这些文件可能
+/// **只被模板引用**（节点删了、工程也删了）。以前这里只查工程和素材库，于是
+/// 「清理未引用文件」会把模板的封面视频和参考图当垃圾扫进暂存区 —— 用户看到的就是
+/// 「模板里的视频/图片突然失效」，且过几天暂存区清空后无法恢复。
+fn collect_template_paths(
+    conn: &Connection,
+    referenced: &mut HashSet<String>,
+) -> Result<(), String> {
+    // 老库可能还没有 templates 表；不能因为这个让整轮清理失败。
+    let mut statement = match conn.prepare("SELECT payload_json FROM templates") {
+        Ok(statement) => statement,
+        Err(_) => return Ok(()),
+    };
+
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("Failed to query template refs: {}", e))?;
+
+    for payload in rows {
+        let payload = payload.map_err(|e| format!("Failed to decode template payload: {}", e))?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        collect_local_paths_from_value(&value, referenced);
+    }
+    Ok(())
+}
+
+/// 递归收集 JSON 里所有「像本地绝对路径」的字符串。
+///
+/// 与工程侧同一个取舍：宁可多保护几个路径（少回收一个文件），也不能漏字段。
+fn collect_local_paths_from_value(value: &serde_json::Value, paths: &mut HashSet<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if looks_like_local_path(text) {
+                paths.insert(text.clone());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_local_paths_from_value(item, paths);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_local_paths_from_value(item, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 收集「仍然被引用」的本地媒体路径。
 ///
-/// 来源有两处：
+/// 来源有三处：
 ///   * `project_image_refs` —— 每次保存工程时按节点数据重建。虽然表名带 image，
 ///     它存的其实是节点 `data` 下**所有像本地路径的字符串**（视频、音频、封面都在内），
 ///     所以视频/音频的引用天然已经覆盖；
-///   * `asset-library` 里更老的记录，可能指向同一个目录，一并保护。
+///   * `asset-library` 里更老的记录，可能指向同一个目录，一并保护；
+///   * `templates` 的 payload —— 模板单独存了一份成品视频与参考素材的路径，
+///     工程删掉之后这些文件就只剩模板在引用。
 fn collect_referenced_media_paths(conn: &Connection) -> Result<HashSet<String>, String> {
     let mut stmt = conn
         .prepare("SELECT DISTINCT path FROM project_image_refs")
@@ -325,6 +381,7 @@ fn collect_referenced_media_paths(conn: &Connection) -> Result<HashSet<String>, 
         referenced.insert(path);
     }
     collect_asset_library_paths(conn, &mut referenced)?;
+    collect_template_paths(conn, &mut referenced)?;
     Ok(referenced)
 }
 
@@ -480,7 +537,8 @@ pub fn cleanup_unreferenced_media(app: AppHandle) -> Result<MediaCleanupReport, 
 mod tests {
     use super::{
         cleanup_media_dir_at, collect_asset_library_paths_from_json, collect_image_paths_from_nodes,
-        extract_project_image_paths, MediaCleanupKindReport, MEDIA_QUARANTINE_DIR,
+        collect_local_paths_from_value, extract_project_image_paths, MediaCleanupKindReport,
+        MEDIA_QUARANTINE_DIR,
     };
     use std::collections::HashSet;
     use std::path::Path;
@@ -494,6 +552,35 @@ mod tests {
             .expect("file must be writable");
         file.set_modified(SystemTime::now() - age)
             .expect("mtime must be settable");
+    }
+
+    /// 模板单独存了一份成品视频和参考素材的路径，而这些文件可能只被模板引用。
+    /// 不把它们算进「仍被引用」，清理未引用文件就会把模板的封面视频扫走 ——
+    /// 用户看到的就是「模板里的视频突然失效」。这里直接测抽取函数。
+    #[test]
+    fn template_payload_local_paths_are_collected() {
+        let payload = serde_json::json!({
+            "artifacts": {
+                "coverVideo": { "sourcePath": "C:////media////cover.mp4", "kind": "video" },
+                "coverImage": { "sourcePath": "/Users/x/preview.png", "kind": "image" }
+            },
+            "pipeline": {
+                "referenceImages": [
+                    { "sourcePath": "D:////media////ref.png" },
+                    { "sourcePath": "https://cdn.example.com/a.png" },
+                    { "sourcePath": "data:image/png;base64,AAAA" }
+                ]
+            }
+        });
+
+        let mut paths = HashSet::new();
+        collect_local_paths_from_value(&payload, &mut paths);
+
+        assert!(paths.contains("C:////media////cover.mp4"));
+        assert!(paths.contains("/Users/x/preview.png"));
+        assert!(paths.contains("D:////media////ref.png"));
+        // 远端链接与内联数据不会过期，也不需要在磁盘上保护。
+        assert_eq!(paths.len(), 3, "{paths:?}");
     }
 
     /// 媒体清理是「只扫 images」的老实现扩出来的：视频/音频过去完全没有回收，

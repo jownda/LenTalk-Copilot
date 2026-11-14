@@ -23,11 +23,6 @@ use image::ImageReader;
 use tauri::{AppHandle, Manager};
 
 use crate::commands::video_cfr::{hide_child_console, resolve_ffmpeg_path};
-use crate::database::app_data_dir;
-
-/// 缩略图缓存目录（位于 app data 下，落在这里才能被 `asset://` 协议读到：
-/// `tauri.conf.json` 的 `assetProtocol.scope` 已放开了 `$APPDATA/**`）。
-const THUMBNAIL_DIR: &str = "thumbnails";
 /// 目标长边像素的兜底值（前端显式传值，见 `thumbnailCache.ts` 的 `THUMBNAIL_MAX_EDGE`）。
 /// 候选卡片格子放大到约 108px 后，2x 屏需要约 216px，所以两处都对齐到 256。
 const DEFAULT_MAX_EDGE: u32 = 256;
@@ -186,7 +181,7 @@ pub async fn ensure_image_thumbnail(
     let edge = max_edge
         .unwrap_or(DEFAULT_MAX_EDGE)
         .clamp(MIN_MAX_EDGE, MAX_MAX_EDGE);
-    let directory = app_data_dir(&app)?.join(THUMBNAIL_DIR);
+    let directory = thumbnail_directory(&app)?;
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("无法创建缩略图缓存目录: {error}"))?;
 
@@ -292,7 +287,7 @@ fn extract_video_filmstrip_blocking(
     let cell_aspect = if cell_aspect.is_finite() { cell_aspect.clamp(0.16, 6.0) } else { 16.0 / 9.0 };
     let cell_width = ((cell_height as f64 * cell_aspect).round() as u32).clamp(8, 480);
 
-    let directory = app_data_dir(app)?.join(THUMBNAIL_DIR);
+    let directory = thumbnail_directory(app)?;
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("无法创建缩略图缓存目录: {error}"))?;
     let target = directory.join(format!(
@@ -339,8 +334,16 @@ crop={cell_width}:{cell_height},tile={frames}x1"
 ///
 /// 目录本来就在 `$APPDATA/**` 之下，但作用域一旦失配的表现是「文件写得出来却显示空白、
 /// 且不报错」，排查成本远高于这里多一行调用。
+/// 缩略图缓存目录。
+///
+/// 新机器默认跟着缓存目录去 D 盘（`D://LenTalk//缓存//thumbnails`），已有缓存的
+/// 老机器保持原位 —— 判定逻辑在 `storage_paths::default_thumbnail_dir`。
+fn thumbnail_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    crate::commands::storage_paths::default_thumbnail_dir(app)
+}
+
 pub fn register_asset_scope(app: &AppHandle) -> Result<(), String> {
-    let directory = app_data_dir(app)?.join(THUMBNAIL_DIR);
+    let directory = thumbnail_directory(app)?;
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("无法创建缩略图缓存目录: {error}"))?;
     app.asset_protocol_scope()

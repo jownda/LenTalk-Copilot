@@ -91,6 +91,11 @@ export interface JimengCanvasVideoRequest {
   referenceAudio?: string[];
   /** 复用已有画布（不传则取最近一个，没有就新建） */
   projectId?: string;
+  /**
+   * 前端节点的 clientJobId，用于「提交前取消」：后端按它记账，在素材上传 /
+   * 建节点 / `node run` 之间逐段检查取消标志。不传就只能等它跑完。
+   */
+  clientJobId?: string;
 }
 
 /**
