@@ -106,6 +106,11 @@ import {
 } from "./application/canvasMediaIndex";
 import { resolveImageDisplayUrl } from "./application/imageData";
 import {
+  resolveAbsolutePositions,
+  resolveClipboardOrigin,
+  resolvePastePlacements,
+} from "./application/clipboardPasteLayout";
+import {
   buildNodeClipboardSnapshot,
   type NodeClipboardSnapshot,
 } from "./application/nodeClipboardSnapshot";
@@ -1007,6 +1012,11 @@ export function Canvas() {
     textContent: string | null;
     /** 右键时节点内被选中的文字（有选区才有），菜单据此提供「复制选中文字」。 */
     selectedText: string | null;
+    /**
+     * 这次右键会作用到几个节点：右键落在多选内的节点上就是整片选区。
+     * 菜单据此把「复制 / 剪切」写成「复制 3 个节点」，不然用户根本看不出多选生效了。
+     */
+    selectionCount: number;
   } | null>(null);
   const [saveTextPromptDialog, setSaveTextPromptDialog] = useState<{
     name: string;
@@ -3307,6 +3317,16 @@ export function Canvas() {
       setPreviewConnectionVisual(null);
       const contextNode = nodeId ? nodes.find((node) => node.id === nodeId) : null;
       const contextMedia = contextNode ? resolveContextMenuMedia(contextNode) : null;
+      // 与 Ctrl+C / Ctrl+X 同一套规则：右键落在多选里的节点上 → 整片选区一起处理。
+      const contextSelectedIds = nodeId
+        ? nodes.filter((node) => Boolean(node.selected)).map((node) => node.id)
+        : [];
+      const contextSelectionCount =
+        nodeId && contextSelectedIds.length > 1 && contextSelectedIds.includes(nodeId)
+          ? contextSelectedIds.length
+          : nodeId
+            ? 1
+            : 0;
       setCanvasContextMenu({
         position: {
           x: event.clientX - containerRect.left,
@@ -3319,6 +3339,7 @@ export function Canvas() {
         nodeId,
         textContent: contextNode && isTextAnnotationNode(contextNode) ? contextNode.data.content : null,
         selectedText,
+        selectionCount: contextSelectionCount,
       });
     },
     [nodes, reactFlowInstance],
@@ -4023,22 +4044,32 @@ export function Canvas() {
         { x: 96, y: 42 },
       ];
       const existingNodes = useCanvasStore.getState().nodes;
+      // 绝对坐标表：源节点可能已经不在画布上（剪切后再粘贴），所以先把快照里的节点补进表。
+      // 组内节点的 position 是相对父节点的局部坐标，直接当画布坐标用会整片错位。
+      const layoutNodeMap = new Map(existingNodes.map((node) => [node.id, node] as const));
+      for (const node of sourceNodes) {
+        layoutNodeMap.set(node.id, node);
+      }
+      const absolutePositions = resolveAbsolutePositions(sourceNodes, layoutNodeMap);
+      // 粘贴锚点 = 整片选区的左上角：所有节点共用同一个偏移量，相对位置原样保留。
+      const clipboardOrigin = resolveClipboardOrigin(sourceNodes, absolutePositions);
       const ignoreNodeIds = new Set<string>();
       const offsetStep = options.disableOffsetIteration ? 0 : pasteIterationRef.current;
       let chosenOffset = options.targetPosition
         ? {
-            x: options.targetPosition.x - sourceNodes[0].position.x,
-            y: options.targetPosition.y - sourceNodes[0].position.y,
+            x: options.targetPosition.x - clipboardOrigin.x,
+            y: options.targetPosition.y - clipboardOrigin.y,
           }
         : (options.explicitOffset ?? baseOffsets[0]);
 
       const isOffsetAvailable = (offset: { x: number; y: number }) =>
         sourceNodes.every((node) => {
           const size = getNodeSize(node);
+          const absolute = absolutePositions.get(node.id) ?? node.position;
           return !hasRectCollision(
             {
-              x: node.position.x + offset.x + offsetStep * 8,
-              y: node.position.y + offset.y + offsetStep * 6,
+              x: absolute.x + offset.x + offsetStep * 8,
+              y: absolute.y + offset.y + offsetStep * 6,
               width: size.width,
               height: size.height,
             },
@@ -4065,6 +4096,14 @@ export function Canvas() {
 
       const idMap = new Map<string, string>();
       const sizeMap = new Map<string, { width: number; height: number }>();
+      // 同批还原的节点集合：父在里面时子节点保持局部坐标，跟着新父一起平移。
+      const copiedIds = new Set(sourceNodes.map((node) => node.id));
+      const pastePlacements = resolvePastePlacements(
+        sourceNodes,
+        absolutePositions,
+        { x: chosenOffset.x + offsetStep * 8, y: chosenOffset.y + offsetStep * 6 },
+        copiedIds,
+      );
       for (const sourceNode of sourceNodes) {
         const data = cloneNodeData(sourceNode.data);
         if ("isGenerating" in (data as Record<string, unknown>)) {
@@ -4106,11 +4145,17 @@ export function Canvas() {
           (data as { studioProjectId?: string }).studioProjectId = nextProjectId;
         }
 
+        // 位置由 `resolvePastePlacements` 统一算：根节点整体平移、组内节点跟着新父走。
+        const placement = pastePlacements.get(sourceNode.id);
+        const nextPosition = placement?.position ?? {
+          x: sourceNode.position.x + chosenOffset.x + offsetStep * 8,
+          y: sourceNode.position.y + chosenOffset.y + offsetStep * 6,
+        };
+
         const nextNodeId = addNode(
           sourceNode.type as CanvasNodeType,
           {
-            x: sourceNode.position.x + chosenOffset.x + offsetStep * 8,
-            y: sourceNode.position.y + chosenOffset.y + offsetStep * 6,
+            ...nextPosition,
             // 组内节点跟着组一起还原：父节点也在这次还原的集合里时接上新 id。
             // 快照已按父先子后排序，父节点这时一定在 idMap 里；父节点不在集合里
             // （例如只剪切组内某一个节点）就当普通顶层节点粘出，不复用原组。
@@ -4153,7 +4198,17 @@ export function Canvas() {
         pasteIterationRef.current += 1;
       }
       const firstNodeId = idMap.get(sourceNodes[0].id) ?? null;
-      if (firstNodeId && !options.suppressSelect) {
+      const duplicatedIds = Array.from(idMap.values());
+      if (duplicatedIds.length > 0 && !options.suppressSelect) {
+        // 粘出来的整片一起选中（原选区让位）：接着拖动、接着再粘都连贯。
+        // 只把 store 的 selectedNodeId 指到第一个的话，画布上看不出到底粘了几个，
+        // 用户会以为多选复制只生效了一个。
+        applyNodesChange([
+          ...existingNodes
+            .filter((node) => node.selected && !duplicatedIds.includes(node.id))
+            .map((node) => ({ id: node.id, type: "select" as const, selected: false })),
+          ...duplicatedIds.map((id) => ({ id, type: "select" as const, selected: true })),
+        ]);
         setSelectedNode(firstNodeId);
       }
       if (!options.suppressPersist) {
@@ -5394,6 +5449,7 @@ export function Canvas() {
           nodeId={canvasContextMenu.nodeId}
           textContent={canvasContextMenu.textContent}
           selectedText={canvasContextMenu.selectedText}
+          selectionCount={canvasContextMenu.selectionCount}
           isGroupNode={isGroupNode(canvasContextMenuNode)}
           groupFrozen={isFrozenGroupNode(canvasContextMenuNode)}
           canPaste={

@@ -5,6 +5,7 @@ dist
 
 # Tauri / Rust
 src-tauri/target
+src-tauri/target-check
 src-tauri/gen
 
 # 随包 ffmpeg 二进制(解压后 79MB):不入库,由 scripts/setup-ffmpeg.mjs(本地)

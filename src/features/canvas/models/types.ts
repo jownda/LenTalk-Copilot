@@ -61,6 +61,36 @@ export interface ImageModelDefinition {
    * 节点里存的 `imageCount` 仍然是档位（1~4），换算只发生在展示与请求两处。
    */
   imagesPerCountUnit?: number;
+  /**
+   * 「生成张数」最多能选到第几档（缺省 4，即全局上限）。
+   *
+   * 用于**张数被平台钉死**的模型：MJ 8.2 的 `--count` 声明 required 且 min==max==4，
+   * 传 8 会被服务端拒。这种情况下档位只能选 1（一档 = 4 张），多给控件只会让用户
+   * 选出一个必然失败的组合。
+   */
+  maxImageCountUnits?: number;
+  /**
+   * `--prompt` 的字符上限（由平台目录声明，缺省不限制）。
+   *
+   * 各模型差得很远（实测 MJ 8.2 只有 1024，seedream 4.x 2000，5.x 5000，
+   * GPT Image 系 7000）。超了服务端回 `service.2 / params.prompt`，所以在节点上
+   * 先把字数标出来、在提交前拦住。
+   */
+  maxPromptLength?: number;
+  /**
+   * 单次最多可带几张参考图（`undefined` = 平台未声明）。
+   *
+   * 图片模型的上限差别很大（实测 4 / 6 / 10 / 14 / 16 / 20），超量会被服务端拒。
+   */
+  maxReferenceImages?: number;
+  /**
+   * 报价是否随「生成张数」变化（按张计费的平台 / 即梦画布 CLI）。
+   *
+   * 缺省 false：绝大多数平台的 `prices` 是按次的，跟张数无关，把 count 传进定价
+   * 上下文反而可能被下游误读。**按张计费**的模型必须置 true，否则节点上选 4 张
+   * 只显示 1 张的价，与实际扣分对不上。
+   */
+  countAffectsPricing?: boolean;
   extraParamsSchema?: ExtraParamDefinition[];
   defaultExtraParams?: Record<string, unknown>;
   pricing?: ModelPricingDefinition;

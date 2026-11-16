@@ -12,6 +12,7 @@ use commands::cinematic_studio;
 use commands::clipboard;
 use commands::cloud_drive;
 use commands::image;
+use commands::jimeng_catalog;
 use commands::jimeng_cli;
 use commands::media_file;
 use commands::media_output;
@@ -419,6 +420,12 @@ pub fn run() {
             jimeng_cli::jimeng_cli_credit,
             jimeng_cli::jimeng_cli_detect,
             jimeng_cli::jimeng_cli_install,
+            jimeng_cli::jimeng_cli_upgrade_check,
+            jimeng_cli::jimeng_cli_upgrade,
+            jimeng_catalog::jimeng_canvas_model_catalog,
+            jimeng_catalog::jimeng_canvas_probe_model_prices,
+            jimeng_catalog::jimeng_canvas_cached_model_prices,
+            jimeng_catalog::jimeng_cli_model_catalog,
             wan_cli::wan_cli_credits,
             balance::query_provider_balance,
             ai_commands::chat_completion,

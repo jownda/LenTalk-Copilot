@@ -6,6 +6,7 @@ pub mod cinematic_studio;
 pub mod clipboard;
 pub mod cloud_drive;
 pub mod image;
+pub mod jimeng_catalog;
 pub mod jimeng_cli;
 pub mod media_bridge;
 pub mod media_file;

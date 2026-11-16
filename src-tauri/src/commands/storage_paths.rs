@@ -24,16 +24,30 @@ use tauri::{AppHandle, Manager};
 use crate::database::app_data_dir;
 
 /// 新装默认根目录。
+#[cfg(target_os = "windows")]
 const PREFERRED_ROOT: &str = r"D:\LenTalk";
 
 /// 有可用（可写）的 D 盘时返回 `D:\LenTalk`，否则 `None`。
+///
+/// 🔴 只在 Windows 上成立。macOS / Linux 没有盘符，`PathBuf::from(r"D:\LenTalk")` 在那里
+/// 是一个**相对路径**（`D:` 只是个目录名），`create_dir_all` 会在进程当前目录下真的建出
+/// `D:\LenTalk` 并且写探针成功 —— 于是素材库与生成缓存被塞进启动目录：从 Finder 启动时
+/// 是 `/`（不可写，探测失败，碰巧无害），从终端或脚本启动时却会成功落进去。
 pub fn preferred_root() -> Option<PathBuf> {
-    let root = PathBuf::from(PREFERRED_ROOT);
-    std::fs::create_dir_all(&root).ok()?;
-    let probe = root.join(".write-probe");
-    std::fs::write(&probe, b"ok").ok()?;
-    let _ = std::fs::remove_file(&probe);
-    Some(root)
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let root = PathBuf::from(PREFERRED_ROOT);
+        std::fs::create_dir_all(&root).ok()?;
+        let probe = root.join(".write-probe");
+        std::fs::write(&probe, b"ok").ok()?;
+        let _ = std::fs::remove_file(&probe);
+        Some(root)
+    }
 }
 
 /// 目录里是否已经有文件（用来判断「这是不是一台已有数据的机器」）。

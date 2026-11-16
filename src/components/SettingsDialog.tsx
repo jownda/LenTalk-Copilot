@@ -3,7 +3,7 @@ import { X, Eye, EyeOff, Pencil, Plus, Trash2, ChevronDown, ChevronRight, Termin
 import { useTranslation } from 'react-i18next';
 import { buildCustomModelId, isAudioModelName, isChatCompletionModelName, isVideoGenerationModelName, useSettingsStore } from '@/stores/settingsStore';
 import type { CustomApiCapabilities, CustomApiProvider } from '@/stores/settingsStore';
-import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck, jimengCliLogout, jimengCliInstall, jimengCliOpenLoginUrl, jimengCliOpenLoginWindow, jimengCliCloseLoginWindow } from '@/commands/ai';
+import { detectProviderCapabilities, fetchProviderModels, verifyProviderUrl, jimengCliLoginStart, jimengCliLoginCheck, jimengCliLogout, jimengCliInstall, jimengCliUpgradeCheck, jimengCliUpgrade, type JimengCliUpgradeStatus, jimengCliOpenLoginUrl, jimengCliOpenLoginWindow, jimengCliCloseLoginWindow } from '@/commands/ai';
 import {
   formatProviderBalance,
   queryJimengCliCredit,
@@ -301,6 +301,9 @@ export function SettingsDialog({
   const [recommendedApisExpanded, setRecommendedApisExpanded] = useState(false);
   const [showJimengCliSettings, setShowJimengCliSettings] = useState(false);
   const [localJimengCliExecutable, setLocalJimengCliExecutable] = useState(jimengCli.executable);
+  /** 升级即梦 CLI：状态就地存, 关掉弹窗即忘 —— 版本信息没有跨会话价值。 */
+  const [jimengUpgradeStatus, setJimengUpgradeStatus] = useState<JimengCliUpgradeStatus | null>(null);
+  const [jimengUpgradeBusy, setJimengUpgradeBusy] = useState<'idle' | 'checking' | 'upgrading'>('idle');
   const [jimengLoginState, setJimengLoginState] = useState<'idle' | 'opening' | 'polling' | 'success' | 'error'>('idle');
   const [jimengLoginInfo, setJimengLoginInfo] = useState<{ verificationUri: string; userCode: string; deviceCode: string } | null>(null);
   /** 本次授权是否走「切换账号」(决定重开授权页时仍用无痕窗口)。 */
@@ -966,6 +969,72 @@ export function SettingsDialog({
       });
     }
   }, [jimengCliAutoInstallStatus.state, setJimengCliAutoInstallStatus, t, probeJimengLoginStatus, localJimengCliExecutable]);
+
+  /** 检查即梦 CLI 更新：只读。CLI 每次启动要联网自检, 单次约 20 秒, 所以只在点击时跑。 */
+  const handleCheckJimengCliUpgrade = useCallback(async () => {
+    if (jimengUpgradeBusy !== 'idle') {
+      return;
+    }
+    setJimengUpgradeBusy('checking');
+    try {
+      const status = await jimengCliUpgradeCheck(localJimengCliExecutable);
+      setJimengUpgradeStatus(status);
+    } catch (error) {
+      setJimengUpgradeStatus({
+        supported: true,
+        currentVersion: '',
+        latestVersion: '',
+        releaseDate: '',
+        releaseNotes: '',
+        targetPath: null,
+        upToDate: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setJimengUpgradeBusy('idle');
+    }
+  }, [jimengUpgradeBusy, localJimengCliExecutable]);
+
+  /** 下载官方最新版并替换当前二进制；旧文件备份为 `.bak`, 失败可原样拷回。 */
+  const handleJimengCliUpgrade = useCallback(async () => {
+    if (jimengUpgradeBusy !== 'idle') {
+      return;
+    }
+    setJimengUpgradeBusy('upgrading');
+    try {
+      const result = await jimengCliUpgrade(localJimengCliExecutable);
+      setJimengUpgradeStatus({
+        supported: true,
+        currentVersion: result.currentVersion,
+        latestVersion: result.latestVersion,
+        releaseDate: '',
+        releaseNotes: result.backupPath ? `备份: ${result.backupPath}` : '',
+        targetPath: result.resolvedPath,
+        upToDate: result.success,
+        message: result.message,
+      });
+      if (result.resolvedPath) {
+        setLocalJimengCliExecutable(result.resolvedPath);
+      }
+      // 换过二进制, 登录态要重新确认。
+      if (result.updated) {
+        void probeJimengLoginStatus(result.resolvedPath ?? localJimengCliExecutable);
+      }
+    } catch (error) {
+      setJimengUpgradeStatus({
+        supported: true,
+        currentVersion: '',
+        latestVersion: '',
+        releaseDate: '',
+        releaseNotes: '',
+        targetPath: null,
+        upToDate: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setJimengUpgradeBusy('idle');
+    }
+  }, [jimengUpgradeBusy, localJimengCliExecutable, probeJimengLoginStatus]);
 
   /** 验证链接:仅检查 Base URL 是否可达(不需要 Key) */
   const handleVerifyCustomUrl = useCallback(async () => {
@@ -2696,6 +2765,61 @@ export function SettingsDialog({
                   </div>
                   <p className="mt-2 text-[11px] leading-4 text-text-muted">
                     {t('settings.jimengCliAutoInstallNotice')}
+                  </p>
+                </div>
+
+                <div className="rounded-md border border-border-dark bg-surface-dark/50 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-medium text-text-dark">
+                        {t('settings.jimengCliUpgradeTitle', '即梦 CLI 版本')}
+                      </p>
+                      <p className="mt-0.5 break-all text-[11px] leading-4 text-text-muted">
+                        {jimengUpgradeBusy === 'checking'
+                          ? t('settings.jimengCliUpgradeChecking')
+                          : jimengUpgradeBusy === 'upgrading'
+                            ? t('settings.jimengCliUpgrading')
+                            : jimengUpgradeStatus
+                              ? jimengUpgradeStatus.message
+                              : t('settings.jimengCliUpgradeIdle')}
+                      </p>
+                      {jimengUpgradeStatus?.releaseNotes && (
+                        <p className="mt-0.5 break-all text-[11px] leading-4 text-text-muted">
+                          {jimengUpgradeStatus.releaseNotes}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={jimengUpgradeBusy !== 'idle'}
+                        onClick={() => void handleCheckJimengCliUpgrade()}
+                        className="rounded-md border border-border-dark px-3 py-1.5 text-xs text-text-muted transition-colors hover:text-text-dark disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {jimengUpgradeBusy === 'checking'
+                          ? t('settings.jimengCliUpgradeChecking')
+                          : t('settings.jimengCliUpgradeCheckBtn')}
+                      </button>
+                      {jimengUpgradeStatus?.supported &&
+                        !jimengUpgradeStatus.upToDate &&
+                        jimengUpgradeStatus.latestVersion && (
+                          <button
+                            type="button"
+                            disabled={jimengUpgradeBusy !== 'idle'}
+                            onClick={() => void handleJimengCliUpgrade()}
+                            className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {jimengUpgradeBusy === 'upgrading'
+                              ? t('settings.jimengCliUpgrading')
+                              : t('settings.jimengCliUpgradeBtn', {
+                                  version: jimengUpgradeStatus.latestVersion,
+                                })}
+                          </button>
+                        )}
+                    </div>
+                  </div>
+                  <p className="mt-2 text-[11px] leading-4 text-text-muted">
+                    {t('settings.jimengCliUpgradeNotice')}
                   </p>
                 </div>
 

@@ -1,5 +1,6 @@
 import type { Edge, Node, XYPosition } from "@xyflow/react";
 import type { SceneStaging } from "@/features/cinematicStudio/shared-types";
+import type { MosaicAdjust } from "./mosaicAdjust";
 
 export const CANVAS_NODE_TYPES = {
   upload: "uploadNode",
@@ -393,6 +394,8 @@ export interface MosaicLayerItem {
   blendMode?: MosaicBlendMode;
   /** 锁定后节点内不能拖动/缩放/旋转(仍可在全屏编辑器里改数值) */
   locked?: boolean;
+  /** 图像调整（曲线/色阶/色彩平衡等），只在渲染时应用，源图不动 */
+  adjust?: MosaicAdjust;
 }
 
 /** 图层混合模式(与 canvas globalCompositeOperation 一一对应, 见 `domain/mosaicBlend.ts`)。 */
@@ -440,6 +443,16 @@ export interface AudioNodeData extends NodeDisplayData {
   aspectRatio?: string;
   /** 媒体类型: audio | video */
   mediaType?: "audio" | "video";
+  /**
+   * 「扒视频」最后一次成功的时刻(毫秒)。
+   *
+   * 扒过之后工具栏按钮从「扒视频」变「重新生成」——引擎的双模型链路按中间文件
+   * 存在即复用，不做这个区分的话第二次点还是上一遍的稿子。有值即表示「这一单
+   * 已经出过剧本」，界面上要按「重新生成」的语义走。
+   */
+  pajubenExtractedAt?: number | null;
+  /** 上面那次扒出来的集号，用于按钮提示与「重新生成」时的说明。 */
+  pajubenScriptEpisode?: number | null;
   /** 下游生成中状态(AI 视频节点生成时写入) */
   isGenerating?: boolean;
   generationStartedAt?: number | null;

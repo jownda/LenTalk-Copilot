@@ -48,6 +48,7 @@ import { prepareNodeImage, resolveImageDisplayUrl } from "@/features/canvas/appl
 import { resolveMediaNodeResizeBounds } from "@/features/canvas/application/aspectLockedResize";
 import { captureVideoFrame, createObjectUrlFromDataUrl } from "@/features/canvas/application/videoFrameCapture";
 import { isVideoTrackUndecoded } from "@/features/canvas/application/videoPlayback";
+import { computeWaveformPeaks } from "@/features/canvas/application/waveformPeaks";
 import { showErrorDialog } from "@/features/canvas/application/errorDialog";
 import { extractVideoThumbnail, persistLibraryAssetFile, persistLibraryAssetFromFile } from "@/commands/assetLibrary";
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -84,21 +85,12 @@ function createWaveformBars(source: string, count = 56): number[] {
   });
 }
 
+/** 峰值压缩逻辑共享给音频试听弹窗，避免同一个文件在节点与弹窗里画出两种波形。 */
 function createWaveformBarsFromBuffer(buffer: AudioBuffer, count = 56): number[] {
-  const frameSize = Math.max(1, Math.floor(buffer.length / count));
-  const bars = Array.from({ length: count }, (_, index) => {
-    const start = index * frameSize;
-    const end = Math.min(buffer.length, start + frameSize);
-    const step = Math.max(1, Math.floor((end - start) / 512));
-    let peak = 0;
-    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
-      const samples = buffer.getChannelData(channel);
-      for (let frame = start; frame < end; frame += step) peak = Math.max(peak, Math.abs(samples[frame] ?? 0));
-    }
-    return peak;
-  });
-  const maximum = Math.max(...bars, 0.0001);
-  return bars.map((bar) => Math.max(0.12, Math.min(1, Math.sqrt(bar / maximum))));
+  const channels = Array.from({ length: buffer.numberOfChannels }, (_, index) =>
+    buffer.getChannelData(index),
+  );
+  return computeWaveformPeaks(channels, buffer.length, count);
 }
 
 /** 已判定为空白(全透明)的缩略图地址缓存, 避免同一会话里反复解码同一张图。 */

@@ -27,6 +27,11 @@ interface CanvasContextMenuProps {
   textContent?: string | null;
   /** 右键时节点内被选中的文字：有值时菜单顶部给「复制选中文字」，与「复制节点」分开。 */
   selectedText?: string | null;
+  /**
+   * 这次右键作用到的节点数：右键落在多选内 → 整片选区。
+   * 大于 1 时「复制 / 剪切」显式写成「复制 3 个节点」，让多选这件事看得见。
+   */
+  selectionCount?: number;
   /** 右键命中的节点是分组时提供冻结/解冻入口 */
   isGroupNode?: boolean;
   groupFrozen?: boolean;
@@ -58,6 +63,7 @@ export function CanvasContextMenu({
   nodeId,
   textContent,
   selectedText,
+  selectionCount = 1,
   isGroupNode = false,
   groupFrozen = false,
   canPaste,
@@ -81,6 +87,18 @@ export function CanvasContextMenu({
   const [isCategoryPickerOpen, setIsCategoryPickerOpen] = useState(false);
   // 有选中文字时，「复制」要明确写成「复制整个节点」，否则用户点下去才发现复制错了东西。
   const hasSelectedText = Boolean(selectedText && selectedText.trim());
+  // 右键落在多选里：整片选区一起复制 / 剪切，文案把数量写出来。
+  const multiSelected = selectionCount > 1;
+  const copyLabel = multiSelected
+    ? t("canvas.contextMenu.copySelection", "复制 {{count}} 个节点", { count: selectionCount })
+    : hasSelectedText
+      ? t("canvas.contextMenu.copyWholeNode", "复制整个节点")
+      : t("canvas.contextMenu.copy", "复制");
+  const cutLabel = multiSelected
+    ? t("canvas.contextMenu.cutSelection", "剪切 {{count}} 个节点", { count: selectionCount })
+    : hasSelectedText
+      ? t("canvas.contextMenu.cutWholeNode", "剪切整个节点")
+      : t("canvas.contextMenu.cut", "剪切");
 
   const handleClear = useCallback(() => {
     if (failedNodeCount === 0) {
@@ -143,11 +161,10 @@ export function CanvasContextMenu({
             className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
           >
             <Scissors className="h-4 w-4 text-text-muted" />
-            <span>
-              {hasSelectedText
-                ? t("canvas.contextMenu.cutWholeNode", "剪切整个节点")
-                : t("canvas.contextMenu.cut", "剪切")}
-            </span>
+            <span>{cutLabel}</span>
+            {multiSelected && (
+              <span className="ml-auto text-[10px] tabular-nums text-text-muted">{selectionCount}</span>
+            )}
           </button>
           <button
             type="button"
@@ -155,11 +172,10 @@ export function CanvasContextMenu({
             className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
           >
             <Copy className="h-4 w-4 text-text-muted" />
-            <span>
-              {hasSelectedText
-                ? t("canvas.contextMenu.copyWholeNode", "复制整个节点")
-                : t("canvas.contextMenu.copy", "复制")}
-            </span>
+            <span>{copyLabel}</span>
+            {multiSelected && (
+              <span className="ml-auto text-[10px] tabular-nums text-text-muted">{selectionCount}</span>
+            )}
           </button>
         </>
       )}

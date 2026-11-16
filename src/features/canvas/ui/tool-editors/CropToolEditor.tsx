@@ -17,6 +17,15 @@ const VIEWPORT_PADDING_PX = 20;
 const VIEWPORT_MIN_WIDTH_PX = 220;
 const VIEWPORT_MIN_HEIGHT_PX = 180;
 
+/**
+ * 小于这个尺寸的框视作「误触」（点了一下但没拖）。
+ *
+ * `react-image-crop` 在图片上按下就会立刻回调一个 0×0 的 crop，松手才给最终值。
+ * 只点击不拖动时最终值仍然极小，若照单收下，用户下一次点「应用」就会得到一张
+ * 1×1 的切片 —— 所以这里丢掉过小的框，保留上一块有效选区。
+ */
+const MIN_CROP_PX = 24;
+
 function parsePresetRatio(value: string): number | null {
   if (!value.includes(':')) {
     return null;
@@ -219,6 +228,32 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
     renderedImageSize,
   ]);
 
+  /**
+   * 🔴 不要给 `ReactCrop` 传 `keepSelection`。
+   *
+   * v11 里这个 prop 只在一个地方生效，就是 `onComponentPointerDown` 的守卫：
+   *
+   * ```js
+   * if (disabled || locked || (keepSelection && crop)) return;
+   * ```
+   *
+   * 而 `crop` 在本组件里**始终有值**（打开对话框就按默认比例框好一块，之后又由
+   * `applyCropFromOptions` 持续同步）。两者同时成立 ⇒ 在图片上按下的事件被直接丢弃，
+   * 用户永远拖不出第二块选区，只能去拖已有选框的把手 —— 实报「裁剪拖不出框」。
+   *
+   * 去掉之后回到库的默认语义：在图上按下即新建选区，在选区内/把手上按下仍是移动与缩放
+   * （选区是容器的兄弟节点，事件不会冒泡到图片那层，两者不冲突）。
+   */
+  const handleCropComplete = useCallback(
+    (pixelCrop: PixelCrop, percentCrop?: PercentCrop | null) => {
+      if (pixelCrop.width < MIN_CROP_PX || pixelCrop.height < MIN_CROP_PX) {
+        return;
+      }
+      syncCropToOptions(pixelCrop, percentCrop);
+    },
+    [syncCropToOptions]
+  );
+
   const applyCropFromOptions = useCallback((): boolean => {
     if (!renderedImageSize || naturalSize.width <= 0 || naturalSize.height <= 0) {
       return false;
@@ -374,19 +409,26 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
           {renderedImageSize && (
             <ReactCrop
               crop={crop}
-              onChange={(nextCrop) => setCrop(nextCrop)}
-              onComplete={(pixelCrop, percentCrop) => syncCropToOptions(pixelCrop, percentCrop)}
+              onChange={(nextCrop) => {
+                if (nextCrop) {
+                  setCrop(nextCrop);
+                }
+              }}
+              onComplete={handleCropComplete}
               aspect={resolvedAspect}
-              minWidth={24}
-              minHeight={24}
-              keepSelection
+              minWidth={MIN_CROP_PX}
+              minHeight={MIN_CROP_PX}
               ruleOfThirds
             >
               <img
                 ref={imageRef}
                 src={displaySourceImageUrl}
                 alt="Crop Source"
-                className="block select-none object-contain"
+                // Safari / WKWebView 里 <img> 默认可拖：按住拖动会起原生 drag 而不是选区，
+                // 指针事件被夺走后表现为「框拖到一半断掉」。Chromium 侧同样受益。
+                draggable={false}
+                onDragStart={(event) => event.preventDefault()}
+                className="block select-none object-contain [-webkit-user-drag:none]"
                 style={{
                   width: `${renderedImageSize.width}px`,
                   height: `${renderedImageSize.height}px`,

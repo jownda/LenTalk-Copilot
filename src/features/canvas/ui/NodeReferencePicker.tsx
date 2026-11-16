@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import { useStore } from '@xyflow/react';
-import { AudioLines } from 'lucide-react';
+import { AudioLines, Play } from 'lucide-react';
 
 import { CanvasNodeImage } from './CanvasNodeImage';
 import {
@@ -51,6 +51,13 @@ interface NodeReferencePickerProps {
   labelClassName?: string;
   /** 面板自身的额外类名（分镜节点的格子更小，需要更窄的最大宽度）。 */
   className?: string;
+  /**
+   * 音频条目的「试听」入口。不给就不显示 —— 图片缩略图双击即可放大，
+   * 音频没有任何可点区域，装一条听不到的声音等于让用户猜。
+   */
+  onPreviewAudio?: (index: number) => void;
+  /** 试听按钮的提示文案（调用方传 i18n 文案）。 */
+  previewAudioTitle?: string;
 }
 
 /**
@@ -68,6 +75,8 @@ export function NodeReferencePicker({
   onHover,
   labelClassName = 'text-xs',
   className = '',
+  onPreviewAudio,
+  previewAudioTitle = '试听',
 }: NodeReferencePickerProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const [placement, setPlacement] = useState<NodePickerPlacement | null>(null);
@@ -186,7 +195,7 @@ export function NodeReferencePicker({
                 onSelect(index);
               }}
               onMouseEnter={() => onHover(index)}
-              className={`flex w-full items-center gap-1.5 border border-transparent bg-bg-dark/70 px-1.5 py-1 text-left ${labelClassName} text-text-dark transition-colors hover:border-[rgba(255,255,255,0.18)] ${
+              className={`group flex w-full items-center gap-1.5 border border-transparent bg-bg-dark/70 px-1.5 py-1 text-left ${labelClassName} text-text-dark transition-colors hover:border-[rgba(255,255,255,0.18)] ${
                 active ? 'border-[rgba(255,255,255,0.24)] bg-bg-dark' : ''
               }`}
             >
@@ -206,7 +215,25 @@ export function NodeReferencePicker({
               ) : (
                 <span className="h-6 w-6 shrink-0 rounded bg-bg-dark" />
               )}
-              <span className="truncate">{entry.label}</span>
+              <span className="min-w-0 flex-1 truncate">{entry.label}</span>
+              {isAudio && onPreviewAudio && (
+                // 行本身是「插入引用」，试听必须自成一处，否则点一下既插入又发声。
+                // 用 span 而不是 button：外层已经是 <button>，嵌套 button 会被浏览器拆开。
+                <span
+                  role="button"
+                  tabIndex={-1}
+                  title={previewAudioTitle}
+                  aria-label={previewAudioTitle}
+                  className="flex h-4 w-4 shrink-0 items-center justify-center rounded text-accent/80 opacity-0 transition-opacity hover:bg-accent/20 hover:text-accent group-hover:opacity-100"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onPreviewAudio(index);
+                  }}
+                  onMouseDown={(event) => event.stopPropagation()}
+                >
+                  <Play className="h-2.5 w-2.5" />
+                </span>
+              )}
             </button>
           );
         })}

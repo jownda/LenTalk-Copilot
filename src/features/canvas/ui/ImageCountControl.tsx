@@ -21,6 +21,13 @@ export interface ImageCountControlProps {
    * 展示与请求换算都以它为准，节点数据结构保持不变。
    */
   imagesPerCountUnit?: number;
+  /**
+   * 档位上限（缺省 4，即全局上限）。
+   *
+   * 张数被平台钉死的模型（MJ 8.2 的 `--count` 恒为 4）传 1：面板里只留「一档」，
+   * 而不是给出 2/3/4 档让用户选出一个必然被服务端拒掉的组合。
+   */
+  maxCount?: number;
   disabled?: boolean;
   onChange: (count: number) => void;
 }
@@ -42,6 +49,7 @@ const PANEL_ESTIMATED_HEIGHT = 168;
 export function ImageCountControl({
   imageCount,
   imagesPerCountUnit = 1,
+  maxCount = IMAGE_GENERATION_COUNT_MAX,
   disabled = false,
   onChange,
 }: ImageCountControlProps) {
@@ -55,8 +63,15 @@ export function ImageCountControl({
   const [open, setOpen] = useState(false);
   const [layout, setLayout] = useState({ left: 0, top: 0 });
 
-  const images = resolveImageCountImages(imageCount, imagesPerCountUnit);
+  const upperBound = Math.max(
+    IMAGE_GENERATION_COUNT_MIN,
+    Math.min(IMAGE_GENERATION_COUNT_MAX, Math.round(maxCount)),
+  );
+  const effectiveCount = Math.min(imageCount, upperBound);
+  const images = resolveImageCountImages(effectiveCount, imagesPerCountUnit);
   const isGrouped = imagesPerCountUnit > 1;
+  // 张数被平台钉死（MJ 8.2 恒 4 张）：只给一档，点开也没得选，说明必须写清楚。
+  const isFixedCount = upperBound === IMAGE_GENERATION_COUNT_MIN;
 
   const updateLayout = useCallback(() => {
     const next = getFloatingPanelPosition(anchorRef.current, panelRef.current, {
@@ -175,10 +190,10 @@ export function ImageCountControl({
               </div>
               <div className="grid grid-cols-2 gap-1">
                 {Array.from(
-                  { length: IMAGE_GENERATION_COUNT_MAX - IMAGE_GENERATION_COUNT_MIN + 1 },
+                  { length: upperBound - IMAGE_GENERATION_COUNT_MIN + 1 },
                   (_, index) => index + IMAGE_GENERATION_COUNT_MIN,
                 ).map((count) => {
-                  const active = count === imageCount;
+                  const active = count === effectiveCount;
                   const countImages = resolveImageCountImages(count, imagesPerCountUnit);
                   return (
                     <button
@@ -205,7 +220,9 @@ export function ImageCountControl({
                 // MJ 的档位不是「张」而是「组」，这行说明是必须的：
                 // 否则用户会以为漏了 1/2/3 张的选项。
                 <p className="mt-1.5 text-[10px] leading-4 text-text-muted">
-                  {t('modelParams.imageCountGroupHint', { unit: imagesPerCountUnit })}
+                  {t(isFixedCount ? 'modelParams.imageCountFixedHint' : 'modelParams.imageCountGroupHint', {
+                    unit: imagesPerCountUnit,
+                  })}
                 </p>
               ) : null}
             </div>,

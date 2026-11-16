@@ -37,6 +37,20 @@ export function isLocalAbsoluteMediaPath(source: string): boolean {
  * 它不会像 CDN 链接那样过期，但清缓存 / 重装 / 换机就整批丢，而且完全不归
  * 「设置 → 默认落盘位置」管 —— 对用户来说风险和远端链接是同一类。
  *
+ * 应用自己的**资产库**目录。
+ *
+ * 老布局是 `%APPDATA%\com.storyboard.copilot\library-assets`
+ * （`storage_paths.rs: default_library_dir`），正好落在 AppData 里面 ——
+ * 于是资产库里的每一张图都会被下面这个「AppData 里的文件要搬走」的判据命中。
+ *
+ * 搬它是有害的：素材地址记在资产库状态表里，画布引用记在节点里，我们只改写后者
+ * ⇒ 两边对不上；而且每从资产库拖一次同一条素材就会再搬一次、再改写一次节点里的
+ * 地址，下游提示词里的 `[imageN]` 就跟着反复失效。资产库要换位置请走
+ * 「设置 → 素材库目录」的成套迁移。
+ */
+const LIBRARY_ASSET_DIR = /[\\/]library-assets[\\/]/i;
+
+/**
  * 只认 AppData / Application Support 这一类应用私有目录：用户自己放在「桌面」「素材盘」
  * 的文件不该被我们搬走（那是他的资产，不是我们的缓存）。
  */
@@ -44,6 +58,7 @@ export function isDetachedLocalMediaSource(source: string): boolean {
   const value = source.trim();
   if (!isLocalAbsoluteMediaPath(value)) return false;
   if (!MEDIA_FILE_EXTENSION.test(value)) return false;
+  if (LIBRARY_ASSET_DIR.test(value)) return false;
   return /[\\/]AppData[\\/]/i.test(value) || /[\\/]Application Support[\\/]/i.test(value);
 }
 

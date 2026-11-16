@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  JIMENG_CANVAS_CLI_PROVIDER_ID,
   JIMENG_CLI_IMAGE_UPSCALE_MODEL_ID,
   JIMENG_CLI_PROVIDER_ID,
   RUNNINGHUB_CLI_PROVIDER_ID,
@@ -1055,10 +1056,12 @@ describe("listAudioModels: 创作面板归属", () => {
 describe("即梦 CLI 图片模型", () => {
   const jimengModels = () => listImageModels().filter((model) => model.providerId === JIMENG_CLI_PROVIDER_ID);
 
-  it("在图片列表里注册 9 个版本, 且属于无密钥平台", () => {
+  it("在图片列表里注册 11 个版本, 且属于无密钥平台", () => {
     expect(jimengModels().map((model) => model.id)).toEqual([
       "jimeng-cli/image-5.0Pro",
       "jimeng-cli/image-5.0",
+      "jimeng-cli/image-5.0lite",
+      "jimeng-cli/image-4.8",
       "jimeng-cli/image-4.7",
       "jimeng-cli/image-4.6",
       "jimeng-cli/image-4.5",
@@ -1083,8 +1086,23 @@ describe("即梦 CLI 图片模型", () => {
     expect(tiersOf("4.0")).toEqual(["2K", "4K"]);
     expect(tiersOf("4.5")).toEqual(["2K", "4K"]);
     expect(tiersOf("4.7")).toEqual(["2K", "4K"]);
+    // 服务端专项加进列表的两个型号（`-h` 里还没有）
+    expect(tiersOf("4.8")).toEqual(["2K", "4K"]);
+    expect(tiersOf("5.0lite")).toEqual(["2K", "4K"]);
     expect(tiersOf("5.0")).toEqual(["2K", "4K"]);
     expect(tiersOf("5.0Pro")).toEqual(["1.5K", "2K", "4K"]);
+  });
+
+  it("5.0lite 复用 5.0 的价目, 4.8 无实测价, 不显示积分", () => {
+    const display = (modelId: string, resolution: string) => {
+      const model = getImageModel(modelId);
+      expect(model.id).toBe(modelId);
+      return resolveModelPriceDisplay(model, { resolution, language: "zh-CN" })?.label;
+    };
+
+    expect(display("jimeng-cli/image-5.0lite", "2K")).toBe("3 积分/次");
+    expect(display("jimeng-cli/image-5.0lite", "4K")).toBe("4 积分/次");
+    expect(display("jimeng-cli/image-4.8", "2K")).toBeUndefined();
   });
 
   it("画幅用 CLI 的 8 档枚举, 不含自定义平台的 5:4 / 4:5", () => {
@@ -1282,5 +1300,26 @@ describe("即梦积分价目(两个 CLI 共用一张表)", () => {
     expect(price("jimeng-cli/image-4.0", "2K")).toBe("1 积分/次");
     expect(price("jimeng-cli/image-5.0", "4K")).toBe("4 积分/次");
     expect(price("jimeng-cli/image-3.0", "2K")).toBeUndefined();
+  });
+});
+
+describe("即梦画布 CLI 视频档位", () => {
+  const canvasVideo = () =>
+    listVideoModels().filter((model) => model.providerId === JIMENG_CANVAS_CLI_PROVIDER_ID);
+  const resolutionsOf = (model: string) => {
+    const found = canvasVideo().find(
+      (item) => item.id === `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`
+    );
+    // 模型不存在时返回空数组: 断言会直接失败, 比 `!` 断言后崩在运行时更好读。
+    return (found?.resolutions ?? []).map((option) => option.value);
+  };
+
+  it("Seedance 2.5 Flash 带 480p: 画布通道是 480p/720p, 与旧 CLI 通道不同", () => {
+    expect(resolutionsOf("seedance_2.5_flash")).toEqual(["480p", "720p"]);
+  });
+
+  it("Seedance 2.5 与样片模式仍有 480p 兜底档", () => {
+    expect(resolutionsOf("seedance_2.5")).toContain("480p");
+    expect(resolutionsOf("seedance_2.5_draft")).toEqual(["480p"]);
   });
 });

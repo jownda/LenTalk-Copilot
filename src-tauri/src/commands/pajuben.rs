@@ -1225,6 +1225,18 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_reaches_engine_in_single_episode_mode() {
+        // 画布「重新生成」走的是单集模式：不传 --overwrite，引擎就会复用这一集的
+        // 听写/拉片中间文件，界面看起来就是「又扒了一次还是上一遍的稿子」。
+        let mut request = base_request();
+        request.batch = false;
+        request.overwrite = true;
+        let args = build_arguments(Path::new("X:/engine"), &request);
+        assert!(args.contains(&"--overwrite".to_string()));
+        assert!(!args.contains(&"--batch".to_string()));
+    }
+
+    #[test]
     fn batch_flags_are_forwarded() {
         let mut request = base_request();
         request.batch = true;

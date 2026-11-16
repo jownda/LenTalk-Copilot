@@ -71,12 +71,14 @@ import { resolveRecommendedApiPriceBadge } from "./nodePriceBadge";
 import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
 import { CanvasNodeImage } from "@/features/canvas/ui/CanvasNodeImage";
 import { NodeReferencePicker } from "@/features/canvas/ui/NodeReferencePicker";
+import { AudioViewerModal } from "@/features/canvas/ui/AudioViewerModal";
 import {
   PICKER_FALLBACK_ANCHOR,
   resolvePickerAnchor,
   type PickerAnchor,
 } from "@/features/canvas/ui/nodeReferencePickerLayout";
 import { prepareNodeImageFromFile, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
+import { useJimengCatalogRevision } from '@/features/canvas/models/jimengCatalog';
 import {
   findReferenceTokens,
   insertReferenceToken,
@@ -84,6 +86,8 @@ import {
   remapImageReferenceTokens,
   removeTextRange,
   resolveReferenceAwareDeleteRange,
+  samePromptIgnoringReferenceTokens,
+  syncImageReferenceTokens,
 } from "@/features/canvas/application/referenceTokenEditing";
 import { useDebouncedNodeTextCommit } from "@/features/canvas/application/useDebouncedNodeTextCommit";
 import { applyLocalReferenceSection, type LocalReferenceAsset } from "@/features/canvas/domain/referenceSection";
@@ -209,6 +213,8 @@ function renderPromptWithHighlights(
   audioSources: string[],
   resolveAudioLabel: (source: string, index: number) => string,
   onThumbnailClick?: (displayUrl: string, event: { clientX: number; clientY: number }) => void,
+  onAudioChipClick?: (source: string, label: string) => void,
+  audioChipHint?: string,
 ): ReactNode {
   if (!prompt) {
     return " ";
@@ -230,12 +236,26 @@ function renderPromptWithHighlights(
       // 音频胶囊必须限制在原始 token 的行内占位宽度中，否则会盖住后续文字。
       const source = audioSources[token.value - 1];
       const label = source ? resolveAudioLabel(source, token.value - 1) : matchText;
+      // 与图片小方块对齐：图片点了能放大，音频胶囊以前是纯装饰（pointer-events-none），
+      // 用户无法确认「@音频1 到底是哪条」。有来源时让它可点，点了开试听弹窗。
+      const clickable = Boolean(source && onAudioChipClick);
       segments.push(
         <span key={`ref-${matchStart}`} className="relative z-0 text-transparent">
           {matchText}
           <span
-            title={label}
-            className="pointer-events-none absolute left-0 top-1/2 inline-flex h-[18px] max-w-full -translate-y-1/2 items-center gap-0.5 overflow-hidden rounded-[5px] bg-accent px-1 text-[10px] font-medium leading-none text-white"
+            title={clickable ? `${label} · ${audioChipHint ?? ""}`.trim() : label}
+            className={`absolute left-0 top-1/2 inline-flex h-[18px] max-w-full -translate-y-1/2 items-center gap-0.5 overflow-hidden rounded-[5px] bg-accent px-1 text-[10px] font-medium leading-none text-white ${
+              clickable ? "pointer-events-auto cursor-zoom-in hover:bg-accent/85" : "pointer-events-none"
+            }`}
+            onClick={
+              clickable
+                ? (event) => {
+                    event.stopPropagation();
+                    onAudioChipClick?.(source, label);
+                  }
+                : undefined
+            }
+            onMouseDown={clickable ? (event) => event.stopPropagation() : undefined}
           >
             <AudioLines className="h-3 w-3 shrink-0" />
             <span className="truncate">{label}</span>
@@ -293,6 +313,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const processingRevision = useCanvasStore((state) => state.processingRevision);
   const updateNodeSize = useCanvasStore((state) => state.updateNodeSize);
   const findNodePosition = useCanvasStore((state) => state.findNodePosition);
+  const openImageViewer = useCanvasStore((state) => state.openImageViewer);
+  /** 引用素材条上的音频试听弹窗（音频没有原生缩略图，只能靠一个播放入口确认是哪条）。 */
+  const [audioPreview, setAudioPreview] = useState<{ url: string; title: string } | null>(null);
   const apiKeys = useSettingsStore((state) => state.apiKeys);
   const customApis = useSettingsStore((state) => state.customApis);
   const customModelPrices = useSettingsStore((state) => state.customModelPrices);
@@ -414,6 +437,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     updateNodeData,
   });
 
+  // 模型目录同步完成后重渲染（并让下面的 useMemo 重算），新模型才会出现在下拉里。
+  const catalogRevision = useJimengCatalogRevision();
   const imageMode = data.imageMode === "first-last" ? "first-last" : "reference";
   const models = useMemo(
     () =>
@@ -438,7 +463,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           !normalized.includes("对口型")
         );
       }),
-    [customApis, imageMode],
+    [customApis, imageMode, catalogRevision],
   );
   const selectedModel =
     models.find((model) => model.id === data.model) ??
@@ -668,6 +693,23 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       if (nextDirectImages.length !== directReferenceImages.length) {
         patch.studioReferenceImages = nextDirectImages;
       }
+      if (tile.kind === 'image') {
+        // 显式删这一条的标记。自动同步（上面的 effect）只在「来源确实少了」时删，
+        // 而且它跑在下一帧；用户点了「移除该引用素材」，提示词必须当场就对上，
+        // 否则输入框里还留着一个指向已删图片的 `[imageN]`。
+        const nextImages = referenceInputImages.filter((item) => item !== tile.source);
+        const nextPrompt = remapImageReferenceTokens(
+          promptDraftRef.current,
+          referenceInputImages,
+          nextImages,
+        );
+        if (nextPrompt !== promptDraftRef.current) {
+          promptDraftRef.current = nextPrompt;
+          setPromptDraft(nextPrompt);
+          cancelPromptCommit();
+          patch.prompt = nextPrompt;
+        }
+      }
       if (tile.kind === "audio") {
         const nextUsableAudio = isJimengCli
           ? inputAudio.filter((item) => !nextExcludedSet.has(item))
@@ -695,6 +737,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       id,
       inputAudio,
       isJimengCli,
+      referenceInputImages,
       usableInputAudio,
       updateNodeData,
     ],
@@ -714,7 +757,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         key: `audio-${source}`,
         kind: "audio" as const,
         source,
-        label: `音频${index + 1}`,
+        // 与提示词胶囊同一套命名：素材名/文件名比「音频1」更容易对上号，
+        // 试听弹窗的标题也用它。
+        label: resolveAudioLabel(source, index),
         displayUrl: null,
         used: true,
       });
@@ -828,11 +873,15 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       return;
     }
     const previousImages = previousReferenceImagesRef.current;
-    // 只按**来源身份**重映射：真正的断连由 remap 精确删掉它自己的标记。
+    // 只按**变化类型**决定要不要删标记：真正的断连由 remap 精确删掉它自己的标记。
     // 绝不再按「当前数量」删越界标记 —— 参考图是异步解析的，节点挂载后数量会经历
     // 5 → 0 → 5 这种抖动，任何一次抖动都会把 `[imageN]` 整段删掉并写回节点，
     // 等图片到齐也不会恢复，表现为「引用刚生成就全掉了」。
-    const remappedPrompt = remapImageReferenceTokens(
+    //
+    // 走 `syncImageReferenceTokens` 而不是 `remapImageReferenceTokens`：后者把
+    // 「找不到这个来源」一律当断开，但本地化 / 资产库路径重映射会把同一个来源换成
+    // 另一个地址（http → 落盘路径），那属于**改写**，标记必须原样保留。
+    const remappedPrompt = syncImageReferenceTokens(
       promptDraftRef.current,
       previousImages,
       referenceInputImages,
@@ -847,18 +896,19 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   }, [cancelPromptCommit, id, imageMode, referenceInputImages, usableInputAudio.length, updateNodeData]);
 
   /**
-   * 自愈：提示词里一个引用标记都没有，但节点挂着参考图 —— 说明标记被某条链路删过
-   * （历史版本的「按数量清理」就这么干过）。这时用工作室写进节点的资产清单重建引用段，
+   * 自愈：提示词里的引用标记与节点挂着的参考图对不上 —— 说明标记被某条链路删过
+   * （历史版本的「按来源身份 remap」在路径被改写时就干过这事）。
    * 用户不必重新生成一遍。
    *
-   * 只在「一个标记都没有」时动手：正常提示词绝不会被这里改写。
+   * 三条路，从精确到宽松，任何一条都只在「确实缺标记」时才写回：
+   * ① 有资产清单且条数与当前参考图一致 → 按清单重建引用段；
+   * ② 没有可用清单 → 从上游工作室的 `quickPrompt` 整段借回，但必须「去掉标记后逐字相同」；
+   * ③ 都不满足 → 一个字都不动。
    */
   useEffect(() => {
     const current = data.prompt ?? "";
     if (!current.trim()) return;
-    if (findReferenceTokens(current).length > 0) return;
 
-    // ① 自己有清单：按资产表重建引用段 + 正文补齐。
     const anchors = (Array.isArray(data.referenceAnchors) ? data.referenceAnchors : [])
       .map((item) => {
         const record = (item ?? {}) as Record<string, unknown>;
@@ -869,22 +919,34 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       })
       .filter((item) => item.name && Number.isFinite(item.imageIndex) && item.imageIndex >= 1);
 
-    if (anchors.length > 0) {
-      const healed = anchorImageReferenceTags(
-        applyLocalReferenceSection(current, anchors as LocalReferenceAsset[]),
-        anchors.map(({ name, imageIndex }) => ({ name, imageIndex })),
-      );
-      if (healed !== current) {
-        promptDraftRef.current = healed;
-        setPromptDraft(healed);
-        updateNodeData(id, { prompt: healed });
+    // 清单条数与当前参考图数量必须一致（顺序才对得上）。用户手动加过 / 删过图之后
+    // 清单会过时，按过时清单重建会把序号补错 —— 那比缺标记更糟，所以直接放弃这条路。
+    if (anchors.length > 0 && anchors.length === referenceInputImages.length) {
+      const present = new Set(findReferenceTokens(current).map((token) => token.value));
+      const missing = anchors.filter((item) => !present.has(item.imageIndex));
+      if (missing.length > 0) {
+        const healed = anchorImageReferenceTags(
+          applyLocalReferenceSection(current, anchors as LocalReferenceAsset[]),
+          anchors.map(({ name, imageIndex }) => ({ name, imageIndex })),
+        );
+        if (healed !== current) {
+          promptDraftRef.current = healed;
+          setPromptDraft(healed);
+          updateNodeData(id, { prompt: healed });
+          return;
+        }
       }
+    }
+
+    // ② 没有可用清单：从上游提示词工作室节点整段借回（它的 quickPrompt 是本地生成的、
+    //    标记完整）。只有「去掉标记后逐字相同」才借 —— 也就是说，正文一个字都没被
+    //    用户改过，缺的只是标记；用户改过内容就不动，绝不覆盖他的编辑。
+    const presentValues = new Set(findReferenceTokens(current).map((token) => token.value));
+    const hasUnreferencedImage = referenceInputImages.some((_, index) => !presentValues.has(index + 1));
+    if (!hasUnreferencedImage) {
       return;
     }
 
-    // ② 老节点没有清单：从上游提示词工作室节点整段借回（它的 quickPrompt 是本地生成的、
-    //    标记完整）。只有「去掉标记后逐字相同」才借 —— 也就是确实只是被删了标记，
-    //    用户自己改过内容就不动。
     const upstreamStudio = edges
       .filter((edge) => edge.target === id)
       .map((edge) => nodes.find((node) => node.id === edge.source))
@@ -893,14 +955,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       typeof upstreamStudio?.data?.quickPrompt === "string" ? upstreamStudio.data.quickPrompt : "";
     if (!upstreamPrompt.trim()) return;
     if (findReferenceTokens(upstreamPrompt).length === 0) return;
-
-    const stripTokens = (text: string) => text.replace(/(\[image\d+\]|@图\d+)/g, "").replace(/\s+/g, "");
-    if (stripTokens(upstreamPrompt) !== stripTokens(current)) return;
+    if (!samePromptIgnoringReferenceTokens(upstreamPrompt, current)) return;
 
     promptDraftRef.current = upstreamPrompt;
     setPromptDraft(upstreamPrompt);
     updateNodeData(id, { prompt: upstreamPrompt });
-  }, [data.prompt, data.referenceAnchors, edges, id, nodes, updateNodeData]);
+  }, [data.prompt, data.referenceAnchors, edges, id, nodes, referenceInputImages.length, updateNodeData]);
 
   useEffect(() => {
     if (referencePickerItems.length === 0) {
@@ -1534,6 +1594,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                   setPreviewState({ url: displayUrl, x: event.clientX, y: event.clientY });
                   setPreviewSize(null);
                 },
+                (source, label) => setAudioPreview({ url: source, title: label }),
+                t("node.videoGen.previewReferenceAudio", "点击试听"),
               )}
             </div>
           </div>
@@ -1600,51 +1662,93 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
               }
             }}
             onHover={setPickerActiveIndex}
+            previewAudioTitle={t("node.videoGen.previewReferenceAudio", "点击试听")}
+            onPreviewAudio={(index) => {
+              const item = referencePickerItems[index];
+              if (item?.kind !== "audio") return;
+              setAudioPreview({ url: item.source, title: item.label });
+            }}
           />
         )}
       </div>
       {referenceTiles.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5" data-video-reference-strip>
           <span className="text-[11px] text-text-muted">{t("node.videoGen.referenceAssets", "引用素材")}</span>
-          {referenceTiles.map((tile) => (
-            <div
-              key={tile.key}
-              className={`nodrag group/ref relative h-9 w-9 shrink-0 overflow-hidden rounded border ${
-                tile.used ? "border-border-dark bg-black/40" : "border-dashed border-border-dark/70 opacity-60"
-              }`}
-              title={tile.used ? tile.label : `${tile.label} · ${t("node.videoGen.ignoredByJimeng", "即梦不使用")}`}
-            >
-              {tile.kind === "image" && tile.displayUrl ? (
-                <CanvasNodeImage
-                  src={tile.displayUrl}
-                  alt={tile.label}
-                  disableViewer
-                  draggable={false}
-                  className="pointer-events-none h-full w-full object-cover"
-                />
-              ) : (
-                <span className="flex h-full w-full items-center justify-center text-accent">
-                  <AudioLines className="h-4 w-4" aria-hidden="true" />
-                </span>
-              )}
-              <span className="pointer-events-none absolute bottom-0 left-0 right-0 bg-black/65 text-center text-[9px] leading-[11px] text-white">
-                {tile.label}
-              </span>
-              <button
-                type="button"
-                className="nodrag absolute right-0 top-0 flex h-4 w-4 items-center justify-center rounded-bl bg-black/70 text-white opacity-70 transition-opacity hover:bg-red-700/90 hover:opacity-100 group-hover/ref:opacity-100"
+          {referenceTiles.map((tile) => {
+            const previewable = tile.kind === "image" ? Boolean(tile.displayUrl) : Boolean(tile.source);
+            const previewHint =
+              tile.kind === "image"
+                ? t("node.videoGen.previewReferenceImage", "点击放大预览")
+                : t("node.videoGen.previewReferenceAudio", "点击试听");
+            const togglePreview = () => {
+              if (!previewable) return;
+              if (tile.kind === "image") {
+                // 一格的缩略图看不清是哪张，和图片节点一样开大图查看器；列表带上全部引用图，
+                // 查看器里可以直接左右翻。
+                const viewerUrl = tile.displayUrl ?? resolveImageDisplayUrl(tile.source);
+                if (!viewerUrl) return;
+                openImageViewer(viewerUrl, inputImageViewerList);
+                return;
+              }
+              setAudioPreview({ url: tile.source, title: tile.label });
+            };
+            return (
+              <div
+                key={tile.key}
+                role={previewable ? "button" : undefined}
+                tabIndex={previewable ? 0 : undefined}
+                className={`nodrag group/ref relative h-9 w-9 shrink-0 overflow-hidden rounded border ${
+                  previewable ? "cursor-pointer" : ""
+                } ${
+                  tile.used ? "border-border-dark bg-black/40" : "border-dashed border-border-dark/70 opacity-60"
+                }`}
+                title={`${tile.label} · ${previewHint}${
+                  tile.used ? "" : ` · ${t("node.videoGen.ignoredByJimeng", "即梦不使用")}`
+                }`}
                 onClick={(event) => {
                   event.stopPropagation();
-                  removeReferenceTile(tile);
+                  togglePreview();
                 }}
-                onMouseDown={(event) => event.stopPropagation()}
-                title={t("node.videoGen.removeReferenceAsset", "移除该引用素材(不再上传给模型)")}
-                aria-label={t("node.videoGen.removeReferenceAsset", "移除该引用素材(不再上传给模型)")}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" && event.key !== " ") return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  togglePreview();
+                }}
+                data-reference-tile={tile.kind}
               >
-                <X className="h-3 w-3" aria-hidden="true" />
-              </button>
-            </div>
-          ))}
+                {tile.kind === "image" && tile.displayUrl ? (
+                  <CanvasNodeImage
+                    src={tile.displayUrl}
+                    alt={tile.label}
+                    disableViewer
+                    draggable={false}
+                    className="pointer-events-none h-full w-full object-cover"
+                  />
+                ) : (
+                  <span className="flex h-full w-full items-center justify-center text-accent">
+                    <AudioLines className="h-4 w-4" aria-hidden="true" />
+                  </span>
+                )}
+                <span className="pointer-events-none absolute bottom-0 left-0 right-0 bg-black/65 text-center text-[9px] leading-[11px] text-white">
+                  {tile.label}
+                </span>
+                <button
+                  type="button"
+                  className="nodrag absolute right-0 top-0 flex h-4 w-4 items-center justify-center rounded-bl bg-black/70 text-white opacity-70 transition-opacity hover:bg-red-700/90 hover:opacity-100 group-hover/ref:opacity-100"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    removeReferenceTile(tile);
+                  }}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  title={t("node.videoGen.removeReferenceAsset", "移除该引用素材(不再上传给模型)")}
+                  aria-label={t("node.videoGen.removeReferenceAsset", "移除该引用素材(不再上传给模型)")}
+                >
+                  <X className="h-3 w-3" aria-hidden="true" />
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
       <div className="flex items-center gap-1" role="group" aria-label={t("node.videoGen.imageMode")}>
@@ -2171,6 +2275,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           </>,
           document.body,
         )}
+      <AudioViewerModal
+        open={audioPreview !== null}
+        audioUrl={audioPreview?.url ?? ""}
+        title={audioPreview?.title}
+        onClose={() => setAudioPreview(null)}
+      />
     </div>
   );
 });

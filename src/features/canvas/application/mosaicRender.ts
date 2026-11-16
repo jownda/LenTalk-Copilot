@@ -6,6 +6,8 @@
  * 两份各写一次必然越走越偏（旋转 / 混合模式只在一边生效那类问题），所以只留这一个函数。
  */
 import { loadImageElement } from "@/features/canvas/application/imageData";
+import { renderAdjustedCanvas } from "@/features/canvas/application/mosaicAdjust";
+import { isAdjustIdentity } from "@/features/canvas/domain/mosaicAdjust";
 import type { SeamlessMosaicNodeData } from "@/features/canvas/domain/canvasNodes";
 import { mosaicBlendOperation } from "@/features/canvas/domain/mosaicBlend";
 
@@ -44,6 +46,11 @@ export async function renderMosaicToCanvas(data: SeamlessMosaicNodeData): Promis
       const crop = layer.crop ?? { x: 0, y: 0, width: 1, height: 1 };
       const imageWidth = Math.max(1, image.naturalWidth);
       const imageHeight = Math.max(1, image.naturalHeight);
+      // 图层调整（曲线/色阶/色彩平衡…）先落到离屏画布上，和预览走同一份实现。
+      const source =
+        layer.adjust && !isAdjustIdentity(layer.adjust)
+          ? renderAdjustedCanvas(image, imageWidth, imageHeight, layer.adjust)
+          : image;
       const cropWidth = Math.max(1, imageWidth * Math.max(0.01, crop.width));
       const cropHeight = Math.max(1, imageHeight * Math.max(0.01, crop.height));
       // 让**裁剪区**铺满图层框：以前是整张图 contain 进框再裁，裁剪区比框小，
@@ -71,7 +78,7 @@ export async function renderMosaicToCanvas(data: SeamlessMosaicNodeData): Promis
       context.beginPath();
       context.rect(layer.x, layer.y, layer.width, layer.height);
       context.clip();
-      context.drawImage(image, drawX, drawY, drawWidth, drawHeight);
+      context.drawImage(source, drawX, drawY, drawWidth, drawHeight);
       context.restore();
       context.globalCompositeOperation = "source-over";
       renderedLayerCount += 1;

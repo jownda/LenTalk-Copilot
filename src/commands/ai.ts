@@ -4159,6 +4159,10 @@ async function submitJimengCanvasImageJob(request: GenerateRequest): Promise<str
         aspectRatio: request.aspect_ratio,
         // size 就是档位（1K/1.5K/2K/4K），保留大小写 —— 各模型档位严格校验。
         resolution: request.size || "2K",
+        // 张数必须传：固定张数模型（MJ 8.2 恒 4 张）漏传会被服务端直接拒。
+        // 这里给的是节点档位（1~4）；一档多张（MJ 系）的换算在后端按模型目录做 ——
+        // 后端有 `fixed_count` / `min_count` / `max_count`，是唯一权威。
+        count: request.image_count ?? 1,
         referenceImages,
       });
       // 画布 CLI 把图下到 `%APPDATA%\...\jimeng-cli\videos\<run_id>\`（它只有这一个
@@ -4362,6 +4366,48 @@ export async function jimengCliInstall(): Promise<JimengCliInstallResult> {
     throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。");
   }
   return await invoke<JimengCliInstallResult>("jimeng_cli_install");
+}
+
+export interface JimengCliUpgradeStatus {
+  supported: boolean;
+  currentVersion: string;
+  latestVersion: string;
+  releaseDate: string;
+  releaseNotes: string;
+  targetPath: string | null;
+  upToDate: boolean;
+  message: string;
+}
+
+export interface JimengCliUpgradeResult {
+  success: boolean;
+  updated: boolean;
+  previousVersion: string;
+  currentVersion: string;
+  latestVersion: string;
+  resolvedPath: string | null;
+  backupPath: string | null;
+  message: string;
+}
+
+/** 检查官方是否有新版即梦 CLI（只读；会起一次 CLI 读它自报的版本）。 */
+export async function jimengCliUpgradeCheck(executable?: string): Promise<JimengCliUpgradeStatus> {
+  if (!isTauri()) {
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。");
+  }
+  return await invoke<JimengCliUpgradeStatus>("jimeng_cli_upgrade_check", {
+    executable: executable ?? "",
+  });
+}
+
+/** 下载官方最新版并替换当前二进制；旧文件备份在 `dreamina.exe.bak`。 */
+export async function jimengCliUpgrade(executable?: string): Promise<JimengCliUpgradeResult> {
+  if (!isTauri()) {
+    throw new Error("即梦 CLI 只能在桌面端使用，请打开 LenTalk 桌面应用后再操作。");
+  }
+  return await invoke<JimengCliUpgradeResult>("jimeng_cli_upgrade", {
+    executable: executable ?? "",
+  });
 }
 
 function isCustomModel(model: string): boolean {

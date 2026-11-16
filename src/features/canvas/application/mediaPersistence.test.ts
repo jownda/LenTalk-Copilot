@@ -64,6 +64,26 @@ describe('isDetachedLocalMediaSource', () => {
     expect(isDetachedLocalMediaSource('\\\\server\\share\\AppData\\a.mp4')).toBe(false);
   });
 
+  it('资产库目录里的素材不搬 —— 它是用户资产，搬家会让引用对不上', () => {
+    // 老布局的资产库就在 AppData 里（storage_paths.rs: default_library_dir），
+    // 它落在 AppData 判据范围之内，必须显式排除：
+    // 否则每从资产库拖一次同一条素材，节点里的地址就被改写一次，下游 `[imageN]` 跟着失效。
+    expect(
+      isDetachedLocalMediaSource(
+        'C:/Users/me/AppData/Roaming/com.storyboard.copilot/library-assets/角色-小满.png',
+      ),
+    ).toBe(false);
+    expect(
+      isDetachedLocalMediaSource('/Users/me/Library/Application Support/com.storyboard.copilot/library-assets/a.png'),
+    ).toBe(false);
+    // CLI 产物仍在同一个应用目录下，不能跟着一起被放过。
+    expect(
+      isDetachedLocalMediaSource(
+        'C:/Users/me/AppData/Roaming/com.storyboard.copilot/jimeng-cli/videos/x/canvas-x.png',
+      ),
+    ).toBe(true);
+  });
+
   it('没有媒体扩展名的（目录、日志）不当素材处理', () => {
     expect(
       isDetachedLocalMediaSource('C:/Users/me/AppData/Roaming/com.storyboard.copilot/jimeng-cli/videos'),

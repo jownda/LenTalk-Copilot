@@ -37,6 +37,9 @@ import type {
 } from "@/features/canvas/domain/canvasNodes";
 import { MOSAIC_BLEND_MODE_OPTIONS, normalizeRotation } from "@/features/canvas/domain/mosaicBlend";
 import { initialLayerBox, layerFillRect, layerImageAspect } from "@/features/canvas/application/mosaicFit";
+import { MosaicAdjustPanel } from "@/features/canvas/ui/MosaicAdjustPanel";
+import { isAdjustIdentity } from "@/features/canvas/domain/mosaicAdjust";
+import { useAdjustedPreview } from "@/features/canvas/ui/useAdjustedPreview";
 import { renderMosaicToCanvas } from "@/features/canvas/application/mosaicRender";
 import {
   prepareNodeImage,
@@ -199,6 +202,58 @@ const HANDLE_CURSOR: Record<string, string> = {
 
 const MIN_FRAME = 8;
 
+/**
+ * 编辑器里的单个图层。
+ *
+ * 单独抽出来是因为要调 `useAdjustedPreview`（hooks 不能写在 map 里）：
+ * 调整参数变了就换成处理过的预览图，源文件不动。
+ */
+function EditorLayerView({
+  layer,
+  scale,
+  active,
+  onPointerDown,
+}: {
+  layer: MosaicLayerItem;
+  scale: number;
+  active: boolean;
+  onPointerDown: (event: ReactPointerEvent) => void;
+}) {
+  const source = useAdjustedPreview(layer);
+  const fill = layerFillRect(layer);
+  return (
+    <div
+      className="absolute overflow-hidden"
+      style={{
+        left: layer.x * scale,
+        top: layer.y * scale,
+        width: Math.max(1, layer.width * scale),
+        height: Math.max(1, layer.height * scale),
+        opacity: layer.opacity ?? 1,
+        mixBlendMode: layer.blendMode ?? "normal",
+        transform: layer.rotation ? `rotate(${layer.rotation}deg)` : undefined,
+        transformOrigin: "center",
+        outline: active ? "1.5px solid #0a84ff" : undefined,
+        cursor: layer.locked ? "default" : "move",
+      }}
+      onPointerDown={onPointerDown}
+    >
+      <img
+        src={resolveImageDisplayUrl(source)}
+        alt=""
+        draggable={false}
+        className="pointer-events-none absolute object-contain"
+        style={{
+          left: `${((fill.x - layer.x) / layer.width) * 100}%`,
+          top: `${((fill.y - layer.y) / layer.height) * 100}%`,
+          width: `${(fill.width / layer.width) * 100}%`,
+          height: `${(fill.height / layer.height) * 100}%`,
+        }}
+      />
+    </div>
+  );
+}
+
 interface SeamlessMosaicEditorProps {
   nodeId: string;
   data: SeamlessMosaicNodeData;
@@ -232,6 +287,7 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
   const [draftLayers, setDraftLayers] = useState<MosaicLayerItem[] | null>(null);
   const [isExporting, setIsExporting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [panelTab, setPanelTab] = useState<"props" | "adjust">("props");
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const artboardRef = useRef<HTMLDivElement | null>(null);
@@ -247,6 +303,33 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
   const visibleCount = layers.filter((layer) => layer.visible).length;
   const selectedLayer = layers.find((layer) => layer.id === selectedLayerId) ?? null;
   const scale = zoom === "fit" ? fitScale : zoom;
+  // 直方图要「已调整」的图：拿选中图层的缩略图算一份。
+  const selectedPreviewUrl = useAdjustedPreview(
+    selectedLayer ?? { imageUrl: "", previewImageUrl: null, adjust: undefined },
+  );
+
+  /**
+   * 默认选中一个图层。
+   *
+   * 调整面板、属性面板都只对「选中图层」生效，一进来什么都没选的话
+   * 拖滑块完全没反应 —— 看起来就像坏了一样。所以打开就先选中顶层那张。
+   */
+  const autoSelectedRef = useRef(false);
+  useEffect(() => {
+    if (layers.length === 0) return;
+    if (!autoSelectedRef.current) {
+      autoSelectedRef.current = true;
+      if (!selectedLayerId) {
+        const top = [...layers].reverse().find((layer) => layer.visible) ?? layers[layers.length - 1];
+        setSelectedLayerId(top?.id ?? null);
+      }
+      return;
+    }
+    // 当前选中的图层被删掉了 → 补选一个
+    if (selectedLayerId && layers.some((layer) => layer.id === selectedLayerId)) return;
+    const fallback = [...layers].reverse().find((layer) => layer.visible) ?? layers[layers.length - 1];
+    setSelectedLayerId(fallback?.id ?? null);
+  }, [layers, selectedLayerId]);
 
   /* ------------------------------- 视口自适应 ------------------------------- */
   useEffect(() => {
@@ -562,9 +645,16 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
   /* ------------------------------- 图层操作 -------------------------------- */
   const patchLayer = useCallback(
     (layerId: string, patch: Partial<MosaicLayerItem>) => {
-      writeLayers(layers.map((layer) => (layer.id === layerId ? { ...layer, ...patch } : layer)));
+      // 从 store 读最新一份再合并。
+      // 拖滑块时事件可能一帧来好几次，用渲染闭包里的 `layers` 会把上一次的修改盖掉，
+      // 表现就是「跳、不跟手、松手才生效」。
+      const latest = useCanvasStore.getState().nodes.find((node) => node.id === nodeId);
+      const base = (latest?.data as SeamlessMosaicNodeData | undefined)?.layers ?? layers;
+      writeLayers(
+        (base ?? []).map((layer) => (layer.id === layerId ? { ...layer, ...patch } : layer)),
+      );
     },
-    [layers, writeLayers],
+    [layers, nodeId, writeLayers],
   );
 
   const moveLayerOrder = useCallback(
@@ -927,51 +1017,24 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
           >
             {layers
               .filter((layer) => layer.visible)
-              .map((layer) => {
-                const fill = layerFillRect(layer);
-                const active = layer.id === selectedLayerId;
-                return (
-                  <div
-                    key={layer.id}
-                    className="absolute overflow-hidden"
-                    style={{
-                      left: layer.x * scale,
-                      top: layer.y * scale,
-                      width: Math.max(1, layer.width * scale),
-                      height: Math.max(1, layer.height * scale),
-                      opacity: layer.opacity ?? 1,
-                      mixBlendMode: layer.blendMode ?? "normal",
-                      transform: layer.rotation ? `rotate(${layer.rotation}deg)` : undefined,
-                      transformOrigin: "center",
-                      outline: active && tool === "move" ? "1.5px solid #0a84ff" : undefined,
-                      cursor: tool === "move" && !layer.locked ? "move" : "default",
-                    }}
-                    onPointerDown={(event) => {
-                      // 裁剪模式下事件要冒泡到画板，否则拖不出裁剪框。
-                      if (tool !== "move") return;
-                      if (layer.locked) {
-                        event.stopPropagation();
-                        setSelectedLayerId(layer.id);
-                        return;
-                      }
-                      beginLayerDrag(event, "move", layer);
-                    }}
-                  >
-                    <img
-                      src={resolveImageDisplayUrl(layer.previewImageUrl || layer.imageUrl)}
-                      alt=""
-                      draggable={false}
-                      className="pointer-events-none absolute object-contain"
-                      style={{
-                        left: `${((fill.x - layer.x) / layer.width) * 100}%`,
-                        top: `${((fill.y - layer.y) / layer.height) * 100}%`,
-                        width: `${(fill.width / layer.width) * 100}%`,
-                        height: `${(fill.height / layer.height) * 100}%`,
-                      }}
-                    />
-                  </div>
-                );
-              })}
+              .map((layer) => (
+                <EditorLayerView
+                  key={layer.id}
+                  layer={layer}
+                  scale={scale}
+                  active={layer.id === selectedLayerId && tool === "move"}
+                  onPointerDown={(event) => {
+                    // 裁剪模式下事件要冒泡到画板，否则拖不出裁剪框。
+                    if (tool !== "move") return;
+                    if (layer.locked) {
+                      event.stopPropagation();
+                      setSelectedLayerId(layer.id);
+                      return;
+                    }
+                    beginLayerDrag(event, "move", layer);
+                  }}
+                />
+              ))}
 
             {/* 选中图层的缩放点 */}
             {tool === "move" && selectedLayer && !selectedLayer.locked && (
@@ -1053,10 +1116,45 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
 
         {/* 右侧面板 */}
         <div className="flex w-[296px] shrink-0 flex-col border-l border-black/50 bg-[#252526]">
-          <div className="flex h-8 shrink-0 items-center border-b border-black/40 px-3 text-[12px] text-[#c8c8c8]">
-            属性
+          <div className="flex h-8 shrink-0 items-center gap-1 border-b border-black/40 px-2 text-[12px] text-[#c8c8c8]">
+            {(
+              [
+                ["props", "属性"],
+                ["adjust", "调整"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                className={`h-6 flex-1 rounded text-[11px] transition-colors ${
+                  panelTab === id ? "bg-[#3d3d3f] text-white" : "text-[#9a9a9a] hover:bg-[#333335]"
+                }`}
+                onClick={() => {
+                  setPanelTab(id);
+                  if (id === "adjust" && !selectedLayerId && layers.length > 0) {
+                    const top = [...layers].reverse().find((layer) => layer.visible) ?? layers[0];
+                    setSelectedLayerId(top?.id ?? null);
+                  }
+                }}
+              >
+                {label}
+              </button>
+            ))}
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto p-3 text-[12px]">
+          {panelTab === "adjust" && (
+            <div className="min-h-0 flex-1 overflow-y-auto p-3 text-[12px]">
+              <MosaicAdjustPanel
+                adjust={selectedLayer?.adjust}
+                previewUrl={selectedPreviewUrl}
+                disabled={!selectedLayer}
+                onChange={(next) => {
+                  if (!selectedLayer) return;
+                  patchLayer(selectedLayer.id, { adjust: next });
+                }}
+              />
+            </div>
+          )}
+          <div className={`min-h-0 flex-1 overflow-y-auto p-3 text-[12px] ${panelTab === "props" ? "" : "hidden"}`}>
             <div className="mb-3 space-y-2">
               <div className="text-[11px] uppercase tracking-wide text-[#8a8a8a]">画布</div>
               <div className="flex items-center gap-2">
@@ -1257,6 +1355,7 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
                     <div className="text-[10px] text-[#7f7f7f]">
                       {Math.round(layer.width)} × {Math.round(layer.height)}
                       {layer.crop ? " · 已裁剪" : ""}
+                      {layer.adjust && !isAdjustIdentity(layer.adjust) ? " · 已调整" : ""}
                     </div>
                   </div>
                   <button

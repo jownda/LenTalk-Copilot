@@ -114,6 +114,23 @@ export function isQuickRunActive(run: PajubenQuickRun | undefined): boolean {
   return run?.status === 'preparing' || run?.status === 'running';
 }
 
+/**
+ * 这个视频节点是否已经扒出过剧本。
+ *
+ * 只要成功过一次就为 true —— 工具栏按钮据此变成「重新生成」，弹窗据此把
+ * `overwrite` 打开（清掉这一集的听写/拉片中间文件，逼引擎真跑一遍）。
+ */
+export function hasPajubenScript(data: unknown): boolean {
+  const stamp = (data as { pajubenExtractedAt?: unknown } | null | undefined)?.pajubenExtractedAt;
+  return typeof stamp === 'number' && Number.isFinite(stamp) && stamp > 0;
+}
+
+/** 已扒出剧本时记下的集号；没记过就返回 null。 */
+export function pajubenScriptEpisodeOf(data: unknown): number | null {
+  const episode = (data as { pajubenScriptEpisode?: unknown } | null | undefined)?.pajubenScriptEpisode;
+  return typeof episode === 'number' && Number.isFinite(episode) && episode > 0 ? episode : null;
+}
+
 function nodeIdForRun(runId: string): string | null {
   const runs = usePajubenQuickRuns.getState().runs;
   const hit = Object.values(runs).find((run) => run.runId === runId);
@@ -135,8 +152,12 @@ function claimPendingRunId(): string | null {
   return pending[0]?.nodeId ?? null;
 }
 
-/** 扒完 → 落剧本节点。卡片关掉也必须执行，所以放在这里而不是组件里。 */
-async function finishRun(nodeId: string, success: boolean, message: string): Promise<void> {
+/**
+ * 扒完 → 落剧本节点。卡片关掉也必须执行，所以放在这里而不是组件里。
+ *
+ * 导出仅为测试：生产路径统一由 `onPajubenFinish` 触发。
+ */
+export async function finishRun(nodeId: string, success: boolean, message: string): Promise<void> {
   const store = usePajubenQuickRuns.getState();
   const run = store.runs[nodeId];
   if (!run) return;
@@ -168,6 +189,12 @@ async function finishRun(nodeId: string, success: boolean, message: string): Pro
     );
     // 挂回来源视频：画布上多扒几条时，一眼看得出这份稿子从哪条片子来。
     canvas.addEdge(nodeId, scriptNodeId);
+    // 记下「这个视频节点已经出过剧本」：工具栏据此把「扒视频」换成「重新生成」，
+    // 再点就必须走「作废中间文件、真重跑一遍」的路径（见 pajuben.py 的 overwrite）。
+    canvas.updateNodeData(nodeId, {
+      pajubenExtractedAt: Date.now(),
+      pajubenScriptEpisode: run.episode,
+    });
     usePajubenQuickRuns.setState((state) => {
       const current = state.runs[nodeId];
       if (!current) return state;

@@ -125,6 +125,68 @@ export function remapImageReferenceTokens(text: string, oldSources: readonly str
     .replace(/[ \t]{2,}/g, ' ');
 }
 
+/**
+ * 参考图数组变化时，该对提示词里的 `[imageN]` 做什么。
+ *
+ * 🔴 判据是**变化类型**，不是「数量变少就删」。
+ *
+ * `remapImageReferenceTokens` 的删除语义建立在「找不到 = 这个来源被断开了」这个前提上，
+ * 但真实链路里还有第三种情况：来源**被原地改写成了另一个字符串**。
+ *
+ * - `UnpersistedMediaNotice` 打开工程 2 秒后会自动把 `http(s)://` 参考图下载成本地文件，
+ *   并把节点数据里的地址整体换成落盘路径；
+ * - 资产库「文件名对齐」走 `applyAssetPathRemap`，一次全局字符串重映射就换掉了
+ *   `studioReferenceImages` 里的路径（这条只作用于资产库来源 —— 这就是「从资产库调的
+ *   图片更容易掉」的原因）。
+ *
+ * 这两种改写都是「同一张图换了个地址」，`nextSources.indexOf(oldSource)` 必然 -1，
+ * 按删除语义就会把 `[image1]`…整段删掉并**写回节点数据**，等图片到齐也不会恢复。
+ * 用户看到的就是「刚开始引用正常，过一会儿（画面动一下回来）全掉了」。
+ * 音频没有这条自动重映射，所以同样的改写对它没有影响 —— 与线上反馈完全一致。
+ *
+ * 所以：
+ * - `next` 是 `previous` 的子集且更短 → 真的断连，删掉那几个标记；
+ * - `next` 是 `previous` 的**重排**（同长度、同一批来源）→ 只换序号；
+ * - 出现 `previous` 里没有的新来源（改写、增删混合）→ **一个标记都不动**。
+ *   宁可留一个越界标记，也绝不删用户的内容。
+ */
+export function syncImageReferenceTokens(
+  text: string,
+  previousSources: readonly string[],
+  nextSources: readonly string[],
+): string {
+  const sameSet = nextSources.every((source) => previousSources.includes(source));
+  if (!sameSet) {
+    // 有陌生来源：至少有一次改写，无法区分「改写」与「断开」，保守不动。
+    return text;
+  }
+  if (nextSources.length === previousSources.length) {
+    // 同一批来源的纯重排：序号要跟着新的上传顺序走。
+    return remapImageReferenceTokens(text, previousSources, nextSources);
+  }
+  if (nextSources.length < previousSources.length) {
+    // 只少了来源、没有新增 —— 这才是真正的上游断连。
+    return remapImageReferenceTokens(text, previousSources, nextSources);
+  }
+  return text;
+}
+
+/**
+ * 两段提示词是否「只差引用标记」（空白与 `[imageN]` / `@图N` 都不计）。
+ *
+ * 用在「自愈」上：视频节点的正文与上游工作室的成品逐字相同、只少了标记 ——
+ * 说明标记是被某条链路删的，可以安全地整段借回。用户只要改过一个字，
+ * 这里就不相等，绝不覆盖他的编辑。
+ */
+export function samePromptIgnoringReferenceTokens(left: string, right: string): boolean {
+  const normalize = (text: string) =>
+    text
+      .replace(/(\[image\d+\]|@图\d+)/g, '')
+      .replace(/\s+/g, '');
+  const a = normalize(left);
+  return a.length > 0 && a === normalize(right);
+}
+
 function findTokenRanges(
   text: string,
   maxImageCount?: number,

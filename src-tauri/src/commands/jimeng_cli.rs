@@ -351,7 +351,14 @@ fn generate_video_blocking(
         return Err("即梦 CLI 视频生成需要提示词".to_string());
     }
     let video_resolution = resolve_video_resolution(&request);
-    validate_model_and_duration(&request.model_version, request.duration, &video_resolution)?;
+    // 目录里有这个型号就以目录为准（见 validate_model_and_duration 的说明）。
+    let catalog = crate::commands::jimeng_catalog::load_cached_catalog(app);
+    validate_model_and_duration(
+        &request.model_version,
+        request.duration,
+        &video_resolution,
+        catalog.as_ref(),
+    )?;
 
     let run_id = Uuid::new_v4().to_string();
     // 从这一刻起这次提交进入「可取消」状态：前端节点上的「取消生成」会按
@@ -420,23 +427,87 @@ fn resolve_video_resolution(request: &GenerateJimengCliVideoRequest) -> String {
         .to_ascii_lowercase()
 }
 
+/// 视频模型的本地前置校验。
+///
+/// 🔴 **目录优先**：下面这份白名单是手写的，CLI 每加一个型号就得跟着改一次，漏改的表现
+/// 是「平台已经支持、软件自己先报不支持」。所以先查自动同步下来的模型目录：只要目录里
+/// 有这个型号，就按目录声明的时长区间与分辨率档位校验，白名单只作为「还没同步过任何
+/// 目录」时的兜底。
 fn validate_model_and_duration(
     model_version: &str,
     duration: u32,
     video_resolution: &str,
+    catalog: Option<&crate::commands::jimeng_catalog::ModelCatalog>,
 ) -> Result<(), String> {
-    const SUPPORTED: [&str; 6] = [
+    if let Some(entry) = catalog.and_then(|catalog| catalog.find(model_version)) {
+        if !entry.durations.is_empty() && !entry.durations.contains(&duration) {
+            let (min, max) = (
+                entry.durations.first().copied().unwrap_or(duration),
+                entry.durations.last().copied().unwrap_or(duration),
+            );
+            return Err(format!(
+                "{model_version} 支持 {min}–{max} 秒视频，请在节点中调整时长"
+            ));
+        }
+        if !entry.resolutions.is_empty()
+            && !entry
+                .resolutions
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(video_resolution))
+        {
+            return Err(format!(
+                "{model_version} 不支持 {video_resolution}，可选：{}",
+                entry.resolutions.join("、")
+            ));
+        }
+        return Ok(());
+    }
+
+    const SUPPORTED: [&str; 7] = [
         "seedance2.0",
         "seedance2.0fast",
         "seedance2.0_vip",
         "seedance2.0fast_vip",
         "seedance2.0mini",
         "seedance2.5",
+        // 服务端有、`text2video -h` 1.4.21 还没写的型号（实测 720p/1080p/4k、4–30 秒）。
+        "seedance2.5_flash",
     ];
+
+    // 与图片同理：`seedance2.5_flash` 这类新型号在 `text2video -h` 里还没有,
+    // 但服务端已经在白名单里 —— 用同步过来的型号快照放行。
+    if let Some(entry) = crate::commands::jimeng_catalog::legacy_snapshot_model(model_version) {
+        let (min, max) = (
+            entry.min_duration.unwrap_or(4),
+            entry.max_duration.unwrap_or(15),
+        );
+        if !(min..=max).contains(&duration) {
+            return Err(format!(
+                "{model_version} 支持 {min}–{max} 秒视频，请在节点中调整时长"
+            ));
+        }
+        if !entry.resolutions.is_empty()
+            && !entry
+                .resolutions
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(video_resolution))
+        {
+            return Err(format!(
+                "{model_version} 不支持 {video_resolution}，可选：{}",
+                entry.resolutions.join("、")
+            ));
+        }
+        return Ok(());
+    }
+
     if !SUPPORTED.contains(&model_version) {
         return Err(format!("即梦 CLI 不支持视频模型: {model_version}"));
     }
-    let maximum = if model_version == "seedance2.5" { 30 } else { 15 };
+    let maximum = if model_version == "seedance2.5" || model_version == "seedance2.5_flash" {
+        30
+    } else {
+        15
+    };
     if !(4..=maximum).contains(&duration) {
         return Err(format!(
             "{model_version} 支持 4–{maximum} 秒视频，请在节点中调整时长"
@@ -444,6 +515,9 @@ fn validate_model_and_duration(
     }
     let supported_resolutions: &[&str] = match model_version {
         "seedance2.5" => &["480p", "720p", "1080p"],
+        // flash 这一档**没有 480p**：服务端会直接回
+        // `video_resolution 480p requires model_version seedance2.5`，加进列表只会让用户必失败。
+        "seedance2.5_flash" => &["720p", "1080p", "4k"],
         "seedance2.0_vip" => &["720p", "1080p", "4k"],
         _ => &["720p"],
     };
@@ -1846,16 +1920,51 @@ fn run_cli_with_timeout(
 /// 设备码轮询(`auth wait`)这类命令会把「本轮没等到」编码成**非零退出码 + JSON 错误体**。
 /// 用 `run_cli` 会把它直接变成 Err, 于是永远读不到 `error.code`, 只能看到一个干巴巴的
 /// 「命令执行失败」。需要读错误体内部的调用方要用这个版本。
-fn spawn_cli_capture(
+pub(crate) fn spawn_cli_capture(
     executable: &str,
     arguments: &[String],
     timeout: Duration,
     extra_env: &[(String, String)],
 ) -> Result<(bool, String), String> {
-    let lock = JIMENG_CLI_PROCESS_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "即梦 CLI 调用锁异常，请重启应用后重试".to_string())?;
+    spawn_cli_capture_inner(executable, arguments, timeout, extra_env, true)
+}
+
+/// 与 {@link spawn_cli_capture} 相同, 但**抢不到进程锁就立刻放弃**（不排队）。
+///
+/// 给「模型目录 / 型号同步」这类后台任务用: 它们一次要跑好几个进程、每个十几秒,
+/// 而进程锁是全局的 —— 后台同步排上队, 用户这时候点的「生成」就得一起等。
+/// 抢不到锁说明用户正在生成, 后台任务让路, 下次再同步。
+pub(crate) fn try_spawn_cli_capture(
+    executable: &str,
+    arguments: &[String],
+    timeout: Duration,
+    extra_env: &[(String, String)],
+) -> Result<(bool, String), String> {
+    spawn_cli_capture_inner(executable, arguments, timeout, extra_env, false)
+}
+
+fn spawn_cli_capture_inner(
+    executable: &str,
+    arguments: &[String],
+    timeout: Duration,
+    extra_env: &[(String, String)],
+    wait_for_lock: bool,
+) -> Result<(bool, String), String> {
+    let mutex = JIMENG_CLI_PROCESS_LOCK.get_or_init(|| Mutex::new(()));
+    let lock = if wait_for_lock {
+        mutex
+            .lock()
+            .map_err(|_| "即梦 CLI 调用锁异常，请重启应用后重试".to_string())?
+    } else {
+        mutex.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => {
+                "即梦 CLI 正在执行其它任务，稍后再同步模型".to_string()
+            }
+            std::sync::TryLockError::Poisoned(_) => {
+                "即梦 CLI 调用锁异常，请重启应用后重试".to_string()
+            }
+        })?
+    };
     let resolved = resolve_executable(executable)?;
     let mut command = build_cli_command(&resolved, extra_env);
     #[cfg(target_os = "windows")]
@@ -3763,12 +3872,12 @@ pub async fn jimeng_cli_logout(executable: String) -> Result<JimengCliLoginCheck
 // (`{"schemaVersion":"1","ok":true,"data":{…}}`), 登录同样是 OAuth Device Flow。
 // 使用文档: https://bytedance.larkoffice.com/wiki/QO66wGahSiakEHkJbxIcNBtDnAc
 
-fn canvas_cli_args(args: &[&str]) -> Vec<String> {
+pub(crate) fn canvas_cli_args(args: &[&str]) -> Vec<String> {
     args.iter().map(|value| (*value).to_string()).collect()
 }
 
 /// 解析 `dreamina-canvas` 的统一 JSON 信封, 返回 `data` 段。
-fn parse_canvas_payload(output: &str) -> Result<serde_json::Value, String> {
+pub(crate) fn parse_canvas_payload(output: &str) -> Result<serde_json::Value, String> {
     let raw = extract_json_object(output).ok_or_else(|| {
         let preview: String = output.trim().chars().take(300).collect();
         format!("即梦画布 CLI 未返回 JSON: {preview}")
@@ -4020,7 +4129,7 @@ fn run_canvas_cli(executable: &str, arguments: &[String]) -> Result<String, Stri
     run_canvas_cli_with_timeout(executable, arguments, CLI_COMMAND_TIMEOUT)
 }
 
-fn run_canvas_cli_with_timeout(
+pub(crate) fn run_canvas_cli_with_timeout(
     executable: &str,
     arguments: &[String],
     timeout: Duration,
@@ -4622,7 +4731,7 @@ fn describe_canvas_error_code(code: i64) -> String {
     }
 }
 
-fn find_json_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+pub(crate) fn find_json_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
     match value {
         serde_json::Value::Object(map) => {
             if let Some(found) = map.get(key).and_then(serde_json::Value::as_str) {
@@ -4638,6 +4747,37 @@ fn find_json_string_field(value: &serde_json::Value, key: &str) -> Option<String
             .find_map(|child| find_json_string_field(child, key)),
         _ => None,
     }
+}
+
+/// 收集 JSON 里所有同名 key 的字符串值（去重、保序）。
+///
+/// 一次出多张的模型（MJ 8.2 一档恒出 4 张）在 `node show` 里会有多个 `resourceId`，
+/// 只取第一个等于把其余三张永远留在服务端 —— 该拿的都得拿回来。
+pub(crate) fn collect_json_string_values(value: &serde_json::Value, key: &str) -> Vec<String> {
+    fn walk(value: &serde_json::Value, key: &str, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(found) = map.get(key).and_then(serde_json::Value::as_str) {
+                    let trimmed = found.trim();
+                    if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+                        out.push(trimmed.to_string());
+                    }
+                }
+                for child in map.values() {
+                    walk(child, key, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    walk(child, key, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut values = Vec::new();
+    walk(value, key, &mut values);
+    values
 }
 
 /// 保证有一个可用的画布项目: 只复用**名为 LenTalk 的专用画布**, 没有就新建。
@@ -4862,8 +5002,38 @@ pub struct GenerateJimengCanvasImageRequest {
     pub aspect_ratio: String,
     /// `1K` / `1.5K` / `2K` / `4K`（大小写按 model list 原样）
     pub resolution: String,
+    /// 生成张数（`--count`）。
+    ///
+    /// 缺省 1。**固定张数模型必须与模型要求一致**（MJ 8.2 恒为 4），否则服务端报
+    /// `service.2 / generation.output_count`；这里会按目录强制覆盖，见
+    /// `resolve_canvas_image_count`。
+    pub count: Option<u32>,
     pub reference_images: Option<Vec<String>>,
     pub project_id: Option<String>,
+}
+
+/// 决定这次图片生成该传多少张（`--count`）。
+///
+/// 三种情况，优先级从高到低：
+///
+/// 1. **固定张数模型**（MJ 8.2：`--count` 声明 required 且 min==max==4）。传 1 会被
+///    服务端拒掉（实测 `service.2 / generation.output_count`：“requires exactly 4
+///    outputs per task”），所以这里直接按目录覆盖，不让调用方决定。
+/// 2. 模型声明了区间（大多数是 1~4 / 1~8）：把用户的选择夹进区间。
+/// 3. 目录不可用：夹到 1~10（CLI 侧 `--count` 的通用范围）。
+fn resolve_canvas_image_count(
+    requested: Option<u32>,
+    entry: Option<&crate::commands::jimeng_catalog::ModelCatalogEntry>,
+) -> u32 {
+    if let Some(fixed) = entry.and_then(|entry| entry.fixed_count) {
+        return fixed.max(1);
+    }
+    let Some(entry) = entry else {
+        return requested.unwrap_or(1).clamp(1, 10);
+    };
+    let min = entry.min_count.max(1);
+    let max = entry.max_count.max(min);
+    requested.unwrap_or(min).clamp(min, max)
 }
 
 /// 即梦画布 CLI 生成图片。
@@ -4887,6 +5057,33 @@ fn generate_canvas_image_blocking(
     }
     if request.prompt.trim().is_empty() {
         return Err("即梦画布 CLI 图片生成需要提示词".to_string());
+    }
+    // 目录里声明的能力上限必须在**提交前**校验：这几种错服务端都只回
+    // `service.2` + 一句英文，用户既看不懂也不知道该怎么改。
+    let catalog = crate::commands::jimeng_catalog::load_cached_catalog(app);
+    let entry = catalog.as_ref().and_then(|catalog| catalog.find(&request.model));
+    if let Some(entry) = entry {
+        let prompt_chars = request.prompt.chars().count() as u32;
+        if entry.max_prompt_length > 0 && prompt_chars > entry.max_prompt_length {
+            return Err(format!(
+                "{} 的提示词上限是 {} 个字符，当前 {} 个，请先精简",
+                entry.display_name, entry.max_prompt_length, prompt_chars
+            ));
+        }
+    }
+    let count = resolve_canvas_image_count(request.count, entry);
+    let reference_count = request
+        .reference_images
+        .as_deref()
+        .map(|values| values.len())
+        .unwrap_or(0);
+    if let Some(entry) = entry {
+        if entry.max_references > 0 && reference_count as u32 > entry.max_references {
+            return Err(format!(
+                "{} 最多接受 {} 张参考图，当前 {} 张，请先删掉多余的",
+                entry.display_name, entry.max_references, reference_count
+            ));
+        }
     }
     let project_id = match request
         .project_id
@@ -4926,6 +5123,8 @@ fn generate_canvas_image_blocking(
             format!("--prompt={}", request.prompt),
             format!("--ratio={}", request.aspect_ratio),
             format!("--resolution={}", request.resolution),
+            // 必须显式传：固定张数模型（MJ 8.2）不传会被拒，普通模型不传默认 1。
+            format!("--count={count}"),
         ];
         for reference in &references {
             content_args.push(format!("--ref={reference}"));
@@ -4951,25 +5150,39 @@ fn generate_canvas_image_blocking(
             ],
         )?;
         let show_data = parse_canvas_payload(&show_output)?;
-        let resource_id = find_json_string_field(&show_data, "resourceId").ok_or_else(|| {
-            format!("即梦画布 CLI 节点 {node_id} 运行完成但没有产物资源, 请到即梦画布网页端确认")
-        })?;
+        // 多图模型（MJ 8.2 一档 4 张）会返回多个 resourceId：全部下载，
+        // 否则用户为 4 张付了积分却只拿到 1 张。
+        let resource_ids = collect_json_string_values(&show_data, "resourceId");
+        let Some(primary) = resource_ids.first().cloned() else {
+            return Err(format!(
+                "即梦画布 CLI 节点 {node_id} 运行完成但没有产物资源, 请到即梦画布网页端确认"
+            ));
+        };
 
         let download_dir = resolve_download_dir(app, &run_id)?;
         let target = download_dir.join(format!("canvas-{run_id}.png"));
-        download_canvas_resource(&executable, &project_id, &resource_id, &target).map_err(
+        download_canvas_resource(&executable, &project_id, &primary, &target).map_err(
             |error| {
                 format!(
-                    "图片已生成但下载失败（resourceId={resource_id}）: {error}。\
-                     可手动取回: dreamina-canvas resource download {resource_id} --project-id={project_id} -o <路径>"
+                    "图片已生成但下载失败（resourceId={primary}）: {error}。\
+                     可手动取回: dreamina-canvas resource download {primary} --project-id={project_id} -o <路径>"
                 )
             },
         )?;
         if !target.is_file() {
             return Err(format!(
-                "图片已生成但本地没有落盘文件（resourceId={resource_id}, 期望 {}）",
+                "图片已生成但本地没有落盘文件（resourceId={primary}, 期望 {}）",
                 target.display()
             ));
+        }
+        // 其余几张：下不下来都不该把整次生成判死（第一张已经拿到了）。
+        for (index, extra) in resource_ids.iter().enumerate().skip(1) {
+            let extra_target = download_dir.join(format!("canvas-{run_id}-{}.png", index + 1));
+            if let Err(error) =
+                download_canvas_resource(&executable, &project_id, extra, &extra_target)
+            {
+                eprintln!("即梦画布第 {} 张下载失败（{extra}）：{error}", index + 1);
+            }
         }
         Ok(target.to_string_lossy().to_string())
     })();
@@ -5113,7 +5326,7 @@ fn generate_canvas_audio_blocking(
 ///
 /// 报价(`node quote`)返回的积分字段名在不同小版本里叫 `credits` / `totalCredits` /
 /// `total` 都有可能, 与其猜一个写死, 不如按候选名找。
-fn find_json_number_field(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+pub(crate) fn find_json_number_field(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
     match value {
         serde_json::Value::Object(map) => {
             for key in keys {
@@ -5131,7 +5344,7 @@ fn find_json_number_field(value: &serde_json::Value, keys: &[&str]) -> Option<f6
     }
 }
 
-const CANVAS_QUOTE_KEYS: [&str; 9] = [
+pub(crate) const CANVAS_QUOTE_KEYS: [&str; 9] = [
     // 实测 `node quote` 回的是 `{"items":[{"nodeId":…,"maxCredits":45}],"totalMaxCredits":45}`
     "totalMaxCredits",
     "maxCredits",
@@ -5929,6 +6142,348 @@ fn jimeng_cli_install_blocking() -> Result<JimengCliInstallResult, String> {
     }
 }
 
+/// 官方 version.json 的内容（`{"version":"1.4.22","release_date":"...","release_notes":"..."}`）。
+#[derive(Debug, Clone, Default)]
+struct CliRelease {
+    version: String,
+    release_date: String,
+    release_notes: String,
+}
+
+/// 「检查更新」的结果：只读，不动磁盘。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JimengCliUpgradeStatus {
+    pub supported: bool,
+    pub current_version: String,
+    pub latest_version: String,
+    pub release_date: String,
+    pub release_notes: String,
+    pub target_path: Option<String>,
+    pub up_to_date: bool,
+    pub message: String,
+}
+
+/// 「升级」的结果：`backup_path` 非空时用户可自行回滚。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JimengCliUpgradeResult {
+    pub success: bool,
+    pub updated: bool,
+    pub previous_version: String,
+    pub current_version: String,
+    pub latest_version: String,
+    pub resolved_path: Option<String>,
+    pub backup_path: Option<String>,
+    pub message: String,
+}
+
+/// 读官方 version.json。国内 CDN，直连即可（不走系统代理更快）。
+fn fetch_cli_release(curl: &Path) -> Result<CliRelease, String> {
+    let output = Command::new(curl)
+        .args(["-fsSL", "--max-time", "20", JIMENG_CLI_VERSION_URL])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("无法启动 curl 检查更新: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "检查更新失败（HTTP 错误），请稍后重试；也可访问 {JIMENG_CLI_VERSION_URL} 手动查看"
+        ));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|error| format!("版本信息格式异常: {error}"))?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if version.is_empty() {
+        return Err("版本信息里没有 version 字段，请稍后重试".to_string());
+    }
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    Ok(CliRelease {
+        version,
+        release_date: text("release_date"),
+        release_notes: text("release_notes"),
+    })
+}
+
+/// 把 `1.4.22` / `v1.4.22` 拆成数字段，用于比较。
+fn version_segments(value: &str) -> Vec<u64> {
+    value
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+/// `candidate` 是否比 `current` 新。段数不同按缺少的段为 0 处理。
+fn is_newer_version(candidate: &str, current: &str) -> bool {
+    let left = version_segments(candidate);
+    let right = version_segments(current);
+    for index in 0..left.len().max(right.len()) {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
+        if a != b {
+            return a > b;
+        }
+    }
+    false
+}
+
+/// 起一次 CLI 读自己报的版本。读不到返回空串（调用方据此判定「未知」）。
+fn read_cli_version(executable: &str) -> String {
+    let Ok((_, raw)) = spawn_cli_capture(
+        executable,
+        &["version".to_string()],
+        Duration::from_secs(90),
+        &[],
+    ) else {
+        return String::new();
+    };
+    serde_json::from_str::<serde_json::Value>(raw.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// 升级要覆盖的文件：优先设置里那个可执行命令能解析出的真实路径（可能是用户自己
+/// 用包管理器装的），解析不到才落到官方安装目录。
+fn upgrade_target_path(requested: &str, platform: JimengCliPlatform) -> Option<PathBuf> {
+    let trimmed = requested.trim().trim_matches(['"', '\'']);
+    if !trimmed.is_empty() {
+        if let Some(path) = detect_executable(trimmed).resolved_path {
+            let candidate = PathBuf::from(path);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    current_user_home().map(|home| {
+        install_bin_dir(&home, platform).join(platform.binary_name())
+    })
+}
+
+fn upgrade_command_name(target: &Path) -> String {
+    target.to_string_lossy().to_string()
+}
+
+/// 检查更新：拉 version.json + 让 CLI 自报版本。只读，不落盘。
+#[tauri::command]
+pub async fn jimeng_cli_upgrade_check(
+    executable: Option<String>,
+) -> Result<JimengCliUpgradeStatus, String> {
+    tokio::task::spawn_blocking(move || jimeng_cli_upgrade_check_blocking(executable))
+        .await
+        .map_err(|error| format!("检查即梦 CLI 更新任务中断: {error}"))?
+}
+
+fn jimeng_cli_upgrade_check_blocking(
+    executable: Option<String>,
+) -> Result<JimengCliUpgradeStatus, String> {
+    let Some(platform) = JimengCliPlatform::detect() else {
+        return Ok(JimengCliUpgradeStatus {
+            supported: false,
+            current_version: String::new(),
+            latest_version: String::new(),
+            release_date: String::new(),
+            release_notes: String::new(),
+            target_path: None,
+            up_to_date: false,
+            message: format!(
+                "当前系统（{}）暂不支持自动升级即梦 CLI，请参考 docs/jimeng-cli-guide.md 手动更新",
+                std::env::consts::OS
+            ),
+        });
+    };
+    let curl = find_curl().ok_or_else(|| "未找到 curl，无法检查更新".to_string())?;
+    let requested = executable.unwrap_or_default();
+    let requested = requested.trim().to_string();
+    let requested = if requested.is_empty() {
+        "dreamina".to_string()
+    } else {
+        requested
+    };
+    let target = upgrade_target_path(&requested, platform);
+    let release = fetch_cli_release(&curl)?;
+
+    let current_version = if detect_executable(&requested).found || target.is_some() {
+        read_cli_version(&target.as_deref().map(upgrade_command_name).unwrap_or(requested.clone()))
+    } else {
+        String::new()
+    };
+    let up_to_date = !current_version.is_empty() && !is_newer_version(&release.version, &current_version);
+    let message = if current_version.is_empty() {
+        format!("未读到当前版本，最新版为 v{}", release.version)
+    } else if up_to_date {
+        format!("已是最新版本 v{current_version}")
+    } else {
+        format!("当前 v{current_version}，可升级到 v{}", release.version)
+    };
+
+    Ok(JimengCliUpgradeStatus {
+        supported: true,
+        current_version,
+        latest_version: release.version,
+        release_date: release.release_date,
+        release_notes: release.release_notes,
+        target_path: target.map(|path| path.to_string_lossy().to_string()),
+        up_to_date,
+        message,
+    })
+}
+
+/// 升级到官方最新版：下载 → 备份旧文件 → 替换 → 复检版本。
+///
+/// 只覆盖当前实际在用的那个二进制（设置里指向的路径优先），备份文件与目标同目录
+/// （`dreamina.exe.bak`），失败时可原样拷回。已是最新版则什么都不做。
+#[tauri::command]
+pub async fn jimeng_cli_upgrade(executable: Option<String>) -> Result<JimengCliUpgradeResult, String> {
+    tokio::task::spawn_blocking(move || jimeng_cli_upgrade_blocking(executable))
+        .await
+        .map_err(|error| format!("升级即梦 CLI 任务中断: {error}"))?
+}
+
+fn jimeng_cli_upgrade_blocking(
+    executable: Option<String>,
+) -> Result<JimengCliUpgradeResult, String> {
+    let platform = JimengCliPlatform::detect().ok_or_else(|| {
+        format!(
+            "当前系统（{}）暂不支持自动升级即梦 CLI，请手动更新",
+            std::env::consts::OS
+        )
+    })?;
+    let curl = find_curl().ok_or_else(|| "未找到 curl，无法下载即梦 CLI".to_string())?;
+    let requested = executable.unwrap_or_default();
+    let requested = requested.trim().to_string();
+    let requested = if requested.is_empty() {
+        "dreamina".to_string()
+    } else {
+        requested
+    };
+    let target = upgrade_target_path(&requested, platform).ok_or_else(|| {
+        "无法定位即梦 CLI 的安装位置，请先在设置里填入可执行文件路径".to_string()
+    })?;
+
+    let previous_version = if target.is_file() {
+        read_cli_version(&upgrade_command_name(&target))
+    } else {
+        String::new()
+    };
+    let release = fetch_cli_release(&curl)?;
+
+    if !previous_version.is_empty() && !is_newer_version(&release.version, &previous_version) {
+        return Ok(JimengCliUpgradeResult {
+            success: true,
+            updated: false,
+            previous_version: previous_version.clone(),
+            current_version: previous_version,
+            latest_version: release.version,
+            resolved_path: Some(target.to_string_lossy().to_string()),
+            backup_path: None,
+            message: "已经是最新版本，无需升级".to_string(),
+        });
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建安装目录 {}: {error}", parent.display()))?;
+    }
+
+    let binary_url = format!("{JIMENG_CLI_DOWNLOAD_BASE}/{}", platform.download_file());
+    let tmp_path = std::env::temp_dir().join(format!(
+        "lentalk-jimeng-upgrade-{}{}",
+        Uuid::new_v4(),
+        platform.binary_suffix()
+    ));
+    if let Err(error) = download_with_curl(&curl, &binary_url, &tmp_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    let size = fs::metadata(&tmp_path).map(|meta| meta.len()).unwrap_or(0);
+    if size < JIMENG_CLI_MIN_BINARY_BYTES {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "下载的文件异常（仅 {size} 字节），已保留原版本未做替换"
+        ));
+    }
+
+    // 备份：同目录 `dreamina.exe.bak`，覆盖上一次的备份。
+    let backup_path = if target.is_file() {
+        let backup = PathBuf::from(format!("{}.bak", target.to_string_lossy()));
+        let _ = fs::remove_file(&backup);
+        match fs::copy(&target, &backup) {
+            Ok(_) => Some(backup),
+            // 备份失败不阻断，但要在结果里说清楚「这次没有回滚点」。
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    if target.exists() {
+        // Windows 上若还有 CLI 进程占着文件，这里会失败 —— 交给调用方提示重试。
+        fs::remove_file(&target).map_err(|error| {
+            let _ = fs::remove_file(&tmp_path);
+            format!(
+                "无法替换旧版本（{error}），若正在生成请等任务结束后重试：{}",
+                target.display()
+            )
+        })?;
+    }
+    fs::rename(&tmp_path, &target)
+        .or_else(|_| fs::copy(&tmp_path, &target).map(|_| ()))
+        .map_err(|error| {
+            let _ = fs::remove_file(&tmp_path);
+            format!("无法写入 {}: {error}", target.display())
+        })?;
+    let _ = fs::remove_file(&tmp_path);
+
+    #[cfg(unix)]
+    {
+        make_unix_executable(&target)?;
+        clear_macos_quarantine(&target);
+    }
+
+    let current_version = read_cli_version(&upgrade_command_name(&target));
+    let verified = !current_version.is_empty() && !is_newer_version(&release.version, &current_version);
+    let message = if verified {
+        format!("已升级到 v{current_version}")
+    } else if current_version.is_empty() {
+        format!("已下载并替换为 v{}，但没能读到新版本号，请重启应用后确认", release.version)
+    } else {
+        format!(
+            "替换完成，但 CLI 自报 v{current_version}（目标 v{}），可能仍有旧进程占用，建议重启应用后重试",
+            release.version
+        )
+    };
+
+    Ok(JimengCliUpgradeResult {
+        success: verified,
+        updated: true,
+        previous_version,
+        current_version,
+        latest_version: release.version,
+        resolved_path: Some(target.to_string_lossy().to_string()),
+        backup_path: backup_path.map(|path| path.to_string_lossy().to_string()),
+        message,
+    })
+}
+
 /// 定位 curl：优先系统自带的固定路径，其次当前进程 PATH。
 /// Windows 用 `C:\Windows\System32\curl.exe`，macOS/Linux 用 `/usr/bin/curl`
 /// —— GUI 应用从 Finder/桌面启动时拿不到登录 shell 的 PATH，直查固定路径最稳。
@@ -6138,12 +6693,17 @@ const JIMENG_CLI_IMAGE_ASPECT_RATIOS: [&str; 8] =
     ["21:9", "16:9", "3:2", "4:3", "1:1", "3:4", "2:3", "9:16"];
 
 /// `text2image` 支持的模型版本。
-const JIMENG_CLI_TEXT2IMAGE_VERSIONS: [&str; 9] =
-    ["3.0", "3.1", "4.0", "4.1", "4.5", "4.6", "4.7", "5.0", "5.0Pro"];
+///
+/// 这里只是**兜底**白名单：`-h` / 服务端同步都没拿到时用它。`4.8` / `5.0lite` 是
+/// 服务端白名单里有、而 `dreamina 1.4.21` 的帮助文本还没写的型号（实测可生成），
+/// 所以先记在这里，避免型号同步完成前生成被本地校验拦住。
+const JIMENG_CLI_TEXT2IMAGE_VERSIONS: [&str; 11] = [
+    "3.0", "3.1", "4.0", "4.1", "4.5", "4.6", "4.7", "4.8", "5.0", "5.0Pro", "5.0lite",
+];
 
 /// `image2image` 不支持 3.0 / 3.1(CLI 只列 4.0 及以上)。
-const JIMENG_CLI_IMAGE2IMAGE_VERSIONS: [&str; 7] =
-    ["4.0", "4.1", "4.5", "4.6", "4.7", "5.0", "5.0Pro"];
+const JIMENG_CLI_IMAGE2IMAGE_VERSIONS: [&str; 9] =
+    ["4.0", "4.1", "4.5", "4.6", "4.7", "4.8", "5.0", "5.0Pro", "5.0lite"];
 
 /// `image_upscale` 的档位枚举。
 const JIMENG_CLI_UPSCALE_RESOLUTIONS: [&str; 3] = ["2k", "4k", "8k"];
@@ -6204,7 +6764,67 @@ fn validate_image_request(
     resolution_type: &str,
     aspect_ratio: Option<&str>,
     reference_count: usize,
+    catalog: Option<&crate::commands::jimeng_catalog::ModelCatalog>,
 ) -> Result<(), String> {
+    // 目录优先：CLI 已登记的型号与档位直接放行，避免新模型被本地白名单拦住。
+    if let Some(entry) = catalog.and_then(|catalog| catalog.find(model_version)) {
+        if !entry.resolutions.is_empty()
+            && !entry
+                .resolutions
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(resolution_type))
+        {
+            return Err(format!(
+                "{model_version} 不支持 {resolution_type} 分辨率，可选：{}",
+                entry.resolutions.join("、")
+            ));
+        }
+        if let Some(ratio) = aspect_ratio {
+            if !entry.aspect_ratios.is_empty()
+                && !entry
+                    .aspect_ratios
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(ratio))
+            {
+                return Err(format!(
+                    "即梦画布 CLI 的 {model_version} 不支持画幅 {ratio}，可选：{}",
+                    entry.aspect_ratios.join("、")
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    // 旧 CLI 的型号声明已经跟服务端对齐过（`jimeng_catalog::probe_versions` 从
+    // `version should be in [...]` 里读权威清单）。4.8 / 5.0lite 这类「CLI 帮助文本
+    // 还没写、服务端已经支持」的型号只能从这份快照里认出来，否则会被下面的本地
+    // 白名单直接拦掉 —— 那正是「新模型都没有」的另一半原因。
+    if let Some(entry) = crate::commands::jimeng_catalog::legacy_snapshot_model(model_version) {
+        if reference_count > 0 && matches!(model_version, "3.0" | "3.1") {
+            return Err(format!("即梦 CLI 图生图不支持模型版本 {model_version}"));
+        }
+        if !entry.resolutions.is_empty()
+            && !entry
+                .resolutions
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(resolution_type))
+        {
+            return Err(format!(
+                "{model_version} 不支持 {resolution_type} 分辨率，可选：{}",
+                entry.resolutions.join("、")
+            ));
+        }
+        if let Some(ratio) = aspect_ratio {
+            if !JIMENG_CLI_IMAGE_ASPECT_RATIOS.contains(&ratio) {
+                return Err(format!(
+                    "{model_version} 不支持画幅 {ratio}，可选：{}",
+                    JIMENG_CLI_IMAGE_ASPECT_RATIOS.join("、")
+                ));
+            }
+        }
+        return Ok(());
+    }
+
     let versions: &[&str] = if reference_count > 0 {
         &JIMENG_CLI_IMAGE2IMAGE_VERSIONS
     } else {
@@ -6356,6 +6976,7 @@ fn generate_image_blocking(
             &resolution_type,
             aspect_ratio,
             images.len(),
+            crate::commands::jimeng_catalog::load_cached_catalog(app).as_ref(),
         )?;
 
         let command = if images.is_empty() { "text2image" } else { "image2image" };
@@ -6509,36 +7130,36 @@ mod image_tests {
 
     #[test]
     fn text2image_rejects_4k_for_legacy_versions() {
-        let error = validate_image_request("3.0", "4k", None, 0).unwrap_err();
+        let error = validate_image_request("3.0", "4k", None, 0, None).unwrap_err();
         assert!(error.contains("不支持 4k"), "实际报错: {error}");
     }
 
     #[test]
     fn text2image_accepts_1k_for_legacy_versions() {
-        assert!(validate_image_request("3.1", "1k", None, 0).is_ok());
+        assert!(validate_image_request("3.1", "1k", None, 0, None).is_ok());
     }
 
     #[test]
     fn image2image_rejects_versions_without_edit_support() {
-        let error = validate_image_request("3.0", "2k", None, 1).unwrap_err();
+        let error = validate_image_request("3.0", "2k", None, 1, None).unwrap_err();
         assert!(error.contains("图生图"), "实际报错: {error}");
     }
 
     #[test]
     fn pro_version_accepts_1_5k_resolution() {
-        assert!(validate_image_request("5.0Pro", "1.5k", None, 0).is_ok());
-        assert!(validate_image_request("5.0", "1.5k", None, 0).is_err());
+        assert!(validate_image_request("5.0Pro", "1.5k", None, 0, None).is_ok());
+        assert!(validate_image_request("5.0", "1.5k", None, 0, None).is_err());
     }
 
     #[test]
     fn unsupported_aspect_ratio_is_rejected() {
-        let error = validate_image_request("5.0", "2k", Some("5:4"), 0).unwrap_err();
+        let error = validate_image_request("5.0", "2k", Some("5:4"), 0, None).unwrap_err();
         assert!(error.contains("画幅"), "实际报错: {error}");
     }
 
     #[test]
     fn supported_aspect_ratio_passes() {
-        assert!(validate_image_request("5.0", "2k", Some("21:9"), 0).is_ok());
+        assert!(validate_image_request("5.0", "2k", Some("21:9"), 0, None).is_ok());
     }
 
     #[test]
@@ -6928,6 +7549,76 @@ mod image_tests {
         assert!(message.contains("unknown flag --ref"), "{message}");
     }
 
+    fn catalog_entry(fixed: Option<u32>, min: u32, max: u32, prompt_limit: u32) -> crate::commands::jimeng_catalog::ModelCatalogEntry {
+        crate::commands::jimeng_catalog::ModelCatalogEntry {
+            model: "jm_image_model_yc_mj82".to_string(),
+            display_name: "图片美学模型 V8.2".to_string(),
+            aliases: Vec::new(),
+            media_type: "image".to_string(),
+            modes: vec!["t2i".to_string()],
+            resolutions: vec!["1K".to_string(), "2K".to_string()],
+            aspect_ratios: vec!["1:1".to_string()],
+            durations: Vec::new(),
+            max_count: max,
+            min_count: min,
+            fixed_count: fixed,
+            max_references: 20,
+            min_references: 0,
+            max_prompt_length: prompt_limit,
+            supports_first_frame: false,
+            vip_required: false,
+        }
+    }
+
+    /// MJ 8.2 的 `--count` 是 required 且恒为 4：调用方传 1 会被服务端拒，
+    /// 所以这里必须按目录覆盖，而不是相信传入值。
+    #[test]
+    fn fixed_count_model_overrides_requested_count() {
+        let entry = catalog_entry(Some(4), 4, 4, 1024);
+        assert_eq!(resolve_canvas_image_count(Some(1), Some(&entry)), 4);
+        assert_eq!(resolve_canvas_image_count(Some(2), Some(&entry)), 4);
+        assert_eq!(resolve_canvas_image_count(None, Some(&entry)), 4);
+    }
+
+    /// 普通模型：把用户选的张数夹进平台声明的区间。
+    #[test]
+    fn variable_count_model_clamps_into_declared_range() {
+        let entry = catalog_entry(None, 1, 4, 5000);
+        assert_eq!(resolve_canvas_image_count(Some(3), Some(&entry)), 3);
+        assert_eq!(resolve_canvas_image_count(Some(9), Some(&entry)), 4);
+        assert_eq!(resolve_canvas_image_count(Some(0), Some(&entry)), 1);
+        assert_eq!(resolve_canvas_image_count(None, Some(&entry)), 1);
+    }
+
+    /// 目录不可用（未登录 / 从没同步过）时退回通用范围，不能因此拒绝生成。
+    #[test]
+    fn missing_catalog_falls_back_to_generic_range() {
+        assert_eq!(resolve_canvas_image_count(Some(2), None), 2);
+        assert_eq!(resolve_canvas_image_count(Some(99), None), 10);
+        assert_eq!(resolve_canvas_image_count(None, None), 1);
+    }
+
+    /// 多图模型在 `node show` 里会有多个 resourceId，只取第一个等于把其余几张
+    /// 白付的积分丢在服务端。
+    #[test]
+    fn collects_every_resource_id_in_order() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"node":{"resources":[{"resourceId":"res-a"},{"resourceId":"res-b"}],"resourceId":"res-a"}}"#,
+        )
+        .expect("valid json");
+        assert_eq!(
+            collect_json_string_values(&value, "resourceId"),
+            vec!["res-a".to_string(), "res-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn collect_resource_ids_ignores_blank_and_missing() {
+        let value: serde_json::Value =
+            serde_json::from_str(r#"{"node":{"resourceId":"  "}}"#).expect("valid json");
+        assert!(collect_json_string_values(&value, "resourceId").is_empty());
+    }
+
     #[test]
     fn failure_without_reason_falls_back_to_message_and_code() {        let value: serde_json::Value = serde_json::from_str(
             r#"{"ok":false,"error":{"code":"cli.invalid_flag","message":"Invalid flag"}}"#,
@@ -6936,4 +7627,76 @@ mod image_tests {
         assert_eq!(describe_canvas_failure(&value), "Invalid flag（cli.invalid_flag）");
     }
 
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn version_segments_ignores_prefix_and_noise() {
+        assert_eq!(version_segments("1.4.22"), vec![1, 4, 22]);
+        assert_eq!(version_segments("v1.4.22"), vec![1, 4, 22]);
+        assert_eq!(version_segments("dreamina 1.4.22-beta"), vec![1, 4, 22]);
+        assert!(version_segments("").is_empty());
+    }
+
+    #[test]
+    fn newer_version_compares_numerically_not_lexically() {
+        assert!(is_newer_version("1.4.22", "1.4.21"));
+        assert!(!is_newer_version("1.4.21", "1.4.22"));
+        // 字符串比较会把 1.4.9 判成比 1.4.10 新，这里必须按数字段比。
+        assert!(is_newer_version("1.4.10", "1.4.9"));
+        assert!(is_newer_version("1.5", "1.4.22"));
+        assert!(!is_newer_version("1.4.22", "1.4.22"));
+        assert!(!is_newer_version("1.4", "1.4.0"));
+    }
+
+    #[test]
+    fn unknown_current_version_always_offers_upgrade() {
+        // 读不到本地版本时不能判成「已是最新」，否则用户永远升不上去。
+        assert!(is_newer_version("1.4.22", ""));
+        assert!(!is_newer_version("", "1.4.22"));
+    }
+
+    /// 真机回归：拿一份**副本**走完整升级流程（下载 → 备份 → 替换 → 复检），
+    /// 不动用户正在用的那个二进制。跑法：
+    /// `cargo test --lib live_upgrade_replaces_copy_and_keeps_backup -- --ignored`
+    #[test]
+    #[ignore]
+    fn live_upgrade_replaces_copy_and_keeps_backup() {
+        let platform = JimengCliPlatform::detect().expect("当前平台支持自动安装");
+        let home = current_user_home().expect("用户主目录");
+        let source = install_bin_dir(&home, platform).join(platform.binary_name());
+        assert!(source.is_file(), "先装好即梦 CLI: {}", source.display());
+
+        let sandbox = std::env::temp_dir().join(format!("lentalk-upgrade-{}", Uuid::new_v4()));
+        fs::create_dir_all(&sandbox).expect("创建沙箱");
+        let copy = sandbox.join(platform.binary_name());
+        fs::copy(&source, &copy).expect("复制二进制");
+
+        let result = jimeng_cli_upgrade_blocking(Some(copy.to_string_lossy().to_string()))
+            .expect("升级流程不应报错");
+        println!("upgrade => {result:?}");
+
+        assert!(result.updated, "副本应被升级: {result:?}");
+        assert_eq!(result.latest_version, result.current_version, "替换后应读到最新版");
+        let backup = result.backup_path.as_deref().expect("应留下备份文件");
+        assert!(Path::new(backup).is_file(), "备份不在: {backup}");
+        assert!(copy.is_file(), "替换后目标文件应存在");
+
+        let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn upgrade_target_falls_back_to_official_bin_dir() {
+        // 传绝对路径但文件不存在 → 落到官方安装目录（`~/bin` 或 `~/.local/bin`），
+        // 这样「装完但没探测到」的情况也能被升级修好。
+        let platform = JimengCliPlatform::WindowsAmd64;
+        let target = upgrade_target_path("/nonexistent/lentalk-probe/dreamina", platform);
+        if let Some(home) = current_user_home() {
+            let expected = install_bin_dir(&home, platform).join(platform.binary_name());
+            assert_eq!(target.as_deref(), Some(expected.as_path()));
+        }
+    }
 }

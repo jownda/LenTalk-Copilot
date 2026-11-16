@@ -6,16 +6,16 @@
 // 区别仅是界面上只留模型选择，并把成功结果自动落到视频节点右侧的文本节点。
 // ---------------------------------------------------------------------------
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { CircleAlert, LoaderCircle, Play, Square } from "lucide-react";
+import { CheckCircle2, CircleAlert, LoaderCircle, Play, RefreshCw, Square } from "lucide-react";
 
 import { UiButton, UiModal } from "@/components/ui/primitives";
 import { useSettingsStore } from "@/stores/settingsStore";
 import type { CanvasNode } from "@/features/canvas/domain/canvasNodes";
 import { cancelPajuben, probePajubenEnvironment, runPajuben, type PajubenRunRequest } from "@/commands/pajuben";
 import { probeVideoAudio } from "@/commands/videoEdit";
-import { isQuickRunActive, usePajubenQuickRuns } from "./pajubenQuickRuns";
+import { hasPajubenScript, isQuickRunActive, pajubenScriptEpisodeOf, usePajubenQuickRuns } from "./pajubenQuickRuns";
 
 import {
   groupPajubenModelOptions,
@@ -72,6 +72,22 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
   const canExtract = isLocalVideoPath(videoPath);
   const episode = useMemo(() => guessEpisodeFromVideoName(videoPath), [videoPath]);
   const videoName = videoPath.split(/[\\/]/).pop() ?? videoPath;
+  /**
+   * 这个节点以前扒过没有。扒过 → 本次是「重新生成」：引擎必须先作废这一集的
+   * 听写/拉片/合并中间文件，否则双模型链路会直接复用上一遍的结果，跑完一秒就
+   * 结束、内容还跟上次一模一样。
+   */
+  const alreadyExtracted = hasPajubenScript(node.data);
+  const extractedEpisode = pajubenScriptEpisodeOf(node.data);
+  /**
+   * 是否作废上一轮的中间文件。
+   *
+   * 默认值跟着「这个节点扒过没有」走：扒过就是「重新生成」，没扒过就是首次扒取
+   * （中断后重试能接着上次的进度跑，不必重听一遍）。但老工程里的节点没有这个
+   * 标记 —— 那种情况用户会遇到「跑完还是旧稿」，所以这里必须留一个手动开关，
+   * 让它成为唯一的逃生口。
+   */
+  const [forceRefresh, setForceRefresh] = useState(alreadyExtracted);
 
   // 运行状态存在模块级登记表里，不随卡片卸载消失：关掉窗口后台继续跑，
   // 重新点「扒视频」时从这里恢复进度。
@@ -152,22 +168,27 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
    */
   // 打开卡片那一刻的状态先记下来：若这单在后台已经跑完（succeeded），
   // 说明用户是来「看结果」的，不能一开就自动关掉。
-  const [statusOnOpen] = useState(run?.status ?? null);
+  //
+  // 判据改成「本卡片里有没有人点过生成」而不是「打开时是不是已完成」：
+  // 节点已经扒过时打开卡片，`statusOnOpen` 早就等于 succeeded，再用它比较就会
+  // 出现「点了重新生成、跑完了、卡片却不收」的僵局。
+  const startedHereRef = useRef(false);
   useEffect(() => {
     if (!run) {
       setNotice(null);
       return;
     }
     if (run.status === "succeeded") {
-      if (statusOnOpen !== "succeeded") {
-        // 本卡片在场时跑完了：剧本节点已落好，收起卡片即可，登记一并清掉。
+      if (startedHereRef.current) {
+        // 本卡片发起的那一单跑完了：剧本节点已落好，收起卡片并清掉登记。
+        startedHereRef.current = false;
         clearRun(node.id);
         onClose();
       }
       return;
     }
     setNotice(run.status === "failed" ? (run.notice ?? "") : null);
-  }, [clearRun, node.id, onClose, run, statusOnOpen]);
+  }, [clearRun, node.id, onClose, run]);
 
   useEffect(() => {
     if (!running || startedAt <= 0) {
@@ -220,12 +241,15 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
     }
     setNotice(null);
     setElapsedSeconds(0);
+    startedHereRef.current = true;
     // 登记「这一单」：卡片此后随时可以关，进度与收尾都在登记表里推进。
     startRun({
       nodeId: node.id,
       videoPath,
       episode,
-      statusText: t("pajuben.quickPreparing", "正在准备视频和模型请求…"),
+      statusText: forceRefresh
+        ? t("pajuben.quickRegeneratePreparing", "正在清空上次的听写与画面结果，准备重新扒取…")
+        : t("pajuben.quickPreparing", "正在准备视频和模型请求…"),
     });
     try {
       setRunStage(node.id, t("pajuben.quickCheckingFfmpeg", "正在检查 FFmpeg…"));
@@ -275,7 +299,9 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
         fromEpisode: null,
         toEpisode: null,
         limit: null,
-        overwrite: false,
+        // 「重新生成」= 作废这一集的断点续跑中间文件。置 false 时引擎按中间文件
+        // 复用（中断后接着跑靠的就是它），置 true 才会真的重新听写、重新拉片。
+        overwrite: forceRefresh,
         skipAliasVerify: false,
         // 固定两步走：画面识别与音频识别各用各的模型，再合并成剧情。
         forceDualFallback: true,
@@ -305,6 +331,7 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
     canExtract,
     episode,
     failRun,
+    forceRefresh,
     node.id,
     qualityPreset,
     running,
@@ -335,7 +362,11 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
   return (
     <UiModal
       isOpen
-      title={t("pajuben.quickTitle", "扒视频")}
+      title={
+        alreadyExtracted
+          ? t("pajuben.quickRegenerateTitle", "重新生成剧本")
+          : t("pajuben.quickTitle", "扒视频")
+      }
       onClose={handleRequestClose}
       widthClassName="w-[520px]"
       footer={
@@ -358,10 +389,16 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
           >
             {running ? (
               <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            ) : alreadyExtracted ? (
+              <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
             ) : (
               <Play className="mr-1.5 h-3.5 w-3.5" />
             )}
-            {running ? t("pajuben.running", "扒取中…") : t("pajuben.quickGenerate", "生成")}
+            {running
+              ? t("pajuben.running", "扒取中…")
+              : alreadyExtracted
+                ? t("pajuben.quickRegenerate", "重新生成")
+                : t("pajuben.quickGenerate", "生成")}
           </UiButton>
         </>
       }
@@ -376,6 +413,16 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
             {" · "}
             {t("pajuben.quickTargetHint", "剧本落在视频同目录的「剧本」文件夹，并同步成右侧文本节点")}
           </p>
+          {alreadyExtracted && (
+            <p className="mt-1.5 flex items-start gap-1.5 text-[11px] leading-relaxed text-text-muted">
+              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-400" />
+              {t(
+                "pajuben.quickExtractedBefore",
+                "已扒过第 {{n}} 集，再次运行会生成一份新的剧本节点。",
+                { n: extractedEpisode ?? episode },
+              )}
+            </p>
+          )}
         </div>
 
         <div>
@@ -512,6 +559,38 @@ export function PajubenQuickExtractDialog({ node, onClose }: PajubenQuickExtract
             )}
           </p>
         </div>
+
+        {/* 逃生口：引擎按「中间文件存在即复用」，老工程里的节点没有扒取标记时，
+            默认会命中上一遍的听写与拉片，只能靠这个开关强制重跑。 */}
+        <label
+          className={`flex cursor-pointer items-start gap-2 rounded-lg border px-3 py-2 text-[11px] leading-relaxed transition-colors ${
+            forceRefresh
+              ? "border-amber-500/40 bg-amber-500/5 text-text-dark"
+              : "border-border-dark bg-bg-dark/60 text-text-muted"
+          }`}
+        >
+          <input
+            type="checkbox"
+            className="nodrag mt-0.5 h-3.5 w-3.5 shrink-0 accent-amber-500"
+            checked={forceRefresh}
+            disabled={running}
+            onChange={(event) => setForceRefresh(event.target.checked)}
+          />
+          <span className="min-w-0 flex-1">
+            {t(
+              "pajuben.quickForceRefresh",
+              "重新扒取：作废上次的听写与画面结果，重新调用模型再扒一遍",
+            )}
+            {forceRefresh && (
+              <span className="mt-1 block text-amber-400">
+                {t(
+                  "pajuben.quickForceRefreshWarning",
+                  "会重新跑一遍视觉与音频模型，产生新的调用费用；上次的剧本文件仍会被新结果覆盖。",
+                )}
+              </span>
+            )}
+          </span>
+        </label>
 
         {running && (
           <div className="space-y-1.5">

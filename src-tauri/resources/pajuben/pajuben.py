@@ -1211,13 +1211,37 @@ def video_fingerprint(path):
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:10]
 
 
-def run_dual_fallback(S, video, ep, out_dir, roles_file):
-    """调用可断点续跑的双模型脚本，返回最终剧本文本。"""
+def dual_cache_dir_for(out_dir, ep, video):
+    """这一集（这个视频文件）的断点续跑目录。"""
+    return os.path.join(out_dir, "_双模型中间文件",
+                        f"第{ep}集_{DUAL_CACHE_VERSION}_{video_fingerprint(video)}")
+
+
+def reset_dual_cache(out_dir, ep, video):
+    """「重新生成」：作废这一集的听写 / 拉片 / 合并中间文件。
+
+    双模型链路的原则是「中间文件在就直接复用」，所以同一个视频第二次跑会连模型
+    都不调用，秒回上一遍的稿子 —— 界面看起来就是「又扒了一次，还是第一遍结果」。
+    返回是否真的删掉了东西（没有中间文件时是正常的，说明这本来就是头一遍）。
+    """
+    cache_dir = dual_cache_dir_for(out_dir, ep, video)
+    if not os.path.isdir(cache_dir):
+        return False
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    return True
+
+
+def run_dual_fallback(S, video, ep, out_dir, roles_file, overwrite=False):
+    """调用可断点续跑的双模型脚本，返回最终剧本文本。
+
+    `overwrite` = 用户明确要求「重新生成」：先作废这一集的断点续跑目录。
+    """
     script = os.path.join(HERE, "dual_model_test.py")
     if not os.path.exists(script):
         raise RuntimeError("找不到双模型降级脚本 dual_model_test.py")
-    cache_dir = os.path.join(out_dir, "_双模型中间文件",
-                             f"第{ep}集_{DUAL_CACHE_VERSION}_{video_fingerprint(video)}")
+    if overwrite and reset_dual_cache(out_dir, ep, video):
+        log("  ↻ 重新生成：已清空这一集的听写与画面中间文件")
+    cache_dir = dual_cache_dir_for(out_dir, ep, video)
     os.makedirs(cache_dir, exist_ok=True)
     native_gemini = is_gemini_native_base(S["base_url"])
     # 原生 Gemini 单模型可以同时听声和看图；快速入口的 --dual-only 则明确
@@ -1415,7 +1439,7 @@ def run_batch(S, folder, seed_n, overwrite, do_verify, ep_from=None, ep_to=None,
             log(f"  ⚠ 第{ep}集 单模型失败：{e}")
             log(f"  ↳ 自动切换双模型：音频听写 + 24帧分批视觉 + 时间戳合并")
             ep_progress(ep, 5, "单模型失败，切换双模型…")
-            result = run_dual_fallback(S, video, ep, out_dir, master_path)
+            result = run_dual_fallback(S, video, ep, out_dir, master_path, overwrite)
             ep_progress(ep, 98, "双模型完成，保存输出…")
         result = normalize_script(result, ep, canonical_roles)
         if not is_complete(result):
@@ -1658,7 +1682,8 @@ def main():
     ap.add_argument("--batch", action="store_true", help="批量：target 当文件夹，整部剧一起扒")
     ap.add_argument("--seed", type=int, default=cfg.get("seed", 3),
                     help="种子集数：先顺序跑前 N 集建统一主角色表（默认3）")
-    ap.add_argument("--overwrite", action="store_true", help="覆盖已扒过的集")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="覆盖已扒过的集（批量：不跳过已完成；单集：清空该集听写/拉片中间文件后重扒）")
     ap.add_argument("--no-verify", action="store_true", help="批量结尾跳过别名核验")
     ap.add_argument("--from", dest="ep_from", type=int, help="批量：只扒从第几集起")
     ap.add_argument("--to", dest="ep_to", type=int, help="批量：只扒到第几集止")
@@ -1761,7 +1786,7 @@ def main():
         log("处理中（抽帧+听声+调模型）…")
         if S["force_dual"]:
             log(f"直接使用双模型：音频 {S['dual_audio_model']}｜画面与合并 {S['dual_vision_model']}")
-            result = run_dual_fallback(S, args.target, ep, out_dir, "")
+            result = run_dual_fallback(S, args.target, ep, out_dir, "", args.overwrite)
         else:
             result = process_video_checked(S, args.target, ep, args.roles)
     except urllib.error.HTTPError as e:
@@ -1778,7 +1803,7 @@ def main():
             log(f"\n⚠ 单模型失败：{e}")
             log("↳ 自动切换双模型…")
             try:
-                result = run_dual_fallback(S, args.target, ep, out_dir, "")
+                result = run_dual_fallback(S, args.target, ep, out_dir, "", args.overwrite)
             except Exception as dual_error:
                 sys.exit(f"\n❌ 单模型与双模型均失败：{dual_error}")
         else:

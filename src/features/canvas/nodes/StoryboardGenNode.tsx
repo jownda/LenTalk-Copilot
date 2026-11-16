@@ -78,6 +78,7 @@ import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canv
 import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
 import { resolveRecommendedApiPriceBadge } from './nodePriceBadge';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
+import { useJimengCatalogRevision } from '@/features/canvas/models/jimengCatalog';
 import {
   NODE_CONTROL_CHIP_CLASS,
   NODE_CONTROL_ICON_CLASS,
@@ -536,6 +537,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     [incomingImageItems]
   );
 
+  // 目录同步后重渲染，新模型才会出现。
+  useJimengCatalogRevision();
   const imageModels = listImageModels();
   const selectedModel = getImageModel(nodeData.model ?? DEFAULT_IMAGE_MODEL_ID);
   const providerApiKey = apiKeys[selectedModel.providerId] ?? '';

@@ -118,6 +118,13 @@ export interface JimengCanvasImageRequest {
   mode: "t2i" | "i2i";
   aspectRatio: string;
   resolution: string;
+  /**
+   * 生成张数（`--count`）。
+   *
+   * 固定张数模型必须与目录声明一致（MJ 8.2 恒为 4），后端会按模型目录强制覆盖 ——
+   * 漏传或传错都会被服务端以 `service.2 / generation.output_count` 拒掉。
+   */
+  count?: number;
   referenceImages?: string[];
   projectId?: string;
 }

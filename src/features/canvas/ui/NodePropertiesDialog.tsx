@@ -22,6 +22,7 @@ import {
 } from "@/features/canvas/models/registry";
 import { buildCustomProviderId, useSettingsStore } from "@/stores/settingsStore";
 import { UiButton, UiModal } from "@/components/ui";
+import { useJimengCatalogRevision } from '@/features/canvas/models/jimengCatalog';
 
 interface NodePropertiesDialogProps {
   /** 打开中的节点;为 null 表示关闭。 */
@@ -193,6 +194,8 @@ function useProviderLookup() {
  * 三张表都查: 图片/视频/音频的模型名可能重名, 先命中的即当作来源。
  */
 function useModelProviderResolver() {
+  // 目录同步后重算一次 id → provider 映射。
+  const catalogRevision = useJimengCatalogRevision();
   const customApis = useSettingsStore((state) => state.customApis);
 
   return useMemo(() => {
@@ -208,7 +211,7 @@ function useModelProviderResolver() {
       // 注册表读不出来就退化成「只显示模型 id」, 不影响其它字段。
     }
     return (modelId: string) => index.get(modelId) ?? null;
-  }, [customApis]);
+  }, [customApis, catalogRevision]);
 }
 
 function PropertyRowView({

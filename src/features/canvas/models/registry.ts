@@ -18,6 +18,7 @@ import {
   useSettingsStore,
 } from "@/stores/settingsStore";
 import { isWindowsDesktopRuntime } from "@/platform/runtime";
+import { IMAGE_GENERATION_COUNT_MAX } from "@/features/canvas/domain/canvasNodes";
 import { createPointsOnlyPricing } from "@/features/canvas/pricing";
 import { resolveVideoModelProfile } from "./videoProfiles";
 import { resolveImageModelResolutionOptions } from "./imageModelCapabilities";
@@ -28,6 +29,13 @@ import {
   type LingkeImageCapability,
 } from "@/features/settings/lingkeModels";
 import { createZhiniaoImagePricing, createZhiniaoVideoPricing, isZhiniaoProvider } from "./zhiniaoPricing";
+import {
+  getJimengCatalog,
+  getLegacyJimengCatalog,
+  jimengAutoImageUnitCredits,
+  jimengAutoVideoUnitCredits,
+  type JimengCatalogEntry,
+} from "./jimengCatalog";
 import { createWgspaiImagePricing, createWgspaiVideoPricing, isWgspaiProvider } from "./wgspaiPricing";
 import { createDramayaVideoPricing, isDramayaVideoBaseUrl, resolveDramayaVideoOptions } from "./dramayaModels";
 import {
@@ -169,11 +177,14 @@ const JIMENG_CANVAS_IMAGE_MODEL_KEYS: Record<string, string> = {
   "jm_image_model_yc_mj82": "mj82",
 };
 
-/** 即梦 CLI 的 `--model_version` → 价目键。3.0/3.1 无实测数据, 故意不登记。 */
+/** 即梦 CLI 的 `--model_version` → 价目键。3.0/3.1/4.8 无实测数据, 故意不登记。 */
 const JIMENG_CLI_IMAGE_MODEL_KEYS: Record<string, string> = {
   "5.0Pro": "5.0pro",
   // 即梦网页端的「图片 5.0」= 画布 CLI 的 Seedream 5.0 Lite, 同一个型号两个叫法。
   "5.0": "5.0lite",
+  // 服务端白名单里 `5.0` 与 `5.0lite` 是并列的两个可提交值（help 只写了前者）,
+  // 实测档位一致(2K/4K), 价格按同一个型号记；4.8 没有实测价, 故意不登记。
+  "5.0lite": "5.0lite",
   "4.7": "4.7",
   "4.6": "4.6",
   "4.5": "4.5",
@@ -772,73 +783,158 @@ export function matchesAudioCreativePanel(model: AudioModelDefinition, mode: Aud
  * seedance 系是小写 `720p`，服务端是严格校验的。`seedance_pro_fast` 是 5~10 秒，其余 4~15（2.5 到 30）。
  * 价格不在本地估算 —— 以 CLI 运行前报价为准，所以这里不挂 pricing。
  */
-function buildJimengCanvasCliVideoModels(): VideoModelDefinition[] {
-  const models = [
-    // 样片模式的专用模型（CLI 1.1.1 起）：只有 480p，便宜快速出小样；满意后用
-    // `node promote video-sample` 转成正式分辨率，别直接拿它当成品。
-    { model: "seedance_2.5_draft", label: "Seedance 2.5 样片", minDuration: 4, maxDuration: 30, resolutions: ["480p"] },
-    { model: "seedance_2.5", label: "Seedance 2.5", minDuration: 4, maxDuration: 30, resolutions: ["480p", "720p", "1080p"] },
-    { model: "seedance_2.0_vip", label: "Seedance 2.0 VIP", minDuration: 4, maxDuration: 15, resolutions: ["720p", "1080p", "4k"] },
-    { model: "seedance_2.0_fast_vip", label: "Seedance 2.0 Fast VIP", minDuration: 4, maxDuration: 15, resolutions: ["720p"] },
-    { model: "seedance_2.0_mini", label: "Seedance 2.0 Mini", minDuration: 4, maxDuration: 15, resolutions: ["720p"] },
-    { model: "seedance_pro_fast", label: "Seedance 1.0 Fast", minDuration: 5, maxDuration: 10, resolutions: ["720p", "1080p"] },
-    { model: "happyhorse_1.1", label: "HappyHorse 1.1", minDuration: 4, maxDuration: 15, resolutions: ["720P", "1080P"] },
-    { model: "wan_3.0", label: "Wan 3.0", minDuration: 4, maxDuration: 15, resolutions: ["720P", "1080P"] },
-  ] as const;
+/**
+ * 画布 CLI 视频模型的策展表（顺序 + 中文名 + 目录不可用时的兜底能力）。
+ *
+ * 与图片侧同一套合并规则：目录（`model list --type=video`）是能力的权威来源，
+ * 这里只保证常用模型的排列顺序，以及「一次都没同步成功过」时下拉里不为空。
+ */
+const CANVAS_VIDEO_CURATION: ReadonlyArray<{
+  model: string;
+  label: string;
+  minDuration: number;
+  maxDuration: number;
+  resolutions: string[];
+}> = [
+  // 样片模式的专用模型（CLI 1.1.1 起）：只有 480p，便宜快速出小样；满意后用
+  // `node promote video-sample` 转成正式分辨率，别直接拿它当成品。
+  { model: "seedance_2.5_draft", label: "Seedance 2.5 样片", minDuration: 4, maxDuration: 30, resolutions: ["480p"] },
+  { model: "seedance_2.5", label: "Seedance 2.5", minDuration: 4, maxDuration: 30, resolutions: ["480p", "720p", "1080p"] },
+  // Flash 的档位和「旧 CLI 的 seedance2.5_flash」不是一回事：画布通道是 480p/720p,
+  // 旧 CLI 通道是 720p/1080p/4k（服务端各自校验，`480p requires model_version seedance2.5`）。
+  { model: "seedance_2.5_flash", label: "Seedance 2.5 Flash", minDuration: 4, maxDuration: 30, resolutions: ["480p", "720p"] },
+  { model: "seedance_2.0_vip", label: "Seedance 2.0 VIP", minDuration: 4, maxDuration: 15, resolutions: ["720p", "1080p", "4k"] },
+  { model: "seedance_2.0_fast_vip", label: "Seedance 2.0 Fast VIP", minDuration: 4, maxDuration: 15, resolutions: ["720p"] },
+  { model: "seedance_2.0_mini", label: "Seedance 2.0 Mini", minDuration: 4, maxDuration: 15, resolutions: ["720p"] },
+  { model: "seedance_pro_fast", label: "Seedance 1.0 Fast", minDuration: 5, maxDuration: 10, resolutions: ["720p", "1080p"] },
+  { model: "happyhorse_1.1", label: "HappyHorse 1.1", minDuration: 4, maxDuration: 15, resolutions: ["720P", "1080P"] },
+  { model: "wan_3.0", label: "Wan 3.0", minDuration: 4, maxDuration: 15, resolutions: ["720P", "1080P"] },
+];
 
-  return models.map(({ model, label, minDuration, maxDuration, resolutions }) => ({
-    id: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
-    mediaType: "video" as const,
-    displayName: `即梦画布 CLI · ${label}`,
-    providerId: JIMENG_CANVAS_CLI_PROVIDER_ID,
-    description: `即梦画布 CLI · ${label}`,
-    expectedDurationMs: 600000,
-    aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
-    defaultAspectRatio: "16:9",
-    durationOptions: Array.from(
-      { length: maxDuration - minDuration + 1 },
-      (_, index) => index + minDuration
-    ),
-    defaultDuration: 5,
-    resolutions: resolutions.map((value) => ({ value, label: value.toUpperCase() })),
-    defaultResolution: resolutions[0],
-    pricing: createPointsOnlyPricing(
-      ({ resolution, extraParams }) =>
-        jimengVideoCreditsPerSecond(model, resolution, resolutions[0]) *
-        Math.max(1, Number(extraParams?.duration) || 5)
-    ),
-  }));
+function buildJimengCanvasCliVideoModels(): VideoModelDefinition[] {
+  const catalog = getJimengCatalog();
+  const entries = new Map<string, JimengCatalogEntry>(
+    (catalog?.video ?? []).map((entry) => [entry.model, entry])
+  );
+
+  const known = new Set(CANVAS_VIDEO_CURATION.map((item) => item.model));
+  const extras: Array<{
+    model: string;
+    label: string;
+    minDuration: number;
+    maxDuration: number;
+    resolutions: string[];
+  }> = (catalog?.video ?? [])
+    .filter((entry) => !known.has(entry.model) && entry.resolutions.length > 0)
+    .map((entry) => ({
+      model: entry.model,
+      label: entry.displayName,
+      minDuration: entry.durations[0] ?? 4,
+      maxDuration: entry.durations[entry.durations.length - 1] ?? 15,
+      resolutions: entry.resolutions,
+    }));
+
+  return [...CANVAS_VIDEO_CURATION, ...extras].map(
+    ({ model, label, minDuration, maxDuration, resolutions }) => {
+      const entry = entries.get(model);
+      const durationOptions = entry?.durations.length
+        ? entry.durations
+        : Array.from(
+            { length: maxDuration - minDuration + 1 },
+            (_, index) => index + minDuration
+          );
+      const tiers = entry?.resolutions.length ? entry.resolutions : resolutions;
+      // 画幅取「目录声明」与「节点通用档位」的交集：目录里偶见 9:21 这类反向比例，
+      // 节点侧不提供，直接放进下拉会选不出来。
+      const aspectRatios = entry?.aspectRatios.length
+        ? CUSTOM_ASPECT_RATIOS.filter((value) => entry.aspectRatios.includes(value))
+        : [];
+
+      return {
+        id: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
+        mediaType: "video" as const,
+        displayName: `即梦画布 CLI · ${label}`,
+        providerId: JIMENG_CANVAS_CLI_PROVIDER_ID,
+        description: `即梦画布 CLI · ${label}`,
+        expectedDurationMs: 600000,
+        aspectRatios: (aspectRatios.length ? aspectRatios : CUSTOM_ASPECT_RATIOS).map((value) => ({
+          value,
+          label: value,
+        })),
+        defaultAspectRatio: "16:9",
+        durationOptions,
+        defaultDuration: durationOptions.includes(5) ? 5 : durationOptions[0],
+        resolutions: tiers.map((value) => ({ value, label: value.toUpperCase() })),
+        defaultResolution: tiers[0],
+        maxReferenceImages: entry?.maxReferences ? entry.maxReferences : undefined,
+        pricing: createPointsOnlyPricing(({ resolution, extraParams }) => {
+          const target = resolution || tiers[0];
+          const perSecond =
+            jimengAutoVideoUnitCredits(model, target)
+            ?? jimengVideoCreditsPerSecond(model, target, tiers[0]);
+          return perSecond * Math.max(1, Number(extraParams?.duration) || 5);
+        }),
+      };
+    }
+  );
 }
 
 function buildJimengCliVideoModels(): VideoModelDefinition[] {
-  const models = [
+  const legacy = getLegacyJimengCatalog();
+  const fromCli = new Map((legacy?.video ?? []).map((entry) => [entry.version, entry]));
+
+  const curated = [
     { version: "seedance2.0fast", label: "Seedance 2.0 Fast", maxDuration: 15, resolutions: ["720p"] },
     { version: "seedance2.0", label: "Seedance 2.0", maxDuration: 15, resolutions: ["720p"] },
     { version: "seedance2.0fast_vip", label: "Seedance 2.0 Fast VIP", maxDuration: 15, resolutions: ["720p"] },
     { version: "seedance2.0_vip", label: "Seedance 2.0 VIP", maxDuration: 15, resolutions: ["720p", "1080p", "4k"] },
     { version: "seedance2.0mini", label: "Seedance 2.0 Mini", maxDuration: 15, resolutions: ["720p"] },
     { version: "seedance2.5", label: "Seedance 2.5", maxDuration: 30, resolutions: ["480p", "720p", "1080p"] },
-  ] as const;
+    // `seedance2.5_flash` 只在服务端白名单里（`text2video -h` 1.4.21 没写），
+    // 型号由后端探针补进来；这里给出中文名与默认档位，实测 720p/1080p/4k、4–30 秒。
+    // 480p 在这个通道上不可用：服务端原话 `video_resolution 480p requires model_version seedance2.5`，
+    // 想要 480p 小样请用 `seedance2.5`（480p=12 积分/秒）。
+    { version: "seedance2.5_flash", label: "Seedance 2.5 Flash", maxDuration: 30, resolutions: ["720p", "1080p", "4k"] },
+  ];
+  const known = new Set(curated.map((item) => item.version));
+  const extras = (legacy?.video ?? [])
+    .filter((entry) => !known.has(entry.version) && entry.resolutions.length > 0)
+    .map((entry) => ({
+      version: entry.version,
+      label: entry.version,
+      maxDuration: entry.maxDuration ?? 15,
+      resolutions: entry.resolutions,
+    }));
 
-  return models.map(({ version, label, maxDuration, resolutions }) => ({
-    id: `${JIMENG_CLI_PROVIDER_ID}/${version}`,
-    mediaType: "video" as const,
-    displayName: `即梦 CLI · ${label}`,
-    providerId: JIMENG_CLI_PROVIDER_ID,
-    description: `即梦 CLI · ${label}`,
-    expectedDurationMs: 300000,
-    aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
-    defaultAspectRatio: "16:9",
-    durationOptions: Array.from({ length: maxDuration - 3 }, (_, index) => index + 4),
-    defaultDuration: 5,
-    resolutions: resolutions.map((value) => ({ value, label: value.toUpperCase() })),
-    defaultResolution: resolutions[0],
-    pricing: createPointsOnlyPricing(
-      ({ resolution, extraParams }) =>
-        jimengVideoCreditsPerSecond(version, resolution, resolutions[0]) *
-        Math.max(1, Number(extraParams?.duration) || 5)
-    ),
-  }));
+  return [...curated, ...extras].map(({ version, label, maxDuration, resolutions }) => {
+    const entry = fromCli.get(version);
+    // CLI 的 `-h` 声明比手写表可信：它同时给出分辨率与时长上限。
+    const tiers = entry?.resolutions.length ? entry.resolutions : resolutions;
+    const limit = entry?.maxDuration ?? maxDuration;
+    const minDuration = entry?.minDuration ?? 4;
+    return {
+      id: `${JIMENG_CLI_PROVIDER_ID}/${version}`,
+      mediaType: "video" as const,
+      displayName: `即梦 CLI · ${label}`,
+      providerId: JIMENG_CLI_PROVIDER_ID,
+      description: `即梦 CLI · ${label}`,
+      expectedDurationMs: 300000,
+      aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
+      defaultAspectRatio: "16:9",
+      durationOptions: Array.from(
+        { length: Math.max(1, limit - minDuration + 1) },
+        (_, index) => index + minDuration
+      ),
+      defaultDuration: 5,
+      resolutions: tiers.map((value) => ({ value, label: value.toUpperCase() })),
+      defaultResolution: tiers[0],
+      pricing: createPointsOnlyPricing(
+        ({ resolution, extraParams }) =>
+          jimengVideoCreditsPerSecond(version, resolution, tiers[0]) *
+          Math.max(1, Number(extraParams?.duration) || 5)
+      ),
+    };
+  });
 }
 
 /**
@@ -996,51 +1092,120 @@ function resolveJimengCliImageResolutions(version: string): string[] {
  * `yc_mj82` = MJ 8.2、`gg_bp` / `gg_bp_21` = 图片 2.0 / 2.1（2.1 中文文字强）。
  * CLI 只回 model/modes/flags，没有描述字段，这些对照关系是唯一能说清「这是什么」的来源。
  */
-function buildJimengCanvasCliImageModels(): ImageModelDefinition[] {
-  const models = [
-    { model: "seedream_5.5", label: "Seedream 5.5", tiers: ["1.5K", "2K"] },
-    { model: "seedream_5.0_pro", label: "Seedream 5.0 Pro", tiers: ["1.5K", "2K", "4K"] },
-    { model: "seedream_5.0_lite", label: "Seedream 5.0 Lite", tiers: ["2K", "4K"] },
-    { model: "seedream_4.7", label: "Seedream 4.7", tiers: ["1K", "2K", "4K"] },
-    { model: "seedream_4.6", label: "Seedream 4.6", tiers: ["2K", "4K"] },
-    { model: "seedream_4.5", label: "Seedream 4.5", tiers: ["2K", "4K"] },
-    { model: "seedream_4.1", label: "Seedream 4.1", tiers: ["2K", "4K"] },
-    { model: "seedream_4.0", label: "Seedream 4.0", tiers: ["2K", "4K"] },
-    { model: "jm_image_model_lib_f", label: "GPT Image 2.5 Flash（高速）", tiers: ["1K", "2K", "4K"] },
-    { model: "jm_image_model_lib_s", label: "GPT Image 2.5 Pro（精细）", tiers: ["1K", "2K", "4K"] },
-    { model: "jm_image_model_oa_it", label: "GPT Image 2（生成与编辑）", tiers: ["1K", "2K", "4K"] },
-    { model: "jm_image_model_gg_bp_21", label: "香蕉 2.1（中文文字强）", tiers: ["1K", "2K", "4K"] },
-    { model: "jm_image_model_gg_bp", label: "香蕉 Pro", tiers: ["1K", "2K", "4K"] },
-    { model: "jm_image_model_yc_mj82", label: "MJ 8.2", tiers: ["1K", "2K"] },
-    { model: "high_aes_general_v50_flash", label: "图片 5.0 Flash", tiers: ["1.5K", "2K"] },
-  ] as const;
+/**
+ * 画布 CLI 图片模型的**策展表**：只决定「顺序」和「中文名」。
+ *
+ * 档位不在这里写死 —— 那部分由 `dreamina-canvas model list` 自动同步（见 `jimengCatalog.ts`），
+ * 平台加档位/改档位不用发版。`fallbackTiers` 只在「从来没同步成功过」时兜底，
+ * 保证离线或未登录时下拉里不是空的。
+ */
+const CANVAS_IMAGE_CURATION: ReadonlyArray<{
+  model: string;
+  label: string;
+  fallbackTiers: string[];
+}> = [
+  { model: "seedream_5.5", label: "Seedream 5.5", fallbackTiers: ["1.5K", "2K"] },
+  { model: "seedream_5.0_pro", label: "Seedream 5.0 Pro", fallbackTiers: ["1.5K", "2K", "4K"] },
+  { model: "seedream_5.0_lite", label: "Seedream 5.0 Lite", fallbackTiers: ["2K", "4K"] },
+  { model: "seedream_4.7", label: "Seedream 4.7", fallbackTiers: ["1K", "2K", "4K"] },
+  { model: "seedream_4.6", label: "Seedream 4.6", fallbackTiers: ["2K", "4K"] },
+  { model: "seedream_4.5", label: "Seedream 4.5", fallbackTiers: ["2K", "4K"] },
+  { model: "seedream_4.1", label: "Seedream 4.1", fallbackTiers: ["2K", "4K"] },
+  { model: "seedream_4.0", label: "Seedream 4.0", fallbackTiers: ["2K", "4K"] },
+  { model: "jm_image_model_lib_f", label: "GPT Image 2.5 Flash（高速）", fallbackTiers: ["1K", "2K", "4K"] },
+  { model: "jm_image_model_lib_s", label: "GPT Image 2.5 Pro（精细）", fallbackTiers: ["1K", "2K", "4K"] },
+  { model: "jm_image_model_oa_it", label: "GPT Image 2（生成与编辑）", fallbackTiers: ["1K", "2K", "4K"] },
+  { model: "jm_image_model_gg_bp_21", label: "香蕉 2.1（中文文字强）", fallbackTiers: ["1K", "2K", "4K"] },
+  { model: "jm_image_model_gg_bp", label: "香蕉 Pro", fallbackTiers: ["1K", "2K", "4K"] },
+  { model: "jm_image_model_yc_mj82", label: "MJ 8.2", fallbackTiers: ["1K", "2K"] },
+  { model: "high_aes_general_v50_flash", label: "图片 5.0 Flash", fallbackTiers: ["1.5K", "2K"] },
+];
 
-  return models.map(({ model, label, tiers }) => ({
-    id: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
-    mediaType: "image" as const,
-    displayName: `即梦画布 CLI · ${label}`,
-    providerId: JIMENG_CANVAS_CLI_PROVIDER_ID,
-    description: `即梦画布 CLI · ${label}`,
-    eta: "1min",
-    expectedDurationMs: 180000,
-    defaultAspectRatio: "1:1",
-    defaultResolution: tiers[1] ?? tiers[0],
-    aspectRatios: JIMENG_CLI_IMAGE_ASPECT_RATIOS.map((value) => ({ value, label: value })),
-    resolutions: tiers.map((value) => ({ value, label: value })),
-    pricing: createPointsOnlyPricing(({ resolution }) =>
-      jimengImageCredits(JIMENG_CANVAS_IMAGE_MODEL_KEYS[model], resolution || tiers[0])
-    ),
-    resolveRequest: ({ referenceImageCount }) => ({
-      requestModel: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
-      modeLabel: referenceImageCount > 0 ? "编辑模式" : "生成模式",
-    }),
-  }));
+function buildJimengCanvasCliImageModels(): ImageModelDefinition[] {
+  const catalog = getJimengCatalog();
+  const entries = new Map<string, JimengCatalogEntry>(
+    (catalog?.image ?? []).map((entry) => [entry.model, entry])
+  );
+
+  // 策展项在前，目录里多出来的（平台上新、我们还没登记）追加到末尾。
+  const known = new Set(CANVAS_IMAGE_CURATION.map((item) => item.model));
+  const extras: Array<{ model: string; label: string; fallbackTiers: string[] }> = (
+    catalog?.image ?? []
+  )
+    .filter((entry) => !known.has(entry.model) && entry.resolutions.length > 0)
+    .map((entry) => ({
+      model: entry.model,
+      label: entry.displayName,
+      fallbackTiers: entry.resolutions,
+    }));
+
+  return [...CANVAS_IMAGE_CURATION, ...extras].map(({ model, label, fallbackTiers }) => {
+    const entry = entries.get(model);
+    const tiers = entry?.resolutions.length ? entry.resolutions : fallbackTiers;
+    const aspectRatios = entry?.aspectRatios.length ? entry.aspectRatios : [...JIMENG_CLI_IMAGE_ASPECT_RATIOS];
+    // 固定张数模型（MJ 8.2）：`--count` 必填且 min==max，界面上只能选一档，
+    // 一档就是平台要求的张数 —— 给 2/3/4 档等于给一个必然失败的选项。
+    const fixedCount = entry?.fixedCount ?? null;
+    const countUpperBound = fixedCount
+      ? 1
+      : Math.max(1, Math.min(IMAGE_GENERATION_COUNT_MAX, entry?.maxCount ?? IMAGE_GENERATION_COUNT_MAX));
+
+    return {
+      id: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
+      mediaType: "image" as const,
+      displayName: `即梦画布 CLI · ${label}`,
+      providerId: JIMENG_CANVAS_CLI_PROVIDER_ID,
+      description: `即梦画布 CLI · ${label}`,
+      eta: "1min",
+      expectedDurationMs: 180000,
+      defaultAspectRatio: "1:1",
+      defaultResolution: tiers[1] ?? tiers[0],
+      aspectRatios: aspectRatios.map((value) => ({ value, label: value })),
+      resolutions: tiers.map((value) => ({ value, label: value })),
+      ...(fixedCount ? { imagesPerCountUnit: fixedCount } : {}),
+      maxImageCountUnits: countUpperBound,
+      ...(entry?.maxPromptLength ? { maxPromptLength: entry.maxPromptLength } : {}),
+      ...(entry?.maxReferences ? { maxReferenceImages: entry.maxReferences } : {}),
+      // 按张计费：节点上选几张就扣几张的分，报价必须跟着乘。
+      countAffectsPricing: true,
+      pricing: createPointsOnlyPricing(({ resolution, extraParams }) => {
+        const target = resolution || tiers[1] || tiers[0];
+        // 自动报价优先（用户点过「刷新积分价格」就有），其次人工实测表，都没有就不显示价格。
+        const unitCredits =
+          jimengAutoImageUnitCredits(model, target)
+          ?? jimengImageCredits(JIMENG_CANVAS_IMAGE_MODEL_KEYS[model], target);
+        // 两张表都是**单张**价（实测 MJ 8.2 一档 4 张共 20 → 单张 5）。
+        // 上下文里的 `count` 是节点上的**档位**，一档多张的模型要再乘一次。
+        const units = Math.max(1, Number(extraParams?.count) || 1);
+        const images = fixedCount ? units * fixedCount : units;
+        return unitCredits * images;
+      }),
+      resolveRequest: ({ referenceImageCount }) => ({
+        requestModel: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
+        modeLabel: referenceImageCount > 0 ? "编辑模式" : "生成模式",
+      }),
+    };
+  });
 }
 
+/**
+ * 旧 CLI（`dreamina`）的图片模型。
+ *
+ * 它没有 `model list`，模型与档位只写在 `dreamina text2image -h` 的说明里，由后端
+ * `jimeng_cli_model_catalog` 解析成 `{ version, resolutions }`。这里只保留顺序与中文名，
+ * 档位以那条声明为准；解析失败（CLI 未装 / 版本太老）时退回 `resolveJimengCliImageResolutions`。
+ */
 function buildJimengCliImageModels(): ImageModelDefinition[] {
-  const models = [
+  const legacy = getLegacyJimengCatalog();
+  const fromCli = new Map((legacy?.image ?? []).map((entry) => [entry.version, entry]));
+
+  const curated = [
     { version: "5.0Pro", label: "图片 5.0 Pro" },
     { version: "5.0", label: "图片 5.0" },
+    // `5.0lite` / `4.8` 一直没写进 CLI 的 `-h` 文本（1.4.21 还停在 5.0Pro），
+    // 但服务端早就支持了 —— 型号清单由后端探针补进来，这里提前给出中文名与顺序。
+    { version: "5.0lite", label: "图片 5.0 Lite" },
+    { version: "4.8", label: "图片 4.8" },
     { version: "4.7", label: "图片 4.7" },
     { version: "4.6", label: "图片 4.6" },
     { version: "4.5", label: "图片 4.5" },
@@ -1048,10 +1213,15 @@ function buildJimengCliImageModels(): ImageModelDefinition[] {
     { version: "4.0", label: "图片 4.0" },
     { version: "3.1", label: "图片 3.1" },
     { version: "3.0", label: "图片 3.0" },
-  ] as const;
+  ];
+  const known = new Set(curated.map((item) => item.version));
+  const extras = (legacy?.image ?? [])
+    .filter((entry) => !known.has(entry.version) && entry.resolutions.length > 0)
+    .map((entry) => ({ version: entry.version, label: `图片 ${entry.version}` }));
 
-  return models.map(({ version, label }) => {
-    const tiers = resolveJimengCliImageResolutions(version);
+  return [...curated, ...extras].map(({ version, label }) => {
+    const declared = fromCli.get(version)?.resolutions ?? [];
+    const tiers = declared.length ? declared : resolveJimengCliImageResolutions(version);
     return {
       id: `${JIMENG_CLI_PROVIDER_ID}/image-${version}`,
       mediaType: "image" as const,

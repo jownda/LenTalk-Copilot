@@ -67,7 +67,7 @@ import {
 } from "@/features/templates/createTemplate";
 import { UiInput, UiTextArea } from "@/components/ui/primitives";
 import { PajubenQuickExtractDialog } from "@/features/pajuben/PajubenQuickExtractDialog";
-import { usePajubenQuickRuns } from "@/features/pajuben/pajubenQuickRuns";
+import { hasPajubenScript, usePajubenQuickRuns } from "@/features/pajuben/pajubenQuickRuns";
 import { VideoEditDialog } from "./VideoEditDialog";
 import { useAssetLibraryStore } from "@/features/library/assetStore";
 import {
@@ -282,6 +282,9 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const quickRunStatus = usePajubenQuickRuns((state) => state.runs[node.id]?.status ?? null);
   const quickRunPercent = usePajubenQuickRuns((state) => state.runs[node.id]?.percent ?? 0);
   const quickRunActive = quickRunStatus === "preparing" || quickRunStatus === "running";
+  // 已经扒过 → 按钮换成「重新生成」：同一个视频再点「扒视频」会命中引擎的
+  // 断点续跑中间文件，看起来像「跑了一遍还是上次的稿子」，所以状态必须显式区分。
+  const scriptExtracted = hasPajubenScript(node.data);
   // 「视频编辑」：剪辑 + 音轨处理，导出成新的视频节点（保留原片）
   const [isVideoEditDialogOpen, setIsVideoEditDialogOpen] = useState(false);
   const [isCopyErrorSuccess, setIsCopyErrorSuccess] = useState(false);
@@ -995,17 +998,23 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
                 title={
                   quickRunActive
                     ? t("pajuben.quickReopenHint", "扒取在后台继续，点击查看进度")
-                    : t("pajuben.quickTitle", "扒视频")
+                    : scriptExtracted
+                      ? t("pajuben.quickRegenerateHint", "已扒过，点击可清空中间结果重新扒一次")
+                      : t("pajuben.quickTitle", "扒视频")
                 }
               >
                 {quickRunActive ? (
                   <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                ) : scriptExtracted ? (
+                  <RefreshCw className="h-3.5 w-3.5" />
                 ) : (
                   <FileText className="h-3.5 w-3.5" />
                 )}
                 {quickRunActive
                   ? t("pajuben.quickRunningShort", "扒取中 {{percent}}%", { percent: quickRunPercent })
-                  : t("pajuben.quickTitle", "扒视频")}
+                  : scriptExtracted
+                    ? t("pajuben.quickRegenerate", "重新生成")
+                    : t("pajuben.quickTitle", "扒视频")}
               </UiChipButton>
             )}
             {canReversePromptImage && (

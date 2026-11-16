@@ -43,6 +43,7 @@ import {
 import { useCanvasStore } from "@/stores/canvasStore";
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
 import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
+import { useAdjustedPreview } from "@/features/canvas/ui/useAdjustedPreview";
 import { layoutMosaicLayers, SeamlessMosaicEditor } from "@/features/canvas/ui/SeamlessMosaicEditor";
 
 const NODE_DEFAULT_WIDTH = 280;
@@ -128,6 +129,8 @@ const MosaicLayerView = memo(function MosaicLayerView({
 }: MosaicLayerViewProps) {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const fill = layerFillRect(layer);
+  // 图层调整后的预览图（曲线/色阶等），源文件不动。
+  const displaySource = useAdjustedPreview(layer);
 
   const reportRatio = useCallback(() => {
     const image = imageRef.current;
@@ -161,7 +164,7 @@ const MosaicLayerView = memo(function MosaicLayerView({
     >
       <img
         ref={imageRef}
-        src={resolveImageDisplayUrl(layer.previewImageUrl || layer.imageUrl)}
+        src={resolveImageDisplayUrl(displaySource)}
         alt=""
         draggable={false}
         className="pointer-events-none absolute object-contain"

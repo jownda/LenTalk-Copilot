@@ -22,6 +22,7 @@ import {
 } from './features/update/application/checkForUpdate';
 import { subscribeOpenGlobalErrorDialog, type GlobalErrorDialogDetail } from './features/app/errorDialogEvents';
 import { subscribeOpenSettingsDialog, type SettingsCategory } from './features/settings/settingsEvents';
+import { bootstrapJimengCatalog } from './features/canvas/models/jimengCatalog';
 import { TemplatePage } from './features/templates/TemplatePage';
 import { TemplateDetailPage } from './features/templates/TemplateDetailPage';
 import { TemplateGraphPage } from './features/templates/TemplateGraphPage';
@@ -66,6 +67,12 @@ function AppShell() {
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark');
   }, [theme]);
+
+  useEffect(() => {
+    // 即梦画布 CLI 的模型目录：缓存优先（24h），失败静默 —— 模型列表会退回内置策展表，
+    // 所以这里不需要任何错误提示，也不该阻塞首屏。
+    void bootstrapJimengCatalog();
+  }, []);
 
   useEffect(() => {
     const root = document.documentElement;

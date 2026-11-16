@@ -10,6 +10,11 @@ import {
 } from "@/commands/jimengCanvasCli";
 import { jimengCliCloseLoginWindow, jimengCliOpenLoginWindow } from "@/commands/ai";
 import { useJimengCanvasCliStore } from "@/stores/jimengCanvasCliStore";
+import {
+  refreshJimengCatalog,
+  refreshJimengPrices,
+  useJimengCatalogStore,
+} from "@/features/canvas/models/jimengCatalog";
 
 /** 即梦画布 CLI 的安装脚本（与 `dreamina` 的 /cli 同构，程序名是 dreamina-canvas）。 */
 const CANVAS_CLI_INSTALL = "curl -fsSL https://jimeng.jianying.com/canvas-cli | bash";
@@ -45,6 +50,25 @@ export function JimengCanvasCliSettings() {
    * 表现就是点了几次都停在「授权码已过期」。
    */
   const loginSeqRef = useRef(0);
+
+  const catalog = useJimengCatalogStore((state) => state.catalog);
+  const legacyCatalog = useJimengCatalogStore((state) => state.legacy);
+  const prices = useJimengCatalogStore((state) => state.prices);
+  const catalogLoading = useJimengCatalogStore((state) => state.loading);
+  const catalogError = useJimengCatalogStore((state) => state.error);
+  const probing = useJimengCatalogStore((state) => state.probing);
+  const [syncMessage, setSyncMessage] = useState("");
+  const [syncFailed, setSyncFailed] = useState(false);
+  /**
+   * 「刷新模型列表」自己的进行中标记。
+   *
+   * 不能只看 `catalogLoading`：那只覆盖画布 CLI 的 `model list`（几秒），而旧 CLI 的
+   * 型号同步要起好几次本地进程（每次十几秒到几十秒），期间按钮会提前变回可点、再点一次
+   * 又叠一轮同步。
+   */
+  const [refreshingCatalog, setRefreshingCatalog] = useState(false);
+  /** 「刷新积分价格」是两步：先展开警告，确认后才真的动。 */
+  const [priceConfirm, setPriceConfirm] = useState(false);
 
   const stopPolling = useCallback(() => {
     if (timerRef.current !== null) {
@@ -252,6 +276,52 @@ export function JimengCanvasCliSettings() {
 
   const busyLogin = loginState === "opening" || loginState === "polling";
 
+  const handleRefreshCatalog = useCallback(async () => {
+    setSyncFailed(false);
+    setRefreshingCatalog(true);
+    setSyncMessage("正在向 CLI 拉取模型列表（旧 CLI 同步较慢，可能几分钟）…");
+    try {
+      await refreshJimengCatalog();
+    } finally {
+      setRefreshingCatalog(false);
+    }
+    const state = useJimengCatalogStore.getState();
+    if (state.error) {
+      setSyncFailed(true);
+      setSyncMessage(state.error);
+      return;
+    }
+    const legacy = state.legacy;
+    setSyncMessage(
+      `已同步 画布 CLI 图片 ${state.catalog?.image.length ?? 0} / 视频 ${state.catalog?.video.length ?? 0}` +
+        (legacy
+          ? `；即梦 CLI 图片 ${legacy.image.length} / 视频 ${legacy.video.length}`
+          : "；即梦 CLI 未同步")
+    );
+  }, []);
+
+  const handleRefreshPrices = useCallback(async () => {
+    setPriceConfirm(false);
+    setSyncFailed(false);
+    setSyncMessage("正在报价，需要几十秒…");
+    try {
+      const report = await refreshJimengPrices();
+      setSyncMessage(
+        report.failures.length > 0
+          ? `已取到 ${report.quotes.length} 条价格，${report.failures.length} 条未取到`
+          : `已取到 ${report.quotes.length} 条价格`
+      );
+    } catch (error) {
+      setSyncFailed(true);
+      setSyncMessage(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
+
+  const formatTime = (seconds?: number | null) => {
+    if (!seconds) return "—";
+    return new Date(seconds * 1000).toLocaleString("zh-CN", { hour12: false });
+  };
+
   return (
     <>
       <div className="rounded-lg border border-border-dark bg-bg-dark/60 p-4">
@@ -389,6 +459,97 @@ export function JimengCanvasCliSettings() {
                   重新打开授权页
                 </button>
               </div>
+            )}
+          </div>
+
+          {/* 模型目录 / 价目自动同步 */}
+          <div className="space-y-2 border-t border-border-dark pt-4">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-text-muted">模型目录</span>
+              <span className={catalog ? "text-text-dark" : "text-text-muted"}>
+                {catalog
+                  ? `CLI v${catalog.cliVersion || "?"} · 图片 ${catalog.image.length} · 视频 ${catalog.video.length}`
+                  : "未同步"}
+              </span>
+              {catalog && (
+                <span className="text-[11px] text-text-muted">上次 {formatTime(catalog.fetchedAt)}</span>
+              )}
+            </div>
+            {legacyCatalog && (
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-text-muted">即梦 CLI（旧）</span>
+                <span className="text-text-dark">
+                  {`v${legacyCatalog.cliVersion || "?"} · 图片 ${legacyCatalog.image.length} · 视频 ${legacyCatalog.video.length}`}
+                </span>
+                {legacyCatalog.fetchedAt ? (
+                  <span className="text-[11px] text-text-muted">
+                    上次 {formatTime(legacyCatalog.fetchedAt)}
+                  </span>
+                ) : null}
+                <span className="text-[11px] text-text-muted">档位取 CLI 说明 + 服务端型号清单</span>
+              </div>
+            )}
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-text-muted">积分价目</span>
+              <span className={prices ? "text-text-dark" : "text-text-muted"}>
+                {prices ? `${prices.quotes.length} 条` : "未采集"}
+              </span>
+              {prices && (
+                <span className="text-[11px] text-text-muted">上次 {formatTime(prices.probedAt)}</span>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <UiButton
+                size="sm"
+                disabled={refreshingCatalog || catalogLoading || probing}
+                onClick={() => void handleRefreshCatalog()}
+              >
+                {refreshingCatalog || catalogLoading ? "同步中…" : "刷新模型列表"}
+              </UiButton>
+              <span className="text-[11px] text-text-muted">
+                旧 CLI 每个型号都要起一次本地进程，同步可能要一两分钟到几分钟
+              </span>
+              {priceConfirm ? (
+                <>
+                  <UiButton size="sm" variant="primary" disabled={probing} onClick={() => void handleRefreshPrices()}>
+                    确认探测价格
+                  </UiButton>
+                  <button
+                    type="button"
+                    className="text-xs text-text-muted hover:underline"
+                    onClick={() => setPriceConfirm(false)}
+                  >
+                    取消
+                  </button>
+                </>
+              ) : (
+                <UiButton size="sm" disabled={probing || catalogLoading} onClick={() => setPriceConfirm(true)}>
+                  {probing ? "报价中…" : "刷新积分价格"}
+                </UiButton>
+              )}
+            </div>
+
+            {priceConfirm && (
+              <p className="rounded-md bg-bg-dark px-2 py-1.5 text-[11px] leading-4 text-text-muted">
+                报价会在「LenTalk-价格探针」画布里建一批临时节点，报完立刻删除。
+                <span className="text-text-dark">不消耗积分</span>，但会推高该画布的草稿版本号，
+                需要几十秒。没有同步过模型列表时请先刷新模型列表。
+              </p>
+            )}
+
+            <p className="text-[11px] leading-4 text-text-muted">
+              模型列表来自 <code>dreamina-canvas model list</code>，缓存 24 小时；平台新增型号会自动出现在下拉里。
+              价格只由平台报价决定，取不到就不显示，不会猜。
+            </p>
+
+            {(syncMessage || catalogError) && (
+              <p
+                role="status"
+                className={`break-words text-xs ${syncFailed || (!syncMessage && catalogError) ? "text-red-400" : "text-text-muted"}`}
+              >
+                {syncMessage || catalogError}
+              </p>
             )}
           </div>
 

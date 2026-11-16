@@ -50,9 +50,9 @@ import {
 import {
   findReferenceTokens,
   insertReferenceToken,
-  remapImageReferenceTokens,
   removeTextRange,
   resolveReferenceAwareDeleteRange,
+  syncImageReferenceTokens,
 } from '@/features/canvas/application/referenceTokenEditing';
 import { useDebouncedNodeTextCommit } from '@/features/canvas/application/useDebouncedNodeTextCommit';
 import { readLiveInputText } from '@/features/canvas/application/liveInputText';
@@ -66,6 +66,7 @@ import {
   resolveImageModelResolutions,
 } from '@/features/canvas/models';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
+import { useJimengCatalogRevision } from '@/features/canvas/models/jimengCatalog';
 import { isWgspaiProvider } from '@/features/canvas/models/wgspaiPricing';
 import {
   NODE_CONTROL_CHIP_CLASS,
@@ -439,12 +440,20 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     [incomingImageItems]
   );
 
+  // 目录同步后重渲染，模型下拉才会出现平台上新的型号。
+  useJimengCatalogRevision();
   const imageModels = listImageModels();
   const selectedModel = getImageModel(data.model ?? DEFAULT_IMAGE_MODEL_ID);
-  const imageCount = resolveImageGenerationCount(data.imageCount);
-  // 一档实际出几张：绝大多数模型是 1，Midjourney 是 4（一档 = 一组 4 张）。
+  // 一档实际出几张：绝大多数模型是 1，Midjourney / MJ 8.2 是 4（一档 = 一组 4 张）。
   // 请求侧与按钮文案都以它为准，见 models/midjourney.ts。
   const imagesPerCountUnit = selectedModel.imagesPerCountUnit ?? 1;
+  // 张数被平台钉死的模型（MJ 8.2 的 --count 恒为 4）只能选一档，且历史节点里存的
+  // 档位可能大于 1 —— 两处都要夹住，否则会提交一个必然被服务端拒掉的张数。
+  const maxImageCountUnits = Math.max(
+    IMAGE_GENERATION_COUNT_MIN,
+    Math.min(IMAGE_GENERATION_COUNT_MAX, selectedModel.maxImageCountUnits ?? IMAGE_GENERATION_COUNT_MAX),
+  );
+  const imageCount = Math.min(resolveImageGenerationCount(data.imageCount), maxImageCountUnits);
   const providerApiKey = apiKeys[selectedModel.providerId] ?? '';
   // 即梦 / 万相这类本机 CLI 平台靠可执行文件与登录态工作, 没有可填的密钥 ——
   // 不能因为 apiKeys 里没有这一项就把生成拦下来。
@@ -503,10 +512,12 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         ? resolveModelPriceDisplay(selectedModel, {
           resolution: selectedResolution.value,
           // 一档多张的模型(Midjourney 一档 = 一组 4 张)按组计价, 报价要乘组数;
-          // WGSPAI 的图片是**按张**计价(0.1 元/张), 选 4 张就该显示 0.4;
+          // WGSPAI 与即梦画布 CLI 的图片是**按张**计价, 选 4 张就该显示 4 张的总价;
           // 其它模型 prices 与张数无关, 不传 count 免得被误读。
           extraParams:
-            imagesPerCountUnit > 1 || isWgspaiProvider('', customApiBaseUrl ?? '')
+            imagesPerCountUnit > 1 ||
+            selectedModel.countAffectsPricing ||
+            isWgspaiProvider('', customApiBaseUrl ?? '')
               ? { ...effectiveExtraParams, count: imageCount }
               : effectiveExtraParams,
           language: i18n.language,
@@ -626,7 +637,10 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     const previousImages = previousIncomingImagesRef.current;
     // 同 VideoGenNode：只按来源身份重映射，不按当前数量删越界标记（异步解析期间
     // 数量抖动会把 [imageN] 整段删掉）。
-    const cleaned = remapImageReferenceTokens(
+    //
+    // 也不能用裸 remap：本地化 / 资产库路径重映射会把同一个来源换成另一个地址
+    // （`http://…` → 落盘路径），那是**改写**不是断开，标记必须保留。
+    const cleaned = syncImageReferenceTokens(
       promptDraftRef.current,
       previousImages,
       incomingImages,
@@ -728,6 +742,38 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
 
     if (!providerApiKey && !isKeylessProvider) {
       const errorMessage = t('node.imageEdit.apiKeyRequired');
+      setError(errorMessage);
+      void showErrorDialog(errorMessage, t('common.error'));
+      generationLockRef.current = false;
+      setIsGenerating(false);
+      return;
+    }
+
+    // 提示词上限按模型差别很大（实测 MJ 8.2 只有 1024 字符，seedream 4.x 2000，
+    // 5.x 5000）。超了服务端只回一句 `service.2 / params.prompt`，既看不懂也不知道
+    // 该删多少，所以在提交前拦住并把字数摊开说。
+    const promptLimit = selectedModel.maxPromptLength ?? 0;
+    if (promptLimit > 0 && prompt.length > promptLimit) {
+      const errorMessage = t('node.imageEdit.promptTooLong', {
+        model: selectedModel.displayName,
+        limit: promptLimit,
+        current: prompt.length,
+      });
+      setError(errorMessage);
+      void showErrorDialog(errorMessage, t('common.error'));
+      generationLockRef.current = false;
+      setIsGenerating(false);
+      return;
+    }
+
+    // 参考图上限同理（实测 4 / 6 / 10 / 14 / 16 / 20 不等），超量服务端直接拒。
+    const referenceLimit = selectedModel.maxReferenceImages ?? 0;
+    if (referenceLimit > 0 && incomingImages.length > referenceLimit) {
+      const errorMessage = t('node.imageEdit.referenceImagesTooMany', {
+        model: selectedModel.displayName,
+        limit: referenceLimit,
+        current: incomingImages.length,
+      });
       setError(errorMessage);
       void showErrorDialog(errorMessage, t('common.error'));
       generationLockRef.current = false;
@@ -917,7 +963,12 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
     requestResolution.requestModel,
     selectedAspectRatio.value,
     selectedModel.id,
+    selectedModel.displayName,
     selectedModel.expectedDurationMs,
+    // 目录同步后这两个上限会变（平台改档位/改字数限制），必须进依赖，
+    // 否则用户在当前会话里改完模型仍然按旧上限校验。
+    selectedModel.maxPromptLength,
+    selectedModel.maxReferenceImages,
     selectedModel.providerId,
     selectedResolution.value,
     supportedAspectRatioValues,
@@ -1370,6 +1421,7 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
         <ImageCountControl
           imageCount={imageCount}
           imagesPerCountUnit={imagesPerCountUnit}
+          maxCount={maxImageCountUnits}
           disabled={isGenerating}
           onChange={(count) =>
             updateNodeData(id, { imageCount: resolveImageGenerationCount(count) })

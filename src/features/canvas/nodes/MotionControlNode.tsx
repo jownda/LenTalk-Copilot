@@ -31,6 +31,7 @@ import { useCanvasStore } from "@/stores/canvasStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { mediaSourceLabel, persistNodeMediaFile } from "@/features/canvas/application/nodeMediaUpload";
 import { isZzdhLipSyncModel } from "@/commands/zzdhApi";
+import { useJimengCatalogRevision } from '@/features/canvas/models/jimengCatalog';
 import {
   isRunningHubBaseUrl,
   isRunningHubDedicatedVideoEndpoint,
@@ -92,6 +93,8 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
       : data.mode === "character-swap"
         ? "character-swap"
         : "motion-control";
+  // 目录同步后重算可选视频模型。
+  const catalogRevision = useJimengCatalogRevision();
   const models = useMemo(() => {
     // 角色替换对应的是一个**具体的 RunningHub 应用**，不是可选的视频模型 ——
     // 它没有模型下拉，直接返回空表让下面所有 model 相关计算短路。
@@ -125,7 +128,7 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
         model.displayName.toLowerCase().includes("motion control") ||
         model.displayName.toLowerCase().includes("动作控制"),
     );
-  }, [customApis, mode]);
+  }, [customApis, mode, catalogRevision]);
   const allModels = useMemo(() => {
     if (mode === "motion-control") return models;
     if (mode === "character-swap") return [];
@@ -140,7 +143,7 @@ export const MotionControlNode = memo(({ id, data, selected, width, height }: Mo
       },
     );
     return lipSyncModels;
-  }, [customApis, mode, models]);
+  }, [customApis, mode, models, catalogRevision]);
   const selectedModelId = allModels.some((model) => model.id === data.model) ? data.model : allModels[0]?.id || "";
   const imageSource = data.imageSource || inputImages[0] || null;
   const motionVideoSource = data.motionVideoSource || inputVideos[0] || null;
