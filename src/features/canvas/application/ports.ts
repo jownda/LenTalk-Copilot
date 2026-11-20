@@ -146,6 +146,13 @@ export interface SunoMusicPayload {
   continueAt?: string;
   /** cover 的源 clip。 */
   coverClipId?: string;
+  /**
+   * upload_cover 的源音频（画布里的原始地址：本地路径 / `asset://` / 公网 URL）。
+   *
+   * 允许非公网地址是**有意的**：换公网直链需要平台上传接口的 Key，而那是
+   * `commands/ai.ts` 的事；网关只搬运，不该在这里做上传。
+   */
+  coverAudioUrl?: string;
 }
 
 export interface GenerateAudioPayload {
@@ -359,6 +366,15 @@ export interface CanvasEventMap {
   "tool-dialog/open": {
     nodeId: string;
     toolType: NodeToolType;
+  };
+  /**
+   * 打开「图片编辑」节点（`seamlessMosaic`）的全屏编辑器。
+   *
+   * 编辑器是否展开是节点内部 state，外部拿不到 setter；统一走事件，
+   * 由节点自己按 nodeId 接住 —— 其余节点收到同一个事件直接忽略。
+   */
+  "mosaic-editor/open": {
+    nodeId: string;
   };
   "tool-dialog/close": undefined;
   "upload-node/reupload": {

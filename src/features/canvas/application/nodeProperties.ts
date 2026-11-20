@@ -445,6 +445,8 @@ export function buildNodeProperties({
       readCount(request, "referenceAudio") ??
       readCount(data, "studioReferenceAudio") ??
       readNumber(debug, "referenceAudioCount");
+    // 参考视频没有节点字段，只有调试上下文里的数量（上游连进来的视频）。
+    const referenceVideoCount = readNumber(debug, "referenceVideoCount");
     const referenceRows: NodePropertyRow[] = [];
     if (referenceImageCount && referenceImageCount > 0) {
       referenceRows.push({
@@ -456,6 +458,12 @@ export function buildNodeProperties({
       referenceRows.push({
         label: t("canvas.nodeProperties.referenceAudio", "参考音频"),
         value: `${referenceAudioCount}`,
+      });
+    }
+    if (referenceVideoCount && referenceVideoCount > 0) {
+      referenceRows.push({
+        label: t("canvas.nodeProperties.referenceVideo", "参考视频"),
+        value: `${referenceVideoCount}`,
       });
     }
     if (referenceRows.length > 0) {

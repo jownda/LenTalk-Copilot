@@ -61,11 +61,17 @@ function toNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function buildDefaultCrop(width: number, height: number, aspect: number | undefined): Crop {
-  if (!aspect) {
-    return { unit: 'px', x: 0, y: 0, width, height };
-  }
-
+/**
+ * 按比例给出的初始框（只用于锁比例的情况）。
+ *
+ * 🔴 自由比例**不要**给初始框：`ReactCrop` 的选区是一层覆盖在图片上的 plane
+ * （`cursor: move`），铺满整张图时会把所有 pointerdown 吃掉 —— 用户按下去拖动，
+ * 触发的是「移动选区」，而选区已经顶到四边、位移被钳成 0，看起来就是「框拖不出来」。
+ * 所以自由比例从「没有框」开始，按住即拖出新框（库的默认语义）。
+ *
+ * 锁比例时给 88% 的框：四周留出余量，仍可在框外按下重新框选。
+ */
+function buildDefaultCrop(width: number, height: number, aspect: number): Crop {
   return centerCrop(
     makeAspectCrop(
       {
@@ -81,10 +87,27 @@ function buildDefaultCrop(width: number, height: number, aspect: number | undefi
   );
 }
 
+/** 两个框是否几乎一样（用于抑制「回写 → 再落地」造成的 1px 抖动）。 */
+export function cropsNearlyEqual(a: Crop | undefined, b: Crop | undefined): boolean {
+  if (!a || !b) {
+    return !a && !b;
+  }
+  return (
+    Math.abs((a.x ?? 0) - (b.x ?? 0)) < 1.5 &&
+    Math.abs((a.y ?? 0) - (b.y ?? 0)) < 1.5 &&
+    Math.abs((a.width ?? 0) - (b.width ?? 0)) < 1.5 &&
+    Math.abs((a.height ?? 0) - (b.height ?? 0)) < 1.5
+  );
+}
+
 export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChange }: VisualToolEditorProps) {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const previousAspectKeyRef = useRef<string | null>(null);
+  /** 正在拖：这期间绝不能用 options 回写 crop，否则拖到一半会被打回上一次的位置。 */
+  const draggingRef = useRef(false);
+  /** 上一块有效选区：误触（只点不拖）时用来回退。 */
+  const lastValidCropRef = useRef<Crop | undefined>(undefined);
   const [crop, setCrop] = useState<Crop>();
   const [customRatioInput, setCustomRatioInput] = useState(
     typeof options.customAspectRatio === 'string' ? options.customAspectRatio : ''
@@ -246,17 +269,29 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
    */
   const handleCropComplete = useCallback(
     (pixelCrop: PixelCrop, percentCrop?: PercentCrop | null) => {
+      // 松手了，允许 options 再次回写
+      draggingRef.current = false;
       if (pixelCrop.width < MIN_CROP_PX || pixelCrop.height < MIN_CROP_PX) {
+        // 只点了一下没拖：丢掉这块 1×1 的框，回到上一块有效的选区
+        setCrop(lastValidCropRef.current);
         return;
       }
+      lastValidCropRef.current = {
+        unit: 'px',
+        x: pixelCrop.x,
+        y: pixelCrop.y,
+        width: pixelCrop.width,
+        height: pixelCrop.height,
+      };
       syncCropToOptions(pixelCrop, percentCrop);
     },
     [syncCropToOptions]
   );
 
-  const applyCropFromOptions = useCallback((): boolean => {
+  /** 已保存的裁剪（源图像素）→ 渲染尺寸下的框；没有或已接近整图时返回 null。 */
+  const cropFromOptions = useCallback((): Crop | null => {
     if (!renderedImageSize || naturalSize.width <= 0 || naturalSize.height <= 0) {
-      return false;
+      return null;
     }
 
     const cropX = toNumber(options.cropX);
@@ -271,10 +306,17 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
       cropWidth <= 0 ||
       cropHeight <= 0
     ) {
-      return false;
+      return null;
     }
 
-    setCrop({
+    // 「整张图」不算裁剪：没必要显示一个铺满画布的框（它会把按下事件全吃掉）。
+    const fullWidth = cropWidth >= naturalSize.width * 0.995;
+    const fullHeight = cropHeight >= naturalSize.height * 0.995;
+    if (fullWidth && fullHeight && cropX <= naturalSize.width * 0.005 && cropY <= naturalSize.height * 0.005) {
+      return null;
+    }
+
+    return {
       unit: 'px',
       ...toRenderedCrop(
         { cropX, cropY, cropWidth, cropHeight },
@@ -283,12 +325,29 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
         naturalSize.width,
         naturalSize.height
       ),
-    });
-    return true;
-  }, [naturalSize.height, naturalSize.width, options.cropHeight, options.cropWidth, options.cropX, options.cropY, renderedImageSize]);
+    };
+  }, [
+    naturalSize.height,
+    naturalSize.width,
+    options.cropHeight,
+    options.cropWidth,
+    options.cropX,
+    options.cropY,
+    renderedImageSize,
+  ]);
 
+  /**
+   * 框的落地入口：只在「打开 / 图片尺寸就绪 / 换比例预设」时决定框长什么样。
+   *
+   * 🔴 不再跟着 `options` 每变一次就回写 `crop`。拖动的中间态在 `onChange` 里，
+   * 松手才写 options；若 effect 也在写，两边会互相覆盖 —— 实报「拖到一半跳回原处」。
+   */
   useEffect(() => {
     if (!renderedImageSize) {
+      return;
+    }
+    // 正在拖：这一刻的框以用户的指针为准，任何回写都会打断手感
+    if (draggingRef.current) {
       return;
     }
 
@@ -298,27 +357,58 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
       && previousAspectKeyRef.current !== aspectKey;
     previousAspectKeyRef.current = aspectKey;
 
-    if (!aspectModeChanged && applyCropFromOptions()) {
+    const restored = cropFromOptions();
+    if (!aspectModeChanged && restored) {
+      // 重开对话框 / 窗口尺寸变化：按已保存的裁剪还原，不重新框
+      if (!cropsNearlyEqual(crop, restored)) {
+        setCrop(restored);
+      }
+      lastValidCropRef.current = restored;
       return;
     }
 
-    const next = buildDefaultCrop(
-      renderedImageSize.width,
-      renderedImageSize.height,
-      resolvedAspect
-    );
-    setCrop(next);
-    syncCropToOptions({
-      unit: 'px',
-      x: Math.round(next.x ?? 0),
-      y: Math.round(next.y ?? 0),
-      width: Math.round(next.width ?? renderedImageSize.width),
-      height: Math.round(next.height ?? renderedImageSize.height),
-    });
+    if (resolvedAspect) {
+      const next = buildDefaultCrop(
+        renderedImageSize.width,
+        renderedImageSize.height,
+        resolvedAspect
+      );
+      setCrop(next);
+      lastValidCropRef.current = next;
+      syncCropToOptions({
+        unit: 'px',
+        x: Math.round(next.x ?? 0),
+        y: Math.round(next.y ?? 0),
+        width: Math.round(next.width ?? renderedImageSize.width),
+        height: Math.round(next.height ?? renderedImageSize.height),
+      });
+      return;
+    }
+
+    // 自由比例、且没有可用的已保存裁剪：不出初始框，让用户按住直接拖。
+    setCrop(undefined);
+    lastValidCropRef.current = undefined;
+    if (aspectModeChanged) {
+      // 从锁定比例切回「自由」：把上一套裁剪参数一并清掉，
+      // 否则下一轮 effect 又会照它把框还原出来（用户以为「切自由没反应」）。
+      onOptionsChange({
+        ...options,
+        aspectRatio: aspectMode,
+        customAspectRatio: customRatioInput,
+        // 宽高给 0：前后端都把「宽或高 <= 0」当作没有手工裁剪
+        cropX: 0,
+        cropY: 0,
+        cropWidth: 0,
+        cropHeight: 0,
+      });
+    }
   }, [
-    applyCropFromOptions,
     aspectMode,
+    crop,
+    cropFromOptions,
     customRatioInput,
+    onOptionsChange,
+    options,
     renderedImageSize,
     resolvedAspect,
     syncCropToOptions,
@@ -410,9 +500,12 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
             <ReactCrop
               crop={crop}
               onChange={(nextCrop) => {
-                if (nextCrop) {
-                  setCrop(nextCrop);
+                if (!nextCrop) {
+                  return;
                 }
+                // 拖动开始：标记一下，避免 effect 拿旧的 options 把框打回去
+                draggingRef.current = true;
+                setCrop(nextCrop);
               }}
               onComplete={handleCropComplete}
               aspect={resolvedAspect}
@@ -449,6 +542,15 @@ export function CropToolEditor({ plugin, sourceImageUrl, options, onOptionsChang
             />
           )}
         </div>
+        {!crop && (
+          // 没有初始框时给一句话：以前默认框铺满整张图，用户以为「框拖不出来」，
+          // 现在从空白开始，得明确告诉他「按住拖」。
+          <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
+            <span className="rounded-full bg-black/60 px-3 py-1 text-xs text-white/85">
+              在图片上按住拖动，框出要保留的区域
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );

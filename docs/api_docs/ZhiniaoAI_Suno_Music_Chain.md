@@ -40,13 +40,56 @@
 ## 2. 端点与传输
 
 ```
-POST {base}/v1/audio/speech/async        ← 提交, 返回 { task_id }
-GET  {base}/v1/tasks/{task_id}           ← 轮询到终态
+POST {base}/api/v1/model-runtime/invoke   ← 提交(信封), 立即返回 { task_id }
+GET  {base}/v1/tasks/{task_id}            ← 轮询到终态
      → 结果给 CDN URL → 下载落盘
 ```
 
-与语音链路**共用同一个提交端点族**，靠 `model` 分流（官方说法：
-「把 base_url 换成本平台、model 填 `music`，其余请求体保持 GT 原样即可」）。
+### 🔴 2.1 为什么不是 `/v1/audio/speech/async`（2026-11-18 修正）
+
+上一版写的是「与语音链路共用同一个提交端点，靠 `model` 分流」——**这条是错的**。
+实测（App 1.2.64 用户报障）：
+
+```json
+{"error": {"message": "params.voice is required for speech"}}   // HTTP 400
+```
+
+`/v1/audio/speech(/async)` 是**语音合成（TTS）专用**端点，固定按 speech 处理，
+`operation` 传什么都不会改变它的判断，缺 `params.voice` 就直接 400。音乐卡必须走
+`POST /api/v1/model-runtime/invoke`（或扁平别名 `/v1/audio/generations`，但那个端点
+固定按「生成」处理，表达不了 `extend/cover/stems`，故不用）。
+
+请求体是**信封**，不是顶层扁平：
+
+```jsonc
+{
+  "model_id": "music",          // 模型目录里的 id / public_id
+  "modality": "audio",          // 音频模态在统一入口里恒为异步
+  "operation": "generate",      // 音乐卡必填：不写会被当成 TTS，报 params.input is required
+  "params": {
+    "prompt": "轻松惬意的民谣",  // 描述/主题；**必须存在**，后处理操作也要给（空串可）
+    "version": "chirp-v6",      // 平台会归一成 v6
+    "mode": "song",             // song / instrumental
+    "style": "民谣, 治愈",
+    "lyrics": "[verse]\n...",
+    "title": "春日",
+    "vocal_gender": "f",        // 仅 song 模式
+    "negative_tags": "重金属",
+    "clip_id": "…",             // stems/stems_all/mp4/concat
+    "continue_clip_id": "…",    // extend
+    "cover_clip_id": "…"        // cover
+  }
+}
+```
+
+免鉴权复核手段（**¥0**，不打厂商、不冻结、不计费）：
+
+```
+POST {base}/api/v1/model-runtime/dry-run     ← 同一个信封, 返回 wire.body 与命中渠道
+```
+
+> dry-run 的 `wire.body` 只展开生成骨架（`prompt/version/custom/style/...`），
+> `clip_id` 一类字段在预览里不出现 —— 别据此判断参数被丢弃。
 
 - **异步是必须的**：Suno 出歌中位 60–120 秒，同步长连接不可靠。
 - 轮询间隔 **3 秒**（文档「建议每 3 秒轮询一次」）。
@@ -71,7 +114,7 @@ GET  {base}/v1/tasks/{task_id}           ← 轮询到终态
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `operation` | enum | `generate` | 8 种，见下 |
+| `operation` | enum | `generate` | 平台 19 种，本应用登记 9 种，见下 |
 | `version` | enum | `chirp-v6` | `chirp-v6` / `chirp-v6-mini` / `chirp-v5` / `chirp-v4-5` |
 | `mode` | enum | `song` | `song`(含人声) / `instrumental`(纯器乐) |
 | `style` | string | — | 音乐风格/流派/情绪，逗号分隔（映射 Suno `tags`） |
@@ -83,6 +126,13 @@ GET  {base}/v1/tasks/{task_id}           ← 轮询到终态
 | `continue_clip_id` | string | — | `extend` **必填** |
 | `continue_at` | string | — | `extend` 可选，不传则从结尾续 |
 | `cover_clip_id` | string | — | `cover` **必填** |
+| `cover_audio_url` | string | — | `upload_cover` **必填**：公网可下载的音频（mp3/wav/m4a，建议 ≤8 分钟）；非纯音乐模式须同时给 `lyrics` |
+
+字段总数为 **25**，`operation` 的 `enum` 有 **19** 项。本应用只落地 9 项，其余
+（`persona` / `import` / `upload_extend` / `inspo` / `sample` / `add_vocals` /
+`add_instrumental` / `add_stem` / `replace_section` / `mashup`）各自还需额外字段
+（`persona_name`、`audio_urls`、`start_s`/`end_s`、`infill_lyrics`、`second_clip_id`），
+**未接入前不要塞进下拉** —— 选了必然失败的项比没有这一项更糟。
 
 模型元数据补充：`max_prompt_chars = 5000`、`tags = [audio, music, suno]`、
 `supported_vendors = [AII, APM, BB6, MXH, OLX, TKG]`。
@@ -90,35 +140,71 @@ GET  {base}/v1/tasks/{task_id}           ← 轮询到终态
 `version` 备注（平台原文）：官方自 2026-09-09 起只提供 V6 系列，旧版本请求自动按 v6 处理；
 `v5` / `v4.5` 是个别渠道专供的旧引擎，非官方现役版本。
 
-## 5. 8 种 operation 的字段依赖
+## 5. 9 种 operation 的字段依赖
 
-| operation | 源 clip 字段 | 需要主题 | 生成类字段生效 | 产出 |
+| operation | 源 | 需要主题 | 生成类字段生效 | 产出 |
 |---|---|---|---|---|
 | `generate` | — | ✅ | ✅ | 音频 |
-| `extend` | `continue_clip_id`(+`continue_at`) | — | ✅ | 音频 |
-| `cover` | `cover_clip_id` | ✅ | ✅ | 音频 |
+| `extend` | clip: `continue_clip_id`(+`continue_at`) | — | ✅ | 音频 |
+| `cover` | clip: `cover_clip_id` | ✅ | ✅ | 音频 |
+| `upload_cover` | **音频**: `cover_audio_url` | —（歌曲模式须给 `lyrics`） | ✅ | 音频 |
 | `lyrics` | — | ✅ | — | **文本** |
-| `stems` | `clip_id` | — | — | 音频（多轨） |
-| `stems_all` | `clip_id` | — | — | 音频（多轨，12 路） |
-| `mp4` | `clip_id` | — | — | **视频** |
-| `concat` | `clip_id` | — | — | 音频 |
+| `stems` | clip: `clip_id` | — | — | 音频（多轨） |
+| `stems_all` | clip: `clip_id` | — | — | 音频（多轨，12 路） |
+| `mp4` | clip: `clip_id` | — | — | **视频** |
+| `concat` | clip: `clip_id` | — | — | 音频 |
 
 这里的「生成类字段」= `version` / `mode` / `style` / `lyrics` / `title` /
 `vocal_gender` / `negative_tags`。
+
+### 5.1 `upload_cover`：源是音频文件，不是 clip
+
+这是唯一**不依赖平台内 clip** 的源。三段式：
+
+```
+画布上的音频（本地路径 / asset:// / data URL / 公网 URL）
+  → uploadZhiniaoReferenceAsset   (/v1/files, 幂等、不计费) → 公网直链
+  → dry-run 免费探测「这条直链真的会被发出去吗」
+  → POST /api/v1/model-runtime/invoke {operation:'upload_cover', params.cover_audio_url}
+```
+
+节点侧存的是**原始地址**（`sunoCoverAudioUrl`），不做预改写：改写只能发生在提交那一刻，
+否则本地文件被换成 24 小时后失效的图床 URL，重开工程就再也上传不了。
+
+#### 🔴 实测：当前平台渠道会丢弃源音频（2026-11-18）
+
+`POST /api/v1/model-runtime/dry-run`（同信封，¥0）逐渠道验证的结果：
+
+| lane | `candidate_type` | 发出去的 body | 有源吗 |
+|---|---|---|---|
+| `music@APM:default` | `apimart-suno-async` | `{"custom":true,"instrumental":true,"style":"jazz","version":"v6"}` | ❌ |
+| `music@MXH:default` | `suno-music-async` | `{"make_instrumental":true,"mv":"chirp-hawk","prompt":"","tags":"jazz"}` | ❌ |
+| `music@AII` / `music@BB6` | — | 锁渠道 + `version=chirp-v6` → `503 dry_run_no_route` | — |
+| `music@OLX` | — | `422 pinned_channel_unavailable` | — |
+
+`cover_audio_url`（以及 `cover_clip_id`、`audio_url`）在**所有可用渠道**都被映射器
+静默丢弃 —— 也就是提交后会扣 ⚡0.1714 却生成一首全新的歌，用户看不出原因。
+
+因此链路层加了守卫 `assertSunoSourceReachesUpstream`：提交前跑一次 dry-run，比对
+`wire` 里是否出现源（整串 → host → 路径 → 文件名逐级放宽，见
+`sunoDryRunCarriesSource`）；不含则**不提交**，直接报出「平台渠道未透传源音频」。
+dry-run 本身失败也拦（付费操作，没有证据就不替平台担保）。
+
+平台修好渠道映射后，这个守卫会自动放行，不需要改代码。
 
 ## 6. 实现映射
 
 | 层 | 文件 | 内容 |
 |---|---|---|
-| 协议 | `src/commands/sunoMusic.ts` | 12 字段表、8 operation 规格、请求体构造、校验、响应解析 |
-| 链路 | `src/commands/ai.ts` | `generateSunoMusic`（异步提交+轮询+下载）、`generateSunoLyrics`、分发顺序 |
+| 协议 | `src/commands/sunoMusic.ts` | 25 字段表、9 operation 规格、请求体构造、校验、响应解析、`sunoDryRunCarriesSource` |
+| 链路 | `src/commands/ai.ts` | `generateSunoMusic`（上传源音频 → dry-run 守卫 → 异步提交+轮询+下载）、`generateSunoLyrics`、分发顺序 |
 | 端口 | `application/ports.ts` | `SunoMusicPayload`、`GenerateAudioLyricsPayload`、`generateAudioLyrics` |
-| 网关 | `infrastructure/tauriAiGateway.ts` | 字段透传 |
+| 网关 | `infrastructure/tauriAiGateway.ts` | 字段透传（含 `suno_cover_audio_url`） |
 | 模型 | `models/registry.ts` | `musicProtocol: 'suno' \| 'generic'`（与链路层同源判定） |
-| 节点 | `nodes/audio/SunoMusicStudio.tsx` | 一个 operation 下拉驱动的表单 |
+| 节点 | `nodes/audio/SunoMusicStudio.tsx` | 一个 operation 下拉驱动的表单（含「源音频」选择） |
 | 节点 | `nodes/audio/SunoTagPicker.tsx` | 风格/排除标签的点选面板（收起态一行） |
 | 节点 | `nodes/audio/sunoTagLibrary.ts` | 446 个风格标签 + 89 个排除标签，按分组维护 |
-| 节点 | `domain/canvasNodes.ts` | `sunoOperation` / `sunoVersion` / … / `sunoCoverClipId` |
+| 节点 | `domain/canvasNodes.ts` | `sunoOperation` / `sunoVersion` / … / `sunoCoverClipId` / `sunoCoverAudioUrl` |
 
 ### 分发顺序（`generateAudio`）
 
@@ -140,17 +226,19 @@ GET  {base}/v1/tasks/{task_id}           ← 轮询到终态
 `operation=lyrics` 的产出是**歌词文本**，不是音频/视频。把它放进下拉会让「生成」按钮
 在一个产出文本的操作上返回「媒体路径」。所以做成歌词框旁边的 **「AI 写词」按钮**，
 结果直接回填歌词框 —— 与平台自身的 UI 一致（其文案为「请先在描述框输入歌曲主题」）。
-因此下拉里是 **7 项**，`lyrics` 走独立入口。
+因此下拉里是 **8 项**，`lyrics` 走独立入口。
 
 ## 7. 待一次实跑确认
 
 | 项 | 现状 | 依据 |
 |---|---|---|
-| 请求体信封形状 | 按**顶层扁平**构造（与 speech 同端点同风格） | `param_schema` 是顶层字段；字子动画的 `metadata` 信封对本平台不成立 |
-| 文本字段名 | 用 `input` | 同端点上 speech-2.8 已用 `input`（见 MiniMax 链路文档） |
-| `operation=generate` 是否可省略 | **显式发送** | `default: generate`，显式更不容易出歧义 |
+| 请求体信封形状 | **已确认**：信封 `{model_id, modality, operation, params}` | openapi.json + dry-run 实测（2026-11-18） |
+| 文本字段名 | 用 `params.prompt`（`params.input` 是等价别名） | dry-run：两种写法都映射成上游 `prompt` |
+| `operation=generate` 是否可省略 | **必须显式发送** | dry-run：不写 → `400 params.input is required`（被当成 TTS） |
 | 响应体形状 | 解析写得**尽量宽容**（深度遍历 + 打分排序） | 未见文档示例，见 `extractSunoFileUrls` |
 | clip 标识字段 | 优先 `source_id`，兼容 `clip_id` | `continue_clip_id` 的说明原文：「来自上次生成结果的 source_id」 |
+| `upload_cover` 源音频是否真的送厂 | **当前渠道未实现**（静默丢弃），已加 dry-run 守卫 | dry-run 逐渠道实测，见 §5.1 |
+| `cover` 的 `cover_clip_id` 是否真的送厂 | **同样未实现**（同一映射器丢弃），尚未加守卫 | 同上；用 cover 前建议先 dry-run 确认 |
 
 按铁律：真实计费端点需**逐个征得同意后一次一条**验证，单价 ⚡0.1714/次。
 

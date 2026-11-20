@@ -288,7 +288,8 @@
       "copyPrompt": "Copy prompt",
       "copyAll": "Copy all",
       "copied": "Copied",
-      "copy": "Copy"
+      "copy": "Copy",
+      "referenceVideo": "Reference videos"
     },
     "nodeManager": {
       "title": "Nodes",
@@ -369,7 +370,8 @@
       "loading": "Loading…",
       "previewAlt": "Rotate Preview"
     },
-    "adjust": "Adjust"
+    "adjust": "Adjust",
+    "imageEdit": "Image editor"
   },
   "toolDialog": {
     "suffix": " Tool",
@@ -420,6 +422,14 @@
     "reversePromptNoModel": "No vision model available yet. Add an API key for a chat model that can read images in Settings.",
     "reversePromptImageUnreadable": "This image cannot be read, so the prompt cannot be reversed. Check that the file still exists.",
     "reversePromptFailed": "Reverse prompt failed",
+    "reverseAudioPrompt": "Reverse Prompt",
+    "reverseAudioPromptHint": "Read this audio with an audio-capable model to reverse-engineer the music style, lyrics and dialogue; the result becomes a text node on the right",
+    "reverseAudioPromptRunning": "Reversing…",
+    "reverseAudioPromptNodeName": "Audio Reverse",
+    "reverseAudioPromptNoModel": "No audio-capable model available yet. Add a chat model that can listen to audio (e.g. gemini, qwen-omni, gpt-4o-audio) in Settings and give it an API key.",
+    "reverseAudioPromptUnreadable": "The audio never reached the model (some relays drop audio content). Try a different model or provider that supports audio input.",
+    "reverseAudioPromptTooLarge": "This audio is over {{size}} MB, too large to inline into a request. Trim or compress it first.",
+    "reverseAudioPromptFailed": "Audio reverse prompt failed",
     "imageUpscaleModel": "HD model",
     "imageUpscaleChangeModel": "Change model",
     "imageUpscaleNoModel": "No image model available yet. Configure a platform in Settings first.",
@@ -632,7 +642,13 @@
       "binghuoReferenceVideosHint": "One public URL per line, max 3; upload local clips via the asset library first and paste the URL. Sent verbatim as reference_videos.",
       "binghuoReferenceVideosCount": "{count}/3",
       "binghuoSkipReviewLabel": "Skip review (bh series only: bh2.0-* and bh2.04K; no effect on other models)",
-      "binghuoSkipReviewHint": "Declare no real-person likeness; the task starts almost immediately. Misrepresenting real-person assets will fail generation upstream (refunded on failure)."
+      "binghuoSkipReviewHint": "Declare no real-person likeness; the task starts almost immediately. Misrepresenting real-person assets will fail generation upstream (refunded on failure).",
+      "previewReferenceVideo": "Click to play",
+      "ignoredByModel": "This model ignores this reference",
+      "videoReferenceUnsupported": "This model does not read reference videos (switch to a model that supports them)",
+      "videoReferenceUnsupportedHint": "Reference videos only apply to protocols that read reference_videos: Binghuo, Zzdh -video models, WGSPAI video series, Kuaizi / likeai / RunningHub, Jimeng Canvas CLI Seedance 2.0 / 2.5 series (m2v), Jimeng CLI multimodal2video models",
+      "videoReferenceFirstLastIgnored": "First/last-frame mode does not submit reference videos (switch back to Reference to include them)",
+      "videoReferenceFirstLastHint": "In first/last-frame mode --ref only carries the first and last images, so reference videos are not submitted. Switch back to Reference to include them."
     },
     "upload": {
       "uploadedAlt": "Uploaded image",
@@ -789,6 +805,7 @@
           "generate": "Generate",
           "extend": "Extend",
           "cover": "Cover",
+          "uploadCover": "Cover upload",
           "lyrics": "AI lyrics",
           "stems": "Vocal / backing split",
           "stemsAll": "12-track split",
@@ -799,6 +816,7 @@
           "generate": "Create a full track from a theme or description, with optional custom lyrics and style tags; leave lyrics empty and AI writes them (inspiration mode)",
           "extend": "Continue an existing track (needs a source clip); optionally set the start second, otherwise it continues from the end",
           "cover": "Keep the melody but re-perform it with a new style and lyrics (needs a source clip)",
+          "uploadCover": "Cover your own audio — any mp3/wav/m4a works and local files are uploaded automatically; song mode requires lyrics",
           "lyrics": "Write lyrics text from a theme",
           "stems": "Split an existing track into vocals and backing (needs a source clip)",
           "stemsAll": "Split an existing track into all 12 stems (needs a source clip)",
@@ -841,7 +859,13 @@
         "continueClip": "Source clip to extend",
         "coverClip": "Source clip to cover",
         "pickFromUpstream": "Pick from upstream…",
-        "noUpstreamClip": "No track available upstream — connect this node after a generated track, or paste a clipId below",
+        "noUpstreamClip": "No usable track upstream — extend/cover/split all need a Suno-generated clip. To use your own audio, switch the operation to “Cover upload”, or paste a clipId below",
+        "coverAudioUrl": "Source audio to cover",
+        "coverAudioUrlPlaceholder": "Local audio path or public URL (mp3 / wav / m4a)",
+        "coverAudioUrlHint": "Any upstream audio works, including local mp3s: it is uploaded to a public URL before submitting, no clip needed. Song mode requires lyrics; instrumental mode may leave them empty.",
+        "uploadCoverProbeHint": "Before submitting, the platform's free dry-run checks that the source audio is really sent — some channels drop this field, and in that case nothing is submitted or charged.",
+        "pickAudioFromUpstream": "Pick upstream audio…",
+        "noUpstreamAudio": "No audio upstream — connect an audio node, or paste a public URL below",
         "clipIdPlaceholder": "clipId (the source_id of a previous result)",
         "continueAt": "Start at (seconds)",
         "continueAtPlaceholder": "Empty continues from the end",
@@ -855,6 +879,8 @@
         "needClipId": "This operation needs a source clip — pick a generated track upstream or paste a clipId",
         "needContinueClipId": "Extending needs a source clip — pick a generated track upstream or paste a clipId",
         "needCoverClipId": "Covering needs a source clip — pick a generated track upstream or paste a clipId",
+        "needCoverAudioUrl": "Cover upload needs source audio — connect an audio node (uploaded automatically) or paste a public audio URL",
+        "needCoverLyrics": "Cover upload in song mode requires lyrics; switch to “Instrumental” to let it sing on its own",
         "needPrompt": "Enter a song theme or description in the input above first",
         "promptHint": "↑ The box above is the song theme / description: write what it is about (subject, story, imagery, mood). Put genre and timbre in the style tags below instead — no need to repeat them here. AI lyrics reads this text too.",
         "promptPlaceholder": "e.g. a farewell at a convenience store on a rainy night, restrained gentle male folk ballad, about missing out and letting go",
@@ -877,7 +903,9 @@
           "negVoice": "Excluded vocals",
           "negAudio": "Excluded audio flaws",
           "negContent": "Excluded moods & themes"
-        }
+        },
+        "useAsSource": "Use this clip as the source for the current operation",
+        "sourceUnavailable": "This audio has no Suno clip id, so it cannot be the source here; switch the operation to “Cover upload” to use plain audio"
       },
       "mmx": {
         "cloneTitle": "Voice clone",
@@ -950,7 +978,8 @@
         "previewCostHint": "Cloning itself returns no preview — this sends one extra speech synthesis (billed per character)",
         "speechPlaceholder": "Enter the text to synthesize with this voice (max 9999 characters)",
         "pricePerCall": "⚡{{price}} / call"
-      }
+      },
+      "previewAsset": "Click to play"
     },
     "motionControl": {
       "modeMotion": "Motion Control",

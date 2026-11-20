@@ -748,6 +748,7 @@ export function renderAdjustedCanvas(
   width: number,
   height: number,
   adjust: MosaicAdjust | undefined | null,
+  mask?: Uint8ClampedArray | null,
 ): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(width));
@@ -757,7 +758,22 @@ export function renderAdjustedCanvas(
   context.drawImage(image, 0, 0, canvas.width, canvas.height);
   if (adjust && !isAdjustIdentity(adjust)) {
     const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+    // 有掩码时：只对掩码内（alpha>0）的像素调色，掩码外保持原样。
+    // 实现：先把原图备份，调完色后按掩码 alpha 把原像素混合回来。
+    const original = mask ? new Uint8ClampedArray(pixels.data) : null;
     applyAdjustToImageData(pixels.data, adjust);
+    if (original && mask) {
+      for (let i = 0; i < mask.length; i += 1) {
+        if (mask[i] === 0) {
+          // 掩码外：还原原像素（RGBA 四个字节）。
+          const o = i * 4;
+          pixels.data[o] = original[o];
+          pixels.data[o + 1] = original[o + 1];
+          pixels.data[o + 2] = original[o + 2];
+          pixels.data[o + 3] = original[o + 3];
+        }
+      }
+    }
     context.putImageData(pixels, 0, 0);
   }
   return canvas;
@@ -880,7 +896,7 @@ async function loadPreviewSource(url: string, maxEdge: number): Promise<PreviewS
 }
 
 /** 把调整参数落到复用画布上，同步完成（所以可以安全地共用一块画布）。 */
-function paintAdjusted(source: PreviewSource, adjust: MosaicAdjust): HTMLCanvasElement {
+function paintAdjusted(source: PreviewSource, adjust: MosaicAdjust, maskAlpha?: Uint8ClampedArray | null): HTMLCanvasElement {
   if (!previewCanvas) previewCanvas = document.createElement("canvas");
   const canvas = previewCanvas;
   if (canvas.width !== source.width || canvas.height !== source.height) {
@@ -892,7 +908,20 @@ function paintAdjusted(source: PreviewSource, adjust: MosaicAdjust): HTMLCanvasE
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.drawImage(source.canvas, 0, 0);
   const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+  // 有掩码时：备份原像素，调完色后掩码外还原（局部调色）。
+  const original = maskAlpha ? new Uint8ClampedArray(pixels.data) : null;
   applyAdjustToImageData(pixels.data, adjust);
+  if (original && maskAlpha) {
+    for (let i = 0; i < maskAlpha.length; i += 1) {
+      if (maskAlpha[i] === 0) {
+        const o = i * 4;
+        pixels.data[o] = original[o];
+        pixels.data[o + 1] = original[o + 1];
+        pixels.data[o + 2] = original[o + 2];
+        pixels.data[o + 3] = original[o + 3];
+      }
+    }
+  }
   context.putImageData(pixels, 0, 0);
   return canvas;
 }
@@ -907,27 +936,53 @@ export function getAdjustedPreviewUrl(
   imageUrl: string,
   adjust: MosaicAdjust | undefined | null,
   maxEdge: number = PREVIEW_MAX_EDGE,
+  maskDataUrl?: string | null,
 ): Promise<string> {
   if (!adjust || isAdjustIdentity(adjust)) return Promise.resolve(imageUrl);
-  const key = `${maxEdge}|${imageUrl}|${JSON.stringify(adjust)}`;
+  const key = `${maxEdge}|${imageUrl}|${JSON.stringify(adjust)}|${maskDataUrl ?? ""}`;
   const cached = previewCache.get(key);
   if (cached) return Promise.resolve(cached);
   const inflight = previewInflight.get(key);
   if (inflight) return inflight;
 
-  const task = loadPreviewSource(imageUrl, maxEdge)
-    .then((source) => {
-      const url = paintAdjusted(source, adjust).toDataURL("image/png");
-      previewCache.set(key, url);
-      if (previewCache.size > PREVIEW_CACHE_LIMIT) {
-        const oldest = previewCache.keys().next().value;
-        if (oldest) previewCache.delete(oldest);
-      }
-      return url;
-    })
-    .finally(() => {
-      previewInflight.delete(key);
-    });
+  const task = (async () => {
+    const source = await loadPreviewSource(imageUrl, maxEdge);
+    // 有局部调色蒙版时，把掩码缩放到预览尺寸（图层框坐标 → 预览源图坐标，近似等比缩放）。
+    let maskAlpha: Uint8ClampedArray | null = null;
+    if (maskDataUrl) {
+      maskAlpha = await loadMaskAlphaForPreview(maskDataUrl, source.width, source.height);
+    }
+    const url = paintAdjusted(source, adjust, maskAlpha).toDataURL("image/png");
+    previewCache.set(key, url);
+    if (previewCache.size > PREVIEW_CACHE_LIMIT) {
+      const oldest = previewCache.keys().next().value;
+      if (oldest) previewCache.delete(oldest);
+    }
+    return url;
+  })().finally(() => {
+    previewInflight.delete(key);
+  });
   previewInflight.set(key, task);
   return task;
+}
+
+/** 从掩码 data URL 读 alpha，缩放到目标尺寸（预览用，近似等比）。 */
+async function loadMaskAlphaForPreview(maskDataUrl: string, width: number, height: number): Promise<Uint8ClampedArray | null> {
+  try {
+    const image = await loadImageElement(maskDataUrl, true);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(image, 0, 0, width, height);
+    const data = ctx.getImageData(0, 0, width, height).data;
+    const alpha = new Uint8ClampedArray(width * height);
+    for (let i = 0; i < alpha.length; i += 1) {
+      alpha[i] = data[i * 4 + 3];
+    }
+    return alpha;
+  } catch {
+    return null;
+  }
 }

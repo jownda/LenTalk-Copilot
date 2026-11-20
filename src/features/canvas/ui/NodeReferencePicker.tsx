@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import { useStore } from '@xyflow/react';
-import { AudioLines, Play } from 'lucide-react';
+import { AudioLines, Clapperboard, Play } from 'lucide-react';
 
 import { CanvasNodeImage } from './CanvasNodeImage';
 import {
@@ -23,8 +23,8 @@ import {
  */
 export interface NodeReferencePickerEntry {
   key: string;
-  /** 缺省按图片处理，`audio` 时显示音频占位图标。 */
-  kind?: 'image' | 'audio';
+  /** 缺省按图片处理，`audio` / `video` 时显示对应的占位图标。 */
+  kind?: 'image' | 'audio' | 'video';
   label: string;
   /** 图片缩略图地址；为空时降级成占位块。 */
   thumbUrl?: string | null;
@@ -58,6 +58,9 @@ interface NodeReferencePickerProps {
   onPreviewAudio?: (index: number) => void;
   /** 试听按钮的提示文案（调用方传 i18n 文案）。 */
   previewAudioTitle?: string;
+  /** 视频条目的「播放」入口：和试听一样必须自成一处，否则点一下既插入又播放。 */
+  onPreviewVideo?: (index: number) => void;
+  previewVideoTitle?: string;
 }
 
 /**
@@ -77,6 +80,8 @@ export function NodeReferencePicker({
   className = '',
   onPreviewAudio,
   previewAudioTitle = '试听',
+  onPreviewVideo,
+  previewVideoTitle = '播放',
 }: NodeReferencePickerProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const [placement, setPlacement] = useState<NodePickerPlacement | null>(null);
@@ -184,6 +189,7 @@ export function NodeReferencePicker({
       >
         {entries.map((entry, index) => {
           const isAudio = entry.kind === 'audio';
+          const isVideo = entry.kind === 'video';
           const active = activeIndex === index;
 
           return (
@@ -199,9 +205,9 @@ export function NodeReferencePicker({
                 active ? 'border-[rgba(255,255,255,0.24)] bg-bg-dark' : ''
               }`}
             >
-              {isAudio ? (
+              {isAudio || isVideo ? (
                 <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-accent/15 text-accent">
-                  <AudioLines className="h-3.5 w-3.5" />
+                  {isVideo ? <Clapperboard className="h-3.5 w-3.5" /> : <AudioLines className="h-3.5 w-3.5" />}
                 </span>
               ) : entry.thumbUrl ? (
                 <CanvasNodeImage
@@ -216,24 +222,28 @@ export function NodeReferencePicker({
                 <span className="h-6 w-6 shrink-0 rounded bg-bg-dark" />
               )}
               <span className="min-w-0 flex-1 truncate">{entry.label}</span>
-              {isAudio && onPreviewAudio && (
-                // 行本身是「插入引用」，试听必须自成一处，否则点一下既插入又发声。
+              {(isAudio && onPreviewAudio) || (isVideo && onPreviewVideo) ? (
+                // 行本身是「插入引用」，试听/播放必须自成一处，否则点一下既插入又预览。
                 // 用 span 而不是 button：外层已经是 <button>，嵌套 button 会被浏览器拆开。
                 <span
                   role="button"
                   tabIndex={-1}
-                  title={previewAudioTitle}
-                  aria-label={previewAudioTitle}
+                  title={isVideo ? previewVideoTitle : previewAudioTitle}
+                  aria-label={isVideo ? previewVideoTitle : previewAudioTitle}
                   className="flex h-4 w-4 shrink-0 items-center justify-center rounded text-accent/80 opacity-0 transition-opacity hover:bg-accent/20 hover:text-accent group-hover:opacity-100"
                   onClick={(event) => {
                     event.stopPropagation();
-                    onPreviewAudio(index);
+                    if (isVideo) {
+                      onPreviewVideo?.(index);
+                    } else {
+                      onPreviewAudio?.(index);
+                    }
                   }}
                   onMouseDown={(event) => event.stopPropagation()}
                 >
                   <Play className="h-2.5 w-2.5" />
                 </span>
-              )}
+              ) : null}
             </button>
           );
         })}

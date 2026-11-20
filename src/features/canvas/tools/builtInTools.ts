@@ -12,9 +12,15 @@ function supportsImageSourceNode(node: CanvasNode): boolean {
   return isUploadNode(node) || isImageEditNode(node) || isExportImageNode(node);
 }
 
+/**
+ * 入口文案叫「图片编辑」，实际打开的是「图片编辑」节点的全屏编辑器
+ * （点它不再弹裁剪对话框，见 `NodeActionToolbar` 的点击处理）。
+ *
+ * 插件本身仍保留裁剪的执行能力：全屏编辑器里裁完直接导出，这条链路没废。
+ */
 export const cropToolPlugin: CanvasToolPlugin = {
   type: NODE_TOOL_TYPES.crop,
-  label: '裁剪',
+  label: '图片编辑',
   icon: 'crop',
   editor: 'crop',
   supportsNode: (node) => supportsImageSourceNode(node) && Boolean(node.data.imageUrl),

@@ -795,20 +795,25 @@ const CANVAS_VIDEO_CURATION: ReadonlyArray<{
   minDuration: number;
   maxDuration: number;
   resolutions: string[];
+  /** 目录没同步到时兜底的参考视频额度（`m2v` 的 `references.types[video].max`）。 */
+  maxVideos?: number;
 }> = [
   // 样片模式的专用模型（CLI 1.1.1 起）：只有 480p，便宜快速出小样；满意后用
   // `node promote video-sample` 转成正式分辨率，别直接拿它当成品。
-  { model: "seedance_2.5_draft", label: "Seedance 2.5 样片", minDuration: 4, maxDuration: 30, resolutions: ["480p"] },
-  { model: "seedance_2.5", label: "Seedance 2.5", minDuration: 4, maxDuration: 30, resolutions: ["480p", "720p", "1080p"] },
+  { model: "seedance_2.5_draft", label: "Seedance 2.5 样片", minDuration: 4, maxDuration: 30, resolutions: ["480p"], maxVideos: 10 },
+  { model: "seedance_2.5", label: "Seedance 2.5", minDuration: 4, maxDuration: 30, resolutions: ["480p", "720p", "1080p"], maxVideos: 10 },
   // Flash 的档位和「旧 CLI 的 seedance2.5_flash」不是一回事：画布通道是 480p/720p,
   // 旧 CLI 通道是 720p/1080p/4k（服务端各自校验，`480p requires model_version seedance2.5`）。
-  { model: "seedance_2.5_flash", label: "Seedance 2.5 Flash", minDuration: 4, maxDuration: 30, resolutions: ["480p", "720p"] },
-  { model: "seedance_2.0_vip", label: "Seedance 2.0 VIP", minDuration: 4, maxDuration: 15, resolutions: ["720p", "1080p", "4k"] },
-  { model: "seedance_2.0_fast_vip", label: "Seedance 2.0 Fast VIP", minDuration: 4, maxDuration: 15, resolutions: ["720p"] },
-  { model: "seedance_2.0_mini", label: "Seedance 2.0 Mini", minDuration: 4, maxDuration: 15, resolutions: ["720p"] },
+  { model: "seedance_2.5_flash", label: "Seedance 2.5 Flash", minDuration: 4, maxDuration: 30, resolutions: ["480p", "720p"], maxVideos: 5 },
+  { model: "seedance_2.0_vip", label: "Seedance 2.0 VIP", minDuration: 4, maxDuration: 15, resolutions: ["720p", "1080p", "4k"], maxVideos: 3 },
+  { model: "seedance_2.0_fast_vip", label: "Seedance 2.0 Fast VIP", minDuration: 4, maxDuration: 15, resolutions: ["720p"], maxVideos: 3 },
+  { model: "seedance_2.0_mini", label: "Seedance 2.0 Mini", minDuration: 4, maxDuration: 15, resolutions: ["720p"], maxVideos: 3 },
+  // 1.0 没有 m2v：一段参考视频都不收，兜底保持 undefined（=由协议判定为 0）。
   { model: "seedance_pro_fast", label: "Seedance 1.0 Fast", minDuration: 5, maxDuration: 10, resolutions: ["720p", "1080p"] },
   { model: "happyhorse_1.1", label: "HappyHorse 1.1", minDuration: 4, maxDuration: 15, resolutions: ["720P", "1080P"] },
-  { model: "wan_3.0", label: "Wan 3.0", minDuration: 4, maxDuration: 15, resolutions: ["720P", "1080P"] },
+  // Wan 3.0 的 m2v 也收视频（目录：图 10 / 视频 5 / 音频 5）—— 它不是 seedance，
+  // 但同属画布通道，兜底值一样要给，否则目录缓存旧了就会误标成不支持。
+  { model: "wan_3.0", label: "Wan 3.0", minDuration: 4, maxDuration: 15, resolutions: ["720P", "1080P"], maxVideos: 5 },
 ];
 
 function buildJimengCanvasCliVideoModels(): VideoModelDefinition[] {
@@ -824,6 +829,7 @@ function buildJimengCanvasCliVideoModels(): VideoModelDefinition[] {
     minDuration: number;
     maxDuration: number;
     resolutions: string[];
+    maxVideos?: number;
   }> = (catalog?.video ?? [])
     .filter((entry) => !known.has(entry.model) && entry.resolutions.length > 0)
     .map((entry) => ({
@@ -832,10 +838,11 @@ function buildJimengCanvasCliVideoModels(): VideoModelDefinition[] {
       minDuration: entry.durations[0] ?? 4,
       maxDuration: entry.durations[entry.durations.length - 1] ?? 15,
       resolutions: entry.resolutions,
+      maxVideos: entry.maxVideoReferences,
     }));
 
   return [...CANVAS_VIDEO_CURATION, ...extras].map(
-    ({ model, label, minDuration, maxDuration, resolutions }) => {
+    ({ model, label, minDuration, maxDuration, resolutions, maxVideos }) => {
       const entry = entries.get(model);
       const durationOptions = entry?.durations.length
         ? entry.durations
@@ -849,12 +856,22 @@ function buildJimengCanvasCliVideoModels(): VideoModelDefinition[] {
       const aspectRatios = entry?.aspectRatios.length
         ? CUSTOM_ASPECT_RATIOS.filter((value) => entry.aspectRatios.includes(value))
         : [];
+      // 目录是权威；但两个坑要兜住：
+      // ① 24h 缓存可能是升级前写的，缺 `maxVideoReferences`；
+      // ② Rust 的 `serde(default)` 会把缺失字段补成 0，前端看到的就是「额度 0」。
+      // 0 与「该模型确实不收视频」无法区分，所以 0 一律退回策展表兜底 ——
+      // 表里没有的模型（vidu / happyhorse）兜底仍是 undefined，判定结果不受影响。
+      const catalogVideoQuota = entry?.maxVideoReferences;
+      const videoQuota = catalogVideoQuota ? catalogVideoQuota : maxVideos;
 
       return {
         id: `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`,
         mediaType: "video" as const,
         displayName: `即梦画布 CLI · ${label}`,
         providerId: JIMENG_CANVAS_CLI_PROVIDER_ID,
+        // 必须显式带上：节点用 `getVideoModelProfile(model.profileId)` 取协议档案，
+        // 漏了就会掉到通用 OpenAI Video 档案 —— 参考视频判定、协议标签全跟着错。
+        profileId: "jimeng-canvas",
         description: `即梦画布 CLI · ${label}`,
         expectedDurationMs: 600000,
         aspectRatios: (aspectRatios.length ? aspectRatios : CUSTOM_ASPECT_RATIOS).map((value) => ({
@@ -866,7 +883,12 @@ function buildJimengCanvasCliVideoModels(): VideoModelDefinition[] {
         defaultDuration: durationOptions.includes(5) ? 5 : durationOptions[0],
         resolutions: tiers.map((value) => ({ value, label: value.toUpperCase() })),
         defaultResolution: tiers[0],
-        maxReferenceImages: entry?.maxReferences ? entry.maxReferences : undefined,
+        // 图片额度优先取 `references.types[image]`：m2v 的总数是「图 + 视频 + 音频」之和
+        // （2.5 系 50 = 30 图 + 10 视频 + 10 音频），拿总数当图片上限会放用户塞 50 张。
+        maxReferenceImages: entry?.maxImageReferences || entry?.maxReferences || undefined,
+        // 参考视频额度只能来自目录的 `references.types`：只看 `references.max` 会把
+        // 「m2v 只收图」的模型（vidu Q2/Q3）也当成收视频，节点就会误标「已引用」。
+        maxReferenceVideos: videoQuota,
         pricing: createPointsOnlyPricing(({ resolution, extraParams }) => {
           const target = resolution || tiers[0];
           const perSecond =
@@ -917,6 +939,8 @@ function buildJimengCliVideoModels(): VideoModelDefinition[] {
       mediaType: "video" as const,
       displayName: `即梦 CLI · ${label}`,
       providerId: JIMENG_CLI_PROVIDER_ID,
+      // 同上：缺 profileId 会掉进通用档案，`multimodal2video` 的参考视频额度就判不出来。
+      profileId: "jimeng-cli",
       description: `即梦 CLI · ${label}`,
       expectedDurationMs: 300000,
       aspectRatios: CUSTOM_ASPECT_RATIOS.map((value) => ({ value, label: value })),
@@ -1165,7 +1189,9 @@ function buildJimengCanvasCliImageModels(): ImageModelDefinition[] {
       ...(fixedCount ? { imagesPerCountUnit: fixedCount } : {}),
       maxImageCountUnits: countUpperBound,
       ...(entry?.maxPromptLength ? { maxPromptLength: entry.maxPromptLength } : {}),
-      ...(entry?.maxReferences ? { maxReferenceImages: entry.maxReferences } : {}),
+      ...(entry?.maxImageReferences || entry?.maxReferences
+        ? { maxReferenceImages: entry.maxImageReferences || entry.maxReferences }
+        : {}),
       // 按张计费：节点上选几张就扣几张的分，报价必须跟着乘。
       countAffectsPricing: true,
       pricing: createPointsOnlyPricing(({ resolution, extraParams }) => {

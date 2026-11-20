@@ -48,6 +48,11 @@ const LEGACY_SETTING_KEY: &str = "jimeng_cli_legacy_catalog";
 /// 目录缓存有效期。CLI 升级是低频事件，一天一次足够；用户也可以手动强制刷新。
 const CATALOG_TTL_SECS: i64 = 24 * 60 * 60;
 
+/// 目录结构版本。加了「分媒体参考额度」这类字段就 +1 ——
+/// 旧缓存里没有这些字段，`serde(default)` 会补成 0，前端会把 0 当成
+/// 「该模型不收视频」，节点上就会一直显示「不读取视频参考」。
+const CATALOG_SCHEMA_VERSION: u32 = 2;
+
 /// `model list` 单次超时。它要打一次网络，比普通命令慢。
 const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -94,6 +99,22 @@ pub struct ModelCatalogEntry {
     /// 报价拿到的是**这一批**的积分，界面要显示单张价就得除以它。
     pub fixed_count: Option<u32>,
     pub max_references: u32,
+    /// `m2v` 模式下能带几张参考图（`references.types[mediaType=image].max`）。
+    ///
+    /// 图片模型里它等于 `max_references`，但视频模型不是：`seedance_2.5` 总数 50
+    /// （图 30 + 视频 10 + 音频 10），拿总数当图片额度会允许用户选 50 张。
+    #[serde(default)]
+    pub max_image_references: u32,
+    /// `m2v` 模式下能带几段参考视频（`references.types[mediaType=video].max`）。
+    ///
+    /// `max_references` 是各类素材的**总数**，不能当视频额度用：`seedance_2.5_flash`
+    /// 总数 20，但视频只收 5 段；`vidu Q2` 总数 7，却一段视频都不收。节点上的
+    /// 「参考视频会不会被提交」只能按这个字段判。
+    #[serde(default)]
+    pub max_video_references: u32,
+    /// `m2v` 模式下能带几段参考音频（`references.types[mediaType=audio].max`）。
+    #[serde(default)]
+    pub max_audio_references: u32,
     /// 图生图最少要几张参考图（`references.min`）。1 = 必须给图，0 = 可以不给。
     #[serde(default)]
     pub min_references: u32,
@@ -111,6 +132,9 @@ pub struct ModelCatalogEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCatalog {
+    /// 结构版本，用于让旧缓存自动失效（见 `CATALOG_SCHEMA_VERSION`）。
+    #[serde(default)]
+    pub schema_version: u32,
     pub cli_version: String,
     pub fetched_at: i64,
     pub image: Vec<ModelCatalogEntry>,
@@ -280,6 +304,9 @@ fn parse_entry(item: &serde_json::Value) -> Option<ModelCatalogEntry> {
     let mut min_count = 1u32;
     let mut fixed_count: Option<u32> = None;
     let mut max_references = 0u32;
+    let mut max_image_references = 0u32;
+    let mut max_video_references = 0u32;
+    let mut max_audio_references = 0u32;
     let mut min_references: Option<u32> = None;
     let mut max_prompt_length: Option<u32> = None;
     let mut vip_required = false;
@@ -379,6 +406,30 @@ fn parse_entry(item: &serde_json::Value) -> Option<ModelCatalogEntry> {
                 None => references,
             });
         }
+        // 分媒体类型的额度：`references.types` 才有，`references.max` 是总数。
+        // 视频/音频额度取各 mode 的最大值 —— 换 mode 不该让节点上的上限变小。
+        if let Some(types) = mode
+            .get("references")
+            .and_then(|value| value.get("types"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for item in types {
+                let media_max = item
+                    .get("max")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32;
+                match item
+                    .get("mediaType")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                {
+                    "image" => max_image_references = max_image_references.max(media_max),
+                    "video" => max_video_references = max_video_references.max(media_max),
+                    "audio" => max_audio_references = max_audio_references.max(media_max),
+                    _ => {}
+                }
+            }
+        }
         if mode
             .get("vipRequired")
             .and_then(serde_json::Value::as_bool)
@@ -417,6 +468,9 @@ fn parse_entry(item: &serde_json::Value) -> Option<ModelCatalogEntry> {
         min_count,
         fixed_count,
         max_references,
+        max_image_references,
+        max_video_references,
+        max_audio_references,
         min_references: min_references.unwrap_or(0),
         max_prompt_length: max_prompt_length.unwrap_or(0),
         supports_first_frame,
@@ -441,7 +495,12 @@ fn parse_catalog_items(value: &serde_json::Value) -> Vec<ModelCatalogEntry> {
 fn read_cached_catalog(app: &AppHandle) -> Option<ModelCatalog> {
     let conn = database::open(app).ok()?;
     let raw = database::get_setting(&conn, CATALOG_SETTING_KEY).ok()??;
-    serde_json::from_str::<ModelCatalog>(&raw).ok()
+    let catalog = serde_json::from_str::<ModelCatalog>(&raw).ok()?;
+    // 旧版本缓存直接当作没有：否则缺字段会被补成 0，判定结果全错。
+    if catalog.schema_version < CATALOG_SCHEMA_VERSION {
+        return None;
+    }
+    Some(catalog)
 }
 
 fn write_cached_catalog(app: &AppHandle, catalog: &ModelCatalog) -> Result<(), String> {
@@ -507,6 +566,7 @@ fn fetch_catalog(executable: &str) -> Result<ModelCatalog, String> {
     }
 
     let catalog = ModelCatalog {
+        schema_version: CATALOG_SCHEMA_VERSION,
         cli_version,
         fetched_at: now_secs(),
         image,
@@ -1029,6 +1089,78 @@ mod tests {
         assert!(image.durations.is_empty());
     }
 
+    /// `seedance_2.5_flash` 的真实声明：总数 20，但视频只收 5 段、音频 5 段。
+    ///
+    /// 视频额度必须从 `references.types[mediaType=video]` 取 —— 只读 `references.max`
+    /// 会让「只收图的 m2v」（vidu Q2：总数 7、视频 0）也显示成支持参考视频。
+    #[test]
+    fn parses_reference_quota_per_media_type() {
+        let value = serde_json::json!({
+            "items": [{
+                "type": "video",
+                "model": "seedance_2.5_flash",
+                "displayName": "即梦 Seedance 2.5 Flash",
+                "modes": [
+                    {
+                        "name": "first_last_frame",
+                        "flags": [{"flag": "--duration", "min": 4, "max": 30, "step": 1}],
+                        "references": {"min": 2, "max": 2, "types": [{"mediaType": "image", "min": 2, "max": 2}]}
+                    },
+                    {
+                        "name": "m2v",
+                        "flags": [{"flag": "--duration", "min": 4, "max": 30, "step": 1}],
+                        "references": {
+                            "min": 1,
+                            "max": 20,
+                            "types": [
+                                {"mediaType": "image", "min": 0, "max": 10},
+                                {"mediaType": "video", "min": 0, "max": 5},
+                                {"mediaType": "audio", "min": 0, "max": 5}
+                            ],
+                            "requireAnyOfTypes": ["image", "video", "audio"]
+                        }
+                    }
+                ]
+            }]
+        });
+        let entries = parse_catalog_items(&value);
+        let entry = &entries[0];
+
+        assert_eq!(entry.max_references, 20);
+        // 图片额度是 10，不是总数 20 —— 总数含视频与音频。
+        assert_eq!(entry.max_image_references, 10);
+        assert_eq!(entry.max_video_references, 5);
+        assert_eq!(entry.max_audio_references, 5);
+        // 首尾帧要 2 张、m2v 只要 1 个素材，取小才不会把单视频提交挡在本地。
+        assert_eq!(entry.min_references, 1);
+        assert!(entry.modes.iter().any(|mode| mode == "m2v"));
+    }
+
+    /// 只收图的 m2v（vidu Q2/Q3）：视频额度为 0，节点不能标「会提交视频」。
+    #[test]
+    fn image_only_m2v_has_no_video_quota() {
+        let value = serde_json::json!({
+            "items": [{
+                "type": "video",
+                "model": "dreamina_vidu_q3",
+                "displayName": "Vidu Q3",
+                "modes": [{
+                    "name": "m2v",
+                    "flags": [{"flag": "--duration", "min": 4, "max": 16, "step": 1}],
+                    "references": {
+                        "min": 1,
+                        "max": 7,
+                        "types": [{"mediaType": "image", "min": 0, "max": 7}],
+                        "requireAnyOfTypes": ["image"]
+                    }
+                }]
+            }]
+        });
+        let entries = parse_catalog_items(&value);
+        assert_eq!(entries[0].max_references, 7);
+        assert_eq!(entries[0].max_video_references, 0);
+    }
+
     /// MJ 8.2 的真实声明（`model list --type=image` 原样）：
     /// `--count` required 且 min==max==4，`--prompt` maxLength 只有 1024。
     #[test]
@@ -1135,6 +1267,9 @@ mod tests {
                 min_count: 1,
                 fixed_count: None,
                 max_references: 0,
+                max_image_references: 0,
+                max_video_references: 0,
+                max_audio_references: 0,
                 min_references: 0,
                 max_prompt_length: 5000,
                 supports_first_frame: false,

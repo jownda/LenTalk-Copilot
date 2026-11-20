@@ -8,7 +8,7 @@ export interface TextRange {
 export interface ReferenceTokenMatch extends TextRange {
   token: string;
   value: number;
-  kind: 'image' | 'audio';
+  kind: 'image' | 'audio' | 'video';
 }
 
 interface TokenRange extends TextRange {
@@ -35,7 +35,8 @@ function isAsciiDigit(char: string): boolean {
 export function findReferenceTokens(
   text: string,
   maxImageCount?: number,
-  maxAudioCount?: number
+  maxAudioCount?: number,
+  maxVideoCount?: number
 ): ReferenceTokenMatch[] {
   const tokens: ReferenceTokenMatch[] = [];
 
@@ -44,13 +45,19 @@ export function findReferenceTokens(
       ? { kind: 'image' as const, prefixLength: 2, closesWithBracket: false }
       : text.startsWith('@音频', index)
         ? { kind: 'audio' as const, prefixLength: 3, closesWithBracket: false }
-        : text.startsWith('@audio', index)
-          ? { kind: 'audio' as const, prefixLength: 6, closesWithBracket: false }
-        : text.startsWith('[image', index)
-          ? { kind: 'image' as const, prefixLength: 6, closesWithBracket: true }
-          : text.startsWith('[audio', index)
-            ? { kind: 'audio' as const, prefixLength: 6, closesWithBracket: true }
-            : null;
+        : text.startsWith('@视频', index)
+          ? { kind: 'video' as const, prefixLength: 3, closesWithBracket: false }
+          : text.startsWith('@audio', index)
+            ? { kind: 'audio' as const, prefixLength: 6, closesWithBracket: false }
+            : text.startsWith('@video', index)
+              ? { kind: 'video' as const, prefixLength: 6, closesWithBracket: false }
+              : text.startsWith('[image', index)
+                ? { kind: 'image' as const, prefixLength: 6, closesWithBracket: true }
+                : text.startsWith('[audio', index)
+                  ? { kind: 'audio' as const, prefixLength: 6, closesWithBracket: true }
+                  : text.startsWith('[video', index)
+                    ? { kind: 'video' as const, prefixLength: 6, closesWithBracket: true }
+                    : null;
     if (!tokenShape) {
       continue;
     }
@@ -61,7 +68,11 @@ export function findReferenceTokens(
     }
 
     const maxReferenceNumber = resolveMaxReferenceNumber(
-      tokenShape.kind === 'image' ? maxImageCount : maxAudioCount
+      tokenShape.kind === 'image'
+        ? maxImageCount
+        : tokenShape.kind === 'audio'
+          ? maxAudioCount
+          : maxVideoCount
     );
 
     let digitsEnd = digitsStart;
@@ -102,6 +113,23 @@ export function remapAudioReferenceTokens(text: string, oldSources: readonly str
       if (token.startsWith('[')) return `[audio${value}]`;
       if (token.startsWith('@音频')) return `@音频${value}`;
       return `@audio${value}`;
+    })
+    .replace(/[ \t]{2,}/g, ' ');
+}
+
+/** Remove or re-number video references after a connected source is removed. */
+export function remapVideoReferenceTokens(text: string, oldSources: readonly string[], nextSources: readonly string[]): string {
+  return text
+    .replace(/@video(\d+)|@视频(\d+)|\[video(\d+)\]/g, (token, asciiIndex?: string, chineseIndex?: string, bracketIndex?: string) => {
+      const oldIndex = Number(asciiIndex || chineseIndex || bracketIndex);
+      const source = oldSources[oldIndex - 1];
+      if (!source) return token;
+      const nextIndex = nextSources.indexOf(source);
+      if (nextIndex < 0) return '';
+      const value = nextIndex + 1;
+      if (token.startsWith('[')) return `[video${value}]`;
+      if (token.startsWith('@视频')) return `@视频${value}`;
+      return `@video${value}`;
     })
     .replace(/[ \t]{2,}/g, ' ');
 }
@@ -190,10 +218,11 @@ export function samePromptIgnoringReferenceTokens(left: string, right: string): 
 function findTokenRanges(
   text: string,
   maxImageCount?: number,
-  maxAudioCount?: number
+  maxAudioCount?: number,
+  maxVideoCount?: number
 ): TokenRange[] {
   const ranges: TokenRange[] = [];
-  const referenceTokens = findReferenceTokens(text, maxImageCount, maxAudioCount);
+  const referenceTokens = findReferenceTokens(text, maxImageCount, maxAudioCount, maxVideoCount);
   for (const token of referenceTokens) {
     const start = token.start;
     const end = token.end;
@@ -237,13 +266,14 @@ export function resolveReferenceAwareDeleteRange(
   selectionEnd: number,
   direction: DeleteDirection,
   maxImageCount?: number,
-  maxAudioCount?: number
+  maxAudioCount?: number,
+  maxVideoCount?: number
 ): TextRange | null {
   const safeStart = clamp(selectionStart, 0, text.length);
   const safeEnd = clamp(selectionEnd, 0, text.length);
   const selectionMin = Math.min(safeStart, safeEnd);
   const selectionMax = Math.max(safeStart, safeEnd);
-  const tokenRanges = findTokenRanges(text, maxImageCount, maxAudioCount);
+  const tokenRanges = findTokenRanges(text, maxImageCount, maxAudioCount, maxVideoCount);
 
   if (selectionMin !== selectionMax) {
     let expandedStart = selectionMin;
@@ -329,12 +359,18 @@ export function shouldPruneReferenceTokens(previousCount: number, nextCount: num
 export function removeOutOfRangeReferenceTokens(
   text: string,
   maxImageCount: number,
-  maxAudioCount?: number
+  maxAudioCount?: number,
+  maxVideoCount?: number
 ): string {
   const tokens = findReferenceTokens(text);
   const maxAudioReferenceNumber = resolveMaxReferenceNumber(maxAudioCount);
+  const maxVideoReferenceNumber = resolveMaxReferenceNumber(maxVideoCount);
   const outOfRange = tokens.filter((token) => token.value > (
-    token.kind === 'image' ? maxImageCount : maxAudioReferenceNumber
+    token.kind === 'image'
+      ? maxImageCount
+      : token.kind === 'audio'
+        ? maxAudioReferenceNumber
+        : maxVideoReferenceNumber
   ));
   if (outOfRange.length === 0) {
     return text;

@@ -396,6 +396,11 @@ export interface MosaicLayerItem {
   locked?: boolean;
   /** 图像调整（曲线/色阶/色彩平衡等），只在渲染时应用，源图不动 */
   adjust?: MosaicAdjust;
+  /**
+   * 局部调色蒙版（选区掩码的 data URL，alpha 通道 = 作用范围）。
+   * 存在时 `adjust` 只作用于蒙版内（选区外保持原样），实现「框选局部调色」。
+   */
+  adjustMask?: string | null;
 }
 
 /** 图层混合模式(与 canvas globalCompositeOperation 一一对应, 见 `domain/mosaicBlend.ts`)。 */
@@ -617,6 +622,15 @@ export interface AudioGenNodeData extends NodeDisplayData {
   sunoContinueAt?: string;
   /** cover 的翻唱源 clip。 */
   sunoCoverClipId?: string;
+  /**
+   * upload_cover 的翻唱源音频。
+   *
+   * 与上面的 `sunoCoverClipId` 是**两条不同的源**：`cover` 只吃平台内的 clip id；
+   * `upload_cover` 吃任意音频，平台要求「公网可直接下载的地址」（mp3/wav/m4a）。
+   * 这里存的是画布里的原始地址（可能是本地路径 / `asset://`），提交前由链路层
+   * 上传换成公网直链 —— 所以**不要**在这一层预先改写。
+   */
+  sunoCoverAudioUrl?: string;
   [key: string]: unknown;
 }
 

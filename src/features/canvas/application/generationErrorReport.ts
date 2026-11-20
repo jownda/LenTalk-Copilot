@@ -11,6 +11,8 @@ export interface GenerationDebugContext {
   referenceImagePlaceholders?: string[];
   /** 音频参考数量。视频链路里参考素材的失败原因常常出在音频上, 必须能看见。 */
   referenceAudioCount?: number;
+  /** 参考视频数量。视频输入（上游连进来的视频）只在部分协议生效, 报错时要能区分。 */
+  referenceVideoCount?: number;
   appVersion?: string;
   osName?: string;
   osVersion?: string;
@@ -156,6 +158,9 @@ export function buildGenerationErrorReport(
   sections.push(`- Reference Images: ${context.referenceImageCount ?? 0}`);
   if (typeof context.referenceAudioCount === 'number') {
     sections.push(`- Reference Audios: ${context.referenceAudioCount}`);
+  }
+  if (typeof context.referenceVideoCount === 'number') {
+    sections.push(`- Reference Videos: ${context.referenceVideoCount}`);
   }
   if (Array.isArray(context.referenceImagePlaceholders) && context.referenceImagePlaceholders.length > 0) {
     sections.push(`- Reference Image Placeholders: ${context.referenceImagePlaceholders.join(', ')}`);

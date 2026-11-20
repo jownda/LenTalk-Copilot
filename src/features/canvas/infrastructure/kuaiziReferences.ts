@@ -219,12 +219,20 @@ async function resolveOne(
 export interface KuaiziReferenceInput {
   images?: string[];
   audios?: string[];
+  /**
+   * 参考视频（上游连进来的视频输入）。
+   *
+   * 与图片/音频同一套格式白名单（`http(s)://` / `asset://`），本地文件必须先把字节
+   * 送进图床换公网直链 —— 筷子不会去读客户端路径。
+   */
+  videos?: string[];
   /** 筷子平台自己的 Base URL 与 ApiKey(素材接口鉴权用)。 */
   kuaiziBaseUrl?: string;
   kuaiziApiKey?: string;
   /** 该模型的素材条数上限(见 `kuaiziModels.ts` 的分档表)。 */
   maxImages?: number;
   maxAudios?: number;
+  maxVideos?: number;
 }
 
 /**
@@ -234,10 +242,13 @@ export interface KuaiziReferenceInput {
  */
 export async function resolveKuaiziVideoReferences(
   input: KuaiziReferenceInput,
-): Promise<{ images: string[]; audios: string[] }> {
+): Promise<{ images: string[]; audios: string[]; videos: string[] }> {
   const images = (input.images ?? []).filter((item) => item?.trim()).slice(0, input.maxImages ?? 30);
   const audios = (input.audios ?? []).filter((item) => item?.trim()).slice(0, input.maxAudios ?? 3);
-  if (images.length === 0 && audios.length === 0) return { images: [], audios: [] };
+  const videos = (input.videos ?? []).filter((item) => item?.trim()).slice(0, input.maxVideos ?? 3);
+  if (images.length === 0 && audios.length === 0 && videos.length === 0) {
+    return { images: [], audios: [], videos: [] };
+  }
   const imageHost = resolveKuaiziImageHost();
   const kuaiziOptions: KuaiziAssetActionOptions | null =
     input.kuaiziBaseUrl && input.kuaiziApiKey
@@ -250,15 +261,15 @@ export async function resolveKuaiziVideoReferences(
           return await resolveOne(source, kind, index, imageHost, kuaiziOptions);
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
-          throw new Error(
-            `筷子AI 参考${kind === 'Image' ? '图' : '素材'}第 ${index + 1} 条上传失败: ${reason}`,
-          );
+          const kindLabel = kind === 'Image' ? '图' : kind === 'Video' ? '视频' : '音频';
+          throw new Error(`筷子AI 参考${kindLabel}第 ${index + 1} 条上传失败: ${reason}`);
         }
       }),
     );
   return {
     images: await resolveAll(images, 'Image'),
     audios: await resolveAll(audios, 'Audio'),
+    videos: await resolveAll(videos, 'Video'),
   };
 }
 

@@ -288,7 +288,8 @@
       "copyPrompt": "复制提示词",
       "copyAll": "复制全部",
       "copied": "已复制",
-      "copy": "复制"
+      "copy": "复制",
+      "referenceVideo": "参考视频"
     },
     "nodeManager": {
       "title": "节点管理",
@@ -369,7 +370,8 @@
       "loading": "加载中…",
       "previewAlt": "旋转预览"
     },
-    "adjust": "调节"
+    "adjust": "调节",
+    "imageEdit": "图片编辑"
   },
   "toolDialog": {
     "suffix": "工具",
@@ -420,6 +422,14 @@
     "reversePromptNoModel": "还没有可用的视觉模型：请到设置里给某个平台的对话模型填好 API Key（需要能读图的模型）。",
     "reversePromptImageUnreadable": "读不到这张图，无法反推。请确认图片文件还在。",
     "reversePromptFailed": "反推失败",
+    "reverseAudioPrompt": "反推提示词",
+    "reverseAudioPromptHint": "用能听音频的模型读这段音频，反推音乐风格、歌词与台词，结果落成右侧文本节点",
+    "reverseAudioPromptRunning": "反推中…",
+    "reverseAudioPromptNodeName": "音频反推",
+    "reverseAudioPromptNoModel": "还没有可用的音频模型：请到设置里添加一个能听音频的对话模型（如 gemini 系列、qwen-omni、gpt-4o-audio）并填好 API Key。",
+    "reverseAudioPromptUnreadable": "这段音频没能送到模型（部分中转会丢弃音频内容）。换一个支持音频输入的模型或渠道再试。",
+    "reverseAudioPromptTooLarge": "音频超过 {{size}} MB，内联给模型会被中转拒绝。请先截短或压缩这段音频。",
+    "reverseAudioPromptFailed": "音频反推失败",
     "imageUpscaleModel": "高清模型",
     "imageUpscaleChangeModel": "更换模型",
     "imageUpscaleNoModel": "还没有可用的图片模型，请先到设置里配置平台。",
@@ -632,7 +642,13 @@
       "binghuoReferenceVideosHint": "每行一个公网 URL，最多 3 个；本机视频请先用资产库上传后粘贴 URL。字段名将作为 reference_videos 提交，不被忽略。",
       "binghuoReferenceVideosCount": "{count}/3",
       "binghuoSkipReviewLabel": "跳过真人审核（仅 bh 系模型，含 bh2.0-* 与 bh2.04K；其他模型无效）",
-      "binghuoSkipReviewHint": "声明素材不含真人时跳过审核，任务几乎立即开始生成；含真人谎报会导致上游生成失败（按失败退款）。"
+      "binghuoSkipReviewHint": "声明素材不含真人时跳过审核，任务几乎立即开始生成；含真人谎报会导致上游生成失败（按失败退款）。",
+      "previewReferenceVideo": "点击播放",
+      "ignoredByModel": "当前模型不使用这项参考",
+      "videoReferenceUnsupported": "当前模型不读取视频参考（换支持视频参考的模型才会提交）",
+      "videoReferenceUnsupportedHint": "参考视频只对支持 reference_videos 的协议生效：炳火、字子 -video 型号、WGSPAI 视频系列、筷子 / likeai / RunningHub、即梦画布 CLI 的 Seedance 2.0 / 2.5 系列（m2v）、即梦 CLI 的 multimodal2video 型号",
+      "videoReferenceFirstLastIgnored": "首尾帧模式不提交视频参考（切回「参考图」才会带上）",
+      "videoReferenceFirstLastHint": "首尾帧模式的 --ref 只放首帧、尾帧两张图，视频参考不会被提交；切回「参考图」才会带上视频"
     },
     "upload": {
       "uploadedAlt": "已上传图片",
@@ -789,6 +805,7 @@
           "generate": "生成",
           "extend": "续写",
           "cover": "翻唱",
+          "uploadCover": "上传翻唱",
           "lyrics": "AI 写词",
           "stems": "人声伴奏分离",
           "stemsAll": "12 轨分离",
@@ -799,6 +816,7 @@
           "generate": "从主题/描述创作整首音乐，可自定义歌词与风格标签；歌词留空则由 AI 自动作词（灵感模式）",
           "extend": "从已有曲子接续创作（需源 clip），可指定从第几秒开始续写，不填则从结尾接",
           "cover": "保留原曲旋律、换成新的风格与歌词重新演绎（需源 clip）",
+          "uploadCover": "用自己上传的音频翻唱——任意 mp3/wav/m4a 都能当源，本地文件会自动上传；歌曲模式必须给歌词",
           "lyrics": "按主题生成歌词文本",
           "stems": "从已有曲子分离出人声轨与伴奏轨（需源 clip）",
           "stemsAll": "从已有曲子分离出全轨 12 路音轨（需源 clip）",
@@ -841,7 +859,13 @@
         "continueClip": "续写源 clip",
         "coverClip": "翻唱源 clip",
         "pickFromUpstream": "从上游选择…",
-        "noUpstreamClip": "上游还没有可用的曲子——把音乐节点连到已生成的音频后面，或直接在下面手填 clipId",
+        "noUpstreamClip": "上游还没有可用的曲子——续写/翻唱/分离都要 Suno 自己生成的 clip。想用自己的音频，请把操作切到「上传翻唱」，也可在下面手填 clipId",
+        "coverAudioUrl": "翻唱源音频",
+        "coverAudioUrlPlaceholder": "本地音频地址或公网 URL（mp3 / wav / m4a）",
+        "coverAudioUrlHint": "支持上游连进来的任意音频（含本地 mp3）：提交前会先上传换成公网地址，不走 clip。歌曲模式必须同时给歌词；纯音乐模式可留空。",
+        "uploadCoverProbeHint": "提交前会用平台的免费校验（dry-run）确认它真的把源音频发了出去——部分渠道会丢弃这个字段，那种情况不提交、也不扣费。",
+        "pickAudioFromUpstream": "从上游音频选择…",
+        "noUpstreamAudio": "上游还没有音频——连一段音频节点过来，或在下面填公网地址",
         "clipIdPlaceholder": "clipId（来自上次生成结果的 source_id）",
         "continueAt": "续写起点（秒）",
         "continueAtPlaceholder": "留空则从结尾续",
@@ -855,6 +879,8 @@
         "needClipId": "该操作需要源 clip——请从上游选一条已生成的曲子，或手填 clipId",
         "needContinueClipId": "续写需要源 clip——请从上游选一条已生成的曲子，或手填 clipId",
         "needCoverClipId": "翻唱需要源 clip——请从上游选一条已生成的曲子，或手填 clipId",
+        "needCoverAudioUrl": "上传翻唱需要一段源音频——请连一段音频（会自动上传）或填公网音频地址",
+        "needCoverLyrics": "上传翻唱在歌曲模式下必须给歌词；想让它自己唱就切到「纯音乐」",
         "needPrompt": "请先在上方输入框填写歌曲主题或描述",
         "promptHint": "↑ 上方输入框＝歌曲主题/描述：只写「唱什么」（主题、故事、画面、情绪）。曲风与音色请用下面的风格标签，这里不必重复；「AI 写词」也读这段。",
         "promptPlaceholder": "例：雨夜便利店的告别，克制而温柔的男声民谣，关于错过与释怀",
@@ -877,7 +903,9 @@
           "negVoice": "排除人声",
           "negAudio": "排除音质缺陷",
           "negContent": "排除情绪与题材"
-        }
+        },
+        "useAsSource": "把这条设为当前操作的源",
+        "sourceUnavailable": "这条音频没有 Suno clip id，不能作为当前操作的源；想用普通音频请把操作切到「上传翻唱」"
       },
       "mmx": {
         "cloneTitle": "音色克隆",
@@ -950,7 +978,8 @@
         "previewCostHint": "克隆本身不产出试听，这里会额外发一次语音合成（按字符计费）",
         "speechPlaceholder": "输入要用该音色合成的文本（最长 9999 字）",
         "pricePerCall": "⚡{{price}} / 次"
-      }
+      },
+      "previewAsset": "点击试听"
     },
     "motionControl": {
       "modeMotion": "肢体控制",

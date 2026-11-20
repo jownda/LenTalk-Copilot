@@ -9,19 +9,21 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import {
-  Check,
   ChevronDown,
   ChevronUp,
+  CircleDashed,
   Crop,
   Download,
   Eye,
   EyeOff,
   ImagePlus,
+  Lasso,
   Lock,
   LockOpen,
   Maximize2,
   Move,
   RotateCw,
+  SquareDashedMousePointer,
   Trash2,
   X,
   ZoomIn,
@@ -36,11 +38,31 @@ import type {
   SeamlessMosaicNodeData,
 } from "@/features/canvas/domain/canvasNodes";
 import { MOSAIC_BLEND_MODE_OPTIONS, normalizeRotation } from "@/features/canvas/domain/mosaicBlend";
-import { initialLayerBox, layerFillRect, layerImageAspect } from "@/features/canvas/application/mosaicFit";
+import {
+  fitCanvasToSingleLayer,
+  initialLayerBox,
+  layerFillRect,
+  layerImageAspect,
+} from "@/features/canvas/application/mosaicFit";
 import { MosaicAdjustPanel } from "@/features/canvas/ui/MosaicAdjustPanel";
 import { isAdjustIdentity } from "@/features/canvas/domain/mosaicAdjust";
 import { useAdjustedPreview } from "@/features/canvas/ui/useAdjustedPreview";
 import { renderMosaicToCanvas } from "@/features/canvas/application/mosaicRender";
+import { snapLayerPosition } from "@/features/canvas/application/layerSnap";
+import { restoreNodeAfterMosaicEdit } from "@/features/canvas/application/openMosaicEditor";
+import {
+  combineSelectionMasks,
+  invertSelectionMask,
+  maskToBoundaryPoints,
+  maskToDataUrl,
+  maskToLayerDataUrl,
+  selectionToMask,
+  type Mask,
+  type Selection,
+  type SelectionCombine,
+} from "@/features/canvas/application/selection";
+import { renderLayerToCanvas } from "@/features/canvas/application/mosaicRender";
+import { SelectionOutline, SELECTION_ANTS_CSS } from "./SelectionOutline";
 import {
   prepareNodeImage,
   prepareNodeImageFromFile,
@@ -171,9 +193,20 @@ const CROP_RATIOS: CropRatioPreset[] = [
   { id: "2:3", label: "2 : 3", aspect: 2 / 3 },
 ];
 
-type ToolId = "move" | "crop";
+type ToolId =
+  | "move"
+  | "crop"
+  | "select-rect"
+  | "select-ellipse"
+  | "select-lasso";
 
-type DragKind = "move" | "resize" | "crop-move" | "crop-handle" | "crop-draw";
+type DragKind =
+  | "move"
+  | "resize"
+  | "crop-move"
+  | "crop-handle"
+  | "crop-draw"
+  | "select-draw";
 
 interface DragState {
   kind: DragKind;
@@ -187,6 +220,12 @@ interface DragState {
   anchorY?: number;
   baseLayers: MosaicLayerItem[];
   ratio: number;
+  /** 套索绘制时的锚点轨迹（画布像素）。 */
+  lassoPoints?: Array<{ x: number; y: number }>;
+  /** 选择工具的布尔组合模式（Shift=加 / Alt=减 / Shift+Alt=交）。 */
+  selectionCombine?: "new" | "add" | "subtract" | "intersect";
+  /** 拖拽中实时更新的选区（松手时从这里取最终值做布尔合并）。 */
+  currentSelection?: Selection | null;
 }
 
 const HANDLE_CURSOR: Record<string, string> = {
@@ -202,25 +241,47 @@ const HANDLE_CURSOR: Record<string, string> = {
 
 const MIN_FRAME = 8;
 
+/** 移动图层时的吸附阈值（屏幕像素）。放大画布时阈值折算成更小的画布像素，手感一致。 */
+const LAYER_SNAP_PX = 6;
 /**
  * 编辑器里的单个图层。
  *
  * 单独抽出来是因为要调 `useAdjustedPreview`（hooks 不能写在 map 里）：
  * 调整参数变了就换成处理过的预览图，源文件不动。
  */
+/**
+ * 编辑器画布的「停手后清晰档」长边。
+ *
+ * 720（节点内预览的默认值）在铺满屏幕的画布上明显发糊 —— 用户的反馈就是
+ * 「图片编辑里面画面比较模糊」。1600 够覆盖 2× 缩放的常见屏幕宽度，
+ * 又不至于让调整管线的单帧耗时失控（720 约 160ms，1600 在一秒内）。
+ */
+const EDITOR_PREVIEW_MAX_EDGE = 1600;
+
 function EditorLayerView({
   layer,
   scale,
   active,
+  tool,
   onPointerDown,
 }: {
   layer: MosaicLayerItem;
   scale: number;
   active: boolean;
+  tool: ToolId;
   onPointerDown: (event: ReactPointerEvent) => void;
 }) {
-  const source = useAdjustedPreview(layer);
+  const source = useAdjustedPreview(layer, { preferFullImage: true, maxEdge: EDITOR_PREVIEW_MAX_EDGE });
   const fill = layerFillRect(layer);
+  // 光标随工具变化：移动工具才用抓手，选择/裁剪工具用十字准星（穿透到画板，框选不受图层阻挡）。
+  const cursor =
+    tool === "move"
+      ? layer.locked
+        ? "default"
+        : "move"
+      : tool === "crop" || tool === "select-rect" || tool === "select-ellipse" || tool === "select-lasso"
+        ? "crosshair"
+        : "default";
   return (
     <div
       className="absolute overflow-hidden"
@@ -234,7 +295,7 @@ function EditorLayerView({
         transform: layer.rotation ? `rotate(${layer.rotation}deg)` : undefined,
         transformOrigin: "center",
         outline: active ? "1.5px solid #0a84ff" : undefined,
-        cursor: layer.locked ? "default" : "move",
+        cursor,
       }}
       onPointerDown={onPointerDown}
     >
@@ -276,12 +337,23 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
   const addDerivedExportNode = useCanvasStore((state) => state.addDerivedExportNode);
   const addEdge = useCanvasStore((state) => state.addEdge);
 
-  const [tool, setTool] = useState<ToolId>("move");
+  // 默认是矩形选框（用户要求：打开编辑器先框选，而不是移动图层）。
+  const [tool, setTool] = useState<ToolId>("select-rect");
   const [selectedLayerId, setSelectedLayerId] = useState<string | null>(null);
   const [frame, setFrame] = useState<CanvasRect | null>(null);
   /** 框被用户动过没有：没动过就是「整张画布」，应用等于什么都不做（同参考项目的 default frame）。 */
   const [frameEdited, setFrameEdited] = useState(false);
   const [cropRatioId, setCropRatioId] = useState("free");
+  /** 选择工具的选区（蚂蚁线）。null = 没有选区。 */
+  const [selection, setSelection] = useState<Selection | null>(null);
+  /** 套索绘制中的临时轨迹（画布像素），用于实时显示正在画的套索轮廓。 */
+  const [lassoDraft, setLassoDraft] = useState<Array<{ x: number; y: number }> | null>(null);
+  /** 反选/布尔运算后的边界点集（掩码提取），优先于点阵渲染蚂蚁线。 */
+  const [selectionBoundary, setSelectionBoundary] = useState<Array<{ x: number; y: number }> | null>(null);
+  /** 当前选区固化的掩码（布尔运算的「旧选区」来源）。ref 避免每帧 setState。 */
+  const selectionMaskRef = useRef<Mask | null>(null);
+  /** 删除选中内容前的图层快照（会话内撤销用）。 */
+  const eraseSnapshotRef = useRef<MosaicLayerItem | null>(null);
   const [zoom, setZoom] = useState<number | "fit">("fit");
   const [fitScale, setFitScale] = useState(0.5);
   const [draftLayers, setDraftLayers] = useState<MosaicLayerItem[] | null>(null);
@@ -307,6 +379,54 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
   const selectedPreviewUrl = useAdjustedPreview(
     selectedLayer ?? { imageUrl: "", previewImageUrl: null, adjust: undefined },
   );
+
+  /**
+   * 单图层历史数据自愈：画幅被节点缩放放大过、图片还留在原来的像素尺寸上。
+   *
+   * 打开编辑器就是「一张小图贴在大画布里」，与用户说的「图片和显示框尺寸不一致」
+   * 完全是同一件事。只在挂载时跑一次，并且**必须**比例基本一致才动手 ——
+   * 比例不同说明画幅是用户刻意做出来的版面，不能替他改。
+   */
+  const pageFitOnceRef = useRef(false);
+  useEffect(() => {
+    if (pageFitOnceRef.current) {
+      return;
+    }
+    pageFitOnceRef.current = true;
+    const list = data.layers ?? [];
+    if (list.length !== 1 || !data.canvasFitted) {
+      return;
+    }
+    const layer = list[0];
+    const layerAspect = (layer.width || 1) / (layer.height || 1);
+    const canvasAspect = (data.canvasWidth || 1) / (data.canvasHeight || 1);
+    if (Math.abs(layerAspect - canvasAspect) > 0.02) {
+      return;
+    }
+    // 已经铺满了就别动（含浮点误差）。
+    if (layer.width >= data.canvasWidth * 0.99 && layer.height >= data.canvasHeight * 0.99) {
+      return;
+    }
+    const fitted = fitCanvasToSingleLayer(list, data.canvasWidth, data.canvasHeight);
+    if (!fitted) {
+      return;
+    }
+    updateNodeData(nodeId, {
+      layers: fitted.layers,
+      canvasWidth: fitted.width,
+      canvasHeight: fitted.height,
+      canvasFitted: true,
+    });
+    onSyncFrame?.(fitted.width / fitted.height);
+  }, [
+    data.canvasFitted,
+    data.canvasHeight,
+    data.canvasWidth,
+    data.layers,
+    nodeId,
+    onSyncFrame,
+    updateNodeData,
+  ]);
 
   /**
    * 默认选中一个图层。
@@ -371,9 +491,11 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
   const startCrop = useCallback(() => {
     setTool("crop");
     setCropRatioId("free");
+    // 进来就让裁剪框 = 整张画布，且直接处于「可编辑」状态：
+    // 八向锚点立即显示，用户可以直接拖四边 / 四角精细调整，不用先手动拉一个框。
     setFrame({ x: 0, y: 0, width: canvasWidth, height: canvasHeight });
-    setFrameEdited(false);
-    setNotice("在画面上拖出一个裁剪框，Enter 应用");
+    setFrameEdited(true);
+    setNotice("拖动边框上的锚点精细调整裁剪范围，Enter 应用，Esc 取消");
   }, [canvasHeight, canvasWidth]);
 
   const cancelCrop = useCallback(() => {
@@ -383,30 +505,31 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
     setNotice(null);
   }, []);
 
-  const applyCrop = useCallback(() => {
-    if (!frame || !frameEdited) {
-      cancelCrop();
-      setNotice("画布没有变化（裁剪框还是整张画布）");
+  /** 反选：把当前选区反转（画布内选区外变选中）。结果固化成掩码边界点。 */
+  const invertSelection = useCallback(() => {
+    if (!selection && !selectionBoundary) {
       return;
     }
-    if (frame.width < 16 || frame.height < 16) {
-      setNotice("裁剪框太小了，再拉大一点");
-      return;
-    }
-    const result = cropCanvasTo(layers, frame);
-    updateNodeData(nodeId, {
-      layers: result.layers,
-      canvasWidth: result.width,
-      canvasHeight: result.height,
-      outputImageUrl: null,
-      outputPreviewImageUrl: null,
-    });
-    onSyncFrame?.(result.width / result.height);
-    setTool("move");
-    setFrame(null);
-    setFrameEdited(false);
-    setNotice(`已裁剪到 ${result.width} × ${result.height}`);
-  }, [cancelCrop, frame, frameEdited, layers, nodeId, onSyncFrame, updateNodeData]);
+    const mask = selection ? selectionToMask(selection, canvasWidth, canvasHeight) : selectionMaskRef.current!;
+    const inverted = invertSelectionMask(mask);
+    selectionMaskRef.current = inverted;
+    setSelectionBoundary(maskToBoundaryPoints(inverted));
+    setSelection(null);
+    setNotice("已反选选区");
+  }, [canvasHeight, canvasWidth, selection, selectionBoundary]);
+
+  /** 调整羽化半径（画布像素）。改完同步固化掩码，后续布尔/反选基于带羽化的软边。 */
+  const setSelectionFeather = useCallback(
+    (feather: number) => {
+      if (!selection) {
+        return;
+      }
+      const next = { ...selection, feather: Math.max(0, feather) };
+      setSelection(next);
+      selectionMaskRef.current = selectionToMask(next, canvasWidth, canvasHeight);
+    },
+    [canvasHeight, canvasWidth, selection],
+  );
 
   const applyRatioPreset = useCallback(
     (presetId: string) => {
@@ -446,13 +569,26 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
       const dy = (event.clientY - drag.startY) / Math.max(0.0001, scale);
 
       if (drag.kind === "move") {
+        const moving = drag.baseLayers.find((item) => item.id === drag.layerId);
+        if (!moving) return;
+        // 先算无吸附的落点，再套吸附：吸附到画布四边 / 中心线 / 其它图层边缘。
+        const rawX = drag.origin.x + dx;
+        const rawY = drag.origin.y + dy;
+        const others = drag.baseLayers.filter((item) => item.id !== drag.layerId);
+        const snapped = snapLayerPosition(
+          { ...moving, x: rawX, y: rawY },
+          canvasWidth,
+          canvasHeight,
+          others,
+          LAYER_SNAP_PX / Math.max(0.0001, scale),
+        );
         setDraftLayers(
           drag.baseLayers.map((layer) =>
             layer.id === drag.layerId
               ? {
                   ...layer,
-                  x: Math.round(drag.origin.x + dx),
-                  y: Math.round(drag.origin.y + dy),
+                  x: Math.round(snapped.x),
+                  y: Math.round(snapped.y),
                 }
               : layer,
           ),
@@ -497,6 +633,33 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
         }
         setFrame(next);
         setFrameEdited(true);
+        return;
+      }
+
+      if (drag.kind === "select-draw") {
+        const ax = drag.anchorX ?? 0;
+        const ay = drag.anchorY ?? 0;
+        const px = Math.min(canvasWidth, Math.max(0, ax + dx));
+        const py = Math.min(canvasHeight, Math.max(0, ay + dy));
+        if (tool === "select-lasso") {
+          // 套索：把当前指针位置追加到轨迹，实时显示轮廓。
+          const points = [...(drag.lassoPoints ?? [{ x: ax, y: ay }])];
+          points.push({ x: px, y: py });
+          drag.lassoPoints = points;
+          setLassoDraft(points);
+          return;
+        }
+        // 矩形 / 椭圆：由对角点确定，实时更新选区，并把最新选区记进 drag（松手合并用）。
+        const rect = rectFromPoints(ax, ay, px, py);
+        const nextSelection: Selection = {
+          shape:
+            tool === "select-ellipse"
+              ? { kind: "ellipse", ...rect }
+              : { kind: "rect", ...rect },
+          feather: 0,
+        };
+        drag.currentSelection = nextSelection;
+        setSelection(nextSelection);
         return;
       }
 
@@ -564,6 +727,36 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
         setDraftLayers(null);
         if (next) writeLayers(next);
       }
+      if (drag.kind === "select-draw") {
+        setLassoDraft(null);
+        // 确定本次拖出的最终选区形状。
+        let finalSelection: Selection | null = null;
+        if (tool === "select-lasso") {
+          const points = drag.lassoPoints ?? [];
+          if (points.length >= 3) {
+            finalSelection = { shape: { kind: "lasso", points }, feather: 0 };
+          }
+        } else {
+          finalSelection = drag.currentSelection ?? null;
+        }
+        if (!finalSelection) {
+          return;
+        }
+        // 布尔运算：Shift / Alt / Shift+Alt 时与旧选区掩码合并。
+        const combine = drag.selectionCombine ?? "new";
+        if (combine !== "new" && selectionMaskRef.current) {
+          const nextMask = selectionToMask(finalSelection, canvasWidth, canvasHeight);
+          const merged = combineSelectionMasks(selectionMaskRef.current, nextMask, combine);
+          selectionMaskRef.current = merged;
+          setSelectionBoundary(maskToBoundaryPoints(merged));
+          setSelection(null);
+        } else {
+          // 新建选区：固化成掩码（后续布尔/反选都基于它）。
+          selectionMaskRef.current = selectionToMask(finalSelection, canvasWidth, canvasHeight);
+          setSelection(finalSelection);
+          setSelectionBoundary(null);
+        }
+      }
     };
 
     window.addEventListener("pointermove", handleMove, { passive: false });
@@ -574,17 +767,51 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
       window.removeEventListener("pointerup", handleUp);
       window.removeEventListener("pointercancel", handleUp);
     };
-  }, [canvasHeight, canvasWidth, draftLayers, scale, writeLayers]);
+  }, [canvasHeight, canvasWidth, draftLayers, scale, tool, writeLayers]);
 
-  /** 画布上的 pointerdown：判定「抓手柄 / 框内移动 / 重新拖一个框」。 */
+  /** 画布上的 pointerdown：判定「抓手柄 / 框内移动 / 重新拖一个框 / 拉选区」。 */
   const handleCanvasPointerDown = useCallback(
     (event: ReactPointerEvent) => {
-      if (tool !== "crop") {
+      if (tool !== "crop" && tool !== "select-rect" && tool !== "select-ellipse" && tool !== "select-lasso") {
         setSelectedLayerId(null);
         return;
       }
       const rect = artboardRef.current?.getBoundingClientRect();
-      if (!rect || !frame) return;
+      if (!rect) return;
+
+      // 选择工具：在画布上按下即开始拉一个选区（矩形 / 椭圆 / 套索）。
+      if (tool === "select-rect" || tool === "select-ellipse" || tool === "select-lasso") {
+        event.preventDefault();
+        const px = (event.clientX - rect.left) / Math.max(0.0001, scale);
+        const py = (event.clientY - rect.top) / Math.max(0.0001, scale);
+        const anchorX = Math.max(0, Math.min(canvasWidth, px));
+        const anchorY = Math.max(0, Math.min(canvasHeight, py));
+        // 布尔组合：Shift 追加 / Alt 减选 / Shift+Alt 相交。有旧选区时才生效。
+        const shift = event.shiftKey;
+        const alt = event.altKey;
+        const combine: SelectionCombine = shift && alt ? "intersect" : shift ? "add" : alt ? "subtract" : "new";
+        if (combine === "new") {
+          setSelection(null);
+          setSelectionBoundary(null);
+          selectionMaskRef.current = null;
+        }
+        setLassoDraft(null);
+        dragRef.current = {
+          kind: "select-draw",
+          startX: event.clientX,
+          startY: event.clientY,
+          origin: { x: 0, y: 0, width: canvasWidth, height: canvasHeight },
+          anchorX,
+          anchorY,
+          baseLayers: layers,
+          ratio: 0,
+          lassoPoints: tool === "select-lasso" ? [{ x: anchorX, y: anchorY }] : undefined,
+          selectionCombine: combine,
+        };
+        return;
+      }
+
+      if (!frame) return;
       event.preventDefault();
       const px = (event.clientX - rect.left) / Math.max(0.0001, scale);
       const py = (event.clientY - rect.top) / Math.max(0.0001, scale);
@@ -657,6 +884,67 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
     [layers, nodeId, writeLayers],
   );
 
+  /**
+   * 破坏性删除选中内容：把选区覆盖的像素从「选中图层」抹成透明。
+   *
+   * 实现：把选中图层 bake 成一张平图（crop/adjust/rotation 都拍进去），
+   * 在图层局部坐标上 `destination-out` 抹掉选区，生成的新图替换 `imageUrl`。
+   * 删除前保存快照，会话内可撤销（Ctrl+Z / 状态栏「撤销删除」）。
+   */
+  const deleteSelection = useCallback(async () => {
+    const mask = selection ? selectionToMask(selection, canvasWidth, canvasHeight) : selectionMaskRef.current;
+    if (!mask) {
+      return;
+    }
+    const target = selectedLayer ?? [...layers].reverse().find((layer) => layer.visible) ?? null;
+    if (!target) {
+      setNotice("没有可删除的图层");
+      return;
+    }
+    try {
+      const baked = await renderLayerToCanvas(target);
+      const ctx = baked.getContext("2d");
+      if (!ctx) {
+        return;
+      }
+      // 选区掩码从画布坐标平移到图层局部坐标，再 destination-out 抹掉。
+      const maskCanvas = maskToDataUrl(mask);
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.drawImage(maskCanvas, -target.x, -target.y);
+      ctx.globalCompositeOperation = "source-over";
+
+      const nextImageUrl = baked.toDataURL("image/png");
+      // 保存快照（会话内撤销）。
+      eraseSnapshotRef.current = target;
+      // bake 成平图后，crop/rotation/adjust 都已拍进像素，清空这些字段。
+      patchLayer(target.id, {
+        imageUrl: nextImageUrl,
+        previewImageUrl: nextImageUrl,
+        crop: null,
+        rotation: 0,
+        adjust: undefined,
+      });
+      setSelection(null);
+      setSelectionBoundary(null);
+      selectionMaskRef.current = null;
+      setNotice("已删除选中内容（Ctrl+Z 撤销）");
+    } catch (error) {
+      console.error("[Mosaic] delete selection failed", error);
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  }, [canvasHeight, canvasWidth, layers, patchLayer, selectedLayer, selection]);
+
+  /** 撤销上一次删除选中内容（会话内）。 */
+  const undoErase = useCallback(() => {
+    const snapshot = eraseSnapshotRef.current;
+    if (!snapshot) {
+      setNotice("没有可撤销的删除");
+      return;
+    }
+    eraseSnapshotRef.current = null;
+    patchLayer(snapshot.id, snapshot);
+    setNotice("已撤销删除");
+  }, [patchLayer]);
   const moveLayerOrder = useCallback(
     (layerId: string, direction: -1 | 1) => {
       const sorted = [...layers].sort((a, b) => a.order - b.order);
@@ -758,14 +1046,26 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
     [layers, nodeId, updateNodeData],
   );
 
-  /* --------------------------------- 导出 --------------------------------- */
+  /* -------------------------------- 应用（导出成新节点） --------------------------------- */
   const handleExport = useCallback(async () => {
     if (isExporting) return;
+    // 裁剪模式下先落实裁剪，再基于裁剪后的画布导出。
+    let base = data;
+    if (tool === "crop" && frame && frameEdited) {
+      if (frame.width < 16 || frame.height < 16) {
+        setNotice("裁剪框太小了，再拉大一点");
+        return;
+      }
+      const cropped = cropCanvasTo(layers, frame);
+      base = { ...data, layers: cropped.layers, canvasWidth: cropped.width, canvasHeight: cropped.height };
+    }
     setIsExporting(true);
     setNotice(null);
     try {
-      const { canvas } = await renderMosaicToCanvas(data);
+      const { canvas } = await renderMosaicToCanvas(base);
       const prepared = await prepareNodeImage(canvas.toDataURL("image/png"));
+      // 应用 = 把结果作为**新节点**生成到下游并连线，绝不替换/回写原节点。
+      // 母节点尺寸与位置全程没动过，`findNodePosition` 对齐自然正确。
       const createdNodeId = addDerivedExportNode(
         nodeId,
         prepared.imageUrl,
@@ -779,10 +1079,10 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
         },
       );
       if (createdNodeId) addEdge(nodeId, createdNodeId);
-      updateNodeData(nodeId, {
-        outputImageUrl: prepared.imageUrl,
-        outputPreviewImageUrl: prepared.previewImageUrl,
-      });
+      // 先确定性还原节点类型（临时会话 → 原图片节点），再关编辑器。
+      // 不能依赖 onClose 里的还原：onClose 是节点组件传进来的闭包，这里显式调一次最稳，
+      // onClose 里的第二次调用会因快照已删而空操作。
+      restoreNodeAfterMosaicEdit(nodeId);
       onClose();
     } catch (error) {
       console.error("[Mosaic] export failed", error);
@@ -790,7 +1090,18 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
     } finally {
       setIsExporting(false);
     }
-  }, [addDerivedExportNode, addEdge, data, isExporting, nodeId, onClose, updateNodeData]);
+  }, [
+    addDerivedExportNode,
+    addEdge,
+    data,
+    frame,
+    frameEdited,
+    isExporting,
+    layers,
+    nodeId,
+    onClose,
+    tool,
+  ]);
 
   /* -------------------------------- 快捷键 -------------------------------- */
   useEffect(() => {
@@ -799,23 +1110,56 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
       if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
       if (event.key === "Escape") {
         if (tool === "crop") cancelCrop();
-        else onClose();
+        else if (tool === "select-rect" || tool === "select-ellipse" || tool === "select-lasso") {
+          // 选择工具下 Esc 先取消选区，再 Esc 才关编辑器（和 Photoshop 一致）。
+          if (selection || lassoDraft || selectionBoundary) {
+            setSelection(null);
+            setSelectionBoundary(null);
+            setLassoDraft(null);
+            selectionMaskRef.current = null;
+          } else {
+            onClose();
+          }
+        } else onClose();
         return;
       }
       if (event.key === "Enter" && tool === "crop") {
         event.preventDefault();
-        applyCrop();
+        // 与标题栏「应用」一致：裁剪生效并导出成新节点。
+        void handleExport();
         return;
       }
       if (event.key === "v" || event.key === "V") setTool("move");
       if (event.key === "c" || event.key === "C") startCrop();
-      if ((event.key === "Delete" || event.key === "Backspace") && selectedLayerId) {
-        removeLayer(selectedLayerId);
+      if (event.key === "m" || event.key === "M") setTool("select-rect");
+      if (event.key === "l" || event.key === "L") setTool("select-lasso");
+      if (event.key === "Delete" || event.key === "Backspace") {
+        // Delete 只删除选区内的内容（破坏性，会话内可 Ctrl+Z 撤销）；无选区时不做删图层。
+        if (selection || selectionBoundary) {
+          event.preventDefault();
+          void deleteSelection();
+        }
+      }
+      // Ctrl+Z：会话内撤销删除（破坏性删除的后悔药）。
+      if ((event.ctrlKey || event.metaKey) && (event.key === "z" || event.key === "Z")) {
+        event.preventDefault();
+        undoErase();
       }
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [applyCrop, cancelCrop, onClose, removeLayer, selectedLayerId, startCrop, tool]);
+  }, [
+    cancelCrop,
+    deleteSelection,
+    handleExport,
+    lassoDraft,
+    onClose,
+    selection,
+    selectionBoundary,
+    startCrop,
+    tool,
+    undoErase,
+  ]);
 
   const beginLayerDrag = useCallback(
     (event: ReactPointerEvent, kind: DragKind, layer: MosaicLayerItem) => {
@@ -840,6 +1184,7 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex flex-col bg-[#1e1e1e] text-[13px] text-[#d6d6d6]">
+      <style>{SELECTION_ANTS_CSS}</style>
       {/* 标题栏 */}
       <div className="flex h-9 shrink-0 items-center justify-between border-b border-black/50 bg-[#323233] px-3">
         <div className="flex items-center gap-2 text-[12px] text-[#a8a8a8]">
@@ -858,7 +1203,8 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
             onClick={() => void handleExport()}
           >
             <Download className="h-3.5 w-3.5" />
-            {isExporting ? "导出中…" : "导出"}
+            {/* 统一一个「应用」：把编辑结果作为新节点生成到下游并连线。 */}
+            {isExporting ? "应用中…" : "应用"}
           </button>
           <button
             type="button"
@@ -888,8 +1234,7 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
               ))}
             </select>
             <span className="text-[11px] text-[#8a8a8a]">
-              {frameSize ? `${frameSize.width} × ${frameSize.height} px` : "在画面上拖出裁剪框"}
-              {frameEdited ? "" : "（整张画布）"}
+              {frameSize ? `${frameSize.width} × ${frameSize.height} px` : "拖动锚点调整裁剪范围"}
             </span>
             <div className="ml-auto flex items-center gap-1.5">
               <button
@@ -898,13 +1243,6 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
                 onClick={cancelCrop}
               >
                 <X className="h-3.5 w-3.5" /> 取消
-              </button>
-              <button
-                type="button"
-                className="inline-flex h-6 items-center gap-1 rounded bg-[#0a84ff] px-2 text-[12px] text-white hover:bg-[#0a84ff]/85"
-                onClick={applyCrop}
-              >
-                <Check className="h-3.5 w-3.5" /> 应用
               </button>
             </div>
           </>
@@ -973,6 +1311,37 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
           </button>
           <button
             type="button"
+            title="矩形选框（M）"
+            className={`flex h-8 w-8 items-center justify-center rounded ${
+              tool === "select-rect" ? "bg-[#3d3d3f] text-white" : "text-[#b8b8b8] hover:bg-[#3a3a3b]"
+            }`}
+            onClick={() => setTool("select-rect")}
+          >
+            <SquareDashedMousePointer className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            title="椭圆选框（M）"
+            className={`flex h-8 w-8 items-center justify-center rounded ${
+              tool === "select-ellipse" ? "bg-[#3d3d3f] text-white" : "text-[#b8b8b8] hover:bg-[#3a3a3b]"
+            }`}
+            onClick={() => setTool("select-ellipse")}
+          >
+            <CircleDashed className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            title="套索（L）"
+            className={`flex h-8 w-8 items-center justify-center rounded ${
+              tool === "select-lasso" ? "bg-[#3d3d3f] text-white" : "text-[#b8b8b8] hover:bg-[#3a3a3b]"
+            }`}
+            onClick={() => setTool("select-lasso")}
+          >
+            <Lasso className="h-4 w-4" />
+          </button>
+          <div className="my-1 h-px w-6 bg-white/10" />
+          <button
+            type="button"
             title="裁剪（C）"
             className={`flex h-8 w-8 items-center justify-center rounded ${
               tool === "crop" ? "bg-[#3d3d3f] text-white" : "text-[#b8b8b8] hover:bg-[#3a3a3b]"
@@ -1012,6 +1381,11 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
               width: Math.round(canvasWidth * scale),
               height: Math.round(canvasHeight * scale),
               backgroundColor: data.backgroundColor ?? "#0f1115",
+              // 鼠标指针随工具变化：选择/裁剪用十字，移动用默认（图层自带 move）。
+              cursor:
+                tool === "select-rect" || tool === "select-ellipse" || tool === "select-lasso" || tool === "crop"
+                  ? "crosshair"
+                  : "default",
             }}
             onPointerDown={handleCanvasPointerDown}
           >
@@ -1022,6 +1396,7 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
                   key={layer.id}
                   layer={layer}
                   scale={scale}
+                  tool={tool}
                   active={layer.id === selectedLayerId && tool === "move"}
                   onPointerDown={(event) => {
                     // 裁剪模式下事件要冒泡到画板，否则拖不出裁剪框。
@@ -1079,8 +1454,9 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
                       />
                     ))}
                   </div>
-                  {frameEdited &&
-                    (["nw", "n", "ne", "e", "se", "s", "sw", "w"] as const).map((handle) => (
+                  {(
+                      ["nw", "n", "ne", "e", "se", "s", "sw", "w"] as const
+                    ).map((handle) => (
                       <div
                         key={handle}
                         className="pointer-events-none absolute h-2.5 w-2.5 border border-white bg-[#0a84ff]"
@@ -1102,14 +1478,33 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
                       />
                     ))}
                 </div>
-                {!frameEdited && (
-                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-                    <span className="rounded bg-black/70 px-3 py-1.5 text-[12px] text-white/90">
-                      在画面上拖动，框出要保留的范围
-                    </span>
-                  </div>
-                )}
               </>
+            )}
+
+            {/* 蚂蚁线选区（选择工具） */}
+            <SelectionOutline
+              selection={selection}
+              boundary={selectionBoundary}
+              canvasWidth={canvasWidth}
+              canvasHeight={canvasHeight}
+              scale={scale}
+            />
+            {/* 套索绘制中的临时轨迹 */}
+            {lassoDraft && lassoDraft.length > 1 && (
+              <svg
+                className="pointer-events-none absolute left-0 top-0"
+                width="100%"
+                height="100%"
+                viewBox={`0 0 ${Math.max(1, canvasWidth)} ${Math.max(1, canvasHeight)}`}
+              >
+                <polyline
+                  points={lassoDraft.map((point) => `${point.x},${point.y}`).join(" ")}
+                  fill="none"
+                  stroke="#fff"
+                  strokeWidth={1.5 / Math.max(0.01, scale)}
+                  strokeDasharray={`${4 / Math.max(0.01, scale)} ${4 / Math.max(0.01, scale)}`}
+                />
+              </svg>
             )}
           </div>
         </div>
@@ -1143,12 +1538,30 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
           </div>
           {panelTab === "adjust" && (
             <div className="min-h-0 flex-1 overflow-y-auto p-3 text-[12px]">
+              {(selection || selectionBoundary) && (
+                <div className="mb-2 rounded bg-[#2b2b2c] px-2 py-1.5 text-[11px] text-[#9a9a9a]">
+                  当前有选区：调整将只作用于框选范围内（选区外保持原样）。
+                </div>
+              )}
               <MosaicAdjustPanel
                 adjust={selectedLayer?.adjust}
                 previewUrl={selectedPreviewUrl}
                 disabled={!selectedLayer}
                 onChange={(next) => {
                   if (!selectedLayer) return;
+                  // 有选区时：把选区掩码固化到图层的局部调色蒙版，渲染/导出只调选区内。
+                  if (selection || selectionBoundary) {
+                    const mask = selection
+                      ? selectionToMask(selection, canvasWidth, canvasHeight)
+                      : selectionMaskRef.current;
+                    if (mask) {
+                      patchLayer(selectedLayer.id, {
+                        adjust: next,
+                        adjustMask: maskToLayerDataUrl(mask, selectedLayer.x, selectedLayer.y, selectedLayer.width, selectedLayer.height),
+                      });
+                      return;
+                    }
+                  }
                   patchLayer(selectedLayer.id, { adjust: next });
                 }}
               />
@@ -1448,6 +1861,63 @@ export function SeamlessMosaicEditor({ nodeId, data, onClose, onSyncFrame }: Sea
           画布 {Math.round(canvasWidth)} × {Math.round(canvasHeight)}
         </span>
         <span>{layers.length} 图层</span>
+        {(selection || selectionBoundary) && (
+          <span className="flex items-center gap-2">
+            <button
+              type="button"
+              className="rounded px-1.5 py-0.5 text-[#c9c9c9] hover:bg-[#3a3a3b] hover:text-white"
+              onClick={invertSelection}
+              title="反选（选区内外互换）"
+            >
+              反选
+            </button>
+            {selection && (
+              <label className="flex items-center gap-1 text-[#9a9a9a]">
+                羽化
+                <input
+                  type="number"
+                  min={0}
+                  max={200}
+                  value={selection.feather}
+                  onChange={(event) => setSelectionFeather(Number(event.target.value) || 0)}
+                  className="h-5 w-12 rounded border border-[#3f3f41] bg-[#3a3a3b] px-1 text-[11px] text-[#ddd] outline-none"
+                  title="羽化半径（像素），软边过渡"
+                />
+              </label>
+            )}
+            <button
+              type="button"
+              className="rounded px-1.5 py-0.5 text-[#c9c9c9] hover:bg-[#3a3a3b] hover:text-white"
+              onClick={() => void deleteSelection()}
+              title="删除选中内容（选中图层上选区内的像素变透明）"
+            >
+              删除
+            </button>
+            {eraseSnapshotRef.current && (
+              <button
+                type="button"
+                className="rounded px-1.5 py-0.5 text-[#c9c9c9] hover:bg-[#3a3a3b] hover:text-white"
+                onClick={undoErase}
+                title="撤销删除（会话内，Ctrl+Z）"
+              >
+                撤销删除
+              </button>
+            )}
+            <button
+              type="button"
+              className="rounded px-1.5 py-0.5 text-[#c9c9c9] hover:bg-[#3a3a3b] hover:text-white"
+              onClick={() => {
+                setSelection(null);
+                setSelectionBoundary(null);
+                selectionMaskRef.current = null;
+                setNotice(null);
+              }}
+              title="取消选区（Ctrl+D）"
+            >
+              取消选区
+            </button>
+          </span>
+        )}
         <span className="ml-auto truncate">
           {notice ??
             (tool === "crop"

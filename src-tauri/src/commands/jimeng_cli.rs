@@ -115,6 +115,18 @@ pub fn cancel_local_cli_video(client_job_id: String) -> bool {
 /// 30 秒的通用命令超时在慢网下必然不够。
 const CANVAS_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// 视频素材的上传超时。
+///
+/// 一段 720p / 30 秒的参考视频常有三四十 MB，弱网下 180 秒会被判成超时；重试三次
+/// 仍然全部超时，用户看到的就是「参考视频上传失败」而素材其实没问题。
+const CANVAS_VIDEO_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 画布本身的读/建操作(`canvas ls` / `canvas create`)超时。
+///
+/// 这两个动作在服务端是轻量的, 但 CLI 每次启动都要先做一遍联网自检(实测 18~48 秒),
+/// 30 秒的通用超时会把一半的调用打成失败 —— 表现就是「画布列表时有时无」。
+const CANVAS_ADMIN_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// 画布素材上传的最大尝试次数与退避。///
 /// 与生成提交的保守策略(见 `JIMENG_SUBMIT_MAX_ATTEMPTS` 上方注释)不是一回事: 上传素材
 /// **不消耗积分**, 而且下面用内容哈希派生 `--resource-id` 幂等键, 重试不会在服务端留下
@@ -326,6 +338,9 @@ pub struct GenerateJimengCliVideoRequest {
     pub video_resolution: Option<String>,
     pub image_mode: Option<String>,
     pub reference_images: Option<Vec<String>>,
+    /// 参考视频（`multimodal2video` 全能参考）。额度按型号：
+    /// `seedance2.5` 收 10 段、2.0 家族收 3 段；`text2video` 通道一段都不收。
+    pub reference_videos: Option<Vec<String>>,
     pub reference_audio: Option<Vec<String>>,
 }
 
@@ -386,13 +401,21 @@ fn generate_video_blocking(
             request.reference_audio.as_deref().unwrap_or_default(),
             &input_dir,
         )?;
+        // 参考视频：`multimodal2video` 才认 `--video`，`text2video` 一段都不收，
+        // 所以有没有视频直接决定走哪个子命令（见 resolve_video_command）。
+        let reference_videos = materialize_video_files(
+            request.reference_videos.as_deref().unwrap_or_default(),
+            &input_dir,
+        )?;
         let command = resolve_video_command(
             request.image_mode.as_deref(),
             &reference_images,
+            &reference_videos,
             &reference_audio,
         )?;
         if command == "multimodal2video"
             && reference_images.is_empty()
+            && reference_videos.is_empty()
             && request.model_version != "seedance2.5"
         {
             return Err("即梦 CLI 的纯音频参考需要选择 Seedance 2.5".to_string());
@@ -407,6 +430,7 @@ fn generate_video_blocking(
             &request,
             &video_resolution,
             &reference_images,
+            &reference_videos,
             &reference_audio,
             &download_dir,
             cancel.flag(),
@@ -582,6 +606,181 @@ fn materialize_audio_files(
         .enumerate()
         .map(|(index, source)| materialize_audio_source(source, directory, index))
         .collect()
+}
+
+/// 把参考视频物化成**本地文件**（`resource upload --file` / `--ref` 只认本地路径）。
+///
+/// 与音频那条并行而不是合并：「参考音频」的历史包袱是它可能**装在视频文件里**
+/// （从 mp4 抽音轨时落盘的 mime 就是 video/*），合并成一条会把 mp4 当音频扩名。
+fn materialize_video_files(
+    sources: &[String],
+    directory: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    sources
+        .iter()
+        .filter(|source| !source.trim().is_empty())
+        .enumerate()
+        .map(|(index, source)| materialize_video_source(source, directory, index))
+        .collect()
+}
+
+/// 单个视频来源 → 本地文件路径。
+fn materialize_video_source(
+    source: &str,
+    directory: &Path,
+    index: usize,
+) -> Result<PathBuf, String> {
+    let trimmed = source.trim();
+
+    // ① data URL：解码落盘
+    if trimmed.starts_with("data:") {
+        let (meta, encoded) = trimmed
+            .split_once(',')
+            .ok_or_else(|| "参考视频的 data URL 格式无效".to_string())?;
+        let mime = meta.trim_start_matches("data:").split(';').next().unwrap_or("");
+        if !mime.starts_with("video/") && !mime.contains("octet-stream") {
+            return Err(format!("参考视频不是视频数据（{mime}）"));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("无法解码参考视频: {error}"))?;
+        let extension = video_extension(mime, "");
+        let path = directory.join(format!("video-{}.{extension}", index + 1));
+        fs::write(&path, bytes).map_err(|error| format!("无法写入参考视频: {error}"))?;
+        return Ok(path);
+    }
+
+    // ② asset:// / http://asset.localhost：前端展示地址，真实文件就在本机
+    if let Some(local) = local_path_from_asset_url(trimmed) {
+        if local.is_file() {
+            return normalize_video_extension(local, directory, index);
+        }
+    }
+
+    // ③ http(s)：下载到临时目录
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return download_video_to_file(trimmed, directory, index);
+    }
+
+    // ④ 本地路径
+    let path = source_path(trimmed);
+    if path.is_file() {
+        return normalize_video_extension(path, directory, index);
+    }
+    Err(format!(
+        "参考视频文件不存在：{}。请重新连接视频节点，或把它导入素材库后再试",
+        if trimmed.is_empty() { "(空)".to_string() } else { trimmed.to_string() }
+    ))
+}
+
+/// 扩展名和内容对不上时纠正；内容其实是音频就直接报错。
+///
+/// 把音频当视频上传，服务端只会回一句 `service.2 / invalid_input`，
+/// 用户完全看不出「这条引用根本不是视频」。
+fn normalize_video_extension(
+    path: PathBuf,
+    directory: &Path,
+    index: usize,
+) -> Result<PathBuf, String> {
+    let Some(actual) = crate::commands::image::sniff_media_extension(&read_file_head(&path, 12))
+    else {
+        return Ok(path);
+    };
+    if matches!(
+        actual,
+        "mp3" | "wav" | "m4a" | "aac" | "ogg" | "flac" | "opus" | "amr"
+    ) {
+        return Err(format!(
+            "参考视频实际是音频文件（{}）：{}。请把真正的视频节点连到「引用素材」里",
+            actual,
+            path.display()
+        ));
+    }
+    // 只纠正能确定的两种容器；webm/mkv 的 EBML 魔数会互相误判，原样交给 CLI。
+    if !matches!(actual, "mp4" | "mov") {
+        return Ok(path);
+    }
+    let current = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if current == actual {
+        return Ok(path);
+    }
+    if let Some(sibling) = sibling_media_file(&path, actual) {
+        return Ok(sibling);
+    }
+    let target = directory.join(format!("video-{}.{actual}", index + 1));
+    fs::copy(&path, &target)
+        .map_err(|error| format!("无法准备参考视频（扩展名与内容不一致）: {error}"))?;
+    Ok(target)
+}
+
+/// 视频扩展名：先看 URL 后缀，再看 Content-Type。
+fn video_extension(content_type: &str, url: &str) -> String {
+    let from_url = url
+        .split('?')
+        .next()
+        .and_then(|path| path.rsplit('.').next())
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| matches!(value.as_str(), "mp4" | "mov" | "webm" | "mkv" | "avi"));
+    if let Some(value) = from_url {
+        return value;
+    }
+    let mime = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    match mime.as_str() {
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        "video/x-matroska" => "mkv",
+        "video/x-msvideo" => "avi",
+        _ => "mp4",
+    }
+    .to_string()
+}
+
+/// 远端视频下载到临时文件。视频比音频大得多，超时单独放宽。
+fn download_video_to_file(
+    url: &str,
+    directory: &Path,
+    index: usize,
+) -> Result<PathBuf, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|error| format!("无法创建下载客户端: {error}"))?;
+    let response = client
+        .get(url)
+        .header("Accept-Encoding", "identity")
+        .send()
+        .map_err(|error| format!("参考视频下载失败（网络）: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let hint = if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::NOT_FOUND
+        {
+            "这条视频存的是远端临时链接且已失效，请在视频节点里重新导入或重新生成后再试"
+        } else {
+            "请检查网络或该链接是否可用"
+        };
+        return Err(format!("参考视频下载失败：HTTP {status}。{hint}（{url}）"));
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = response
+        .bytes()
+        .map_err(|error| format!("参考视频下载失败（响应体中断）: {error}"))?;
+    if bytes.is_empty() {
+        return Err(format!("参考视频下载失败：内容为空（{url}）"));
+    }
+    let extension = video_extension(&content_type, url);
+    let path = directory.join(format!("video-{}.{extension}", index + 1));
+    fs::write(&path, &bytes).map_err(|error| format!("无法写入参考视频: {error}"))?;
+    Ok(path)
 }
 
 /// 单个音频来源 → 本地文件路径。
@@ -800,6 +999,7 @@ fn source_path(source: &str) -> PathBuf {
 fn resolve_video_command(
     image_mode: Option<&str>,
     images: &[PathBuf],
+    videos: &[PathBuf],
     audio: &[PathBuf],
 ) -> Result<&'static str, String> {
     if image_mode == Some("first-last") {
@@ -809,7 +1009,20 @@ fn resolve_video_command(
         if !audio.is_empty() {
             return Err("即梦 CLI 首尾帧模式暂不支持同时引用音频".to_string());
         }
+        // `frames2video` 只有 `--first` / `--last`，塞不进视频；而首尾帧本身
+        // 就把「参考」这件事占满了，混着提交语义也不清，所以直接拦掉。
+        if !videos.is_empty() {
+            return Err(
+                "即梦 CLI 首尾帧模式不支持视频参考，请切回「参考图」模式，或移除视频引用".to_string(),
+            );
+        }
         return Ok("frames2video");
+    }
+
+    // `multimodal2video`（全能参考）才认 `--video`：只要有视频就必须走它，
+    // 否则 `text2video` 会把视频静默丢掉 —— 用户以为传了，实际没传。
+    if !videos.is_empty() {
+        return Ok("multimodal2video");
     }
 
     if images.is_empty() && audio.is_empty() {
@@ -844,6 +1057,7 @@ fn run_jimeng_video_task(
     request: &GenerateJimengCliVideoRequest,
     video_resolution: &str,
     images: &[PathBuf],
+    videos: &[PathBuf],
     audio: &[PathBuf],
     download_dir: &Path,
     cancel: &Arc<AtomicBool>,
@@ -855,6 +1069,7 @@ fn run_jimeng_video_task(
         request,
         video_resolution,
         images,
+        videos,
         audio,
     );
     // 先提交并立即返回 submit_id，后续由本函数自行查询并向前端上报状态。
@@ -1867,6 +2082,7 @@ fn append_generation_args(
     request: &GenerateJimengCliVideoRequest,
     video_resolution: &str,
     images: &[PathBuf],
+    videos: &[PathBuf],
     audio: &[PathBuf],
 ) {
     arguments.push(format!("--prompt={}", request.prompt.trim()));
@@ -1892,6 +2108,9 @@ fn append_generation_args(
         "multimodal2video" => {
             for image in images {
                 arguments.push(format!("--image={}", image.display()));
+            }
+            for video in videos {
+                arguments.push(format!("--video={}", video.display()));
             }
             for audio_path in audio {
                 arguments.push(format!("--audio={}", audio_path.display()));
@@ -3008,6 +3227,46 @@ fn extract_url_field(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `canvas create` 的实测返回体（2026-11-18 真机）——projectId 嵌在 `project` 里。
+    #[test]
+    fn parse_created_canvas_project_reads_nested_project() {
+        let data: serde_json::Value = serde_json::from_str(
+            r#"{"project":{"projectId":"3134deb2-9882-4ab4-b660-0d1a5584e2c5","name":"LenTalk-Diag-1118","createdAt":1794975441317,"updatedAt":1794975441317,"webUrl":"https://x"},"draftVersion":0,"current":false}"#,
+        )
+        .expect("json");
+        let summary = parse_created_canvas_project(&data, "fallback").expect("parse");
+        assert_eq!(summary.project_id, "3134deb2-9882-4ab4-b660-0d1a5584e2c5");
+        assert_eq!(summary.name, "LenTalk-Diag-1118");
+        assert_eq!(summary.created_at, Some(1794975441317));
+    }
+
+    /// 旧/未来格式：projectId 直接在顶层。不能因为层级变了就报「未返回 projectId」。
+    #[test]
+    fn parse_created_canvas_project_tolerates_flat_payload() {
+        let data: serde_json::Value =
+            serde_json::from_str(r#"{"projectId":"p-flat","name":""}"#).expect("json");
+        let summary = parse_created_canvas_project(&data, "LenTalk-兜底").expect("parse");
+        assert_eq!(summary.project_id, "p-flat");
+        assert_eq!(summary.name, "LenTalk-兜底");
+    }
+
+    /// 真机：`canvas ls` 的输出能被解析成画布清单（不创建任何东西）。
+    ///
+    /// 跑法: `cargo test --lib live_canvas_project_list -- --ignored --nocapture`
+    /// 需要本机已安装并登录 `dreamina-canvas`。
+    #[test]
+    #[ignore]
+    fn live_canvas_project_list_parses_real_output() {
+        let executable = std::env::var("JIMENG_CANVAS_CLI")
+            .unwrap_or_else(|_| "dreamina-canvas".to_string());
+        let projects = list_canvas_projects_blocking(&executable).expect("列出画布失败");
+        assert!(!projects.is_empty(), "账号下应至少有一张画布");
+        for item in &projects {
+            println!("{} | {}", item.project_id, item.name);
+        }
+        assert!(projects.iter().all(|item| !item.project_id.is_empty()));
+    }
 
     /// 传输层失败必须被认出来（用户 App 1.2.44 实际踩到 `cli.transport_failed`：
     /// 平台已经生成完成，只是轮询那一次连不上）。
@@ -4370,8 +4629,13 @@ fn upload_canvas_resource(
             }
         }
 
+        let upload_timeout = if media_type == "video" {
+            CANVAS_VIDEO_UPLOAD_TIMEOUT
+        } else {
+            CANVAS_UPLOAD_TIMEOUT
+        };
         let (success, output) =
-            spawn_cli_capture(executable, &arguments, CANVAS_UPLOAD_TIMEOUT, &[])?;
+            spawn_cli_capture(executable, &arguments, upload_timeout, &[])?;
         let parsed = parse_canvas_payload(&output);
         if success {
             if let Ok(data) = &parsed {
@@ -4821,6 +5085,137 @@ fn ensure_canvas_project(executable: &str) -> Result<String, String> {
         .ok_or_else(|| "即梦画布 CLI 新建画布后未返回 projectId".to_string())
 }
 
+// ── 画布分配（按 LenTalk 工程建独立画布） ──────────────────────────────────
+
+/// `canvas ls` / `canvas create` 只回定位摘要, 这里一一对应即可。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasProjectSummary {
+    pub project_id: String,
+    pub name: String,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+}
+
+fn canvas_project_from_value(item: &serde_json::Value) -> Option<CanvasProjectSummary> {
+    let project_id = item
+        .get("projectId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(CanvasProjectSummary {
+        project_id: project_id.to_string(),
+        name: item
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        created_at: item.get("createdAt").and_then(serde_json::Value::as_i64),
+        updated_at: item.get("updatedAt").and_then(serde_json::Value::as_i64),
+    })
+}
+
+fn list_canvas_projects_blocking(executable: &str) -> Result<Vec<CanvasProjectSummary>, String> {
+    let output = run_canvas_cli_with_timeout(
+        executable,
+        &canvas_cli_args(&["canvas", "ls", "--non-interactive", "--format", "json"]),
+        CANVAS_ADMIN_TIMEOUT,
+    )?;
+    let data = parse_canvas_payload(&output)?;
+    Ok(data
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(canvas_project_from_value).collect())
+        .unwrap_or_default())
+}
+
+fn create_canvas_project_blocking(
+    executable: &str,
+    name: &str,
+) -> Result<CanvasProjectSummary, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("画布名称不能为空".to_string());
+    }
+    let output = run_canvas_cli_with_timeout(
+        executable,
+        &canvas_cli_args(&[
+            "canvas",
+            "create",
+            trimmed,
+            "--non-interactive",
+            "--format",
+            "json",
+        ]),
+        CANVAS_ADMIN_TIMEOUT,
+    )?;
+    let data = parse_canvas_payload(&output)?;
+    parse_created_canvas_project(&data, trimmed)
+}
+
+/// 解析 `canvas create` 的返回体。
+///
+/// 🔴 实测返回是 `{ "project": { projectId, name, createdAt, updatedAt, webUrl },
+/// "draftVersion": 0, "current": false }` —— projectId 嵌在 `project` 子对象里，
+/// 直接读顶层会拿不到时间字段。`current: false` 也确认了它不会切换当前画布。
+fn parse_created_canvas_project(
+    data: &serde_json::Value,
+    fallback_name: &str,
+) -> Result<CanvasProjectSummary, String> {
+    let project_node = data.get("project").unwrap_or(data);
+    let project_id = project_node
+        .get("projectId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        // 版本差异兜底：万一哪天又挪到别的层级，递归找一遍也能挖出来。
+        .or_else(|| find_json_string_field(data, "projectId"))
+        .ok_or_else(|| "即梦画布 CLI 新建画布后未返回 projectId".to_string())?;
+    let mut summary =
+        canvas_project_from_value(project_node).unwrap_or(CanvasProjectSummary {
+            project_id: project_id.clone(),
+            name: fallback_name.to_string(),
+            created_at: None,
+            updated_at: None,
+        });
+    summary.project_id = project_id;
+    if summary.name.is_empty() {
+        summary.name = fallback_name.to_string();
+    }
+    Ok(summary)
+}
+
+/// 列出账号下全部协作画布（生成节点选画布用）。
+#[tauri::command]
+pub async fn jimeng_canvas_project_list(
+    executable: String,
+) -> Result<Vec<CanvasProjectSummary>, String> {
+    let executable = executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先填写即梦画布 CLI 的可执行命令".to_string());
+    }
+    tokio::task::spawn_blocking(move || list_canvas_projects_blocking(&executable))
+        .await
+        .map_err(|error| format!("即梦画布列表读取中断: {error}"))?
+}
+
+/// 新建一张画布并返回它（创建后**不会**切换 CLI 的当前画布, 后续命令都显式传 projectId）。
+#[tauri::command]
+pub async fn jimeng_canvas_project_create(
+    executable: String,
+    name: String,
+) -> Result<CanvasProjectSummary, String> {
+    let executable = executable.trim().to_string();
+    if executable.is_empty() {
+        return Err("请先填写即梦画布 CLI 的可执行命令".to_string());
+    }
+    tokio::task::spawn_blocking(move || create_canvas_project_blocking(&executable, &name))
+        .await
+        .map_err(|error| format!("即梦画布创建中断: {error}"))?
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateJimengCanvasVideoRequest {
@@ -4835,6 +5230,10 @@ pub struct GenerateJimengCanvasVideoRequest {
     /// `480p` / `720P` / `1080P` / `4K`(大小写按 model list 原样)
     pub resolution: String,
     pub reference_images: Option<Vec<String>>,
+    /// 参考视频(`m2v` 模式支持, 额度按模型来自 `model list` 的 `references.types[video].max`)。
+    ///
+    /// 漏传的表现是「视频素材在节点上标着已引用, 实际一个字节都没发」。
+    pub reference_videos: Option<Vec<String>>,
     /// 参考音频(`m2v` 模式支持, 最多 10 个)。漏传会表现为「音频素材没进生成」。
     pub reference_audio: Option<Vec<String>>,
     pub project_id: Option<String>,
@@ -4905,6 +5304,24 @@ fn generate_canvas_video_blocking(
                 path,
                 "image",
                 "参考图",
+            )?);
+        }
+
+        // 参考视频也要登记成项目资源：`--ref` 只认 `res:<id>`，光给本地路径服务端看不到。
+        // 额度（`seedance_2.5_flash` 5 段 / `seedance_2.5` 10 段 / 2.0 系 3 段）由前端按
+        // `model list` 的 `references.types[video].max` 截断，这里不再重复判定。
+        let video_files = materialize_video_files(
+            request.reference_videos.as_deref().unwrap_or_default(),
+            &input_dir,
+        )?;
+        for path in &video_files {
+            ensure_local_cli_not_canceled(cancel.flag())?;
+            references.push(upload_canvas_resource(
+                &executable,
+                &project_id,
+                path,
+                "video",
+                "参考视频",
             )?);
         }
 
@@ -7077,6 +7494,7 @@ mod image_tests {
             video_resolution: Some("720p".to_string()),
             image_mode: image_mode.map(str::to_string),
             reference_images: None,
+            reference_videos: None,
             reference_audio: None,
         }
     }
@@ -7085,9 +7503,53 @@ mod image_tests {
     fn reference_mode_single_image_is_not_treated_as_first_frame() {
         let images = vec![PathBuf::from("reference.png")];
         assert_eq!(
-            resolve_video_command(Some("reference"), &images, &[]).unwrap(),
+            resolve_video_command(Some("reference"), &images, &[], &[]).unwrap(),
             "multimodal2video"
         );
+    }
+
+    /// 有视频就必须走全能参考（`multimodal2video`），否则 `text2video` 会把视频静默丢掉。
+    #[test]
+    fn video_reference_forces_multimodal_command() {
+        let videos = vec![PathBuf::from("ref.mp4")];
+        assert_eq!(
+            resolve_video_command(Some("reference"), &[], &videos, &[]).unwrap(),
+            "multimodal2video"
+        );
+        // 只有视频、没有图：2.5 允许这种组合，2.0 家族由服务端按「至少要一张图或视频」校验。
+        assert_eq!(
+            resolve_video_command(None, &[], &videos, &[]).unwrap(),
+            "multimodal2video"
+        );
+    }
+
+    /// 首尾帧模式的 `--ref` 只有 --first/--last，塞不进视频，必须明确拦下而不是静默忽略。
+    #[test]
+    fn first_last_mode_rejects_video_reference() {
+        let images = vec![PathBuf::from("first.png"), PathBuf::from("last.png")];
+        let videos = vec![PathBuf::from("ref.mp4")];
+        let error = resolve_video_command(Some("first-last"), &images, &videos, &[]).unwrap_err();
+        assert!(error.contains("视频参考"), "{error}");
+    }
+
+    #[test]
+    fn multimodal_command_carries_video_flag() {
+        let request = video_request(Some("reference"));
+        let images = vec![PathBuf::from("reference.png")];
+        let videos = vec![PathBuf::from("ref.mp4")];
+        let mut arguments = Vec::new();
+        append_generation_args(
+            &mut arguments,
+            "multimodal2video",
+            &request,
+            "720p",
+            &images,
+            &videos,
+            &[],
+        );
+
+        assert!(arguments.iter().any(|argument| argument == "--video=ref.mp4"));
+        assert!(arguments.iter().any(|argument| argument == "--image=reference.png"));
     }
 
     #[test]
@@ -7101,6 +7563,7 @@ mod image_tests {
             &request,
             "720p",
             &images,
+            &[],
             &[],
         );
 
@@ -7120,6 +7583,7 @@ mod image_tests {
             &request,
             "720p",
             &images,
+            &[],
             &[],
         );
 
@@ -7563,6 +8027,9 @@ mod image_tests {
             min_count: min,
             fixed_count: fixed,
             max_references: 20,
+            max_image_references: 0,
+            max_video_references: 0,
+            max_audio_references: 0,
             min_references: 0,
             max_prompt_length: prompt_limit,
             supports_first_frame: false,

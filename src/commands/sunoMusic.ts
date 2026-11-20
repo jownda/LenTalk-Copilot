@@ -1,23 +1,29 @@
 /**
  * 知鸟AI · Suno 音乐链路（`music` 模型）协议模块。
  *
- * 事实来源（2026-09-20 实测，全部**免鉴权**可复核）：
+ * 事实来源（2026-11-18 复核）：
  *   - `GET https://cuai.token6688.com/v1/logical-models` → `models[].param_schema`
- *     是**权威字段表**（12 个字段，见下）
- *   - `GET https://cuai.token6688.com/api/v1/models` → 价格元数据
- *     （`unit_price_micro_usd = 171429`、`billing_unit = per_request`）
+ *     是**权威字段表**（`music` 卡已扩到 25 个字段 / 19 个 operation）
+ *   - `GET https://cuai.token6688.com/openapi.json` → 端点契约
+ *   - `POST /api/v1/model-runtime/dry-run` → **¥0** 校验信封与路由（未打厂商、不计费），
+ *     用它确认过 `operation`、`params.prompt`、`mode=instrumental` 的真实映射
  *   - 无 key 探测：`/v1/audio/speech` `401` ✓、`/v1/audio/speech/async` `401` ✓、
  *     `GET /v1/tasks/{id}` `401` ✓；`/v1/audio/music` **`404`** ✗
  *
- * **本项目旧实现走的正是那条不存在的 `/v1/audio/music`**，且请求体是字子动画的
- * `metadata{lyrics_text, music_length_ms}` —— 所以这个页面的音乐生成一直是打不通的。
+ * 两代实现各踩过一个坑，都记在这里：
+ *   1. 早期走**不存在的** `/v1/audio/music` + 字子动画的 `metadata{...}` 信封 → 404。
+ *   2. 之后改到 `/v1/audio/speech/async` + 顶层扁平字段（`model/input/operation`）——
+ *      端点确实存在，但它**固定按语音合成处理**，与 `operation` 无关 →
+ *      `HTTP 400 params.voice is required for speech`（App 1.2.64 用户实际踩到）。
+ *      现在统一走 `/api/v1/model-runtime/invoke` 信封，见 `SUNO_INVOKE_PATH`。
  *
  * 与 MiniMax 链路的三处关键差异：
- *   1. **异步**。Suno 出歌中位 60–120 秒，走 `POST /v1/audio/speech/async` 拿
- *      `task_id`，再 `GET /v1/tasks/{task_id}` 轮询到终态取 CDN URL。
+ *   1. **异步**。Suno 出歌中位 60–120 秒：提交拿 `task_id`（信封音频模态恒异步），
+ *      再 `GET /v1/tasks/{task_id}` 轮询到终态取 CDN URL。
  *   2. **没有 `voice` 字段**。声线由 `vocal_gender`(`auto|m|f`) 控制，音色由
  *      `style` 风格标签间接影响。旧 UI 给的「演唱音色」下拉平台根本不认。
- *   3. **没有 `music_length_ms`**。曲长由模型决定，不能指定（那是字子动画的字段）。
+ *   3. **没有 `music_length_ms`**。曲长由 `duration`(10–360 秒) 指定，且只在
+ *      有歌词或纯器乐时生效（那是另一套字段，别混进来）。
  *
  * 计费：按次 ⚡0.171429（`per_request`，与提交次数挂钩，与时长/字符无关）。
  */
@@ -25,14 +31,62 @@
 /** 平台侧模型名。**必须精确匹配** —— 见下方 `resolveSunoMusicOperation` 的顺序说明。 */
 export const SUNO_MUSIC_MODEL = "music";
 
-/** 音乐生成与语音合成**共用**同一个端点，靠 `model` 分流。 */
-export const SUNO_AUDIO_PATH = "/v1/audio/speech";
-/** 异步入口：返回 `task_id` 而非音频字节。 */
-export const SUNO_ASYNC_PATH = "/v1/audio/speech/async";
+/**
+ * 音乐生成走平台的**统一调用入口**：`{model_id, modality, operation, params}` 信封。
+ *
+ * 🔴 **绝不要把音乐请求发到 `/v1/audio/speech` 或 `/v1/audio/speech/async`**。
+ * 那条路径固定按「语音合成」处理，与 `operation` 传什么无关 —— 响应就是
+ * `HTTP 400 params.voice is required for speech`（App 1.2.64 用户实际踩到）。
+ * 语音合成（TTS）才走 `/v1/audio/speech(/async)`；音乐卡用本常量 + `operation`。
+ *
+ * 同一入口还支持 `extend / cover / upload_cover / lyrics / stems / stems_all / mp4 /
+ * concat` 等全部音乐操作，是这条链路唯一的正确入口。
+ */
+export const SUNO_INVOKE_PATH = "/api/v1/model-runtime/invoke";
+/** 音乐卡在统一入口里的模态（`chat / image / video / audio`）。 */
+export const SUNO_INVOKE_MODALITY = "audio";
 
 /** 网关统一的任务查询端点（与提交路径不同，别拼成 `/v1/audio/speech/{id}`）。 */
 export function resolveSunoTaskPath(taskId: string): string {
   return `/v1/tasks/${encodeURIComponent(taskId)}`;
+}
+
+/**
+ * 免费前置校验端点（同信封，¥0，不打厂商、不冻结、不计费）。
+ *
+ * 用它做一件事：确认**源音频真的会被发出去**。平台的路由由渠道决定，而渠道的
+ * 字段映射各有各的残缺 —— 2026-11-18 实测 `upload_cover` 在 `music@APM:default`
+ * 与 `music@MXH:default` 上都被映射成「纯生成」，`cover_audio_url` 被静默丢弃。
+ * 那种情况下提交会扣费、却出一首全新的歌（不是翻唱），用户完全看不出原因。
+ */
+export const SUNO_DRY_RUN_PATH = "/api/v1/model-runtime/dry-run";
+
+/**
+ * dry-run 的 `wire` 里是否出现了源音频 —— 即「这条渠道真的把源发出去了」。
+ *
+ * 上游可能 re-host / 改写 URL，所以不比对整串，而是逐级放宽：
+ * 完整 URL → host → 路径 → 文件名（≥6 字符）。任一命中即认为带上了。
+ * `wire` 缺失时返回 `false`：拿不到证据就不该替平台担保。
+ */
+export function sunoDryRunCarriesSource(payload: unknown, sourceUrl: string): boolean {
+  const url = sourceUrl.trim();
+  if (!url) return false;
+  const wire = (payload as { wire?: unknown } | null | undefined)?.wire;
+  if (!wire) return false;
+  const text = typeof wire === "string" ? wire : JSON.stringify(wire);
+  if (!text) return false;
+  const candidates = new Set<string>([url]);
+  try {
+    const parsed = new URL(url);
+    candidates.add(parsed.host);
+    const path = parsed.pathname.replace(/^\/+/, "");
+    if (path.length >= 4) candidates.add(path);
+    const file = path.split("/").pop() ?? "";
+    if (file.length >= 6) candidates.add(file);
+  } catch {
+    // 不是合法 URL（手填的奇怪字符串）就只比原串。
+  }
+  return Array.from(candidates).some((candidate) => candidate.length > 0 && text.includes(candidate));
 }
 
 /** 文档「建议每 3 秒轮询一次」。 */
@@ -48,12 +102,31 @@ export const SUNO_MUSIC_UNIT_PRICE_MICRO_USD = 171429;
 // operation（8 种，照抄 param_schema 的 enum 与顺序）
 // ---------------------------------------------------------------------------
 
-export type SunoOperation = "generate" | "extend" | "cover" | "lyrics" | "stems" | "stems_all" | "mp4" | "concat";
+export type SunoOperation =
+  | "generate"
+  | "extend"
+  | "cover"
+  | "upload_cover"
+  | "lyrics"
+  | "stems"
+  | "stems_all"
+  | "mp4"
+  | "concat";
 
+/**
+ * 顺序照抄 `param_schema.operation.enum`（2026-11-18 复核：19 个操作）。
+ *
+ * 本应用只登记**已落地 UI/链路的 9 个**；平台还支持
+ * `persona / import / upload_extend / inspo / sample / add_vocals / add_instrumental /
+ * add_stem / replace_section / mashup` —— 它们各自要额外字段（`persona_name`、
+ * `audio_urls`、`start_s`/`end_s`、`infill_lyrics`、`second_clip_id`），
+ * 未接入前不要往这个数组里加，否则下拉会出现选了就必然失败的项。
+ */
 export const SUNO_OPERATIONS: SunoOperation[] = [
   "generate",
   "extend",
   "cover",
+  "upload_cover",
   "lyrics",
   "stems",
   "stems_all",
@@ -66,9 +139,21 @@ export const SUNO_DEFAULT_OPERATION: SunoOperation = "generate";
 /** 该操作消费哪个「源 clip」字段；`null` = 不吃已生成的曲子（纯生成）。 */
 export type SunoClipSource = "clip_id" | "continue_clip_id" | "cover_clip_id" | null;
 
+/**
+ * 该操作消费哪个「源音频 URL」字段；`null` = 不需要上传音频。
+ *
+ * `upload_cover` 是**唯一不依赖 clip 的源**：它吃一段公网可直接下载的音频
+ * （`cover_audio_url`，mp3/wav/m4a，建议 ≤8 分钟）。本地文件必须先换成公网直链，
+ * 换算在 `generateSunoMusic` 里做（`uploadZhiniaoReferenceAsset`）。
+ */
+export type SunoAudioUrlSource = "cover_audio_url" | null;
+
+/** 单个操作要不要源音频，用哪个字段 —— 与 `clipSource` 并列，互斥。 */
 export interface SunoOperationSpec {
   /** 源 clip 字段名，`null` 表示不需要。 */
   clipSource: SunoClipSource;
+  /** 源音频 URL 字段名，`null` 表示不需要。 */
+  audioUrlSource: SunoAudioUrlSource;
   /** 是否需要 `input`（主题 / 描述）。 */
   needsPrompt: boolean;
   /** `version` / `mode` / `style` / `lyrics` / `title` / `vocal_gender` / `negative_tags` 是否生效。 */
@@ -84,23 +169,85 @@ export interface SunoOperationSpec {
  *   - `clip_id`:        "operation=stems/stems_all/mp4/concat 必填"
  *   - `continue_clip_id`+`continue_at`: "operation=extend 必填 / 可选"
  *   - `cover_clip_id`:  "operation=cover 必填"
+ *   - `cover_audio_url`:"operation=upload_cover 必填: 公网可直接下载的音频地址
+ *                        (mp3/wav/m4a, 建议不超过 8 分钟); 非纯音乐模式须同时给 lyrics"
  *   - `lyrics`:         "operation=lyrics 需 prompt"（写出歌词**文本**，不产音频）
  */
 export const SUNO_OPERATION_SPECS: Record<SunoOperation, SunoOperationSpec> = {
-  generate: { clipSource: null, needsPrompt: true, usesSongParams: true, output: "audio", multiTrack: false },
+  generate: {
+    clipSource: null,
+    audioUrlSource: null,
+    needsPrompt: true,
+    usesSongParams: true,
+    output: "audio",
+    multiTrack: false,
+  },
   extend: {
     clipSource: "continue_clip_id",
+    audioUrlSource: null,
     needsPrompt: false,
     usesSongParams: true,
     output: "audio",
     multiTrack: false,
   },
-  cover: { clipSource: "cover_clip_id", needsPrompt: true, usesSongParams: true, output: "audio", multiTrack: false },
-  lyrics: { clipSource: null, needsPrompt: true, usesSongParams: false, output: "text", multiTrack: false },
-  stems: { clipSource: "clip_id", needsPrompt: false, usesSongParams: false, output: "audio", multiTrack: true },
-  stems_all: { clipSource: "clip_id", needsPrompt: false, usesSongParams: false, output: "audio", multiTrack: true },
-  mp4: { clipSource: "clip_id", needsPrompt: false, usesSongParams: false, output: "video", multiTrack: false },
-  concat: { clipSource: "clip_id", needsPrompt: false, usesSongParams: false, output: "audio", multiTrack: false },
+  cover: {
+    clipSource: "cover_clip_id",
+    audioUrlSource: null,
+    needsPrompt: true,
+    usesSongParams: true,
+    output: "audio",
+    multiTrack: false,
+  },
+  // 平台 2026-11 起放开「上传自己的音频翻唱」：源不再必须是平台内的 clip。
+  // `needsPrompt: false` —— 平台只要求 `cover_audio_url`（歌曲模式另需 lyrics）。
+  upload_cover: {
+    clipSource: null,
+    audioUrlSource: "cover_audio_url",
+    needsPrompt: false,
+    usesSongParams: true,
+    output: "audio",
+    multiTrack: false,
+  },
+  lyrics: {
+    clipSource: null,
+    audioUrlSource: null,
+    needsPrompt: true,
+    usesSongParams: false,
+    output: "text",
+    multiTrack: false,
+  },
+  stems: {
+    clipSource: "clip_id",
+    audioUrlSource: null,
+    needsPrompt: false,
+    usesSongParams: false,
+    output: "audio",
+    multiTrack: true,
+  },
+  stems_all: {
+    clipSource: "clip_id",
+    audioUrlSource: null,
+    needsPrompt: false,
+    usesSongParams: false,
+    output: "audio",
+    multiTrack: true,
+  },
+  mp4: {
+    clipSource: "clip_id",
+    audioUrlSource: null,
+    needsPrompt: false,
+    usesSongParams: false,
+    output: "video",
+    multiTrack: false,
+  },
+  concat: {
+    clipSource: "clip_id",
+    audioUrlSource: null,
+    needsPrompt: false,
+    usesSongParams: false,
+    output: "audio",
+    multiTrack: false,
+  },
 };
 
 /**
@@ -121,6 +268,7 @@ export const SUNO_OPERATION_LABEL_KEYS: Record<SunoOperation, string> = {
   generate: "node.audioGen.suno.operations.generate",
   extend: "node.audioGen.suno.operations.extend",
   cover: "node.audioGen.suno.operations.cover",
+  upload_cover: "node.audioGen.suno.operations.uploadCover",
   lyrics: "node.audioGen.suno.operations.lyrics",
   stems: "node.audioGen.suno.operations.stems",
   stems_all: "node.audioGen.suno.operations.stemsAll",
@@ -133,6 +281,7 @@ export const SUNO_OPERATION_HINT_KEYS: Record<SunoOperation, string> = {
   generate: "node.audioGen.suno.operationHints.generate",
   extend: "node.audioGen.suno.operationHints.extend",
   cover: "node.audioGen.suno.operationHints.cover",
+  upload_cover: "node.audioGen.suno.operationHints.uploadCover",
   lyrics: "node.audioGen.suno.operationHints.lyrics",
   stems: "node.audioGen.suno.operationHints.stems",
   stems_all: "node.audioGen.suno.operationHints.stemsAll",
@@ -240,6 +389,8 @@ export interface SunoMusicBodyInput {
   continueClipId?: string;
   continueAt?: string;
   coverClipId?: string;
+  /** `upload_cover` 的源音频（公网直链；本地文件由链路层先上传换取）。 */
+  coverAudioUrl?: string;
 }
 
 /** 按 operation 决定必填的源 clip 字段名（`null` = 不需要）。 */
@@ -247,58 +398,115 @@ export function requiredSunoClipField(operation: SunoOperation): SunoClipSource 
   return SUNO_OPERATION_SPECS[operation].clipSource;
 }
 
-/**
- * 组装音乐请求体。
- *
- * 形状是**顶层扁平**（与 speech 同端点、同风格），不是字子动画那种
- * `metadata{...}` 信封 —— 这是本次修正的核心。
- *
- * `input` 沿用同一端点上已验证过的文本字段名（speech-2.8 走的就是它）。
- * 音乐侧的信封形状尚未实跑确认，见 docs/api_docs/ZhiniaoAI_Suno_Music_Chain.md。
- */
-export function buildSunoMusicBody(apiModel: string, input: SunoMusicBodyInput): Record<string, unknown> {
-  const spec = SUNO_OPERATION_SPECS[input.operation];
-  const body: Record<string, unknown> = { model: apiModel, operation: input.operation };
+/** 统一入口的信封：音乐卡的参数全在 `params` 里。 */
+export interface SunoInvokeBody {
+  model_id: string;
+  modality: typeof SUNO_INVOKE_MODALITY;
+  operation: SunoOperation;
+  params: Record<string, unknown>;
+}
 
-  const prompt = input.prompt?.trim();
-  if (prompt) body.input = prompt;
+/** 协议里的源 clip 字段 → 画布节点上对应的 data 字段。 */
+const CLIP_SOURCE_TO_NODE_FIELD: Record<Exclude<SunoClipSource, null>, string> = {
+  clip_id: "sunoClipId",
+  continue_clip_id: "sunoContinueClipId",
+  cover_clip_id: "sunoCoverClipId",
+};
+
+/**
+ * 这个 operation 把「源 clip」写到节点的哪个字段（`null` = 不需要源）。
+ *
+ * 由 `SUNO_OPERATION_SPECS` 推导，**不再各写一份**：UI 的下拉、节点上「点素材设为源」
+ * 和请求体的 `cover_clip_id` 必须永远指同一个字段，否则会出现「界面上选了、
+ * 请求里没带上」这种白扣费的错。
+ */
+export function sunoClipNodeField(operation: SunoOperation): string | null {
+  const source = SUNO_OPERATION_SPECS[operation].clipSource;
+  return source ? CLIP_SOURCE_TO_NODE_FIELD[source] : null;
+}
+
+/** 协议里的源音频 URL 字段 → 画布节点上对应的 data 字段。 */
+const AUDIO_URL_SOURCE_TO_NODE_FIELD: Record<Exclude<SunoAudioUrlSource, null>, string> = {
+  cover_audio_url: "sunoCoverAudioUrl",
+};
+
+/**
+ * 这个 operation 把「源音频」写到节点的哪个字段（`null` = 不需要源音频）。
+ *
+ * 与 `sunoClipNodeField` 一样由规格表推导：UI 的输入框、素材条上的「设为源」角标
+ * 和请求体的 `cover_audio_url` 必须永远指同一个字段。
+ */
+export function sunoAudioUrlNodeField(operation: SunoOperation): string | null {
+  const source = SUNO_OPERATION_SPECS[operation].audioUrlSource;
+  return source ? AUDIO_URL_SOURCE_TO_NODE_FIELD[source] : null;
+}
+
+/**
+ * 组装音乐请求体 —— 平台统一入口的信封。
+ *
+ * 形状照 `POST /api/v1/model-runtime/invoke` 的契约：
+ *   `{model_id, modality: "audio", operation, params: {...}}`
+ * 音乐卡的参数**全部**放进 `params`（包括 `prompt`），不是顶层扁平；
+ * 顶层扁平那个写法属于 `/v1/audio/generations`，而那个端点固定按「生成」处理、
+ * 表达不了 `extend / cover / stems`，所以这里统一用信封。
+ *
+ * `params.prompt` 必须**存在**（空串也算有）：平台对音频模态会先校验这个键，
+ * 缺了直接 `400 params.input is required` —— `stems` / `extend` 这类本来不需要
+ * 主题的操作也一样，所以不做「有值才发」的判断。
+ */
+export function buildSunoInvokeBody(apiModel: string, input: SunoMusicBodyInput): SunoInvokeBody {
+  const spec = SUNO_OPERATION_SPECS[input.operation];
+  const params: Record<string, unknown> = {
+    prompt: input.prompt?.trim() ?? "",
+  };
 
   if (spec.usesSongParams) {
-    body.version = normalizeSunoVersion(input.version);
+    params.version = normalizeSunoVersion(input.version);
     const mode = normalizeSunoMode(input.mode);
-    body.mode = mode;
+    params.mode = mode;
 
     const style = input.style?.trim();
-    if (style) body.style = style;
+    if (style) params.style = style;
     const lyrics = input.lyrics?.trim();
-    if (lyrics) body.lyrics = lyrics;
+    if (lyrics) params.lyrics = lyrics;
     const title = input.title?.trim();
-    if (title) body.title = title;
+    if (title) params.title = title;
     const negativeTags = input.negativeTags?.trim();
-    if (negativeTags) body.negative_tags = negativeTags;
+    if (negativeTags) params.negative_tags = negativeTags;
 
     // param_schema 原文: 「歌曲模式下控制演唱者声线 (纯音乐模式无效)」——
     // 纯器乐时不要发这个字段, 免得平台按「有人声」误判。
-    if (mode === "song") body.vocal_gender = normalizeSunoVocalGender(input.vocalGender);
+    if (mode === "song") params.vocal_gender = normalizeSunoVocalGender(input.vocalGender);
   }
 
   if (spec.clipSource === "clip_id") {
     const clipId = input.clipId?.trim();
-    if (clipId) body.clip_id = clipId;
+    if (clipId) params.clip_id = clipId;
   }
   if (spec.clipSource === "continue_clip_id") {
     const sourceClipId = input.continueClipId?.trim();
-    if (sourceClipId) body.continue_clip_id = sourceClipId;
+    if (sourceClipId) params.continue_clip_id = sourceClipId;
     const continueAt = input.continueAt?.trim();
     // 「不传默认从结尾续」，所以只在实际填了数值时才带。
-    if (continueAt && Number.isFinite(Number(continueAt))) body.continue_at = continueAt;
+    if (continueAt && Number.isFinite(Number(continueAt))) params.continue_at = continueAt;
   }
   if (spec.clipSource === "cover_clip_id") {
     const coverClipId = input.coverClipId?.trim();
-    if (coverClipId) body.cover_clip_id = coverClipId;
+    if (coverClipId) params.cover_clip_id = coverClipId;
+  }
+  // `upload_cover` 的源 —— 到这一步必须已经是公网直链（本地文件在链路层
+  // `generateSunoMusic` 里先换过），这里只做搬运。
+  if (spec.audioUrlSource === "cover_audio_url") {
+    const coverAudioUrl = input.coverAudioUrl?.trim();
+    if (coverAudioUrl) params.cover_audio_url = coverAudioUrl;
   }
 
-  return body;
+  return {
+    model_id: apiModel,
+    modality: SUNO_INVOKE_MODALITY,
+    operation: input.operation,
+    params,
+  };
 }
 
 /**
@@ -318,6 +526,13 @@ export function validateSunoMusicInput(input: SunoMusicBodyInput): string | null
   }
   if (clipSource === "cover_clip_id" && !input.coverClipId?.trim()) {
     return "needCoverClipId";
+  }
+  if (spec.audioUrlSource === "cover_audio_url") {
+    if (!input.coverAudioUrl?.trim()) return "needCoverAudioUrl";
+    // 平台原文：「非纯音乐模式须同时给 lyrics」。这一条不在客户端挡，就会先扣费
+    // 再返回 400 —— 本文件的其它校验都是这个理由。
+    const mode = normalizeSunoMode(input.mode);
+    if (mode === "song" && !input.lyrics?.trim()) return "needCoverLyrics";
   }
   if (spec.needsPrompt && !input.prompt?.trim()) {
     return "needPrompt";
@@ -546,6 +761,8 @@ export const SUNO_VALIDATION_MESSAGES: Record<string, string> = {
   needClipId: "该操作需要源 clip —— 请先选一条已生成的音乐，或直接填写 clipId",
   needContinueClipId: "续写需要源 clip —— 请先选一条已生成的音乐，或直接填写 clipId",
   needCoverClipId: "翻唱需要源 clip —— 请先选一条已生成的音乐，或直接填写 clipId",
+  needCoverAudioUrl: "上传翻唱需要一段源音频 —— 请连一段音频（会自动上传）或填写公网音频地址",
+  needCoverLyrics: "上传翻唱在歌曲模式下必须给歌词 —— 想让它自己唱就切到「纯音乐」",
   needPrompt: "请先填写主题或描述",
 };
 
@@ -563,5 +780,7 @@ export const SUNO_VALIDATION_MESSAGE_KEYS: Record<string, string> = {
   needClipId: "node.audioGen.suno.needClipId",
   needContinueClipId: "node.audioGen.suno.needContinueClipId",
   needCoverClipId: "node.audioGen.suno.needCoverClipId",
+  needCoverAudioUrl: "node.audioGen.suno.needCoverAudioUrl",
+  needCoverLyrics: "node.audioGen.suno.needCoverLyrics",
   needPrompt: "node.audioGen.suno.needPrompt",
 };

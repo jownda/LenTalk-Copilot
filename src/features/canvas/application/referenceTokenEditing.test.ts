@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   findReferenceTokens,
   remapImageReferenceTokens,
+  remapVideoReferenceTokens,
   samePromptIgnoringReferenceTokens,
   shouldPruneReferenceTokens,
   syncImageReferenceTokens,
@@ -26,6 +27,28 @@ describe("cinematic prompt reference tokens", () => {
       ["image-a", "image-b", "image-c"],
       ["image-a", "image-c"],
     )).toBe("保留 @图1，断开的 ，继续使用 [image2]。");
+  });
+});
+
+describe("视频引用标记 @视频N", () => {
+  it("三种写法都能识别，并按视频额度校验序号", () => {
+    expect(findReferenceTokens("@视频1 和 @video2 与 [video3]", 0, 0, 2)).toEqual([
+      { start: 0, end: 4, token: "@视频1", value: 1, kind: "video" },
+      { start: 7, end: 14, token: "@video2", value: 2, kind: "video" },
+    ]);
+  });
+
+  it("移除中间一条视频后，后面的序号跟着往回收", () => {
+    const prompt = "首帧参考 @视频1，动作参考 @视频2，风格参考 @视频3。";
+    expect(
+      remapVideoReferenceTokens(prompt, ["v-a", "v-b", "v-c"], ["v-a", "v-c"]),
+    ).toBe("首帧参考 @视频1，动作参考 ，风格参考 @视频2。");
+  });
+
+  it("被移除的那条视频，其标记整体删掉", () => {
+    expect(remapVideoReferenceTokens("@video1 与 @video2", ["v-a", "v-b"], ["v-b"])).toBe(
+      " 与 @video1",
+    );
   });
 });
 

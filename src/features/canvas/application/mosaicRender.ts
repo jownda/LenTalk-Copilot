@@ -17,6 +17,95 @@ export interface MosaicRenderResult {
   renderedLayerCount: number;
 }
 
+/**
+ * 从掩码 data URL 读出 alpha 通道，缩放到 `width × height`，返回逐像素 alpha 数组。
+ *
+ * 局部调色的掩码存的是图层框坐标，而渲染时平图就是图层框尺寸，两者天然对齐；
+ * 万一尺寸有出入，这里 `drawImage` 缩放兜底。
+ */
+export async function loadMaskAlpha(maskDataUrl: string, width: number, height: number): Promise<Uint8ClampedArray | null> {
+  if (!maskDataUrl) {
+    return null;
+  }
+  try {
+    const image = await loadImageElement(maskDataUrl);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(width));
+    canvas.height = Math.max(1, Math.round(height));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return null;
+    }
+    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    const alpha = new Uint8ClampedArray(canvas.width * canvas.height);
+    for (let i = 0; i < alpha.length; i += 1) {
+      alpha[i] = data[i * 4 + 3];
+    }
+    return alpha;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把单个图层渲染成一张与「图层框」等大的独立画布（不含画布偏移）。
+ *
+ * 破坏性「删除选中内容」用：先把图层 bake 成平图（crop/adjust/rotation 都拍进去），
+ * 再在局部坐标上 destination-out 抹掉选区，生成的新图替换 `imageUrl`。
+ *
+ * 坐标约定：返回 canvas 的 (0,0) 对应图层框左上角（layer.x, layer.y），
+ * 选区掩码从画布坐标平移 (mask.x - layer.x, mask.y - layer.y) 即可对齐。
+ */
+export async function renderLayerToCanvas(
+  layer: import("@/features/canvas/domain/canvasNodes").MosaicLayerItem,
+  options?: { skipAdjust?: boolean },
+): Promise<HTMLCanvasElement> {
+  const width = Math.max(1, Math.round(layer.width));
+  const height = Math.max(1, Math.round(layer.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("无法创建画布上下文");
+  }
+
+  const image = await loadImageElement(layer.imageUrl);
+  const crop = layer.crop ?? { x: 0, y: 0, width: 1, height: 1 };
+  const imageWidth = Math.max(1, image.naturalWidth);
+  const imageHeight = Math.max(1, image.naturalHeight);
+  // 局部调色蒙版（图层局部坐标的 alpha 掩码）。
+  const maskAlpha = layer.adjustMask ? await loadMaskAlpha(layer.adjustMask, width, height) : null;
+  const source =
+    !options?.skipAdjust && layer.adjust && !isAdjustIdentity(layer.adjust)
+      ? renderAdjustedCanvas(image, imageWidth, imageHeight, layer.adjust, maskAlpha)
+      : image;
+  const cropWidth = Math.max(1, imageWidth * Math.max(0.01, crop.width));
+  const cropHeight = Math.max(1, imageHeight * Math.max(0.01, crop.height));
+  const scale = Math.max(layer.width / cropWidth, layer.height / cropHeight);
+  const drawWidth = imageWidth * scale;
+  const drawHeight = imageHeight * scale;
+  // 图层框局部坐标：中心对齐。
+  const drawX = layer.width / 2 - (crop.x + crop.width / 2) * drawWidth;
+  const drawY = layer.height / 2 - (crop.y + crop.height / 2) * drawHeight;
+
+  context.globalAlpha = typeof layer.opacity === "number" ? layer.opacity : 1;
+  context.save();
+  const rotation = layer.rotation ?? 0;
+  if (rotation) {
+    context.translate(layer.width / 2, layer.height / 2);
+    context.rotate((rotation * Math.PI) / 180);
+    context.translate(-layer.width / 2, -layer.height / 2);
+  }
+  context.beginPath();
+  context.rect(0, 0, width, height);
+  context.clip();
+  context.drawImage(source, drawX, drawY, drawWidth, drawHeight);
+  context.restore();
+  return canvas;
+}
+
 export async function renderMosaicToCanvas(data: SeamlessMosaicNodeData): Promise<MosaicRenderResult> {
   const canvasWidth = Math.max(1, Math.round(data.canvasWidth || 1920));
   const canvasHeight = Math.max(1, Math.round(data.canvasHeight || 1080));
@@ -42,6 +131,24 @@ export async function renderMosaicToCanvas(data: SeamlessMosaicNodeData): Promis
   let renderedLayerCount = 0;
   for (const layer of sorted) {
     try {
+      // 有「局部调色蒙版」的图层走「bake 平图 + 局部调色」路径：
+      // 先把图层（crop/rotation 都拍进去，但不含 adjust）bake 成图层框坐标的平图，
+      // 再在图层框坐标上应用「选区掩码限制的 adjust」，最后整框贴到画布。
+      // 这样掩码（图层局部坐标）与调色范围直接对齐，没有源图/画布坐标转换的坑。
+      if (layer.adjustMask && layer.adjust && !isAdjustIdentity(layer.adjust)) {
+        const baked = await renderLayerToCanvas(layer, { skipAdjust: true });
+        const maskAlpha = await loadMaskAlpha(layer.adjustMask, baked.width, baked.height);
+        const localized = renderAdjustedCanvas(baked, baked.width, baked.height, layer.adjust, maskAlpha);
+        context.globalAlpha = typeof layer.opacity === "number" ? layer.opacity : 1;
+        context.save();
+        context.globalCompositeOperation = mosaicBlendOperation(layer.blendMode);
+        context.drawImage(localized, layer.x, layer.y, layer.width, layer.height);
+        context.restore();
+        context.globalCompositeOperation = "source-over";
+        renderedLayerCount += 1;
+        continue;
+      }
+
       const image = await loadImageElement(layer.imageUrl);
       const crop = layer.crop ?? { x: 0, y: 0, width: 1, height: 1 };
       const imageWidth = Math.max(1, image.naturalWidth);

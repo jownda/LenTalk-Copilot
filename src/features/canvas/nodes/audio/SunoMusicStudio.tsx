@@ -17,6 +17,8 @@ import {
   SUNO_VERSION_LABEL_KEYS,
   SUNO_VOCAL_GENDERS,
   SUNO_VOCAL_GENDER_LABEL_KEYS,
+  sunoClipNodeField,
+  sunoAudioUrlNodeField,
   validateSunoMusicInput,
   type SunoOperation,
 } from "@/commands/sunoMusic";
@@ -36,6 +38,20 @@ export interface SunoClipCandidate {
   label: string;
 }
 
+/**
+ * 上游连线上的一音频素材 —— 「上传翻唱」用它当源。
+ *
+ * 与 `SunoClipCandidate` 的区别: 这里**不需要 clip id**, 普通 mp3 也能当源;
+ * 提交前由链路层把 `source` 换成公网直链(`uploadZhiniaoReferenceAsset`)。
+ */
+export interface SunoAudioCandidate {
+  /** 画布里的原始地址（本地路径 / `asset://` / 公网 URL）。 */
+  source: string;
+  label: string;
+  /** 是不是 Suno 自己生成的结果（有 clip id）—— 两种源都可用, 只是展示上有区分。 */
+  clipId?: string;
+}
+
 export type SunoMusicStudioProps = {
   /** 音乐家族里走 Suno 协议的模型。 */
   models: AudioModelDefinition[];
@@ -46,6 +62,8 @@ export type SunoMusicStudioProps = {
   isBusy: boolean;
   /** 从上游连线里捞到的源 clip。 */
   clipCandidates: SunoClipCandidate[];
+  /** 从上游连线里捞到的全部音频素材（「上传翻唱」的候选，普通 mp3 也能用）。 */
+  audioCandidates: SunoAudioCandidate[];
   /** 当前节点正在跑哪种动作(生成 / 写词), 用来只转对应的那个圈。 */
   activeAction: "generate" | "lyrics" | null;
   message?: { tone: "error" | "success"; text: string };
@@ -60,28 +78,26 @@ const LABEL_CLASS = "block text-[10px] text-text-muted";
 const TEXTAREA_CLASS =
   "nodrag nowheel ui-scrollbar w-full resize-none rounded border border-border-dark bg-bg-dark p-1.5 text-[11px] leading-4 text-text-dark outline-none placeholder:text-text-muted/70";
 
-/** 每个操作把「源 clip」写到哪个节点字段。 */
-const CLIP_FIELD_BY_OPERATION: Record<string, keyof AudioGenNodeData> = {
-  stems: "sunoClipId",
-  stems_all: "sunoClipId",
-  mp4: "sunoClipId",
-  concat: "sunoClipId",
-  extend: "sunoContinueClipId",
-  cover: "sunoCoverClipId",
-};
+/**
+ * 每个操作把「源 clip」写到哪个节点字段 —— 由 `sunoMusic.ts` 的 `SUNO_OPERATION_SPECS`
+ * 推导，不在这里另写一份（否则加一个操作就会漏一处）。
+ */
+const clipFieldByOperation = (operation: SunoOperation): keyof AudioGenNodeData | null =>
+  sunoClipNodeField(operation) as keyof AudioGenNodeData | null;
 
 function readString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
 /**
- * 知鸟 Suno 音乐工作室 —— 按 `param_schema` 的 12 个字段逐项落地。
+ * 知鸟 Suno 音乐工作室 —— 按 `param_schema` 的字段逐项落地。
  *
  * 与 MINIMAX 三卡片的根本差异：这里**不是流水线上的多个工位**，而是**同一个模型的
  * 一种操作**。`operation` 决定其余字段显隐：
- *   - 生成类（generate / extend / cover）吃 version / mode / style / lyrics / title /
- *     vocal_gender / negative_tags
+ *   - 生成类（generate / extend / cover / upload_cover）吃 version / mode / style /
+ *     lyrics / title / vocal_gender / negative_tags
  *   - 后处理类（stems / stems_all / mp4 / concat）只吃一个源 clip
+ *   - `upload_cover` 多一条「源音频」输入（普通 mp3 也能当源，本地文件先上传换公网地址）
  * 所以是「一个下拉驱动一张表单」，而不是多张并行卡片。
  *
  * 另外两处与旧实现的关键修正:
@@ -96,6 +112,7 @@ export function SunoMusicStudio({
   description,
   isBusy,
   clipCandidates,
+  audioCandidates,
   activeAction,
   message,
   onGenerate,
@@ -121,18 +138,28 @@ export function SunoMusicStudio({
   const negativeTags = readString(data.sunoNegativeTags);
   const continueAt = readString(data.sunoContinueAt);
 
-  const clipField = CLIP_FIELD_BY_OPERATION[effectiveOperation];
+  const clipField = clipFieldByOperation(effectiveOperation);
   const clipValue = clipField ? readString(data[clipField]) : "";
   const clipSource = spec.clipSource;
+  /** 源音频字段（只有 upload_cover 有）—— 与 clip 是两条互斥的源。 */
+  const audioUrlField = sunoAudioUrlNodeField(effectiveOperation) as keyof AudioGenNodeData | null;
+  const coverAudioUrl = audioUrlField ? readString(data[audioUrlField]) : "";
+  /** 上游音频去重（同一段音频可能被多个节点指向）。 */
+  const audioOptions = audioCandidates.filter(
+    (candidate, index) => candidate.source?.trim() && audioCandidates.findIndex((item) => item.source === candidate.source) === index,
+  );
 
   // 本地校验与链路层**同一个函数** —— UI 显示「能点」而请求被判非法, 或反过来,
   // 都会白扣一次费(平台按提交次数计费)。
   const invalid = validateSunoMusicInput({
     operation: effectiveOperation,
     prompt: description,
+    mode,
+    lyrics,
     clipId: readString(data.sunoClipId),
     continueClipId: readString(data.sunoContinueClipId),
     coverClipId: readString(data.sunoCoverClipId),
+    coverAudioUrl,
   });
   const canGenerate = !isBusy && models.length > 0 && invalid === null;
   const canWriteLyrics =
@@ -227,6 +254,38 @@ export function SunoMusicStudio({
           {spec.multiTrack && (
             <p className="text-[10px] leading-4 text-text-muted">{t("node.audioGen.suno.multiTrackHint")}</p>
           )}
+        </div>
+      )}
+
+      {/* ---- 源音频：upload_cover（翻唱自己上传的音频）---- */}
+      {spec.audioUrlSource === "cover_audio_url" && (
+        <div className="space-y-1 rounded-lg border border-border-dark bg-bg-dark/55 p-2">
+          <div className="text-[10px] text-text-muted">{t("node.audioGen.suno.coverAudioUrl")}</div>
+          {audioOptions.length > 0 ? (
+            <select
+              className={FIELD_CLASS}
+              value={audioOptions.some((candidate) => candidate.source === coverAudioUrl) ? coverAudioUrl : ""}
+              onChange={(event) => audioUrlField && onChange({ [audioUrlField]: event.target.value })}
+            >
+              <option value="">{t("node.audioGen.suno.pickAudioFromUpstream")}</option>
+              {audioOptions.map((candidate) => (
+                <option key={candidate.source} value={candidate.source}>
+                  {candidate.label}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <p className="text-[10px] leading-4 text-text-muted">{t("node.audioGen.suno.noUpstreamAudio")}</p>
+          )}
+          {/* 手填：上游没连、或要用别处的公网音频时走这里。 */}
+          <input
+            className={FIELD_CLASS}
+            value={coverAudioUrl}
+            placeholder={t("node.audioGen.suno.coverAudioUrlPlaceholder")}
+            onChange={(event) => audioUrlField && onChange({ [audioUrlField]: event.target.value })}
+          />
+          <p className="text-[10px] leading-4 text-text-muted">{t("node.audioGen.suno.coverAudioUrlHint")}</p>
+          <p className="text-[10px] leading-4 text-text-muted/80">{t("node.audioGen.suno.uploadCoverProbeHint")}</p>
         </div>
       )}
 

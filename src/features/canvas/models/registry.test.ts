@@ -1322,4 +1322,50 @@ describe("即梦画布 CLI 视频档位", () => {
     expect(resolutionsOf("seedance_2.5")).toContain("480p");
     expect(resolutionsOf("seedance_2.5_draft")).toEqual(["480p"]);
   });
+
+  /**
+   * 目录没同步到（首次启动 / 缓存过期）时走的就是这张兜底表，
+   * 所以它必须和 `model list` 的实测值一致 —— 差一个数，节点就会误标「视频不会被提交」。
+   */
+  /**
+   * 真实踩过的坑：这两个内置 CLI 模型族曾经一个 `profileId` 都没写，
+   * 节点用 `getVideoModelProfile(undefined)` 就掉进「通用 OpenAI Video」档案，
+   * 结果 `seedance_2.5_flash` 明明收 5 段参考视频，节点上却一直显示「不读取视频参考」。
+   */
+  it("每个模型都带协议档案，缺了会掉进通用 OpenAI Video", () => {
+    const models = canvasVideo();
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.every((model) => model.profileId === "jimeng-canvas")).toBe(true);
+  });
+
+  it("参考视频兜底额度对齐目录实测值", () => {
+    const quota = (model: string) =>
+      canvasVideo().find((item) => item.id === `${JIMENG_CANVAS_CLI_PROVIDER_ID}/${model}`)
+        ?.maxReferenceVideos;
+    expect(quota("seedance_2.5_flash")).toBe(5);
+    expect(quota("seedance_2.5")).toBe(10);
+    expect(quota("seedance_2.5_draft")).toBe(10);
+    expect(quota("seedance_2.0_vip")).toBe(3);
+    expect(quota("seedance_2.0_fast_vip")).toBe(3);
+    expect(quota("seedance_2.0_mini")).toBe(3);
+    // Wan 3.0 的 m2v 同样收 5 段视频。
+    expect(quota("wan_3.0")).toBe(5);
+    // 1.0 没有 m2v；HappyHorse 的 m2v 只收图 —— 都不能标成支持。
+    expect(quota("seedance_pro_fast")).toBeUndefined();
+    expect(quota("happyhorse_1.1")).toBeUndefined();
+  });
+});
+
+describe("即梦 CLI（旧 dreamina）视频模型", () => {
+  /**
+   * 旧 CLI 的视频模型同样曾经漏 `profileId`：`multimodal2video` 明明收视频，
+   * 节点上却按通用 OpenAI Video 判成不支持。
+   */
+  it("每个模型都带 jimeng-cli 档案", () => {
+    const models = listVideoModels().filter(
+      (model) => model.providerId === JIMENG_CLI_PROVIDER_ID
+    );
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.every((model) => model.profileId === "jimeng-cli")).toBe(true);
+  });
 });

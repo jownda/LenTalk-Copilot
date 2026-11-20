@@ -17,7 +17,8 @@ import {
   type MosaicLayerItem,
   type SeamlessMosaicNodeData,
 } from "@/features/canvas/domain/canvasNodes";
-import { graphImageResolver } from "@/features/canvas/application/canvasServices";
+import { canvasEventBus, graphImageResolver } from "@/features/canvas/application/canvasServices";
+import { restoreNodeAfterMosaicEdit } from "@/features/canvas/application/openMosaicEditor";
 import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
 import {
   prepareNodeImage,
@@ -508,6 +509,22 @@ export const SeamlessMosaicNode = memo(({ id, data, selected, width, height }: S
   }, [id, setSelectedNode]);
 
   /**
+   * 外部（图片节点的「图片编辑」按钮）也能唤起全屏编辑器。
+   *
+   * 编辑器展开是本地 state，别处无法直接 setState，所以走一次事件：
+   * 只接 `nodeId === id` 的那条，其余节点收到同一个事件直接忽略。
+   */
+  useEffect(() => {
+    return canvasEventBus.subscribe("mosaic-editor/open", (payload) => {
+      if (payload.nodeId !== id) {
+        return;
+      }
+      setSelectedNode(id);
+      setIsEditorOpen(true);
+    });
+  }, [id, setSelectedNode]);
+
+  /**
    * 节点内拖动/缩放图层后提交。
    *
    * 顺带把上一次的导出结果作废：否则节点缩略图与下游取图仍是「挪动前」的那张 PNG，
@@ -596,14 +613,33 @@ export const SeamlessMosaicNode = memo(({ id, data, selected, width, height }: S
     );
     if (!next) return;
 
-    // 只替换画幅，图层原样保留。
+    /**
+     * 单图层：画幅与图层一起缩放。
+     *
+     * 以前这里只换画幅、图层原样保留 —— 拖一下节点边框，画幅被放大而图片还停在
+     * 原来的像素尺寸上，四周立刻多出一圈空白。用户看到的说法就是
+     * 「图片的尺寸和图片编辑里显示框的尺寸不一致」。
+     */
+    const onlyLayer = (data.layers ?? []).length === 1 ? data.layers![0] : null;
+    if (onlyLayer) {
+      updateNodeData(id, {
+        canvasWidth: next.width,
+        canvasHeight: next.height,
+        layers: [{ ...onlyLayer, x: 0, y: 0, width: next.width, height: next.height }],
+        outputImageUrl: null,
+        outputPreviewImageUrl: null,
+      });
+      return;
+    }
+
+    // 多图层：只替换画幅，图层原样保留（各自的位置是用户排的，不能跟着缩放）。
     updateNodeData(id, {
       canvasWidth: next.width,
       canvasHeight: next.height,
       outputImageUrl: null,
       outputPreviewImageUrl: null,
     });
-  }, [data.canvasHeight, data.canvasWidth, id, resolvedHeight, resolvedWidth, updateNodeData]);
+  }, [data.canvasHeight, data.canvasWidth, data.layers, id, resolvedHeight, resolvedWidth, updateNodeData]);
 
   /**
    * 老工程一次性自愈：单图层的节点，把画幅从「比图片大一圈」收成贴合图片。
@@ -847,7 +883,13 @@ export const SeamlessMosaicNode = memo(({ id, data, selected, width, height }: S
         <SeamlessMosaicEditor
           nodeId={id}
           data={data}
-          onClose={() => setIsEditorOpen(false)}
+          onClose={() => {
+            setIsEditorOpen(false);
+            // 从图片节点点「图片编辑」进来的是**临时会话**：关掉编辑器就把节点还原成
+            // 原来的图片节点，别让它在画布上永久变成「图片编辑」。
+            // 真正的图片编辑节点没有快照，这里是空操作。
+            restoreNodeAfterMosaicEdit(id);
+          }}
           onSyncFrame={(aspect) => {
             // 画布裁剪后比例变了：节点框跟着换，预览才不会被拉扁；
             // 记进 selfResizedRef，免得尺寸监听再把画幅缩放一遍。

@@ -121,6 +121,14 @@ export interface VideoModelDefinition {
    * 超量会直接报错, 而不是静默忽略。
    */
   maxReferenceImages?: number;
+  /**
+   * 单次最多可带几段参考视频。`undefined` = 平台未声明上限（由协议档案判定）。
+   *
+   * 平台目录声明的额度优先于 `videoReferenceSupport` 里按协议登记的默认值：
+   * 即梦画布 CLI 同一个协议下 `seedance_2.5_flash` 收 5 段、`seedance_pro_fast` 一段都不收，
+   * 只看协议会把两者判成一样。
+   */
+  maxReferenceVideos?: number;
   pricing?: ModelPricingDefinition;
   profileId?: string;
   profileStatus?: "verified" | "pending-adaptation";
@@ -194,7 +202,7 @@ export interface AudioModelDefinition {
    * 音乐链路协议 —— 决定音乐页渲染哪套 UI。
    *
    *   - `suno`    知鸟的 `music`：8 种 operation + version/mode/style/title/vocal_gender/negative_tags，
-   *               走 `/v1/audio/speech/async` 异步轮询。字段表见 `@/commands/sunoMusic`。
+   *               走统一入口 `/api/v1/model-runtime/invoke` 异步轮询。字段表见 `@/commands/sunoMusic`。
    *   - `generic` 其余平台(字子动画 `music-2.6` 等)：只有歌词 + 时长，同步返回二进制。
    *
    * 判定复用 `isSunoMusicModel`，与链路层的分流**同源**，避免 UI 显示 A 协议、

@@ -19,6 +19,7 @@ import {
   Clapperboard,
   ImagePlus,
   LoaderCircle,
+  Play,
   Plus,
   Sparkles,
   Trash2,
@@ -58,11 +59,13 @@ import {
   getDefaultVideoModelId,
   getModelProvider,
   getVideoModelProfile,
+  resolveVideoModelProfile,
   JIMENG_CANVAS_CLI_PROVIDER_ID,
   JIMENG_CLI_PROVIDER_ID,
   RUNNINGHUB_CLI_PROVIDER_ID,
   listVideoModels,
 } from "@/features/canvas/models";
+import { resolveVideoReferenceSupport } from "@/features/canvas/models/videoReferenceSupport";
 import { resolveModelPriceDisplay } from "@/features/canvas/pricing";
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from "@/features/canvas/ui/NodeHeader";
 import { CanvasRefThumb } from "@/features/canvas/ui/CanvasRefThumb";
@@ -72,6 +75,7 @@ import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
 import { CanvasNodeImage } from "@/features/canvas/ui/CanvasNodeImage";
 import { NodeReferencePicker } from "@/features/canvas/ui/NodeReferencePicker";
 import { AudioViewerModal } from "@/features/canvas/ui/AudioViewerModal";
+import { VideoViewerModal } from "@/features/canvas/ui/VideoViewerModal";
 import {
   PICKER_FALLBACK_ANCHOR,
   resolvePickerAnchor,
@@ -84,6 +88,7 @@ import {
   insertReferenceToken,
   remapAudioReferenceTokens,
   remapImageReferenceTokens,
+  remapVideoReferenceTokens,
   removeTextRange,
   resolveReferenceAwareDeleteRange,
   samePromptIgnoringReferenceTokens,
@@ -93,6 +98,12 @@ import { useDebouncedNodeTextCommit } from "@/features/canvas/application/useDeb
 import { applyLocalReferenceSection, type LocalReferenceAsset } from "@/features/canvas/domain/referenceSection";
 import { anchorImageReferenceTags } from "@/features/canvas/domain/referenceTagAnchors";
 import { readLiveInputText } from "@/features/canvas/application/liveInputText";
+import {
+  isVideoSubmitThrottled,
+  markVideoSubmit,
+  remainingVideoSubmitCooldown,
+  VIDEO_SUBMIT_COOLDOWN_MS,
+} from "@/features/canvas/application/videoSubmitThrottle";
 import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
 import { useCanvasStore } from "@/stores/canvasStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -116,15 +127,9 @@ const VIDEO_GEN_NODE_MAX_HEIGHT = 560;
 const VIDEO_GEN_NODE_DEFAULT_WIDTH = 420;
 const VIDEO_GEN_NODE_DEFAULT_HEIGHT = 360;
 const JIMENG_CLI_MAX_REFERENCE_IMAGES = 9;
-/**
- * 连点冷却：一次提交成功后 2s 内不再接受新的提交。
- * 这是「防手滑连点」而不是「防重复扣费」——刻意不再等视频生成完才解禁，
- * 让用户能连续发起多次生成，各次任务互不影响。
- */
-const GENERATE_COOLDOWN_MS = 2000;
 
 interface ReferencePickerItem {
-  kind: "image" | "audio";
+  kind: "image" | "audio" | "video";
   index: number;
   label: string;
   source: string;
@@ -133,12 +138,12 @@ interface ReferencePickerItem {
 /** 输入框下方展示的一条「已引用素材」缩略图。 */
 interface ReferenceTile {
   key: string;
-  kind: "image" | "audio";
+  kind: "image" | "audio" | "video";
   source: string;
-  /** 与该素材在提示词里的引用序号一致(图N / 音频N) */
+  /** 与该素材在提示词里的引用序号一致(图N / 音频N)；视频只做展示与提交顺序 */
   label: string;
   displayUrl: string | null;
-  /** false = 当前模型不会使用它(即梦忽略工作室音频), 仅展示以便删除 */
+  /** false = 当前模型不会使用它(即梦忽略工作室音频 / 本地 CLI 不吃视频参考), 仅展示以便删除 */
   used: boolean;
 }
 
@@ -205,24 +210,47 @@ function resolvePreviewTop(clientY: number, height: number): number {
   return Math.max(REFERENCE_PREVIEW_MARGIN, Math.min(top, window.innerHeight - height - REFERENCE_PREVIEW_MARGIN));
 }
 
-function renderPromptWithHighlights(
-  prompt: string,
-  maxImageCount: number,
-  maxAudioCount: number,
-  imageUrls: string[],
-  audioSources: string[],
-  resolveAudioLabel: (source: string, index: number) => string,
-  onThumbnailClick?: (displayUrl: string, event: { clientX: number; clientY: number }) => void,
-  onAudioChipClick?: (source: string, label: string) => void,
-  audioChipHint?: string,
-): ReactNode {
+interface PromptHighlightOptions {
+  maxImageCount: number;
+  maxAudioCount: number;
+  /** 视频参考额度；不给就按 0 处理（标记仍会显示成普通文字）。 */
+  maxVideoCount?: number;
+  imageUrls: string[];
+  audioSources: string[];
+  videoSources?: string[];
+  resolveAudioLabel: (source: string, index: number) => string;
+  resolveVideoLabel?: (source: string, index: number) => string;
+  onThumbnailClick?: (displayUrl: string, event: { clientX: number; clientY: number }) => void;
+  onAudioChipClick?: (source: string, label: string) => void;
+  onVideoChipClick?: (source: string, label: string) => void;
+  audioChipHint?: string;
+  videoChipHint?: string;
+}
+
+function renderPromptWithHighlights(prompt: string, options: PromptHighlightOptions): ReactNode {
+  const {
+    maxImageCount,
+    maxAudioCount,
+    maxVideoCount,
+    imageUrls,
+    audioSources,
+    videoSources,
+    resolveAudioLabel,
+    resolveVideoLabel,
+    onThumbnailClick,
+    onAudioChipClick,
+    onVideoChipClick,
+    audioChipHint,
+    videoChipHint,
+  } = options;
+
   if (!prompt) {
     return " ";
   }
 
   const segments: ReactNode[] = [];
   let lastIndex = 0;
-  const referenceTokens = findReferenceTokens(prompt, maxImageCount, maxAudioCount);
+  const referenceTokens = findReferenceTokens(prompt, maxImageCount, maxAudioCount, maxVideoCount);
   for (const token of referenceTokens) {
     const matchStart = token.start;
     const matchText = token.token;
@@ -232,32 +260,40 @@ function renderPromptWithHighlights(
       segments.push(<span key={`plain-${lastIndex}`}>{prompt.slice(lastIndex, matchStart)}</span>);
     }
 
-    if (token.kind === "audio") {
-      // 音频胶囊必须限制在原始 token 的行内占位宽度中，否则会盖住后续文字。
-      const source = audioSources[token.value - 1];
-      const label = source ? resolveAudioLabel(source, token.value - 1) : matchText;
-      // 与图片小方块对齐：图片点了能放大，音频胶囊以前是纯装饰（pointer-events-none），
-      // 用户无法确认「@音频1 到底是哪条」。有来源时让它可点，点了开试听弹窗。
-      const clickable = Boolean(source && onAudioChipClick);
+    if (token.kind === "audio" || token.kind === "video") {
+      // 音频 / 视频胶囊必须限制在原始 token 的行内占位宽度中，否则会盖住后续文字。
+      const isVideo = token.kind === "video";
+      const sources = isVideo ? (videoSources ?? []) : audioSources;
+      const source = sources[token.value - 1];
+      const label = source
+        ? isVideo
+          ? (resolveVideoLabel?.(source, token.value - 1) ?? `视频${token.value}`)
+          : resolveAudioLabel(source, token.value - 1)
+        : matchText;
+      // 与图片小方块对齐：图片点了能放大，音频/视频胶囊以前是纯装饰，
+      // 用户无法确认「@视频1 到底是哪条」。有来源时让它可点，点了直接预览。
+      const onChipClick = isVideo ? onVideoChipClick : onAudioChipClick;
+      const chipHint = isVideo ? videoChipHint : audioChipHint;
+      const clickable = Boolean(source && onChipClick);
       segments.push(
         <span key={`ref-${matchStart}`} className="relative z-0 text-transparent">
           {matchText}
           <span
-            title={clickable ? `${label} · ${audioChipHint ?? ""}`.trim() : label}
-            className={`absolute left-0 top-1/2 inline-flex h-[18px] max-w-full -translate-y-1/2 items-center gap-0.5 overflow-hidden rounded-[5px] bg-accent px-1 text-[10px] font-medium leading-none text-white ${
-              clickable ? "pointer-events-auto cursor-zoom-in hover:bg-accent/85" : "pointer-events-none"
-            }`}
+            title={clickable ? `${label} · ${chipHint ?? ""}`.trim() : label}
+            className={`absolute left-0 top-1/2 inline-flex h-[18px] max-w-full -translate-y-1/2 items-center gap-0.5 overflow-hidden rounded-[5px] px-1 text-[10px] font-medium leading-none text-white ${
+              isVideo ? "bg-sky-600" : "bg-accent"
+            } ${clickable ? "pointer-events-auto cursor-zoom-in hover:opacity-85" : "pointer-events-none"}`}
             onClick={
               clickable
                 ? (event) => {
                     event.stopPropagation();
-                    onAudioChipClick?.(source, label);
+                    onChipClick?.(source, label);
                   }
                 : undefined
             }
             onMouseDown={clickable ? (event) => event.stopPropagation() : undefined}
           >
-            <AudioLines className="h-3 w-3 shrink-0" />
+            {isVideo ? <Clapperboard className="h-3 w-3 shrink-0" /> : <AudioLines className="h-3 w-3 shrink-0" />}
             <span className="truncate">{label}</span>
           </span>
         </span>,
@@ -316,6 +352,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const openImageViewer = useCanvasStore((state) => state.openImageViewer);
   /** 引用素材条上的音频试听弹窗（音频没有原生缩略图，只能靠一个播放入口确认是哪条）。 */
   const [audioPreview, setAudioPreview] = useState<{ url: string; title: string } | null>(null);
+  /** 引用素材条上的视频全屏预览（点击 tile 播放，确认「这条视频就是我要参考的那条」）。 */
+  const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
   const apiKeys = useSettingsStore((state) => state.apiKeys);
   const customApis = useSettingsStore((state) => state.customApis);
   const customModelPrices = useSettingsStore((state) => state.customModelPrices);
@@ -336,11 +374,13 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   /** 已提交、还没跑完的任务数——允许连点后会 > 1。 */
   const activeTaskCount = activeGenerationNodeIds.length;
   /**
-   * 连点冷却：提交成功后 2s 内不再接受新的提交。
-   * 之所以记「上次提交的时刻」而不是布尔量，是因为一次提交里有 await，
-   * 布尔量要等异步返回才能复位，会让实际冷却变成「2s + 接口耗时」，不可控。
+   * 有任务在跑时，按钮文案改成「再生成一个」。
+   *
+   * 注意这只影响**文案**，不影响能否点击：产品口径是「点一次生成一次，
+   * 过几秒可以再点一次生成新的」。挡住重复提交靠的是防误点时间窗
+   * （`videoSubmitThrottle`），不是任务锁。
    */
-  const lastSubmitAtRef = useRef(0);
+  const isGenerationInFlight = activeTaskCount > 0;
   /**
    * 本节点开出去的「可取消窗口」(下游结果节点 id)。
    *
@@ -356,27 +396,33 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     [],
   );
   const [jimengCliStatus, setJimengCliStatus] = useState<JimengCliStatus | null>(null);
-  const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
+  // 初始值从模块级记录读：节点滚出视口再滚回来会重挂载，组件内 state 会清零，
+  // 那样按钮立刻变回「生成视频」，手一抖就是重复提交。
+  const [cooldownRemainingMs, setCooldownRemainingMs] = useState(() =>
+    remainingVideoSubmitCooldown(id),
+  );
   const isCoolingDown = cooldownRemainingMs > 0;
   const cooldownSeconds = Math.max(1, Math.ceil(cooldownRemainingMs / 1000));
 
   useEffect(() => {
     if (!isCoolingDown) return;
     const timer = window.setInterval(() => {
-      const left = GENERATE_COOLDOWN_MS - (Date.now() - lastSubmitAtRef.current);
-      setCooldownRemainingMs(left > 0 ? left : 0);
+      setCooldownRemainingMs(remainingVideoSubmitCooldown(id));
     }, 100);
     return () => window.clearInterval(timer);
-  }, [isCoolingDown]);
+  }, [id, isCoolingDown]);
 
   const beginCooldown = useCallback(() => {
-    lastSubmitAtRef.current = Date.now();
-    setCooldownRemainingMs(GENERATE_COOLDOWN_MS);
-  }, []);
+    markVideoSubmit(id);
+    setCooldownRemainingMs(VIDEO_SUBMIT_COOLDOWN_MS);
+  }, [id]);
 
-  // 下游媒体节点才持有真正的平台任务状态。连点之后可能同时有多个任务在跑，
-  // 所以逐个核对：已经进入终态（或被删掉）的从列表里摘掉，只要还剩一个就让源节点
-  // 维持「生成中」。这里不再充当提交互斥锁——提交频率由 2s 冷却控制。
+  // 下游媒体节点才持有真正的平台任务状态，所以逐个核对：已经进入终态（或被删掉）的
+  // 从列表里摘掉，只要还剩一个就让源节点维持「生成中」。
+  //
+  // 这个列表现在**同时是提交互斥锁**（见 `handleGenerate` 顶部与按钮的 disabled）：
+  // 视频一单几十秒到几分钟，2s 冷却挡不住「滚动画布 → 节点重挂载 → 冷却丢失 → 再点一次」，
+  // 那种情况会实打实地跑两单、扣两份钱。
   useEffect(() => {
     void activeGenerationKey;
     // 下游任务状态更新走 processingRevision，不一定刷新 inputGraphRevision；
@@ -478,7 +524,33 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   // 没有声明时退回「即梦 CLI 固定 9 张」这条老规则，其余模型不显示上限。
   const referenceImageLimit =
     selectedModel?.maxReferenceImages ?? (isJimengCli ? JIMENG_CLI_MAX_REFERENCE_IMAGES : undefined);
-  const selectedProfile = selectedModel ? getVideoModelProfile(selectedModel.profileId) : null;
+  /**
+   * 协议档案：优先用模型自带的 `profileId`；内置 CLI 模型偶尔会漏这个字段，
+   * 那就按模型 id 再兜一层 —— 否则会静默掉进「通用 OpenAI Video」，
+   * 参考视频判定与协议标签会一起判错。
+   */
+  const selectedProfile = selectedModel
+    ? selectedModel.profileId
+      ? getVideoModelProfile(selectedModel.profileId)
+      : resolveVideoModelProfile(selectedModel.id)
+    : null;
+  /**
+   * 参考视频支持度。视频输入只有上游连线一个来源（不提供手动上传），
+   * 但**不是每个协议都真的会把 `reference_videos` 提交上去** —— 不支持时节点上要
+   * 明确标出来，而不是让用户以为传上去了。
+   *
+   * 即梦画布 CLI 这类「同一协议里按模型分档」的链路靠 `maxReferenceVideos` 判定，
+   * 它来自 `model list` 的 `references.types[video].max`。
+   */
+  const videoReferenceSupport = useMemo(
+    () =>
+      resolveVideoReferenceSupport(
+        selectedProfile?.id,
+        selectedModel?.id,
+        selectedModel?.maxReferenceVideos,
+      ),
+    [selectedModel?.id, selectedModel?.maxReferenceVideos, selectedProfile?.id],
+  );
   useEffect(() => {
     if (isZzdhLipSyncModel(data.model) && selectedModel && data.model !== selectedModel.id) {
       updateNodeData(id, { model: selectedModel.id });
@@ -549,6 +621,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const inputAudioFiltered = useMemo(
     () => filterExcludedReferences(inputAudio, excludedReferenceSources),
     [excludedReferenceSources, inputAudio],
+  );
+  // 视频参考只有上游连线一个来源（没有 studio 快照、也不做手动上传），
+  // 所以只需过一遍「用户移除过」这层过滤。
+  const usableInputVideos = useMemo(
+    () => filterExcludedReferences(inputVideos, excludedReferenceSources),
+    [excludedReferenceSources, inputVideos],
   );
   const resolvedInputImages = useMemo(
     () => mergeMediaReferenceSources(directReferenceImages, inputImagesFiltered),
@@ -639,6 +717,21 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     },
     [audioLabelBySource],
   );
+  /**
+   * 视频引用标签。
+   *
+   * 与音频不同：视频结果节点的 `displayName` 通常是整段提示词（生成时直接写进去的），
+   * 拿来当 36px 小方块的标签只会糊成一团，所以视频只认文件名，取不到才退成「视频N」。
+   */
+  /**
+   * 视频的展示名固定成「视频N」，和「图N / 音频N」同一套命名。
+   *
+   * 原先优先用文件名：上游视频节点的落盘名常是 UUID（`416a56d-daded7…`），
+   * 一排格子看过去全是乱码，也没法和提示词里的 @视频N 对上号。
+   */
+  const resolveVideoLabel = useCallback((_source: string, index: number): string => {
+    return `视频${index + 1}`;
+  }, []);
   const inputImageItems = useMemo(
     () =>
       referenceInputImages.map((imageUrl, index) => ({
@@ -669,8 +762,25 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         label: resolveAudioLabel(source, index),
         source,
       })),
+      // 视频只在「当前模型真的会提交」时放进 @ 列表：模型不收还让用户 @ 上去，
+      // 等于承诺一件不会发生的事。
+      ...(videoReferenceSupport.supported
+        ? usableInputVideos.map((source, index) => ({
+            kind: "video" as const,
+            index,
+            label: resolveVideoLabel(source, index),
+            source,
+          }))
+        : []),
     ],
-    [inputImageItems, resolveAudioLabel, usableInputAudio],
+    [
+      inputImageItems,
+      resolveAudioLabel,
+      resolveVideoLabel,
+      usableInputAudio,
+      usableInputVideos,
+      videoReferenceSupport.supported,
+    ],
   );
   /**
    * 移除一条引用素材。两个来源都要处理:
@@ -710,6 +820,22 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           patch.prompt = nextPrompt;
         }
       }
+      // 视频现在也有提示词标记（@视频N）：移除后必须当场重编号，
+      // 否则输入框里会留着一个指向已删视频的 @视频3。
+      if (tile.kind === "video") {
+        const nextUsableVideo = usableInputVideos.filter((item) => !nextExcludedSet.has(item));
+        const nextPrompt = remapVideoReferenceTokens(
+          promptDraftRef.current,
+          usableInputVideos,
+          nextUsableVideo,
+        );
+        if (nextPrompt !== promptDraftRef.current) {
+          promptDraftRef.current = nextPrompt;
+          setPromptDraft(nextPrompt);
+          cancelPromptCommit();
+          patch.prompt = nextPrompt;
+        }
+      }
       if (tile.kind === "audio") {
         const nextUsableAudio = isJimengCli
           ? inputAudio.filter((item) => !nextExcludedSet.has(item))
@@ -726,6 +852,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           patch.studioReferenceAudio = nextDirectAudio;
         }
       }
+      // 视频: 只走排除表（上面的 nextExcluded 已经带上这条来源），无需再写别的字段。
       updateNodeData(id, patch);
     },
     [
@@ -739,9 +866,25 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       isJimengCli,
       referenceInputImages,
       usableInputAudio,
+      usableInputVideos,
       updateNodeData,
     ],
   );
+  /**
+   * 上游有视频、但这次不会提交，分两种原因：
+   * - `unsupported`：协议/模型不读参考视频；
+   * - `first-last`：首尾帧模式的 `--ref` 只放首帧、尾帧两张图，多挂的视频会被 CLI 拒，
+   *   所以这里主动不传，而不是让用户提交后收到一句含糊的失败。
+   */
+  const videoReferenceBlockReason: "unsupported" | "first-last" | null =
+    usableInputVideos.length === 0
+      ? null
+      : !videoReferenceSupport.supported
+        ? "unsupported"
+        : imageMode === "first-last"
+          ? "first-last"
+          : null;
+  const videoReferenceIgnored = videoReferenceBlockReason !== null;
   /** 输入框下方要显示的「实际会随请求上传的引用素材」清单。 */
   const referenceTiles = useMemo<ReferenceTile[]>(() => {
     const tiles: ReferenceTile[] = referenceInputImages.map((source, index) => ({
@@ -781,6 +924,18 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         });
       });
     }
+    // 视频参考：来源只有上游连线，但必须让用户看见 —— 之前它悄悄进了
+    // `reference_videos`，节点上却一个字都没有，既无法确认也没法单独撤掉。
+    usableInputVideos.forEach((source, index) => {
+      tiles.push({
+        key: `video-${source}`,
+        kind: "video" as const,
+        source,
+        label: resolveVideoLabel(source, index),
+        displayUrl: null,
+        used: !videoReferenceIgnored,
+      });
+    });
     return tiles;
   }, [
     directReferenceAudio,
@@ -788,7 +943,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     isJimengCli,
     referenceInputImages,
     resolveAudioLabel,
+    resolveVideoLabel,
     usableInputAudio,
+    usableInputVideos,
+    videoReferenceIgnored,
   ]);
   const title = useMemo(() => resolveNodeDisplayName(CANVAS_NODE_TYPES.videoGen, data), [data]);
   const resolvedWidth = Math.max(VIDEO_GEN_NODE_MIN_WIDTH, Math.round(width ?? VIDEO_GEN_NODE_DEFAULT_WIDTH));
@@ -1085,7 +1243,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
 
   const insertReference = useCallback(
     (item: ReferencePickerItem) => {
-      const marker = item.kind === "image" ? `@图${item.index + 1}` : `@音频${item.index + 1}`;
+      const marker =
+        item.kind === "image"
+          ? `@图${item.index + 1}`
+          : item.kind === "video"
+            ? `@视频${item.index + 1}`
+            : `@音频${item.index + 1}`;
       let basePrompt = promptDraftRef.current;
       // 优先用按 @ 时记录的光标；异常路径（没记录到）退回 textarea 当前光标，
       // 绝不退回「文末」—— 否则引用会凭空插到最后一行，光标也跟着跳到末尾。
@@ -1129,6 +1292,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           deletionDirection,
           referenceInputImages.length,
           usableInputAudio.length,
+          // 模型不收视频时 @视频N 只是普通文字，别让退格"整个吃掉"这段内容。
+          videoReferenceSupport.supported ? usableInputVideos.length : 0,
         );
         if (deleteRange) {
           event.preventDefault();
@@ -1192,7 +1357,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       referencePickerItems,
       showImagePicker,
       usableInputAudio.length,
+      usableInputVideos.length,
       updateNodeData,
+      videoReferenceSupport.supported,
       zoom,
     ],
   );
@@ -1258,7 +1425,9 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
   const handleGenerate = useCallback(async () => {
     // 冷却期内的连点直接丢弃（按钮此时也是灰的）。校验失败不消耗冷却，
     // 用户改完提示词/密钥可以立刻重试。
-    if (Date.now() - lastSubmitAtRef.current < GENERATE_COOLDOWN_MS) {
+    // 防误点：双击、手滑、以及"滚回来冷却丢失后再点一下"都在这个时间窗里被丢掉。
+    // 窗口只有 2 秒，正常「过几秒再点一次生成新的」完全不受影响。
+    if (isVideoSubmitThrottled(id)) {
       return;
     }
     if (!selectedModel) {
@@ -1318,9 +1487,27 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           (source): source is string => typeof source === "string" && source.trim().length > 0,
         )
       : [];
-    const referenceVideos = Array.from(new Set([...inputVideos, ...manualReferenceVideos]));
+    /**
+     * 上游连进来的视频（「AI 视频节点支持视频输入」）。
+     *
+     * 只在**当前协议真的会读这个字段**时才发：其余协议的后端代码里根本没有
+     * `reference_videos` 这一项，发过去要么被丢掉（多数），要么被严格网关当成
+     * 非法字段退单。上限按协议登记值截断（炳火 3 / 方舟 2.0 系 3 / 2.5 系 10 …），
+     * 让「节点上显示几条」与「实际提交几条」始终一致。
+     */
+    const upstreamReferenceVideos = videoReferenceSupport.supported ? usableInputVideos : [];
+    const referenceVideoLimit = videoReferenceSupport.supported
+      ? Math.max(1, videoReferenceSupport.maxVideos)
+      : 0;
+    const referenceVideos =
+      referenceVideoLimit > 0
+        ? Array.from(new Set([...upstreamReferenceVideos, ...manualReferenceVideos])).slice(
+            0,
+            referenceVideoLimit,
+          )
+        : [];
     const generationExtraParams = {
-      ...(referenceVideos.length > 0 ? { reference_videos: referenceVideos.slice(0, 10) } : {}),
+      ...(referenceVideos.length > 0 ? { reference_videos: referenceVideos } : {}),
       ...(data.binghuoSkipReview === true ? { skip_review: true } : {}),
     };
     const baseGenerationDebugContext: GenerationDebugContext = {
@@ -1338,6 +1525,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       referenceImageCount: videoReferenceImages.length,
       referenceImagePlaceholders: createReferenceImagePlaceholders(videoReferenceImages.length),
       referenceAudioCount: usableInputAudio.length,
+      referenceVideoCount: referenceVideos.length,
     };
     const runtimeDiagnosticsPromise = getRuntimeDiagnostics().catch(() => null);
     // 立即创建下游视频节点(生成中状态), 成功后再填充视频地址, 失败时把错误写入节点。
@@ -1517,7 +1705,6 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     flushPromptCommit,
     id,
     imageMode,
-    inputVideos,
     inputText,
     isWanCli,
     selectedDuration,
@@ -1530,6 +1717,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
     setLastVideoResolution,
     t,
     usableInputAudio,
+    // 参考视频：上游来源与协议支持度都参与提交，漏进依赖会让「刚接上的视频」不生效。
+    usableInputVideos,
+    videoReferenceSupport.supported,
+    videoReferenceSupport.maxVideos,
     updateNodeData,
     updateNodeSize,
     videoReferenceImages,
@@ -1583,20 +1774,25 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             style={{ scrollbarGutter: "stable" }}
           >
             <div className="min-h-full whitespace-pre-wrap break-words p-2">
-              {renderPromptWithHighlights(
-                promptDraft,
-                referenceInputImages.length,
-                usableInputAudio.length,
-                inputImageDisplayUrls,
-                usableInputAudio,
+              {renderPromptWithHighlights(promptDraft, {
+                maxImageCount: referenceInputImages.length,
+                maxAudioCount: usableInputAudio.length,
+                // 视频额度为 0 时标记退化成普通文字：模型不收，就不该在这里装作能用。
+                maxVideoCount: videoReferenceSupport.supported ? usableInputVideos.length : 0,
+                imageUrls: inputImageDisplayUrls,
+                audioSources: usableInputAudio,
+                videoSources: usableInputVideos,
                 resolveAudioLabel,
-                (displayUrl, event) => {
+                resolveVideoLabel,
+                onThumbnailClick: (displayUrl, event) => {
                   setPreviewState({ url: displayUrl, x: event.clientX, y: event.clientY });
                   setPreviewSize(null);
                 },
-                (source, label) => setAudioPreview({ url: source, title: label }),
-                t("node.videoGen.previewReferenceAudio", "点击试听"),
-              )}
+                onAudioChipClick: (source, label) => setAudioPreview({ url: source, title: label }),
+                onVideoChipClick: (source) => setVideoPreviewUrl(source),
+                audioChipHint: t("node.videoGen.previewReferenceAudio", "点击试听"),
+                videoChipHint: t("node.videoGen.previewReferenceVideo", "点击播放"),
+              })}
             </div>
           </div>
           <textarea
@@ -1668,6 +1864,12 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
               if (item?.kind !== "audio") return;
               setAudioPreview({ url: item.source, title: item.label });
             }}
+            onPreviewVideo={(index) => {
+              const item = referencePickerItems[index];
+              if (item?.kind !== "video") return;
+              setVideoPreviewUrl(item.source);
+            }}
+            previewVideoTitle={t("node.videoGen.previewReferenceVideo", "点击播放")}
           />
         )}
       </div>
@@ -1679,7 +1881,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
             const previewHint =
               tile.kind === "image"
                 ? t("node.videoGen.previewReferenceImage", "点击放大预览")
-                : t("node.videoGen.previewReferenceAudio", "点击试听");
+                : tile.kind === "video"
+                  ? t("node.videoGen.previewReferenceVideo", "点击播放")
+                  : t("node.videoGen.previewReferenceAudio", "点击试听");
+            const ignoredHint = t("node.videoGen.ignoredByModel", "当前模型不使用这项参考");
             const togglePreview = () => {
               if (!previewable) return;
               if (tile.kind === "image") {
@@ -1688,6 +1893,10 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                 const viewerUrl = tile.displayUrl ?? resolveImageDisplayUrl(tile.source);
                 if (!viewerUrl) return;
                 openImageViewer(viewerUrl, inputImageViewerList);
+                return;
+              }
+              if (tile.kind === "video") {
+                setVideoPreviewUrl(tile.source);
                 return;
               }
               setAudioPreview({ url: tile.source, title: tile.label });
@@ -1702,9 +1911,7 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                 } ${
                   tile.used ? "border-border-dark bg-black/40" : "border-dashed border-border-dark/70 opacity-60"
                 }`}
-                title={`${tile.label} · ${previewHint}${
-                  tile.used ? "" : ` · ${t("node.videoGen.ignoredByJimeng", "即梦不使用")}`
-                }`}
+                title={`${tile.label} · ${previewHint}${tile.used ? "" : ` · ${ignoredHint}`}`}
                 onClick={(event) => {
                   event.stopPropagation();
                   togglePreview();
@@ -1725,6 +1932,17 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
                     draggable={false}
                     className="pointer-events-none h-full w-full object-cover"
                   />
+                ) : tile.kind === "video" ? (
+                  // 视频格不放 `<video>`：36px 里解码一路视频只为画一帧太贵，
+                  // 用胶片图标 + 播放小三角表达「这是视频」，点开就是全屏播放。
+                  <span className="pointer-events-none relative flex h-full w-full items-center justify-center bg-accent/10 text-accent">
+                    <Clapperboard className="h-4 w-4" aria-hidden="true" />
+                    <span className="absolute inset-0 flex items-center justify-center">
+                      <span className="flex h-4 w-4 items-center justify-center rounded-full bg-black/55">
+                        <Play className="ml-[1px] h-2 w-2 text-white" aria-hidden="true" />
+                      </span>
+                    </span>
+                  </span>
                 ) : (
                   <span className="flex h-full w-full items-center justify-center text-accent">
                     <AudioLines className="h-4 w-4" aria-hidden="true" />
@@ -1749,6 +1967,32 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
               </div>
             );
           })}
+          {videoReferenceIgnored && (
+            <span
+              className="w-full text-[10px] leading-4 text-amber-400/80"
+              title={
+                videoReferenceBlockReason === "first-last"
+                  ? t(
+                      "node.videoGen.videoReferenceFirstLastHint",
+                      "首尾帧模式的 --ref 只放首帧、尾帧两张图，视频参考不会被提交；切回「参考图」才会带上视频",
+                    )
+                  : t(
+                      "node.videoGen.videoReferenceUnsupportedHint",
+                      "参考视频只对支持 reference_videos 的协议生效：炳火、字子 -video 型号、WGSPAI 视频系列、筷子 / likeai / RunningHub、即梦画布 CLI 的 Seedance 2.0 / 2.5 系列（m2v）、即梦 CLI 的 multimodal2video 型号",
+                    )
+              }
+            >
+              {videoReferenceBlockReason === "first-last"
+                ? t(
+                    "node.videoGen.videoReferenceFirstLastIgnored",
+                    "首尾帧模式不提交视频参考（切回「参考图」才会带上）",
+                  )
+                : t(
+                    "node.videoGen.videoReferenceUnsupported",
+                    "当前模型不读取视频参考（换支持视频参考的模型才会提交）",
+                  )}
+            </span>
+          )}
         </div>
       )}
       <div className="flex items-center gap-1" role="group" aria-label={t("node.videoGen.imageMode")}>
@@ -2211,12 +2455,29 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
       )}
       <button
         type="button"
-        disabled={isCoolingDown || !selectedModel || (!promptDraft.trim() && inputText.length === 0)}
+        disabled={
+          isCoolingDown || !selectedModel || (!promptDraft.trim() && inputText.length === 0)
+        }
         onClick={() => void handleGenerate()}
         className="nodrag mt-auto flex h-8 items-center justify-center gap-1.5 rounded-md bg-accent text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-45"
+        title={
+          isCoolingDown
+            ? "刚刚提交过，稍等一下再点（防误点）"
+            : isGenerationInFlight
+              ? `已提交 ${activeTaskCount} 个任务；再点会生成新的一单`
+              : undefined
+        }
       >
-        {isCoolingDown ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-        {isCoolingDown ? `冷却 ${cooldownSeconds}s` : "生成视频"}
+        {isCoolingDown ? (
+          <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <Sparkles className="h-3.5 w-3.5" />
+        )}
+        {isCoolingDown
+          ? `冷却 ${cooldownSeconds}s`
+          : isGenerationInFlight
+            ? "再生成一个"
+            : "生成视频"}
         {activeTaskCount > 0 && (
           <span
             className="rounded-full bg-white/25 px-1.5 text-[10px] leading-4"
@@ -2281,6 +2542,18 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
         title={audioPreview?.title}
         onClose={() => setAudioPreview(null)}
       />
+      {/* VideoViewerModal 是 `fixed` 全屏层，节点在 React Flow 的 transform 容器里会被
+          当成包含块 → 必须 portal 到 body，否则弹窗跟着画布缩放偏移。 */}
+      {videoPreviewUrl !== null &&
+        createPortal(
+          <VideoViewerModal
+            open
+            videoUrl={videoPreviewUrl}
+            title={referenceTiles.find((tile) => tile.kind === "video" && tile.source === videoPreviewUrl)?.label}
+            onClose={() => setVideoPreviewUrl(null)}
+          />,
+          document.body,
+        )}
     </div>
   );
 });

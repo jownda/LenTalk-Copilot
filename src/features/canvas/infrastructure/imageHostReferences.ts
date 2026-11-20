@@ -94,9 +94,12 @@ export async function uploadReferenceViaImageHost(
 export interface PublicUrlReferenceInput {
   images?: string[];
   audios?: string[];
+  /** 参考视频（上游视频输入），与图片同理：本地文件必须先换成公网直链。 */
+  videos?: string[];
   /** 平台按模型限定的条数上限(超出先裁掉, 避免白上传)。 */
   maxImages?: number;
   maxAudios?: number;
+  maxVideos?: number;
 }
 
 /**
@@ -107,10 +110,13 @@ export interface PublicUrlReferenceInput {
  */
 export async function uploadReferencesViaImageHost(
   input: PublicUrlReferenceInput,
-): Promise<{ images: string[]; audios: string[] }> {
+): Promise<{ images: string[]; audios: string[]; videos: string[] }> {
   const images = (input.images ?? []).filter((item) => item?.trim()).slice(0, input.maxImages ?? 30);
   const audios = (input.audios ?? []).filter((item) => item?.trim()).slice(0, input.maxAudios ?? 10);
-  if (images.length === 0 && audios.length === 0) return { images: [], audios: [] };
+  const videos = (input.videos ?? []).filter((item) => item?.trim()).slice(0, input.maxVideos ?? 3);
+  if (images.length === 0 && audios.length === 0 && videos.length === 0) {
+    return { images: [], audios: [], videos: [] };
+  }
   const host = resolveImageHostConfig();
   const resolveAll = async (sources: string[], label: string) =>
     await Promise.all(
@@ -126,5 +132,6 @@ export async function uploadReferencesViaImageHost(
   return {
     images: await resolveAll(images, '图'),
     audios: await resolveAll(audios, '音频'),
+    videos: await resolveAll(videos, '视频'),
   };
 }

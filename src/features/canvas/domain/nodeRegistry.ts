@@ -586,6 +586,7 @@ const audioGenNodeDefinition: CanvasNodeDefinition<AudioGenNodeData> = {
       sunoContinueClipId: "",
       sunoContinueAt: "",
       sunoCoverClipId: "",
+      sunoCoverAudioUrl: "",
     };
   },
   // 尺寸跟着 MINIMAX 页走(520×620): 所有音频页共用同一份默认画布,

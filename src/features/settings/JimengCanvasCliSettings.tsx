@@ -3,13 +3,17 @@ import { ChevronRight, LayoutGrid } from "lucide-react";
 import { UiButton, UiInput, UiModal } from "@/components/ui";
 import {
   checkJimengCanvasCliLogin,
+  listJimengCanvasProjects,
   logoutJimengCanvasCli,
   queryJimengCanvasCliStatus,
   startJimengCanvasCliLogin,
   type JimengCanvasCliStatus,
+  type JimengCanvasProject,
 } from "@/commands/jimengCanvasCli";
 import { jimengCliCloseLoginWindow, jimengCliOpenLoginWindow } from "@/commands/ai";
 import { useJimengCanvasCliStore } from "@/stores/jimengCanvasCliStore";
+import { useProjectStore } from "@/stores/projectStore";
+import { ensureJimengCanvasProject } from "@/features/canvas/application/jimengCanvasProject";
 import {
   refreshJimengCatalog,
   refreshJimengPrices,
@@ -69,6 +73,77 @@ export function JimengCanvasCliSettings() {
   const [refreshingCatalog, setRefreshingCatalog] = useState(false);
   /** 「刷新积分价格」是两步：先展开警告，确认后才真的动。 */
   const [priceConfirm, setPriceConfirm] = useState(false);
+
+  // ── 画布分配 ──────────────────────────────────────────────────────────────
+  const currentProjectId = useProjectStore((state) => state.currentProjectId);
+  const currentProjectName = useProjectStore((state) => state.currentProject?.name ?? "");
+  const bindings = useJimengCanvasCliStore((state) => state.bindings);
+  const binding = currentProjectId ? bindings[currentProjectId] : undefined;
+  const [canvasBusy, setCanvasBusy] = useState(false);
+  const [canvasMessage, setCanvasMessage] = useState("");
+  /** `null` = 还没点开过（不主动起 CLI，`canvas ls` 每次十几秒）。 */
+  const [canvasList, setCanvasList] = useState<JimengCanvasProject[] | null>(null);
+  const [canvasListError, setCanvasListError] = useState("");
+
+  const reloadCanvasList = useCallback(async () => {
+    setCanvasListError("");
+    try {
+      setCanvasList(await listJimengCanvasProjects(executable));
+    } catch (error) {
+      setCanvasListError(error instanceof Error ? error.message : String(error));
+      setCanvasList([]);
+    }
+  }, [executable]);
+
+  /** 给当前工程强制新建一张画布（旧的那张保留，只是不再写入）。 */
+  const handleRebindCanvas = useCallback(async () => {
+    if (!currentProjectId) return;
+    setCanvasBusy(true);
+    setCanvasListError("");
+    setCanvasMessage("正在新建画布…");
+    try {
+      const projectId = await ensureJimengCanvasProject(executable, { forceNew: true });
+      if (!projectId) {
+        setCanvasMessage("新建失败，详见日志；本次生成会退回共享画布");
+      } else {
+        const created = useJimengCanvasCliStore.getState().bindings[currentProjectId];
+        setCanvasMessage(`已改用新画布：${created?.name ?? projectId.slice(0, 8)}`);
+        // 列表已经展开过就顺手刷新，免得看到的是旧的。
+        if (canvasList !== null) await reloadCanvasList();
+      }
+    } finally {
+      setCanvasBusy(false);
+    }
+  }, [canvasList, currentProjectId, executable, reloadCanvasList]);
+
+  const handleListCanvases = useCallback(async () => {
+    if (canvasList === null) setCanvasMessage("");
+    setCanvasBusy(true);
+    try {
+      await reloadCanvasList();
+    } finally {
+      setCanvasBusy(false);
+    }
+  }, [canvasList, reloadCanvasList]);
+
+  /**
+   * 手动把当前工程绑到列表里某张画布。
+   *
+   * 用于两种情况：想让这个工程继续用旧画布，或者自动建的那张在官网上被删了。
+   * 只改本地绑定，云端画布一个字节都不动。
+   */
+  const handleBindCanvas = useCallback(
+    (item: JimengCanvasProject) => {
+      if (!currentProjectId) return;
+      useJimengCanvasCliStore.getState().setBinding(currentProjectId, {
+        projectId: item.projectId,
+        name: item.name,
+        boundAt: Date.now(),
+      });
+      setCanvasMessage(`当前工程已改用：${item.name || item.projectId.slice(0, 8)}`);
+    },
+    [currentProjectId]
+  );
 
   const stopPolling = useCallback(() => {
     if (timerRef.current !== null) {
@@ -459,6 +534,89 @@ export function JimengCanvasCliSettings() {
                   重新打开授权页
                 </button>
               </div>
+            )}
+          </div>
+
+          {/* 画布分配：一个 LenTalk 工程一张即梦画布 */}
+          <div className="space-y-2 border-t border-border-dark pt-4">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-text-muted">工程</span>
+              <span className={currentProjectId ? "text-text-dark" : "text-text-muted"}>
+                {currentProjectId ? currentProjectName || "未命名工程" : "没有打开的工程"}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-text-muted">画布</span>
+              <span className={binding ? "text-text-dark" : "text-text-muted"}>
+                {currentProjectId
+                  ? binding
+                    ? binding.name
+                    : "未分配（首次生成时自动新建）"
+                  : "—"}
+              </span>
+              {binding && (
+                <code className="rounded bg-bg-dark px-1 py-0.5 text-[10px] text-text-muted">
+                  {binding.projectId.slice(0, 8)}
+                </code>
+              )}
+            </div>
+            <p className="text-[11px] leading-4 text-text-muted">
+              生成进哪张即梦画布，由<strong className="text-text-dark">当前打开的 LenTalk 工程</strong>决定：
+              每个工程第一次生成时自动建一张
+              <code className="mx-1 text-text-dark">LenTalk-工程名-工程号</code>
+              画布，之后都往这张里写，切工程自动跟着换。图 / 视频 / 音频三条链路共用同一张。
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <UiButton
+                size="sm"
+                disabled={canvasBusy || !currentProjectId || status?.found === false}
+                onClick={() => void handleRebindCanvas()}
+              >
+                {canvasBusy ? "处理中…" : "为当前工程新建画布"}
+              </UiButton>
+              <UiButton size="sm" disabled={canvasBusy || !status?.found} onClick={() => void handleListCanvases()}>
+                {canvasList === null ? "查看全部画布" : "刷新画布列表"}
+              </UiButton>
+              <span className="text-[11px] text-text-muted">旧画布不会被删，也不会再被写入</span>
+            </div>
+            {canvasMessage && (
+              <p className="break-words text-[11px] leading-4 text-text-muted">{canvasMessage}</p>
+            )}
+            {canvasList !== null && (
+              <div className="max-h-40 space-y-1 overflow-y-auto rounded-md bg-bg-dark px-2 py-1.5 ui-scrollbar">
+                {canvasList.length === 0 ? (
+                  <p className="text-[11px] text-text-muted">账号下没有画布</p>
+                ) : (
+                  canvasList.map((item) => {
+                    const isCurrent = binding?.projectId === item.projectId;
+                    return (
+                      <div key={item.projectId} className="flex items-center gap-2 text-[11px]">
+                        <span className={isCurrent ? "text-accent" : "text-text-dark"}>
+                          {item.name || "(未命名)"}
+                        </span>
+                        {isCurrent && (
+                          <span className="rounded bg-accent/10 px-1 text-[9px] text-accent">当前</span>
+                        )}
+                        {!isCurrent && currentProjectId && (
+                          <button
+                            type="button"
+                            className="shrink-0 text-[10px] text-text-muted hover:text-accent hover:underline"
+                            onClick={() => handleBindCanvas(item)}
+                          >
+                            用这张
+                          </button>
+                        )}
+                        <span className="ml-auto shrink-0 text-text-muted">
+                          {item.updatedAt ? new Date(item.updatedAt).toLocaleDateString("zh-CN") : "—"}
+                        </span>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            )}
+            {canvasListError && (
+              <p className="break-words text-[11px] leading-4 text-red-400">{canvasListError}</p>
             )}
           </div>
 

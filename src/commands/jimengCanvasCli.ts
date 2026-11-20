@@ -87,9 +87,23 @@ export interface JimengCanvasVideoRequest {
   aspectRatio: string;
   resolution: string;
   referenceImages?: string[];
+  /**
+   * 参考视频（`m2v`）。额度按模型来自目录的 `references.types[video].max`
+   * （`seedance_2.5_flash` 5 段、`seedance_2.5` 10 段、2.0 系 3 段）。
+   *
+   * 传本地路径 / `asset://` / http(s) 都行 —— 后端会先物化成临时文件再
+   * `resource upload --type=video` 登记，最后用 `res:<id>` 挂到 `--ref`。
+   */
+  referenceVideos?: string[];
   /** 参考音频（m2v 最多 10 个）；不传 = 音频没进生成 */
   referenceAudio?: string[];
-  /** 复用已有画布（不传则取最近一个，没有就新建） */
+  /**
+   * 目标画布（`canvas ls` 的 projectId）。
+   *
+   * 不传时后端会在账号里找一张名为 `LenTalk` 的画布，没有就新建 —— 也就是说所有工程、
+   * 所有节点都会堆在同一张画布上。按工程分画布走
+   * `application/jimengCanvasProject.ts` 的 `ensureJimengCanvasProject`。
+   */
   projectId?: string;
   /**
    * 前端节点的 clientJobId，用于「提交前取消」：后端按它记账，在素材上传 /
@@ -135,6 +149,40 @@ export async function generateJimengCanvasImage(
 ): Promise<string> {
   requireDesktop();
   return await invoke<string>("generate_jimeng_canvas_image", { request });
+}
+
+/** 账号下一张协作画布的定位摘要（`canvas ls` 的 items 一一对应）。 */
+export interface JimengCanvasProject {
+  projectId: string;
+  name: string;
+  /** 毫秒时间戳；CLI 没给时为 null */
+  createdAt: number | null;
+  updatedAt: number | null;
+}
+
+/** 列出账号下全部画布（含用户在官网自己建的，只读，不会改动任何东西）。 */
+export async function listJimengCanvasProjects(
+  executable: string
+): Promise<JimengCanvasProject[]> {
+  requireDesktop();
+  return await invoke<JimengCanvasProject[]>("jimeng_canvas_project_list", { executable });
+}
+
+/**
+ * 新建一张画布。
+ *
+ * 不传 `--use`：创建后**不会**改 CLI 的「当前画布」，后续所有命令都显式带 projectId，
+ * 免得把用户官网正在用的画布悄悄切走。
+ */
+export async function createJimengCanvasProject(
+  executable: string,
+  name: string
+): Promise<JimengCanvasProject> {
+  requireDesktop();
+  return await invoke<JimengCanvasProject>("jimeng_canvas_project_create", {
+    executable,
+    name,
+  });
 }
 
 export interface JimengCanvasAudioRequest {

@@ -3,6 +3,7 @@ import { remove } from "@tauri-apps/plugin-fs";
 import { CUSTOM_API_PROVIDER_PREFIX, useSettingsStore } from "@/stores/settingsStore";
 import { useJimengCanvasCliStore } from "@/stores/jimengCanvasCliStore";
 import { generateJimengCanvasImage } from "@/commands/jimengCanvasCli";
+import { ensureJimengCanvasProject } from "@/features/canvas/application/jimengCanvasProject";
 import type { CustomApiCapabilities } from "@/stores/settingsStore";
 import { isWindowsDesktopRuntime } from "@/platform/runtime";
 import { isKnownOpenAiImagesBaseUrl } from "@/features/settings/recommendedApis";
@@ -23,7 +24,7 @@ import {
   resolveMmxVoiceOperation,
 } from "@/commands/minimaxVoice";
 import {
-  buildSunoMusicBody,
+  buildSunoInvokeBody,
   describeSunoResponse,
   describeSunoValidation,
   extractSunoErrorMessage,
@@ -36,10 +37,13 @@ import {
   readSunoTaskStatus,
   resolveSunoMusicOperation,
   resolveSunoTaskPath,
-  SUNO_ASYNC_PATH,
+  SUNO_INVOKE_PATH,
+  SUNO_DRY_RUN_PATH,
   SUNO_OPERATION_SPECS,
   SUNO_POLL_INTERVAL_MS,
+  sunoDryRunCarriesSource,
   validateSunoMusicInput,
+  type SunoInvokeBody,
   type SunoMusicBodyInput,
 } from "@/commands/sunoMusic";
 import { createVideoIdempotencyKey, getVideoTaskFailureReason, resolveRjmVideoApiBaseUrl } from "@/commands/videoApi";
@@ -138,6 +142,8 @@ interface GenerateJimengCliVideoRequest {
   video_resolution?: string;
   image_mode?: "reference" | "first-last";
   reference_images?: string[];
+  /** 参考视频：只有 `multimodal2video`（全能参考）认这个字段。 */
+  reference_videos?: string[];
   reference_audio?: string[];
 }
 
@@ -2532,7 +2538,7 @@ export interface GenerateAudioRequest {
   lyrics?: string;
   /**
    * 音乐生成的操作(知鸟 Suno `music` 模型专有)。
-   * `generate` / `extend` / `cover` / `lyrics` / `stems` / `stems_all` / `mp4` / `concat`。
+   * `generate` / `extend` / `cover` / `upload_cover` / `lyrics` / `stems` / `stems_all` / `mp4` / `concat`。
    * 见 `@/commands/sunoMusic` 的 `SUNO_OPERATION_SPECS`。
    */
   suno_operation?: string;
@@ -2556,6 +2562,14 @@ export interface GenerateAudioRequest {
   suno_continue_at?: string;
   /** Suno 翻唱源 clip(cover 必填)。 */
   suno_cover_clip_id?: string;
+  /**
+   * Suno 上传翻唱的源音频(upload_cover 必填)。
+   *
+   * 平台只要「公网可直接下载的地址」, 而这里的值通常来自画布上的本地音频
+   * (绝对路径 / `asset://` / data URL) —— 由 `generateSunoMusic` 在提交前调
+   * `uploadZhiniaoReferenceAsset` 换成公网直链。不要在这一层要求调用方先转好。
+   */
+  suno_cover_audio_url?: string;
   /**
    * MiniMax 音色 ID。
    *
@@ -3849,6 +3863,7 @@ function collectSunoInput(request: GenerateAudioRequest): SunoMusicBodyInput {
     continueClipId: request.suno_continue_clip_id,
     continueAt: request.suno_continue_at,
     coverClipId: request.suno_cover_clip_id,
+    coverAudioUrl: request.suno_cover_audio_url,
   };
 }
 
@@ -3864,11 +3879,12 @@ function collectSunoInput(request: GenerateAudioRequest): SunoMusicBodyInput {
 async function submitAndPollSunoTask<T>(
   baseUrl: string,
   headers: Record<string, string>,
-  body: Record<string, unknown>,
+  body: SunoInvokeBody,
   label: string,
   extract: (payload: unknown) => T | null,
 ): Promise<T> {
-  const submitUrl = `${baseUrl}${SUNO_ASYNC_PATH}`;
+  // 统一入口（音频模态固定异步）：立刻返回 task_id，随后自己轮询。
+  const submitUrl = `${baseUrl}${SUNO_INVOKE_PATH}`;
   const response = await requestProviderJson(submitUrl, {
     method: "POST",
     headers,
@@ -3944,7 +3960,52 @@ async function downloadSunoMedia(url: string, wantsVideo: boolean): Promise<stri
 }
 
 /**
- * Suno 媒体产出（`generate` / `extend` / `cover` / `stems` / `stems_all` / `mp4` / `concat`）。
+ * 提交前确认「源确实会被发出去」—— 走平台的免费 dry-run（¥0，不打厂商、不计费）。
+ *
+ * 为什么非做不可：平台把 `params` 映射成各渠道的 wire body 时，**未实现的字段会被
+ * 静默丢弃**，不是报错。2026-11-18 实测 `upload_cover` 在 `music@APM:default` 与
+ * `music@MXH:default` 上发出去的 body 里完全没有 `cover_audio_url`（前者退化成
+ * `{custom:true, instrumental:…}`，后者退化成 `{make_instrumental:…}`）——
+ * 也就是扣一次费、出一首全新的歌，用户会以为「翻唱失败」。
+ *
+ * 拿不到 dry-run 结果时**也拦**：这是付费操作，没有证据就不替平台担保。
+ */
+async function assertSunoSourceReachesUpstream(
+  baseUrl: string,
+  headers: Record<string, string>,
+  body: SunoInvokeBody,
+  sourceUrl: string,
+): Promise<void> {
+  const dryRunUrl = `${baseUrl}${SUNO_DRY_RUN_PATH}`;
+  let payload: unknown;
+  try {
+    const response = await requestProviderJson(dryRunUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    const raw = await response.text();
+    if (!response.ok) {
+      throw new Error(buildHttpErrorSummary(response.status, raw, dryRunUrl));
+    }
+    payload = raw ? JSON.parse(raw) : {};
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Suno 上传翻唱未提交: 提交前的免费校验(dry-run)失败, 无法确认平台会不会丢源音频 — ${reason} (${dryRunUrl})`,
+    );
+  }
+  if (sunoDryRunCarriesSource(payload, sourceUrl)) return;
+  throw new Error(
+    "Suno 上传翻唱暂不可用: 平台当前的音乐渠道没有把上传的音频透传给上游 " +
+      "(免费 dry-run 显示发出去的请求里不含源音频), 提交只会扣费并生成一首全新的歌。本次未提交、未扣费。" +
+      " 可在平台「模型详情 → 反馈」提出, 或先用「生成」/「翻唱(源 clip)」。",
+  );
+}
+
+/**
+ * Suno 媒体产出（`generate` / `extend` / `cover` / `upload_cover` / `stems` /
+ * `stems_all` / `mp4` / `concat`）。
  *
  * `operation=lyrics` **不走这里** —— 它产出歌词文本，见 `generateSunoLyrics`。
  *
@@ -3968,8 +4029,31 @@ async function generateSunoMusic(
     throw new Error(`Suno 参数不完整: ${describeSunoValidation(invalid)}`);
   }
 
+  // `upload_cover` 的源音频必须先是「公网可直接下载」的地址，而画布上它多半是
+  // 本地 mp3（绝对路径 / `asset://` / data URL）—— 先换成平台 /v1/files 的直链。
+  // 上传不计费且幂等，放在提交前做没有副作用；本地文件读不出来时给的是可定位的报错，
+  // 不会变成一次「钱扣了、返回 400」。
+  if (spec.audioUrlSource === "cover_audio_url") {
+    const rawCoverAudio = input.coverAudioUrl?.trim();
+    if (rawCoverAudio) {
+      try {
+        input.coverAudioUrl = await uploadZhiniaoReferenceAsset(rawCoverAudio, baseUrl, headers, 0);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`Suno 上传翻唱源音频失败: ${reason}`);
+      }
+    }
+  }
+  const body = buildSunoInvokeBody(apiModel, input);
+
+  // 源音频现在一定是公网直链，但**平台未必会把它发给上游** —— 渠道映射可能整段丢弃
+  // 这个字段（2026-11-18 实测 APM / MXH 两条渠道都会）。那种情况提交就是白扣一次费
+  // 换回一首全新的歌，所以提交前用免费 dry-run 验一次「发出去的请求里到底有没有它」。
+  if (spec.audioUrlSource === "cover_audio_url" && input.coverAudioUrl?.trim()) {
+    await assertSunoSourceReachesUpstream(baseUrl, headers, body, input.coverAudioUrl.trim());
+  }
+
   const wantsVideo = spec.output === "video";
-  const body = buildSunoMusicBody(apiModel, input);
   // 顺手记下结果自带的 clip —— 供后续 extend/cover/stems/concat 当源。
   let clipId: string | null = null;
   const files = await submitAndPollSunoTask(baseUrl, headers, body, "Suno 音乐生成", (payload) => {
@@ -3998,7 +4082,7 @@ export async function generateSunoLyrics(request: GenerateAudioRequest): Promise
   input.operation = "lyrics";
   const invalid = validateSunoMusicInput(input);
   if (invalid) throw new Error(`Suno 参数不完整: ${describeSunoValidation(invalid)}`);
-  const body = buildSunoMusicBody(apiModel, input);
+  const body = buildSunoInvokeBody(apiModel, input);
   return await submitAndPollSunoTask(baseUrl, headers, body, "Suno AI 写词", (payload) =>
     extractSunoLyricsText(payload),
   );
@@ -4152,6 +4236,8 @@ async function submitJimengCanvasImageJob(request: GenerateRequest): Promise<str
 
       const generated = await generateJimengCanvasImage({
         executable,
+        // 一个 LenTalk 工程一张即梦画布（解析失败返回 undefined，后端退回共享画布兜底）。
+        projectId: await ensureJimengCanvasProject(executable),
         prompt: request.prompt,
         model,
         // 有参考图就是图生图，否则是文生图（服务端是两套 mode，必须显式给）。
@@ -5287,8 +5373,18 @@ export async function fetchProviderModels(
   });
 }
 
+/**
+ * 多模态消息片段。`input_audio` 只在「能听音频」的模型上有效（gemini / *-omni /
+ * gpt-4o-audio 之类），音频必须以 base64 内联——OpenAI 规范里没有音频直链字段。
+ * 部分中转会静默丢弃这一段，调用方需要自己判定模型是否真的收到了音频。
+ */
 export type ChatCompletionContentPart =
-  { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } }
+  | {
+      type: "input_audio";
+      input_audio: { data: string; format: "wav" | "mp3" | "m4a" | "ogg" | "flac" };
+    };
 
 export interface ChatCompletionMessage {
   role: "system" | "user" | "assistant";

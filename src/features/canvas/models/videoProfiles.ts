@@ -71,8 +71,8 @@ const JIMENG_CANVAS_CLI_VIDEO_PROFILE: VideoModelProfile = {
   referenceImageTarget: 'platform-file',
   supportsReferenceImages: true,
   supportsFirstLast: true,
-  // 画布 CLI 的视频节点目前只吃图片参考, 没有音频参考入参。
-  supportsReferenceAudio: false,
+  // `m2v` 模式能挂参考音频; 参考视频同理, 但额度按模型走, 见 `maxReferenceVideos`。
+  supportsReferenceAudio: true,
 };
 
 const JIMENG_CLI_VIDEO_PROFILE: VideoModelProfile = {

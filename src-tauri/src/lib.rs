@@ -409,6 +409,8 @@ pub fn run() {
             jimeng_cli::jimeng_cli_open_login_window,
             jimeng_cli::jimeng_cli_close_login_window,
             jimeng_cli::jimeng_canvas_cli_status,
+            jimeng_cli::jimeng_canvas_project_list,
+            jimeng_cli::jimeng_canvas_project_create,
             jimeng_cli::jimeng_canvas_cli_login_start,
             jimeng_cli::jimeng_canvas_cli_login_check,
             jimeng_cli::jimeng_canvas_cli_logout,

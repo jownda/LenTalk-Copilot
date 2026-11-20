@@ -9,6 +9,8 @@ import {
   describeSunoValidation,
   normalizeSunoOperation,
   SUNO_OPERATION_SPECS,
+  sunoAudioUrlNodeField,
+  sunoClipNodeField,
   validateSunoMusicInput,
 } from "@/commands/sunoMusic";
 import {
@@ -52,6 +54,10 @@ import { SunoMusicStudio, type SunoClipCandidate } from "./audio/SunoMusicStudio
 import { useAudioPreview } from "./audio/useAudioPreview";
 import { rememberVoice, resolveVoiceForModel } from "./audio/voiceMemory";
 import { NodeResizeHandle } from "@/features/canvas/ui/NodeResizeHandle";
+import { AudioViewerModal } from "@/features/canvas/ui/AudioViewerModal";
+import { graphImageResolver } from "@/features/canvas/application/canvasServices";
+import { useCanvasInputGraph } from "@/features/canvas/application/useCanvasInputGraph";
+import { buildUpstreamAudioTiles } from "@/features/canvas/application/upstreamAudioTiles";
 import { useCanvasStore } from "@/stores/canvasStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { registerNodeGenerationHandler } from "@/features/canvas/application/nodeGenerationRegistry";
@@ -299,33 +305,41 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
   );
 
   /**
-   * 上游连线上能当「源 clip」的结果。
+   * 上游连进来的音频素材（含节点名 / Suno clip id）。
    *
-   * 只订阅 `edges` —— 节点位置一变 `nodes` 就是新数组, 订阅它会让拖拽时整棵子树重渲染。
-   * 而 clip 是在**生成完成后**才写进上游媒体节点的(那时 edges 没变), 所以另加一个
-   * refresh token, 生成成功后手动触发一次重算。
+   * 走 `useCanvasInputGraph` 而不是直接订阅 `nodes`：它只在**输入图真的变了**（连线、增删、
+   * 音频节点的 sourcePath 变化）时重算，拖拽节点不会连带整棵子树重渲染。
+   *
+   * 以前这块完全不存在 —— 上游连了音频，节点上没有任何显示，用户既不知道连上没有，
+   * 也没法点开确认是哪一个。
    */
-  const canvasEdges = useCanvasStore((state) => state.edges);
-  const [sunoClipRefreshToken, setSunoClipRefreshToken] = useState(0);
+  const { nodes: inputNodes, edges: inputEdges } = useCanvasInputGraph();
+  const upstreamAudioTiles = useMemo(() => {
+    const sources = graphImageResolver.collectInputAudio(id, inputNodes, inputEdges);
+    return buildUpstreamAudioTiles(sources, inputNodes);
+  }, [id, inputEdges, inputNodes]);
+  /** 点开输入素材的试听弹窗（自带 portal，见 `AudioViewerModal`）。 */
+  const [inputAudioPreview, setInputAudioPreview] = useState<{ url: string; title: string } | null>(null);
+
+  /**
+   * Suno 的「源 clip」候选 —— 只有带 clip id 的输入才能当续写/翻唱/分离/出片的源。
+   *
+   * 直接从上面的素材条目派生，不再单独扫一遍连线：两处各算一次迟早会不一致
+   * （界面上能看到、下拉里却没有）。注意**普通音频不在这个列表里** ——
+   * 它们走 `upload_cover` 的「源音频」下拉（`audioCandidates` = 全部素材条目）。
+   */
   const sunoClipCandidates = useMemo<SunoClipCandidate[]>(() => {
-    // 让 token 进入依赖并真正被读取, 否则 lint 会判定它是多余依赖。
-    void sunoClipRefreshToken;
-    const canvasNodes = useCanvasStore.getState().nodes;
+    const seen = new Set<string>();
     const candidates: SunoClipCandidate[] = [];
-    for (const edge of canvasEdges) {
-      if (edge.target !== id) continue;
-      const source = canvasNodes.find((node) => node.id === edge.source);
-      const raw = (source?.data as Record<string, unknown> | undefined)?.sunoResultClipId;
-      const clipId = typeof raw === "string" ? raw.trim() : "";
-      if (!clipId || candidates.some((item) => item.clipId === clipId)) continue;
-      const displayName = (source?.data as Record<string, unknown> | undefined)?.displayName;
-      candidates.push({
-        clipId,
-        label: typeof displayName === "string" && displayName.trim() ? displayName.trim() : clipId,
-      });
+    for (const tile of upstreamAudioTiles) {
+      // 同一段音频可能被两个节点指向（组内复制过），clip id 相同就必须去重 ——
+      // 否则下拉里两个 option 同 key，React 会警告、选中态也会错乱。
+      if (!tile.clipId || seen.has(tile.clipId)) continue;
+      seen.add(tile.clipId);
+      candidates.push({ clipId: tile.clipId, label: tile.label });
     }
     return candidates;
-  }, [canvasEdges, id, sunoClipRefreshToken]);
+  }, [upstreamAudioTiles]);
 
   const voice = (typeof data.voice === "string" && data.voice.trim()) || "";
   const voiceProfileId =
@@ -547,9 +561,12 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
         const failure = validateSunoMusicInput({
           operation: sunoOperation,
           prompt,
+          mode: typeof data.sunoMode === "string" ? data.sunoMode : undefined,
+          lyrics: typeof data.lyrics === "string" ? data.lyrics : undefined,
           clipId: typeof data.sunoClipId === "string" ? data.sunoClipId : "",
           continueClipId: typeof data.sunoContinueClipId === "string" ? data.sunoContinueClipId : "",
           coverClipId: typeof data.sunoCoverClipId === "string" ? data.sunoCoverClipId : "",
+          coverAudioUrl: typeof data.sunoCoverAudioUrl === "string" ? data.sunoCoverAudioUrl : "",
         });
         if (failure) {
           setSunoMessage({ tone: "error", text: describeSunoValidation(failure) });
@@ -671,6 +688,7 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
                 continueClipId: typeof data.sunoContinueClipId === "string" ? data.sunoContinueClipId : undefined,
                 continueAt: typeof data.sunoContinueAt === "string" ? data.sunoContinueAt : undefined,
                 coverClipId: typeof data.sunoCoverClipId === "string" ? data.sunoCoverClipId : undefined,
+                coverAudioUrl: typeof data.sunoCoverAudioUrl === "string" ? data.sunoCoverAudioUrl : undefined,
               }
             : undefined,
           mmxParams: isMmxStudio
@@ -733,8 +751,8 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
           }
         }
         if (isSunoMusic) {
-          // 上游的 clip 列表在生成完成后才变, edges 没动, 手动触发一次重算。
-          setSunoClipRefreshToken((current) => current + 1);
+          // 上游的 clip 列表跟着输入图一起刷新: 写回 `sourcePath`/`sunoResultClipId` 会让
+          // store 的 inputGraphRevision +1, 下游节点的候选自动重算, 不需要再手动打 token。
           setSunoMessage({ tone: "success", text: t("node.audioGen.suno.generateDone") });
         }
       } catch (generationError) {
@@ -1282,6 +1300,93 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
         />
       </div>
 
+      {/* 上游输入素材: 与 AI 视频节点同构 —— 连上就有一格图标, 点开能听, 一眼确认
+          「到底收到了什么」。以前这里什么都没有, 用户只能靠猜。 */}
+      {upstreamAudioTiles.length > 0 && (
+        <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto pb-0.5">
+          {upstreamAudioTiles.map((tile) => {
+            // 两条互斥的源：吃 clip 的操作（续写/翻唱/分离/拼接/出片）要 clipId；
+            // 「上传翻唱」吃任意音频，用它自己的画布地址（提交前换公网直链）。
+            const sunoOperation = isSunoMusic ? normalizeSunoOperation(effectiveSunoOperation) : null;
+            const clipField = sunoOperation ? sunoClipNodeField(sunoOperation) : null;
+            const audioUrlField = sunoOperation ? sunoAudioUrlNodeField(sunoOperation) : null;
+            const sourceField = clipField ?? audioUrlField;
+            const sourceValue = clipField ? tile.clipId : tile.source;
+            const usableAsSource = Boolean(sourceField && sourceValue);
+            const activeValue =
+              sourceField && typeof data[sourceField as keyof AudioGenNodeData] === "string"
+                ? (data[sourceField as keyof AudioGenNodeData] as string)
+                : "";
+            const sourceActive = usableAsSource && activeValue === sourceValue;
+            // 只有「这个操作吃 clip、而这条素材没有 clip id」才需要虚线 + 解释。
+            const clipMissing = Boolean(isSunoMusic && clipField && !tile.clipId);
+            const unavailableHint = clipMissing
+              ? t(
+                  "node.audioGen.suno.sourceUnavailable",
+                  "当前操作只接受 Suno 生成的 clip 作源；想用普通音频请把操作切到「上传翻唱」",
+                )
+              : "";
+            return (
+              <div
+                key={tile.source}
+                role="button"
+                tabIndex={0}
+                className={`nodrag group/ref relative h-9 w-9 shrink-0 cursor-pointer overflow-hidden rounded border ${
+                  usableAsSource
+                    ? sourceActive
+                      ? "border-accent bg-black/40"
+                      : "border-border-dark bg-black/40"
+                    : clipMissing
+                      ? "border-dashed border-border-dark/70 bg-black/25"
+                      : "border-border-dark bg-black/40"
+                }`}
+                title={`${tile.label} · ${t(
+                  "node.audioGen.previewAsset",
+                  "点击试听",
+                )}${clipMissing ? ` · ${unavailableHint}` : ""}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setInputAudioPreview({ url: tile.source, title: tile.label });
+                }}
+                onMouseDown={(event) => event.stopPropagation()}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" && event.key !== " ") return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setInputAudioPreview({ url: tile.source, title: tile.label });
+                }}
+              >
+                <span className="flex h-full w-full items-center justify-center text-accent">
+                  <AudioLines className="h-4 w-4" aria-hidden="true" />
+                </span>
+                <span className="pointer-events-none absolute inset-x-0 bottom-0 truncate bg-black/65 px-0.5 text-center text-[9px] leading-[11px] text-white">
+                  {tile.label}
+                </span>
+                {/* 能当 Suno 源的那几条给个角标: 点它直接把这个 clip 设为当前操作的源,
+                    不用再去下面的下拉里对名字。 */}
+                {usableAsSource && sourceField && (
+                  <button
+                    type="button"
+                    className={`absolute right-0 top-0 flex h-4 w-4 items-center justify-center rounded-bl ${
+                      sourceActive ? "bg-accent text-white" : "bg-black/70 text-white/80 hover:bg-accent hover:text-white"
+                    }`}
+                    title={t("node.audioGen.suno.useAsSource", "把这条设为当前操作的源")}
+                    aria-label={t("node.audioGen.suno.useAsSource", "把这条设为当前操作的源")}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      updateNodeData(id, { [sourceField]: sourceValue } as Partial<AudioGenNodeData>);
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                  >
+                    <Music2 className="h-3 w-3" aria-hidden="true" />
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {isMmxStudio ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <MmxVoiceStudio
@@ -1308,6 +1413,7 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
           description={promptDraft}
           isBusy={isGenerating}
           clipCandidates={sunoClipCandidates}
+          audioCandidates={upstreamAudioTiles}
           activeAction={sunoAction}
           message={sunoMessage}
           onGenerate={() => void handleGenerate()}
@@ -1411,6 +1517,15 @@ export const AudioGenNode = memo(({ id, data, selected, width, height }: AudioGe
         minHeight={AUDIO_GEN_NODE_MIN_HEIGHT}
         maxWidth={AUDIO_GEN_NODE_MAX_WIDTH}
         maxHeight={AUDIO_GEN_NODE_MAX_HEIGHT}
+      />
+
+      {/* 输入素材试听弹窗 —— 组件自带 portal 到 body（节点在 React Flow 的 transform
+          容器里，不 portal 的 fixed 会跟着画布缩放跑偏）。 */}
+      <AudioViewerModal
+        open={inputAudioPreview !== null}
+        audioUrl={inputAudioPreview?.url ?? ""}
+        title={inputAudioPreview?.title}
+        onClose={() => setInputAudioPreview(null)}
       />
     </div>
   );

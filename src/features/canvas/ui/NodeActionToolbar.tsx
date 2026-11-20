@@ -3,7 +3,7 @@ import { NodeToolbar as ReactFlowNodeToolbar } from "@xyflow/react";
 import {
   Camera,
   Copy,
-  Crop,
+  Images,
   Download,
   FileText,
   Library,
@@ -20,6 +20,7 @@ import {
   Unlink2,
   LayoutTemplate,
   LoaderCircle,
+  AudioLines,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -32,16 +33,20 @@ import {
   isExportImageNode,
   isGroupNode,
   isImageEditNode,
+  isAudioGenNode,
   isAudioNode,
   isStoryboardGenNode,
   isStoryboardSplitNode,
   isTextAnnotationNode,
   isUploadNode,
+  type AudioGenNodeData,
   type CanvasNode,
   type NodeToolType,
 } from "@/features/canvas/domain/canvasNodes";
-import { canvasAiGateway, canvasEventBus } from "@/features/canvas/application/canvasServices";
+import { pickAudioReverseSection } from "@/features/canvas/domain/audioReversePrompt";
+import { canvasAiGateway, canvasEventBus, graphImageResolver } from "@/features/canvas/application/canvasServices";
 import { getNodeToolPlugins } from "@/features/canvas/tools";
+import { openMosaicEditorForNode } from "@/features/canvas/application/openMosaicEditor";
 import type { ToolIconKey } from "@/features/canvas/tools";
 import { UiChipButton, UiPanel, UiModal, UiButton } from "@/components/ui";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -59,6 +64,13 @@ import {
   VisionImageUnreadableError,
   VisionModelMissingError,
 } from "@/features/canvas/application/visionPromptReverse";
+import {
+  AudioReverseModelMissingError,
+  AudioReverseTooLargeError,
+  AudioReverseUnreadableError,
+  MAX_AUDIO_INLINE_BYTES,
+  reversePromptFromAudio,
+} from "@/features/canvas/application/audioPromptReverse";
 import { importVideoUrlToAsset } from "@/features/library/importAssets";
 import {
   buildTemplateFromCanvas,
@@ -215,8 +227,9 @@ function resolveGenerationErrorContext(node: CanvasNode): unknown {
   };
 }
 
-const toolIconMap: Record<ToolIconKey, typeof Crop> = {
-  crop: Crop,
+const toolIconMap: Record<ToolIconKey, typeof Images> = {
+  // 「裁剪」入口已并进「图片编辑」：点它直接开全屏编辑界面，不再是裁剪对话框。
+  crop: Images,
   annotate: PenLine,
   split: Scissors,
   rotate: RotateCw,
@@ -232,6 +245,9 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const isImageEdit = isImageEditNode(node);
   // AI 生成视频与本地上传视频最终都落在同一个媒体节点，统一开放视频工具栏。
   const isVideoMediaNode = isAudioNode(node) && node.data.mediaType === "video";
+  // 同一个节点类型也承载纯音频（上传的 mp3 / 音频模型生成的结果），
+  // 「反推提示词」只对这类开放 —— 视频反推要先抽音轨，不在本次范围。
+  const isAudioMediaNode = isAudioNode(node) && node.data.mediaType !== "video";
   const isStoryboardGen = isStoryboardGenNode(node);
   const isStoryboardSplit = isStoryboardSplitNode(node);
   const isTextAnnotation = isTextAnnotationNode(node);
@@ -274,6 +290,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const [isSavingToLibrary, setIsSavingToLibrary] = useState(false);
   // 「反推提示词」：拿本节点的图问视觉模型，结果落成右侧文本节点。
   const [isReversingPrompt, setIsReversingPrompt] = useState(false);
+  // 音频版：把 mp3 交给能听音频的对话模型，反推风格 / 歌词 / 台词。
+  const [isReversingAudioPrompt, setIsReversingAudioPrompt] = useState(false);
   const [isCopyTextSuccess, setIsCopyTextSuccess] = useState(false);
   // 「扒视频」：从视频节点直接跑一次最精简的扒剧本，结果落成右侧文本节点
   const [isScriptDialogOpen, setIsScriptDialogOpen] = useState(false);
@@ -302,6 +320,25 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     return null;
   }, [node]);
   const videoSource = isVideoMediaNode ? ((node.data as { sourcePath?: string | null }).sourcePath ?? null) : null;
+  const audioSource = isAudioMediaNode ? ((node.data as { sourcePath?: string | null }).sourcePath ?? null) : null;
+  /**
+   * AI 音频节点自身是**生成器**，不存音频结果（结果落在新开的媒体节点）。
+   * 但用户常在它前面接一段参考曲 —— 上游第一段音频就是最合适的反推对象。
+   *
+   * 依赖 `canvasInputRevision` 而不是 `nodes/edges`：连线一变 revision 就变，
+   * 而拖动节点不会，避免工具栏跟着每帧重算。
+   */
+  const audioGenUpstreamSources = useMemo(() => {
+    if (!isAudioGenNode(node)) return [] as string[];
+    const { nodes, edges } = useCanvasStore.getState();
+    try {
+      return graphImageResolver.collectInputAudio(node.id, nodes, edges);
+    } catch {
+      return [] as string[];
+    }
+    // 只依赖 revision 与 id：`node` 对象在拖动时每帧都换，绑上去会让这条图遍历每帧重跑。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasInputRevision, node.id, node.type]);
   useEffect(() => {
     if (!isUpscaleDialogOpen || videoUpscaleProvider !== "runninghub-topaz") return;
     const dimensions = getTopazTargetDimensions(node.data.aspectRatio);
@@ -334,6 +371,14 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const canUpscaleImage = !isImageEdit && Boolean(imageSource) && !videoSource;
   // 「反推提示词」和「图片高清」同一批节点：只要盒子里的是一张静态图就能反推。
   const canReversePromptImage = !isImageEdit && Boolean(imageSource) && !videoSource;
+  /**
+   * 音频反推的两个入口：
+   *   - 音频媒体节点 —— 反推它自己的字节（上传的 mp3 / 生成结果）；
+   *   - AI 音频节点 —— 反推它上游接进来的第一段音频（它自己没有音频）。
+   */
+  const audioReverseSourceForGen = audioGenUpstreamSources[0] ?? null;
+  const canReversePromptAudio =
+    !isImageEdit && Boolean(audioSource ?? audioReverseSourceForGen);
   const upscaleModelOptions = useMemo<ImageModelDefinition[]>(
     () => (isImageUpscaleDialogOpen ? listImageUpscaleModels() : []),
     [isImageUpscaleDialogOpen],
@@ -603,6 +648,102 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
     node.id,
     t,
   ]);
+  /**
+   * 音频反推提示词：把这段音频交给能「听」的对话模型，反推风格 / 歌词 / 台词。
+   *
+   * 交付形态与图片反推保持一致 —— 结果落成右侧文本节点并连线，用户可以继续编辑、
+   * 也可以整段复制去喂 Suno 或配音节点。不直接写回音频节点的字段：音频媒体节点是
+   * 「结果节点」，没有可回填的提示词字段；写进去反而会让人以为那是生成参数。
+   */
+  const handleReversePromptAudio = useCallback(async () => {
+    const source = audioSource ?? audioReverseSourceForGen;
+    if (!source || isReversingAudioPrompt) {
+      return;
+    }
+
+    setIsReversingAudioPrompt(true);
+    try {
+      const lang = i18n.language?.startsWith('zh') ? 'zh' : 'en';
+      const { text } = await reversePromptFromAudio({
+        audioSource: source,
+        label: typeof node.data.displayName === 'string' ? node.data.displayName.trim() : '',
+        lang,
+      });
+      if (!text.trim()) {
+        throw new Error('empty-response');
+      }
+      const newNodeId = addNode(
+        CANVAS_NODE_TYPES.textAnnotation,
+        findNodePosition(node.id, 360, 260),
+        {
+          displayName: t("nodeToolbar.reverseAudioPromptNodeName"),
+          content: text,
+        },
+      );
+      addEdge(node.id, newNodeId);
+
+      /**
+       * AI 音频节点额外做一次「填回表单」：反推出来的风格标签与歌词，正是 Suno 页
+       * 要填的东西。只填空字段 —— 用户已经写过的一律不动，否则点一下按钮就把
+       * 自己写的风格覆盖掉了，比不给填更糟。
+       */
+      if (isAudioGenNode(node)) {
+        // 只有音乐家族（Suno）有「风格 / 歌词」两栏可填；TTS 页填进去也没地方显示。
+        const family = typeof node.data.audioFamily === 'string' ? node.data.audioFamily : '';
+        const isSunoPage = family === 'suno' || typeof node.data.sunoOperation === 'string';
+        const patch: Partial<AudioGenNodeData> = {};
+        if (isSunoPage) {
+          const existingStyle = typeof node.data.sunoStyle === 'string' ? node.data.sunoStyle.trim() : '';
+          const existingLyrics = typeof node.data.lyrics === 'string' ? node.data.lyrics.trim() : '';
+          const style = pickAudioReverseSection(text, '风格标签');
+          const lyrics = pickAudioReverseSection(text, '歌词');
+          if (style && !existingStyle) {
+            // 风格是一行逗号分隔的标签串；模型偶尔会按行排，这里压平。
+            patch.sunoStyle = style
+              .split(/\r?\n/)
+              .map((line) => line.replace(/^[-*·]\s*/, '').trim())
+              .filter(Boolean)
+              .join(', ');
+          }
+          if (lyrics && !existingLyrics) {
+            patch.lyrics = lyrics;
+          }
+        }
+        if (Object.keys(patch).length > 0) {
+          updateNodeData(node.id, patch);
+        }
+      }
+    } catch (error) {
+      if (error instanceof AudioReverseModelMissingError) {
+        void showErrorDialog(t("nodeToolbar.reverseAudioPromptNoModel"), t("common.error"));
+      } else if (error instanceof AudioReverseTooLargeError) {
+        void showErrorDialog(
+          t("nodeToolbar.reverseAudioPromptTooLarge", {
+            size: Math.round(MAX_AUDIO_INLINE_BYTES / 1024 / 1024),
+          }),
+          t("common.error"),
+        );
+      } else if (error instanceof AudioReverseUnreadableError) {
+        void showErrorDialog(t("nodeToolbar.reverseAudioPromptUnreadable"), t("common.error"));
+      } else {
+        const message = error instanceof Error ? error.message : String(error);
+        void showErrorDialog(t("nodeToolbar.reverseAudioPromptFailed"), t("common.error"), message);
+      }
+    } finally {
+      setIsReversingAudioPrompt(false);
+    }
+  }, [
+    addEdge,
+    addNode,
+    audioReverseSourceForGen,
+    audioSource,
+    findNodePosition,
+    i18n.language,
+    isReversingAudioPrompt,
+    node,
+    t,
+    updateNodeData,
+  ]);
   const libraryCategories = useMemo(
     () => categories.filter((category) => category.libraryId === (activeLibraryId || libraries[0]?.id)),
     [activeLibraryId, categories, libraries],
@@ -647,7 +788,8 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
   const resolveToolLabel = useCallback(
     (toolType: NodeToolType) => {
       if (toolType === NODE_TOOL_TYPES.crop) {
-        return t("tool.crop");
+        // 按钮文案改成「图片编辑」：行为也换成了开全屏编辑器（见点击处）。
+        return t("tool.imageEdit", "图片编辑");
       }
       if (toolType === NODE_TOOL_TYPES.annotate) {
         return t("tool.annotate");
@@ -851,18 +993,24 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
         )}
         {!isImageEdit &&
           tools.map((tool) => {
-            const Icon = toolIconMap[tool.icon] ?? Crop;
+            const Icon = toolIconMap[tool.icon] ?? Images;
 
             return (
               <UiChipButton
                 key={tool.type}
                 className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
-                onClick={() =>
+                onClick={() => {
+                  if (tool.type === NODE_TOOL_TYPES.crop) {
+                    // 图片编辑：直接在右侧新建「图片编辑」节点并打开全屏编辑器
+                    // （节点本身就是图片编辑节点时，开的是它自己）。
+                    openMosaicEditorForNode(node);
+                    return;
+                  }
                   canvasEventBus.publish("tool-dialog/open", {
                     nodeId: node.id,
                     toolType: tool.type,
-                  })
-                }
+                  });
+                }}
               >
                 <Icon className="h-3.5 w-3.5" />
                 {resolveToolLabel(tool.type)}
@@ -1070,6 +1218,28 @@ export const NodeActionToolbar = memo(({ node }: NodeActionToolbarProps) => {
               </UiChipButton>
             )}
           </>
+        )}
+        {!isImageEdit && canReversePromptAudio && (
+          <UiChipButton
+            key="audio-reverse-prompt"
+            className={`h-8 ${TOOLBAR_BUTTON_RADIUS_CLASS} px-2.5 text-xs ${TOOLBAR_NEUTRAL_BUTTON_CLASS}`}
+            disabled={isReversingAudioPrompt}
+            title={t("nodeToolbar.reverseAudioPromptHint")}
+            onClick={(event) => {
+              event.stopPropagation();
+              // 用能听音频的对话模型读本节点的音频，结果落成右侧文本节点。
+              void handleReversePromptAudio();
+            }}
+          >
+            {isReversingAudioPrompt ? (
+              <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <AudioLines className="h-3.5 w-3.5" />
+            )}
+            {isReversingAudioPrompt
+              ? t("nodeToolbar.reverseAudioPromptRunning")
+              : t("nodeToolbar.reverseAudioPrompt")}
+          </UiChipButton>
         )}
         {!isImageEdit && canSaveVideoTemplate && videoSource && (
           <>

@@ -33,6 +33,18 @@ export interface JimengCatalogEntry {
   /** 固定出图张数（MJ 8.2 必出 4 张才有值） */
   fixedCount: number | null;
   maxReferences: number;
+  /**
+   * `m2v` 模式下能带几张参考图（`references.types[mediaType=image].max`）。
+   * 图片模型等于 `maxReferences`，视频模型比总数小（2.5 系：总数 50、图 30）。
+   */
+  maxImageReferences?: number;
+  /**
+   * `m2v` 模式下能带几段参考视频（`references.types[mediaType=video].max`）。
+   * 0 / 缺省 = 不收视频。`references.max` 是各类素材的**总数**，不能当视频额度用。
+   */
+  maxVideoReferences?: number;
+  /** `m2v` 模式下能带几段参考音频（`references.types[mediaType=audio].max`）。 */
+  maxAudioReferences?: number;
   /** 图生图最少几张参考图（`references.min`） */
   minReferences?: number;
   /** `--prompt` 字符上限，取各 mode 最小值；0 = 未声明 */
