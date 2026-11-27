@@ -231,7 +231,8 @@
       "addImageToLibraryFailed": "Unable to add this image to the asset library",
       "addAudioToLibraryFailed": "Unable to add this audio to the asset library",
       "addVideoToLibraryFailed": "Unable to add this video to the asset library",
-      "addToLibraryFailed": "Add failed"
+      "addToLibraryFailed": "Add failed",
+      "renameMedia": "Rename file"
     },
     "saveTextPrompt": {
       "title": "Save to Prompt Library",
@@ -289,7 +290,8 @@
       "copyAll": "Copy all",
       "copied": "Copied",
       "copy": "Copy",
-      "referenceVideo": "Reference videos"
+      "referenceVideo": "Reference videos",
+      "fileCreatedAt": "Created"
     },
     "nodeManager": {
       "title": "Nodes",
@@ -355,6 +357,11 @@
       "tipPan": "Pan canvas: drag with left/middle/right mouse button (scroll wheel to zoom)",
       "tipAssetDrop": "Add asset: drag image/video/audio from the asset library onto canvas",
       "tipPromptDrop": "Add prompt: drag a prompt card onto canvas to create an AI image node"
+    },
+    "mediaRename": {
+      "title": "Rename file",
+      "placeholder": "Enter a new file name",
+      "hint": "The extension stays the same; a number is appended if the name is taken. Every node referencing this file is updated."
     }
   },
   "tool": {

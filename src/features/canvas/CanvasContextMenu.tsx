@@ -8,6 +8,7 @@ import {
   Library,
   Lock,
   LockOpen,
+  PencilLine,
   Save,
   Scissors,
   Trash2,
@@ -51,6 +52,9 @@ interface CanvasContextMenuProps {
   onDownloadMedia: (url: string, mediaType: "image" | "video" | "audio") => void;
   /** 打开「节点属性」: 查看媒体本体参数与生成信息。仅媒体节点可用。 */
   onShowProperties?: () => void;
+  /** 重命名磁盘上的媒体文件: 只对本地落盘文件出现。 */
+  canRenameMedia?: boolean;
+  onRenameMedia?: () => void;
   onToggleGroupFrozen: () => void;
   onClose: () => void;
 }
@@ -79,6 +83,8 @@ export function CanvasContextMenu({
   onAddMediaToLibrary,
   onDownloadMedia,
   onShowProperties,
+  canRenameMedia = false,
+  onRenameMedia,
   onToggleGroupFrozen,
   onClose,
 }: CanvasContextMenuProps) {
@@ -238,6 +244,18 @@ export function CanvasContextMenu({
         >
           <Info className="h-4 w-4 text-accent" />
           <span>{t("canvas.contextMenu.properties", "属性")}</span>
+        </button>
+      )}
+
+      {/* 重命名磁盘文件: 只有本地落盘文件才有意义, 云端链接改了地址会断。 */}
+      {canRenameMedia && onRenameMedia && (
+        <button
+          type="button"
+          onClick={onRenameMedia}
+          className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-text-dark transition-colors hover:bg-bg-dark"
+        >
+          <PencilLine className="h-4 w-4 text-accent" />
+          <span>{t("canvas.contextMenu.renameMedia", "重命名文件")}</span>
         </button>
       )}
 

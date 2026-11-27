@@ -60,7 +60,13 @@ import {
   UPLOAD_BATCH_GAP,
 } from "@/features/canvas/application/uploadBatchPlacement";
 import { prepareNodeImage, prepareNodeImageFromFile } from "@/features/canvas/application/imageData";
-import { persistVideoLocally } from "@/features/canvas/application/mediaPersistence";
+import { isLocalAbsoluteMediaPath, persistVideoLocally } from "@/features/canvas/application/mediaPersistence";
+import {
+  normalizeMediaPathKey,
+  rememberMediaRename,
+  rewriteMediaPathInValue,
+} from "@/features/canvas/application/mediaRenames";
+import { renameMediaFile } from "@/commands/mediaOutput";
 import {
   buildGenerationErrorReport,
   CURRENT_RUNTIME_SESSION_ID,
@@ -274,8 +280,7 @@ function resolveContextMenuMedia(node: CanvasNode): { url: string; mediaType: "i
   return url ? { url: url.trim(), mediaType: "image" } : null;
 }
 
-/** 会产出媒体结果的生成节点类型: 平台/模型/提示词都记在它们身上。 */
-const MEDIA_GENERATION_NODE_TYPES = new Set<string>([
+/** 会产出媒体结果的生成节点类型: 平台/模型/提示词都记在它们身上。 */const MEDIA_GENERATION_NODE_TYPES = new Set<string>([
   CANVAS_NODE_TYPES.imageEdit,
   CANVAS_NODE_TYPES.videoGen,
   CANVAS_NODE_TYPES.audioGen,
@@ -1002,6 +1007,19 @@ export function Canvas() {
   const [videoViewerUrl, setVideoViewerUrl] = useState<string | null>(null);
   /** 「节点属性」面板正在查看的节点;null 表示面板关闭。 */
   const [propertiesNodeId, setPropertiesNodeId] = useState<string | null>(null);
+  /**
+   * 「重命名文件」弹窗。
+   *
+   * 只改磁盘文件名会立刻让画布上的引用失效, 所以这里要带 nodeId/path:
+   * 改完把整个画布里指向旧路径的节点（可能不止一个）一起改写。
+   */
+  const [mediaRenameDialog, setMediaRenameDialog] = useState<{
+    nodeId: string;
+    path: string;
+    name: string;
+  } | null>(null);
+  /** 重命名结果提示（成功/失败都说话, 否则用户会以为没生效而反复点）。 */
+  const [mediaRenameToast, setMediaRenameToast] = useState<string | null>(null);
   const [canvasContextMenu, setCanvasContextMenu] = useState<{
     position: { x: number; y: number };
     flowPosition: { x: number; y: number };
@@ -3392,6 +3410,81 @@ export function Canvas() {
     setCanvasContextMenu(null);
   }, [canvasContextMenu?.nodeId]);
 
+  /** 右键「重命名文件」：打开弹窗，预填当前文件名（去掉扩展名，扩展名跟随真实文件）。 */
+  const handleContextRenameMedia = useCallback(() => {
+    const nodeId = canvasContextMenu?.nodeId;
+    const url = canvasContextMenu?.downloadUrl?.trim();
+    setCanvasContextMenu(null);
+    if (!nodeId || !url) {
+      return;
+    }
+    if (!isLocalAbsoluteMediaPath(url)) {
+      setMediaRenameToast('只能重命名本地文件（云端链接请先下载到本地）');
+      return;
+    }
+    const fileName = url.split(/[\\/]/).pop() ?? '';
+    setMediaRenameDialog({
+      nodeId,
+      path: url,
+      name: fileName.replace(/\.[^.]+$/, ''),
+    });
+  }, [canvasContextMenu?.downloadUrl, canvasContextMenu?.nodeId]);
+
+  /**
+   * 把画布里所有指向旧文件路径的节点改写成新路径。
+   *
+   * 同一个文件可能被多个节点引用（复制节点、结果节点 + 生成节点），只改右键命中的
+   * 那一个会让其余节点在下次渲染时变成坏图。这里按值精确匹配，改动最小化。
+   */
+  const rewriteMediaPathReferences = useCallback(
+    (oldPath: string, newPath: string) => {
+      const from = normalizeMediaPathKey(oldPath);
+      if (!from) {
+        return;
+      }
+      for (const node of nodes) {
+        const current = node.data as unknown as Record<string, unknown>;
+        const rewritten = rewriteMediaPathInValue(current, from, newPath);
+        if (rewritten === current) {
+          continue;
+        }
+        const next = rewritten as Record<string, unknown>;
+        const patch: Record<string, unknown> = {};
+        for (const key of Object.keys(next)) {
+          if (next[key] !== current[key]) {
+            patch[key] = next[key];
+          }
+        }
+        if (Object.keys(patch).length > 0) {
+          updateNodeData(node.id, patch as unknown as Partial<CanvasNode['data']>);
+        }
+      }
+    },
+    [nodes, updateNodeData],
+  );
+
+  const confirmMediaRename = useCallback(async () => {
+    const dialog = mediaRenameDialog;
+    const nextName = dialog?.name.trim();
+    if (!dialog || !nextName) {
+      return;
+    }
+    try {
+      const result = await renameMediaFile(dialog.path, nextName);
+      // 先记账再改节点：撤销栈里的旧快照还要靠它把路径修回来。
+      rememberMediaRename(dialog.path, result.path);
+      rewriteMediaPathReferences(dialog.path, result.path);
+      setMediaRenameDialog(null);
+      setMediaRenameToast(
+        result.adjusted
+          ? `已重命名为 ${result.name}（同名文件已存在，已自动加序号）`
+          : `已重命名为 ${result.name}`,
+      );
+    } catch (error) {
+      setMediaRenameToast(error instanceof Error ? error.message : String(error));
+    }
+  }, [mediaRenameDialog, rewriteMediaPathReferences]);
+
   /**
    * 右键落在多选里的某个节点上时，按整片选区处理（和 Ctrl+C / Ctrl+X 一致）；
    * 只选中了这一个（或右键的是选区外的节点）就只处理这一个。
@@ -5469,6 +5562,10 @@ export function Canvas() {
           onAddMediaToLibrary={handleAddMediaToLibrary}
           onDownloadMedia={handleContextDownloadMedia}
           onShowProperties={handleContextShowProperties}
+          canRenameMedia={Boolean(
+            canvasContextMenu.downloadUrl && isLocalAbsoluteMediaPath(canvasContextMenu.downloadUrl),
+          )}
+          onRenameMedia={handleContextRenameMedia}
           onToggleGroupFrozen={handleContextToggleGroupFrozen}
           onClose={() => setCanvasContextMenu(null)}
         />
@@ -5481,6 +5578,59 @@ export function Canvas() {
         upstream={propertiesUpstream}
         onClose={() => setPropertiesNodeId(null)}
       />
+
+      <UiModal
+        isOpen={Boolean(mediaRenameDialog)}
+        title={t("canvas.mediaRename.title", "重命名文件")}
+        onClose={() => setMediaRenameDialog(null)}
+        footer={
+          <>
+            <UiButton variant="muted" size="sm" onClick={() => setMediaRenameDialog(null)}>
+              {t("common.cancel")}
+            </UiButton>
+            <UiButton
+              variant="primary"
+              size="sm"
+              disabled={!mediaRenameDialog?.name.trim()}
+              onClick={() => void confirmMediaRename()}
+            >
+              {t("common.confirm")}
+            </UiButton>
+          </>
+        }
+      >
+        <div className="space-y-2">
+          <UiInput
+            autoFocus
+            value={mediaRenameDialog?.name ?? ""}
+            placeholder={t("canvas.mediaRename.placeholder", "输入新的文件名")}
+            onChange={(event) =>
+              setMediaRenameDialog((current) =>
+                current ? { ...current, name: event.target.value } : current,
+              )
+            }
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && mediaRenameDialog?.name.trim()) {
+                event.preventDefault();
+                void confirmMediaRename();
+              }
+            }}
+          />
+          <p className="text-[11px] leading-relaxed text-text-muted">
+            {t(
+              "canvas.mediaRename.hint",
+              "扩展名保持不变；同名文件已存在时自动加序号。画布里引用这个文件的所有节点会一起更新。",
+            )}
+          </p>
+        </div>
+      </UiModal>
+
+      {mediaRenameToast && (
+        <CanvasToast
+          message={mediaRenameToast}
+          onDismiss={() => setMediaRenameToast(null)}
+        />
+      )}
 
       <NodeToolDialog />
 

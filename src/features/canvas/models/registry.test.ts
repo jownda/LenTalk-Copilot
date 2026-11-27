@@ -77,6 +77,10 @@ describe("listVideoModels", () => {
       expect(gptImage?.pricing).toBeDefined();
       expect(resolveModelPriceDisplay(gptImage!, { resolution: "1K", language: "zh-CN" })?.label).toContain("0.03");
 
+      // MJ 没有分辨率参数，只有 hd 开关，所以档位只有「标准 1024 / 高清 HD 2048」两档。
+      expect(midjourney?.resolutions?.map((option) => option.value)).toEqual(["1K", "2K"]);
+      expect(midjourney?.defaultResolution).toBe("1K");
+
       // 一组 4 张按次计费；count 是组数，两组就该翻倍。
       const oneGroup = resolveModelPriceDisplay(midjourney!, {
         resolution: "1K",

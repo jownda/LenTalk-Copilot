@@ -36,6 +36,8 @@ import {
   jimengAutoVideoUnitCredits,
   type JimengCatalogEntry,
 } from "./jimengCatalog";
+import { getRhtvCatalog, getRhtvSpec } from "./rhtvCatalog";
+import type { RhtvParamSpec } from "@/commands/rhtvCli";
 import { createWgspaiImagePricing, createWgspaiVideoPricing, isWgspaiProvider } from "./wgspaiPricing";
 import { createDramayaVideoPricing, isDramayaVideoBaseUrl, resolveDramayaVideoOptions } from "./dramayaModels";
 import {
@@ -43,6 +45,7 @@ import {
   MIDJOURNEY_DEFAULT_EXTRA_PARAMS,
   MIDJOURNEY_EXTRA_PARAMS,
   MIDJOURNEY_IMAGES_PER_GROUP,
+  MIDJOURNEY_RESOLUTIONS,
 } from "./midjourney";
 import { isRjmVideoApiBaseUrl } from "@/commands/videoApi";
 import { resolveMmxVoiceOperation } from "@/commands/minimaxVoice";
@@ -121,6 +124,21 @@ const RUNNINGHUB_CLI_PROVIDER: ModelProviderDefinition = {
 };
 
 /**
+ * RunningHub **画布**（`rhtvcli`）—— 与上面的标准模型 API（`rh`）是两条不同链路：
+ * 标准 API 有 356 个端点、一次请求出片；画布按节点生成，但目录里独有 RH Enhanced 系
+ * （`Minimax-H3-RH-Enhanced` 这类自研增强模型）以及画布上新上的模型。
+ *
+ * 模型清单不写死在这里：由 `rhtvCatalog` 从 CLI 的 `model search` 实时拉取，
+ * 画布上新不需要跟着发版。
+ */
+export const RHTV_CANVAS_PROVIDER_ID = "rhtv-canvas";
+const RHTV_CANVAS_PROVIDER: ModelProviderDefinition = {
+  id: RHTV_CANVAS_PROVIDER_ID,
+  name: "RunningHub 画布",
+  label: "RunningHub 画布",
+};
+
+/**
  * 不使用 API Key 的平台: 本地 CLI(即梦 / 万相)靠可执行文件与各自的登录态工作,
  * 「密钥」页里没有可填的密钥。
  *
@@ -132,6 +150,8 @@ const API_KEYLESS_PROVIDER_IDS: ReadonlySet<string> = new Set([
   JIMENG_CANVAS_CLI_PROVIDER_ID,
   WAN_CLI_PROVIDER_ID,
   RUNNINGHUB_CLI_PROVIDER_ID,
+  // 画布 CLI 同样是「登录态而非密钥」：没填 Key 也必须出现在图片/视频模型选择器里。
+  RHTV_CANVAS_PROVIDER_ID,
 ]);
 
 export function isApiKeylessProvider(providerId: string): boolean {
@@ -261,17 +281,28 @@ export function listImageModels(): ImageModelDefinition[] {
   const jimengCliModels = buildJimengCliImageModels();
   const jimengCanvasModels = buildJimengCanvasCliImageModels();
   if (isWindowsDesktopRuntime()) {
-    const available = [...buildCustomImageModels(), ...jimengCliModels, ...jimengCanvasModels];
+    const available = [
+      ...buildCustomImageModels(),
+      ...jimengCliModels,
+      ...jimengCanvasModels,
+      ...buildRhtvCanvasImageModels(),
+    ];
     return available.length > 0 ? available : [WINDOWS_UNCONFIGURED_IMAGE_MODEL];
   }
-  return [...imageModels, ...jimengCliModels, ...jimengCanvasModels, ...buildCustomImageModels()];
+  return [
+    ...imageModels,
+    ...jimengCliModels,
+    ...jimengCanvasModels,
+    ...buildRhtvCanvasImageModels(),
+    ...buildCustomImageModels(),
+  ];
 }
 
 export function listModelProviders(): ModelProviderDefinition[] {
   if (isWindowsDesktopRuntime()) {
     return buildCustomProviders();
   }
-  return [...providers, RUNNINGHUB_CLI_PROVIDER, ...buildCustomProviders()];
+  return [...providers, RUNNINGHUB_CLI_PROVIDER, RHTV_CANVAS_PROVIDER, ...buildCustomProviders()];
 }
 
 export function getImageModel(modelId: string): ImageModelDefinition {
@@ -292,6 +323,12 @@ export function getImageModel(modelId: string): ImageModelDefinition {
   const jimengCli = buildJimengCliImageModels().find((model) => model.id === resolvedModelId);
   if (jimengCli) {
     return jimengCli;
+  }
+
+  // 画布模型同样不在 imageModelMap 里（目录是运行期拉的），重开工程时必须能查回来。
+  const rhtvCanvas = buildRhtvCanvasImageModels().find((model) => model.id === resolvedModelId);
+  if (rhtvCanvas) {
+    return rhtvCanvas;
   }
 
   // 超清任务不是下拉里的可选项, 但必须有定义: 否则记账会按内置模型估价。
@@ -550,6 +587,7 @@ export function listVideoModels(): VideoModelDefinition[] {
 
   return [
     ...customVideoModels,
+    ...buildRhtvCanvasVideoModels(),
     ...buildRunningHubCliVideoModels(),
     ...buildJimengCliVideoModels(),
     ...buildJimengCanvasCliVideoModels(),
@@ -959,6 +997,125 @@ function buildJimengCliVideoModels(): VideoModelDefinition[] {
       ),
     };
   });
+}
+
+/**
+ * 画布模型的参数档位全部来自该模型的实时 schema。
+ *
+ * 为什么不能写死：画布每个模型的字段名和取值都不同 —— H3 的比例叫 `aspectRatio`、
+ * 只有 480p/768p 两档、时长 4–15 秒；seedream 的比例叫 `whAspectRatio`、分辨率只有
+ * 1K/2K。写死一份"通用档位"等于给用户发一批必被服务端拒绝的选项。
+ *
+ * schema 还没拉到（首次启动、尚未登录）时，退回一组保守的常见档位：只影响下拉里能选
+ * 什么，提交时 Rust 侧仍会按实时 schema 过滤，不会把不支持的字段发出去。
+ */
+const RHTV_CANVAS_FALLBACK_ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"];
+
+function rhtvSpec(modelCode: string, semantic: RhtvParamSpec["semantic"]) {
+  return getRhtvSpec(modelCode).find((spec) => spec.semantic === semantic);
+}
+
+function rhtvSelectOptions(
+  modelCode: string,
+  semantic: RhtvParamSpec["semantic"],
+): Array<{ value: string; label: string }> {
+  const spec = rhtvSpec(modelCode, semantic);
+  const options = (spec?.options ?? [])
+    // 空值代表"自适应"，不能作为可选项提交。
+    .filter((option) => option.value.length > 0)
+    .map((option) => ({ value: option.value, label: option.label || option.value }));
+  return options;
+}
+
+function rhtvAspectRatios(modelCode: string): Array<{ value: string; label: string }> {
+  const options = rhtvSelectOptions(modelCode, "aspectRatio");
+  return options.length > 0
+    ? options
+    : RHTV_CANVAS_FALLBACK_ASPECT_RATIOS.map((value) => ({ value, label: value }));
+}
+
+function rhtvResolutions(modelCode: string): Array<{ value: string; label: string }> {
+  return rhtvSelectOptions(modelCode, "resolution").map((option) => ({
+    value: option.value,
+    label: option.value.toUpperCase(),
+  }));
+}
+
+/** slider 型时长（H3 是 4–15 秒）展开成离散档位。 */
+function rhtvDurations(modelCode: string): number[] {
+  const spec = rhtvSpec(modelCode, "duration");
+  const min = spec?.min ?? 1;
+  const max = spec?.max ?? 0;
+  if (max < min) return [];
+  const step = Math.max(1, Math.round(spec?.step ?? 1));
+  const values: number[] = [];
+  for (let value = Math.round(min); value <= Math.round(max) && values.length < 60; value += step) {
+    values.push(value);
+  }
+  return values;
+}
+
+function rhtvDefault<T extends string | number>(
+  modelCode: string,
+  semantic: RhtvParamSpec["semantic"],
+  fallback: T,
+): T {
+  const spec = rhtvSpec(modelCode, semantic);
+  const raw = spec?.defaultValue;
+  if (raw == null || raw === "") return fallback;
+  const parsed = typeof fallback === "number" ? Number(raw) : raw;
+  return (Number.isNaN(parsed) ? fallback : parsed) as T;
+}
+
+function buildRhtvCanvasVideoModels(): VideoModelDefinition[] {
+  return getRhtvCatalog()
+    .video.filter((item) => item.available !== false)
+    .map((item) => {
+      const durations = rhtvDurations(item.modelCode);
+      const resolutions = rhtvResolutions(item.modelCode);
+      return {
+        id: `${RHTV_CANVAS_PROVIDER_ID}/${item.modelCode}`,
+        mediaType: "video" as const,
+        displayName: `RunningHub 画布 · ${item.name ?? item.modelCode}`,
+        providerId: RHTV_CANVAS_PROVIDER_ID,
+        description: `RunningHub 画布 · ${item.modelCode}`,
+        expectedDurationMs: 300000,
+        aspectRatios: rhtvAspectRatios(item.modelCode),
+        defaultAspectRatio: rhtvDefault(item.modelCode, "aspectRatio", "16:9"),
+        // 拿不到 schema 时给一段常见时长，避免下拉是空的。
+        durationOptions: durations.length > 0 ? durations : [5, 10],
+        defaultDuration: rhtvDefault(item.modelCode, "duration", durations[0] ?? 5),
+        resolutions,
+        defaultResolution: rhtvDefault(item.modelCode, "resolution", resolutions[0]?.value ?? ""),
+      };
+    });
+}
+
+function buildRhtvCanvasImageModels(): ImageModelDefinition[] {
+  return getRhtvCatalog()
+    .image.filter((item) => item.available !== false)
+    .map((item) => {
+      const resolutions = rhtvResolutions(item.modelCode);
+      return {
+        id: `${RHTV_CANVAS_PROVIDER_ID}/${item.modelCode}`,
+        mediaType: "image" as const,
+        displayName: `RunningHub 画布 · ${item.name ?? item.modelCode}`,
+        providerId: RHTV_CANVAS_PROVIDER_ID,
+        description: `RunningHub 画布 · ${item.modelCode}`,
+        eta: "1-3min",
+        expectedDurationMs: 180000,
+        defaultAspectRatio: rhtvDefault(item.modelCode, "aspectRatio", "1:1"),
+        defaultResolution: rhtvDefault(item.modelCode, "resolution", resolutions[0]?.value ?? ""),
+        aspectRatios: rhtvAspectRatios(item.modelCode),
+        resolutions,
+        // 画布的图生图与文生图是同一个模型编码，模式由"有没有参考图"决定，
+        // 与标准模型 API 的 endpoint 拆分方式不同。
+        resolveRequest: ({ referenceImageCount }: { referenceImageCount: number }) => ({
+          requestModel: `${RHTV_CANVAS_PROVIDER_ID}/${item.modelCode}`,
+          modeLabel: referenceImageCount > 0 ? "编辑模式" : "生成模式",
+        }),
+      };
+    });
 }
 
 /**
@@ -2275,11 +2432,14 @@ function buildCustomImageModels(): ImageModelDefinition[] {
           : (resolveLingkeAspectRatios(lingkeCapability) ?? CUSTOM_ASPECT_RATIOS);
         // 档位常被平台写进模型名(qwen-image-3.0-pro-1k / flux-2k / sd-4k), 这类模型
         // 只能按名字里那一档请求; 读不到档位时才放开 1K/2K/4K 全档位。
-        const resolutions = resolveLingkeImageResolutions(lingkeCapability)
-          ?? resolveImageModelResolutionOptions(model);
+        // Midjourney 例外: 它没有分辨率参数, 只有 hd 开关, 所以只有「标准 / 高清」两档。
+        const isMidjourney = isMidjourneyImageModel(model);
+        const resolutions = isMidjourney
+          ? MIDJOURNEY_RESOLUTIONS
+          : (resolveLingkeImageResolutions(lingkeCapability)
+            ?? resolveImageModelResolutionOptions(model));
         // Midjourney 单独一套语义: 一档 = 一组 4 张, 且有引擎/版本/风格化三个专属参数。
         // 见 models/midjourney.ts —— 没有这段, 面板上选的 count/bot_type 根本发不出去。
-        const isMidjourney = isMidjourneyImageModel(model);
         return {
           id: modelId,
           mediaType: "image",

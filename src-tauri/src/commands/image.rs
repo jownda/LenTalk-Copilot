@@ -1154,12 +1154,58 @@ fn resolve_images_dir(app: &AppHandle) -> Result<PathBuf, String> {
     media_output::media_dir(app, media_output::MediaKind::Image)
 }
 
-/// 把字节写进指定目录，文件名取内容 md5（同一份内容只落一次）。
-/// 把字节写进目录，文件名优先用**来源名**，没有可读名字才退回内容哈希。
+/// 生成产物的文件名主干：落盘时刻（本地时间）。
+///
+/// 以前没有来源名时用内容 md5（`8e8adbeb1d9d05f875a56a782cce52e1.png`），用户完全认不出
+/// 这是什么、什么时候出的；有来源名时又常常直接沿用 CDN 的哈希文件名。现在统一按时间命名，
+/// 同一秒内落多张由 [`unique_media_path`] 依次补 `-2`、`-3`，既不重名也能排序。
+fn generated_media_stem() -> String {
+    chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string()
+}
+
+/// 名字看起来像机器生成的哈希 / CDN id / CLI run_id。
+///
+/// 这类名字对用户没有信息量，落盘时换成时间。判断**必须保守** —— 误判会连用户自己起的
+/// 名字一起改掉，所以只认几种明确形态：纯十六进制（md5/sha1/sha256 片段）、UUID、以及
+/// 又长又数字密集的 base62 串。
+fn looks_like_opaque_stem(stem: &str) -> bool {
+    let trimmed = stem.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() < 16 {
+        return false;
+    }
+    let all_hex = chars.iter().all(|c| c.is_ascii_hexdigit());
+    let has_alpha = chars.iter().any(|c| c.is_ascii_alphabetic());
+    // 纯数字（时间戳、序号）不算哈希：`20261126112041` 保留原样。
+    if all_hex && has_alpha {
+        return true;
+    }
+    // UUID：36 位，去掉 `-` 后是纯十六进制。
+    let compact: String = trimmed.chars().filter(|c| *c != '-').collect();
+    if compact.len() >= 16
+        && compact.chars().all(|c| c.is_ascii_hexdigit())
+        && compact.chars().any(|c| c.is_ascii_alphabetic())
+    {
+        return true;
+    }
+    // 长且数字密集的 base62/base64url 串（`9f8a7b6c5d4e3f2a1b0c`、CLI 的 `canvas-a1b2c3…`）。
+    if chars.len() >= 24
+        && chars
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        let digits = chars.iter().filter(|c| c.is_ascii_digit()).count();
+        return digits * 4 >= chars.len();
+    }
+    false
+}
+
+/// 把字节写进目录，文件名优先用**来源名**，没有可读名字才按落盘时间命名。
 ///
 /// 以前一律用 `<md5>.<ext>`：去重和幂等都是白送的，但文件名完全不可读 ——
 /// 用户在资源管理器里看到 `8e8adbeb1d9d05f875a56a782cce52e1.mp3` 认不出这是什么。
-/// 素材多来自资产库或本地导入，名字本来就是用户起的，直接沿用更符合直觉。
+/// 素材多来自资产库或本地导入，名字本来就是用户起的，直接沿用更符合直觉；
+/// 生成产物（哈希 / 无来源名）则用 `2026-11-26-11-20-41.png` 这种时间名。
 ///
 /// 去重依然保留：**同名且内容相同就复用同一个文件**，同名不同内容才加 `-2`、`-3`。
 fn persist_bytes_into(
@@ -1169,11 +1215,17 @@ fn persist_bytes_into(
     suggested_stem: Option<&str>,
 ) -> Result<String, String> {
     let extension = normalize_extension(extension);
-    let output_path = match suggested_stem.and_then(usable_file_stem) {
-        Some(stem) => unique_media_path(dir, &stem, &extension, md5::compute(bytes), bytes.len() as u64),
-        // 连名字都没有（平台直接甩回二进制）时仍用内容哈希：至少保证重复请求命中同一个文件。
-        None => dir.join(format!("{:x}.{}", md5::compute(bytes), extension)),
-    };
+    let stem = suggested_stem
+        .and_then(usable_file_stem)
+        .filter(|stem| !looks_like_opaque_stem(stem))
+        .unwrap_or_else(generated_media_stem);
+    let output_path = unique_media_path(
+        dir,
+        &stem,
+        &extension,
+        md5::compute(bytes),
+        bytes.len() as u64,
+    );
 
     if !output_path.exists() {
         std::fs::write(&output_path, bytes)
@@ -1368,17 +1420,17 @@ fn adopt_local_media_file(
     let digest = hash_file_md5(source)?;
     // 搬进落盘目录时保留原文件名：用户在墙纸/资源管理器里看到的应该是
     // 「丈夫.mp3」而不是「8e8adbeb….mp3」。同名且内容相同则复用，不同才加序号。
+    // CLI 产物（`canvas-a1b2c3…`）这类机器名同样换成本地时间，和生成产物对齐。
     let size = std::fs::metadata(source)
         .map(|meta| meta.len())
         .unwrap_or(0);
-    let suggested = source
+    let stem = source
         .file_stem()
         .and_then(|value| value.to_str())
-        .and_then(usable_file_stem);
-    let output_path = match suggested {
-        Some(stem) => unique_media_path(dir, &stem, &extension, digest, size),
-        None => dir.join(format!("{:x}.{}", digest, extension)),
-    };
+        .and_then(usable_file_stem)
+        .filter(|stem| !looks_like_opaque_stem(stem))
+        .unwrap_or_else(generated_media_stem);
+    let output_path = unique_media_path(dir, &stem, &extension, digest, size);
     let source_text = source.to_string_lossy().to_string();
 
     if !output_path.exists() {
@@ -1982,6 +2034,202 @@ pub async fn persist_media_source_auto(app: AppHandle, source: String) -> Result
         }
         Err(error) => Err(error),
     }
+}
+
+/// 把来源还原成本机文件路径：绝对路径与 `file://` 都认（节点里两种写法都有）。
+fn local_media_path_or_file_url(source: &str) -> Option<PathBuf> {
+    let trimmed = source.trim();
+    if let Some(path) = local_media_path(trimmed) {
+        return Some(path.to_path_buf());
+    }
+    if trimmed.starts_with("file://") {
+        let path = PathBuf::from(decode_file_url_path(trimmed));
+        return path.is_file().then_some(path);
+    }
+    None
+}
+
+/// 文件系统里的创建 / 修改时间（毫秒时间戳）。取不到的项为 null。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaFileTime {
+    pub created_at_ms: Option<u64>,
+    pub modified_at_ms: Option<u64>,
+}
+
+fn system_time_to_millis(value: std::io::Result<SystemTime>) -> Option<u64> {
+    value
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
+/// 媒体文件的落盘时间，给「右键 → 属性」显示「生成时间」用。
+///
+/// 节点的 `generationStartedAt` 只在**这次生成**的记录还在时才有（结果节点、老工程、
+/// 手动导入的素材都没有）。文件的创建时间（macOS / Windows 都有；Linux 上 `created()`
+/// 不可用时退回修改时间）是任何本地媒体都拿得到的兜底。
+#[tauri::command]
+pub async fn resolve_media_file_time(source: String) -> Result<Option<MediaFileTime>, String> {
+    let Some(path) = local_media_path_or_file_url(&source) else {
+        return Ok(None);
+    };
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("无法读取媒体文件时间: {error}"))?;
+    let created_at_ms = system_time_to_millis(metadata.created());
+    let modified_at_ms = system_time_to_millis(metadata.modified());
+    if created_at_ms.is_none() && modified_at_ms.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(MediaFileTime {
+        created_at_ms,
+        modified_at_ms,
+    }))
+}
+
+/// 一次重命名的结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameMediaResult {
+    /// 重命名后的绝对路径（调用方要用它改写节点里的引用）。
+    pub path: String,
+    /// 最终文件名（含扩展名）。
+    pub name: String,
+    /// 目标名已被占用，实际落成了带序号的名字（`xxx-2.png`）。
+    pub adjusted: bool,
+}
+
+/// 重命名落盘目录里的媒体文件。
+///
+/// 只允许动「默认落盘位置」下 images / videos / audio 三个目录里的文件：用户自己素材盘
+/// 上的文件不归本应用管，不能因为画布上一个右键就被改名。扩展名以**磁盘上的真实文件**
+/// 为准（用户在输入框里连扩展名一起改也按原扩展名落地），重名自动补 `-2`、`-3`，
+/// 同名同内容则直接并到已有文件上，不重复占空间。
+#[tauri::command]
+pub async fn rename_media_file(
+    app: AppHandle,
+    source: String,
+    name: String,
+) -> Result<RenameMediaResult, String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err("媒体地址为空".to_string());
+    }
+    let path = local_media_path_or_file_url(trimmed)
+        .ok_or_else(|| "只能重命名本地文件（云端链接请先下载到本地）".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "无法定位文件所在目录".to_string())?
+        .to_path_buf();
+
+    let in_output_dir = media_output::MediaKind::ALL
+        .iter()
+        .filter_map(|kind| media_output::media_dir(&app, *kind).ok())
+        .any(|dir| dir == parent);
+    if !in_output_dir {
+        return Err("只能重命名默认落盘位置里的媒体文件".to_string());
+    }
+
+    rename_media_in_dir(&path, &name)
+}
+
+/// 剥掉用户在输入框里顺手写上的扩展名（`镜头1.mp4` / `镜头1.png` 都剥）。
+///
+/// 只认「点后面 2–5 位、至少含一个字母」的纯字母数字段：`v1.2 开场` 这种名字里本来
+/// 就有点号的不受影响，纯数字后缀（`.2`）也不会被当成扩展名。
+fn strip_trailing_extension(raw: &str) -> &str {
+    match raw.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty()
+                && (2..=5).contains(&extension.len())
+                && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+                && extension.chars().any(|ch| ch.is_ascii_alphabetic()) =>
+        {
+            stem
+        }
+        _ => raw,
+    }
+}
+
+/// 真正的改名动作（不带目录白名单校验，便于单测）。
+///
+/// 规则：扩展名永远跟随磁盘上的真实文件（用户连扩展名一起改也按原扩展名落地）、
+/// 重名自动补序号、同名同内容直接并到已有文件上。
+fn rename_media_in_dir(path: &Path, name: &str) -> Result<RenameMediaResult, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "无法定位文件所在目录".to_string())?;
+
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(normalize_extension)
+        .unwrap_or_default();
+    if extension.is_empty() {
+        return Err("这个文件没有扩展名，无法重命名".to_string());
+    }
+
+    let raw = name.trim();
+    if raw.is_empty() {
+        return Err("文件名不能为空".to_string());
+    }
+    // 输入框里可能带着扩展名（`镜头1.mp4`），甚至连格式都改了（`镜头1.png`）。
+    // 无论写的是哪个，统一剥掉尾部扩展名 —— 最终扩展名永远跟随真实文件，
+    // 否则会得到 `镜头1.png.mp4`，既难看又可能被播放器误判。
+    let stem_input = strip_trailing_extension(raw);
+    let stem = sanitize_file_stem(stem_input);
+    // 输入全是非法字符（`///`、`***`）时清洗完会退回占位名，那种「改名成功」是骗人的，
+    // 直接拒绝，让用户重新输入。
+    let has_printable = stem_input
+        .chars()
+        .any(|ch| !ch.is_control() && !matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'));
+    if !has_printable {
+        return Err("文件名不能为空".to_string());
+    }
+
+    // 目标名没人用（绝大多数情况）时直接改，省掉对整段视频算 md5 的开销；
+    // 只有撞名才需要摘要来区分「同名同内容（并掉）」和「同名不同内容（加序号）」。
+    let first_choice = parent.join(format!("{stem}.{extension}"));
+    let target = if first_choice.exists() && first_choice != path {
+        let digest = hash_file_md5(path)?;
+        let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        unique_media_path(parent, &stem, &extension, digest, size)
+    } else {
+        first_choice
+    };
+
+    if target == path {
+        // 改成了原本的名字（大小写不同的同名文件在 macOS 上也算同一个）。
+        return Ok(RenameMediaResult {
+            path: path.to_string_lossy().to_string(),
+            name: path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            adjusted: false,
+        });
+    }
+    if target.exists() {
+        // 同名同内容：并到已有文件上，原文件删掉，不重复占空间。
+        std::fs::remove_file(path)
+            .map_err(|error| format!("重命名失败（无法合并同名文件）: {error}"))?;
+    } else {
+        std::fs::rename(path, &target).map_err(|error| format!("重命名失败: {error}"))?;
+    }
+
+    let final_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let adjusted = target.file_stem().and_then(|value| value.to_str()) != Some(stem.as_str());
+    Ok(RenameMediaResult {
+        path: target.to_string_lossy().to_string(),
+        name: final_name,
+        adjusted,
+    })
 }
 
 /// 下载远端/内联/本机的媒体并落盘，返回本地绝对路径。
@@ -2766,5 +3014,200 @@ mod file_stem_tests {
         assert_eq!(sanitize_file_stem(""), "storyboard-image");
         assert_eq!(sanitize_file_stem("   "), "storyboard-image");
         assert_eq!(sanitize_file_stem("..."), "storyboard-image");
+    }
+}
+
+#[cfg(test)]
+mod media_naming_tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lentalk-naming-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn is_timestamp_stem(stem: &str) -> bool {
+        // 2026-11-26-11-20-41
+        let bytes = stem.as_bytes();
+        if bytes.len() != 19 {
+            return false;
+        }
+        let pattern = b"dddd-dd-dd-dd-dd-dd";
+        for (index, expected) in pattern.iter().enumerate() {
+            let actual = bytes[index];
+            if *expected == b'd' {
+                if !actual.is_ascii_digit() {
+                    return false;
+                }
+            } else if actual != b'-' {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn hashes_and_ids_are_opaque() {
+        // md5 / sha1 / sha256 片段
+        assert!(looks_like_opaque_stem("8e8adbeb1d9d05f875a56a782cce52e1"));
+        assert!(looks_like_opaque_stem("a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"));
+        // uuid
+        assert!(looks_like_opaque_stem("3f2504e0-4f89-11d3-9a0c-0305e82c3301"));
+        // 长且数字密集的 CDN id（CLI 的 canvas-xxxx）
+        assert!(looks_like_opaque_stem("9f8a7b6c5d4e3f2a1b0c9d8e"));
+    }
+
+    #[test]
+    fn readable_names_are_kept() {
+        assert!(!looks_like_opaque_stem("丈夫"));
+        assert!(!looks_like_opaque_stem("镜头-01-开场"));
+        assert!(!looks_like_opaque_stem("IMG_20261126_112041"));
+        assert!(!looks_like_opaque_stem("20261126112041"));
+        assert!(!looks_like_opaque_stem("canvas-abc"));
+        assert!(!looks_like_opaque_stem("tmp-def"));
+    }
+
+    #[test]
+    fn generated_media_is_named_by_local_time() {
+        let dir = temp_dir("bytes");
+        let path = persist_bytes_into(&dir, b"first-image", "png", None).expect("persist");
+        let stem = Path::new(&path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("stem");
+        assert!(is_timestamp_stem(stem), "生成产物应按时间命名，实际是 {stem}");
+        assert!(path.ends_with(".png"));
+    }
+
+    #[test]
+    fn hash_like_source_name_is_replaced_by_time() {
+        let dir = temp_dir("hash-src");
+        let hash = "8e8adbeb1d9d05f875a56a782cce52e1";
+        let path = persist_bytes_into(&dir, b"image", "png", Some(hash)).expect("persist");
+        let stem = Path::new(&path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("stem");
+        assert!(!stem.contains("8e8adbeb"), "哈希名应被换掉，实际是 {stem}");
+        assert!(is_timestamp_stem(stem));
+    }
+
+    #[test]
+    fn readable_source_name_is_kept() {
+        let dir = temp_dir("readable");
+        let path = persist_bytes_into(&dir, b"audio", "mp3", Some("丈夫")).expect("persist");
+        assert_eq!(
+            Path::new(&path).file_name().and_then(|value| value.to_str()),
+            Some("丈夫.mp3")
+        );
+    }
+
+    #[test]
+    fn same_second_files_get_sequence_numbers() {
+        let dir = temp_dir("sequence");
+        // 直接固定同一个主干，避免测试恰好跨秒时变成「两个不同时间戳」而失去意义。
+        let stem = generated_media_stem();
+        let first = unique_media_path(&dir, &stem, "png", md5::compute(b"one"), 3);
+        std::fs::write(&first, b"one").expect("write first");
+        let second = unique_media_path(&dir, &stem, "png", md5::compute(b"two"), 3);
+        assert_ne!(first, second, "同秒两张不能互相覆盖");
+        let expected = format!("{stem}-2");
+        assert_eq!(
+            second.file_stem().and_then(|value| value.to_str()),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn repeated_same_content_reuses_the_file() {
+        let dir = temp_dir("dedupe");
+        let stem = generated_media_stem();
+        let first = unique_media_path(&dir, &stem, "png", md5::compute(b"same"), 4);
+        std::fs::write(&first, b"same").expect("write first");
+        let second = unique_media_path(&dir, &stem, "png", md5::compute(b"same"), 4);
+        assert_eq!(first, second, "同名同内容应复用同一个文件");
+    }
+}
+
+#[cfg(test)]
+mod media_rename_tests {
+    use super::*;
+
+    fn temp_file(label: &str, name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lentalk-rename-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("write file");
+        path
+    }
+
+    #[test]
+    fn renames_keeping_the_real_extension() {
+        let path = temp_file("basic", "2026-11-26-11-20-41.png", b"img");
+        let result = rename_media_in_dir(&path, "开场镜头").expect("rename");
+
+        assert_eq!(result.name, "开场镜头.png");
+        assert!(!result.adjusted);
+        assert!(!path.exists(), "旧文件不能留下");
+        assert!(Path::new(&result.path).exists());
+    }
+
+    #[test]
+    fn drops_extension_typed_by_user() {
+        let path = temp_file("typed", "clip.mp4", b"video");
+        // 用户把扩展名也改了（甚至改成另一种格式）：仍按真实扩展名落地。
+        let result = rename_media_in_dir(&path, "镜头1.png").expect("rename");
+
+        assert_eq!(result.name, "镜头1.mp4");
+        assert!(Path::new(&result.path).exists());
+    }
+
+    #[test]
+    fn appends_sequence_when_name_is_taken() {
+        let path = temp_file("taken", "a.png", b"first-content");
+        let dir = path.parent().expect("parent").to_path_buf();
+        std::fs::write(dir.join("占用.png"), b"another-content").expect("write other");
+
+        let result = rename_media_in_dir(&path, "占用").expect("rename");
+
+        assert_eq!(result.name, "占用-2.png");
+        assert!(result.adjusted);
+    }
+
+    #[test]
+    fn merges_identical_content_instead_of_duplicating() {
+        let path = temp_file("merge", "a.png", b"same-bytes");
+        let dir = path.parent().expect("parent").to_path_buf();
+        std::fs::write(dir.join("已有.png"), b"same-bytes").expect("write other");
+
+        let result = rename_media_in_dir(&path, "已有").expect("rename");
+
+        assert_eq!(result.name, "已有.png");
+        assert!(!path.exists(), "内容相同的旧文件应该被并掉");
+        assert_eq!(std::fs::read_dir(&dir).expect("list").count(), 1);
+    }
+
+    #[test]
+    fn rejects_empty_or_illegal_names() {
+        let path = temp_file("invalid", "a.png", b"x");
+        assert!(rename_media_in_dir(&path, "   ").is_err());
+        assert!(rename_media_in_dir(&path, "///").is_err());
+    }
+
+    #[test]
+    fn renaming_to_the_same_name_is_a_noop() {
+        let path = temp_file("noop", "same.png", b"x");
+        let result = rename_media_in_dir(&path, "same").expect("rename");
+
+        assert_eq!(result.name, "same.png");
+        assert!(!result.adjusted);
+        assert!(path.exists());
     }
 }

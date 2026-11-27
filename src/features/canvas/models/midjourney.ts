@@ -1,4 +1,4 @@
-import type { ExtraParamDefinition } from "./types";
+import type { ExtraParamDefinition, ResolutionOption } from "./types";
 
 /**
  * Midjourney 的「张数」语义 —— 与其它图片模型不一样，必须先讲清楚再写代码。
@@ -10,6 +10,24 @@ import type { ExtraParamDefinition } from "./types";
  * 所以 MJ 的「生成张数」最小单位就是 4，客户端再怎么选也拿不到 1~3 张。
  */
 export const MIDJOURNEY_IMAGES_PER_GROUP = 4;
+
+/**
+ * MJ 的清晰度只有两档 —— 它**没有** 1K/2K/4K 三档的分辨率参数。
+ *
+ * 平台把清晰度做成一个 `hd` 开关（模型卡 param_schema：
+ * 「开启后出图分辨率大幅提升，不额外收费。仅 v8.1 / v8.2 支持」），
+ * 所以节点上的分辨率下拉只该给两项，多出来的 4K 是客户端自己编的、
+ * 发上去也没有任何作用（以前的 `size: 2048x2048` 对 MJ 是无效字段）。
+ *
+ * 实测 v8.2 / 1:1（2026-11-24）：
+ *   - 不开 hd → 1024×1024
+ *   - 开 hd   → 2048×2048
+ * 因此 1K = 标准、2K = 高清 HD，值与实际像素正好对得上；两档同价。
+ */
+export const MIDJOURNEY_RESOLUTIONS: ResolutionOption[] = [
+  { value: "1K", label: "标准 1024" },
+  { value: "2K", label: "高清 HD 2048" },
+];
 
 /**
  * 识别 Midjourney 模型。

@@ -8,11 +8,13 @@ import { resolveNodeDisplayName } from "@/features/canvas/domain/nodeDisplay";
 import {
   buildNodeProperties,
   serializeNodeProperties,
+  type MediaFileTimeInfo,
   type MediaProbe,
   type NodeMediaKind,
   type NodePropertyRow,
   type UpstreamGenerationSource,
 } from "@/features/canvas/application/nodeProperties";
+import { resolveMediaFileTime } from "@/commands/mediaOutput";
 import { resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import {
   listAudioModels,
@@ -150,6 +152,42 @@ function useMediaByteSizeProbe(mediaUrl: string | null): number | null {
 }
 
 /**
+ * 媒体文件的落盘时间。
+ *
+ * 节点的 `generationStartedAt` 只在「这次生成的记录还在」时才有, 结果节点/老工程/手动
+ * 导入的素材都拿不到, 所以属性面板要能直接读文件系统时间 —— 这也是「右键属性里能看到
+ * 生成时间」的兜底。
+ */
+function useMediaFileTime(mediaUrl: string | null): MediaFileTimeInfo | null {
+  const [fileTime, setFileTime] = useState<MediaFileTimeInfo | null>(null);
+
+  useEffect(() => {
+    setFileTime(null);
+    const source = mediaUrl?.trim();
+    if (!source || !isTauri()) {
+      return;
+    }
+
+    let disposed = false;
+    void resolveMediaFileTime(source)
+      .then((value) => {
+        if (!disposed && value) {
+          setFileTime(value);
+        }
+      })
+      .catch(() => {
+        // 时间属于附加信息: 远程地址或权限不足时静默降级。
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [mediaUrl]);
+
+  return fileTime;
+}
+
+/**
  * providerId → 平台显示名 / 接口地址。
  *
  * 自定义平台的名字只有设置里才有,内置平台走模型注册表。节点里存的是生成当时的
@@ -268,6 +306,7 @@ export function NodePropertiesDialog({
   const { t } = useTranslation();
   const probe = useMediaProbe(mediaKind, mediaUrl);
   const byteSize = useMediaByteSizeProbe(mediaUrl);
+  const fileTime = useMediaFileTime(mediaUrl);
   const provider = useProviderLookup();
   const resolveModelProviderId = useModelProviderResolver();
   const copyFeedbackRef = useRef<CopyFeedbackState>({ timer: null });
@@ -292,12 +331,13 @@ export function NodePropertiesDialog({
       mediaKind,
       mediaUrl,
       probe: mergedProbe,
+      fileTime,
       provider,
       upstream,
       resolveModelProviderId,
       t: (key: string, fallback: string) => String(t(key, fallback)),
     });
-  }, [node, mediaKind, mediaUrl, mergedProbe, provider, upstream, resolveModelProviderId, t]);
+  }, [node, mediaKind, mediaUrl, mergedProbe, fileTime, provider, upstream, resolveModelProviderId, t]);
 
   useEffect(
     () => () => {

@@ -49,6 +49,7 @@ import { listModelProviders } from '@/features/canvas/models';
 import type { SettingsCategory } from '@/features/settings/settingsEvents';
 import { WanCliSettings } from '@/features/settings/WanCliSettings';
 import { JimengCanvasCliSettings } from '@/features/settings/JimengCanvasCliSettings';
+import { RhtvCanvasSettings } from '@/features/settings/RhtvCanvasSettings';
 import { RunningHubCliSettings } from '@/features/settings/RunningHubCliSettings';
 import { isZhenjianProvider } from '@/commands/zhenjianApi';
 
@@ -2285,6 +2286,7 @@ export function SettingsDialog({
                   <JimengCanvasCliSettings />
                   <WanCliSettings />
                   <RunningHubCliSettings />
+                  <RhtvCanvasSettings />
                   </div>
 
                   {/* 自定义平台(OpenAI 兼容) */}

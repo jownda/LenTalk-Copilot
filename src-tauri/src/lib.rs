@@ -22,6 +22,7 @@ use commands::pajuben;
 use commands::wan_cli;
 use commands::project_state;
 use commands::project_archive;
+use commands::rhtv_cli;
 use commands::runninghub_cli;
 use commands::system;
 use commands::template_state;
@@ -346,9 +347,18 @@ pub fn run() {
             runninghub_cli::runninghub_cli_logout,
             runninghub_cli::runninghub_cli_read_clipboard,
             runninghub_cli::generate_runninghub_cli_model,
+            rhtv_cli::rhtv_cli_status,
+            rhtv_cli::rhtv_cli_account,
+            rhtv_cli::rhtv_cli_models,
+            rhtv_cli::rhtv_cli_model,
+            rhtv_cli::rhtv_cli_model_params_batch,
+            rhtv_cli::rhtv_cli_forget_canvas,
+            rhtv_cli::generate_rhtv_canvas_model,
             image::persist_image_source,
             image::persist_video_source,
             image::persist_media_source_auto,
+            image::rename_media_file,
+            image::resolve_media_file_time,
             media_output::resolve_default_media_output_dir,
             media_output::resolve_media_output_dir,
             media_output::save_media_output_dir,

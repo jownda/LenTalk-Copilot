@@ -34,6 +34,38 @@ export async function persistMediaSourceAuto(source: string): Promise<string> {
   return invoke<string>('persist_media_source_auto', { source });
 }
 
+/** 一次重命名的结果。 */
+export interface RenameMediaResult {
+  /** 重命名后的绝对路径 —— 节点里存的旧地址必须替换成它，否则引用立刻失效。 */
+  path: string;
+  /** 最终文件名（含扩展名）。 */
+  name: string;
+  /** 目标名已被占用，实际落成了带序号的名字（`xxx-2.png`）。 */
+  adjusted: boolean;
+}
+
+/**
+ * 重命名落盘目录里的媒体文件。
+ *
+ * 只对「默认落盘位置」下的 images / videos / audio 生效（Rust 侧校验），
+ * 扩展名以磁盘上的真实文件为准，重名自动补序号。
+ */
+export async function renameMediaFile(source: string, name: string): Promise<RenameMediaResult> {
+  if (!isTauri()) throw new Error('仅桌面版支持重命名媒体文件');
+  return invoke<RenameMediaResult>('rename_media_file', { source, name });
+}
+
+/** 媒体文件的创建 / 修改时间（毫秒时间戳）；远程地址或取不到时返回 null。 */
+export interface MediaFileTime {
+  createdAtMs: number | null;
+  modifiedAtMs: number | null;
+}
+
+export async function resolveMediaFileTime(source: string): Promise<MediaFileTime | null> {
+  if (!isTauri()) return null;
+  return invoke<MediaFileTime | null>('resolve_media_file_time', { source });
+}
+
 /** 未配置时实际会用的默认落盘位置（`<系统下载文件夹>/LenTalk`）。 */
 export async function resolveDefaultMediaOutputDir(): Promise<string> {
   if (!isTauri()) return '';
@@ -127,7 +159,7 @@ export interface MediaMigrationReport {
   sourceRoots: string[];
   copiedFiles: number;
   copiedBytes: number;
-  /** 新位置里已有同名文件而跳过 —— 文件名就是内容 md5，同名即同内容。 */
+  /** 新位置里已有同名且大小一致的文件而跳过（同名但内容不同会另存为带序号的名字）。 */
   skippedFiles: number;
   failedFiles: number;
 }

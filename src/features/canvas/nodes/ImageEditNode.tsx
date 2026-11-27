@@ -67,6 +67,7 @@ import {
 } from '@/features/canvas/models';
 import { resolveModelPriceDisplay } from '@/features/canvas/pricing';
 import { useJimengCatalogRevision } from '@/features/canvas/models/jimengCatalog';
+import { useRhtvModelSpec } from '@/features/canvas/models/useRhtvModelSpec';
 import { isWgspaiProvider } from '@/features/canvas/models/wgspaiPricing';
 import {
   NODE_CONTROL_CHIP_CLASS,
@@ -444,6 +445,8 @@ export const ImageEditNode = memo(({ id, data, selected, width, height }: ImageE
   useJimengCatalogRevision();
   const imageModels = listImageModels();
   const selectedModel = getImageModel(data.model ?? DEFAULT_IMAGE_MODEL_ID);
+  // 画布模型：选中后异步拉参数清单，拉到即重渲染（档位换成该模型真实支持的）。
+  useRhtvModelSpec(selectedModel.id, 'image');
   // 一档实际出几张：绝大多数模型是 1，Midjourney / MJ 8.2 是 4（一档 = 一组 4 张）。
   // 请求侧与按钮文案都以它为准，见 models/midjourney.ts。
   const imagesPerCountUnit = selectedModel.imagesPerCountUnit ?? 1;

@@ -27,8 +27,30 @@ import { generateJimengCanvasAudio, generateJimengCanvasVideo } from "@/commands
 import { ensureJimengCanvasProject } from "@/features/canvas/application/jimengCanvasProject";
 import { isApiKeylessProvider, JIMENG_CANVAS_CLI_PROVIDER_ID, JIMENG_CLI_PROVIDER_ID, resolveVideoModelProfile } from "@/features/canvas/models";
 import { getVideoModel } from "@/features/canvas/models";
-import { RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
+import { RHTV_CANVAS_PROVIDER_ID, RUNNINGHUB_CLI_PROVIDER_ID } from "@/features/canvas/models";
 import { useRunningHubCliStore } from "@/stores/runningHubCliStore";
+import { useRhtvCanvasStore } from "@/stores/rhtvCanvasStore";
+import { generateRhtvCanvasModel } from "@/commands/rhtvCli";
+
+/** 画布 CLI 的可执行文件；留空交给 Rust 侧自动探测，不能复用标准 CLI 的 `rh`。 */
+function rhtvExecutable(): string | undefined {
+  const value = useRhtvCanvasStore.getState().executable?.trim();
+  return value && value.length > 0 ? value : undefined;
+}
+
+/**
+ * 把调用方给的自定义参数折成 `key=value`。
+ *
+ * 画布每个模型都有自己的字段（H3 的 `audioMode`、部分模型的 `fps`），节点面板不可能
+ * 为每个模型写一套控件。这里只做透传，**不过滤**：Rust 侧会用该模型的实时 schema
+ * 兜底，不认识的字段直接丢弃，所以多传是安全的。
+ */
+function rhtvCustomParams(extraParams?: Record<string, unknown>): string[] {
+  if (!extraParams) return [];
+  return Object.entries(extraParams)
+    .filter(([, value]) => ['string', 'number', 'boolean'].includes(typeof value))
+    .map(([key, value]) => `${key}=${String(value)}`);
+}
 import { toVideoGenerationRequest } from "@/features/canvas/application/videoGeneration";
 import { persistAudioLocally, persistVideoLocally } from "@/features/canvas/application/mediaPersistence";
 import { isRjmVideoApiBaseUrl } from "@/commands/videoApi";
@@ -293,13 +315,17 @@ export function withZhiniaoImageMode<
   const providerId = payload.model.split("/")[0]?.replace(/^custom:/i, "") ?? "";
   const baseUrl = typeof extraParams.provider_base_url === "string" ? extraParams.provider_base_url : "";
   if (!isZhiniaoProviderId(providerId) && !isZhiniaoBaseUrl(baseUrl)) return payload;
-  // Midjourney 的 mode 只有 text-to-image / multi-reference 两档（模型卡 param_schema），
-  // 传 image-edit 属于非法枚举。单张垫图在 MJ 语义里也是「多图融合」的一种，
-  // 所以 MJ 一律走 multi-reference，避免选了参考图就被上游判参数错误。
+  // Midjourney 的 mode 只有 text-to-image / multi-reference 两档（模型卡 param_schema）：
+  // - text-to-image 下 `images` 是「垫图」, 官方允许 1-4 张, 只影响风格/氛围/构图;
+  // - multi-reference 是 Blend, 官方要求 **2-4 张**, 只给 1 张会被上游直接 400
+  //   「多图融合需要至少 2 张不同的图片」。
+  // 所以单张垫图必须留在 text-to-image, 不能因为"有参考图"就一律走融合。
   extraParams.image_generation_mode =
-    isMidjourneyImageModel(payload.model) || usableReferences.length > 1
+    usableReferences.length > 1
       ? "multi-reference"
-      : "image-edit";
+      : isMidjourneyImageModel(payload.model)
+        ? "text-to-image"
+        : "image-edit";
   return { ...payload, extraParams };
 }
 
@@ -749,6 +775,27 @@ export const tauriAiGateway: AiGateway = {
     await setApiKey(provider, apiKey);
   },
   generateImage: async (payload: GenerateImagePayload) => {
+    // RunningHub **画布**（rhtvcli）：与视频同一套节点语义，见下方 generateVideo 的说明。
+    if (payload.model.startsWith(`${RHTV_CANVAS_PROVIDER_ID}/`)) {
+      const model = payload.model.slice(`${RHTV_CANVAS_PROVIDER_ID}/`.length);
+      const sources = await normalizeUrlsForCli(payload.referenceImages, "image");
+      return await persistImageLocally(
+        await generateRhtvCanvasModel({
+          executable: rhtvExecutable(),
+          model,
+          prompt: payload.prompt,
+          // 图片节点的 `size` 就是分辨率档位（1K/2K）；画布把它叫 `whResolution`。
+          params: [
+            payload.aspectRatio ? `aspectRatio=${payload.aspectRatio}` : "",
+            payload.size ? `resolution=${payload.size}` : "",
+            ...rhtvCustomParams(payload.extraParams),
+          ].filter(Boolean),
+          images: sources,
+          kind: "image",
+        }),
+      );
+    }
+
     // 显式同步通道(等价 Infinite-Canvas /api/generate): 强制 request_mode=sync,
     // 后端走 generate_image 直出, 不创建异步任务, 避免 poll 不收敛导致的永久转圈。
     const providerId = payload.model.split("/")[0]?.replace(/^custom:/i, "") ?? "";
@@ -963,6 +1010,31 @@ export const tauriAiGateway: AiGateway = {
     return { jobId, cancelable: true };
   },
   generateVideo: async (payload: GenerateVideoPayload) => {
+    // RunningHub **画布**（rhtvcli）：节点语义，一次调用里完成建节点→运行→取产物。
+    // 参数只传通用字段，Rust 侧会按该模型的实时 schema 过滤（画布对未知字段直接整单拒绝）。
+    if (payload.model.startsWith(`${RHTV_CANVAS_PROVIDER_ID}/`)) {
+      const model = payload.model.slice(`${RHTV_CANVAS_PROVIDER_ID}/`.length);
+      const sources = await normalizeUrlsForCli(payload.referenceImages, "image");
+      return await persistVideoLocally(
+        await generateRhtvCanvasModel({
+          executable: rhtvExecutable(),
+          model,
+          prompt: payload.prompt,
+          // 只传通用名，字段名由 Rust 侧按该模型 schema 映射（`aspectRatio` 还是
+          // `whAspectRatio`、`duration` 还是 `videoDuration`，各模型不一样）。
+          params: [
+            payload.aspectRatio ? `aspectRatio=${payload.aspectRatio}` : "",
+            Number.isFinite(payload.duration) ? `duration=${Math.round(payload.duration)}` : "",
+            payload.videoResolution ? `resolution=${payload.videoResolution}` : "",
+            ...rhtvCustomParams(payload.extraParams),
+          ].filter(Boolean),
+          // 画布只认上传后的媒体节点：本地路径 / data URL / 外链都由 Rust 侧落成文件再上传。
+          images: sources,
+          kind: "video",
+        }),
+      );
+    }
+
     // 🔴 四个本地 CLI 分支（wan / 即梦 CLI / 即梦画布 CLI / RunningHub）返回的都是
     // **它们自己的下载目录**，不是「默认落盘位置」：即梦两条会把产物下到
     // `%APPDATA%\...\jimeng-cli\videos\<run_id>\`，节点从此寄居在 AppData 里，

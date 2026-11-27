@@ -57,6 +57,7 @@ import {
   resolveMediaNodeFitSize,
 } from '@/features/canvas/application/mediaNodeSizing';
 import { reduceAspectRatio } from '@/features/canvas/application/imageData';
+import { remapRenamedMediaPathsInNodes } from '@/features/canvas/application/mediaRenames';
 
 export type {
   ActiveToolDialog,
@@ -3031,7 +3032,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     );
 
     set({
-      nodes: restoredSnapshot.nodes,
+      // 快照里的媒体路径可能是改名前保存的旧路径（文件已经不在了），先修回当前路径。
+      nodes: remapRenamedMediaPathsInNodes(restoredSnapshot.nodes),
       edges: restoredSnapshot.edges,
       routingRevision: state.routingRevision + 1,
       processingRevision: state.processingRevision + 1,
@@ -3056,15 +3058,16 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     const currentSnapshot = createSnapshot(state.nodes, state.edges);
     const nextFuture = state.history.future.slice(0, -1);
+    const restoredNodes = remapRenamedMediaPathsInNodes(target.nodes);
 
     set({
-      nodes: target.nodes,
+      nodes: restoredNodes,
       edges: target.edges,
       routingRevision: state.routingRevision + 1,
       processingRevision: state.processingRevision + 1,
       inputGraphRevision: state.inputGraphRevision + 1,
-      selectedNodeId: resolveSelectedNodeId(state.selectedNodeId, target.nodes),
-      activeToolDialog: resolveActiveToolDialog(state.activeToolDialog, target.nodes),
+      selectedNodeId: resolveSelectedNodeId(state.selectedNodeId, restoredNodes),
+      activeToolDialog: resolveActiveToolDialog(state.activeToolDialog, restoredNodes),
       history: {
         past: pushSnapshot(state.history.past, currentSnapshot),
         future: nextFuture,

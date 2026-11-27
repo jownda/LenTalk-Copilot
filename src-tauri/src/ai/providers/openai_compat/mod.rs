@@ -1598,6 +1598,23 @@ transfer-encoding={}；request_id={}。本次请求平台已受理，这类断�
             .map(|(_, value)| *value)
     }
 
+    /// Midjourney 模型识别（与前端 `models/midjourney.ts` 的口径一致）。
+    ///
+    /// 只认 `mj_imagine` / `mj-imagine` / `midjourney` 这几个完整 token：
+    /// `grok-imagine-image` 名字里也有 `imagine`，但它是 xAI 的模型，不能套 MJ 语义。
+    fn is_midjourney_image_model(api_model: &str) -> bool {
+        let model = api_model.trim().to_ascii_lowercase();
+        model
+            .split(['/', ':'])
+            .last()
+            .map(|tail| {
+                matches!(tail, "mj_imagine" | "mj-imagine" | "midjourney")
+                    || tail.starts_with("mj_imagine")
+                    || tail.starts_with("midjourney")
+            })
+            .unwrap_or(false)
+    }
+
     /// 灵柯 / API666888 的图片模型参数命名族。
     ///
     /// 用**族**而不是逐模型分支: 同族模型的参数签名完全一致, 逐模型写会漏。
@@ -1927,11 +1944,23 @@ transfer-encoding={}；request_id={}。本次请求平台已受理，这类断�
             "prompt": prompt,
             "n": 1,
         });
-        body["size"] = json!(Self::map_requested_image_size(
-            api_model,
-            resolution,
-            aspect_ratio,
-        ));
+        let is_midjourney = Self::is_midjourney_image_model(api_model);
+        if is_midjourney {
+            // MJ 没有分辨率参数: `size` 是无效字段, 清晰度只有 `hd` 开关
+            // (模型卡: 「开启后出图分辨率大幅提升, 仅 v8.1 / v8.2 支持」)。
+            // 实测 v8.2 / 1:1: 不开 hd → 1024×1024, 开 hd → 2048×2048,
+            // 所以节点上的 2K 档映射成 hd, 1K 保持标准。两档同价。
+            body["aspect_ratio"] = json!(aspect_ratio);
+            if !resolution.trim().eq_ignore_ascii_case("1K") {
+                body["hd"] = json!(true);
+            }
+        } else {
+            body["size"] = json!(Self::map_requested_image_size(
+                api_model,
+                resolution,
+                aspect_ratio,
+            ));
+        }
         if is_gpt_image {
             body["output_format"] = json!("png");
             // gpt-image-2-* 中转模型会读取该字段；仅传 OpenAI 的 size 时会回退为服务端默认横幅。
@@ -3651,6 +3680,44 @@ mod tests {
             OpenAICompatibleProvider::video_result_url(&payload).as_deref(),
             Some("https://cdn.example.com/result.mp4")
         );
+    }
+
+    #[test]
+    fn midjourney_uses_hd_switch_instead_of_size() {
+        // MJ 没有 size 参数: 1K = 标准(不发 hd), 2K = 高清(发 hd:true)。
+        let standard = OpenAICompatibleProvider::build_request_body(
+            "mj_imagine",
+            "a portrait",
+            "1K",
+            "1:1",
+            None,
+            "images",
+            "data_url",
+        )
+        .expect("body");
+        assert!(standard.get("size").is_none());
+        assert!(standard.get("hd").is_none());
+        assert_eq!(standard["aspect_ratio"], "1:1");
+
+        let hd = OpenAICompatibleProvider::build_request_body(
+            "mj_imagine",
+            "a portrait",
+            "2K",
+            "1:1",
+            None,
+            "images",
+            "data_url",
+        )
+        .expect("body");
+        assert!(hd.get("size").is_none());
+        assert_eq!(hd["hd"], true);
+    }
+
+    #[test]
+    fn midjourney_detection_ignores_grok_imagine() {
+        assert!(OpenAICompatibleProvider::is_midjourney_image_model("mj_imagine"));
+        assert!(OpenAICompatibleProvider::is_midjourney_image_model("custom:x/midjourney"));
+        assert!(!OpenAICompatibleProvider::is_midjourney_image_model("grok-imagine-image"));
     }
 
     #[test]

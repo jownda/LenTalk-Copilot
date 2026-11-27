@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { buildNodeProperties, serializeNodeProperties } from "./nodeProperties";
+import { formatTimestamp } from "./mediaFormat";
+
+/** 固定时间戳; 期望值现算, 避免测试随运行机器的时区漂移。 */
+const FILE_MS = 1_763_400_000_000;
+const FILE_LABEL = formatTimestamp(FILE_MS) as string;
 
 const t = (_key: string, fallback: string) => fallback;
 
@@ -297,5 +302,53 @@ describe("serializeNodeProperties", () => {
     expect(text).toContain("[生成信息]");
     expect(text).toContain("生成平台：知鸟ai");
     expect(text).toContain("提示词：一张图");
+  });
+});
+
+describe("文件时间", () => {
+  it("媒体信息里显示创建时间（本地文件时间）", () => {
+    const groups = buildNodeProperties({
+      nodeType: "exportImageNode",
+      mediaKind: "image",
+      mediaUrl: "/media/2026-11-26-11-20-41.png",
+      data: {},
+      fileTime: { createdAtMs: FILE_MS },
+      t,
+    });
+
+    expect(collectRows(groups)).toContain(`创建时间|${FILE_LABEL}`);
+  });
+
+  it("有生成记录但没有提交时间时, 生成时间用文件创建时间兜底", () => {
+    const groups = buildNodeProperties({
+      nodeType: "videoNode",
+      mediaKind: "video",
+      mediaUrl: "/media/2026-11-26-11-20-41.mp4",
+      // 结果节点/老工程保留着生成记录, 但 generationStartedAt 被清掉了。
+      data: { generationJobId: "job-1" },
+      fileTime: { createdAtMs: FILE_MS },
+      t,
+    });
+
+    const generation = findGroup(groups, "generation");
+    expect(generation?.rows.map((row) => `${row.label}|${row.value}`)).toContain(
+      `生成时间|${FILE_LABEL}`,
+    );
+  });
+
+  it("有生成记录时优先用节点上的提交时间", () => {
+    const groups = buildNodeProperties({
+      nodeType: "exportImageNode",
+      mediaKind: "image",
+      mediaUrl: "/media/a.png",
+      data: { generationStartedAt: 1_700_000_000_000 },
+      fileTime: { createdAtMs: FILE_MS },
+      t,
+    });
+
+    const generation = findGroup(groups, "generation");
+    const startedRows = generation?.rows.filter((row) => row.label === "生成时间") ?? [];
+    expect(startedRows).toHaveLength(1);
+    expect(startedRows[0].value).not.toBe(FILE_LABEL);
   });
 });

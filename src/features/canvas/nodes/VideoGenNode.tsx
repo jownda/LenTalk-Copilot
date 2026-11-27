@@ -83,6 +83,8 @@ import {
 } from "@/features/canvas/ui/nodeReferencePickerLayout";
 import { prepareNodeImageFromFile, resolveImageDisplayUrl } from "@/features/canvas/application/imageData";
 import { useJimengCatalogRevision } from '@/features/canvas/models/jimengCatalog';
+import { useRhtvCatalogRevision } from '@/features/canvas/models/rhtvCatalog';
+import { useRhtvModelSpec } from '@/features/canvas/models/useRhtvModelSpec';
 import {
   findReferenceTokens,
   insertReferenceToken,
@@ -485,6 +487,8 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
 
   // 模型目录同步完成后重渲染（并让下面的 useMemo 重算），新模型才会出现在下拉里。
   const catalogRevision = useJimengCatalogRevision();
+  // 画布模型的参数清单是选中后异步拉的，拉到后要重算下拉档位。
+  const rhtvRevision = useRhtvCatalogRevision();
   const imageMode = data.imageMode === "first-last" ? "first-last" : "reference";
   const models = useMemo(
     () =>
@@ -509,12 +513,13 @@ export const VideoGenNode = memo(({ id, data, selected, width, height }: VideoGe
           !normalized.includes("对口型")
         );
       }),
-    [customApis, imageMode, catalogRevision],
+    [customApis, imageMode, catalogRevision, rhtvRevision],
   );
   const selectedModel =
     models.find((model) => model.id === data.model) ??
     models.find((model) => model.id === getDefaultVideoModelId()) ??
     models[0];
+  useRhtvModelSpec(selectedModel?.id, "video");
   const isJimengCli = selectedModel?.providerId === JIMENG_CLI_PROVIDER_ID;
   // 画布 CLI 同样是本地命令、没有 API Key, 必须一起跳过密钥校验, 否则报「请在设置中填写 API Key」。
   const isJimengCanvasCli = selectedModel?.providerId === JIMENG_CANVAS_CLI_PROVIDER_ID;

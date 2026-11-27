@@ -1252,6 +1252,7 @@ mod tests {
     #[test]
     fn catalog_supports_matches_resolution_case_insensitively() {
         let catalog = ModelCatalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
             cli_version: "1.2.1".into(),
             fetched_at: 0,
             image: vec![ModelCatalogEntry {

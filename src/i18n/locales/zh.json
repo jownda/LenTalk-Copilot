@@ -231,7 +231,8 @@
       "addImageToLibraryFailed": "无法将该图片添加到素材库",
       "addAudioToLibraryFailed": "无法将该音频添加到素材库",
       "addVideoToLibraryFailed": "无法将该视频添加到素材库",
-      "addToLibraryFailed": "添加失败"
+      "addToLibraryFailed": "添加失败",
+      "renameMedia": "重命名文件"
     },
     "saveTextPrompt": {
       "title": "保存到提示词库",
@@ -289,7 +290,8 @@
       "copyAll": "复制全部",
       "copied": "已复制",
       "copy": "复制",
-      "referenceVideo": "参考视频"
+      "referenceVideo": "参考视频",
+      "fileCreatedAt": "创建时间"
     },
     "nodeManager": {
       "title": "节点管理",
@@ -355,6 +357,11 @@
       "tipPan": "平移画布: 按住鼠标左键/中键/右键拖拽(滚动滚轮缩放)",
       "tipAssetDrop": "素材入画: 从素材库拖拽图片/视频/音频到画布",
       "tipPromptDrop": "提示词入画: 从提示词库拖拽提示词卡片到画布, 自动创建 AI 图片节点"
+    },
+    "mediaRename": {
+      "title": "重命名文件",
+      "placeholder": "输入新的文件名",
+      "hint": "扩展名保持不变；同名文件已存在时自动加序号。画布里引用这个文件的所有节点会一起更新。"
     }
   },
   "tool": {

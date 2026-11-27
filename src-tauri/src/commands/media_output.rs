@@ -8,12 +8,14 @@
 //!
 //! ```text
 //! <落盘根目录>/
-//!   images/<md5>.<ext>
-//!   videos/<md5>.<ext>
-//!   audio/<md5>.<ext>
+//!   images/2026-11-26-11-20-41.png
+//!   videos/2026-11-26-11-20-41.mp4
+//!   audio/丈夫.mp3
 //! ```
 //!
-//! 文件名用内容 md5，所以同一份字节只会落一次盘。
+//! **生成产物按落盘时间命名**（本地时间），一眼能看出是什么时候出的；同一秒多张时补
+//! `-2`、`-3`。有可读来源名（资产库 / 本地导入）时沿用原名 —— 那是用户自己起的。
+//! 同目录下同名且内容一致的文件会复用，不重复占盘。
 
 use std::collections::HashSet;
 use std::fs;
@@ -356,7 +358,11 @@ fn migrate_roots(
     Ok(report)
 }
 
-/// 把 `source_dir` 里目标尚未拥有的文件复制过去；同名直接跳过（文件名是内容 md5）。
+/// 把 `source_dir` 里目标尚未拥有的文件复制过去。
+///
+/// 同名且**大小一致**才跳过（老文件的文件名是内容 md5，同名即同内容）；同名但大小不同
+/// 说明是两份不同的素材（新命名按时间，同一秒两张就会撞名），换一个带序号的名字复制，
+/// 不能因为撞名把用户的素材丢掉。
 fn copy_missing_files(source_dir: &Path, target_dir: &Path, report: &mut MediaMigrationReport) {
     let Ok(entries) = fs::read_dir(source_dir) else {
         return;
@@ -370,10 +376,17 @@ fn copy_missing_files(source_dir: &Path, target_dir: &Path, report: &mut MediaMi
         let Some(file_name) = path.file_name() else {
             continue;
         };
-        let target = target_dir.join(file_name);
+        let mut target = target_dir.join(file_name);
         if target.is_file() {
-            report.skipped_files += 1;
-            continue;
+            let same_size = fs::metadata(&path)
+                .map(|meta| meta.len())
+                .ok()
+                == fs::metadata(&target).map(|meta| meta.len()).ok();
+            if same_size {
+                report.skipped_files += 1;
+                continue;
+            }
+            target = unique_copy_target(target_dir, &path);
         }
         match fs::copy(&path, &target) {
             Ok(bytes) => {
@@ -388,10 +401,33 @@ fn copy_missing_files(source_dir: &Path, target_dir: &Path, report: &mut MediaMi
     }
 }
 
+/// 目标目录里已有同名但内容不同的文件时，给迁移过来的文件换一个不冲突的名字。
+fn unique_copy_target(target_dir: &Path, source: &Path) -> PathBuf {
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("media");
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    for index in 2..1000u32 {
+        let name = if extension.is_empty() {
+            format!("{stem}-{index}")
+        } else {
+            format!("{stem}-{index}.{extension}")
+        };
+        let candidate = target_dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    target_dir.join(format!("{stem}-copy"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn classifies_known_extensions() {
         assert_eq!(kind_for_extension("mp4"), MediaKind::Video);

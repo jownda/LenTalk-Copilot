@@ -79,6 +79,7 @@ import { NodePriceBadge } from '@/features/canvas/ui/NodePriceBadge';
 import { resolveRecommendedApiPriceBadge } from './nodePriceBadge';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { useJimengCatalogRevision } from '@/features/canvas/models/jimengCatalog';
+import { useRhtvModelSpec } from '@/features/canvas/models/useRhtvModelSpec';
 import {
   NODE_CONTROL_CHIP_CLASS,
   NODE_CONTROL_ICON_CLASS,
@@ -541,6 +542,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
   useJimengCatalogRevision();
   const imageModels = listImageModels();
   const selectedModel = getImageModel(nodeData.model ?? DEFAULT_IMAGE_MODEL_ID);
+  // 画布模型：选中后异步拉参数清单，拉到即重渲染（档位换成该模型真实支持的）。
+  useRhtvModelSpec(selectedModel.id, 'image');
   const providerApiKey = apiKeys[selectedModel.providerId] ?? '';
   const customApiBaseUrl = useMemo(() => {
     if (!selectedModel.providerId.startsWith('custom:')) {

@@ -40,6 +40,17 @@ export interface MediaProbe {
   byteSize?: number | null;
 }
 
+/**
+ * 文件系统里的时间(毫秒时间戳)。
+ *
+ * 节点的 `generationStartedAt` 只在「这次生成的记录还在」时才有 —— 结果节点、老工程、
+ * 手动导入的素材都没有。文件的创建时间任何本地媒体都拿得到,是兜底来源。
+ */
+export interface MediaFileTimeInfo {
+  createdAtMs?: number | null;
+  modifiedAtMs?: number | null;
+}
+
 export interface ProviderLookup {
   /** providerId → 平台显示名(如 `custom:zhiniao` → `知鸟ai`)。 */
   label?: (providerId: string) => string | null;
@@ -67,6 +78,8 @@ export interface BuildNodePropertiesInput {
   /** 节点的媒体地址(本地路径 / URL),用于推断格式与来源。 */
   mediaUrl: string | null;
   probe?: MediaProbe | null;
+  /** 文件系统时间: 节点没有生成记录时用来显示「生成时间」。 */
+  fileTime?: MediaFileTimeInfo | null;
   provider?: ProviderLookup;
   /** 上游生成节点: 本节点没有生成记录时从它补平台/模型/提示词等信息。 */
   upstream?: UpstreamGenerationSource | null;
@@ -182,6 +195,7 @@ export function buildNodeProperties({
   mediaKind,
   mediaUrl,
   probe,
+  fileTime,
   provider,
   upstream,
   resolveModelProviderId,
@@ -249,6 +263,17 @@ export function buildNodeProperties({
     mediaRows.push({
       label: t("canvas.nodeProperties.format", "格式"),
       value: format,
+    });
+  }
+
+  // 文件是什么时候出来的: 节点上的生成记录会被清掉, 文件时间不会。
+  // 创建时间优先(它就是落盘那一刻), 取不到(部分 Linux 文件系统)退回修改时间。
+  const fileTimeStamp =
+    formatTimestamp(fileTime?.createdAtMs) ?? formatTimestamp(fileTime?.modifiedAtMs);
+  if (fileTimeStamp) {
+    mediaRows.push({
+      label: t("canvas.nodeProperties.fileCreatedAt", "创建时间"),
+      value: fileTimeStamp,
     });
   }
 
@@ -397,7 +422,11 @@ export function buildNodeProperties({
     }
 
     push(t("canvas.nodeProperties.jobId", "任务 ID"), jobId, { copyable: true, multiline: true });
-    push(t("canvas.nodeProperties.startedAt", "生成时间"), formatTimestamp(startedAt));
+    // 有提交记录就用提交时间; 没有(结果节点/老工程)退回文件创建时间, 不能留空。
+    push(
+      t("canvas.nodeProperties.startedAt", "生成时间"),
+      formatTimestamp(startedAt) ?? formatTimestamp(fileTime?.createdAtMs) ?? formatTimestamp(fileTime?.modifiedAtMs),
+    );
 
     if (expectedDuration) {
       push(t("canvas.nodeProperties.expectedDuration", "预计耗时"), expectedDuration);

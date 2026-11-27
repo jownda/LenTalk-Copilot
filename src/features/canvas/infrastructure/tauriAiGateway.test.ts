@@ -162,6 +162,20 @@ describe("withZhiniaoImageMode", () => {
     expect(modeOf(withZhiniaoImageMode(build(ZN_MODEL, ZN_URL, ["a.png"])))).toBe("image-edit");
   });
 
+  it("Midjourney 单张垫图 → text-to-image(不走融合)", () => {
+    // 实测: mj_imagine 的 multi-reference 要求 2-4 张, 单张会被上游 400
+    // 「多图融合需要至少 2 张不同的图片」; text-to-image 下 images 就是垫图(1-4 张)。
+    expect(
+      modeOf(withZhiniaoImageMode(build("custom:知鸟ai/mj_imagine", ZN_URL, ["a.png"]))),
+    ).toBe("text-to-image");
+  });
+
+  it("Midjourney 多张 → multi-reference", () => {
+    expect(
+      modeOf(withZhiniaoImageMode(build("custom:知鸟ai/mj_imagine", ZN_URL, ["a.png", "b.png"]))),
+    ).toBe("multi-reference");
+  });
+
   it("多张参考图 → multi-reference", () => {
     expect(modeOf(withZhiniaoImageMode(build(ZN_MODEL, ZN_URL, ["a.png", "b.png"])))).toBe(
       "multi-reference",

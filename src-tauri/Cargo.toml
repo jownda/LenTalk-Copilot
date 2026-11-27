@@ -57,6 +57,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # 因为 resolver v2 下主机侧与目标侧的依赖图是分开做特性解析的。
 indexmap = { version = "1.9.3", features = ["std"], default-features = false }
 md5 = "0.7"
+# 生成产物按**本地时间**命名（`2026-11-26-11-20-41.png`），用户一眼能看出是什么时候出的。
+# 已经在依赖图里（tauri 的间接依赖），这里只是把它提到直接依赖，不引入新的下载。
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 arboard = "3.4"
 fast_image_resize = "6.0.0"
 imageproc = "0.26.1"
